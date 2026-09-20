@@ -14,7 +14,7 @@ use crate::git::{self, repo_counts};
 pub use cockpit_proto::{LaunchBundle, LaunchInfo};
 
 pub const APP_NAME: &str = "FlyCockpit";
-pub const INPUT_PREFIX: &str = "❯ ";
+pub const INPUT_PREFIX: &str = "";
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";

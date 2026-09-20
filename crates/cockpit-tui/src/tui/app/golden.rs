@@ -12,12 +12,16 @@ use crate::tui::golden::{
 };
 use crate::tui::onboarding::OnboardingShell;
 use crate::tui::settings::Dialog;
+use cockpit_client::presentation::TurnEvent;
 use cockpit_config::extended::VimModeSetting;
 use cockpit_config::providers::{
     ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ModelCapabilities, ModelEntry,
     ProviderEntry, ReasoningEffortCapability, ThinkingMode,
 };
-use cockpit_proto::{OnboardingBootstrapSnapshot, OnboardingStage};
+use cockpit_proto::{
+    OnboardingBootstrapSnapshot, OnboardingStage, QueueDeliveryClass, QueueItem, QueueItemStatus,
+    QueueTarget,
+};
 use crossterm::event::{KeyCode, KeyEvent};
 use uuid::Uuid;
 
@@ -674,6 +678,116 @@ pub fn assert_composer_pickers() {
     }
 }
 
+fn shell_chrome_app(scene: &str) -> App {
+    let mut app = empty_chat_banner_app();
+    app.launch.banner_enabled = false;
+    app.launch.session_short_id = Some("fixture-session".to_string());
+    app.launch.repo_status = Some(cockpit_proto::RepoStatus {
+        branch: "issue-449".to_string(),
+        staged: 1,
+        unstaged: 1,
+        unpushed: 0,
+    });
+    match scene {
+        "idle" => {}
+        "working-queue" => {
+            app.busy = true;
+            for index in 0..6u128 {
+                app.queue.push(QueueItem {
+                    id: uuid::Uuid::from_u128(index + 1),
+                    status: QueueItemStatus::Queued,
+                    text: format!("queued message {}", index + 1),
+                    display_text: None,
+                    target: QueueTarget::root("Build"),
+                    delivery_class: if index % 2 == 0 {
+                        QueueDeliveryClass::Held
+                    } else {
+                        QueueDeliveryClass::Steering
+                    },
+                    send_now: index == 4,
+                });
+            }
+        }
+        "eight-row-composer" => {
+            app.composer
+                .replace_buffer("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+        }
+        "sandbox-unavailable" => {
+            app.apply_event(TurnEvent::SandboxUnavailable {
+                remedy: "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); \
+                     `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` re-enables confinement"
+                    .to_string(),
+                fix_command: Some(
+                    "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".to_string(),
+                ),
+            });
+            app.open_composer_picker(ComposerControlKind::Sandbox);
+        }
+        "picker-open" => {
+            app.open_composer_picker(ComposerControlKind::Effort);
+        }
+        "slash-three" => {
+            app.composer.replace_buffer("/pi");
+            app.reset_slash_window();
+            assert_eq!(app.slash_suggestions().len(), 3);
+        }
+        other => panic!("unknown shell chrome scene {other}"),
+    }
+    app
+}
+
+pub fn assert_shell_chrome() {
+    let _pins = GoldenPins::install();
+    for scene in [
+        "idle",
+        "working-queue",
+        "eight-row-composer",
+        "sandbox-unavailable",
+        "picker-open",
+        "slash-three",
+    ] {
+        assert_golden_sizes("shell-chrome", scene, |width, height| {
+            let mut app = shell_chrome_app(scene);
+            let buffer = render_app(&mut app, width, height);
+            if scene == "working-queue" {
+                assert_eq!(app.queue.len(), 6);
+                assert_eq!(app.queue_row_hits.len(), 5);
+            }
+            if scene == "eight-row-composer" {
+                assert_eq!(app.input_area.expect("composer area").height, 10);
+            }
+            if scene == "slash-three" {
+                let text = buffer_text(&buffer);
+                assert!(
+                    text.contains("Commands"),
+                    "slash box keeps its titled shape"
+                );
+                for command in ["/pin", "/pins", "/pin-context"] {
+                    assert!(text.contains(command), "missing slash match {command}");
+                }
+                assert_eq!(
+                    app.suggestion_row_hits.len(),
+                    3,
+                    "the golden contains exactly three clickable matches"
+                );
+            }
+            if scene == "sandbox-unavailable" && width == 80 && height == 24 {
+                let text = buffer_text(&buffer);
+                assert!(
+                    text.contains("/sandbox off"),
+                    "painted sandbox status must include the composer action"
+                );
+                assert!(
+                    text.contains("sudo sysctl")
+                        && text.contains("kernel.apparmor_restrict_unprivileged_userns=0"),
+                    "painted sandbox status must include the sysctl remedy tail"
+                );
+            }
+            buffer
+        });
+    }
+}
+
 /// Compare onboarding Welcome dumps at both review sizes.
 pub fn assert_onboarding_welcome() {
     let _pins = GoldenPins::install();
@@ -908,5 +1022,11 @@ mod seed_tests {
     fn golden_product_popovers() {
         let _env = isolate_render_env();
         assert_product_popovers();
+    }
+
+    #[test]
+    fn golden_shell_chrome() {
+        let _env = isolate_render_env();
+        assert_shell_chrome();
     }
 }

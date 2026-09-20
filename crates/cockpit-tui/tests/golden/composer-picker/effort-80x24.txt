@@ -1,5 +1,5 @@
                                                                           ● Idle
- ◆ Cockpit           [Hide] ~/project                                           
+ ◆ Cockpit           [Hide] ⎇ ~/project                            [Setup: Code]
                             ────────────────────────────────────────────────────
   + New session                                                                 
                                                                                 
@@ -14,11 +14,11 @@
                                                                                 
                                                                                 
                                                                                 
-                          ╭ Effort ─────────────────────────────────────╮       
- ● working  ● waiting  ● do  Fast  short reasoning pass                 │       
-                          │› Balanced  balanced speed and depth         │       
-                          │  Thorough  deep reasoning pass              │       
-╭─────────────────────────│↑/↓ move · enter choose · esc back           │──────╮
-│❯ Message FlyCockpit — Ct╰─────────────────────────────────────────────╯tokens│
+                                                                                
+                            ╭ Effort ─────────────────────────────────────╮     
+ ● working  ● waiting  ● do │  Fast  short reasoning pass                 │     
+                            │› Balanced  balanced speed and depth         │     
+                            │  Thorough  deep reasoning pass              │     
+╭───────────────────────────│↑/↓ move · enter choose · esc back           │────╮
+│Ask anything, ⇧↵ for a newl╰─────────────────────────────────────────────╯kens│
 ╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───[Send]╯
-Setup: Code                                                                     

@@ -6,7 +6,7 @@ use super::{
     App, AttentionInterruptKind, AttentionInterruptState, HistoryEntry, Overlay,
     StartupWorkspaceTrust, TranscriptFind,
 };
-use crate::tui::chat_header::{CHAT_HEADER_HEIGHT, HEADER_COLLAPSE_PROBE_WIDTHS, HeaderPillKind};
+use crate::tui::chat_header::{HEADER_COLLAPSE_PROBE_WIDTHS, HeaderPillKind};
 use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
 use crate::tui::rules_overlay::RulesReview;
 use cockpit_proto::{
@@ -28,6 +28,52 @@ fn press(code: KeyCode) -> KeyEvent {
         kind: KeyEventKind::Press,
         state: KeyEventState::empty(),
     }
+}
+
+#[test]
+fn pins_count_rehomes_to_header_pill() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut app = App::new(Some(tmp.path()), false);
+    app.pin_count = 3;
+
+    let labels: Vec<_> = app
+        .chat_header_state()
+        .pills
+        .into_iter()
+        .map(|pill| (pill.kind, pill.label))
+        .collect();
+    assert!(labels.contains(&(HeaderPillKind::Pins, "pins: 3".to_string())));
+}
+
+#[test]
+fn longcache_status_rehomes_to_header_pill() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut app = App::new(Some(tmp.path()), false);
+    app.longcache_enabled = true;
+    app.longcache_supported = true;
+
+    let labels: Vec<_> = app
+        .chat_header_state()
+        .pills
+        .into_iter()
+        .map(|pill| (pill.kind, pill.label))
+        .collect();
+    assert!(labels.contains(&(HeaderPillKind::Longcache, "longcache".to_string())));
+}
+
+#[test]
+fn setup_mode_rehomes_to_header_pill() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut app = App::new(Some(tmp.path()), false);
+    app.session_mode = Some(super::SessionMode::Code);
+
+    let setup = app
+        .chat_header_state()
+        .pills
+        .into_iter()
+        .find(|pill| pill.kind == HeaderPillKind::Setup)
+        .expect("known setup mode has a header pill");
+    assert_eq!(setup.label, "Setup: Code");
 }
 
 fn click(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -143,13 +189,13 @@ fn header_meta_row_replaces_footer_path_and_git() {
         "branch badge on the meta row: {meta:?}"
     );
     assert!(
-        meta.contains("+1 ~2"),
+        meta.contains("● 3 changes"),
         "dirty counts on the meta row: {meta:?}"
     );
 
     let footer = row_text(&buf, 29);
     assert!(
-        !footer.contains("/fly/repo") && !footer.contains("+1 ~2"),
+        !footer.contains("/fly/repo") && !footer.contains("● 3 changes"),
         "footer must not duplicate the header summary: {footer:?}"
     );
 
@@ -165,9 +211,9 @@ fn header_meta_row_replaces_footer_path_and_git() {
     );
 }
 
-/// Every pill derives from established state; unknown/empty states omit the
-/// pill rather than render a placeholder. The async-schedule strip summary
-/// (task/timer) moved from the footer to pills.
+/// Every activity pill derives from established state; unknown/empty activity
+/// is omitted. Setup remains visible while its mode loads, as it did in the
+/// removed status row. The async-schedule summary moved to pills.
 #[test]
 fn header_pills_draw_only_from_real_state() {
     let tmp = tempfile::tempdir().unwrap();
@@ -175,9 +221,10 @@ fn header_pills_draw_only_from_real_state() {
 
     let _ = render(&mut app, 100, 30);
     let layout = app.chat_header_layout.clone().expect("header rendered");
-    assert!(
-        layout.pill_buttons.is_empty(),
-        "an idle session renders no activity pills"
+    assert_eq!(
+        layout.active_kinds(),
+        vec![HeaderPillKind::Setup],
+        "an idle session keeps only its setup status"
     );
 
     // One timer job: exactly one timer pill, no `more` chip.
@@ -185,7 +232,11 @@ fn header_pills_draw_only_from_real_state() {
     let buf = render(&mut app, 100, 30);
     let layout = app.chat_header_layout.clone().expect("header rendered");
     let kinds: Vec<_> = layout.pill_buttons.iter().map(|(k, _)| *k).collect();
-    assert_eq!(kinds, vec![HeaderPillKind::Timer], "{kinds:?}");
+    assert_eq!(
+        kinds,
+        vec![HeaderPillKind::Timer, HeaderPillKind::Setup],
+        "{kinds:?}"
+    );
     assert!(layout.more_button.is_none());
     let meta = row_text(&buf, layout.area.y + 1);
     assert!(meta.contains("[timer 1]"), "timer pill label: {meta:?}");
@@ -203,7 +254,14 @@ fn header_pills_draw_only_from_real_state() {
     let buf = render(&mut app, 100, 30);
     let layout = app.chat_header_layout.clone().expect("header rendered");
     let kinds: Vec<_> = layout.pill_buttons.iter().map(|(k, _)| *k).collect();
-    assert_eq!(kinds, vec![HeaderPillKind::Task, HeaderPillKind::Timer]);
+    assert_eq!(
+        kinds,
+        vec![
+            HeaderPillKind::Task,
+            HeaderPillKind::Timer,
+            HeaderPillKind::Setup
+        ]
+    );
     let meta = row_text(&buf, layout.area.y + 1);
     assert!(meta.contains("[task 2]"), "counted task label: {meta:?}");
 
@@ -406,7 +464,11 @@ fn header_pill_keyboard_cycles_and_enter_opens() {
     let kinds = layout.active_kinds();
     assert_eq!(
         kinds,
-        vec![HeaderPillKind::Task, HeaderPillKind::Timer],
+        vec![
+            HeaderPillKind::Task,
+            HeaderPillKind::Timer,
+            HeaderPillKind::Setup,
+        ],
         "cycling follows priority order"
     );
 
@@ -414,14 +476,17 @@ fn header_pill_keyboard_cycles_and_enter_opens() {
     app.handle_key(press(KeyCode::Right));
     assert_eq!(app.header_pill_selection, Some(HeaderPillKind::Timer));
     app.handle_key(press(KeyCode::Right));
+    assert_eq!(app.header_pill_selection, Some(HeaderPillKind::Setup));
+    app.handle_key(press(KeyCode::Right));
     assert_eq!(
         app.header_pill_selection,
         Some(HeaderPillKind::Task),
         "cycling wraps"
     );
     app.handle_key(press(KeyCode::Left));
-    assert_eq!(app.header_pill_selection, Some(HeaderPillKind::Timer));
+    assert_eq!(app.header_pill_selection, Some(HeaderPillKind::Setup));
 
+    app.header_pill_selection = Some(HeaderPillKind::Timer);
     app.handle_key(press(KeyCode::Enter));
     assert!(
         !matches!(app.overlay, Overlay::AgentTree(_)),
@@ -733,50 +798,51 @@ fn header_parity_table_names_retained_surfaces_and_proofs() {
     }
 }
 
-/// A too-short chat pane skips the header rather than crowding out
-/// history — the pane passes through unchanged, no layout is recorded (so
-/// nothing in the header is activatable), and stale selection/popover
-/// state is released.
+/// The header consumes three, two, then one row as space contracts while
+/// preserving one transcript row. A one-row pane is transcript-only.
 #[test]
-fn header_skips_when_pane_cannot_hold_history() {
+fn header_degrades_to_two_then_one_row() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
     let backend = TestBackend::new(60, 8);
     let mut terminal = Terminal::new(backend).expect("test backend");
     schedule(&mut app, "t1", "timer");
 
-    terminal
-        .draw(|frame| {
-            let pane = ratatui::layout::Rect::new(0, 0, 60, CHAT_HEADER_HEIGHT);
-            let rest = app.render_chat_header(frame, pane);
-            assert_eq!(rest, pane, "an unholdable pane passes through unchanged");
-        })
-        .expect("draw");
-    assert!(app.chat_header_layout.is_none());
-    assert!(!app.chat_header_more_open);
-    assert!(app.chat_header_more_rect.is_none());
+    for (pane_height, header_height) in [(2, 1), (3, 2), (4, 3)] {
+        terminal
+            .draw(|frame| {
+                let pane = ratatui::layout::Rect::new(0, 0, 60, pane_height);
+                let rest = app.render_chat_header(frame, pane);
+                assert_eq!(rest.height, 1);
+                assert_eq!(rest.y, header_height);
+            })
+            .expect("draw");
+        assert_eq!(
+            app.chat_header_layout
+                .as_ref()
+                .map(|layout| layout.area.height),
+            Some(header_height)
+        );
+    }
 
-    // Stale selection/popover state from a previous frame is released.
-    app.header_pill_selection = Some(HeaderPillKind::Timer);
-    app.chat_header_more_open = true;
     terminal
         .draw(|frame| {
-            let pane = ratatui::layout::Rect::new(0, 0, 60, CHAT_HEADER_HEIGHT);
+            let pane = ratatui::layout::Rect::new(0, 0, 60, 3);
             let _ = app.render_chat_header(frame, pane);
         })
         .expect("draw");
-    assert_eq!(app.header_pill_selection, None);
-    assert!(!app.chat_header_more_open);
+    let rule = (0..60)
+        .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+        .collect::<String>();
+    assert_eq!(rule, "─".repeat(60), "two-row header ends in a rule");
 
-    // A pane that can hold history renders the header and carves it.
     terminal
         .draw(|frame| {
-            let pane = ratatui::layout::Rect::new(0, 0, 60, 8);
-            let rest = app.render_chat_header(frame, pane);
-            assert_eq!(rest, ratatui::layout::Rect::new(0, 3, 60, 5));
-            assert!(app.chat_header_layout.is_some());
+            let pane = ratatui::layout::Rect::new(0, 0, 60, 1);
+            assert_eq!(app.render_chat_header(frame, pane), pane);
         })
         .expect("draw");
+    assert!(app.chat_header_layout.is_none());
 }
 
 /// Header chrome never preempts a body-owning modal: with the approval

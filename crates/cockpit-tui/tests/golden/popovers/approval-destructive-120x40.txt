@@ -1,10 +1,11 @@
                                                                                                                ● Working
- ◆ Cockpit             [Hide] /tmp/project                                                                              
+ ◆ Cockpit             [Hide] ⎇ /tmp/project                                                               [Setup: Code]
                               ──────────────────────────────────────────────────────────────────────────────────────────
-  + New session               ▌Continue with every transcript element.                                                 │
-                                ─ explore                                                                              │
- SESSIONS                     ▌ interactive ✓ explore worked for 3s [u]                                                │
- no active sessions in all pr ▌ Interactive child inspected the rendering seam.                                        │
+  + New session               ▌Continue with every transcript element.tory/mod.rs                                      │
+                                                                                                                       │
+ SESSIONS                       ─ explore                                                                              │
+ no active sessions in all pr ▌ interactive ✓ explore worked for 3s [u]                                                │
+                              ▌ Interactive child inspected the rendering seam.                                        │
                                                                                                                        │
                               ▌ background ✓ runner worked for 4s [u]                                                  │
                                 Background child returned a compact report.                                            │
@@ -12,7 +13,7 @@
                                 ◇ Edited src/transcript.rs  +1 -1                                                      │
                                 │ - old line                                                                           │
                                 │ + new line                                                                           │
-                                │   shared line                                                                        │
+                                │   shared line                                                                        █
                                ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 ·  ⋯ █
                                                                ⋯ 2 seed tools (~42) ⋯                                  █
                                 [show summary]                                                                         █
@@ -37,4 +38,3 @@
 │                                                                                                                      │
 │esc: cancel  ·  enter again: confirm  ·  1-9/enter: select  ·  ↑/↓: move  ·  shift+pgup/pgdn: chat                    │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-Setup: Code                                                                                                             

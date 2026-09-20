@@ -50,14 +50,11 @@ pub(crate) fn run_settings_pointer_z_order_matrix() {
         .max_by_key(|rect| rect.y)
         .expect("root target");
 
-    app.sandbox_notice_copy_rect = Some(target);
     app.auth_failure_notice = Some(crate::tui::auth_failure::AuthFailureNotice {
         provider: "fixture".into(),
         model: "fixture".into(),
         kind: cockpit_proto::AuthFailureKind::ProviderNotConfigured,
     });
-    app.auth_notice_switch_rect = Some(target);
-    app.auth_notice_fix_rect = Some(target);
     app.handle_mouse(mouse(
         MouseEventKind::Down(MouseButton::Left),
         target.x,

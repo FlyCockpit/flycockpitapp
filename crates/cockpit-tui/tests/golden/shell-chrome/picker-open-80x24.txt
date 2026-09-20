@@ -1,0 +1,24 @@
+                            fixture-session                               ● Idle
+ ◆ Cockpit           [Hide] ⎇ ~/project   issue-449 ● 2 changes    [Setup: Code]
+                            ────────────────────────────────────────────────────
+  + New session                                                                 
+                                                                                
+ SESSIONS                                                                       
+ no active sessions in all                                                      
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ ● working  ● waiting  ● do ╭ effort ─────────────────────────────────────╮     
+                            │No active model.                             │     
+                            │(none)                                       │     
+╭───────────────────────────│↑/↓ move · enter choose · esc back           │────╮
+│Ask anything, ⇧↵ for a newl╰─────────────────────────────────────────────╯kens│
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯

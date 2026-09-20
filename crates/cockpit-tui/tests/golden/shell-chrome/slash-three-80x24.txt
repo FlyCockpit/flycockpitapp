@@ -1,0 +1,24 @@
+                            fixture-session                               ● Idle
+ ◆ Cockpit           [Hide] ⎇ ~/project   issue-449 ● 2 changes    [Setup: Code]
+                            ────────────────────────────────────────────────────
+  + New session                                                                 
+                                                                                
+ SESSIONS                                                                       
+ no active sessions in all                                                      
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ ● working  ● waiting  ● do                                                     
+                                                                                
+                                                                                
+╭ Commands ────────────────────────────────────────────╮                        
+│› /pin          Pick a message to pin (↑/↓ move, enter│                        
+│  /pins         Review pinned messages (↑/↓ jump, d/✓ │                        
+│  /pin-context  Pin verbatim text so it survives /comp│                        
+╰──────────────────────────────────────────────────────╯                        
+╭──────────────────────────────────────────────────────────────────────────────╮
+│/pi                                                                           │
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯

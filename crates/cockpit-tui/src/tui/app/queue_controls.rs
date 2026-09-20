@@ -21,6 +21,7 @@ impl App {
             .any(|item| item.delivery_class == QueueDeliveryClass::Held)
     }
 
+    #[cfg(test)]
     pub(super) fn queue_box_toggle_label(&self) -> &'static str {
         if self.queue_has_held() {
             "Steer"
@@ -29,6 +30,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn queue_item_toggle_label(class: QueueDeliveryClass) -> &'static str {
         match class {
             QueueDeliveryClass::Steering => "Held",
@@ -36,6 +38,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn queue_message_revealed(&self, id: Uuid) -> bool {
         self.queue_focus == Some(id)
             || self.queue_hover == Some(id)

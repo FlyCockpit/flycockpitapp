@@ -1,0 +1,40 @@
+                              fixture-session                                                                  ● Working
+ ◆ Cockpit             [Hide] ⎇ ~/project   issue-449 ● 2 changes                                [Cockpit] [Setup: Code]
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session                                                                                                         
+                                                                                                                        
+ SESSIONS                                                                                                               
+ no active sessions in all pr                                                                                           
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+ ● working  ● waiting  ● done                                                                                           
+                                                                                                                        
+                                                                                                                        
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮ 
+ │Send now · 6 messages  Stops the agent and sends now                                                      [Edit all]│ 
+ │queued message 2                                                                        [Held] [Steer] [Send now][x]│ 
+ │queued message 4                                                                        [Held] [Steer] [Send now][x]│ 
+ │queued message 5                                                                        [Held] [Steer] [Send now][x]│ 
+ │queued message 6                                                                        [Held] [Steer] [Send now][x]│ 
+ │queued message 1                                                                        [Held] [Steer] [Send now][x]│ 
+ │↑ recall · ⌃↑ focus queue · then ⇧S send now · ⇧T toggle · ⇧X cancel                                                │ 
+╭┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴╮
+│Press ⌃↑ to focus the queue…                                                                                  0 tokens│
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]─────────────────────────────────────────────────[Queue]╯

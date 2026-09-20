@@ -3,28 +3,23 @@
 //! The TUI viewport is a fixed-height pane anchored to the bottom of the
 //! terminal. Its layout is one of:
 //!
-//! - chat:   `[ body (history)  |  strip  |  input  |  status ]`
-//! - dialog: `[ body (dialog)                                  |  status ]`
+//! - chat:   `[ body (history) | queue/slash | input ]`
+//! - dialog: `[ body (dialog)                         ]`
 //!
 //! `PaneGeometry::compute` produces the section heights for a given app
 //! state; `layout` then carves a `Rect` into the named sub-rects.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 
-pub const STATUS_HEIGHT: u16 = 1;
 pub const MIN_HISTORY_HEIGHT: u16 = 1;
 pub const MIN_INPUT_CONTENT: u16 = 1;
-pub const MAX_INPUT_CONTENT: u16 = 6;
+pub const MAX_INPUT_CONTENT: u16 = 8;
 pub const INPUT_BORDER: u16 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PaneGeometry {
     /// Input box height (content + border). Zero when a dialog is open.
     pub input: u16,
-    /// "Agent is working" status indicator row above the queue strip.
-    /// Zero unless the agent is busy past the startup grace. One row
-    /// when shown.
-    pub indicator: u16,
     /// Queued-messages strip above the input. Zero when nothing is
     /// queued, or while suggestions occupy the same connected strip slot.
     /// Includes its top border and its bottom border. When the input is
@@ -34,18 +29,6 @@ pub struct PaneGeometry {
     /// active suggestions and no vim hint, or a dialog is open. Occupies
     /// the same connected strip slot as the queue and takes precedence.
     pub suggestions: u16,
-    /// Pinned-message count indicator row below the input
-    /// (`pinned-messages`). One row when the session has ≥1 pin and no
-    /// dialog is open; zero otherwise.
-    pub pins: u16,
-    /// Persistent sandbox-down notice rows below the input
-    /// (`implementation notes` §6.5). Non-zero (its wrapped row count) while the
-    /// shell sandbox can't initialize and no dialog is open; zero otherwise.
-    /// Persistent — never times out like a toast.
-    pub sandbox_notice: u16,
-    /// Status row height. Always `STATUS_HEIGHT`; named so that callers
-    /// don't need to reach for the constant separately.
-    pub status: u16,
     /// Dialog height. Zero when no dialog is open.
     pub dialog: u16,
     /// Compact bottom-anchored overlay height (the answering/question
@@ -66,9 +49,6 @@ pub struct PaneRects {
     /// Where history renders (chat mode) or the dialog overlays
     /// (dialog mode).
     pub body: Rect,
-    /// Status-indicator row above the queue strip. Zero-area unless the
-    /// working indicator is showing.
-    pub indicator: Rect,
     /// Queued-messages strip above the input. Zero-area when the queue
     /// is empty, suggestions are visible, or a dialog is open.
     pub queue: Rect,
@@ -77,29 +57,19 @@ pub struct PaneRects {
     pub suggestions: Rect,
     /// Input box rect. Zero-area when a dialog is open.
     pub input: Rect,
-    /// Pinned-message count indicator rect, below the input
-    /// (`pinned-messages`). Zero-area when the session has no pins or a
-    /// dialog is open.
-    pub pins: Rect,
-    /// Persistent sandbox-down notice rect, below the input
-    /// (`implementation notes` §6.5). Zero-area when the sandbox is fine or a
-    /// dialog/popup occupies the space.
-    pub sandbox_notice: Rect,
     /// Compact bottom-anchored overlay rect (answering dialog). Zero-area
     /// unless a compact overlay is open. Sits below `body` (history) and
-    /// above `status`.
+    /// below `body`.
     pub compact: Rect,
-    /// Status row — always rendered, including under a dialog.
-    pub status: Rect,
 }
 
 impl PaneGeometry {
     /// Stable launch-banner reference height: the frame minus only the
-    /// permanent chrome — the status row, the minimum bordered input box,
+    /// permanent chrome — the minimum bordered input box,
     /// and the three-row chat header that sits above the history pane
     /// whenever the body is tall enough to host it.
     pub const fn baseline_body_height(frame_height: u16) -> u16 {
-        let body = frame_height.saturating_sub(STATUS_HEIGHT + MIN_INPUT_CONTENT + INPUT_BORDER);
+        let body = frame_height.saturating_sub(MIN_INPUT_CONTENT + INPUT_BORDER);
         // The header renders only when the body is taller than it; the
         // baseline must match the pane the banner actually centers in.
         if body > crate::tui::chat_header::CHAT_HEADER_HEIGHT {
@@ -113,16 +83,10 @@ impl PaneGeometry {
     /// `input_height` and `suggestions_height` are passed in (rather than
     /// computed here) so the only inputs this module needs are integers —
     /// no dependency on the App or Composer types.
-    // Each arg is one below-input slot height; grouping them into a struct
-    // would only move the same integer list behind a constructor.
-    #[allow(clippy::too_many_arguments)]
     pub fn compute(
         input_height: u16,
-        indicator_height: u16,
         queue_height: u16,
         suggestions_height: u16,
-        pins_height: u16,
-        sandbox_notice_height: u16,
         history_lines: u16,
         dialog_height: u16,
         compact_height: u16,
@@ -133,12 +97,8 @@ impl PaneGeometry {
         if compact_height > 0 {
             return Self {
                 input: 0,
-                indicator: 0,
                 queue: 0,
                 suggestions: 0,
-                pins: 0,
-                sandbox_notice: 0,
-                status: STATUS_HEIGHT,
                 dialog: 0,
                 compact: compact_height,
                 history: history_lines.max(MIN_HISTORY_HEIGHT),
@@ -147,12 +107,8 @@ impl PaneGeometry {
         if dialog_height > 0 {
             Self {
                 input: 0,
-                indicator: 0,
                 queue: 0,
                 suggestions: 0,
-                pins: 0,
-                sandbox_notice: 0,
-                status: STATUS_HEIGHT,
                 dialog: dialog_height,
                 compact: 0,
                 history: history_lines.max(MIN_HISTORY_HEIGHT),
@@ -170,12 +126,8 @@ impl PaneGeometry {
             let queue = if suggestions > 0 { 0 } else { queue_height };
             Self {
                 input,
-                indicator: indicator_height,
                 queue,
                 suggestions,
-                pins: pins_height,
-                sandbox_notice: sandbox_notice_height,
-                status: STATUS_HEIGHT,
                 dialog: 0,
                 compact: 0,
                 history: history_lines.max(MIN_HISTORY_HEIGHT),
@@ -190,16 +142,12 @@ impl PaneGeometry {
     #[allow(dead_code)]
     pub fn desired_pane_height(&self) -> u16 {
         if self.dialog > 0 {
-            self.dialog + self.status
+            self.dialog
         } else {
             self.history
-                + self.indicator
                 + self.active_strip()
                 + self.input.saturating_sub(self.strip_input_overlap())
-                + self.pins
-                + self.sandbox_notice
                 + self.compact
-                + self.status
         }
     }
 
@@ -217,15 +165,11 @@ impl PaneGeometry {
     #[allow(dead_code)]
     pub fn chrome_height(&self) -> u16 {
         if self.dialog > 0 {
-            self.status
+            0
         } else {
-            self.indicator
-                + self.active_strip()
+            self.active_strip()
                 + self.input.saturating_sub(self.strip_input_overlap())
-                + self.pins
-                + self.sandbox_notice
                 + self.compact
-                + self.status
         }
     }
 
@@ -251,45 +195,37 @@ impl PaneGeometry {
         let visible = |height| if dialog_mode { 0 } else { height };
         let parts = Layout::vertical([
             Constraint::Min(0),
-            Constraint::Length(visible(self.indicator)),
             Constraint::Length(visible(self.active_strip())),
             Constraint::Length(input_slot),
-            Constraint::Length(visible(self.pins)),
-            Constraint::Length(visible(self.sandbox_notice)),
             Constraint::Length(visible(self.compact)),
-            Constraint::Length(self.status),
         ])
         .split(area);
         let input = if strip_input_overlap > 0 {
             Rect::new(
-                parts[3].x,
-                parts[3].y.saturating_sub(strip_input_overlap),
-                parts[3].width,
+                parts[2].x,
+                parts[2].y.saturating_sub(strip_input_overlap),
+                parts[2].width,
                 self.input,
             )
         } else {
-            parts[3]
+            parts[2]
         };
         let queue = if self.suggestions > 0 {
             Rect::new(0, 0, 0, 0)
         } else {
-            parts[2]
+            parts[1]
         };
         let suggestions = if self.suggestions > 0 {
-            parts[2]
+            parts[1]
         } else {
             Rect::new(0, 0, 0, 0)
         };
         PaneRects {
             body: parts[0],
-            indicator: parts[1],
             queue,
             suggestions,
             input,
-            pins: parts[4],
-            sandbox_notice: parts[5],
-            compact: parts[6],
-            status: parts[7],
+            compact: parts[3],
         }
     }
 }
@@ -300,45 +236,42 @@ mod tests {
 
     #[test]
     fn baseline_body_height_subtracts_only_permanent_chrome() {
-        // Status row + minimum bordered input + the permanent three-row
+        // Minimum bordered input + the permanent three-row
         // chat header (subtracted only while the body can host the header).
-        assert_eq!(PaneGeometry::baseline_body_height(24), 17);
-        assert_eq!(PaneGeometry::baseline_body_height(40), 33);
+        assert_eq!(PaneGeometry::baseline_body_height(24), 18);
+        assert_eq!(PaneGeometry::baseline_body_height(40), 34);
         // Bodies no taller than the header keep every row: the header is
         // skipped, so nothing is carved.
-        assert_eq!(PaneGeometry::baseline_body_height(7), 3);
-        assert_eq!(PaneGeometry::baseline_body_height(4), 0);
+        assert_eq!(PaneGeometry::baseline_body_height(7), 1);
+        assert_eq!(PaneGeometry::baseline_body_height(4), 1);
         assert_eq!(PaneGeometry::baseline_body_height(2), 0);
 
         let transient_heights = [0, 1, 3, 6, 8, u16::MAX];
         for _transient in transient_heights {
-            assert_eq!(PaneGeometry::baseline_body_height(40), 33);
+            assert_eq!(PaneGeometry::baseline_body_height(40), 34);
         }
     }
 
     #[test]
     fn dialog_layout_keeps_a_stable_body_for_pre_overlay_navigation_split() {
-        let geometry = PaneGeometry::compute(3, 1, 2, 0, 1, 1, 20, 12, 0);
+        let geometry = PaneGeometry::compute(3, 2, 0, 20, 12, 0);
         let rects = geometry.layout(Rect::new(0, 0, 120, 40));
-        assert_eq!(rects.body, Rect::new(0, 0, 120, 39));
-        assert_eq!(rects.status, Rect::new(0, 39, 120, 1));
+        assert_eq!(rects.body, Rect::new(0, 0, 120, 40));
         assert!(rects.input.is_empty());
         assert!(rects.queue.is_empty());
-        assert!(rects.indicator.is_empty());
     }
 
     #[test]
     fn queue_and_input_rects_overlap_on_one_border_row() {
-        let geom = PaneGeometry::compute(3, 0, 3, 0, 0, 0, 1, 0, 0);
+        let geom = PaneGeometry::compute(3, 3, 0, 1, 0, 0);
 
         assert_eq!(geom.input, 3);
         assert_eq!(geom.queue, 3);
-        assert_eq!(geom.chrome_height(), 6);
+        assert_eq!(geom.chrome_height(), 5);
 
         let rects = geom.layout(Rect::new(0, 0, 20, 8));
         assert_eq!(rects.queue.y + rects.queue.height - 1, rects.input.y);
         assert_eq!(rects.input.height, 3);
-        assert_eq!(rects.status.y, 7);
     }
 
     #[test]
@@ -346,11 +279,11 @@ mod tests {
         // Documented slot conflict: a visible suggestion box occupies the
         // same connected strip as the queue and wins, so queue height is
         // zero even when messages are queued.
-        let geom = PaneGeometry::compute(3, 0, 3, 4, 1, 1, 1, 0, 0);
+        let geom = PaneGeometry::compute(3, 3, 4, 1, 0, 0);
 
         assert_eq!(geom.queue, 0);
         assert_eq!(geom.suggestions, 4);
-        assert_eq!(geom.chrome_height(), 9);
+        assert_eq!(geom.chrome_height(), 6);
 
         let rects = geom.layout(Rect::new(0, 0, 20, 11));
         assert_eq!(rects.queue.height, 0);
@@ -358,7 +291,5 @@ mod tests {
             rects.suggestions.y + rects.suggestions.height - 1,
             rects.input.y
         );
-        assert_eq!(rects.pins.height, 1);
-        assert_eq!(rects.sandbox_notice.height, 1);
     }
 }

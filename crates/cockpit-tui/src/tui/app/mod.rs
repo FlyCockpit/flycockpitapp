@@ -1765,6 +1765,7 @@ fn primary_swap_warning(name: &str) -> Option<&'static str> {
 /// present). Always names the deterministic `/sandbox off` composer action so
 /// the user has a clear instruction independent of the model. Pure chrome
 /// text — it never enters history or any inference request.
+#[cfg(test)]
 const MAX_SANDBOX_NOTICE_ROWS: u16 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1837,12 +1838,13 @@ pub(super) fn sandbox_notice_render_text(text: &str) -> String {
     format!(" {text}")
 }
 
+#[cfg(test)]
 pub(super) fn sandbox_notice_wrapped_rows(text: &str, width: u16) -> u16 {
     let width = width.max(1);
     word_wrap_line_count(&sandbox_notice_render_text(text), width).min(MAX_SANDBOX_NOTICE_ROWS)
 }
 
-fn word_wrap_line_count(line: &str, width: u16) -> u16 {
+pub(super) fn word_wrap_line_count(line: &str, width: u16) -> u16 {
     let mut rows = 0u16;
     let mut line_width = 0u16;
     let mut word_width = 0u16;
@@ -2577,6 +2579,9 @@ pub struct App {
     /// moved by Up/Down while the popup is open. While the popup shows,
     /// Up/Down drive this cursor instead of composer history recall.
     pub(super) slash_selected: usize,
+    /// Escape hides the slash popover without erasing the typed query. Any
+    /// subsequent composer edit resets this flag and reopens matching.
+    pub(super) slash_dismissed: bool,
     /// Top visible index of the slash popup's scroll window, maintained
     /// with the same 1-row scrolloff as the `@`-popup (see
     /// [`crate::tui::nav::windowed_scroll`]). Reset alongside `slash_selected`.
@@ -2594,7 +2599,6 @@ pub struct App {
     /// through it the same way ↑/↓ moves the highlight. `None` when not
     /// mid-cycle; cleared by any non-Tab composer edit via
     /// [`App::reset_slash_window`].
-    pub(super) slash_cycle_stem: Option<String>,
     /// `/new` was invoked; the event loop services it on the next tick
     /// (needs the terminal handle for `insert_before` so the existing
     /// history spills to scrollback before the welcome header is
@@ -2948,14 +2952,11 @@ pub struct App {
     pub(super) sandbox_down_notice: Option<SandboxDownNotice>,
     pub(super) command_capability_notice: Option<CommandCapabilityNotice>,
     pub(super) update_disabled_notice: Option<String>,
-    pub(super) sandbox_notice_copy_rect: Option<Rect>,
     /// Process-local, event-earned per-model auth failures. These deliberately
     /// have no persistence path and start empty for every TUI process.
     pub(super) auth_failure_annotations: crate::tui::auth_failure::AuthFailureAnnotations,
     pub(super) auth_failure_notice: Option<crate::tui::auth_failure::AuthFailureNotice>,
     auth_failure_fingerprints: std::collections::HashMap<String, u64>,
-    pub(super) auth_notice_switch_rect: Option<Rect>,
-    pub(super) auth_notice_fix_rect: Option<Rect>,
     /// Session-only redaction-source state (`/toggle-redaction`). Seeded
     /// from the layered `redact` config at launch and kept in sync by the
     /// daemon's `RedactionState` broadcast. Tracked client-side so a bare
@@ -4249,9 +4250,9 @@ impl App {
             pending_text_object: None,
             at_dismissed: false,
             slash_selected: 0,
+            slash_dismissed: false,
             slash_scroll: 0,
             slash_menu_cache: std::cell::RefCell::new(None),
-            slash_cycle_stem: None,
             pending_new_session: false,
             provisional_new_session: false,
             visible_attachment_epoch: 0,
@@ -4375,12 +4376,9 @@ impl App {
             sandbox_down_notice: None,
             command_capability_notice: None,
             update_disabled_notice: None,
-            sandbox_notice_copy_rect: None,
             auth_failure_annotations: Default::default(),
             auth_failure_notice: None,
             auth_failure_fingerprints: Default::default(),
-            auth_notice_switch_rect: None,
-            auth_notice_fix_rect: None,
             redact_scan_environment,
             redact_scan_dotenv,
             redact_scan_ssh_keys,

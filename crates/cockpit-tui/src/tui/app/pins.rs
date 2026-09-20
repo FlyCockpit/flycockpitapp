@@ -733,6 +733,9 @@ impl App {
                 self.pins_review = None;
                 self.copy_pick = Some(pick);
                 self.scroll_copy_pick_into_view();
+                if let Some(hint) = self.copy_pick_target_hint() {
+                    self.show_toast(hint, ToastKind::Info);
+                }
             }
             None => {
                 self.push_plain("/copy-pick: no message to copy yet".to_string());
@@ -765,6 +768,9 @@ impl App {
             .unwrap_or(0);
         if let Some(pick) = self.copy_pick.as_mut() {
             pick.cycle_block_target(delta, block_count);
+        }
+        if let Some(hint) = self.copy_pick_target_hint() {
+            self.show_toast(hint, ToastKind::Info);
         }
     }
 
@@ -1551,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_pick_enter_selects_last_message() {
+    fn copy_pick_enter_selects_last_message_and_toasts_hint() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = test_app(tmp.path());
         app.history = vec![user(Some(1)), agent(Some(2)), user(Some(3))].into();
@@ -1563,6 +1569,11 @@ mod tests {
                 .as_ref()
                 .map(|pick| pick.selected_history_index()),
             Some(2)
+        );
+        let hint = app.copy_pick_target_hint().expect("copy-pick hint");
+        assert!(
+            app.toast.as_ref().is_some_and(|toast| toast.text == hint),
+            "the removed status-row hint moves to a transient toast"
         );
     }
 

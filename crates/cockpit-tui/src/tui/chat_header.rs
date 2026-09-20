@@ -9,11 +9,11 @@
 //! Layout is planned explicitly ([`plan_chat_header`]) before anything is
 //! painted so widths, pill hit regions, and the collapsed-pill set have one
 //! source of truth. Every pill draws only from daemon/launch-provided
-//! state: a pill whose state is unknown or empty is omitted, never guessed.
+//! state; setup retains its explicit loading state until the mode arrives.
 //! Lower-priority pills collapse into a counted `more` chip in the priority
 //! order [`HeaderPillKind`] declares (attention, tool, agent, task, timer,
-//! skill), so narrow widths deterministically retain the highest-priority
-//! active indicator.
+//! skill, pins, longcache, setup, lock, side, caffeinate), so narrow widths
+//! deterministically retain the highest-priority active indicator.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -24,15 +24,14 @@ use crate::tui::button::{
     ButtonDispatch, ButtonId, ButtonSpec, clip_to_display_width, display_width,
 };
 use crate::tui::theme::{
-    DISABLED, DISABLED_INDEX, DIVIDER_DIM, GREEN, GREEN_INDEX, MUTED_COLOR_INDEX, RED, RED_INDEX,
-    STATUS_BRANCH_BADGE, YELLOW, YELLOW_INDEX, resolve_color,
+    BRASS, DISABLED, DISABLED_INDEX, FOG, GREEN, GREEN_INDEX, INK, NIGHT, RED, RED_INDEX, YELLOW,
+    YELLOW_INDEX, resolve_color,
 };
 
 /// Height of the full header: title row, meta row, rule row.
 pub(crate) const CHAT_HEADER_HEIGHT: u16 = 3;
 
-/// One column of separation between the path cluster and the pill cluster
-/// (and between pills), mirroring the reference shell.
+/// One column of separation between pills, mirroring the reference shell.
 const CLUSTER_GAP: u16 = 1;
 
 /// Chat widths at which the acceptance fixtures verify deterministic pill
@@ -51,18 +50,52 @@ pub(crate) enum HeaderPillKind {
     Task,
     Timer,
     Skill,
+    Pins,
+    Longcache,
+    Setup,
+    Lock,
+    Side,
+    Caffeinate,
+    #[cfg(feature = "remote")]
+    OrgSync,
+    #[cfg(feature = "remote")]
+    Connector,
 }
 
 impl HeaderPillKind {
     /// Every kind, in priority order. The button inventory derives its
     /// header coverage from this list.
-    pub(crate) const ALL: [HeaderPillKind; 6] = [
+    #[cfg(not(feature = "remote"))]
+    pub(crate) const ALL: [HeaderPillKind; 12] = [
         HeaderPillKind::Attention,
         HeaderPillKind::Tool,
         HeaderPillKind::Agent,
         HeaderPillKind::Task,
         HeaderPillKind::Timer,
         HeaderPillKind::Skill,
+        HeaderPillKind::Pins,
+        HeaderPillKind::Longcache,
+        HeaderPillKind::Setup,
+        HeaderPillKind::Lock,
+        HeaderPillKind::Side,
+        HeaderPillKind::Caffeinate,
+    ];
+    #[cfg(feature = "remote")]
+    pub(crate) const ALL: [HeaderPillKind; 14] = [
+        HeaderPillKind::Attention,
+        HeaderPillKind::Tool,
+        HeaderPillKind::Agent,
+        HeaderPillKind::Task,
+        HeaderPillKind::Timer,
+        HeaderPillKind::Skill,
+        HeaderPillKind::Pins,
+        HeaderPillKind::Longcache,
+        HeaderPillKind::Setup,
+        HeaderPillKind::Lock,
+        HeaderPillKind::Side,
+        HeaderPillKind::Caffeinate,
+        HeaderPillKind::OrgSync,
+        HeaderPillKind::Connector,
     ];
 }
 
@@ -78,8 +111,7 @@ pub(crate) struct HeaderPill {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitFacts {
     pub branch: String,
-    /// `+staged ~unstaged ^unpushed` — empty when the tree is clean.
-    pub counts: String,
+    pub changes: u32,
 }
 
 /// Session status derived from authoritative app state (attention
@@ -141,6 +173,10 @@ pub(crate) struct ChatHeaderState {
     /// short id). `None` renders no title text — never a placeholder.
     pub title: Option<String>,
     pub status: HeaderSessionStatus,
+    /// Status-only routing target, shown left of the status badge.
+    pub routing_status: Option<String>,
+    /// Reserve cell zero for the session rail's `[Show]` chip.
+    pub rail_hidden: bool,
     /// Display path of the working directory (launch fact).
     pub path: String,
     /// Git branch + dirty counts. `None` while the repo probe is pending or
@@ -163,6 +199,8 @@ pub(crate) struct ChatHeaderLayout {
     pub more_button: Option<(usize, Rect)>,
     /// Pills collapsed behind `more`, in priority order, with full labels.
     pub collapsed: Vec<HeaderPill>,
+    /// Full labels collapse to terse labels before the path is elided.
+    pub compact_pills: bool,
 }
 
 impl ChatHeaderLayout {
@@ -227,8 +265,33 @@ pub(crate) fn plan_chat_header(state: &ChatHeaderState, area: Rect) -> ChatHeade
     if area.width == 0 || area.height == 0 {
         return layout;
     }
+    if area.height < 3 {
+        return layout;
+    }
+    let full_left_w: u16 = launch_path_spans(&state.path, state.git.as_ref(), u16::MAX)
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum();
+    let full_labels: Vec<&str> = state.pills.iter().map(|pill| pill.label.as_str()).collect();
+    let compact = cluster_width(&full_labels)
+        .saturating_add(3)
+        .saturating_add(full_left_w)
+        > area.width;
+    layout.compact_pills = compact;
+    let planned_pills: Vec<HeaderPill> = state
+        .pills
+        .iter()
+        .map(|pill| HeaderPill {
+            kind: pill.kind,
+            label: if compact {
+                compact_pill_label(pill)
+            } else {
+                pill.label.clone()
+            },
+        })
+        .collect();
     let budget = area.width.saturating_sub(CLUSTER_GAP);
-    let (visible, more) = plan_pill_cluster(&state.pills, budget);
+    let (visible, more) = plan_pill_cluster(&planned_pills, budget);
 
     // Right-align: walk from the right edge leftward, placing the `more`
     // chip first (rightmost) and then the visible pills so the
@@ -259,7 +322,7 @@ pub(crate) fn plan_chat_header(state: &ChatHeaderState, area: Rect) -> ChatHeade
     }
     let mut pill_buttons = Vec::with_capacity(visible.len());
     for index in visible.iter().rev() {
-        let pill = &state.pills[*index];
+        let pill = &planned_pills[*index];
         let w = pill_width(&pill.label);
         x = x.saturating_sub(w);
         pill_buttons.push((
@@ -279,6 +342,32 @@ pub(crate) fn plan_chat_header(state: &ChatHeaderState, area: Rect) -> ChatHeade
     layout
 }
 
+fn compact_pill_label(pill: &HeaderPill) -> String {
+    match pill.kind {
+        HeaderPillKind::Attention => pill.label.replace("attention", "attn"),
+        HeaderPillKind::Tool => pill.label.clone(),
+        HeaderPillKind::Agent => pill
+            .label
+            .rsplit(" › ")
+            .next()
+            .unwrap_or(&pill.label)
+            .to_string(),
+        HeaderPillKind::Task => pill.label.replace("tasks", "t").replace("task", "t"),
+        HeaderPillKind::Timer => pill.label.replace("timers", "tm").replace("timer", "tm"),
+        HeaderPillKind::Skill => pill.label.replace("skill ", ""),
+        HeaderPillKind::Pins => pill.label.replace("pins: ", "pins:"),
+        HeaderPillKind::Longcache => "cache".to_string(),
+        HeaderPillKind::Setup => pill.label.trim_start_matches("Setup: ").to_string(),
+        HeaderPillKind::Lock => "lock".to_string(),
+        HeaderPillKind::Side => "side".to_string(),
+        HeaderPillKind::Caffeinate => "☕".to_string(),
+        #[cfg(feature = "remote")]
+        HeaderPillKind::OrgSync => "org".to_string(),
+        #[cfg(feature = "remote")]
+        HeaderPillKind::Connector => "remote".to_string(),
+    }
+}
+
 /// Paint the planned header. All interactive affordances route through the
 /// button registry so pointer hover/press handling is shared with every
 /// other chip in the shell.
@@ -293,7 +382,7 @@ pub(crate) fn paint_chat_header(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Row 1: title (bold) left, status badge right.
+    // Row 0: optional rail [Show] reservation, title, routing status, badge.
     let title_row = Rect {
         y: area.y,
         height: 1,
@@ -301,7 +390,16 @@ pub(crate) fn paint_chat_header(
     };
     let status_label = state.status.label();
     let status_w = display_width(status_label);
-    let title_budget = title_row.width.saturating_sub(status_w + CLUSTER_GAP);
+    let show_w = if state.rail_hidden { 7 } else { 0 };
+    let routing = state.routing_status.as_deref().unwrap_or("");
+    let routing_w = if routing.is_empty() {
+        0
+    } else {
+        display_width(routing).saturating_add(2)
+    };
+    let title_budget = title_row
+        .width
+        .saturating_sub(show_w + status_w + routing_w + CLUSTER_GAP);
     let title_text = state
         .title
         .as_deref()
@@ -311,9 +409,10 @@ pub(crate) fn paint_chat_header(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 title_text,
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default().fg(INK).add_modifier(Modifier::BOLD),
             ))),
             Rect {
+                x: title_row.x.saturating_add(show_w),
                 width: title_budget,
                 ..title_row
             },
@@ -328,29 +427,58 @@ pub(crate) fn paint_chat_header(
     if state.status.pulses() {
         status_style = status_style.add_modifier(Modifier::BOLD);
     }
+    if !routing.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                routing.to_string(),
+                Style::default().fg(DISABLED),
+            )))
+            .right_aligned(),
+            Rect {
+                x: title_row.x.saturating_add(show_w),
+                width: title_row.width.saturating_sub(show_w + status_w + 1),
+                ..title_row
+            },
+        );
+    }
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(status_label, status_style))).right_aligned(),
         title_row,
     );
 
-    // Row 2: path + git left, pills right.
+    if area.height < 2 {
+        return;
+    }
+    if area.height == 2 {
+        let rule_row = Rect {
+            y: area.y.saturating_add(1),
+            height: 1,
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(usize::from(rule_row.width)),
+                Style::default().fg(NIGHT),
+            ))),
+            rule_row,
+        );
+        return;
+    }
+    // Row 1: path + git left, pills right.
     let meta_row = Rect {
         y: area.y.saturating_add(1),
         height: 1,
         ..area
     };
-    let pills_used: u16 = layout
+    let cluster_left = layout
         .pill_buttons
         .iter()
-        .map(|(_, rect)| rect.width + CLUSTER_GAP)
-        .chain(
-            layout
-                .more_button
-                .iter()
-                .map(|(_, rect)| rect.width + CLUSTER_GAP),
-        )
-        .sum();
-    let left_budget = meta_row.width.saturating_sub(pills_used);
+        .map(|(_, rect)| rect.x)
+        .chain(layout.more_button.iter().map(|(_, rect)| rect.x))
+        .min();
+    let left_budget = cluster_left.map_or(meta_row.width, |left| {
+        left.saturating_sub(meta_row.x).saturating_sub(3)
+    });
     let path_spans = path_git_spans(state, left_budget);
     frame.render_widget(
         Paragraph::new(Line::from(path_spans)),
@@ -367,18 +495,27 @@ pub(crate) fn paint_chat_header(
         if rect.width == 0 {
             continue;
         }
+        let display_label = if layout.compact_pills {
+            compact_pill_label(pill)
+        } else {
+            pill.label.clone()
+        };
         let spec = ButtonSpec::new(
             ButtonId::HeaderPill(*kind),
-            pill.label.clone(),
+            display_label.clone(),
             ButtonDispatch::HeaderPill(*kind),
         )
-        .focused(selected == Some(*kind))
-        .kind(if *kind == HeaderPillKind::Attention {
-            crate::tui::button::ButtonKind::Destructive
-        } else {
-            crate::tui::button::ButtonKind::Default
-        });
-        let _ = buttons.paint(frame, rect.x, rect.y, rect.width, spec);
+        .focused(selected == Some(*kind));
+        let hovered = buttons.hover() == Some(&spec.id);
+        let label = crate::tui::button::bracketed_label(&display_label);
+        crate::tui::chrome::paint_chip(
+            frame,
+            *rect,
+            &label,
+            Style::default().fg(FOG),
+            hovered || selected == Some(*kind),
+        );
+        buttons.register(*rect, spec);
     }
     if let Some((collapsed, rect)) = layout.more_button {
         let spec = ButtonSpec::new(
@@ -386,10 +523,21 @@ pub(crate) fn paint_chat_header(
             format!("+{collapsed}"),
             ButtonDispatch::HeaderMore,
         );
-        let _ = buttons.paint(frame, rect.x, rect.y, rect.width, spec);
+        let hovered = buttons.hover() == Some(&spec.id);
+        crate::tui::chrome::paint_chip(
+            frame,
+            rect,
+            &crate::tui::button::bracketed_label(&format!("+{collapsed}")),
+            Style::default().fg(FOG),
+            hovered,
+        );
+        buttons.register(rect, spec);
     }
 
-    // Row 3: literal horizontal rule.
+    if area.height < 3 {
+        return;
+    }
+    // Row 2: literal horizontal rule.
     let rule_row = Rect {
         y: area.y.saturating_add(2),
         height: 1,
@@ -397,10 +545,7 @@ pub(crate) fn paint_chat_header(
     };
     let rule = "─".repeat(usize::from(rule_row.width));
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            rule,
-            Style::default().fg(DIVIDER_DIM),
-        ))),
+        Paragraph::new(Line::from(Span::styled(rule, Style::default().fg(NIGHT)))),
         rule_row,
     );
 }
@@ -414,9 +559,8 @@ fn path_git_spans(state: &ChatHeaderState, budget: u16) -> Vec<Span<'static>> {
     launch_path_spans(&state.path, state.git.as_ref(), budget)
 }
 
-/// The one path + git badge span builder. `budget` caps the total width in
-/// display columns; degradation order is path, then branch name, then
-/// dirty counts. Pass `u16::MAX` for unbounded measurement. All
+/// The one path + git span builder. `budget` caps the total width in
+/// display columns; the path elides from the left before git is dropped. All
 /// measurements are display width — the same unit [`pill_width`] budgets
 /// the right-hand cluster with — so wide glyphs can never make the two
 /// clusters disagree about what a column is.
@@ -428,55 +572,74 @@ pub(crate) fn launch_path_spans(
     if budget == 0 {
         return Vec::new();
     }
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let fog = Style::default().fg(FOG);
+    let prefix = "⎇ ";
     let Some(git) = git else {
-        return vec![Span::styled(
-            truncate_to_width(path, budget as usize),
-            muted,
-        )];
-    };
-    let badge = Style::default().fg(Color::Black).bg(STATUS_BRANCH_BADGE);
-    let edge = Style::default().fg(STATUS_BRANCH_BADGE);
-    let counts = if git.counts.is_empty() {
-        String::new()
-    } else {
-        format!("{} ", git.counts)
-    };
-    let mut counts_w = display_width(&counts);
-    // The badge frame is `▐` + ` branch ` + counts + `▌`: four columns of
-    // chrome plus the branch and counts. Degrade in order: the path
-    // truncates first, then the branch name truncates, and the dirty
-    // counts drop when the frame cannot host them beside any branch — so
-    // the badge never spills past the reserved pill cluster.
-    let mut branch_budget = budget.saturating_sub(4 + counts_w);
-    if branch_budget == 0 {
-        counts_w = 0;
-        branch_budget = budget.saturating_sub(4);
-    }
-    let branch = truncate_to_width(&git.branch, branch_budget as usize);
-    let counts = if counts_w == 0 { String::new() } else { counts };
-    let badge_w = 4 + display_width(&branch) + counts_w;
-    if budget <= badge_w + 1 {
-        // The path degrades first; keep the branch visible when it fits.
-        let mut spans = vec![
-            Span::styled("▐", edge),
-            Span::styled(format!(" {} ", branch), badge),
-        ];
-        if !counts.is_empty() {
-            spans.push(Span::styled(counts.clone(), badge));
+        if budget <= display_width(prefix) {
+            return vec![Span::styled(
+                truncate_to_width(prefix, budget as usize),
+                fog,
+            )];
         }
-        spans.push(Span::styled("▌", edge));
-        return spans;
+        let path_budget = budget.saturating_sub(display_width(prefix)) as usize;
+        return vec![
+            Span::styled(prefix, fog),
+            Span::styled(elide_path(path, path_budget), fog),
+        ];
+    };
+    let suffix = if git.changes == 0 {
+        " ✓ clean".to_string()
+    } else {
+        let plural = if git.changes == 1 { "" } else { "s" };
+        format!(" ● {} change{plural}", git.changes)
+    };
+    let git_core_w = display_width(&git.branch).saturating_add(display_width(&suffix));
+    if git_core_w > budget {
+        return vec![Span::styled(
+            truncate_to_width(&format!("{}{}", git.branch, suffix), budget as usize),
+            Style::default().fg(BRASS).add_modifier(Modifier::BOLD),
+        )];
     }
-    let path_budget = (budget - badge_w - 1) as usize;
+    let git_style = Style::default().fg(BRASS).add_modifier(Modifier::BOLD);
+    let suffix_style = Style::default().fg(if git.changes == 0 { GREEN } else { YELLOW });
+    let fixed_w = display_width(prefix)
+        .saturating_add(display_width("   "))
+        .saturating_add(git_core_w);
+    if fixed_w > budget {
+        return vec![
+            Span::styled(git.branch.clone(), git_style),
+            Span::styled(suffix, suffix_style),
+        ];
+    }
+    let path_budget = budget.saturating_sub(fixed_w) as usize;
     vec![
-        Span::styled(truncate_to_width(path, path_budget), muted),
-        Span::raw(" "),
-        Span::styled("▐", edge),
-        Span::styled(format!(" {} ", branch), badge),
-        Span::styled(counts, badge),
-        Span::styled("▌", edge),
+        Span::styled(prefix, fog),
+        Span::styled(elide_path(path, path_budget), fog),
+        Span::styled("   ", fog),
+        Span::styled(git.branch.clone(), git_style),
+        Span::styled(suffix, suffix_style),
     ]
+}
+
+fn elide_path(path: &str, max: usize) -> String {
+    if display_width(path) as usize <= max {
+        return path.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let tail = path
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path);
+    let marker = "…/";
+    if max <= display_width(marker) as usize {
+        return truncate_to_width("…", max);
+    }
+    format!(
+        "{marker}{}",
+        truncate_to_width(tail, max.saturating_sub(display_width(marker) as usize))
+    )
 }
 
 /// Git facts for a launch snapshot — the bridge the banner box uses to
@@ -486,7 +649,7 @@ pub(crate) fn launch_path_spans(
 pub(crate) fn launch_git_facts(repo: &cockpit_proto::RepoStatus) -> GitFacts {
     GitFacts {
         branch: repo.branch.clone(),
-        counts: cockpit_core::git::repo_counts(repo),
+        changes: repo.staged.saturating_add(repo.unstaged),
     }
 }
 
@@ -590,10 +753,12 @@ mod tests {
         ChatHeaderState {
             title: Some("Implement the demo shell".to_string()),
             status: HeaderSessionStatus::Working,
+            routing_status: None,
+            rail_hidden: false,
             path: "/home/dev/flycockpit".to_string(),
             git: Some(GitFacts {
                 branch: "main".to_string(),
-                counts: "+1 ~2".to_string(),
+                changes: 3,
             }),
             pills: vec![
                 pill(HeaderPillKind::Attention, "attention 2"),
@@ -694,13 +859,20 @@ mod tests {
             assert_eq!(again.collapsed, layout.collapsed);
         }
 
-        // Skill collapses before timer, timer before task: at 56 columns the
-        // tail of the fixture drops while the head survives.
+        // At 56 columns, labels compact before any path elision or pill
+        // collapse. This fixture's terse labels all fit.
         let layout = plan_chat_header(&state, area(56));
+        let visible: Vec<_> = layout.pill_buttons.iter().map(|(k, _)| *k).collect();
+        assert!(layout.compact_pills);
+        assert_eq!(visible.len(), state.pills.len());
+        assert!(layout.collapsed.is_empty());
+
+        // At 40 columns the tail drops while the priority head survives.
+        let layout = plan_chat_header(&state, area(40));
         let visible: Vec<_> = layout.pill_buttons.iter().map(|(k, _)| *k).collect();
         assert!(
             visible.len() < state.pills.len(),
-            "56 columns must collapse part of the fixture"
+            "40 columns must collapse part of the fixture"
         );
         let collapsed: Vec<_> = layout.collapsed.iter().map(|p| p.kind).collect();
         assert_eq!(collapsed.last().copied(), Some(HeaderPillKind::Skill));
@@ -714,8 +886,7 @@ mod tests {
             "only lower-priority pills collapse: visible {visible:?} collapsed {collapsed:?}"
         );
 
-        // At 40 columns the counted summary still reaches the user.
-        let layout = plan_chat_header(&state, area(40));
+        // The counted summary still reaches the user.
         assert!(
             !layout.pill_buttons.is_empty() || layout.more_button.is_some(),
             "40 columns still surfaces the counted activity summary"
@@ -726,33 +897,35 @@ mod tests {
     }
 
     #[test]
-    fn unknown_git_renders_no_slot_and_known_git_renders_branch_and_counts() {
+    fn unknown_git_renders_no_slot_and_known_git_renders_branch_and_changes() {
         let mut state = full_state();
         state.git = None;
         let spans = path_git_spans(&state, 40);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "/home/dev/flycockpit");
-        assert!(!text.contains('▐'), "no repo slot while unresolved: {text}");
+        assert_eq!(text, "⎇ /home/dev/flycockpit");
+        assert!(
+            !text.contains("main"),
+            "no repo slot while unresolved: {text}"
+        );
 
         state.git = Some(GitFacts {
             branch: "main".to_string(),
-            counts: "+1 ~2 ^3".to_string(),
+            changes: 3,
         });
         let spans = path_git_spans(&state, 80);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("main"), "branch badge present: {text}");
-        assert!(text.contains("+1 ~2 ^3"), "dirty counts present: {text}");
+        assert!(text.contains("● 3 changes"), "dirty suffix present: {text}");
 
         // Clean tree: badge without counts, never a synthesized zero.
         state.git = Some(GitFacts {
             branch: "main".to_string(),
-            counts: String::new(),
+            changes: 0,
         });
         let spans = path_git_spans(&state, 80);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("main"), "{text}");
-        assert!(!text.contains("+0"), "no synthetic zero counts: {text}");
-        assert!(!text.contains('~'), "{text}");
+        assert!(text.contains("✓ clean"), "clean suffix present: {text}");
     }
 
     #[test]
@@ -805,27 +978,21 @@ mod tests {
     }
 
     #[test]
-    fn git_facts_use_the_core_counts_formatter() {
-        // The dirty-count spelling is the shared core symbol, so header,
-        // banner, and startup welcome text cannot drift apart.
+    fn git_facts_count_staged_and_unstaged_changes() {
         let dirty = cockpit_proto::RepoStatus {
             branch: "main".into(),
             staged: 1,
             unstaged: 2,
             unpushed: 3,
         };
-        assert_eq!(
-            launch_git_facts(&dirty).counts,
-            cockpit_core::git::repo_counts(&dirty)
-        );
-        assert_eq!(launch_git_facts(&dirty).counts, "+1 ~2 ^3");
+        assert_eq!(launch_git_facts(&dirty).changes, 3);
         let clean = cockpit_proto::RepoStatus {
             branch: "main".into(),
             staged: 0,
             unstaged: 0,
             unpushed: 0,
         };
-        assert_eq!(launch_git_facts(&clean).counts, "");
+        assert_eq!(launch_git_facts(&clean).changes, 0);
     }
 
     #[test]
@@ -847,7 +1014,7 @@ mod tests {
         let wide_path = "路径路径路径路径"; // 16 columns, 8 chars
         let git = GitFacts {
             branch: "main".to_string(),
-            counts: "+1 ~2".to_string(),
+            changes: 3,
         };
         for budget in 6u16..40 {
             let spans = launch_path_spans(wide_path, Some(&git), budget);
@@ -860,16 +1027,15 @@ mod tests {
                 "spans ({total} cols) must fit the {budget}-column budget"
             );
         }
-        // No git: the wide path truncates by columns, so a 7-column budget
-        // keeps three wide glyphs plus the ellipsis.
+        // No git: the path keeps its branch-like tail marker.
         let spans = launch_path_spans(wide_path, None, 7);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "路径路…");
+        assert_eq!(text, "⎇ …/路…");
         // A wide-glyph branch name truncates too instead of spilling past
         // the reserved pill cluster.
         let wide_branch = GitFacts {
             branch: "分支分支分支".to_string(),
-            counts: String::new(),
+            changes: 0,
         };
         let spans = launch_path_spans("/p", Some(&wide_branch), 10);
         let total: u16 = spans

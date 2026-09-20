@@ -1,5 +1,5 @@
                                                                                                                   ● Idle
- ◆ Cockpit             [Hide] ~/project                                                                                 
+ ◆ Cockpit             [Hide] ⎇ ~/project                                                                  [Setup: Code]
                               ──────────────────────────────────────────────────────────────────────────────────────────
   + New session                                                                                                         
                                                                                                                         
@@ -30,11 +30,11 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-           ╭ openai ─────────────────────────────────────╮                                                              
- ● working  ● waiting  ● donet · 12 uses                 │                                                              
-           │  gpt-5-mini                                 │                                                              
-           │  Add model…  configure openai               │                                                              
-╭──────────│↑/↓ move · enter choose · ctrl+enter default │─────────────────────────────────────────────────────────────╮
-│❯ Message ╰─────────────────────────────────────────────╯l+K keys                                             0 tokens│
+                                                                                                                        
+                              ╭ openai ─────────────────────────────────────╮                                           
+ ● working  ● waiting  ● done │› ★ gpt-5  current · 12 uses                 │                                           
+                              │  gpt-5-mini                                 │                                           
+                              │  Add model…  configure openai               │                                           
+╭─────────────────────────────│↑/↓ move · enter choose · ctrl+enter default │──────────────────────────────────────────╮
+│Ask anything, ⇧↵ for a newlin╰─────────────────────────────────────────────╯                                  0 tokens│
 ╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───────────────────────────────────────────[Send]╯
-Setup: Code                                                                                                             

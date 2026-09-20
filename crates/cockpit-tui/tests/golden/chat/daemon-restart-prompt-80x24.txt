@@ -1,24 +1,24 @@
-┌ Session setup ───────────────────────────────────────────────────────────────┐
-│Daemon stopped; choose Restart or Quit.                                       │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│             ╭ Daemon stopped ──────────────────────────────────╮             │
-│             │                                                  │             │
-│             │   The daemon stopped unexpectedly. Restart it?   │             │
-│             │                                                  │             │
-│             │               [ Restart ] [ Quit ]               │             │
-│             │                                                  │             │
-│             ╰──────────────────────────────────────────────────╯             │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                                                                
-                                                                                
-                                                                                
-Setup: Code                                                                     
+                                                                          ● Idle
+ ◆ Cockpit           [Hide] ⎇ ╭ Session setup ───────────────────────────────╮e]
+                            ──│  Daemon stopped; choose Restart or Quit.     │──
+  + New session               │                                              │  
+                              │                                              │  
+ SESSIONS                     │                                              │  
+ no active sessions in all    │                                              │  
+                              │                                              │  
+              ╭ Daemon stopped ──────────────────────────────────╮           │  
+              │                                                  │           │  
+              │   The daemon stopped unexpectedly. Restart it?   │           │  
+              │                                                  │           │  
+              │               [ Restart ] [ Quit ]               │           │  
+              │                                                  │           │  
+              ╰──────────────────────────────────────────────────╯           │  
+                              │                                              │  
+                              │                                              │  
+                              │                                              │  
+                              │                                              │  
+                              │                                              │  
+                              │                                              │  
+ ● working  ● waiting  ● do   │                                              │  
+                            ⋯ ╰──────────────────────────────────────────────╯c 
+                                                 ision. ⋯                       

@@ -1,27 +1,28 @@
                                                                                                                ● Working
- ◆ Cockpit             [Hide] /tmp/project                                                                              
+ ◆ Cockpit             [Hide] ⎇ /tmp/project                                                               [Setup: Code]
                               ──────────────────────────────────────────────────────────────────────────────────────────
   + New session               ▌Continue with every transcript element.                                                 │
-                              note to self                                                                      12:00  │
- SESSIONS                     ┊ Keep product-only transcript variants.                                                 │
- no active sessions in all pr ▌ Agent                                                             [Pin] [Fork]  12:00  │
+                                Prioritize the transcript chrome.                                                      │
+ SESSIONS                     note to self                                                                      12:00  │
+ no active sessions in all pr ┊ Keep product-only transcript variants.                                                 │
+                              ▌ Agent                                                             [Pin] [Fork]  12:00  │
                                 Model  Agent                                                                           │
                                 TTFT   0.9s                                                                            │
                                 TPS    40                                                                              │
                                 Cache  —                                                                               │
                                 ▾ Thought                                                                              │
-                                Map each requested row to its owning renderer.                                         │
+                                Map each requested row to its owning renderer.                                         █
                                 The open thought is followed by tool work.                                             █
                                                                                                                        █
                                 ▸ read  crates/cockpit-tui/src/tui/history/mod.rs                                      █
                                                                                                                        █
-                                ─ explore                                                                              █
-                              ▌ interactive ✓ explore worked for 3s [u]             ╭────────────────────╮             █
-                              ▌ Interactive child inspected the rendering seam.     │› Open in $EDITOR   │             █
-                                                                                    │  Copy as rich text │             █
-                              ▌ background ✓ runner worked for 4s [u]               │  Copy as markdown  │             █
-                                Background child returned a compact report.         │  Copy as plain text│             █
-                                                                                    ╰────────────────────╯             █
+                                ─ explore                                           ╭────────────────────╮             █
+                              ▌ interactive ✓ explore worked for 3s [u]             │› Open in $EDITOR   │             █
+                              ▌ Interactive child inspected the rendering seam.     │  Copy as rich text │             █
+                                                                                    │  Copy as markdown  │             █
+                              ▌ background ✓ runner worked for 4s [u]               │  Copy as plain text│             █
+                                Background child returned a compact report.         ╰────────────────────╯             █
+                                                                                                                       █
                                 ◇ Edited src/transcript.rs  +1 -1                                                      █
                                 │ - old line                                                                           █
                                 │ + new line                                                                           █
@@ -35,6 +36,5 @@
                                 Check the final visual hierarchy.                                                      █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys                                           113 tokens│
+│Ask anything, ⇧↵ for a newline, or / for commands…                                                          113 tokens│
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯
-Setup: Code                                                                                                             

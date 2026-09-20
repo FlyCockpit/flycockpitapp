@@ -2,6 +2,10 @@ use super::{
     App, MAX_SANDBOX_NOTICE_ROWS, sandbox_down_notice_text, sandbox_notice_render_text,
     sandbox_notice_wrapped_rows,
 };
+use crate::tui::app::golden::render_app;
+use crate::tui::chat_header::HeaderPillKind;
+use crate::tui::composer_controls::ComposerControlKind;
+use crate::tui::golden::buffer_text;
 use cockpit_client::presentation::TurnEvent;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -28,7 +32,6 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
 
     // No notice initially.
     assert!(app.sandbox_down_notice.is_none());
-    assert_eq!(app.sandbox_notice_lines(), 0);
 
     // Sandbox-unavailable → persistent notice raised.
     app.apply_event(TurnEvent::SandboxUnavailable {
@@ -47,12 +50,38 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
             .and_then(|notice| notice.fix_command.as_deref()),
         Some(FIX_COMMAND)
     );
-    assert!(app.sandbox_notice_lines() > 0, "persistent row reserved");
     let text = app.sandbox_down_notice_text().unwrap();
     assert!(text.contains("/sandbox off"));
     assert!(text.contains("sudo sysctl"));
     // Purely client-side: nothing was pushed into the transcript.
     assert_eq!(app.history.len(), history_len_before);
+    app.open_composer_picker(ComposerControlKind::Sandbox);
+    let picker = app
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("sandbox picker");
+    assert_eq!(
+        picker.status,
+        super::composer_controls::ComposerPickerStatus::Unavailable
+    );
+    assert!(
+        picker
+            .status_text
+            .as_deref()
+            .is_some_and(|status| status.contains("/sandbox off"))
+    );
+
+    let painted = buffer_text(&render_app(&mut app, 80, 24));
+    assert!(
+        painted.contains("sudo sysctl")
+            && painted.contains("kernel.apparmor_restrict_unprivileged_userns=0"),
+        "picker status paint must include the sysctl remedy at 80x24: {painted:?}"
+    );
+    assert!(
+        painted.contains("/sandbox off"),
+        "picker status paint must include the composer action at 80x24"
+    );
 
     // A repeated unavailable event just refreshes the same notice (the
     // daemon de-dupes the broadcast; the client stays idempotent).
@@ -82,7 +111,6 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
         persisted_intent: Some(cockpit_proto::SandboxMode::Off),
     });
     assert!(app.sandbox_down_notice.is_none());
-    assert_eq!(app.sandbox_notice_lines(), 0);
 
     // Re-enabling does not resurrect a stale notice on its own.
     app.apply_event(TurnEvent::SandboxState {
@@ -117,7 +145,22 @@ fn command_capability_unavailable_raises_persistent_copyable_notice() {
     let notice = app.persistent_notice_text().unwrap();
     assert!(notice.contains("Required command capability unavailable"));
     assert!(notice.contains("sudo apt-get install demo"));
-    assert!(app.sandbox_notice_lines() > 0, "persistent row reserved");
+    app.open_composer_picker(ComposerControlKind::Sandbox);
+    let picker = app
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("sandbox picker");
+    assert_eq!(
+        picker.status,
+        super::composer_controls::ComposerPickerStatus::Unavailable
+    );
+    assert!(
+        picker
+            .status_text
+            .as_deref()
+            .is_some_and(|status| status.contains("sudo apt-get install demo"))
+    );
     assert_eq!(app.history.len(), history_len_before);
 }
 
@@ -145,12 +188,16 @@ fn waiting_for_lock_event_sets_and_clears_chrome_state() {
             .map(|(p, h)| (p.as_str(), h.as_str())),
         Some(("/repo/src/lib.rs", "builder"))
     );
-    // The chrome renders the path basename + holder.
-    let spans = crate::tui::chrome::waiting_for_lock_spans(app.waiting_for_lock.as_ref());
-    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    let lock_pill = app
+        .chat_header_state()
+        .pills
+        .into_iter()
+        .find(|pill| pill.kind == HeaderPillKind::Lock)
+        .expect("waiting lock rehomes to a header pill");
     assert!(
-        text.contains("lib.rs") && text.contains("builder"),
-        "{text}"
+        lock_pill.label.contains("lib.rs") && lock_pill.label.contains("builder"),
+        "{}",
+        lock_pill.label
     );
     // Purely client-side: nothing entered the transcript.
     assert_eq!(app.history.len(), history_len_before);
@@ -162,7 +209,12 @@ fn waiting_for_lock_event_sets_and_clears_chrome_state() {
         waiting: false,
     });
     assert!(app.waiting_for_lock.is_none());
-    assert!(crate::tui::chrome::waiting_for_lock_spans(app.waiting_for_lock.as_ref()).is_empty());
+    assert!(
+        !app.chat_header_state()
+            .pills
+            .iter()
+            .any(|pill| pill.kind == HeaderPillKind::Lock)
+    );
     assert_eq!(app.history.len(), history_len_before);
 }
 

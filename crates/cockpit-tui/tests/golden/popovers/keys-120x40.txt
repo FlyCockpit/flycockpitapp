@@ -1,33 +1,34 @@
                                                                                                                ● Working
- ◆ Cockpit             [Hide] /tmp/project                                                                              
+ ◆ Cockpit             [Hide] ⎇ /tmp/project                                                               [Setup: Code]
                               ──────────────────────────────────────────────────────────────────────────────────────────
   + New session               ▌Continue with every transcript element.                                                 │
-                              note to self                                                                      12:00  │
- SESSIONS                     ┊ Keep product-only transcript variants.                                                 │
- no active sessions in all pr ▌ Agent╭ keybindings — Composer ──────────────────────────────────────────────────╮2:00  │
-                                Model│Composer                                                                  │      │
-                                TTFT │  Enter        send           submit the message                          │      │
-                                TPS  │  Shift+Enter  newline        insert a newline (Alt+Enter also)           │      │
-                                Cache│  Ctrl+P       model          open the composer model picker              │      │
-                                ▾ Tho│  Ctrl+E       effort         open the composer effort picker             │      │
-                                Map e│  Ctrl+B       sessions       toggle the session sidebar                  │      │
-                                The o│  Ctrl+N       new session    start a fresh session                       │      █
-                                     │  Alt+↑/↓      switch session resume the previous or next session         │      █
-                                ▸ rea│  Ctrl+↑       enter queue    focus queued messages from an empty composer│      █
-                                     │  Ctrl+K b     btw focus      toggle focus for an open /btw pane          │      █
-                                ─ exp│  Ctrl+K n     scratchpad     open the project scratchpad                 │      █
-                              ▌ inter│  Ctrl+K r     reveal         toggle original inputs and compact briefs   │      █
-                              ▌ Inter│  Ctrl+T       thinking       toggle reasoning blocks                     │      █
-                                     │  Ctrl+Y       copy pick      pick a message or code block to copy        │      █
-                              ▌ backg│  Shift+Tab    cycle agent    switch the primary agent                    │      █
-                                Backg│  @            file tag       tag a file into the message                 │      █
-                                     │Global                                                                    │      █
-                                ◇ Edi│  Ctrl+K       keys           open/close this which-key overlay (also /key│      █
-                                │ - o│  Ctrl+C       interrupt      stop the running agent; press twice to quit │      █
-                                │ + n│  Ctrl+D       quit           exit when idle; guarded while work is active│      █
-                                │   s│  /            commands       open the slash-command menu                 │      █
-                               ⋯ Comp│Esc/q/Ctrl+K close  ↑/↓ scroll  g/G top/bottom                            │ ·  ⋯ █
-                                     ╰──────────────────────────────────────────────────────────────────────────╯      █
+                                Prioritize the transcript chrome.                                                      │
+ SESSIONS                     note to self                                                                      12:00  │
+ no active sessions in all pr ┊ Keep ╭ keybindings — Composer ──────────────────────────────────────────────────╮      │
+                              ▌ Agent│Composer                                                                  │2:00  │
+                                Model│  Enter        send           submit the message                          │      │
+                                TTFT │  Shift+Enter  newline        insert a newline (Alt+Enter also)           │      │
+                                TPS  │  Ctrl+P       model          open the composer model picker              │      │
+                                Cache│  Ctrl+E       effort         open the composer effort picker             │      │
+                                ▾ Tho│  Ctrl+B       sessions       toggle the session sidebar                  │      │
+                                Map e│  Ctrl+N       new session    start a fresh session                       │      █
+                                The o│  Alt+↑/↓      switch session resume the previous or next session         │      █
+                                     │  Ctrl+↑       enter queue    focus queued messages from an empty composer│      █
+                                ▸ rea│  Ctrl+K b     btw focus      toggle focus for an open /btw pane          │      █
+                                     │  Ctrl+K n     scratchpad     open the project scratchpad                 │      █
+                                ─ exp│  Ctrl+K r     reveal         toggle original inputs and compact briefs   │      █
+                              ▌ inter│  Ctrl+T       thinking       toggle reasoning blocks                     │      █
+                              ▌ Inter│  Ctrl+Y       copy pick      pick a message or code block to copy        │      █
+                                     │  Shift+Tab    cycle agent    switch the primary agent                    │      █
+                              ▌ backg│  @            file tag       tag a file into the message                 │      █
+                                Backg│Global                                                                    │      █
+                                     │  Ctrl+K       keys           open/close this which-key overlay (also /key│      █
+                                ◇ Edi│  Ctrl+C       interrupt      stop the running agent; press twice to quit │      █
+                                │ - o│  Ctrl+D       quit           exit when idle; guarded while work is active│      █
+                                │ + n│  /            commands       open the slash-command menu                 │      █
+                                │   s│Esc/q/Ctrl+K close  ↑/↓ scroll  g/G top/bottom                            │      █
+                               ⋯ Comp╰──────────────────────────────────────────────────────────────────────────╯ ·  ⋯ █
+                                                               ⋯ 2 seed tools (~42) ⋯                                  █
                                 [show summary]                                                                         █
                                                                                                                        █
                               ▌ Agent                                                                           12:00  █
@@ -35,6 +36,5 @@
                                 Check the final visual hierarchy.                                                      █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys                                           113 tokens│
+│Ask anything, ⇧↵ for a newline, or / for commands…                                                          113 tokens│
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯
-Setup: Code                                                                                                             

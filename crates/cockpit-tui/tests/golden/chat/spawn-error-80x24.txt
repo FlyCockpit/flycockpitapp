@@ -1,5 +1,5 @@
                                                                           ● Idle
- ◆ Cockpit           [Hide] ~/project                                           
+ ◆ Cockpit           [Hide] ⎇ ~/project                            [Setup: Code]
                             ────────────────────────────────────────────────────
   + New session                                                                 
                                                                                 
@@ -9,16 +9,16 @@
                               │ ▗▖          ▄█▛                             │   
                               │ ▐█▖▄     ▗▄▀▝▀   ▘   FlyCockpit v0.1.0      │   
                               │ ▀▀▀██▛▀▜█▀▀▀▟▛▀▀▘▘   Daemon failed to start │   
-                              │      ▀▀▀████▀▝▀▀▘▘   ~/project              │   
+                              │      ▀▀▀████▀▝▀▀▘▘   ⎇ ~/project            │   
                               │      ▄▜█▀▘       ▘                          │   
                               │     ▝▀▀                                     │   
                               │ Tip: /help gets you oriented                │   
                               ╰─────────────────────────────────────────────╯   
                                                                                 
+                                                                                
  ● working  ● waiting  ● do                                                     
                                                                                 
-                             daemon socket address already in use: /tmp/cockpit…
+ daemon socket address already in use: /tmp/cockpit.sock                        
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys     0 tokens│
+│Ask anything, ⇧↵ for a newline, or / for commands…                    0 tokens│
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯
-Setup: Code                                                                     

@@ -1,0 +1,40 @@
+                              fixture-session                                                                     ● Idle
+ ◆ Cockpit             [Hide] ⎇ ~/project   issue-449 ● 2 changes                                          [Setup: Code]
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session                                                                                                         
+                                                                                                                        
+ SESSIONS                                                                                                               
+ no active sessions in all pr                                                                                           
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+ ● working  ● waiting  ● done ╭ effort ─────────────────────────────────────╮                                           
+                              │No active model.                             │                                           
+                              │(none)                                       │                                           
+╭─────────────────────────────│↑/↓ move · enter choose · esc back           │──────────────────────────────────────────╮
+│Ask anything, ⇧↵ for a newlin╰─────────────────────────────────────────────╯                                  0 tokens│
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯

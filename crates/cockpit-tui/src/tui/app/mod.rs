@@ -1379,6 +1379,28 @@ pub(super) struct DaemonLinkStatus {
     pub(super) started_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DaemonRestartFocus {
+    Restart,
+    Quit,
+}
+
+pub(super) struct DaemonRestartPrompt {
+    pub(super) focus: DaemonRestartFocus,
+    pub(super) restart_rect: Rect,
+    pub(super) quit_rect: Rect,
+}
+
+impl Default for DaemonRestartPrompt {
+    fn default() -> Self {
+        Self {
+            focus: DaemonRestartFocus::Restart,
+            restart_rect: Rect::default(),
+            quit_rect: Rect::default(),
+        }
+    }
+}
+
 /// Legacy `/compact` handoff state from the old review-then-commit path.
 /// New compactions are queued and applied in place by the driver.
 #[allow(dead_code)]
@@ -2047,6 +2069,7 @@ pub struct App {
     /// capability. Session/epoch replacement must not redirect settlement to
     /// a newer runner.
     sealed_capability_bindings: HashMap<String, crate::tui::agent_runner::AttachedRequestBinding>,
+    pub(super) daemon_restart_prompt: Option<DaemonRestartPrompt>,
     exit_requested: bool,
     exit_notice: Option<String>,
     pub(super) active_model_state_generation: u64,
@@ -3710,6 +3733,7 @@ impl App {
             endpoint: cockpit_client::ClientEndpoint::InProcess(
                 cockpit_client::InProcessEndpoint::new(connections, sensitive),
             ),
+            process_watch: None,
             lifetime_client: None,
             owns_daemon: true,
             ephemeral_owner: false,
@@ -4030,6 +4054,7 @@ impl App {
             startup_pending_trust: None,
             pending_sealed_operations: HashMap::new(),
             sealed_capability_bindings: HashMap::new(),
+            daemon_restart_prompt: None,
             exit_requested: false,
             exit_notice: None,
             active_model_state_generation: 0,

@@ -414,14 +414,86 @@ where
 }
 
 fn lifecycle_resolution(connected: ConnectedDaemon) -> cockpit_client::LifecycleResolution {
+    let process_watch = daemon_process_watch(&connected.socket);
     cockpit_client::LifecycleResolution {
         endpoint: connected.endpoint,
+        process_watch,
         lifetime_client: Some(connected.client),
         owns_daemon: connected.owns_daemon,
         ephemeral_owner: connected.ephemeral_owner,
         socket: connected.socket,
         startup_notice: connected.startup_notice,
         promoted_from_ephemeral: connected.promoted_from_ephemeral,
+    }
+}
+
+fn daemon_process_watch(socket: &Path) -> Option<cockpit_client::DaemonProcessWatch> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
+    {
+        use cockpit_host::daemon_lifecycle::{
+            PidIdentity, VerifiedProcessOutcome, acquire_verified_daemon_process,
+        };
+
+        let canonical = crate::daemon::DaemonPaths::resolve_canonical().ok()?;
+        let record = crate::daemon::read_endpoint_record(&canonical)?;
+        if record.socket_path != socket {
+            return None;
+        }
+        let receipt = record.receipt;
+        let process = match acquire_verified_daemon_process(&receipt) {
+            VerifiedProcessOutcome::Verified(process) => process,
+            VerifiedProcessOutcome::Identity(_) => return None,
+        };
+        let (watch, exited) = cockpit_client::DaemonProcessWatch::channel();
+        tokio::spawn(async move {
+            // Reacquire only from the same v2 receipt after a bounded wait.
+            // This keeps Windows waits below their DWORD timeout ceiling and
+            // never falls back to polling a bare numeric PID.
+            let mut process = process;
+            loop {
+                match process.wait_for_exit(Duration::from_secs(60 * 60)).await {
+                    Ok(true) => {
+                        let _ = exited.send(true);
+                        return;
+                    }
+                    Ok(false) => {
+                        process = match acquire_verified_daemon_process(&receipt) {
+                            VerifiedProcessOutcome::Verified(process) => process,
+                            VerifiedProcessOutcome::Identity(
+                                PidIdentity::Missing | PidIdentity::NotDaemon,
+                            ) => {
+                                let _ = exited.send(true);
+                                return;
+                            }
+                            VerifiedProcessOutcome::Identity(PidIdentity::Unverified) => return,
+                            VerifiedProcessOutcome::Identity(PidIdentity::VerifiedDaemon) => {
+                                unreachable!("verified daemon identity is not returned as Identity")
+                            }
+                        };
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "daemon process watcher stopped");
+                        return;
+                    }
+                }
+            }
+        });
+        Some(watch)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    )))]
+    {
+        let _ = socket;
+        None
     }
 }
 

@@ -109,6 +109,36 @@ pub enum ClientEndpoint {
     InProcess(InProcessEndpoint),
 }
 
+/// Daemon process-exit notification supplied by the receipt-verifying
+/// lifecycle host. Presentation code never receives the platform process
+/// handle behind it.
+#[derive(Clone, Debug)]
+pub struct DaemonProcessWatch {
+    exited: watch::Receiver<bool>,
+}
+
+impl DaemonProcessWatch {
+    pub fn channel() -> (Self, watch::Sender<bool>) {
+        let (sender, exited) = watch::channel(false);
+        (Self { exited }, sender)
+    }
+
+    /// Wait until the exact daemon process exits. A dropped host-side watcher
+    /// is reported as unavailable rather than misclassified as process exit;
+    /// socket EOF remains the independent transport fallback.
+    pub async fn wait_for_exit(&mut self) -> Result<(), String> {
+        loop {
+            if *self.exited.borrow_and_update() {
+                return Ok(());
+            }
+            self.exited
+                .changed()
+                .await
+                .map_err(|_| "daemon process watcher stopped".to_string())?;
+        }
+    }
+}
+
 impl ClientEndpoint {
     /// True when the endpoint is a discoverable OS transport owner: a Unix
     /// control socket or a Windows named-pipe identity path. Multi-window hosts
@@ -215,6 +245,9 @@ impl LifecycleIntent {
 #[derive(Debug)]
 pub struct LifecycleResolution {
     pub endpoint: ClientEndpoint,
+    /// Stable pidfd/kqueue/process-handle observation of the selected wire
+    /// owner. In-process owners and unsupported platforms use socket EOF only.
+    pub process_watch: Option<DaemonProcessWatch>,
     /// Connection that keeps a newly selected ephemeral owner alive until
     /// the presentation establishes its next daemon connection.
     pub lifetime_client: Option<DaemonClient>,
@@ -1557,6 +1590,26 @@ mod tests {
     #[cfg(unix)]
     use tokio::net::UnixListener;
 
+    #[tokio::test]
+    async fn daemon_process_watch_reports_only_explicit_exit_signal() {
+        let (mut watch, exited) = DaemonProcessWatch::channel();
+        let waiter = tokio::spawn(async move { watch.wait_for_exit().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        exited.send(true).expect("watch receiver remains live");
+        assert_eq!(waiter.await.expect("watch task"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn dropped_process_watcher_is_not_misclassified_as_exit() {
+        let (mut watch, exited) = DaemonProcessWatch::channel();
+        drop(exited);
+        assert_eq!(
+            watch.wait_for_exit().await,
+            Err("daemon process watcher stopped".to_string())
+        );
+    }
+
     fn lsp_event(text: impl Into<String>) -> proto::Event {
         proto::Event::LspNotice { text: text.into() }
     }
@@ -2554,6 +2607,7 @@ mod tests {
                         connections,
                         sensitive,
                     )),
+                    process_watch: None,
                     lifetime_client: None,
                     owns_daemon: true,
                     ephemeral_owner: true,

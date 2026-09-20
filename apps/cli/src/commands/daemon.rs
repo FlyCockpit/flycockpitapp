@@ -665,7 +665,7 @@ fn remaining_command_budget_at(
 fn restart_started_message(restarted: bool, pid: u32, socket: &std::path::Path) -> String {
     if restarted {
         format!(
-            "daemon: restarted (pid {pid})\n  socket: {}",
+            "daemon: restarted (pid {pid}); attached clients will reconnect\n  socket: {}",
             socket.display()
         )
     } else {
@@ -711,7 +711,7 @@ mod tests {
         let socket = std::path::Path::new("/tmp/cockpit.sock");
         assert_eq!(
             restart_started_message(true, 123, socket),
-            "daemon: restarted (pid 123)\n  socket: /tmp/cockpit.sock"
+            "daemon: restarted (pid 123); attached clients will reconnect\n  socket: /tmp/cockpit.sock"
         );
         assert_eq!(
             restart_started_message(false, 456, socket),

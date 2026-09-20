@@ -532,23 +532,44 @@ impl App {
             TurnEvent::DaemonLinkReconnecting {
                 restarting,
                 attempt,
-            } => match &mut self.daemon_link {
-                Some(status) => {
-                    status.restarting = restarting;
-                    status.attempt = attempt;
+            } => {
+                if let Overlay::SessionSetup(pane) = &mut self.overlay {
+                    pane.set_error("Reconnecting to daemon…");
                 }
-                None => {
-                    self.daemon_link = Some(super::DaemonLinkStatus {
-                        restarting,
-                        attempt,
-                        started_at: Instant::now(),
-                    });
+                if let Some(pane) = self.session_setup_inline.as_mut() {
+                    pane.set_error("Reconnecting to daemon…");
                 }
-            },
+                match &mut self.daemon_link {
+                    Some(status) => {
+                        status.restarting = restarting;
+                        status.attempt = attempt;
+                    }
+                    None => {
+                        self.daemon_link = Some(super::DaemonLinkStatus {
+                            restarting,
+                            attempt,
+                            started_at: Instant::now(),
+                        });
+                    }
+                }
+            }
             TurnEvent::DaemonLinkReconnected { .. } => {
-                if self.daemon_link.take().is_some() {
-                    self.daemon_draining = false;
+                let had_link = self.daemon_link.take().is_some();
+                self.daemon_draining = false;
+                if had_link {
+                    self.show_toast("daemon reconnected", ToastKind::Success);
                 }
+            }
+            TurnEvent::DaemonRestartPrompt => {
+                self.daemon_link = None;
+                self.daemon_draining = false;
+                if let Overlay::SessionSetup(pane) = &mut self.overlay {
+                    pane.set_error("Daemon stopped; choose Restart or Quit.");
+                }
+                if let Some(pane) = self.session_setup_inline.as_mut() {
+                    pane.set_error("Daemon stopped; choose Restart or Quit.");
+                }
+                self.daemon_restart_prompt = Some(super::DaemonRestartPrompt::default());
             }
             TurnEvent::DaemonLinkResynced { .. } => {}
             TurnEvent::DaemonLinkTerminal { .. } => {
@@ -714,6 +735,12 @@ impl App {
                 attempt,
             } => {
                 self.finalize_pending();
+                if let Overlay::SessionSetup(pane) = &mut self.overlay {
+                    pane.set_error("Reconnecting to daemon…");
+                }
+                if let Some(pane) = self.session_setup_inline.as_mut() {
+                    pane.set_error("Reconnecting to daemon…");
+                }
                 match &mut self.daemon_link {
                     Some(status) => {
                         status.restarting = restarting;
@@ -728,14 +755,29 @@ impl App {
                     }
                 }
             }
+            TurnEvent::DaemonRestartPrompt => {
+                self.daemon_link = None;
+                self.daemon_draining = false;
+                self.finalize_pending();
+                self.end_working_span();
+                if let Overlay::SessionSetup(pane) = &mut self.overlay {
+                    pane.set_error("Daemon stopped; choose Restart or Quit.");
+                }
+                if let Some(pane) = self.session_setup_inline.as_mut() {
+                    pane.set_error("Daemon stopped; choose Restart or Quit.");
+                }
+                self.daemon_restart_prompt = Some(super::DaemonRestartPrompt::default());
+            }
             TurnEvent::DaemonLinkReconnected { active_model_state } => {
+                self.daemon_restart_prompt = None;
                 self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
                 self.retry_pending_queue_edit();
                 self.invalidate_session_rail_for_reconnect();
-                if self.daemon_link.take().is_some() {
-                    self.daemon_draining = false;
+                let had_link = self.daemon_link.take().is_some();
+                self.daemon_draining = false;
+                if had_link {
                     self.show_toast("daemon reconnected", ToastKind::Success);
                 }
             }
@@ -747,6 +789,7 @@ impl App {
                 self.invalidate_session_rail_for_reconnect();
             }
             TurnEvent::DaemonLinkTerminal { error } => {
+                self.daemon_restart_prompt = None;
                 self.cancel_model_controls_for_terminal_link();
                 self.daemon_link = None;
                 self.daemon_draining = false;
@@ -4858,6 +4901,37 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("rename_session  name=\"Test session\"")),
             "{restored_lines:?}"
+        );
+    }
+
+    #[test]
+    fn provisional_new_session_daemon_restart_prompt_clears_loading_placeholder() {
+        use crate::tui::agent_runner::{GLOBAL_ATTACHMENT_EPOCH, QueuedTurnEvent};
+        use crate::tui::session_setup::SessionSetupPane;
+        use cockpit_client::presentation::TurnEvent;
+
+        let mut app = App::new(Some(std::path::Path::new("/tmp/project")), false);
+        app.provisional_new_session = true;
+        app.overlay = Overlay::SessionSetup(SessionSetupPane::loading(false));
+        app.session_setup_inline = Some(SessionSetupPane::loading_inline(false));
+
+        app.route_queued_turn_event(QueuedTurnEvent {
+            attachment_epoch: GLOBAL_ATTACHMENT_EPOCH,
+            event: TurnEvent::DaemonRestartPrompt,
+        });
+
+        assert!(app.daemon_restart_prompt.is_some());
+        if let Overlay::SessionSetup(pane) = &app.overlay {
+            assert_eq!(
+                pane.error_message(),
+                Some("Daemon stopped; choose Restart or Quit.")
+            );
+        }
+        assert_eq!(
+            app.session_setup_inline
+                .as_ref()
+                .and_then(|pane| pane.error_message()),
+            Some("Daemon stopped; choose Restart or Quit.")
         );
     }
 }

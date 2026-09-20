@@ -43,6 +43,24 @@ impl App {
     /// - left-up → finalize drag-select (selection persists for copy).
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
+        if let Some(prompt) = self.daemon_restart_prompt.as_mut() {
+            let restart = point_in(prompt.restart_rect, mouse.column, mouse.row);
+            let quit = point_in(prompt.quit_rect, mouse.column, mouse.row);
+            if matches!(mouse.kind, MouseEventKind::Moved) {
+                if restart {
+                    prompt.focus = DaemonRestartFocus::Restart;
+                } else if quit {
+                    prompt.focus = DaemonRestartFocus::Quit;
+                }
+            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if restart {
+                    self.accept_daemon_restart();
+                } else if quit {
+                    self.quit_after_daemon_stop();
+                }
+            }
+            return;
+        }
         // Toast dismissal on "meaningful" mouse events — clicks and
         // wheels count, motion-only / drag-continuation / release
         // don't (those are part of an in-flight gesture and the

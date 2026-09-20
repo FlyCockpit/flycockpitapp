@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -371,6 +371,9 @@ pub struct AgentRunner {
     pub control_tx: mpsc::Sender<ControlRequest>,
     /// Response-bearing requests sent over the already-attached daemon client.
     pub attached_request_tx: mpsc::Sender<AttachedRequest>,
+    /// Wakes the disconnected event task after the user accepts the restart
+    /// prompt. The lifecycle actor remains the sole spawn/reclaim authority.
+    pub(crate) daemon_restart_tx: mpsc::Sender<()>,
     /// Drained per tick into [`crate::tui::app::App::history`].
     pub(crate) events: Arc<Mutex<Vec<QueuedTurnEvent>>>,
     pub(crate) event_notify: Arc<Notify>,
@@ -608,6 +611,7 @@ impl AgentRunner {
             record_tx: record_tx.unwrap_or_else(|| mpsc::channel(1).0),
             control_tx: control_tx.unwrap_or_else(|| mpsc::channel(1).0),
             attached_request_tx: attached_request_tx.unwrap_or_else(|| mpsc::channel(1).0),
+            daemon_restart_tx: mpsc::channel(1).0,
             events: events.unwrap_or_else(|| Arc::new(Mutex::new(Vec::new()))),
             event_notify: Arc::new(Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
@@ -1037,6 +1041,7 @@ fn is_global_turn_event(event: &TurnEvent) -> bool {
     matches!(
         event,
         TurnEvent::DaemonLinkReconnecting { .. }
+            | TurnEvent::DaemonRestartPrompt
             | TurnEvent::DaemonLinkReconnected { .. }
             | TurnEvent::DaemonLinkResynced { .. }
             | TurnEvent::DaemonLinkTerminal { .. }
@@ -1623,11 +1628,106 @@ pub struct SessionSwitchOutcome {
 #[derive(Clone)]
 struct LocalReconnectDriver {
     endpoint: ClientEndpoint,
+    lifecycle: LifecycleClient,
 }
 
 impl LocalReconnectDriver {
     async fn connect(&self) -> Result<DaemonClient, anyhow::Error> {
         DaemonClient::connect_endpoint(&self.endpoint).await
+    }
+
+    async fn resolve_owner(&mut self) -> Result<cockpit_client::LifecycleResolution, String> {
+        let resolution = self.lifecycle.resolve_default().await?;
+        self.endpoint = resolution.endpoint.clone();
+        Ok(resolution)
+    }
+}
+
+/// Match Syncthing's bounded-restart principle with a deliberately small TUI
+/// budget: three trusted daemon restarts in any rolling minute reconnect
+/// automatically; the fourth requires the visible restart decision.
+const AUTOMATIC_RESTARTS_PER_MINUTE: usize = 3;
+/// Bounded wait for lifecycle resolution after the user accepts `[ Restart ]`.
+/// Persistent failure re-presents the restart decision instead of spinning forever.
+const DAEMON_RESTART_RESOLVE_ATTEMPTS: usize = 120;
+/// After transport/process-exit wins the inner `select!`, the reader may still
+/// enqueue `DaemonDraining` for a graceful `cockpit daemon restart`.
+const POST_DROP_DRAINING_DRAIN: Duration = Duration::from_millis(100);
+
+async fn absorb_late_daemon_draining(
+    client: &cockpit_client::DaemonClient,
+    saw_draining: bool,
+) -> bool {
+    if saw_draining {
+        return true;
+    }
+    let deadline = Instant::now() + POST_DROP_DRAINING_DRAIN;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        if matches!(event, proto::Event::DaemonDraining { .. }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn post_drop_trusted_restart(
+    saw_draining: bool,
+    guard: &mut AutomaticRestartGuard,
+    now: Instant,
+) -> bool {
+    saw_draining && guard.allow(now)
+}
+
+fn push_restart_prompt_if_untrusted_drop(
+    saw_draining: bool,
+    automatic_restarts: &mut AutomaticRestartGuard,
+    now: Instant,
+    events: &Arc<Mutex<Vec<QueuedTurnEvent>>>,
+    event_notify: &Arc<Notify>,
+) -> bool {
+    let trusted_restart = post_drop_trusted_restart(saw_draining, automatic_restarts, now);
+    if !trusted_restart {
+        push_turn_event(
+            events,
+            event_notify,
+            GLOBAL_ATTACHMENT_EPOCH,
+            TurnEvent::DaemonRestartPrompt,
+        );
+    }
+    trusted_restart
+}
+
+struct AutomaticRestartGuard {
+    attempts: VecDeque<Instant>,
+}
+
+impl AutomaticRestartGuard {
+    fn new() -> Self {
+        Self {
+            attempts: VecDeque::new(),
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        let window = Duration::from_secs(60);
+        while self
+            .attempts
+            .front()
+            .is_some_and(|attempt| now.saturating_duration_since(*attempt) >= window)
+        {
+            self.attempts.pop_front();
+        }
+        if self.attempts.len() >= AUTOMATIC_RESTARTS_PER_MINUTE {
+            return false;
+        }
+        self.attempts.push_back(now);
+        true
     }
 }
 
@@ -2478,6 +2578,7 @@ pub async fn attach_to_session(
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedLifecycle {
     pub(crate) endpoint: ClientEndpoint,
+    pub(crate) process_watch: Option<cockpit_client::DaemonProcessWatch>,
     /// Keeps an ephemeral owner alive across lifecycle selection and the
     /// presentation's first follow-up connection.
     pub(crate) lifetime_client: Option<DaemonClient>,
@@ -2492,6 +2593,7 @@ impl From<cockpit_client::LifecycleResolution> for SelectedLifecycle {
     fn from(value: cockpit_client::LifecycleResolution) -> Self {
         Self {
             endpoint: value.endpoint,
+            process_watch: value.process_watch,
             lifetime_client: value.lifetime_client,
             owns_daemon: value.owns_daemon,
             ephemeral_owner: value.ephemeral_owner,
@@ -2568,6 +2670,7 @@ async fn try_spawn_inner(
         let startup_notice = daemon.startup_notice.clone();
         let promoted_from_ephemeral = daemon.promoted_from_ephemeral;
         let _lifetime_client = daemon.lifetime_client;
+        let process_watch = daemon.process_watch;
         let endpoint = daemon.endpoint;
         let client = DaemonClient::connect_endpoint(&endpoint)
             .await
@@ -2699,6 +2802,7 @@ async fn try_spawn_inner(
         Ok::<_, String>((
             client,
             endpoint,
+            process_watch,
             lifecycle,
             session_id,
             short_id,
@@ -2727,6 +2831,7 @@ async fn try_spawn_inner(
     let (
         client,
         endpoint,
+        process_watch,
         lifecycle,
         session_id,
         short_id,
@@ -2758,6 +2863,7 @@ async fn try_spawn_inner(
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
     let (control_tx, mut control_rx) = mpsc::channel::<ControlRequest>(32);
     let (attached_request_tx, mut attached_request_rx) = mpsc::channel::<AttachedRequest>(32);
+    let (daemon_restart_tx, mut daemon_restart_rx) = mpsc::channel::<()>(1);
     let events = Arc::new(Mutex::new(Vec::new()));
     if let Some(text) = startup_notice {
         events.lock().unwrap().push(QueuedTurnEvent {
@@ -3130,8 +3236,9 @@ async fn try_spawn_inner(
         let attachment_ready_tx = attachment_ready_tx.clone();
         let event_ephemeral_owner = ephemeral_owner.clone();
         let transition_gate = transition_gate.clone();
-        let driver = LocalReconnectDriver {
+        let mut driver = LocalReconnectDriver {
             endpoint: endpoint.clone(),
+            lifecycle: lifecycle.clone(),
         };
         // The current primary (root-frame) agent, tracked so a subagent pop
         // returns the active-agent slot to the right primary after a `/plan`
@@ -3166,6 +3273,8 @@ async fn try_spawn_inner(
                 client_epoch: 0,
             };
             let mut saw_draining = false;
+            let mut process_watch = process_watch;
+            let mut automatic_restarts = AutomaticRestartGuard::new();
             loop {
                 let client_epoch = *client_epoch_rx.borrow_and_update();
                 event_state.client_epoch = client_epoch;
@@ -3182,6 +3291,21 @@ async fn try_spawn_inner(
                             break;
                         }
                         event = client.next_event() => event,
+                        process_exit = async {
+                            match process_watch.as_mut() {
+                                Some(watch) => watch.wait_for_exit().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match process_exit {
+                                Ok(()) => None,
+                                Err(error) => {
+                                    tracing::debug!(%error, "daemon process watch unavailable; retaining socket EOF fallback");
+                                    process_watch = None;
+                                    continue;
+                                }
+                            }
+                        }
                     };
                     let Some(event) = event else {
                         break;
@@ -3198,8 +3322,6 @@ async fn try_spawn_inner(
                     };
                     if matches!(event, proto::Event::DaemonDraining { .. }) {
                         saw_draining = true;
-                    } else if saw_draining {
-                        saw_draining = false;
                     }
                     let resync_driver = driver.clone();
                     let resync_current_client = current_client.clone();
@@ -3229,6 +3351,56 @@ async fn try_spawn_inner(
                 }
                 if !client.is_socket_backed() {
                     return;
+                }
+
+                // The old generation's watcher is spent even when socket EOF
+                // wins the race with its process notification. A successful
+                // replacement attach must always install a fresh watcher.
+                process_watch = None;
+
+                saw_draining = absorb_late_daemon_draining(&client, saw_draining).await;
+                let trusted_restart = push_restart_prompt_if_untrusted_drop(
+                    saw_draining,
+                    &mut automatic_restarts,
+                    Instant::now(),
+                    &events,
+                    &event_notify,
+                );
+                let mut recovery_lifetime_client = None;
+                if !trusted_restart {
+                    if daemon_restart_rx.recv().await.is_none() {
+                        return;
+                    }
+                    // Resolving through the host reuses #436's serialized
+                    // stale-endpoint reclaim and detached spawn path. Retain
+                    // its lifetime client until the replacement Attach below.
+                    let mut resolution = 'resolve: {
+                        loop {
+                            for _ in 0..DAEMON_RESTART_RESOLVE_ATTEMPTS {
+                                match driver.resolve_owner().await {
+                                    Ok(resolution) => break 'resolve resolution,
+                                    Err(error) => {
+                                        tracing::debug!(
+                                            %error,
+                                            "daemon restart lifecycle resolution failed"
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                    }
+                                }
+                            }
+                            push_turn_event(
+                                &events,
+                                &event_notify,
+                                GLOBAL_ATTACHMENT_EPOCH,
+                                TurnEvent::DaemonRestartPrompt,
+                            );
+                            if daemon_restart_rx.recv().await.is_none() {
+                                return;
+                            }
+                        }
+                    };
+                    process_watch = resolution.process_watch.take();
+                    recovery_lifetime_client = resolution.lifetime_client.take();
                 }
 
                 let mut attempt = 1;
@@ -3282,6 +3454,12 @@ async fn try_spawn_inner(
                                 GLOBAL_ATTACHMENT_EPOCH,
                                 TurnEvent::DaemonLinkReconnected { active_model_state },
                             );
+                            if process_watch.is_none()
+                                && let Ok(mut resolution) = driver.resolve_owner().await
+                            {
+                                process_watch = resolution.process_watch.take();
+                            }
+                            drop(recovery_lifetime_client.take());
                             break;
                         }
                         Err(ReconnectAttachError::Retriable(error)) => {
@@ -3318,6 +3496,7 @@ async fn try_spawn_inner(
         record_tx,
         control_tx,
         attached_request_tx,
+        daemon_restart_tx,
         events,
         event_notify,
         active_agent,
@@ -7823,6 +8002,93 @@ mod tests {
             *backoff.jitter.seen_upper_bounds.lock().unwrap(),
             vec![500, 1_000, 2_000, 4_000]
         );
+    }
+
+    #[test]
+    fn automatic_restart_guard_allows_three_per_rolling_minute() {
+        let start = Instant::now();
+        let mut guard = AutomaticRestartGuard::new();
+        assert!(guard.allow(start));
+        assert!(guard.allow(start + Duration::from_secs(10)));
+        assert!(guard.allow(start + Duration::from_secs(20)));
+        assert!(!guard.allow(start + Duration::from_secs(59)));
+        assert!(guard.allow(start + Duration::from_secs(60)));
+        assert!(!guard.allow(start + Duration::from_secs(61)));
+    }
+
+    fn test_client_with_events(
+        events: mpsc::Receiver<proto::Event>,
+    ) -> cockpit_client::DaemonClient {
+        let (requests, _requests_rx) = mpsc::channel(1);
+        cockpit_client::DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+            requests,
+            events,
+        })
+    }
+
+    #[tokio::test]
+    async fn absorb_late_daemon_draining_after_process_exit_waits_for_draining_frame() {
+        let (event_tx, event_rx) = mpsc::channel(4);
+        let client = test_client_with_events(event_rx);
+        let (mut watch, exited) = cockpit_client::DaemonProcessWatch::channel();
+        exited.send(true).expect("watch receiver remains live");
+        assert_eq!(watch.wait_for_exit().await, Ok(()));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            event_tx
+                .send(proto::Event::DaemonDraining { forced: false })
+                .await
+                .ok();
+        });
+        assert!(absorb_late_daemon_draining(&client, false).await);
+        let mut guard = AutomaticRestartGuard::new();
+        assert!(post_drop_trusted_restart(true, &mut guard, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn absorb_late_daemon_draining_without_draining_frame_stays_untrusted() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let client = test_client_with_events(event_rx);
+        assert!(!absorb_late_daemon_draining(&client, false).await);
+        let mut guard = AutomaticRestartGuard::new();
+        assert!(!post_drop_trusted_restart(
+            false,
+            &mut guard,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn fourth_trusted_daemon_drop_requires_restart_prompt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let start = Instant::now();
+        let mut automatic_restarts = AutomaticRestartGuard::new();
+        for secs in [0_u64, 10, 20] {
+            assert!(
+                push_restart_prompt_if_untrusted_drop(
+                    true,
+                    &mut automatic_restarts,
+                    start + Duration::from_secs(secs),
+                    &events,
+                    &notify,
+                ),
+                "trusted draining drop {secs}s must auto-reconnect"
+            );
+        }
+        assert!(
+            !push_restart_prompt_if_untrusted_drop(
+                true,
+                &mut automatic_restarts,
+                start + Duration::from_secs(30),
+                &events,
+                &notify,
+            ),
+            "fourth trusted restart in one minute must present the restart decision"
+        );
+        let drained = drain_turn_events(&events);
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(drained[0].event, TurnEvent::DaemonRestartPrompt));
     }
 
     #[tokio::test]

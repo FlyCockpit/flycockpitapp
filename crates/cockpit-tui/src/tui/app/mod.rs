@@ -45,6 +45,8 @@ pub(crate) use response_metrics_tokenizer::{
 };
 mod local_commands;
 mod model_controls;
+#[cfg(test)]
+mod model_selection_input_tests;
 mod models_refresh;
 mod mouse;
 mod mouse_gesture;

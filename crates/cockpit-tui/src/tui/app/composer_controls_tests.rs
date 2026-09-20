@@ -1269,6 +1269,56 @@ fn closing_composer_picker_fences_in_flight_control_request() {
 }
 
 #[test]
+fn detached_model_commit_without_runner_avoids_false_delivery_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    App::prepare_runner_attach_harness(&mut app);
+    app.agent_runner = None;
+    app.activate_composer_pill(ComposerControlKind::Model);
+    if app
+        .composer_controls
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.level == 0)
+    {
+        app.handle_key(press(KeyCode::Enter));
+    }
+    if let Some(picker) = app.composer_controls.picker.as_mut()
+        && let Some(idx) = picker.categories.get(picker.category).and_then(|category| {
+            category
+                .items
+                .iter()
+                .position(|item| item.id == "gpt-other")
+        })
+    {
+        picker.cursor = idx;
+    }
+    app.handle_key(press(KeyCode::Enter));
+    assert!(
+        app.pending_runner_attach.is_some(),
+        "choosing a model without a runner must queue attach"
+    );
+    assert!(
+        app.composer_controls.picker.as_ref().is_none_or(|picker| {
+            !picker
+                .status_text
+                .as_ref()
+                .is_some_and(|text| text.contains("Control request was not delivered"))
+        }),
+        "attach-in-flight must not surface a false delivery failure"
+    );
+    let attach = app.pending_runner_attach.as_ref().unwrap();
+    app.apply_runner_attach_result(attach.action_id, Err("session not found".to_string()));
+    assert!(app.composer_controls.picker.as_ref().is_some_and(|picker| {
+        picker.status_text.as_ref().is_some_and(|error| {
+            error
+                .to_ascii_lowercase()
+                .contains("could not start a session")
+        })
+    }));
+}
+
+#[test]
 fn fenced_model_selection_failed_delivery_releases_ownership() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, _control_rx) = app_with_runner(&tmp);
@@ -1295,7 +1345,6 @@ fn fenced_model_selection_failed_delivery_releases_ownership() {
         app.pending_model_selection.is_none(),
         "rejected fenced model selection must release ownership"
     );
-    assert!(app.composer_controls.picker.is_none());
     assert!(
         app.composer_controls.picker.is_none(),
         "fenced model rejection must not reopen the model picker"

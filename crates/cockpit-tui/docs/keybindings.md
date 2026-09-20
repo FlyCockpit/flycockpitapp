@@ -133,16 +133,16 @@ Box-level `[Send now] [Steer] [Held] [edit] [cancel]` also sit on the top border
 | `Enter` | submit | submit all answers |
 | `←/h` | back | return to the previous question |
 
-## Model picker
+## Composer model menu
+
+Opened from the model pill, `Ctrl+P`, or `/model`. The session rail stays visible.
 
 | Key | Action | Description |
 | --- | --- | --- |
-| `↑/↓` | move | highlight a model |
-| `type` | filter | filter the model list |
-| `Enter` | select | switch to the highlighted model |
-| `Ctrl+Enter` | make default | switch this session and save the future-session default |
-| `Ctrl+A` | add model | add a model to the scoped provider |
-| `Esc` | cancel | close without changing the model |
+| `↑/↓` | move | highlight a provider or model |
+| `Enter` | choose | drill into a provider or switch to the highlighted model |
+| `Ctrl+Enter` | default | set the highlighted model as the default for new sessions (settings default-model flow) |
+| `Esc` | back / close | go up a level or dismiss the menu without changing the model |
 
 ## Settings
 

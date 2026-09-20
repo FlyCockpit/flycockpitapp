@@ -1671,18 +1671,18 @@ fn reexec_watch_accepts_only_a_replacement_with_the_same_endpoint_and_clock() {
     let previous = cockpit_host::daemon_lifecycle::DaemonPidReceipt {
         pid: std::process::id(),
         executable: executable.clone(),
-        process_start: process_start.clone(),
+        process_start,
         publication_nonce: [1; 32],
     };
     let replacement = cockpit_host::daemon_lifecycle::DaemonPidReceipt {
         pid: std::process::id(),
         executable,
-        process_start: process_start.clone(),
+        process_start,
         publication_nonce: [2; 32],
     };
     let record = |socket_path: PathBuf, opened_at_unix_ms| super::DaemonEndpointRecord {
         pid: replacement.pid,
-        start_time: process_start.clone(),
+        start_time: process_start,
         socket_path,
         protocol_version: super::proto::PROTOCOL_VERSION,
         daemon_version: super::proto::DAEMON_VERSION.to_string(),

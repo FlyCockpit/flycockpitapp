@@ -1,8 +1,38 @@
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::support::{COMPOSER_PLACEHOLDER, HermeticCockpit, HermeticProfile, sgr_left_click};
+use rusqlite::{Connection, params};
+use uuid::Uuid;
 
 const HISTORY_MARKER: &str = "watchdog-history-marker-437";
+
+fn session_id_with_durable_marker(db_path: &Path, marker: &str) -> Uuid {
+    let session_id: String = Connection::open(db_path)
+        .expect("open hermetic session db")
+        .query_row(
+            "SELECT session_id FROM session_events \
+             WHERE type = 'user_message' AND data_json LIKE ?1 \
+             ORDER BY seq DESC LIMIT 1",
+            params![format!("%{marker}%")],
+            |row| row.get(0),
+        )
+        .expect("durable user message with history marker");
+    Uuid::parse_str(&session_id).expect("session id in sqlite")
+}
+
+fn durable_user_message_contains(db_path: &Path, session_id: Uuid, marker: &str) -> bool {
+    Connection::open(db_path)
+        .expect("open hermetic session db")
+        .query_row(
+            "SELECT data_json FROM session_events \
+             WHERE session_id = ?1 AND type = 'user_message' ORDER BY seq LIMIT 1",
+            params![session_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|json| json.contains(marker))
+        .unwrap_or(false)
+}
 
 fn attach_with_durable_history() -> HermeticCockpit {
     let mut session = HermeticCockpit::launch_ready(HermeticProfile::Default);
@@ -33,6 +63,7 @@ fn attach_with_durable_history() -> HermeticCockpit {
 #[test]
 fn sigkill_prompts_within_one_second_and_restart_replays_same_session() {
     let mut session = attach_with_durable_history();
+    let session_id = session_id_with_durable_marker(&session.home().db_path(), HISTORY_MARKER);
     let killed_at = Instant::now();
     session.sigkill_daemon();
     session
@@ -63,6 +94,10 @@ fn sigkill_prompts_within_one_second_and_restart_replays_same_session() {
             },
         )
         .expect("restart must reattach and replay SQLite history");
+    assert!(
+        durable_user_message_contains(&session.home().db_path(), session_id, HISTORY_MARKER),
+        "reattach must keep the durable transcript for the original session id"
+    );
     session.adopt_current_daemon_generation();
     session.reap();
     session.assert_reaped();
@@ -71,6 +106,7 @@ fn sigkill_prompts_within_one_second_and_restart_replays_same_session() {
 #[test]
 fn daemon_restart_reconnects_attached_tui_without_prompt() {
     let mut session = attach_with_durable_history();
+    let session_id = session_id_with_durable_marker(&session.home().db_path(), HISTORY_MARKER);
     let output = session.restart_daemon();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -89,6 +125,10 @@ fn daemon_restart_reconnects_attached_tui_without_prompt() {
             },
         )
         .expect("trusted restart must reconnect without user input");
+    assert!(
+        durable_user_message_contains(&session.home().db_path(), session_id, HISTORY_MARKER),
+        "trusted restart must preserve the durable session id and transcript"
+    );
     session.reap();
     session.assert_reaped();
 }

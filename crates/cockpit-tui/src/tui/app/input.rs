@@ -488,6 +488,12 @@ impl App {
         let Some(prompt) = self.daemon_restart_prompt.as_mut() else {
             return;
         };
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            self.quit_after_daemon_stop();
+            return;
+        }
         match key.code {
             KeyCode::Left | KeyCode::BackTab | KeyCode::Char('r') => {
                 prompt.focus = super::DaemonRestartFocus::Restart;

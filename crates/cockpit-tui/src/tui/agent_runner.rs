@@ -1647,6 +1647,9 @@ impl LocalReconnectDriver {
 /// budget: three trusted daemon restarts in any rolling minute reconnect
 /// automatically; the fourth requires the visible restart decision.
 const AUTOMATIC_RESTARTS_PER_MINUTE: usize = 3;
+/// Bounded wait for lifecycle resolution after the user accepts `[ Restart ]`.
+/// Persistent failure re-presents the restart decision instead of spinning forever.
+const DAEMON_RESTART_RESOLVE_ATTEMPTS: usize = 120;
 
 struct AutomaticRestartGuard {
     attempts: VecDeque<Instant>,
@@ -3235,6 +3238,7 @@ async fn try_spawn_inner(
                             attachment_replaced = true;
                             break;
                         }
+                        event = client.next_event() => event,
                         process_exit = async {
                             match process_watch.as_mut() {
                                 Some(watch) => watch.wait_for_exit().await,
@@ -3250,7 +3254,6 @@ async fn try_spawn_inner(
                                 }
                             }
                         }
-                        event = client.next_event() => event,
                     };
                     let Some(event) = event else {
                         break;
@@ -3318,12 +3321,28 @@ async fn try_spawn_inner(
                     // Resolving through the host reuses #436's serialized
                     // stale-endpoint reclaim and detached spawn path. Retain
                     // its lifetime client until the replacement Attach below.
-                    let mut resolution = loop {
-                        match driver.resolve_owner().await {
-                            Ok(resolution) => break resolution,
-                            Err(error) => {
-                                tracing::debug!(%error, "daemon restart lifecycle resolution failed");
-                                tokio::time::sleep(Duration::from_millis(500)).await;
+                    let mut resolution = 'resolve: {
+                        loop {
+                            for _ in 0..DAEMON_RESTART_RESOLVE_ATTEMPTS {
+                                match driver.resolve_owner().await {
+                                    Ok(resolution) => break 'resolve resolution,
+                                    Err(error) => {
+                                        tracing::debug!(
+                                            %error,
+                                            "daemon restart lifecycle resolution failed"
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                    }
+                                }
+                            }
+                            push_turn_event(
+                                &events,
+                                &event_notify,
+                                GLOBAL_ATTACHMENT_EPOCH,
+                                TurnEvent::DaemonRestartPrompt,
+                            );
+                            if daemon_restart_rx.recv().await.is_none() {
+                                return;
                             }
                         }
                     };
@@ -7942,6 +7961,20 @@ mod tests {
         assert!(!guard.allow(start + Duration::from_secs(59)));
         assert!(guard.allow(start + Duration::from_secs(60)));
         assert!(!guard.allow(start + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn fourth_trusted_daemon_drop_requires_restart_prompt() {
+        let start = Instant::now();
+        let mut guard = AutomaticRestartGuard::new();
+        let saw_draining = true;
+        assert!(saw_draining && guard.allow(start));
+        assert!(saw_draining && guard.allow(start + Duration::from_secs(10)));
+        assert!(saw_draining && guard.allow(start + Duration::from_secs(20)));
+        assert!(
+            !(saw_draining && guard.allow(start + Duration::from_secs(30))),
+            "fourth trusted restart in one minute must present the restart decision"
+        );
     }
 
     #[tokio::test]

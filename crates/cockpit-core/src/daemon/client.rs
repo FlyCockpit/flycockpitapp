@@ -436,7 +436,7 @@ fn daemon_process_watch(socket: &Path) -> Option<cockpit_client::DaemonProcessWa
     ))]
     {
         use cockpit_host::daemon_lifecycle::{
-            VerifiedProcessOutcome, acquire_verified_daemon_process,
+            PidIdentity, VerifiedProcessOutcome, acquire_verified_daemon_process,
         };
 
         let canonical = crate::daemon::DaemonPaths::resolve_canonical().ok()?;
@@ -464,9 +464,15 @@ fn daemon_process_watch(socket: &Path) -> Option<cockpit_client::DaemonProcessWa
                     Ok(false) => {
                         process = match acquire_verified_daemon_process(&receipt) {
                             VerifiedProcessOutcome::Verified(process) => process,
-                            VerifiedProcessOutcome::Identity(_) => {
+                            VerifiedProcessOutcome::Identity(
+                                PidIdentity::Missing | PidIdentity::NotDaemon,
+                            ) => {
                                 let _ = exited.send(true);
                                 return;
+                            }
+                            VerifiedProcessOutcome::Identity(PidIdentity::Unverified) => return,
+                            VerifiedProcessOutcome::Identity(PidIdentity::VerifiedDaemon) => {
+                                unreachable!("verified daemon identity is not returned as Identity")
                             }
                         };
                     }

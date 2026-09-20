@@ -1,24 +1,24 @@
-                                                                                
-  Tune the agent                                                                
-  These settings are independent; the defaults are a sane starting point.       
-  ────────────────────────────                                                  
-                                                                                
-  ╭ Optimizations ───────────────────────────────────────────────────────────╮  
-  │ ▸ Interactive subagents: on                                              │  
-  │   Self-verification: on                                                  │  
-  │   Goal skeptics: 2 goal skeptics                                         │  
-  │   Make default agent: on                                                 │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  ╰──────────────────────────────────────────────────────────────────────────╯  
-  ↑↓ move   space toggle   enter continue   esc back              [ Continue ]  
-                                                                                
+╭ Optimizations ───────────────────────────────────────────────────────────────╮
+│ ▸ Interactive subagents: on                                                  │
+│   Self-verification: on                                                      │
+│   Goal skeptics: 2 goal skeptics                                             │
+│   Make default agent: on                                                     │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

@@ -1,10 +1,6 @@
 use super::{App, HistoryEntry};
 use crate::tui::agent_runner::AgentRunner;
-use crate::tui::async_action::{
-    AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
-};
 use cockpit_client::submission::ClientUserSubmission;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use std::fs;
 use tokio::sync::mpsc;
 
@@ -114,39 +110,6 @@ fn passive_same_generation_terminal_result_corrects_default_and_divergence() {
     );
     assert_eq!(app.active_model_selection, Some(active));
     assert_eq!(app.active_model_state_generation, 4);
-}
-
-fn press(code: KeyCode) -> KeyEvent {
-    KeyEvent {
-        code,
-        modifiers: KeyModifiers::empty(),
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    }
-}
-
-fn ctrl_press(code: KeyCode) -> KeyEvent {
-    KeyEvent {
-        code,
-        modifiers: KeyModifiers::CONTROL,
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    }
-}
-
-fn snapshot_config() -> cockpit_config::providers::ProvidersConfig {
-    let mut cfg = cockpit_config::providers::ProvidersConfig::default();
-    cfg.providers.insert(
-        "p".to_string(),
-        cockpit_config::providers::ProviderEntry {
-            models: vec![cockpit_config::providers::ModelEntry {
-                id: "a".to_string(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-    );
-    cfg
 }
 
 fn write_config(path: &std::path::Path) {

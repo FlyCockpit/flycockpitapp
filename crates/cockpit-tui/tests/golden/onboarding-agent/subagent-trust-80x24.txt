@@ -1,0 +1,24 @@
+                                                                                
+  How much does this subagent see?                                              
+  Confirm the shared trust classification for every unset model.                
+  ────────────────────────────                                                  
+                                                                                
+  ╭ Trust ───────────────────────────────────────────────────────────────────╮  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  ↑↓ choose   space confirm   enter continue   esc back           [ Continue ]  
+                                                                                

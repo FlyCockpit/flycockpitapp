@@ -1,0 +1,24 @@
+                                                                                
+  Subagent                                                                      
+  Name it, then choose its models, trust, tools, and helpers.                   
+  ────────────────────────────                                                  
+                                                                                
+  ╭ Subagent ────────────────────────────────────────────────────────────────╮  
+  │ Name  runner                                                             │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  type text   enter continue   esc back                           [ Continue ]  
+                                                                                

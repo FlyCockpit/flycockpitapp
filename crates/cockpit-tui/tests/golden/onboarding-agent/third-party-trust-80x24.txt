@@ -1,0 +1,24 @@
+                                                                                
+  Trust this publisher?                                                         
+  Confirm who published this pinned definition before it can run.               
+  ────────────────────────────                                                  
+                                                                                
+  ╭ Trust ───────────────────────────────────────────────────────────────────╮  
+  │ ○ I trust this publisher and pinned source                               │  
+  │ Click once to select; click the selected row again to confirm.           │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  ↑↓ choose   space confirm   enter continue   esc back           [ Continue ]  
+                                                                                

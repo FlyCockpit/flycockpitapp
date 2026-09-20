@@ -1,0 +1,24 @@
+                                                                                
+  Your agent is ready                                                           
+  The agent package was committed successfully.                                 
+  ────────────────────────────                                                  
+                                                                                
+  ╭ Status ──────────────────────────────────────────────────────────────────╮  
+  │ ◐  Agent package committed successfully.  ✓                              │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  enter continue setup                                                [ Done ]  
+                                                                                

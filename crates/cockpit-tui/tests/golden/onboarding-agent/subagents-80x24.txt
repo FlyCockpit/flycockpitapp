@@ -1,0 +1,24 @@
+                                                                                
+  Define subagents                                                              
+  Helpers this agent can delegate to. The runner is ready to keep or edit.      
+  ────────────────────────────                                                  
+                                                                                
+  ╭ Subagents  ·  1 ─────────────────────────────────────────────────────────╮  
+  │ ▸ runner  ·  untrusted                                                   │  
+  │   Review agent package                                                   │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  a add   e edit   d delete   ↑↓ move   enter co [ Add subagent ] [ Continue ]  
+                                                                                

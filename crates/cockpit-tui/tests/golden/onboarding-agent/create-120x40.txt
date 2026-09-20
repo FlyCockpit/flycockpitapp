@@ -1,0 +1,40 @@
+                                                                                                                        
+                 Create your agent                                                                                      
+                 Everything is ready for the stable create operation.                                                   
+                 ────────────────────────────                                                                           
+                                                                                                                        
+                 ╭ Status ────────────────────────────────────────────────────────────────────────────╮                 
+                 │ ▣ Make default agent  on                                                           │                 
+                 │ ◐  Ready to submit the stable create operation.                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 enter create   esc review                                             [ Create agent ]                 
+                                                                                                                        

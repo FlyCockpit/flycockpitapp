@@ -1,0 +1,24 @@
+                                                                                
+  Pin a third-party agent                                                       
+  Paste the immutable source locator you want Cockpit to pin.                   
+  ────────────────────────────                                                  
+                                                                                
+  ╭ Source ──────────────────────────────────────────────────────────────────╮  
+  │ Locator                                                                  │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  type text   enter continue   esc back                           [ Continue ]  
+                                                                                

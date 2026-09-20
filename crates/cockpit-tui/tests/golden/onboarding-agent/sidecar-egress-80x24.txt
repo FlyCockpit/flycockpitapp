@@ -1,0 +1,24 @@
+                                                                                
+  Let the sidecar reach the network?                                            
+  This remote sidecar needs explicit permission to leave the machine.           
+  ────────────────────────────                                                  
+                                                                                
+  ╭ Trust ───────────────────────────────────────────────────────────────────╮  
+  │ ○ Allow remote sidecar egress                                            │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  ↑↓ choose   space confirm   enter continue   esc back           [ Continue ]  
+                                                                                

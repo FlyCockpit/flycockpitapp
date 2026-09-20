@@ -154,10 +154,6 @@ impl Level {
         level
     }
 
-    fn select(&mut self, index: usize) {
-        self.selected_session_id = self.cards.get(index).map(|(summary, _)| summary.session_id);
-    }
-
     fn restore_selection(&mut self, session_id: Option<Uuid>) {
         let requested_id = session_id.or(self.selected_session_id);
         let index = requested_id.and_then(|id| {
@@ -1033,15 +1029,15 @@ impl SessionRail {
             .pending_favorites
             .get(&canonical_root)
             .and_then(|intent| intent.queued);
-        if let Some(desired) = queued {
-            if let Some(intent) = self.pending_favorites.get_mut(&canonical_root) {
-                intent.desired = desired;
-                intent.queued = None;
-                intent.in_flight = true;
-                intent.generation = self.list_generation;
-                intent.attachment_generation = self.attachment_generation;
-                intent.target_session_id = session_id;
-            }
+        if let Some(desired) = queued
+            && let Some(intent) = self.pending_favorites.get_mut(&canonical_root)
+        {
+            intent.desired = desired;
+            intent.queued = None;
+            intent.in_flight = true;
+            intent.generation = self.list_generation;
+            intent.attachment_generation = self.attachment_generation;
+            intent.target_session_id = session_id;
             self.counts.favorite_started = self.counts.favorite_started.saturating_add(1);
             Some((session_id, canonical_root, desired))
         } else {
@@ -1378,10 +1374,10 @@ impl SessionRail {
                 if let Some(index) = hit_card(&self.card_hits, mouse.column, mouse.row) {
                     self.focus();
                     self.column_focus = ColumnFocus::List;
-                    if let Some((summary, _)) = self.filtered_cards().get(index) {
-                        if let Some(level) = self.levels.last_mut() {
-                            level.selected_session_id = Some(summary.session_id);
-                        }
+                    if let Some((summary, _)) = self.filtered_cards().get(index)
+                        && let Some(level) = self.levels.last_mut()
+                    {
+                        level.selected_session_id = Some(summary.session_id);
                     }
                     self.ensure_session_scroll_shows_selected();
                     return self.preview_for_selection();

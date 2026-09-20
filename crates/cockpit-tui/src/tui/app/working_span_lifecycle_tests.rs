@@ -134,6 +134,12 @@ fn idle_reason_status_copy_matches_reason_severity() {
     let stalled = app.idle_reason_status_text().unwrap();
     assert!(stalled.contains("run `/goal resume`"));
     assert!(stalled.contains("send guidance"));
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text == stalled),
+        "idle reason moved to the transient toast surface"
+    );
 
     app.apply_event(TurnEvent::AgentIdle {
         turn_id: None,

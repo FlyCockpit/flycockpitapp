@@ -2235,21 +2235,12 @@ impl App {
             .unwrap_or_else(|| 0);
         PaneGeometry::compute(
             self.input_height(),
-            self.indicator_lines(),
             self.queue_lines(),
             self.suggestion_box_lines(),
-            self.pins_indicator_lines(),
-            self.sandbox_notice_lines(),
             self.total_history_lines(),
             dialog,
             compact,
         )
-    }
-
-    /// Height of the below-input pin-count indicator (`pinned-messages`):
-    /// one row when the session has ≥1 pin, hidden (zero) otherwise.
-    pub(super) fn pins_indicator_lines(&self) -> u16 {
-        if self.pin_count > 0 { 1 } else { 0 }
     }
 
     /// Full text of the persistent sandbox-down notice (§6.5), or `None` when
@@ -2301,6 +2292,7 @@ impl App {
             })
     }
 
+    #[cfg(test)]
     pub(super) fn persistent_notice_text(&self) -> Option<String> {
         // Sandbox recovery is safety-critical, so it keeps the shared notice
         // row while active. Command-capability startup notices are next; the
@@ -2313,17 +2305,6 @@ impl App {
                     .as_ref()
                     .map(|notice| crate::tui::auth_failure::notice_text(notice, true))
             })
-    }
-
-    /// Height of the persistent below-input sandbox-down notice (§6.5): its
-    /// wrapped row count (capped) when the sandbox can't initialize, zero
-    /// otherwise. Persistent — never times out like a toast.
-    pub(super) fn sandbox_notice_lines(&self) -> u16 {
-        let Some(text) = self.persistent_notice_text() else {
-            return 0;
-        };
-        let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
-        sandbox_notice_wrapped_rows(&text, term_w)
     }
 }
 

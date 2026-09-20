@@ -238,8 +238,8 @@ fn slash_menu_cache_rebuilds_after_close_and_reopen() {
 
 #[test]
 fn takes_args_is_a_declared_field() {
-    // `takes_args` is declared on the registry row so completion does
-    // not infer behavior from description prose.
+    // `takes_args` remains declared catalog metadata even though completion
+    // now consistently appends a space for every command.
     let copy = SLASH_COMMANDS.iter().find(|c| c.name == "copy").unwrap();
     assert!(copy.takes_args, "/copy declares argument support");
     let settings = SLASH_COMMANDS
@@ -250,17 +250,15 @@ fn takes_args_is_a_declared_field() {
 }
 
 #[test]
-fn completion_text_adds_a_trailing_space_only_for_arg_commands() {
-    // The Tab-completion target: arg-taking commands get a trailing
-    // space so the cursor lands ready for the argument; bare commands
-    // get none (`slash-command-tab-completion.md`).
+fn completion_text_adds_a_trailing_space_for_every_command() {
+    // The Tab-completion target always leaves the cursor ready for more text.
     let copy = SLASH_COMMANDS.iter().find(|c| c.name == "copy").unwrap();
     assert_eq!(copy.completion_text(), "/copy ");
     let settings = SLASH_COMMANDS
         .iter()
         .find(|c| c.name == "settings")
         .unwrap();
-    assert_eq!(settings.completion_text(), "/settings");
+    assert_eq!(settings.completion_text(), "/settings ");
 }
 
 #[test]

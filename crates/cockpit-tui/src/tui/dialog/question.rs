@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::tui::settings::secret_display::mask_value;
 
 use crate::tui::dialog::{Answer, DialogOption, DialogOutcome, DialogState, Page, PageKind};
-use crate::tui::geometry::{MIN_HISTORY_HEIGHT, STATUS_HEIGHT};
+use crate::tui::geometry::MIN_HISTORY_HEIGHT;
 use crate::tui::keys_overlay::{DialogBindingId, dialog_binding, dialog_footer_bindings};
 use crate::tui::pane::Pane;
 use crate::tui::theme::{
@@ -362,14 +362,14 @@ impl QuestionDialog {
         answer_want > collapsed_answer_h
     }
 
-    /// Height ceiling after reserving the pinned status row and one row of
-    /// history. Expanded mode prefers a 5/6 terminal share and both modes use
+    /// Height ceiling after reserving one row of history. Expanded mode
+    /// prefers a 5/6 terminal share and both modes use
     /// the 16-row cap only when the terminal can afford it.
     fn effective_height_cap(&self, expanded: bool) -> u16 {
         if self.last_term_height == 0 {
             return MAX_DIALOG_HEIGHT;
         }
-        let reserve = STATUS_HEIGHT.saturating_add(MIN_HISTORY_HEIGHT);
+        let reserve = MIN_HISTORY_HEIGHT;
         let afford = self.last_term_height.saturating_sub(reserve).max(1);
         let cap = if expanded {
             let frac =
@@ -3288,7 +3288,7 @@ mod tests {
         d.sync_viewport(Rect::new(0, 0, 80, 10), 12);
 
         let height = d.desired_height();
-        let afford = 12 - STATUS_HEIGHT - MIN_HISTORY_HEIGHT;
+        let afford = 12 - MIN_HISTORY_HEIGHT;
         assert!(height <= afford, "height={height}, afford={afford}");
         assert!(height >= 1, "height={height}");
     }
@@ -3311,7 +3311,7 @@ mod tests {
         d.sync_viewport(Rect::new(0, 0, 80, 8), 10);
 
         let height = d.desired_height();
-        let afford = 10 - STATUS_HEIGHT - MIN_HISTORY_HEIGHT;
+        let afford = 10 - MIN_HISTORY_HEIGHT;
         assert!(height <= afford, "height={height}, afford={afford}");
     }
 
@@ -3324,17 +3324,16 @@ mod tests {
     }
 
     #[test]
-    fn expanded_request_leaves_status_and_history() {
+    fn expanded_request_leaves_history() {
         let mut d = tall_approval_dialog();
         d.sync_viewport(Rect::new(0, 0, 80, 10), 12);
         assert!(!d.handle_key(press(KeyCode::Tab)));
         d.sync_viewport(Rect::new(0, 0, 80, 10), 12);
 
         let geometry =
-            crate::tui::geometry::PaneGeometry::compute(0, 0, 0, 0, 0, 0, 1, 0, d.desired_height());
-        assert_eq!(geometry.status, STATUS_HEIGHT);
+            crate::tui::geometry::PaneGeometry::compute(0, 0, 0, 1, 0, d.desired_height());
         assert!(geometry.history >= MIN_HISTORY_HEIGHT);
-        assert!(geometry.compact + geometry.status + geometry.history <= 12);
+        assert!(geometry.compact + geometry.history <= 12);
     }
 
     #[test]
@@ -3344,7 +3343,7 @@ mod tests {
         assert!(!d.handle_key(press(KeyCode::Tab)));
         d.sync_viewport(Rect::new(0, 0, 80, 3), 5);
 
-        assert!(d.desired_height() + STATUS_HEIGHT + MIN_HISTORY_HEIGHT <= 5);
+        assert!(d.desired_height() + MIN_HISTORY_HEIGHT <= 5);
     }
 
     #[test]

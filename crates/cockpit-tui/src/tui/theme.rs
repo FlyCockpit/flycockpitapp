@@ -87,14 +87,6 @@ pub const DISABLED_ANSI: Color = Color::Indexed(DISABLED_INDEX);
 pub const HOVER_BG_ANSI: Color = Color::Indexed(HOVER_BG_INDEX);
 pub const PLACEHOLDER_ANSI: Color = Color::Indexed(PLACEHOLDER_INDEX);
 
-/// Border color for the composer/input box and queue strip while the agent
-/// is busy (request in flight).
-pub const BUSY_BORDER: Color = Color::Indexed(245);
-pub const BUSY_BORDER_INDEX: u8 = 245;
-pub const IDLE_BORDER: Color = Color::White;
-pub const SHELL_MODE_BORDER: Color = Color::Indexed(70);
-pub const SHELL_MODE_BADGE_BG: Color = SHELL_MODE_BORDER;
-
 pub const STATUS_BRANCH_BADGE: Color = Color::Indexed(220);
 pub const FAVORITE_MODEL: Color = Color::Indexed(178);
 pub const CHIP_TEXT: Color = METADATA_TEXT;
@@ -350,16 +342,6 @@ mod tests {
         assert_eq!(PLACEHOLDER_ANSI, Color::Indexed(245));
         // Yellow shares BRASS's RGB, so it shares its fallback too.
         assert_eq!(YELLOW_INDEX, BRASS_INDEX);
-    }
-
-    #[test]
-    fn busy_border_role_stays_visible_and_not_dim_divider() {
-        assert_eq!(BUSY_BORDER, Color::Indexed(BUSY_BORDER_INDEX));
-        assert_ne!(BUSY_BORDER, DIVIDER_DIM);
-        assert!(
-            (244..=250).contains(&BUSY_BORDER_INDEX),
-            "busy border must stay in the visible-grey band"
-        );
     }
 
     #[test]

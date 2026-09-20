@@ -1603,14 +1603,14 @@ impl App {
                 false
             }
             KeyCode::Esc => {
-                // Esc cancels an in-progress slash command. Otherwise:
+                // Esc dismisses the slash palette but preserves the query.
                 // when vim is enabled, it drops the composer into
                 // Normal mode. When vim is disabled it's a no-op
                 // (deliberate — too easy to hit accidentally for an
                 // exit path; `/exit`, Ctrl+C, Ctrl+D cover that).
                 if self.slash_query().is_some() {
-                    self.clear_composer_buffer();
-                    self.reset_slash_window();
+                    self.slash_dismissed = true;
+                    self.slash_menu_cache.borrow_mut().take();
                 } else if self.composer.vim_enabled() {
                     self.composer.set_vim_mode(VimMode::Normal);
                     self.composer.set_pending_g(false);
@@ -1930,13 +1930,13 @@ impl App {
     /// narrowed match set; also restores the "Enter runs the top match"
     /// default. Harmless when no slash query is active.
     pub(super) fn reset_slash_window(&mut self) {
+        self.slash_dismissed = false;
         self.slash_selected = 0;
         self.slash_scroll = 0;
         // A non-Tab composer edit changes the live query, so any
         // in-progress Tab-completion cycle is abandoned: drop the anchored
         // stem and let the menu re-derive from the freshly typed text
         // (`slash-command-tab-completion.md`).
-        self.slash_cycle_stem = None;
         self.refresh_slash_menu_cache();
     }
 
@@ -2018,12 +2018,9 @@ impl App {
     }
 
     /// Tab inside an open slash menu: complete the composer to the
-    /// highlighted command, or — when the composer already holds that
-    /// completion — advance to the next match and complete to it, cycling
-    /// forward the same way ↑/↓ moves the highlight
-    /// (`slash-command-tab-completion.md`). Never runs or submits; leaves
-    /// the cursor after the inserted command (plus a trailing space for
-    /// arg-taking commands). A no-op when the menu has zero matches.
+    /// highlighted command. Never runs or submits; leaves the cursor after
+    /// the inserted command and its trailing space, which closes command
+    /// mode. A no-op when the menu has zero matches.
     /// Returns true when the slash menu was open (so the caller consumes
     /// the key), false when there was no slash menu to act on.
     pub(super) fn complete_slash_selection(&mut self) -> bool {
@@ -2043,23 +2040,9 @@ impl App {
             // Menu open but nothing matches — Tab is inert.
             return true;
         }
-        // Anchor cycling on the stem the user originally typed, captured on
-        // the first Tab before the completion rewrites the composer to a
-        // full `/name` (which would otherwise collapse the candidate set).
-        if self.slash_cycle_stem.is_none() {
-            self.slash_cycle_stem = self.slash_query().map(str::to_string);
-        }
         let n = completions.len();
-        let idx = self.slash_selected.min(n - 1);
-        // A repeat Tab — the composer already equals the highlighted
-        // command's completion — advances to the next match before
-        // completing, so successive Tabs walk the list.
-        if self.composer.text() == completions[idx] {
-            self.move_slash_selection_by(1);
-        }
         let chosen = self.slash_selected.min(n - 1);
-        // `set` resets the cursor to the end — exactly after the inserted
-        // command (and its trailing space, if any).
+        // `set` resets the cursor to exactly after the trailing space.
         self.replace_composer_buffer(completions[chosen].clone());
         true
     }
@@ -4983,8 +4966,6 @@ mod queued_message_edit_tests {
         QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Request, Response,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
     fn runner_with_attached_request_tx(
@@ -6204,6 +6185,10 @@ mod slash_cursor_tests {
         assert!(app.complete_slash_selection());
 
         assert_eq!(app.composer.text(), expected);
+        assert!(
+            app.slash_query().is_none(),
+            "the trailing space closes command mode"
+        );
     }
 
     #[test]
@@ -6223,75 +6208,78 @@ mod slash_cursor_tests {
         assert_eq!(app.slash_scroll, 0);
     }
 
+    #[test]
+    fn escape_dismisses_slash_palette_without_clearing_query() {
+        let mut app = slash_app();
+        app.composer.set("/pi".to_string());
+        app.reset_slash_window();
+
+        app.handle_key_insert(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.composer.text(), "/pi");
+        assert!(
+            app.slash_query().is_none(),
+            "dismissed palette stays closed"
+        );
+
+        app.handle_key_insert(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(
+            app.slash_query(),
+            Some("pin"),
+            "editing reopens the palette"
+        );
+    }
+
     /// Pure model of `App::complete_slash_selection`
     /// (`slash-command-tab-completion.md`): given the candidate
-    /// completions (`/name` or `/name ` per the command's arg-marker), the
+    /// completions (`/name `), the
     /// current highlight, and the composer text, return the new composer
-    /// text + highlight after one Tab. A repeat Tab — composer already
-    /// equals the highlighted completion — advances to the next match
-    /// before completing, so Tab cycles forward like ↓.
-    fn tab_complete(
-        completions: &[&str],
-        selected: usize,
-        composer: &str,
-    ) -> Option<(String, usize)> {
+    /// text + highlight after one Tab.
+    fn tab_complete(completions: &[&str], selected: usize) -> Option<(String, usize)> {
         if completions.is_empty() {
             // Menu open but zero matches → Tab is a no-op.
             return None;
         }
         let n = completions.len();
-        let mut idx = selected.min(n - 1);
-        if composer == completions[idx] {
-            idx = wrap_next(idx, n);
-        }
+        let idx = selected.min(n - 1);
         Some((completions[idx].to_string(), idx))
     }
 
     #[test]
     fn first_tab_completes_to_highlighted_without_submitting() {
         // `/se` → menu highlight on the top match `/settings`; Tab fills
-        // the composer with the full name. No trailing space (bare cmd).
-        let comps = ["/settings", "/session", "/stats"];
-        let (text, sel) = tab_complete(&comps, 0, "/se").unwrap();
-        assert_eq!(text, "/settings", "completes to the highlighted command");
+        // the composer with the full name and a trailing space.
+        let comps = ["/settings ", "/session ", "/stats "];
+        let (text, sel) = tab_complete(&comps, 0).unwrap();
+        assert_eq!(text, "/settings ", "completes to the highlighted command");
         assert_eq!(sel, 0, "first Tab keeps the highlight on the top match");
     }
 
     #[test]
-    fn arg_command_completion_carries_a_trailing_space() {
-        // An arg-taking command's completion ends in a space so the
-        // cursor lands ready for the argument; a bare one does not.
+    fn every_command_completion_carries_a_trailing_space() {
+        // Both argument-taking and bare commands leave the cursor ready to
+        // continue typing without immediately executing the command.
         let with_args = ["/copy "];
-        let (text, _) = tab_complete(&with_args, 0, "/co").unwrap();
+        let (text, _) = tab_complete(&with_args, 0).unwrap();
         assert_eq!(text, "/copy ");
-        let bare = ["/settings"];
-        let (text, _) = tab_complete(&bare, 0, "/se").unwrap();
-        assert_eq!(text, "/settings");
+        let bare = ["/settings "];
+        let (text, _) = tab_complete(&bare, 0).unwrap();
+        assert_eq!(text, "/settings ");
     }
 
     #[test]
-    fn second_tab_advances_to_next_match_and_completes() {
-        // After the first Tab landed `/settings`, a second Tab (composer
-        // already equals the highlighted completion) advances to the next
-        // anchored match and completes to it.
-        let comps = ["/settings", "/session", "/stats"];
-        let (text, sel) = tab_complete(&comps, 0, "/settings").unwrap();
-        assert_eq!(text, "/session", "second Tab cycles to the next match");
+    fn tab_completion_uses_the_current_highlight() {
+        let comps = ["/settings ", "/session ", "/stats "];
+        let (text, sel) = tab_complete(&comps, 1).unwrap();
+        assert_eq!(text, "/session ");
         assert_eq!(sel, 1);
-        // A third Tab advances again, and the last wraps back to the top.
-        let (text, sel) = tab_complete(&comps, sel, "/session").unwrap();
-        assert_eq!(text, "/stats");
-        assert_eq!(sel, 2);
-        let (text, sel) = tab_complete(&comps, sel, "/stats").unwrap();
-        assert_eq!(text, "/settings", "Tab wraps forward like ↓");
-        assert_eq!(sel, 0);
     }
 
     #[test]
     fn tab_with_zero_matches_is_a_no_op() {
         // Menu open (composer starts with `/`) but nothing matches: the
         // helper makes no change and reports no completion.
-        assert!(tab_complete(&[], 0, "/zzzz").is_none());
+        assert!(tab_complete(&[], 0).is_none());
     }
 
     /// Guard: the new slash-Tab branch is gated on the slash menu being

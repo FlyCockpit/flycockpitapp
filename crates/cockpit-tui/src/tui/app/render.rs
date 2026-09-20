@@ -8,7 +8,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::Duration;
 
 use super::Overlay;
 
@@ -22,38 +21,28 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::tui::chrome;
 use crate::tui::composer::{
     INPUT_PREFIX, VimMode, display_width, input_prefix_width, truncate_display_width,
     visual_position_for_byte, wrap_display_chunks,
 };
 use crate::tui::geometry::{INPUT_BORDER, MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneGeometry};
 use crate::tui::history::{
-    AGENT_INDENT, HistoryEntry, PendingRender, Rendered, ToolCallState, agent_display_label,
-    format_status_elapsed, render_entry, render_pending_incremental, thinking_dots_padded,
+    AGENT_INDENT, HistoryEntry, PendingRender, Rendered, ToolCallState, render_entry,
+    render_pending_incremental,
 };
 use crate::tui::theme::{
-    BRASS, BRASS_INDEX, BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, FOG,
-    FOG_INDEX, HOVER_BG, HOVER_BG_INDEX, IDLE_BORDER, INFO_TEXT, MUTED_COLOR_INDEX, MUTED_TEXT,
-    PLACEHOLDER, PLACEHOLDER_INDEX, SHELL_MODE_BADGE_BG, SHELL_MODE_BORDER, SUCCESS_TEXT,
-    WARNING_TEXT, resolve_color,
+    BRASS, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, FOG, GREEN, INFO_TEXT,
+    MUTED_COLOR_INDEX, MUTED_TEXT, NIGHT, PLACEHOLDER, SUCCESS_TEXT, WARNING_TEXT,
 };
 
 use super::{
     AUTOCOMPLETE_ROWS, AffordanceTarget, App, DirtyScan, HistoryEntryId, HistoryRenderCacheEntry,
     PaneSide, PrewrappedEntry, ScrollAnchor, Selection, SelectionSpan, StartupModal,
     SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind,
-    WORKING_MESSAGES,
 };
-
-/// Startup grace before the working indicator first appears — prevents
-/// quick turns from flashing it on and off.
-const STATUS_GRACE: Duration = Duration::from_secs(2);
-/// A reasoning block must last at least this long before the indicator
-/// flips from the working line to the yellow `Thinking` override.
-const THINKING_FLIP_AFTER: Duration = Duration::from_secs(2);
-const COMPOSER_PLACEHOLDER: &str =
-    "Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys";
+const IDLE_COMPOSER_PLACEHOLDER: &str = "Ask anything, ⇧↵ for a newline, or / for commands…";
+const WORKING_COMPOSER_PLACEHOLDER: &str = "The agent is working — type to queue a message…";
+const QUEUED_COMPOSER_PLACEHOLDER: &str = "Press ⌃↑ to focus the queue…";
 /// Maximum total wrapped visual rows retained across all cached history
 /// entries. Sized above normal viewports while bounding worst-case sessions.
 pub(super) const HISTORY_RENDER_CACHE_MAX_ROWS: usize = 20_000;
@@ -888,9 +877,14 @@ fn history_entry_gap_rows(
 
 impl App {
     pub(super) fn slash_query(&self) -> Option<&str> {
+        if self.slash_dismissed {
+            return None;
+        }
         let rest = self.composer.text().strip_prefix('/')?;
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        Some(&rest[..end])
+        if rest.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(rest)
     }
 
     pub(super) fn refresh_slash_menu_cache(&self) {
@@ -925,19 +919,13 @@ impl App {
     /// `skill_commands` at discovery), then skills in discovery order.
     pub(super) fn slash_suggestions(&self) -> Vec<super::SlashEntry<'_>> {
         match self.slash_query() {
-            // While Tab-cycling, the composer holds a completed `/name`
-            // but the candidate set stays anchored on the originally-typed
-            // stem so the full match list remains visible to cycle through
-            // (`slash-command-tab-completion.md`); otherwise match the live
-            // query.
             Some(query) => {
                 self.refresh_slash_menu_cache();
-                let stem = self.slash_cycle_stem.as_deref().unwrap_or(query);
                 let mut entries: Vec<super::SlashEntry<'_>> = self
                     .slash_menu_cache
                     .borrow()
                     .as_ref()
-                    .map(|cache| super::slash_matches_in(&cache.builtins, stem, &self.usage_slash))
+                    .map(|cache| super::slash_matches_in(&cache.builtins, query, &self.usage_slash))
                     .unwrap_or_default()
                     .into_iter()
                     .map(super::SlashEntry::Builtin)
@@ -945,7 +933,7 @@ impl App {
                 entries.extend(
                     self.skill_commands
                         .iter()
-                        .filter(|s| s.name.starts_with(stem))
+                        .filter(|s| s.name.starts_with(query))
                         .map(super::SlashEntry::Skill),
                 );
                 entries
@@ -995,7 +983,10 @@ impl App {
                 .len()
                 .min(AUTOCOMPLETE_ROWS as usize);
             if rows > 0 {
-                return rows as u16 + 2;
+                // PaneGeometry's shared popover slot overlaps the input top
+                // border. The slash palette is a detached box, so reserve one
+                // extra row and leave that overlap row unpainted below it.
+                return rows as u16 + 3;
             }
         }
         if self.show_vim_hint() { 3 } else { 0 }
@@ -1011,34 +1002,13 @@ impl App {
             && self.composer.vim_mode() == VimMode::Normal
     }
 
-    /// Height of the queued-messages strip above the input box. Zero
-    /// when nothing's queued; otherwise top border (1) + group headers
-    /// and messages + bottom border (1). Geometry overlaps that bottom
-    /// border with the input's top border.
+    /// Border + summary + at most five messages + binding hint + border.
     pub(super) fn queue_lines(&self) -> u16 {
         if self.queue.is_empty() {
             0
         } else {
-            2 + self.queue_content_lines() as u16
+            self.queue.len().min(5) as u16 + 4
         }
-    }
-
-    fn queue_content_lines(&self) -> usize {
-        let groups = self.queue_delivery_groups();
-        let mixed_targets = groups.len() > 1;
-        let mut lines = 0;
-        for (_, steering, held) in groups {
-            if mixed_targets {
-                lines += 1;
-            }
-            if !steering.is_empty() {
-                lines += 1 + steering.len();
-            }
-            if !held.is_empty() {
-                lines += 1 + held.len();
-            }
-        }
-        lines
     }
 
     /// Project the queue in the same order in which focused agent layers can
@@ -1099,25 +1069,6 @@ impl App {
             .collect()
     }
 
-    fn queue_box_title(&self) -> Line<'static> {
-        let agent = self
-            .foreground_input_target
-            .as_ref()
-            .map(|target| target.agent.clone())
-            .filter(|agent| !agent.is_empty())
-            .or_else(|| {
-                self.queue_delivery_groups()
-                    .first()
-                    .map(|(target, _, _)| target.agent.clone())
-                    .filter(|agent| !agent.is_empty())
-            })
-            .unwrap_or_else(|| "agent".to_string());
-        Line::from(vec![Span::styled(
-            format!(" {agent} "),
-            Style::default().fg(MUTED_TEXT),
-        )])
-    }
-
     pub(super) fn input_height(&self) -> u16 {
         let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
         // Inner content width = terminal width - 2 side rails.
@@ -1135,146 +1086,6 @@ impl App {
         };
         let visual = input_visual_rows(&measured, prefix, wrap_width);
         (visual as u16).clamp(MIN_INPUT_CONTENT, MAX_INPUT_CONTENT) + INPUT_BORDER
-    }
-
-    /// Elapsed time on the cumulative span clock, but only once the
-    /// agent has been busy past the startup grace. `None` (→ indicator
-    /// hidden) when idle or still inside the grace window.
-    pub(super) fn status_span_elapsed(&self) -> Option<Duration> {
-        if let Some(status) = &self.daemon_link {
-            return Some(status.started_at.elapsed());
-        }
-        if !self.busy {
-            return None;
-        }
-        let elapsed = self.span_started_at?.elapsed();
-        (elapsed >= STATUS_GRACE).then_some(elapsed)
-    }
-
-    /// 1 when the working indicator should occupy a row above the queue
-    /// strip, else 0.
-    pub(super) fn indicator_lines(&self) -> u16 {
-        u16::from(self.status_span_elapsed().is_some())
-    }
-
-    /// Render the "agent is working" status indicator. Ground state is
-    /// the playful working line (muted, span clock); it flips to a
-    /// yellow `Thinking` override only while the current reasoning block
-    /// has itself lasted past [`THINKING_FLIP_AFTER`], reading as
-    /// "working" otherwise so there are no blank gaps after the grace
-    /// period. No-op when the indicator shouldn't show.
-    pub(super) fn render_status_indicator(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let Some(span_elapsed) = self.status_span_elapsed() else {
-            return;
-        };
-        let dots = thinking_dots_padded(self.started_at.elapsed().as_millis());
-        let block_elapsed = self.pending.as_ref().map(|p| p.started_at.elapsed());
-        let thinking =
-            self.in_thinking_block() && block_elapsed.is_some_and(|e| e >= THINKING_FLIP_AFTER);
-
-        if let Some(status) = &self.daemon_link {
-            let text = daemon_link_status_text(
-                status,
-                &dots,
-                &format_status_elapsed(status.started_at.elapsed()),
-            );
-            let line = Line::from(vec![
-                Span::raw(" ".repeat(AGENT_INDENT)),
-                Span::styled(
-                    text,
-                    Style::default()
-                        .fg(WARNING_TEXT)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(line), area);
-            return;
-        }
-
-        // A mid-retry network reconnect overrides everything else
-        // (Thinking and the generic working line both): it's the most
-        // informative state, signals the call isn't hung, and must never
-        // fall back to the generic working spinner while a `Network`-class
-        // retry loop is live. Names the unreachable provider/model/url + the
-        // current attempt.
-        if let Some(reconnect) = &self.reconnect {
-            let text =
-                reconnect_status_text(reconnect, &dots, &format_status_elapsed(span_elapsed));
-            let line = Line::from(vec![
-                Span::raw(" ".repeat(AGENT_INDENT)),
-                Span::styled(
-                    text,
-                    Style::default()
-                        .fg(WARNING_TEXT)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(line), area);
-            return;
-        }
-
-        if let Some((parent, child, spawned_at)) =
-            self.history.iter().rev().find_map(|entry| match entry {
-                HistoryEntry::Subagent {
-                    parent,
-                    child,
-                    spawned_at,
-                    outcome: None,
-                    ..
-                } => Some((parent.as_str(), child.as_str(), *spawned_at)),
-                _ => None,
-            })
-        {
-            let delegate_elapsed = spawned_at.elapsed();
-            let mut text = format!(
-                "{parent} waiting on {}{} {}",
-                agent_display_label(child),
-                dots,
-                format_status_elapsed(delegate_elapsed)
-            );
-            if !self.queue.is_empty() {
-                text.push_str(&format!(" · {} queued", self.queue.len()));
-            } else {
-                text.push_str(" · parent continues after report");
-            }
-            let line = Line::from(vec![
-                Span::raw(" ".repeat(AGENT_INDENT)),
-                Span::styled(
-                    text,
-                    Style::default()
-                        .fg(Color::Indexed(MUTED_COLOR_INDEX))
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(line), area);
-            return;
-        }
-
-        let (label, elapsed, color) = if thinking {
-            (
-                "Thinking",
-                block_elapsed.unwrap_or(span_elapsed),
-                WARNING_TEXT,
-            )
-        } else {
-            let msg = WORKING_MESSAGES
-                .get(self.working_msg_idx)
-                .copied()
-                .unwrap_or("Working");
-            (msg, span_elapsed, Color::Indexed(MUTED_COLOR_INDEX))
-        };
-        let text = format!("{label}{dots} {}", format_status_elapsed(elapsed));
-        let line = Line::from(vec![
-            // Match the original in-body "Thinking…" placeholder's left
-            // indent so the live status reads as a continuation of the
-            // agent column rather than jumping a column.
-            Span::raw(" ".repeat(AGENT_INDENT)),
-            Span::styled(
-                text,
-                Style::default().fg(color).add_modifier(Modifier::ITALIC),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
     }
 
     pub(super) fn total_history_lines(&self) -> u16 {
@@ -1618,9 +1429,6 @@ impl App {
                             self.sticky_header_target = None;
                         }
                     }
-                    if geom.indicator > 0 {
-                        self.render_status_indicator(frame, rects.indicator);
-                    }
                     let cursor_pos = self.render_input(frame, rects.input);
                     if geom.queue > 0 {
                         self.render_queue(frame, rects.queue);
@@ -1634,17 +1442,6 @@ impl App {
                     } else {
                         self.clear_suggestion_box_hits();
                     }
-                    // Below-input pin-count indicator (`pinned-messages`). Only
-                    // shown when the session has ≥1 pin (geometry gives it a row).
-                    if geom.pins > 0 {
-                        self.render_pins_indicator(frame, rects.pins);
-                    }
-                    // Persistent below-input sandbox-down notice (§6.5). Shown while
-                    // the shell sandbox can't initialize; geometry gives it rows.
-                    // Persistent — it does not time out like a toast.
-                    if geom.sandbox_notice > 0 {
-                        self.render_sandbox_notice(frame, rects.sandbox_notice);
-                    }
                     self.paint_composer_picker(frame);
                     // Park the real cursor: in the focused pane (when the child
                     // shows one), otherwise in the composer.
@@ -1654,7 +1451,14 @@ impl App {
                         {
                             frame.set_cursor_position(Position::new(x, y));
                         }
-                    } else {
+                    } else if self.composer_controls.picker.is_none()
+                        && geom.suggestions == 0
+                        && !self.chat_header_more_open
+                        && self.context_menu.is_none()
+                        && self.pins_review.is_none()
+                        && self.rules_review.is_none()
+                        && self.keys_overlay.is_none()
+                    {
                         frame.set_cursor_position(cursor_pos);
                     }
                 }
@@ -1670,17 +1474,19 @@ impl App {
                 frame_width,
             );
         }
-        // The collapsed-pill `more` popover floats over the transcript,
-        // above the status row. Painted only when the header rendered.
+        // The collapsed-pill `more` popover floats over the transcript.
         self.paint_chat_header_more_popover(frame);
-        self.render_status(frame, rects.status);
 
-        // Toast sits at the bottom-right of the transcript, immediately
-        // above the composer. Rendered before the
-        // context menu / text popup so those still cover it if both
-        // happen to be active at the same time.
+        // Transient notices float over the body's final row now that the
+        // shell has no footer/status row.
         if let Some(toast) = self.toast.clone() {
-            render_toast(frame, chat_body, &toast);
+            let toast_row = Rect::new(
+                rects.body.x,
+                rects.body.bottom().saturating_sub(1),
+                rects.body.width,
+                u16::from(rects.body.height > 0),
+            );
+            render_toast(frame, toast_row, &toast);
         }
 
         // `/pins` review checklist overlay (`pinned-messages`): a compact
@@ -1800,94 +1606,6 @@ impl App {
         );
     }
 
-    /// Render the below-input pin-count indicator (`pinned-messages`):
-    /// `📌 N pinned · /pins to review`. Hidden by the geometry when the
-    /// session has no pins.
-    fn render_pins_indicator(&self, frame: &mut ratatui::Frame, area: Rect) {
-        if area.height == 0 {
-            return;
-        }
-        let n = self.pin_count;
-        let glyph = if self.use_emojis { "📌 " } else { "" };
-        let text = format!("{glyph}{n} pinned · /pins to review");
-        let line = Line::from(vec![Span::styled(
-            text,
-            Style::default().fg(crate::tui::pins_overlay::PIN_YELLOW),
-        )]);
-        frame.render_widget(Paragraph::new(line), area);
-    }
-
-    /// Render the persistent below-input sandbox-down notice (`implementation notes`
-    /// §6.5): a red, wrapped, model-independent remedy telling the user to run
-    /// `/sandbox off` (plus the `sudo sysctl …=0` command when diagnosed). Stays
-    /// until the sandbox is usable / dismissed — it does NOT time out like a
-    /// toast. Hidden by the geometry when the sandbox is fine. Pure chrome:
-    /// nothing here ever enters the model's context.
-    fn render_sandbox_notice(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        self.sandbox_notice_copy_rect = None;
-        self.auth_notice_switch_rect = None;
-        self.auth_notice_fix_rect = None;
-        if area.height == 0 {
-            return;
-        }
-        let Some(text) = self.persistent_notice_text() else {
-            return;
-        };
-        let para = Paragraph::new(Line::from(Span::styled(
-            super::sandbox_notice_render_text(&text),
-            Style::default().fg(ERROR_TEXT),
-        )))
-        .wrap(ratatui::widgets::Wrap { trim: true });
-        frame.render_widget(para, area);
-
-        use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
-        let y = area.y;
-        if self.auth_failure_notice.is_some()
-            && text.starts_with("[switch model] [fix provider]")
-            && area.width >= 31
-        {
-            self.auth_notice_switch_rect = self.button_registry.paint(
-                frame,
-                area.x.saturating_add(1),
-                y,
-                14,
-                ButtonSpec::new(
-                    ButtonId::PersistentNoticeSwitchModel,
-                    "switch model",
-                    ButtonDispatch::PersistentNoticeSwitchModel,
-                ),
-            );
-            self.auth_notice_fix_rect = self.button_registry.paint(
-                frame,
-                area.x.saturating_add(16),
-                y,
-                14,
-                ButtonSpec::new(
-                    ButtonId::PersistentNoticeFixProvider,
-                    "fix provider",
-                    ButtonDispatch::PersistentNoticeFixProvider,
-                ),
-            );
-            return;
-        }
-        if self.persistent_notice_fix_command().is_some()
-            && text.starts_with("[copy]")
-            && area.width >= 7
-        {
-            self.sandbox_notice_copy_rect = self.button_registry.paint(
-                frame,
-                area.x.saturating_add(1),
-                y,
-                6,
-                ButtonSpec::new(
-                    ButtonId::PersistentNoticeCopy,
-                    "copy",
-                    ButtonDispatch::PersistentNoticeCopy,
-                ),
-            );
-        }
-    }
-
     fn paint_transcript_control_buttons(&mut self, frame: &mut ratatui::Frame) {
         use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
         let Some(area) = self.chat_area else {
@@ -1987,21 +1705,10 @@ impl App {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
-    /// Border color for the composer/input box and the queue strip,
-    /// keyed on busy + shell mode. Shell mode (leading `!`) tints green;
-    /// while the agent is busy the border is a visibly-grey muted shade
-    /// ([`BUSY_BORDER`]) signalling "hold off typing"; idle is
-    /// white. Shared by `render_input` and `render_queue` so the two
-    /// borders never drift. The queue strip has no shell mode and passes
-    /// `shell_mode = false`.
-    fn input_border_color(busy: bool, shell_mode: bool) -> Color {
-        if shell_mode {
-            SHELL_MODE_BORDER
-        } else if busy {
-            BUSY_BORDER
-        } else {
-            IDLE_BORDER
-        }
+    /// Composer chrome is brass while focused and night while a picker is
+    /// open. Working state is conveyed by the header badge and placeholder.
+    fn input_border_color(picker_open: bool) -> Color {
+        if picker_open { NIGHT } else { BRASS }
     }
 
     const CONNECTED_INPUT_STRIP_BORDER_SET: border::Set<'static> = border::Set {
@@ -2055,256 +1762,236 @@ impl App {
         if self.queue.is_empty() {
             return;
         }
-        // Border tracks the input box: visibly-grey for the whole span
-        // the agent is busy (matches the "agent is working, hold off"
-        // cue on the input border), white when idle. No shell mode on
-        // the queue strip, so it reuses the same helper with
-        // `shell_mode = false`.
-        let border_color = Self::input_border_color(self.busy, false);
-        let Some(content_area) = Self::render_connected_input_top_strip(
-            frame,
-            area,
-            border_color,
-            Some(self.queue_box_title()),
-        ) else {
+        let border_color = Self::input_border_color(self.composer_controls.picker.is_some());
+        let Some(content_area) =
+            Self::render_connected_input_top_strip(frame, area, border_color, None)
+        else {
             return;
         };
-        let queue_text_style = Style::default().fg(MUTED_TEXT);
-        let header_style = queue_text_style.add_modifier(Modifier::ITALIC);
-        let non_foreground_style = queue_text_style.add_modifier(Modifier::DIM);
-        let groups = self.queue_delivery_groups();
-        let mixed_targets = groups.len() > 1;
-        let inner_w = content_area.width.saturating_sub(2).max(1) as usize;
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut row_meta = Vec::<(u16, uuid::Uuid, cockpit_proto::QueueDeliveryClass)>::new();
-
-        let push_header = |lines: &mut Vec<Line<'static>>, label: &str| {
-            let text = first_line_truncated(label, inner_w);
-            let pad = inner_w.saturating_sub(display_width(&text));
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(text, header_style),
-                Span::raw(" ".repeat(pad)),
-                Span::raw(" "),
-            ]));
-        };
-        let push_item = |lines: &mut Vec<Line<'static>>, msg: &cockpit_proto::QueueItem| {
-            let line = lines.len() as u16;
-            let non_foreground = self
-                .foreground_input_target
-                .as_ref()
-                .is_some_and(|target| msg.target.id != target.id);
-            let style = if non_foreground {
-                non_foreground_style
-            } else {
-                queue_text_style
-            };
-            let body = first_line_truncated(
-                msg.display_text
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(&msg.text),
-                inner_w,
-            );
-            let body_w = display_width(&body);
-            let annotation = if non_foreground || mixed_targets || msg.send_now {
-                let remaining = inner_w.saturating_sub(body_w);
-                if remaining > 0 {
-                    let mut parts = Vec::new();
-                    if non_foreground || mixed_targets {
-                        parts.push(msg.target.agent.as_str());
-                    }
-                    if msg.send_now {
-                        parts.push("send now");
-                    }
-                    first_line_truncated(&format!(" · {}", parts.join(" · ")), remaining)
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-            let annotation_w = display_width(&annotation);
-            let trailing = inner_w.saturating_sub(body_w + annotation_w);
-            let mut spans = vec![Span::raw(" "), Span::styled(body, style)];
-            if !annotation.is_empty() {
-                spans.push(Span::styled(annotation, style));
-            }
-            spans.extend([Span::raw(" ".repeat(trailing)), Span::raw(" ")]);
-            lines.push(Line::from(spans));
-            line
-        };
-
-        for (target, steering, held) in groups {
-            if mixed_targets {
-                let suffix = self
-                    .foreground_input_target
-                    .as_ref()
-                    .is_some_and(|foreground| foreground.id == target.id)
-                    .then_some(" · focused")
-                    .unwrap_or_default();
-                push_header(&mut lines, &format!("{}{}", target.agent, suffix));
-            }
-            if !steering.is_empty() {
-                push_header(&mut lines, "Steer · next safe boundary");
-                for msg in steering {
-                    let line = push_item(&mut lines, msg);
-                    row_meta.push((line, msg.id, msg.delivery_class));
-                }
-            }
-            if !held.is_empty() {
-                push_header(&mut lines, "Held · after completion");
-                for msg in held {
-                    let line = push_item(&mut lines, msg);
-                    row_meta.push((line, msg.id, msg.delivery_class));
-                }
-            }
-        }
-
-        frame.render_widget(Paragraph::new(lines), content_area);
         self.queue_row_hits.clear();
-        self.paint_queue_box_buttons(frame, area);
-        for (line, id, class) in row_meta {
-            self.paint_queue_message_row(frame, content_area, line, id, class);
-        }
-    }
-
-    fn paint_queue_box_buttons(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
-        let y = area.y;
-        let mut x = area.x.saturating_add(area.width.saturating_sub(2));
-        let title_reserve = {
-            let title: String = self
-                .queue_box_title()
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect();
-            (display_width(&title) as u16).saturating_add(2)
-        };
-        let labels = [
-            (
-                "cancel",
-                ButtonId::QueueCancel { item_id: None },
-                ButtonDispatch::QueueCancel { item_id: None },
-            ),
-            (
-                "edit",
-                ButtonId::QueueEdit { item_id: None },
-                ButtonDispatch::QueueEdit { item_id: None },
-            ),
-            (
-                "Held",
-                ButtonId::QueueSetClass {
-                    item_id: None,
-                    class: cockpit_proto::QueueDeliveryClass::Held,
-                },
-                ButtonDispatch::QueueSetClass {
-                    item_id: None,
-                    class: cockpit_proto::QueueDeliveryClass::Held,
-                },
-            ),
-            (
-                "Steer",
-                ButtonId::QueueSetClass {
-                    item_id: None,
-                    class: cockpit_proto::QueueDeliveryClass::Steering,
-                },
-                ButtonDispatch::QueueSetClass {
-                    item_id: None,
-                    class: cockpit_proto::QueueDeliveryClass::Steering,
-                },
-            ),
+        let peak = if self.queue.iter().any(|item| item.send_now) {
             (
                 "Send now",
-                ButtonId::QueueSendNow { item_id: None },
-                ButtonDispatch::QueueSendNow { item_id: None },
-            ),
-        ];
-        for (label, id, dispatch) in labels {
-            let width = (label.len() as u16).saturating_add(2);
-            x = x.saturating_sub(width.saturating_add(1));
-            if x <= area.x.saturating_add(title_reserve) {
-                break;
-            }
-            let _ = self.button_registry.paint(
-                frame,
-                x,
-                y,
-                width,
-                ButtonSpec::new(id, label, dispatch),
+                "Stops the agent and sends now",
+                crate::tui::theme::RED,
+            )
+        } else if self
+            .queue
+            .iter()
+            .any(|item| item.delivery_class.is_steering())
+        {
+            (
+                "Steer",
+                "Sends at the next safe boundary",
+                crate::tui::theme::YELLOW,
+            )
+        } else {
+            (
+                "Held",
+                "Sends when this turn finishes",
+                crate::tui::theme::FOG,
+            )
+        };
+        let count = self.queue.len();
+        let plural = if count == 1 { "" } else { "s" };
+        let edit_label = if count == 1 { "Edit" } else { "Edit all" };
+        let edit_text = crate::tui::button::bracketed_label(edit_label);
+        let edit_w = display_width(&edit_text) as u16;
+        let summary_area = Rect::new(
+            content_area.x,
+            content_area.y,
+            content_area.width.saturating_sub(edit_w + 1),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    peak.0,
+                    Style::default().fg(peak.2).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" · {count} message{plural}  {}", peak.1),
+                    Style::default().fg(MUTED_TEXT),
+                ),
+            ])),
+            summary_area,
+        );
+        let edit_rect = Rect::new(
+            content_area.right().saturating_sub(edit_w),
+            content_area.y,
+            edit_w,
+            1,
+        );
+        let edit_spec = crate::tui::button::ButtonSpec::new(
+            crate::tui::button::ButtonId::QueueEdit { item_id: None },
+            edit_label,
+            crate::tui::button::ButtonDispatch::QueueEdit { item_id: None },
+        );
+        let edit_hovered = self.button_registry.hover() == Some(&edit_spec.id);
+        crate::tui::chrome::paint_chip(
+            frame,
+            edit_rect,
+            &edit_text,
+            Style::default().fg(BRASS),
+            edit_hovered,
+        );
+        self.button_registry.register(edit_rect, edit_spec);
+
+        let items: Vec<_> = self
+            .queue_visual_ids()
+            .into_iter()
+            .take(5)
+            .filter_map(|id| self.queue.iter().find(|item| item.id == id).cloned())
+            .collect();
+        for (row, item) in items.iter().enumerate() {
+            let rect = Rect::new(
+                content_area.x,
+                content_area.y.saturating_add(1 + row as u16),
+                content_area.width,
+                1,
             );
+            self.paint_queue_message_row(frame, rect, item);
         }
+        let hint_y = content_area.y.saturating_add(1 + items.len() as u16);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "↑ recall · ⌃↑ focus queue · then ⇧S send now · ⇧T toggle · ⇧X cancel",
+                Style::default().fg(MUTED_TEXT),
+            ))),
+            Rect::new(content_area.x, hint_y, content_area.width, 1),
+        );
     }
 
     fn paint_queue_message_row(
         &mut self,
         frame: &mut ratatui::Frame,
-        content_area: Rect,
-        line: u16,
-        id: uuid::Uuid,
-        class: cockpit_proto::QueueDeliveryClass,
+        row: Rect,
+        item: &cockpit_proto::QueueItem,
     ) {
-        let y = content_area.y.saturating_add(line);
-        self.queue_row_hits
-            .push((id, Rect::new(content_area.x, y, content_area.width, 1)));
-        if !self.queue_message_revealed(id) {
-            return;
-        }
         use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
-        let _ = class;
-        let mut x = content_area.x.saturating_add(content_area.width);
-        for (label, button_id, dispatch) in [
-            (
-                "cancel",
-                ButtonId::QueueCancel { item_id: Some(id) },
-                ButtonDispatch::QueueCancel { item_id: Some(id) },
-            ),
-            (
-                "edit",
-                ButtonId::QueueEdit { item_id: Some(id) },
-                ButtonDispatch::QueueEdit { item_id: Some(id) },
-            ),
+        self.queue_row_hits.push((item.id, row));
+        let controls = [
             (
                 "Held",
+                "Held · after completion",
+                item.delivery_class == cockpit_proto::QueueDeliveryClass::Held && !item.send_now,
+                crate::tui::theme::FOG,
                 ButtonId::QueueSetClass {
-                    item_id: Some(id),
+                    item_id: Some(item.id),
                     class: cockpit_proto::QueueDeliveryClass::Held,
                 },
                 ButtonDispatch::QueueSetClass {
-                    item_id: Some(id),
+                    item_id: Some(item.id),
                     class: cockpit_proto::QueueDeliveryClass::Held,
                 },
             ),
             (
                 "Steer",
+                "Steer · next safe boundary",
+                item.delivery_class.is_steering() && !item.send_now,
+                crate::tui::theme::YELLOW,
                 ButtonId::QueueSetClass {
-                    item_id: Some(id),
+                    item_id: Some(item.id),
                     class: cockpit_proto::QueueDeliveryClass::Steering,
                 },
                 ButtonDispatch::QueueSetClass {
-                    item_id: Some(id),
+                    item_id: Some(item.id),
                     class: cockpit_proto::QueueDeliveryClass::Steering,
                 },
             ),
             (
                 "Send now",
-                ButtonId::QueueSendNow { item_id: Some(id) },
-                ButtonDispatch::QueueSendNow { item_id: Some(id) },
+                "Send now",
+                item.send_now,
+                crate::tui::theme::RED,
+                ButtonId::QueueSendNow {
+                    item_id: Some(item.id),
+                },
+                ButtonDispatch::QueueSendNow {
+                    item_id: Some(item.id),
+                },
             ),
-        ] {
-            let width = (label.len() as u16).saturating_add(2);
-            x = x.saturating_sub(width.saturating_add(1));
-            if x <= content_area.x {
-                break;
-            }
-            let _ = self.button_registry.paint(
+            (
+                "x",
+                "Remove queued message",
+                false,
+                crate::tui::theme::FOG,
+                ButtonId::QueueCancel {
+                    item_id: Some(item.id),
+                },
+                ButtonDispatch::QueueCancel {
+                    item_id: Some(item.id),
+                },
+            ),
+        ];
+        let control_w: u16 = controls
+            .iter()
+            .map(|(label, ..)| display_width(&crate::tui::button::bracketed_label(label)) as u16)
+            .sum::<u16>()
+            + 2;
+        let body = item
+            .display_text
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .unwrap_or(&item.text);
+        let mixed_targets = self.queue_delivery_groups().len() > 1;
+        let non_foreground = self
+            .foreground_input_target
+            .as_ref()
+            .is_some_and(|target| target.id != item.target.id);
+        let body_style = Style::default()
+            .fg(MUTED_TEXT)
+            .add_modifier(if non_foreground {
+                Modifier::DIM
+            } else {
+                Modifier::empty()
+            });
+        let text_width = row.width.saturating_sub(control_w + 1) as usize;
+        let body = first_line_truncated(body, text_width);
+        let body_width = display_width(&body);
+        let annotation = if non_foreground || mixed_targets {
+            first_line_truncated(
+                &format!(" · {}", item.target.agent),
+                text_width.saturating_sub(body_width),
+            )
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(body, body_style),
+                Span::styled(annotation, body_style),
+            ])),
+            row,
+        );
+        let mut x = row.right().saturating_sub(control_w);
+        for (index, (label, control_hint, selected, selected_color, button_id, dispatch)) in
+            controls.into_iter().enumerate()
+        {
+            let text = crate::tui::button::bracketed_label(label);
+            let width = display_width(&text) as u16;
+            let rect = Rect::new(x, row.y, width, 1);
+            let spec = ButtonSpec::new(button_id, control_hint, dispatch);
+            let hovered = self.button_registry.hover() == Some(&spec.id);
+            crate::tui::chrome::paint_chip(
                 frame,
-                x,
-                y,
-                width,
-                ButtonSpec::new(button_id, label, dispatch),
+                rect,
+                &text,
+                Style::default()
+                    .fg(if selected {
+                        selected_color
+                    } else {
+                        crate::tui::theme::DISABLED
+                    })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                hovered,
             );
+            self.button_registry.register(rect, spec);
+            x = x.saturating_add(width + u16::from(index < 2));
         }
     }
 
@@ -3666,19 +3353,11 @@ impl App {
         // Stash for the mouse handler so a click can route to
         // click-to-position-cursor (plan.md T8.d).
         self.input_area = Some(area);
-        // Visibly-grey border for the whole span the agent is busy;
-        // white when idle. Gated on `busy` (not `pending.is_some()`) so
-        // it stays dim across reasoning, streaming, AND tool execution —
-        // `pending` drops to `None` between tool rounds, which used to
-        // flicker the border white mid-turn. BUSY_BORDER_INDEX is a
-        // mid-grey: clearly dimmer than white so the "agent is working,
-        // hold off typing" signal reads as muted, but never near-black/
-        // invisible against the surrounding chrome.
-        // Shell mode (GOALS §1k): a leading `!` swaps the top border for
-        // a "shell mode" label and tints the border green. Leaves the
-        // moment the `!` is gone.
+        // The focused composer is brass. Opening one of its pickers dims the
+        // border to night; working state lives in the header and placeholder.
+        // Shell mode keeps its green title badge without recolouring the box.
         let shell_mode = self.composer.text().starts_with('!');
-        let border_color = Self::input_border_color(self.busy, shell_mode);
+        let border_color = Self::input_border_color(self.composer_controls.picker.is_some());
         let mut input_block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_type(BorderType::Rounded)
@@ -3695,7 +3374,7 @@ impl App {
                 " shell mode ",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(SHELL_MODE_BADGE_BG)
+                    .bg(GREEN)
                     .add_modifier(Modifier::BOLD),
             )));
         }
@@ -3776,10 +3455,21 @@ impl App {
         }
         let placeholder_displayed = text.is_empty() && ghost_display.is_none();
         if placeholder_displayed {
-            let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-            let chunks = wrap_ghost_line_chunks(COMPOSER_PLACEHOLDER, budget, first_row_budget);
+            let placeholder = if self.busy {
+                if self.queue.is_empty() {
+                    WORKING_COMPOSER_PLACEHOLDER
+                } else {
+                    QUEUED_COMPOSER_PLACEHOLDER
+                }
+            } else {
+                IDLE_COMPOSER_PLACEHOLDER
+            };
+            let muted = Style::default()
+                .fg(PLACEHOLDER)
+                .add_modifier(Modifier::ITALIC);
+            let chunks = wrap_ghost_line_chunks(placeholder, budget, first_row_budget);
             for (ci, (start, end, _, _)) in chunks.iter().enumerate() {
-                let chunk_text = COMPOSER_PLACEHOLDER[*start..*end].to_string();
+                let chunk_text = placeholder[*start..*end].to_string();
                 let pre = if ci == 0 {
                     INPUT_PREFIX
                 } else {
@@ -3937,7 +3627,10 @@ impl App {
             return plain();
         }
         let block_style = Style::default()
-            .fg(resolve_color(FOG, FOG_INDEX))
+            .fg(crate::tui::theme::resolve_color(
+                FOG,
+                crate::tui::theme::FOG_INDEX,
+            ))
             .add_modifier(Modifier::BOLD);
         let normal = Style::default().fg(Color::White);
         let mut spans: Vec<Span<'static>> = Vec::new();
@@ -4307,7 +4000,27 @@ impl App {
         if area.height < 3 || area.width < 5 {
             return;
         }
-        let border_color = Self::input_border_color(self.busy, false);
+        if self.slash_query().is_some() {
+            let width = area.width.clamp(24, 56).min(area.width);
+            let detached_height = if area.height == self.suggestion_box_lines() {
+                area.height.saturating_sub(1)
+            } else {
+                area.height
+            };
+            let slash_area = Rect::new(area.x, area.y, width, detached_height);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(BRASS))
+                .title(" Commands ");
+            let content_area = block.inner(slash_area);
+            frame.render_widget(ratatui::widgets::Clear, slash_area);
+            frame.render_widget(block, slash_area);
+            self.suggestion_box_area = Some(slash_area);
+            self.render_slash_suggestion_box(frame, slash_area, content_area);
+            return;
+        }
+        let border_color = Self::input_border_color(self.composer_controls.picker.is_some());
         let Some(content_area) =
             Self::render_connected_input_top_strip(frame, area, border_color, None)
         else {
@@ -4317,8 +4030,6 @@ impl App {
 
         if self.at_popup_active() {
             self.render_at_suggestion_box(frame, area, content_area);
-        } else if self.slash_query().is_some() {
-            self.render_slash_suggestion_box(frame, area, content_area);
         } else if self.show_vim_hint() {
             self.render_vim_hint_box(frame, content_area);
         }
@@ -4378,13 +4089,11 @@ impl App {
                 kind: SuggestionBoxKind::Slash,
                 index: i,
             };
-            let marker = if is_sel { "▸ " } else { "  " };
+            let marker = if is_sel { "› " } else { "  " };
             let name_padded = format!("/{:<width$}", name, width = name_w);
-            let name_style = if is_sel {
-                Style::default().fg(WARNING_TEXT)
-            } else {
-                Style::default().fg(Color::White)
-            };
+            let name_style = Style::default()
+                .fg(crate::tui::theme::INK)
+                .add_modifier(Modifier::BOLD);
             let mut line = Line::from(vec![
                 Span::raw(marker),
                 Span::styled(name_padded, name_style),
@@ -4607,7 +4316,7 @@ impl App {
             return;
         };
         pane.body_rect = Some(area);
-        let border = resolve_color(BRASS, BRASS_INDEX);
+        let border = crate::tui::theme::resolve_color(BRASS, crate::tui::theme::BRASS_INDEX);
         let mode = match pane.mode() {
             crate::tui::app::btw_pane::BtwMode::Seeded => "seeded",
             crate::tui::app::btw_pane::BtwMode::Tangent => "tangent",
@@ -4682,7 +4391,10 @@ impl App {
             Line::from(Span::styled(
                 "Ask a side question…",
                 Style::default()
-                    .fg(resolve_color(PLACEHOLDER, PLACEHOLDER_INDEX))
+                    .fg(crate::tui::theme::resolve_color(
+                        PLACEHOLDER,
+                        crate::tui::theme::PLACEHOLDER_INDEX,
+                    ))
                     .add_modifier(Modifier::ITALIC),
             ))
         } else {
@@ -4710,56 +4422,6 @@ impl App {
             frame.render_widget(Paragraph::new(Line::from(Span::styled(bar, style))), rect);
         }
     }
-
-    pub(super) fn render_status(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        let mut right = chrome::waiting_for_lock_spans(self.waiting_for_lock.as_ref());
-        right.extend(chrome::side_glyph_spans(self.side_conversation.is_some()));
-        #[cfg(feature = "remote")]
-        {
-            right.extend(chrome::org_sync_spans(self.org_sync_disclosure.as_ref()));
-            right.extend(chrome::connector_spans(self.connector_disclosure.as_ref()));
-        }
-        right.extend(chrome::caffeinate_glyph_spans(self.caffeinate_active));
-        let status = chrome::left_status(chrome::LongcacheStatus::new(
-            self.longcache_enabled,
-            self.longcache_supported,
-        ));
-        let mut left = status.spans;
-        if !left.is_empty() {
-            left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
-        }
-        let setup_label = self
-            .session_mode
-            .map(|mode| format!("Setup: {}", mode.display_name()))
-            .unwrap_or_else(|| "Setup: loading…".to_string());
-        left.push(Span::styled(
-            setup_label,
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-        ));
-        if let Some(hint) = self.copy_pick_target_hint() {
-            left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
-            left.push(Span::styled(
-                hint,
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-            ));
-        }
-        if let Some(status) = &self.idle_reason_status {
-            left.push(Span::styled(" · ", Style::default().fg(DIVIDER_DIM)));
-            left.push(Span::styled(
-                status.text.clone(),
-                Style::default().fg(toast_fg(status.kind)),
-            ));
-        }
-        let right_width: u16 = right
-            .iter()
-            .map(|s| s.width() as u16)
-            .sum::<u16>()
-            .min(area.width);
-        let bottom =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
-        frame.render_widget(Paragraph::new(Line::from(left)), bottom[0]);
-        frame.render_widget(Paragraph::new(Line::from(right)), bottom[1]);
-    }
 }
 
 struct ContextIndicatorChip {
@@ -4777,21 +4439,16 @@ fn toast_fg(kind: ToastKind) -> Color {
     }
 }
 
-/// Render a compact toast at bottom-right above the composer.
-fn render_toast(frame: &mut ratatui::Frame, chat_body: Rect, toast: &Toast) {
+/// Render a transient brass chip over the body's final row.
+fn render_toast(frame: &mut ratatui::Frame, status_rect: Rect, toast: &Toast) {
     use ratatui::widgets::Clear;
-    if chat_body.height == 0 || chat_body.width == 0 {
+    if status_rect.height == 0 || status_rect.width == 0 {
         return;
     }
+    let _intent = toast_fg(toast.kind);
     let text = format!(" {} ", toast.text);
-    let width = (text.chars().count() as u16).min(chat_body.width).max(1);
-    let rect = Rect::new(
-        chat_body.right().saturating_sub(width),
-        chat_body.bottom().saturating_sub(1),
-        width,
-        1,
-    );
-    let max = rect.width as usize;
+    // Truncate to fit if the message is longer than the status row.
+    let max = status_rect.width as usize;
     let display: String = if text.chars().count() > max {
         let cap = max.saturating_sub(1);
         let truncated: String = text.chars().take(cap).collect();
@@ -4799,16 +4456,25 @@ fn render_toast(frame: &mut ratatui::Frame, chat_body: Rect, toast: &Toast) {
     } else {
         text
     };
-    frame.render_widget(Clear, rect);
-    crate::tui::chrome::fill_bg(frame, rect, resolve_color(HOVER_BG, HOVER_BG_INDEX));
+    frame.render_widget(Clear, status_rect);
+    crate::tui::chrome::fill_bg(
+        frame,
+        status_rect,
+        crate::tui::theme::resolve_color(
+            crate::tui::theme::HOVER_BG,
+            crate::tui::theme::HOVER_BG_INDEX,
+        ),
+    );
     let para = Paragraph::new(Line::from(Span::styled(
         display,
         Style::default()
-            .fg(resolve_color(BRASS, BRASS_INDEX))
-            .bg(resolve_color(HOVER_BG, HOVER_BG_INDEX))
+            .fg(crate::tui::theme::resolve_color(
+                crate::tui::theme::BRASS,
+                crate::tui::theme::BRASS_INDEX,
+            ))
             .add_modifier(Modifier::BOLD),
     )));
-    frame.render_widget(para, rect);
+    frame.render_widget(para, status_rect);
 }
 
 fn prewrap_entry_rows(
@@ -5900,6 +5566,7 @@ fn hybrid_context_tokens(anchor: u32, estimate: u32, estimate_at_anchor: u32) ->
 /// `provider/model` for the reconnect status, collapsing the empty cases so
 /// a utility/test target with a blank field still reads cleanly (`provider`,
 /// `model`, or `model` alone — never a stray slash).
+#[cfg(test)]
 fn reconnect_target_label(provider: &str, model: &str) -> String {
     match (provider.trim(), model.trim()) {
         ("", "") => "the model server".to_string(),
@@ -5913,6 +5580,7 @@ fn reconnect_target_label(provider: &str, model: &str) -> String {
 /// distinct, never-the-generic-spinner reconnect message naming the
 /// unreachable target, the attempt count, and the elapsed clock. Pure so the
 /// precedence + formatting is unit-testable.
+#[cfg(test)]
 fn reconnect_status_text(reconnect: &super::ReconnectStatus, dots: &str, elapsed: &str) -> String {
     format!(
         "reconnecting{dots} {} unreachable at {} (attempt {}) {elapsed}",
@@ -5922,6 +5590,7 @@ fn reconnect_status_text(reconnect: &super::ReconnectStatus, dots: &str, elapsed
     )
 }
 
+#[cfg(test)]
 fn daemon_link_status_text(status: &super::DaemonLinkStatus, dots: &str, elapsed: &str) -> String {
     let label = if status.restarting {
         "daemon restarting"
@@ -6105,6 +5774,7 @@ mod slash_popup_full_list_tests {
 
     #[test]
     fn slash_suggestion_hover_paints_hover_background() {
+        let _truecolor = crate::tui::theme::pin_truecolor(true);
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.composer.set("/".to_string());
@@ -10687,7 +10357,8 @@ mod render_history_spacing_tests {
 #[cfg(test)]
 mod prediction_ghost_context_indicator_tests {
     use super::{
-        App, COMPOSER_PLACEHOLDER, first_line_truncated, input_visual_rows, wrap_ghost_line_chunks,
+        App, IDLE_COMPOSER_PLACEHOLDER, first_line_truncated, input_visual_rows,
+        wrap_ghost_line_chunks,
     };
     use crate::tui::composer::{PredictionGhost, VimMode, display_width, input_prefix_width};
     use crate::tui::theme::MUTED_TEXT;
@@ -10775,13 +10446,15 @@ mod prediction_ghost_context_indicator_tests {
         let height = app.queue_lines();
         let buf = render_queue_buffer(&mut app, width, height);
         let top = row_text(&buf, 0, width);
+        let summary = row_text(&buf, 1, width);
         let bottom = row_text(&buf, height - 1, width);
 
         assert!(top.contains('╭') && top.contains('╮'), "{top:?}");
         assert!(
-            top.contains("Build"),
-            "box labels the target agent: {top:?}"
+            summary.contains("Held · 1 message"),
+            "summary line: {summary:?}"
         );
+        assert!(summary.contains("[Edit]"), "edit action: {summary:?}");
         assert_eq!(bottom, format!("╭┴{}┴╮", "─".repeat(width as usize - 4)));
     }
 
@@ -10853,10 +10526,10 @@ mod prediction_ghost_context_indicator_tests {
         assert_eq!(app.queue_visual_ids(), expected);
         let height = app.queue_lines();
         let buf = render_queue_buffer(&mut app, 60, height);
-        let top = row_text(&buf, 0, 60);
+        let rows: Vec<String> = (0..height).map(|y| row_text(&buf, y, 60)).collect();
         assert!(
-            top.contains("builder"),
-            "mixed-target title names the focused target: {top:?}"
+            rows.iter().any(|row| row.contains(" · builder")),
+            "mixed-target messages name their target: {rows:?}"
         );
     }
 
@@ -10957,7 +10630,7 @@ mod prediction_ghost_context_indicator_tests {
     }
 
     #[test]
-    fn queue_narrow_render_preserves_message_and_border_while_truncating_annotation() {
+    fn queue_narrow_render_preserves_controls_and_border() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.foreground_input_target = Some(QueueTarget::root("Build"));
@@ -10971,7 +10644,14 @@ mod prediction_ghost_context_indicator_tests {
         let top = row_text(&buf, 0, 30);
         let row = row_text(&buf, 2, 30);
         let bottom = row_text(&buf, height - 1, 30);
-        assert!(row.contains("queued text"), "{row:?}");
+        assert!(
+            row.contains("[Held]"),
+            "class control remains reachable: {row:?}"
+        );
+        assert!(
+            row.contains("[x]"),
+            "remove control remains reachable: {row:?}"
+        );
         assert!(
             !row.contains("task:"),
             "raw target ids must not render: {row:?}"
@@ -10984,7 +10664,7 @@ mod prediction_ghost_context_indicator_tests {
     }
 
     #[test]
-    fn queue_renders_steering_and_held_groups_in_delivery_order() {
+    fn queue_renders_peak_summary_and_items_in_delivery_order() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.foreground_input_target = Some(QueueTarget::root("Build"));
@@ -10997,15 +10677,13 @@ mod prediction_ghost_context_indicator_tests {
         app.queue.extend([first, held, second]);
 
         let height = app.queue_lines();
-        let buf = render_queue_buffer(&mut app, 48, height);
-        let rows: Vec<String> = (0..height).map(|y| row_text(&buf, y, 48)).collect();
+        let buf = render_queue_buffer(&mut app, 80, height);
+        let rows: Vec<String> = (0..height).map(|y| row_text(&buf, y, 80)).collect();
         let joined = rows.join("\n");
-        assert!(joined.contains("Steer · next safe boundary"), "{joined}");
-        assert!(joined.contains("Held · after completion"), "{joined}");
-        let steer_header = rows
-            .iter()
-            .position(|row| row.contains("Steer · next safe boundary"))
-            .expect("steering header");
+        assert!(
+            joined.contains("Steer · 3 messages  Sends at the next safe boundary"),
+            "{joined}"
+        );
         let first_idx = rows
             .iter()
             .position(|row| row.contains("steer first"))
@@ -11014,20 +10692,16 @@ mod prediction_ghost_context_indicator_tests {
             .iter()
             .position(|row| row.contains("steer second"))
             .expect("second steering message");
-        let held_header = rows
-            .iter()
-            .position(|row| row.contains("after completion"))
-            .expect("held header");
         let held_idx = rows
             .iter()
             .position(|row| row.contains("hold me"))
             .expect("held message");
-        assert!(steer_header < first_idx && first_idx < second_idx);
-        assert!(second_idx < held_header && held_header < held_idx);
+        assert!(first_idx < second_idx && second_idx < held_idx);
+        assert!(joined.contains("↑ recall · ⌃↑ focus queue"), "{joined}");
     }
 
     #[test]
-    fn queue_group_move_rerenders_toggled_class() {
+    fn queue_class_change_updates_summary_and_selected_chip() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         let mut item = queued_item("toggle me", QueueTarget::root("Build"));
@@ -11036,26 +10710,25 @@ mod prediction_ghost_context_indicator_tests {
 
         let before = {
             let height = app.queue_lines();
-            let buf = render_queue_buffer(&mut app, 40, height);
+            let buf = render_queue_buffer(&mut app, 64, height);
             (0..height)
-                .map(|y| row_text(&buf, y, 40))
+                .map(|y| row_text(&buf, y, 64))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        assert!(before.contains("Steer · next safe boundary"));
-        assert!(!before.contains("Held · after completion"));
+        assert!(before.contains("Steer · 1 message"));
 
         app.queue[0].delivery_class = QueueDeliveryClass::Held;
         let after = {
             let height = app.queue_lines();
-            let buf = render_queue_buffer(&mut app, 40, height);
+            let buf = render_queue_buffer(&mut app, 64, height);
             (0..height)
-                .map(|y| row_text(&buf, y, 40))
+                .map(|y| row_text(&buf, y, 64))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        assert!(after.contains("Held · after completion"));
-        assert!(!after.contains("Steer · next safe boundary"));
+        assert!(after.contains("Held · 1 message"));
+        assert!(!after.contains("Steer · 1 message"));
         assert!(after.contains("toggle me"));
     }
 
@@ -11139,14 +10812,14 @@ mod prediction_ghost_context_indicator_tests {
 
         let empty_row = render_input_row(&mut app, 80);
         assert!(
-            empty_row.contains(COMPOSER_PLACEHOLDER),
+            empty_row.contains(IDLE_COMPOSER_PLACEHOLDER),
             "empty composer renders the placeholder:\n{empty_row}"
         );
 
         app.composer.insert_str("x");
         let typed_row = render_input_row(&mut app, 80);
         assert!(
-            !typed_row.contains(COMPOSER_PLACEHOLDER),
+            !typed_row.contains(IDLE_COMPOSER_PLACEHOLDER),
             "typed text removes the placeholder:\n{typed_row}"
         );
         assert!(
@@ -11170,7 +10843,7 @@ mod prediction_ghost_context_indicator_tests {
         let row = render_input_row(&mut app, 80);
 
         assert!(
-            !row.contains(COMPOSER_PLACEHOLDER),
+            !row.contains(IDLE_COMPOSER_PLACEHOLDER),
             "prediction ghost suppresses the placeholder:\n{row}"
         );
         assert!(
@@ -11305,40 +10978,9 @@ mod input_border_color_tests {
     use super::super::App;
 
     #[test]
-    fn busy_border_is_visible_grey_not_near_black() {
-        // Regression guard (prompt `tui-busy-border-too-dark`): the
-        // busy-state border must be a visibly-grey mid-shade, never the
-        // near-black Indexed(238) that read as invisible. Pin it to the
-        // shared constant so a future darkening can't slip back in.
-        assert_eq!(
-            App::input_border_color(true, false),
-            crate::tui::theme::BUSY_BORDER
-        );
-        // The chosen shade sits in the "visibly grey, dimmer than white"
-        // band — far brighter than the old 238.
-        let idx = crate::tui::theme::BUSY_BORDER_INDEX;
-        assert!(
-            (244..=250).contains(&idx),
-            "busy border must stay in the visible-grey band"
-        );
-    }
-
-    #[test]
-    fn idle_border_is_white_and_shell_is_green() {
-        // Idle (white) and shell-mode (green Indexed(70)) are unchanged.
-        assert_eq!(
-            App::input_border_color(false, false),
-            crate::tui::theme::IDLE_BORDER
-        );
-        assert_eq!(
-            App::input_border_color(true, true),
-            crate::tui::theme::SHELL_MODE_BORDER
-        );
-        // Shell mode wins over busy.
-        assert_eq!(
-            App::input_border_color(false, true),
-            crate::tui::theme::SHELL_MODE_BORDER
-        );
+    fn composer_border_dims_only_for_an_open_picker() {
+        assert_eq!(App::input_border_color(false), crate::tui::theme::BRASS);
+        assert_eq!(App::input_border_color(true), crate::tui::theme::NIGHT);
     }
 }
 

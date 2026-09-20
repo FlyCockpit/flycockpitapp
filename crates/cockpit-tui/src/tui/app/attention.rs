@@ -28,6 +28,9 @@ impl App {
 
     pub(super) fn apply_idle_reason_status(&mut self, reason: cockpit_proto::IdleReason) {
         self.idle_reason_status = idle_reason_status(reason);
+        if let Some(status) = self.idle_reason_status.clone() {
+            self.show_toast(status.text, status.kind);
+        }
     }
 
     #[cfg(test)]

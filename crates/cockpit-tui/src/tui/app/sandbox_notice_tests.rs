@@ -2,6 +2,7 @@ use super::{
     App, MAX_SANDBOX_NOTICE_ROWS, sandbox_down_notice_text, sandbox_notice_render_text,
     sandbox_notice_wrapped_rows,
 };
+use crate::tui::composer_controls::ComposerControlKind;
 use cockpit_client::presentation::TurnEvent;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -28,7 +29,6 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
 
     // No notice initially.
     assert!(app.sandbox_down_notice.is_none());
-    assert_eq!(app.sandbox_notice_lines(), 0);
 
     // Sandbox-unavailable → persistent notice raised.
     app.apply_event(TurnEvent::SandboxUnavailable {
@@ -47,12 +47,27 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
             .and_then(|notice| notice.fix_command.as_deref()),
         Some(FIX_COMMAND)
     );
-    assert!(app.sandbox_notice_lines() > 0, "persistent row reserved");
     let text = app.sandbox_down_notice_text().unwrap();
     assert!(text.contains("/sandbox off"));
     assert!(text.contains("sudo sysctl"));
     // Purely client-side: nothing was pushed into the transcript.
     assert_eq!(app.history.len(), history_len_before);
+    app.open_composer_picker(ComposerControlKind::Sandbox);
+    let picker = app
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("sandbox picker");
+    assert_eq!(
+        picker.status,
+        super::composer_controls::ComposerPickerStatus::Unavailable
+    );
+    assert!(
+        picker
+            .status_text
+            .as_deref()
+            .is_some_and(|status| status.contains("/sandbox off"))
+    );
 
     // A repeated unavailable event just refreshes the same notice (the
     // daemon de-dupes the broadcast; the client stays idempotent).
@@ -82,7 +97,6 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
         persisted_intent: Some(cockpit_proto::SandboxMode::Off),
     });
     assert!(app.sandbox_down_notice.is_none());
-    assert_eq!(app.sandbox_notice_lines(), 0);
 
     // Re-enabling does not resurrect a stale notice on its own.
     app.apply_event(TurnEvent::SandboxState {
@@ -117,7 +131,22 @@ fn command_capability_unavailable_raises_persistent_copyable_notice() {
     let notice = app.persistent_notice_text().unwrap();
     assert!(notice.contains("Required command capability unavailable"));
     assert!(notice.contains("sudo apt-get install demo"));
-    assert!(app.sandbox_notice_lines() > 0, "persistent row reserved");
+    app.open_composer_picker(ComposerControlKind::Sandbox);
+    let picker = app
+        .composer_controls
+        .picker
+        .as_ref()
+        .expect("sandbox picker");
+    assert_eq!(
+        picker.status,
+        super::composer_controls::ComposerPickerStatus::Unavailable
+    );
+    assert!(
+        picker
+            .status_text
+            .as_deref()
+            .is_some_and(|status| status.contains("sudo apt-get install demo"))
+    );
     assert_eq!(app.history.len(), history_len_before);
 }
 

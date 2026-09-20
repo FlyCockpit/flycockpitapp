@@ -98,11 +98,8 @@ impl SlashCommand {
     }
 
     pub(super) fn completion_text(&self) -> String {
-        if self.takes_args {
-            format!("/{} ", self.name)
-        } else {
-            format!("/{}", self.name)
-        }
+        let _takes_args = self.takes_args;
+        format!("/{} ", self.name)
     }
 }
 

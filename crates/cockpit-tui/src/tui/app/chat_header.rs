@@ -26,6 +26,8 @@ impl App {
         ChatHeaderState {
             title: self.chat_header_title(),
             status: self.chat_header_status(),
+            routing_status: self.header_routing_status(),
+            rail_hidden: !self.session_rail.is_visible(),
             path: self.launch.cwd_display.clone(),
             git: self
                 .launch
@@ -80,6 +82,30 @@ impl App {
             return HeaderSessionStatus::Done;
         }
         HeaderSessionStatus::Idle
+    }
+
+    fn header_routing_status(&self) -> Option<String> {
+        if let Some(status) = self.daemon_link.as_ref() {
+            let label = if status.restarting {
+                "daemon restarting"
+            } else {
+                "daemon reconnecting"
+            };
+            return Some(format!(
+                "{label} · attempt {} · {}s",
+                status.attempt,
+                status.started_at.elapsed().as_secs()
+            ));
+        }
+        if let Some(status) = self.reconnect.as_ref() {
+            return Some(format!(
+                "{}/{} · {} · attempt {}",
+                status.provider, status.model, status.url, status.attempt
+            ));
+        }
+        (self.agent_path.len() > 1)
+            .then(|| self.agent_path.last().cloned())
+            .flatten()
     }
 
     /// Whether the transcript holds any conversation message (user or
@@ -176,6 +202,72 @@ impl App {
             });
         }
 
+        if self.pin_count > 0 {
+            pills.push(HeaderPill {
+                kind: HeaderPillKind::Pins,
+                label: format!("pins: {}", self.pin_count),
+            });
+        }
+
+        if self.longcache_enabled {
+            pills.push(HeaderPill {
+                kind: HeaderPillKind::Longcache,
+                label: if self.longcache_supported {
+                    "longcache".to_string()
+                } else {
+                    "longcache unsupported".to_string()
+                },
+            });
+        }
+
+        pills.push(HeaderPill {
+            kind: HeaderPillKind::Setup,
+            label: self
+                .session_mode
+                .map(|mode| format!("Setup: {}", mode.display_name()))
+                .unwrap_or_else(|| "Setup: loading…".to_string()),
+        });
+
+        if let Some((path, holder)) = self.waiting_for_lock.as_ref() {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(path);
+            pills.push(HeaderPill {
+                kind: HeaderPillKind::Lock,
+                label: format!("lock: {name} · {holder}"),
+            });
+        }
+        if self.side_conversation.is_some() {
+            pills.push(HeaderPill {
+                kind: HeaderPillKind::Side,
+                label: "side".to_string(),
+            });
+        }
+        if self.caffeinate_active {
+            pills.push(HeaderPill {
+                kind: HeaderPillKind::Caffeinate,
+                label: "☕ awake".to_string(),
+            });
+        }
+        #[cfg(feature = "remote")]
+        {
+            if let Some(disclosure) = self.org_sync_disclosure.as_ref() {
+                pills.push(HeaderPill {
+                    kind: HeaderPillKind::OrgSync,
+                    label: format!("org sync {}", disclosure.org_id),
+                });
+            }
+            if let Some(disclosure) = self.connector_disclosure.as_ref()
+                && (disclosure.enabled || disclosure.status != "off")
+            {
+                pills.push(HeaderPill {
+                    kind: HeaderPillKind::Connector,
+                    label: format!("remote {}", disclosure.status),
+                });
+            }
+        }
+
         pills
     }
 
@@ -221,25 +313,25 @@ impl App {
         None
     }
 
-    /// Render the three-row header at the top of `chat`, returning the
-    /// remaining rect. When the pane is too short to hold the header plus a
-    /// history row, the header is skipped and the pane passes through
-    /// unchanged (recorded as no layout, so pills cannot be activated).
+    /// Render the header at the top of `chat`, returning the remaining rect.
+    /// It contracts from title/meta/rule to title/rule and then title-only so
+    /// one transcript row survives; a one-row pane remains transcript-only.
     pub(super) fn render_chat_header(&mut self, frame: &mut Frame, chat: Rect) -> Rect {
-        if chat.width == 0 || chat.height <= CHAT_HEADER_HEIGHT {
+        if chat.width == 0 || chat.height < 2 {
             self.chat_header_layout = None;
             self.header_pill_selection = None;
             self.chat_header_more_open = false;
             self.chat_header_more_rect = None;
             return chat;
         }
+        let header_height = CHAT_HEADER_HEIGHT.min(chat.height.saturating_sub(1));
         let header_area = Rect {
-            height: CHAT_HEADER_HEIGHT,
+            height: header_height,
             ..chat
         };
         let rest = Rect {
-            y: chat.y.saturating_add(CHAT_HEADER_HEIGHT),
-            height: chat.height.saturating_sub(CHAT_HEADER_HEIGHT),
+            y: chat.y.saturating_add(header_height),
+            height: chat.height.saturating_sub(header_height),
             ..chat
         };
         let state = self.chat_header_state();
@@ -301,7 +393,7 @@ impl App {
             .x
             .saturating_add(more_rect.width)
             .saturating_sub(width);
-        let y = layout.area.y.saturating_add(CHAT_HEADER_HEIGHT);
+        let y = layout.area.bottom();
         let popover = Rect {
             x,
             y,
@@ -415,6 +507,16 @@ impl App {
             HeaderPillKind::Tool => self.open_tools_pane(),
             HeaderPillKind::Task | HeaderPillKind::Timer => self.handle_schedule_command(""),
             HeaderPillKind::Skill => self.open_skills_pane(),
+            HeaderPillKind::Pins => self.enter_pins_review_mode(),
+            HeaderPillKind::Setup => self.open_session_setup(),
+            HeaderPillKind::Longcache
+            | HeaderPillKind::Lock
+            | HeaderPillKind::Side
+            | HeaderPillKind::Caffeinate => self.header_pill_selection = None,
+            #[cfg(feature = "remote")]
+            HeaderPillKind::OrgSync | HeaderPillKind::Connector => {
+                self.header_pill_selection = None;
+            }
         }
     }
 

@@ -126,6 +126,17 @@ fn auth_failure_notice_actions() {
     assert!(app.composer_controls.picker.as_ref().is_some_and(
         |picker| picker.kind == crate::tui::composer_controls::ComposerControlKind::Model
     ));
+    let picker = app.composer_controls.picker.as_ref().expect("model picker");
+    assert_eq!(
+        picker.status,
+        super::composer_controls::ComposerPickerStatus::Unavailable
+    );
+    assert!(
+        picker
+            .status_text
+            .as_deref()
+            .is_some_and(|status| status.contains("failed 403"))
+    );
     app.close_composer_picker();
 
     cockpit_config::trust::with_workspace_trust_policy(

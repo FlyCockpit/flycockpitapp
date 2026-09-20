@@ -310,7 +310,6 @@ impl App {
         }
 
         use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
-        let selected = self.composer_controls.selection;
         let labels = match layout.tier {
             ComposerLabelTier::Full => state.full_labels_owned(),
             ComposerLabelTier::Compact => state.compact_labels_owned(),
@@ -319,6 +318,24 @@ impl App {
                 .map(|kind| kind.glyph_label().to_string())
                 .collect(),
         };
+        if let Some(send) = layout.send_button {
+            let spec = ButtonSpec::new(
+                ButtonId::ComposerSend,
+                send_label(state.working),
+                ButtonDispatch::ComposerSend,
+            );
+            let hovered = self.button_registry.hover() == Some(&spec.id);
+            crate::tui::chrome::paint_chip(
+                frame,
+                send,
+                &crate::tui::button::bracketed_label(send_label(state.working)),
+                Style::default()
+                    .fg(crate::tui::theme::BRASS)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+                hovered,
+            );
+            self.button_registry.register(send, spec);
+        }
         for (kind, rect) in &layout.pill_buttons {
             let idx = ComposerControlKind::ALL
                 .iter()
@@ -330,23 +347,33 @@ impl App {
                 .unwrap_or_else(|| kind.as_str().to_string());
             let spec = ButtonSpec::new(
                 ButtonId::ComposerPill(*kind),
-                label,
+                label.clone(),
                 ButtonDispatch::ComposerPill(*kind),
-            )
-            .focused(selected == Some(*kind));
-            let _ = self
-                .button_registry
-                .paint(frame, rect.x, rect.y, rect.width, spec);
-        }
-        if let Some(send) = layout.send_button {
-            let spec = ButtonSpec::new(
-                ButtonId::ComposerSend,
-                send_label(state.working),
-                ButtonDispatch::ComposerSend,
             );
-            let _ = self
-                .button_registry
-                .paint(frame, send.x, send.y, send.width, spec);
+            let hovered = self.button_registry.hover() == Some(&spec.id);
+            let color = match kind {
+                ComposerControlKind::Sandbox if self.sandbox_down_notice.is_some() => {
+                    crate::tui::theme::RED
+                }
+                ComposerControlKind::Sandbox
+                    if self.command_capability_notice.is_some()
+                        || self.update_disabled_notice_text().is_some() =>
+                {
+                    crate::tui::theme::YELLOW
+                }
+                ComposerControlKind::Model if self.auth_failure_notice.is_some() => {
+                    crate::tui::theme::RED
+                }
+                _ => crate::tui::theme::FOG,
+            };
+            crate::tui::chrome::paint_chip(
+                frame,
+                *rect,
+                &crate::tui::button::bracketed_label(&label),
+                Style::default().fg(color),
+                hovered,
+            );
+            self.button_registry.register(*rect, spec);
         }
         self.composer_controls.layout = Some(layout);
     }
@@ -693,6 +720,25 @@ impl App {
             ComposerControlKind::Effort => self.fill_effort_picker(&mut picker),
             ComposerControlKind::Approval => self.fill_approval_picker(&mut picker),
             ComposerControlKind::Sandbox => self.fill_sandbox_picker(&mut picker),
+        }
+        match kind {
+            ComposerControlKind::Sandbox => {
+                let notice = self
+                    .sandbox_down_notice_text()
+                    .or_else(|| self.command_capability_notice_text())
+                    .or_else(|| self.update_disabled_notice_text().map(str::to_string));
+                if let Some(notice) = notice {
+                    picker.status = ComposerPickerStatus::Unavailable;
+                    picker.status_text = Some(super::sandbox_notice_render_text(&notice));
+                }
+            }
+            ComposerControlKind::Model => {
+                if let Some(notice) = self.auth_failure_notice.as_ref() {
+                    picker.status = ComposerPickerStatus::Unavailable;
+                    picker.status_text = Some(crate::tui::auth_failure::notice_text(notice, true));
+                }
+            }
+            _ => {}
         }
         if kind == ComposerControlKind::Model
             && let Some((provider, _)) = self.launch.active_model.as_ref()

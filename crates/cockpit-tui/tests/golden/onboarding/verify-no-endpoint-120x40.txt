@@ -3,8 +3,8 @@
                  openai has no public /models endpoint.                                                                 
                  ────────────────────────────                                                                           
                  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready                                  
-                 The credential is stored. This provider does not publish a model catalog, so Cockpit w                 
-                                                                                                                        
+                 The credential is stored. This provider does not publish a model catalog, so Cockpit                   
+                 will use configured models.                                                                            
                                                                                                                         
                                                                                                                         
                                                                                                                         

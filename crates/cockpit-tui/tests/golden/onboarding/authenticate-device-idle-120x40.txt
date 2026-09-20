@@ -1,15 +1,16 @@
  ‹ Back                                                                                                                 
                  Sign in to your subscription · step 4/8                                                                
-                 Approve access in the browser, then paste the result back.                                             
+                 A device code links this client to your account.                                                       
                  ────────────────────────────                                                                           
                  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready                                  
-                 Open this URL and approve access:                                                                      
+                 Open this URL in a browser and enter the code:                                                         
                                                                                                                         
-                 https://auth.example.com/oauth/authorize                                                               
+                 https://auth.openai.com/codex/device                                                                   
                                                                                                                         
-                 ╭ Callback URL or code ──────────────────────────────────────────────────────────────╮                 
-                 │ Paste callback                                                                     │                 
+                 ╭ One-time code ─────────────────────────────────────────────────────────────────────╮                 
+                 │                                      ABCD-EFGH                                     │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 Press Enter once you've opened the page to start polling.                                              
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -35,6 +36,5 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
-                 paste callback   enter continue   esc back   ^c quit                      [ Continue ]                 
+                 enter open & poll   esc back   ^c quit                                 [ Open & poll ]                 
                                                                                                                         

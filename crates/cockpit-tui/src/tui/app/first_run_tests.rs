@@ -30,6 +30,41 @@ fn write_global_config(cfg: &ProvidersConfig) {
     write_providers_at(&path, cfg);
 }
 
+fn install_global_provider_config(app: &mut App, cfg: &ProvidersConfig) {
+    write_global_config(cfg);
+    app.config_snapshot.providers = cfg.clone();
+    if app.config_snapshot.generation == 0 {
+        app.config_snapshot.generation = 1;
+    }
+    app.config_snapshot.providers.set_resolution_generation(1);
+}
+
+fn detour_provider_settlement() -> crate::tui::onboarding::ProviderSettlementEvidence {
+    crate::tui::onboarding::ProviderSettlementEvidence {
+        operation_id: "detour-op".into(),
+        mutation_intent_hash: "00".repeat(32),
+        mutation_config_generation: 1,
+        config_generation: 1,
+    }
+}
+
+fn complete_detour_provider_verify(app: &mut App, provider_id: &str) {
+    assert_eq!(
+        shell_screen_kind(app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Authenticate),
+        "detour provider walk must reach native Authenticate before Verify"
+    );
+    if let Some(shell) = app.onboarding_shell.as_mut() {
+        shell.present_verify(provider_id.to_string());
+        shell.apply_provider_verification(
+            provider_id,
+            crate::tui::onboarding::VerifyOutcome::Models(vec!["detour-model".into()]),
+            Some(detour_provider_settlement()),
+        );
+    }
+    shell_key(app, KeyCode::Enter);
+}
+
 fn write_providers_at(path: &std::path::Path, cfg: &ProvidersConfig) {
     let mut doc = ConfigDoc::load(path).unwrap();
     doc.write(cfg).unwrap();
@@ -401,7 +436,7 @@ fn first_run_chains_provider_then_model() {
     let mut app = App::new(Some(tmp.path()), false);
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
-    write_global_config(&config_with_provider("p", "m"));
+    install_global_provider_config(&mut app, &config_with_provider("p", "m"));
     with_untrusted_workspace(tmp.path(), || {
         set_onboarding_stage(&mut app, OnboardingStage::Model)
     });
@@ -430,10 +465,10 @@ fn first_run_provider_without_catalog_offers_manual_model_entry() {
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
     // No catalog: the provider was saved without a validated model list.
-    write_global_config(&config_with_provider("p", ""));
+    install_global_provider_config(&mut app, &config_with_provider("p", ""));
     let mut empty_catalog = config_with_provider("p", "");
     empty_catalog.providers.get_mut("p").unwrap().models.clear();
-    write_global_config(&empty_catalog);
+    install_global_provider_config(&mut app, &empty_catalog);
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     assert_eq!(
         shell_screen_kind(&app),
@@ -469,7 +504,7 @@ fn first_run_flow_completes_end_to_end() {
     let mut app = App::new(Some(tmp.path()), false);
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
-    write_global_config(&config_with_provider("p", "m"));
+    install_global_provider_config(&mut app, &config_with_provider("p", "m"));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
@@ -521,7 +556,7 @@ fn completion_detour_ends_when_the_added_provider_settles() {
     let mut app = App::new(Some(tmp.path()), false);
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
-    write_global_config(&config_with_provider("p", "m"));
+    install_global_provider_config(&mut app, &config_with_provider("p", "m"));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
@@ -560,13 +595,15 @@ fn completion_detour_ends_when_the_added_provider_settles() {
     shell_key(&mut app, KeyCode::Up);
     shell_key(&mut app, KeyCode::Enter);
     select_provider_template(&mut app, "openai");
-    app.onboarding_shell
-        .as_mut()
-        .expect("completion detour shell")
-        .return_to_completion();
+    complete_detour_provider_verify(&mut app, "openai");
     assert_eq!(
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
+    );
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| !shell.completion_detour_active())
     );
     assert!(!app.dialog.is_active());
 }
@@ -581,7 +618,7 @@ fn first_run_completes_under_an_untrusted_workspace() {
     let mut app = App::new(Some(tmp.path()), false);
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
-    write_global_config(&config_with_provider("p", "m"));
+    install_global_provider_config(&mut app, &config_with_provider("p", "m"));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     assert_eq!(
         shell_screen_kind(&app),
@@ -601,7 +638,7 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
     let mut app = App::new(Some(tmp.path()), false);
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
-    write_global_config(&config_with_provider("p", "m"));
+    install_global_provider_config(&mut app, &config_with_provider("p", "m"));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
@@ -642,14 +679,15 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
             .is_some_and(|shell| shell.completion_detour_active())
     );
 
-    // Verified Done ends the detour through its local completion path.
-    app.onboarding_shell
-        .as_mut()
-        .expect("completion detour shell")
-        .return_to_completion();
+    complete_detour_provider_verify(&mut app, "openai-compatible");
     assert_eq!(
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
+    );
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| !shell.completion_detour_active())
     );
     assert!(!app.dialog.is_active());
 }
@@ -680,7 +718,7 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
         prompt_cache_retention: None,
     });
     write_config(tmp.path(), &cfg);
-    write_global_config(&cfg);
+    install_global_provider_config(&mut app, &cfg);
     select_provider_template(&mut app, "openai");
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
@@ -742,7 +780,7 @@ fn lifetime_settlement_adopts_the_committed_choice_only_after_the_daemon_commit(
     let mut app = App::new(Some(tmp.path()), false);
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
-    write_global_config(&config_with_provider("p", "m"));
+    install_global_provider_config(&mut app, &config_with_provider("p", "m"));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
@@ -979,7 +1017,7 @@ fn native_provider_screen_is_not_advanced_by_legacy_service_polling() {
     let mut app = App::new(Some(tmp.path()), false);
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
-    write_global_config(&config_with_provider("p", "m"));
+    install_global_provider_config(&mut app, &config_with_provider("p", "m"));
     // Native Authenticate/Verify are reducer-driven. Repeated service wakes
     // cannot synthesize the former embedded-engine completion.
     assert!(!with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));

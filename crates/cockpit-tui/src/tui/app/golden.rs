@@ -955,6 +955,11 @@ pub fn assert_onboarding_native_screens() {
             crate::tui::onboarding::AuthPhase::Acknowledge,
         ),
         (
+            "authenticate-device-idle",
+            "codex-oauth",
+            crate::tui::onboarding::AuthPhase::DeviceIdle,
+        ),
+        (
             "authenticate-device-code",
             "codex-oauth",
             crate::tui::onboarding::AuthPhase::DevicePolling,

@@ -1235,6 +1235,11 @@ impl OnboardingShell {
         {
             return None;
         }
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen
+            && screen.back()
+        {
+            return None;
+        }
         if matches!(
             self.screen,
             OnboardingScreen::Authenticate(_) | OnboardingScreen::Verify(_)
@@ -1415,7 +1420,9 @@ impl OnboardingShell {
             }
             OnboardingScreen::AgentAuthoring(screen) => {
                 if matches!(key.code, KeyCode::Esc) {
-                    self.open_escape_menu(engine);
+                    if !screen.back() {
+                        self.open_escape_menu(engine);
+                    }
                     return None;
                 }
                 screen

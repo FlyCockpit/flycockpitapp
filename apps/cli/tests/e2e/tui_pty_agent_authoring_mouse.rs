@@ -192,6 +192,11 @@ fn mouse_through_agent_authoring(session: &mut HermeticCockpit) {
         .expect("review advance reaches create");
 
     click_text(session, "[ Create agent ]");
+    session
+        .wait_until_screen("agent authoring success", AGENT_ASYNC_TIMEOUT, |screen| {
+            screen.contains("Your agent is ready") && screen.contains("step 6/8")
+        })
+        .expect("create receipt reaches the agent authoring success screen");
 }
 
 fn find_runner_subagent_package(agents_root: &Path) -> Option<PathBuf> {

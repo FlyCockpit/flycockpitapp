@@ -177,6 +177,15 @@ fn default_replacement_toggle_on_create_screen() {
     screen.cursor = 0;
     screen.handle_key(key(KeyCode::Char(' ')));
     assert!(!screen.draft.make_default);
+    assert!(
+        screen.review.is_none(),
+        "changing Create invalidates its preview"
+    );
+    let rendered = render_string(&mut screen, 120, 40);
+    assert!(
+        rendered.contains("Make default agent  off"),
+        "Create must render the value that Apply will send: {rendered}"
+    );
 }
 
 #[test]
@@ -190,6 +199,81 @@ fn back_restores_parent_after_canceling_nested_subagent() {
     screen.handle_key(key(KeyCode::Esc));
     assert!(matches!(screen.phase, Phase::SubagentsList));
     assert_eq!(screen.draft.children.len(), before);
+}
+
+#[test]
+fn canceling_nested_subagent_restores_its_parent_editor_without_the_new_child() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "nested-cancel".into());
+    advance_to_subagents(&mut screen);
+    screen.begin_edit_subagent(0);
+    screen.phase = Phase::SubagentEdit(SubagentPhase::SubagentsList);
+    screen.cursor = 0;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::Identity)
+    ));
+    assert_eq!(screen.subagent_stack.len(), 2);
+
+    screen.handle_key(key(KeyCode::Esc));
+
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::SubagentsList)
+    ));
+    assert_eq!(screen.subagent_stack.len(), 1, "runner edit stays active");
+    assert_eq!(
+        screen
+            .editing_child
+            .as_ref()
+            .expect("parent editor must be restored")
+            .name,
+        "runner"
+    );
+    assert!(
+        screen.draft.children[0].children.is_empty(),
+        "cancel must discard the uncommitted nested helper"
+    );
+}
+
+#[test]
+fn tool_model_selection_is_scoped_to_the_draft_being_edited() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "tool-scope".into());
+    let tool_index = tool_surface_catalog()
+        .iter()
+        .position(|item| item.name == "transcribe_audio")
+        .expect("model-gated tool");
+    let cursor = tool_presentation_order()
+        .iter()
+        .position(|index| *index == tool_index)
+        .expect("model-gated tool must be visible");
+
+    screen.phase = Phase::ToolTiers;
+    screen.cursor = cursor;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    screen.handle_key(key(KeyCode::Enter));
+    assert_eq!(screen.draft.tool_models["transcribe_audio"], 0);
+
+    screen.begin_edit_subagent(0);
+    screen.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
+    screen.cursor = cursor;
+    let child_before = render_string(&mut screen, 120, 40);
+    assert!(
+        child_before.contains("transcribe_audio") && child_before.contains("choose model"),
+        "the child must not render its parent's model choice: {child_before}"
+    );
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(
+        screen.tool_model_picker.is_some(),
+        "a child must open its own picker rather than inheriting the parent choice"
+    );
+    screen.handle_key(key(KeyCode::Down));
+    screen.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        screen.current_child().expect("child editor").tool_models["transcribe_audio"],
+        1
+    );
+    assert_eq!(screen.draft.tool_models["transcribe_audio"], 0);
 }
 
 #[test]
@@ -314,6 +398,7 @@ fn invalid_nested_depth_surfaces_canonical_failure() {
             default_route_index: 0,
             trust_confirmations: vec![false],
             tool_tiers: Default::default(),
+            tool_models: Default::default(),
             children: vec![],
         },
         cockpit_core::authoring_draft::ChildAuthoringDraft {
@@ -322,6 +407,7 @@ fn invalid_nested_depth_surfaces_canonical_failure() {
             default_route_index: 0,
             trust_confirmations: vec![false],
             tool_tiers: Default::default(),
+            tool_models: Default::default(),
             children: vec![],
         },
     ];
@@ -551,7 +637,7 @@ fn tool_model_picker_click_uses_picker_row_index_after_tools_scroll() {
     assert_eq!(screen.model_picker_row_rects.len(), 2);
     let second_route = screen.model_picker_row_rects[1];
     assert!(screen.handle_mouse(click_at(Position::new(second_route.x, second_route.y))));
-    assert_eq!(screen.tool_models["transcribe_audio"], 1);
+    assert_eq!(screen.draft.tool_models["transcribe_audio"], 1);
     assert_eq!(
         screen.draft.tool_tiers["transcribe_audio"],
         cockpit_core::agents::ToolTier::Enabled

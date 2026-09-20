@@ -1514,6 +1514,56 @@ fn model_back_walks_substeps_then_escape_opens_options() {
 }
 
 #[test]
+fn agent_authoring_back_stays_inside_the_editor_until_the_root_name_phase() {
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 30;
+    let mut shell = shell_at(OnboardingStage::Agent);
+    shell.present_agent_authoring(agent::golden_sample_projection(), "agent-back".into());
+    let mut engine = Dialog::None;
+
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    assert_eq!(
+        shell.test_agent_authoring_phase(),
+        Some(agent::Phase::ModelGrants)
+    );
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    assert_eq!(
+        shell.test_agent_authoring_phase(),
+        Some(agent::Phase::SourceIdentity),
+        "Escape must use authoring phase-back before opening shell options"
+    );
+    let root = render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    assert!(
+        !root.contains("Leave setup?"),
+        "phase back must not open options"
+    );
+
+    shell.handle_key(key(KeyCode::Enter), &mut engine);
+    assert_eq!(
+        shell.test_agent_authoring_phase(),
+        Some(agent::Phase::ModelGrants)
+    );
+    render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    let back = shell.back_rect;
+    let outcome = shell.handle_mouse(click(back.x, back.y), &mut engine);
+    assert!(
+        outcome.action.is_none(),
+        "authoring Back must not leave the stage"
+    );
+    assert_eq!(
+        shell.test_agent_authoring_phase(),
+        Some(agent::Phase::SourceIdentity)
+    );
+
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let options = render_string(&mut shell, WIDTH, HEIGHT, &engine);
+    assert!(
+        options.contains("Leave setup?"),
+        "only root-name Escape may open shell options: {options}"
+    );
+}
+
+#[test]
 fn model_same_default_after_back_preserves_every_policy_edit() {
     let mut shell = shell_at(OnboardingStage::Model);
     shell.present_model(

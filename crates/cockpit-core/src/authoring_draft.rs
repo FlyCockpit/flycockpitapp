@@ -46,6 +46,8 @@ pub struct ChildAuthoringDraft {
     pub default_route_index: usize,
     pub trust_confirmations: Vec<bool>,
     pub tool_tiers: BTreeMap<String, ToolTier>,
+    /// UI-only model selections for tools that require a dedicated model.
+    pub tool_models: BTreeMap<String, usize>,
     pub children: Vec<ChildAuthoringDraft>,
 }
 
@@ -66,6 +68,8 @@ pub struct AgentAuthoringDraft {
     pub goal_skeptics: GoalSkepticsPolicy,
     pub verification_enabled: bool,
     pub tool_tiers: BTreeMap<String, ToolTier>,
+    /// UI-only model selections for tools that require a dedicated model.
+    pub tool_models: BTreeMap<String, usize>,
     pub children: Vec<ChildAuthoringDraft>,
     pub sidecar_route_index: Option<usize>,
     pub sidecar_egress_confirmed: bool,
@@ -108,6 +112,7 @@ impl AgentAuthoringDraft {
             goal_skeptics: GoalSkepticsPolicy::Count { count: 2 },
             verification_enabled: true,
             tool_tiers: default_tool_tiers(),
+            tool_models: BTreeMap::new(),
             children: Vec::new(),
             sidecar_route_index: preferred_sidecar_route_index(projection),
             sidecar_egress_confirmed: false,
@@ -242,22 +247,34 @@ fn default_tool_tiers() -> BTreeMap<String, ToolTier> {
 
 fn author_placeable_tool_tier_preferences(
     tool_tiers: &BTreeMap<String, ToolTier>,
+    diagnostics: &mut Vec<String>,
 ) -> BTreeMap<String, ToolTier> {
-    tool_tiers
-        .iter()
-        .filter(|(tool, tier)| {
-            crate::agents::known_tool_names().contains(&tool.as_str())
-                && matches!(*tier, ToolTier::Enabled | ToolTier::Discoverable)
-                && legal_tool_tiers(tool).contains(tier)
-                && !crate::engine::builtin::author_tool_tier_preference_is_reserved(tool)
-        })
-        .map(|(tool, tier)| (tool.clone(), *tier))
-        .collect()
+    let mut preferences = BTreeMap::new();
+    for (tool, tier) in tool_tiers {
+        let diagnostic = if !known_tool_names().contains(&tool.as_str()) {
+            Some(format!("Ignored unknown tool preference `{tool}`."))
+        } else if !matches!(*tier, ToolTier::Enabled | ToolTier::Discoverable) {
+            None
+        } else if !legal_tool_tiers(tool).contains(tier) {
+            Some(format!(
+                "Ignored illegal tier for tool preference `{tool}`."
+            ))
+        } else if crate::engine::builtin::author_tool_tier_preference_is_reserved(tool) {
+            Some(format!("Ignored reserved tool preference `{tool}`."))
+        } else {
+            preferences.insert(tool.clone(), *tier);
+            None
+        };
+        if let Some(diagnostic) = diagnostic {
+            diagnostics.push(diagnostic);
+        }
+    }
+    preferences
 }
 
 fn child_default_tool_tiers() -> BTreeMap<String, ToolTier> {
     let mut tiers = default_tool_tiers();
-    for tool in ["search", "timer", "background", "task"] {
+    for tool in ["search", "timer", "task"] {
         if legal_tool_tiers(tool).contains(&ToolTier::Enabled) {
             tiers.insert(tool.to_string(), ToolTier::Enabled);
         }
@@ -265,11 +282,28 @@ fn child_default_tool_tiers() -> BTreeMap<String, ToolTier> {
     tiers
 }
 
+/// Canonical package plus non-fatal warnings discovered while normalizing an
+/// authored draft for preview or apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltAuthoredAgentPackageDraft {
+    pub package: AuthoredAgentPackageDraft,
+    pub diagnostics: Vec<String>,
+}
+
 /// Build the wire package draft from local editing state and the pinned projection.
 pub fn build_package_draft(
     projection: &AgentAuthoringProjection,
     draft: &AgentAuthoringDraft,
 ) -> Result<AuthoredAgentPackageDraft> {
+    Ok(build_package_draft_with_diagnostics(projection, draft)?.package)
+}
+
+/// Build the wire package draft and retain warnings for preferences that were
+/// deliberately excluded from the canonical package.
+pub fn build_package_draft_with_diagnostics(
+    projection: &AgentAuthoringProjection,
+    draft: &AgentAuthoringDraft,
+) -> Result<BuiltAuthoredAgentPackageDraft> {
     ensure!(
         projection.dto_version == AGENT_AUTHORING_DTO_VERSION,
         "unsupported agent authoring projection DTO version"
@@ -310,11 +344,12 @@ pub fn build_package_draft(
 
     let (source, name, body) = resolve_source(projection, draft)?;
     validate_authored_agent_name(&name)?;
-    let frontmatter = build_frontmatter(projection, draft, &name)?;
+    let mut diagnostics = Vec::new();
+    let frontmatter = build_frontmatter(projection, draft, &name, &mut diagnostics)?;
     let yaml = serde_yaml::to_string(&frontmatter)?;
     let markdown = format!("---\n{}---\n{body}", yaml.trim_start_matches("---\n"));
 
-    let children = collect_child_package_files(projection, &draft.children)?;
+    let children = collect_child_package_files(projection, &draft.children, &mut diagnostics)?;
 
     let sidecars = draft
         .sidecar_route_index
@@ -342,18 +377,21 @@ pub fn build_package_draft(
         &mut model_trust_confirmations,
     );
 
-    Ok(AuthoredAgentPackageDraft {
-        dto_version: AGENT_AUTHORING_DTO_VERSION,
-        name,
-        markdown,
-        source,
-        children,
-        mcp_json: None,
-        sidecars,
-        policy_revision: projection.policy.policy_revision.clone(),
-        model_trust_confirmations,
-        make_default: draft.make_default,
-        draft_revision: None,
+    Ok(BuiltAuthoredAgentPackageDraft {
+        package: AuthoredAgentPackageDraft {
+            dto_version: AGENT_AUTHORING_DTO_VERSION,
+            name,
+            markdown,
+            source,
+            children,
+            mcp_json: None,
+            sidecars,
+            policy_revision: projection.policy.policy_revision.clone(),
+            model_trust_confirmations,
+            make_default: draft.make_default,
+            draft_revision: None,
+        },
+        diagnostics,
     })
 }
 
@@ -435,6 +473,7 @@ fn build_frontmatter(
     projection: &AgentAuthoringProjection,
     draft: &AgentAuthoringDraft,
     name: &str,
+    diagnostics: &mut Vec<String>,
 ) -> Result<AgentDefinitionFrontmatter> {
     let models = draft
         .route_grants
@@ -453,7 +492,8 @@ fn build_frontmatter(
         })
         .collect::<Vec<_>>();
 
-    let tool_tier_preferences = author_placeable_tool_tier_preferences(&draft.tool_tiers);
+    let tool_tier_preferences =
+        author_placeable_tool_tier_preferences(&draft.tool_tiers, diagnostics);
 
     let delegation = if draft.children.is_empty() {
         None
@@ -631,11 +671,15 @@ fn validate_child_tree(
 fn collect_child_package_files(
     projection: &AgentAuthoringProjection,
     children: &[ChildAuthoringDraft],
+    diagnostics: &mut Vec<String>,
 ) -> Result<Vec<AuthoredAgentChild>> {
     let mut files = Vec::new();
     for child in children {
         files.extend(collect_child_package_files_recursive(
-            projection, child, "",
+            projection,
+            child,
+            "",
+            diagnostics,
         )?);
     }
     Ok(files)
@@ -645,8 +689,10 @@ fn collect_child_package_files_recursive(
     projection: &AgentAuthoringProjection,
     child: &ChildAuthoringDraft,
     parent_prefix: &str,
+    diagnostics: &mut Vec<String>,
 ) -> Result<Vec<AuthoredAgentChild>> {
-    let (relative_path, markdown) = build_child_markdown(projection, child, parent_prefix)?;
+    let (relative_path, markdown) =
+        build_child_markdown(projection, child, parent_prefix, diagnostics)?;
     let mut files = vec![AuthoredAgentChild {
         relative_path,
         markdown,
@@ -662,6 +708,7 @@ fn collect_child_package_files_recursive(
             projection,
             nested,
             &nested_prefix,
+            diagnostics,
         )?);
     }
     Ok(files)
@@ -671,6 +718,7 @@ fn build_child_markdown(
     projection: &AgentAuthoringProjection,
     child: &ChildAuthoringDraft,
     parent_prefix: &str,
+    diagnostics: &mut Vec<String>,
 ) -> Result<(String, String)> {
     let name = child_slug(child);
     let relative_path = if parent_prefix.is_empty() {
@@ -698,7 +746,8 @@ fn build_child_markdown(
         !models.is_empty(),
         "subagent `{name}` requires a model grant"
     );
-    let tool_tier_preferences = author_placeable_tool_tier_preferences(&child.tool_tiers);
+    let tool_tier_preferences =
+        author_placeable_tool_tier_preferences(&child.tool_tiers, diagnostics);
     let frontmatter = AgentDefinitionFrontmatter {
         schema_version: SCHEMA_VERSION,
         agent_id: format!("authored/{name}"),
@@ -775,6 +824,7 @@ pub fn default_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthor
         default_route_index: 0,
         trust_confirmations: vec![false; route_count],
         tool_tiers: child_default_tool_tiers(),
+        tool_models: BTreeMap::new(),
         children: Vec::new(),
     }
 }
@@ -843,7 +893,13 @@ mod tests {
         let projection = sample_projection();
         let mut child = default_child_draft(&projection);
         child.trust_confirmations[0] = true;
-        let (_path, markdown) = build_child_markdown(&projection, &child, "").unwrap();
+        let mut diagnostics = Vec::new();
+        let (_path, markdown) =
+            build_child_markdown(&projection, &child, "", &mut diagnostics).unwrap();
+        assert!(
+            diagnostics.is_empty(),
+            "runner defaults must need no repair"
+        );
         let files = BTreeMap::from([(
             crate::agents::PACKAGE_ROOT_FILE.to_string(),
             markdown.into_bytes(),
@@ -868,6 +924,54 @@ mod tests {
         assert!(
             !package.markdown.contains("extract_audio:"),
             "host-placement tools must not be written into toolTierPreferences"
+        );
+    }
+
+    #[test]
+    fn child_default_tool_tiers_only_contain_registered_tools() {
+        for tool in child_default_tool_tiers().keys() {
+            assert!(
+                known_tool_names().contains(&tool.as_str()),
+                "child default `{tool}` must be a registered tool"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_user_tool_preference_warns_and_is_dropped() {
+        let projection = sample_projection();
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
+        draft.trust_confirmations[0] = true;
+        draft.children.clear();
+        draft
+            .tool_tiers
+            .insert("misspelled_tool".into(), ToolTier::Enabled);
+
+        let built = build_package_draft_with_diagnostics(&projection, &draft).unwrap();
+        assert!(
+            !built.package.markdown.contains("misspelled_tool"),
+            "unknown preferences must not enter the canonical package"
+        );
+        assert_eq!(
+            built.diagnostics,
+            vec!["Ignored unknown tool preference `misspelled_tool`."],
+            "the user-authored typo must remain visible as a warning"
+        );
+    }
+
+    #[test]
+    fn default_tool_preferences_need_no_diagnostics() {
+        let projection = sample_projection();
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
+        draft.trust_confirmations[0] = true;
+        let mut child = default_child_draft(&projection);
+        child.trust_confirmations[0] = true;
+        draft.children = vec![child];
+
+        let built = build_package_draft_with_diagnostics(&projection, &draft).unwrap();
+        assert!(
+            built.diagnostics.is_empty(),
+            "hardcoded defaults must not be silently repaired"
         );
     }
 

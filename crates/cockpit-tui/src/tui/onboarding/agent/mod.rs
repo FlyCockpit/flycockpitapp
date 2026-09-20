@@ -19,7 +19,7 @@ use crate::tui::textfield::TextField;
 use cockpit_core::agents::{GoalSkepticsPolicy, ToolTier, tool_surface_catalog};
 use cockpit_core::authoring_draft::{
     AgentAuthoringDraft, ChildAuthoringDraft, RouteGrantDraft, SourceSelection,
-    build_package_draft, default_child_draft,
+    build_package_draft_with_diagnostics, default_child_draft,
 };
 use cockpit_proto::{
     AgentAuthoringProjection, ApplyAuthoredAgentPackageOutcome, ApplyAuthoredAgentPackageReceipt,
@@ -112,7 +112,7 @@ pub struct AgentAuthoringScreen {
     mouse_selected: Option<usize>,
     tool_model_picker: Option<usize>,
     tool_model_cursor: usize,
-    tool_models: std::collections::BTreeMap<String, usize>,
+    draft_diagnostics: Vec<String>,
 }
 
 impl std::fmt::Debug for AgentAuthoringScreen {
@@ -154,7 +154,7 @@ impl AgentAuthoringScreen {
             mouse_selected: None,
             tool_model_picker: None,
             tool_model_cursor: 0,
-            tool_models: std::collections::BTreeMap::new(),
+            draft_diagnostics: Vec::new(),
         }
     }
 
@@ -201,6 +201,7 @@ impl AgentAuthoringScreen {
             .is_some_and(|revision| revision != projection.policy.policy_revision);
         self.projection = projection;
         self.draft = fresh_authoring_draft(&self.projection);
+        self.draft_diagnostics.clear();
         if stale_review {
             self.review = None;
             self.review_policy_revision = None;
@@ -299,6 +300,17 @@ impl AgentAuthoringScreen {
         self.editing_child.as_mut()
     }
 
+    fn tool_model_for(&self, tool: &str) -> Option<usize> {
+        self.current_child()
+            .and_then(|child| child.tool_models.get(tool))
+            .or_else(|| {
+                self.editing_root()
+                    .then(|| self.draft.tool_models.get(tool))
+                    .flatten()
+            })
+            .copied()
+    }
+
     pub(super) fn phase_title(&self) -> &'static str {
         match self.phase {
             Phase::SourceIdentity => "Create your first agent",
@@ -325,7 +337,7 @@ impl AgentAuthoringScreen {
     }
 
     pub(super) fn phase_subtitle(&self) -> String {
-        let subtitle = match self.phase {
+        let mut subtitle = match self.phase {
             Phase::SourceIdentity => {
                 "An agent is a saved configuration you can fly again and again.".into()
             }
@@ -383,6 +395,10 @@ impl AgentAuthoringScreen {
             }),
             Phase::Success => "The agent package was committed successfully.".into(),
         };
+        if !self.draft_diagnostics.is_empty() {
+            subtitle.push_str("  Warning: ");
+            subtitle.push_str(&self.draft_diagnostics.join(" "));
+        }
         if !matches!(
             self.phase,
             Phase::Create | Phase::Pending | Phase::Conflict | Phase::Unknown
@@ -397,6 +413,20 @@ impl AgentAuthoringScreen {
     #[cfg(test)]
     pub(crate) fn test_phase(&self) -> Phase {
         self.phase
+    }
+
+    /// Step back inside authoring. Returns false only at the root name phase,
+    /// where the onboarding shell may offer its escape menu or stage Back.
+    pub(crate) fn back(&mut self) -> bool {
+        if self.tool_model_picker.take().is_some() {
+            self.status = None;
+            return true;
+        }
+        if matches!(self.phase, Phase::SourceIdentity) && self.editing_root() {
+            return false;
+        }
+        self.handle_back();
+        true
     }
 
     pub(super) fn header_is_failure(&self) -> bool {
@@ -484,9 +514,7 @@ impl AgentAuthoringScreen {
         }
         self.tool_model_picker = Some(index);
         self.tool_model_cursor = self
-            .tool_models
-            .get(catalog[index].name)
-            .copied()
+            .tool_model_for(catalog[index].name)
             .unwrap_or(0)
             .min(self.projection.policy.routes.len() - 1);
         self.status = None;
@@ -510,14 +538,22 @@ impl AgentAuthoringScreen {
             self.status = Some("Choose a model for this tool.".into());
             return;
         }
-        self.tool_models
-            .insert(item.name.to_string(), self.tool_model_cursor);
-        let tiers = if let Some(child) = self.current_child_mut() {
-            &mut child.tool_tiers
+        let selected_model = self.tool_model_cursor;
+        if let Some(child) = self.current_child_mut() {
+            child
+                .tool_models
+                .insert(item.name.to_string(), selected_model);
+            child
+                .tool_tiers
+                .insert(item.name.to_string(), ToolTier::Enabled);
         } else {
-            &mut self.draft.tool_tiers
-        };
-        tiers.insert(item.name.to_string(), ToolTier::Enabled);
+            self.draft
+                .tool_models
+                .insert(item.name.to_string(), selected_model);
+            self.draft
+                .tool_tiers
+                .insert(item.name.to_string(), ToolTier::Enabled);
+        }
         self.status = None;
     }
 
@@ -830,6 +866,8 @@ impl AgentAuthoringScreen {
             }
             Phase::Create => {
                 self.draft.make_default = !self.draft.make_default;
+                self.review = None;
+                self.review_policy_revision = None;
             }
             Phase::Optimizations => match self.cursor {
                 0 => {
@@ -861,7 +899,7 @@ impl AgentAuthoringScreen {
                     self.status = Some("Required tools stay enabled.".into());
                 } else if current == ToolTier::Disabled
                     && tool_requires_model(item.name)
-                    && !self.tool_models.contains_key(item.name)
+                    && self.tool_model_for(item.name).is_none()
                 {
                     self.open_tool_model_picker();
                 } else {
@@ -890,7 +928,7 @@ impl AgentAuthoringScreen {
                     return;
                 } else if current == ToolTier::Disabled
                     && tool_requires_model(item.name)
-                    && !self.tool_models.contains_key(item.name)
+                    && self.tool_model_for(item.name).is_none()
                 {
                     self.open_tool_model_picker();
                     return;
@@ -1207,10 +1245,18 @@ impl AgentAuthoringScreen {
     }
 
     fn request_preview(&mut self) -> Option<AgentAuthoringAction> {
-        match build_package_draft(&self.projection, &self.draft) {
-            Ok(package) => {
-                let action = AgentAuthoringAction::PreviewPackage(package);
-                self.status = Some("Requesting canonical review preview…".into());
+        match build_package_draft_with_diagnostics(&self.projection, &self.draft) {
+            Ok(built) => {
+                self.draft_diagnostics = built.diagnostics;
+                let action = AgentAuthoringAction::PreviewPackage(built.package);
+                self.status = Some(if self.draft_diagnostics.is_empty() {
+                    "Requesting canonical review preview…".into()
+                } else {
+                    format!(
+                        "Warning: {} Requesting canonical review preview…",
+                        self.draft_diagnostics.join(" ")
+                    )
+                });
                 Some(action)
             }
             Err(error) => {
@@ -1221,14 +1267,22 @@ impl AgentAuthoringScreen {
     }
 
     fn request_apply(&mut self) -> Option<AgentAuthoringAction> {
-        match build_package_draft(&self.projection, &self.draft) {
-            Ok(package) => {
+        match build_package_draft_with_diagnostics(&self.projection, &self.draft) {
+            Ok(built) => {
+                self.draft_diagnostics = built.diagnostics;
                 let action = AgentAuthoringAction::ApplyPackage {
                     client_operation_id: self.client_operation_id.clone(),
-                    package,
+                    package: built.package,
                 };
                 self.phase = Phase::Pending;
-                self.status = Some("Creating agent package…".into());
+                self.status = Some(if self.draft_diagnostics.is_empty() {
+                    "Creating agent package…".into()
+                } else {
+                    format!(
+                        "Warning: {} Creating agent package…",
+                        self.draft_diagnostics.join(" ")
+                    )
+                });
                 Some(action)
             }
             Err(error) => {
@@ -1268,27 +1322,27 @@ impl AgentAuthoringScreen {
         else {
             return;
         };
-        let child = prepared_child_draft(&self.projection);
+        let Some(parent) = Self::child_at_path(&self.draft, &parent_path) else {
+            return;
+        };
+        let child_path = parent_path
+            .iter()
+            .chain([&parent.children.len()])
+            .copied()
+            .collect::<Vec<usize>>();
+        self.subagent_stack.push(SubagentStackFrame {
+            parent: self.draft.clone(),
+            child_path: child_path.clone(),
+            phase: SubagentPhase::Identity,
+        });
         if let Some(parent) = Self::child_slot_at_path(&mut self.draft, &parent_path) {
-            let child_path = parent_path
-                .iter()
-                .chain([&parent.children.len()])
-                .copied()
-                .collect::<Vec<usize>>();
-            if let Some(parent) = Self::child_slot_at_path(&mut self.draft, &parent_path) {
-                parent.children.push(child);
-            }
-            self.subagent_stack.push(SubagentStackFrame {
-                parent: self.draft.clone(),
-                child_path: child_path.clone(),
-                phase: SubagentPhase::Identity,
-            });
-            self.editing_child = Self::child_at_path(&self.draft, &child_path).cloned();
-            self.subagents_focus = SubagentsFocus::Add;
-            self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
-            self.cursor = 0;
-            self.name_field.set("helper");
+            parent.children.push(prepared_child_draft(&self.projection));
         }
+        self.editing_child = Self::child_at_path(&self.draft, &child_path).cloned();
+        self.subagents_focus = SubagentsFocus::Add;
+        self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
+        self.cursor = 0;
+        self.name_field.set("helper");
     }
 
     fn begin_edit_nested_subagent(&mut self, index: usize) {
@@ -1392,6 +1446,13 @@ impl AgentAuthoringScreen {
             // The stacked parent snapshot never includes an uncommitted child;
             // restoring it is sufficient for both add and edit cancellation.
             self.draft = frame.parent;
+            if frame.child_path.len() > 1 {
+                let parent_path = &frame.child_path[..frame.child_path.len() - 1];
+                self.editing_child = Self::child_at_path(&self.draft, parent_path).cloned();
+                self.phase = Phase::SubagentEdit(SubagentPhase::SubagentsList);
+                self.subagents_focus = SubagentsFocus::List;
+                return;
+            }
         }
         self.editing_child = None;
         self.phase = Phase::SubagentsList;
@@ -1987,9 +2048,8 @@ impl AgentAuthoringScreen {
                         effective.label().to_string()
                     };
                     if let Some(model) = self
-                        .tool_models
-                        .get(item.name)
-                        .and_then(|index| self.projection.policy.routes.get(*index))
+                        .tool_model_for(item.name)
+                        .and_then(|index| self.projection.policy.routes.get(index))
                     {
                         tail.push_str(&format!(" · {}/{}", model.provider_id, model.model_id));
                     } else if tool_requires_model(item.name) {

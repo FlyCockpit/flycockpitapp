@@ -223,19 +223,6 @@ impl VerifyScreen {
     }
 }
 
-/// Copy seam shared by the onboarding Verify screen and settings' retained
-/// provider wizard reducer.
-pub(crate) fn provider_verify_copy(provider_id: &str, fetching: bool) -> (&'static str, String) {
-    if fetching {
-        (
-            "Verifying provider",
-            format!("Checking {provider_id} through the Cockpit daemon."),
-        )
-    } else {
-        ("✓ Connected", format!("{provider_id} is ready."))
-    }
-}
-
 fn error_copy(outcome: &VerifyOutcome) -> (String, String, String) {
     match outcome {
         VerifyOutcome::Unauthorized(status) => (

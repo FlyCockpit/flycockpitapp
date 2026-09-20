@@ -52,7 +52,6 @@ use crate::tui::settings::Dialog;
 pub(crate) use auth::AuthPhase;
 pub(crate) use auth::AuthScreen;
 pub(crate) use auth::AuthSubmission;
-pub(crate) use auth::provider_api_key_copy;
 use chrome::ActionBar;
 use cockpit_core::providers::ProviderTemplate;
 use cockpit_proto::{
@@ -70,7 +69,6 @@ use theme::{BAD, BRASS, FOG, GOOD, HOVER_BG, INK, NIGHT};
 pub(crate) use verify::VerifyOutcome;
 pub(crate) use verify::VerifyPhase;
 pub(crate) use verify::VerifyScreen;
-pub(crate) use verify::provider_verify_copy;
 
 #[derive(Debug, Clone)]
 pub struct ProviderSettlementEvidence {

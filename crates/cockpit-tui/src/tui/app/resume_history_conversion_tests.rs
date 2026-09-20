@@ -64,10 +64,11 @@ fn live_write_events_render_created_and_edited_fixture_files() {
     );
 
     let edited_path = tmp.path().join("edited.txt");
-    std::fs::write(&edited_path, "keep\nold line\n").unwrap();
+    std::fs::write(&edited_path, "keep\r\nold line\r\n").unwrap();
     let old = std::fs::read_to_string(&edited_path).unwrap();
-    std::fs::write(&edited_path, "keep\nnew line\n").unwrap();
-    let new = std::fs::read_to_string(&edited_path).unwrap();
+    assert_eq!(old, "keep\r\nold line\r\n");
+    let surfaced_old = old.replace("\r\n", "\n");
+    let new = "keep\nnew line\n";
     app.apply_event(TurnEvent::ToolStart {
         agent: "Build".into(),
         call_id: "write-edit".into(),
@@ -82,7 +83,7 @@ fn live_write_events_render_created_and_edited_fixture_files() {
         truncated: false,
         seq: Some(2),
         hint: None,
-        pre_write_content: Some(old),
+        pre_write_content: Some(surfaced_old),
         write_applied: true,
     });
     assert_eq!(

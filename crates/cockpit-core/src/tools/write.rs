@@ -347,8 +347,8 @@ impl Tool for WriteTool {
 /// approval write-preview diff budget).
 pub(crate) const PRE_WRITE_CONTENT_BYTE_CAP: usize = 12 * 1024;
 
-/// Capture the on-disk body immediately before a `write`, redacted and capped.
-/// `None` means the path did not exist (new file).
+/// Capture the on-disk body immediately before a `write`, normalized to LF,
+/// redacted, and capped. `None` means the path did not exist (new file).
 pub(crate) fn bounded_pre_write_content(
     redact: &crate::redact::RedactionTable,
     existing: Option<&[u8]>,
@@ -358,7 +358,8 @@ pub(crate) fn bounded_pre_write_content(
         return Some(format!("… [binary file, {} bytes]", bytes.len()));
     }
     let text = String::from_utf8_lossy(bytes);
-    let scrubbed = redact.scrub(text.as_ref());
+    let normalized = normalize_line_endings(text.as_ref(), false);
+    let scrubbed = redact.scrub(&normalized);
     if scrubbed.len() <= PRE_WRITE_CONTENT_BYTE_CAP {
         return Some(scrubbed);
     }
@@ -2426,6 +2427,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.pre_write_content.as_deref(), Some("before\n"));
+        assert!(out.write_applied);
+    }
+
+    #[tokio::test]
+    async fn write_existing_crlf_file_surfaces_lf_normalized_pre_write_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("existing.md");
+        std::fs::write(&file, "keep\r\nold line\r\n").unwrap();
+        note_read(&ctx, &file).await;
+
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "existing.md", "content": "keep\nnew line\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.pre_write_content.as_deref(), Some("keep\nold line\n"));
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"keep\r\nnew line\r\n",
+            "the surfaced diff body is canonical LF, while the write preserves the file's CRLF convention"
+        );
         assert!(out.write_applied);
     }
 

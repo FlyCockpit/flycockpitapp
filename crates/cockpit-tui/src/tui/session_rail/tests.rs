@@ -1,6 +1,6 @@
 use super::*;
 use cockpit_proto::MessageRole;
-use crossterm::event::{KeyEventKind, KeyEventState};
+use crossterm::event::{KeyEventKind, KeyEventState, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, backend::TestBackend};
 use std::collections::HashMap;
 
@@ -116,10 +116,122 @@ fn golden_rail(selected: bool, hovered: Option<usize>, visible: bool) -> ratatui
 }
 
 #[test]
+fn golden_rail_region_matches_excoc_reference_120x40() {
+    let _pins = crate::tui::golden::GoldenPins::install().allow_hover();
+    let buffer = golden_rail(true, None, true);
+    let reference_path =
+        crate::tui::golden::golden_root().join("session-rail/excoc-reference-120x40.txt");
+    let reference = cockpit_test_support::read_fixture(&reference_path);
+    let rendered = crate::tui::golden::buffer_text(&buffer);
+    let rail_width = 30usize;
+    let excoc_crop = crop_buffer_width(&rendered, rail_width);
+    if reference != excoc_crop {
+        panic!(
+            "session rail crop drifted from excoc reference; refresh excoc-reference-120x40.txt with COCKPIT_UPDATE_GOLDEN=1 if intentional\n{}",
+            similar::TextDiff::from_lines(&reference, &excoc_crop)
+                .unified_diff()
+                .to_string()
+        );
+    }
+}
+
+fn crop_buffer_width(text: &str, width: usize) -> String {
+    text.lines()
+        .map(|line| {
+            let mut out = String::new();
+            let mut cols = 0usize;
+            for ch in line.chars() {
+                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if cols + w > width {
+                    break;
+                }
+                out.push(ch);
+                cols += w;
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+#[test]
+fn wheel_over_rail_steps_one_session_window() {
+    let cards: Vec<_> = (0..20)
+        .map(|i| {
+            (
+                summary(Uuid::from_u128(i as u128 + 1), 1000 - i),
+                Tier::Idle,
+            )
+        })
+        .collect();
+    let mut rail = test_rail(cards);
+    let backend = TestBackend::new(36, 14);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            rail.render(frame, Some(Rect::new(0, 0, 36, 14)), None, None, 80);
+        })
+        .unwrap();
+    assert!(
+        20 > rail.session_viewport_for_test(),
+        "sessions must overflow the viewport"
+    );
+    let before = rail.session_scroll_for_test();
+    let list = rail.list_area_for_test().expect("list area");
+    rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: list.x + 1,
+        row: list.y + 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert_eq!(
+        rail.session_scroll_for_test(),
+        before + 1,
+        "wheel down over the rail advances the session window by one"
+    );
+}
+
+#[test]
+fn sessions_keybindings_include_open_preview_and_switch_actions() {
+    let group = SessionRail::keybindings();
+    let actions: Vec<_> = group.bindings.iter().map(|b| b.action).collect();
+    for required in ["open", "preview", "switch", "forks", "windows"] {
+        assert!(
+            actions.iter().any(|action| *action == required),
+            "missing Sessions which-key action: {required}"
+        );
+    }
+}
+
+#[test]
+fn hover_archive_mutates_without_confirm_popover() {
+    let id = Uuid::from_u128(1);
+    let mut rail = test_rail(vec![(summary(id, 10), Tier::Idle)]);
+    rail.action_hits = vec![ActionHit {
+        index: 0,
+        action: CardAction::Archive,
+        rect: Rect::new(10, 1, 8, 1),
+    }];
+    let outcome = rail.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 11,
+        row: 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(matches!(
+        outcome,
+        Some(RailOutcome::Mutate(effect))
+            if matches!(effect.request, cockpit_proto::Request::ArchiveSession { cascade: true, .. })
+    ));
+    assert!(matches!(rail.step, Step::Browse));
+}
+
+#[test]
 fn golden_session_rail_open_hidden_hovered_and_selected_120x40() {
     let _pins = crate::tui::golden::GoldenPins::install().allow_hover();
     for (name, selected, hovered, visible) in [
-        ("open", false, None, true),
+        ("open", true, None, true),
         ("hidden-show", false, None, false),
         ("hovered-row", false, Some(1), true),
         ("selected-row", true, None, true),

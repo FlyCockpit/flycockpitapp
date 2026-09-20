@@ -225,15 +225,27 @@ mod tests {
     }
 
     fn render_width(app: &mut App, width: u16, height: u16) -> String {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
+        let buffer = render_buffer(app, width, height);
         buffer
             .content()
             .iter()
             .map(|cell| cell.symbol().to_string())
             .collect()
+    }
+
+    fn render_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, x_start: u16, x_end: u16) -> String {
+        let mut out = String::new();
+        for x in x_start..x_end {
+            out.push_str(buf.get(x, y).symbol());
+        }
+        out
     }
 
     #[test]
@@ -313,8 +325,23 @@ mod tests {
             .unwrap();
         tools.execute_slash(command);
         assert!(matches!(tools.overlay, Overlay::Tools(_)));
-        render_width(&mut tools, 120, 40);
-        assert!(tools.session_rail.rail_area().is_some());
+        tools.first_paint_completed = true;
+        let tools_buf = render_buffer(&mut tools, 120, 40);
+        let rail = tools.session_rail.rail_area().expect("persistent rail");
+        let tools_text = tools_buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect::<String>();
+        assert!(tools_text.contains("◆ Cockpit"));
+        assert!(tools_text.contains("SESSIONS"));
+        let rail_right = rail.x + rail.width;
+        let chat_has_tools = (0..40u16)
+            .any(|y| row_text(&tools_buf, y, rail_right, 120).contains("current agent tools"));
+        assert!(
+            chat_has_tools,
+            "tools popover must render in the chat body, not over the rail"
+        );
 
         let mut settings = configured_app(&tmp);
         settings.dialog = Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
@@ -401,9 +428,14 @@ mod tests {
         assert!(!first.session_rail.is_visible());
         assert!(!first.config_snapshot.extended.tui.session_rail_visible);
 
-        let persisted = first.config_snapshot.extended.clone();
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        let persisted = cockpit_config::extended::ExtendedConfigDoc::load(&global)
+            .unwrap()
+            .config();
+        assert!(!persisted.tui.session_rail_visible);
         let mut restarted = configured_app(&tmp);
-        restarted.config_snapshot.extended = persisted;
+        restarted.config_snapshot.extended.tui.session_rail_visible =
+            persisted.tui.session_rail_visible;
         restarted.apply_tui_config_from_snapshot();
         assert!(
             !restarted.session_rail.is_visible(),

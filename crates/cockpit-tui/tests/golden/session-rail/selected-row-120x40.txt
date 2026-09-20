@@ -5,10 +5,10 @@
                                                                                                                         
  SESSIONS                                                                                                               
  ▌● ★ Build session rail                                                                                                
- ▌  Jan 15, 12:00                                                                                                       
- ▌  ● working  [alpha]  pin 2                                                                                           
+ ▌Jan 15, 12:00                                                                                                         
+ ▌● working  [alpha]  pin 2                                                                                             
   ● Waiting for approval                                                                                                
-    Jan 15, 12:00                                                                                                       
+  Jan 15, 12:00                                                                                                         
                                                                                                                         
                                                                                                                         
                                                                                                                         

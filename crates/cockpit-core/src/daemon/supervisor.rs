@@ -490,17 +490,17 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
         let admin = bind_admin(&admin_path)?;
         let opened_at_unix_ms = now_unix_ms();
         let generation = 1_u64;
-        let worker = spawn_ready_worker(
-            &endpoint_owner,
-            &executable,
-            &paths,
-            &log,
-            &log_path,
+        let worker = spawn_ready_worker(WorkerSpawnRequest {
+            endpoints: &endpoint_owner,
+            binary: &executable,
+            paths: &paths,
+            log: &log,
+            log_path: &log_path,
             generation,
             opened_at_unix_ms,
             no_sandbox,
             resume_all_sessions,
-        )
+        })
         .await?;
         publish_generation(&paths, &receipt, worker.pid, generation, opened_at_unix_ms)?;
         metadata.track_endpoint_record(endpoint_record.clone());
@@ -537,10 +537,17 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                 }
                 generation = generation.saturating_add(1);
                 let respawn_binary = worker.binary.clone();
-                worker = spawn_ready_worker(
-                    &endpoint_owner, &respawn_binary, &paths, &log, &log_path,
-                    generation, opened_at_unix_ms, no_sandbox, resume_all_sessions,
-                ).await?;
+                worker = spawn_ready_worker(WorkerSpawnRequest {
+                    endpoints: &endpoint_owner,
+                    binary: &respawn_binary,
+                    paths: &paths,
+                    log: &log,
+                    log_path: &log_path,
+                    generation,
+                    opened_at_unix_ms,
+                    no_sandbox,
+                    resume_all_sessions,
+                }).await?;
                 publish_generation(&paths, &receipt, worker.pid, generation, opened_at_unix_ms)?;
             }
             accepted = accept_admin(&mut admin) => {
@@ -576,10 +583,17 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             _ => executable.clone(),
                         };
                         let next_generation = generation.saturating_add(1);
-                        let successor = spawn_ready_worker(
-                            &endpoint_owner, &binary, &paths, &log, &log_path,
-                            next_generation, opened_at_unix_ms, no_sandbox, resume_all_sessions,
-                        ).await;
+                        let successor = spawn_ready_worker(WorkerSpawnRequest {
+                            endpoints: &endpoint_owner,
+                            binary: &binary,
+                            paths: &paths,
+                            log: &log,
+                            log_path: &log_path,
+                            generation: next_generation,
+                            opened_at_unix_ms,
+                            no_sandbox,
+                            resume_all_sessions,
+                        }).await;
                         match successor {
                             Ok(successor) => {
                                 let old_pid = worker.pid;
@@ -609,11 +623,22 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                     }
                     AdminCommand::Reexec => {
                         write_admin(&mut stream, &AdminResponse::Reexecing { version: ADMIN_PROTOCOL_VERSION }).await?;
-                        reexec_supervisor(
-                            &executable, &paths, &metadata, &endpoint_owner, &admin,
-                            &_database_owner, &worker, generation, opened_at_unix_ms, no_sandbox,
+                        reexec_supervisor(ReexecRequest {
+                            executable: &executable,
+                            #[cfg(unix)]
+                            metadata: &metadata,
+                            #[cfg(unix)]
+                            endpoints: &endpoint_owner,
+                            #[cfg(unix)]
+                            admin: &admin,
+                            #[cfg(unix)]
+                            database_owner: &_database_owner,
+                            worker: &worker,
+                            generation,
+                            opened_at_unix_ms,
+                            no_sandbox,
                             resume_all_sessions,
-                        )?;
+                        })?;
                         unreachable!("successful reexec replaces the supervisor image")
                     }
                 }
@@ -702,93 +727,93 @@ type EndpointOwner = UnixEndpointOwner;
 #[cfg(windows)]
 type EndpointOwner = WindowsEndpointOwner;
 
-#[allow(clippy::too_many_arguments)]
-async fn spawn_ready_worker(
-    endpoints: &EndpointOwner,
-    binary: &Path,
-    paths: &DaemonPaths,
-    log: &std::fs::File,
-    log_path: &Path,
+struct WorkerSpawnRequest<'a> {
+    endpoints: &'a EndpointOwner,
+    binary: &'a Path,
+    paths: &'a DaemonPaths,
+    log: &'a std::fs::File,
+    log_path: &'a Path,
     generation: u64,
     opened_at_unix_ms: u64,
     no_sandbox: bool,
     resume_all_sessions: bool,
-) -> Result<Worker> {
-    let binary = binary.to_path_buf();
-    let paths = paths.clone();
-    let log = log.try_clone()?;
-    let log_path = log_path.to_path_buf();
+}
+
+struct OwnedWorkerSpawnRequest {
+    binary: PathBuf,
+    paths: DaemonPaths,
+    log: std::fs::File,
+    log_path: PathBuf,
+    generation: u64,
+    opened_at_unix_ms: u64,
+    no_sandbox: bool,
+    resume_all_sessions: bool,
+    #[cfg(unix)]
+    control_fd: std::os::fd::RawFd,
+    #[cfg(unix)]
+    reveal_fd: std::os::fd::RawFd,
+}
+
+async fn spawn_ready_worker(request: WorkerSpawnRequest<'_>) -> Result<Worker> {
     #[cfg(unix)]
     let control_fd = {
         use std::os::fd::AsRawFd as _;
-        endpoints.control.as_raw_fd()
+        request.endpoints.control.as_raw_fd()
     };
     #[cfg(unix)]
-    let reveal_fd = endpoints.reveal.raw_fd();
-    tokio::task::spawn_blocking(move || {
-        spawn_ready_worker_blocking(
-            &binary,
-            &paths,
-            log,
-            &log_path,
-            generation,
-            opened_at_unix_ms,
-            no_sandbox,
-            resume_all_sessions,
-            #[cfg(unix)]
-            control_fd,
-            #[cfg(unix)]
-            reveal_fd,
-        )
-    })
-    .await
-    .context("joining worker readiness task")?
+    let reveal_fd = request.endpoints.reveal.raw_fd();
+    let request = OwnedWorkerSpawnRequest {
+        binary: request.binary.to_path_buf(),
+        paths: request.paths.clone(),
+        log: request.log.try_clone()?,
+        log_path: request.log_path.to_path_buf(),
+        generation: request.generation,
+        opened_at_unix_ms: request.opened_at_unix_ms,
+        no_sandbox: request.no_sandbox,
+        resume_all_sessions: request.resume_all_sessions,
+        #[cfg(unix)]
+        control_fd,
+        #[cfg(unix)]
+        reveal_fd,
+    };
+    tokio::task::spawn_blocking(move || spawn_ready_worker_blocking(request))
+        .await
+        .context("joining worker readiness task")?
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_ready_worker_blocking(
-    binary: &Path,
-    paths: &DaemonPaths,
-    log: std::fs::File,
-    log_path: &Path,
-    generation: u64,
-    opened_at_unix_ms: u64,
-    no_sandbox: bool,
-    resume_all_sessions: bool,
-    #[cfg(unix)] control_fd: std::os::fd::RawFd,
-    #[cfg(unix)] reveal_fd: std::os::fd::RawFd,
-) -> Result<Worker> {
+fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worker> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt as _;
     #[cfg(windows)]
     use std::os::windows::process::CommandExt as _;
     use std::process::{Command, Stdio};
 
-    let stderr = log.try_clone()?;
-    let mut command = Command::new(binary);
+    let stderr = request.log.try_clone()?;
+    let mut command = Command::new(&request.binary);
     command
         .args(["daemon", "worker"])
         .env(WORKER_ENV, "1")
-        .env(GENERATION_ENV, generation.to_string())
-        .env(OPENED_AT_ENV, opened_at_unix_ms.to_string())
+        .env(GENERATION_ENV, request.generation.to_string())
+        .env(OPENED_AT_ENV, request.opened_at_unix_ms.to_string())
         .env(SUPERVISOR_PID_ENV, std::process::id().to_string())
         .env_remove(REEXEC_STATE_ENV)
         .env_remove("LISTEN_PID")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
+        .stdout(Stdio::from(request.log))
         .stderr(Stdio::from(stderr));
-    if paths.ephemeral {
+    if request.paths.ephemeral {
         command.env(super::DAEMON_LIFETIME_ENV, super::EPHEMERAL_LIFETIME);
     }
-    if no_sandbox {
+    if request.no_sandbox {
         command.arg("--no-sandbox");
     }
-    if resume_all_sessions {
+    if request.resume_all_sessions {
         command.arg("--resume-all-sessions");
     }
 
     #[cfg(windows)]
-    let (staged_identity, staged_reveal_identity) = windows_staged_identities(paths, generation)?;
+    let (staged_identity, staged_reveal_identity) =
+        windows_staged_identities(&request.paths, request.generation)?;
     #[cfg(windows)]
     {
         remove_if_present(&staged_identity)?;
@@ -807,9 +832,9 @@ fn spawn_ready_worker_blocking(
         // open through `spawn`; dup2 atomically installs the activation ABI.
         unsafe {
             command.pre_exec(move || {
-                let safe_control = libc::fcntl(control_fd, libc::F_DUPFD, 16);
+                let safe_control = libc::fcntl(request.control_fd, libc::F_DUPFD, 16);
                 let safe_ready = libc::fcntl(ready_write_fd, libc::F_DUPFD, 16);
-                let safe_reveal = libc::fcntl(reveal_fd, libc::F_DUPFD, 16);
+                let safe_reveal = libc::fcntl(request.reveal_fd, libc::F_DUPFD, 16);
                 if safe_control < 0 || safe_ready < 0 || safe_reveal < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -848,7 +873,7 @@ fn spawn_ready_worker_blocking(
             ready_read,
             &mut child,
             super::DAEMON_SPAWN_TIMEOUT,
-            log_path,
+            &request.log_path,
         )?;
     }
     #[cfg(windows)]
@@ -859,17 +884,17 @@ fn spawn_ready_worker_blocking(
             let _ = remove_if_present(&staged_reveal_identity);
             return Err(super::spawn_notify::error_with_log_tail(
                 format!("worker pid {pid} did not publish a ready pipe identity"),
-                log_path,
+                &request.log_path,
             ));
         }
-        promote_windows_identity(&staged_reveal_identity, &paths.leak_reveal_socket())?;
-        promote_windows_identity(&staged_identity, &paths.socket)?;
+        promote_windows_identity(&staged_reveal_identity, &request.paths.leak_reveal_socket())?;
+        promote_windows_identity(&staged_identity, &request.paths.socket)?;
     }
-    let receipt = worker_receipt(pid, binary)?;
+    let receipt = worker_receipt(pid, &request.binary)?;
     let exited = watch_worker(&receipt)?;
     Ok(Worker {
         pid,
-        binary: std::fs::canonicalize(binary)?,
+        binary: std::fs::canonicalize(&request.binary)?,
         #[cfg(windows)]
         receipt,
         child: Some(child),
@@ -1421,25 +1446,30 @@ fn set_close_on_exec(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn reexec_supervisor(
-    executable: &Path,
-    _paths: &DaemonPaths,
-    metadata: &cockpit_host::daemon_lifecycle::ForegroundMetadataGuard,
-    endpoints: &UnixEndpointOwner,
-    admin: &AdminListener,
-    database_owner: &crate::db::SupervisorDatabaseOwner,
-    worker: &Worker,
+struct ReexecRequest<'a> {
+    executable: &'a Path,
+    #[cfg(unix)]
+    metadata: &'a cockpit_host::daemon_lifecycle::ForegroundMetadataGuard,
+    #[cfg(unix)]
+    endpoints: &'a EndpointOwner,
+    #[cfg(unix)]
+    admin: &'a AdminListener,
+    #[cfg(unix)]
+    database_owner: &'a crate::db::SupervisorDatabaseOwner,
+    worker: &'a Worker,
     generation: u64,
     opened_at_unix_ms: u64,
     no_sandbox: bool,
     resume_all_sessions: bool,
-) -> Result<()> {
+}
+
+#[cfg(unix)]
+fn reexec_supervisor(request: ReexecRequest<'_>) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
-    let (lifetime_fd, pid_lock_fd) = metadata.prepare_for_reexec()?;
-    let (control_fd, reveal_fd) = endpoints.prepare_for_reexec()?;
-    let admin_fd = prepare_admin_for_reexec(admin)?;
-    let database_lock_fd = database_owner.raw_fd();
+    let (lifetime_fd, pid_lock_fd) = request.metadata.prepare_for_reexec()?;
+    let (control_fd, reveal_fd) = request.endpoints.prepare_for_reexec()?;
+    let admin_fd = prepare_admin_for_reexec(request.admin)?;
+    let database_lock_fd = request.database_owner.raw_fd();
     clear_close_on_exec(database_lock_fd)?;
     let state = serde_json::to_string(&ReexecState {
         database_lock_fd,
@@ -1448,19 +1478,19 @@ fn reexec_supervisor(
         control_fd,
         reveal_fd,
         admin_fd,
-        worker_pid: worker.pid,
-        worker_binary: worker.binary.clone(),
-        generation,
-        opened_at_unix_ms,
+        worker_pid: request.worker.pid,
+        worker_binary: request.worker.binary.clone(),
+        generation: request.generation,
+        opened_at_unix_ms: request.opened_at_unix_ms,
     })?;
-    let mut command = std::process::Command::new(executable);
+    let mut command = std::process::Command::new(request.executable);
     command
         .args(["daemon", "supervise", "--reexec-child"])
         .env(REEXEC_STATE_ENV, state);
-    if no_sandbox {
+    if request.no_sandbox {
         command.arg("--no-sandbox");
     }
-    if resume_all_sessions {
+    if request.resume_all_sessions {
         command.arg("--resume-all-sessions");
     }
     let error = command.exec();
@@ -1468,36 +1498,24 @@ fn reexec_supervisor(
 }
 
 #[cfg(windows)]
-fn reexec_supervisor(
-    executable: &Path,
-    _paths: &DaemonPaths,
-    _metadata: &cockpit_host::daemon_lifecycle::ForegroundMetadataGuard,
-    _endpoints: &WindowsEndpointOwner,
-    _admin: &AdminListener,
-    _database_owner: &crate::db::SupervisorDatabaseOwner,
-    worker: &Worker,
-    generation: u64,
-    opened_at_unix_ms: u64,
-    no_sandbox: bool,
-    resume_all_sessions: bool,
-) -> Result<()> {
+fn reexec_supervisor(request: ReexecRequest<'_>) -> Result<()> {
     use std::os::windows::process::CommandExt as _;
 
     let state = serde_json::to_string(&ReexecState {
-        worker_pid: worker.pid,
-        worker_binary: worker.binary.clone(),
-        generation,
-        opened_at_unix_ms,
+        worker_pid: request.worker.pid,
+        worker_binary: request.worker.binary.clone(),
+        generation: request.generation,
+        opened_at_unix_ms: request.opened_at_unix_ms,
     })?;
-    let mut command = std::process::Command::new(executable);
+    let mut command = std::process::Command::new(request.executable);
     command
         .args(["daemon", "supervise", "--reexec-child"])
         .env(REEXEC_STATE_ENV, state)
         .creation_flags(0x0800_0000);
-    if no_sandbox {
+    if request.no_sandbox {
         command.arg("--no-sandbox");
     }
-    if resume_all_sessions {
+    if request.resume_all_sessions {
         command.arg("--resume-all-sessions");
     }
     command.spawn().context("spawning replacement supervisor")?;

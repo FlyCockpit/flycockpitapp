@@ -27,10 +27,6 @@ pub(super) fn column(area: Rect) -> Rect {
         .centered(Constraint::Max(86), Constraint::Fill(1))
 }
 
-pub(super) fn render_header(frame: &mut Frame, area: Rect, title: &str, subtitle: &str) {
-    render_header_colored(frame, area, title, subtitle, INK);
-}
-
 pub(super) fn render_header_colored(
     frame: &mut Frame,
     area: Rect,
@@ -70,6 +66,18 @@ pub(super) fn render_field(
     focused: bool,
     placeholder: &str,
 ) -> Option<Position> {
+    render_field_masked(frame, area, title, field, focused, placeholder, false)
+}
+
+pub(super) fn render_field_masked(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    field: &TextField,
+    focused: bool,
+    placeholder: &str,
+    masked: bool,
+) -> Option<Position> {
     let border = if focused { BRASS } else { NIGHT };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -78,7 +86,7 @@ pub(super) fn render_field(
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(&block, area);
-    let (line, _) = field.render(inner.width, false, placeholder, INK, PLACEHOLDER);
+    let (line, _) = field.render(inner.width, masked, placeholder, INK, PLACEHOLDER);
     frame.render_widget(Paragraph::new(line), inner);
     focused.then(|| field.caret_position(inner)).flatten()
 }

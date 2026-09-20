@@ -573,6 +573,7 @@ pub enum AsyncActionPayload {
     WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
     OnboardingBootstrap(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
     StartupOnboardingTransition(crate::tui::app::StartupOnboardingCompletion),
+    StartupProviderVerification(crate::tui::onboarding::ProviderVerificationCompletion),
     /// The initial post-paint bootstrap carries the already-selected daemon
     /// endpoint forward to the trust reducer.  Reusing it is what keeps
     /// startup to one lifecycle request rather than accidentally resolving a

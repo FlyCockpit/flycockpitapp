@@ -1,0 +1,24 @@
+ ‹ Back                                                                         
+  ✓ Connected · step 4/8                                                        
+  openai · 3 model(s) available                                                 
+  ────────────────────────────                                                  
+  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready         
+  ╭ Models ──────────────────────────────────────────────────────────────────╮  
+  │✓ gpt-5.4                                                                 │  
+  │✓ gpt-5.4-mini                                                            │  
+  │✓ o4-mini                                                                 │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  ↑↓ scroll   a add another   enter done   esc back   [ Add another ] [ Done ]  
+                                                                                

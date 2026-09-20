@@ -1,0 +1,24 @@
+ ‹ Back                                                                         
+  Credential stored · step 4/8                                                  
+  openai has no public /models endpoint.                                        
+  ────────────────────────────                                                  
+  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready         
+  The credential is stored. This provider does not publish a model catalog, so  
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+  ↑↓ scroll   a add another   enter done   esc back   [ Add another ] [ Done ]  
+                                                                                

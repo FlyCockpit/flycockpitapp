@@ -5672,11 +5672,14 @@ use lsp_page::{
 };
 use mcp_page::McpPage;
 pub(crate) use mcp_page::row_color as mcp_row_color;
+pub(crate) use pointer_actions::OAuthFlowId;
 use providers::{AddState, EditState, ModelEditor, ProvidersPage};
 pub(crate) use providers::{
-    OAuthBeginResult, OAuthFlowOp, OAuthFlowRequest, OAuthProvider, OAuthPublicBegin,
+    OAuthBeginResult, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthPresentationResult,
+    OAuthProvider, OAuthPublicBegin,
 };
 use reset::ResetButton;
+pub(crate) use shell::PointerOperationId;
 use skills_page::SkillsPage;
 use string_list::StringListPage;
 use tools_page::ToolsPage;
@@ -5853,76 +5856,6 @@ impl Dialog {
             settings.page.as_any().downcast_ref::<ProvidersPage>(),
             Some(ProvidersPage::Add(_))
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_provider_add_status(&self) -> Option<&str> {
-        let Dialog::Settings(settings) = self else {
-            return None;
-        };
-        let page = settings.page.as_any().downcast_ref::<ProvidersPage>()?;
-        let ProvidersPage::Add(add) = page else {
-            return None;
-        };
-        add.error.as_deref()
-    }
-
-    /// Current step id of the onboarding provider engine's Add wizard, for
-    /// integration tests that drive the wizard with real keys and wait for
-    /// daemon-backed steps (save, validation) to settle.
-    #[cfg(test)]
-    pub(crate) fn test_provider_add_step(&self) -> Option<&'static str> {
-        let Dialog::Settings(settings) = self else {
-            return None;
-        };
-        let page = settings.page.as_any().downcast_ref::<ProvidersPage>()?;
-        let ProvidersPage::Add(add) = page else {
-            return None;
-        };
-        add.run.current_step_id()
-    }
-
-    /// Whether the onboarding provider engine has a validation fetch in
-    /// flight. Real-daemon tests wait for this to clear before driving the
-    /// offline continuation keys.
-    #[cfg(test)]
-    pub(crate) fn test_provider_add_fetch_pending(&self) -> bool {
-        let Dialog::Settings(settings) = self else {
-            return false;
-        };
-        let Some(page) = settings.page.as_any().downcast_ref::<ProvidersPage>() else {
-            return false;
-        };
-        let ProvidersPage::Add(add) = page else {
-            return false;
-        };
-        add.fetch.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_mark_provider_add_done(&mut self, provider_id: &str) {
-        let Dialog::Settings(settings) = self else {
-            panic!("expected settings dialog");
-        };
-        let page = settings
-            .page
-            .downcast_mut::<ProvidersPage>()
-            .expect("expected providers page");
-        let ProvidersPage::Add(add) = page else {
-            panic!("expected provider add page");
-        };
-        add.saved_provider_id = Some(provider_id.to_string());
-        add.run
-            .return_to("done")
-            .expect("provider done step exists");
-        // A completed provider stage is backed by a committed daemon mutation
-        // receipt. Populate that authority evidence along with the visual
-        // completion state so onboarding tests cannot bypass the settlement
-        // contract introduced by the daemon-owned flow.
-        settings.cx.last_provider_mutation_operation_id =
-            Some("test-provider-mutation".to_string());
-        settings.cx.last_provider_mutation_intent_hash = Some("00".repeat(32));
-        settings.cx.config.set_resolution_generation(1);
     }
 
     #[cfg(test)]
@@ -6146,43 +6079,6 @@ impl Dialog {
 
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
         Self::open_providers_add_mode(cwd, status, false)
-    }
-
-    /// Provider-add engine for the onboarding shell: the same daemon-backed
-    /// add wizard the providers page hosts, presented inside the full-screen
-    /// shell instead of the settings modal. The onboarding flag keeps its
-    /// resume/validation semantics.
-    pub fn onboarding_provider_engine(cwd: &std::path::Path, status: Option<String>) -> Self {
-        Self::open_providers_add_mode(cwd, status, true)
-    }
-
-    /// True while this dialog is the onboarding provider engine sitting on
-    /// its Add page. The shell uses this to detect the wizard abandoning
-    /// provider setup (its own back semantics) so it can return to the
-    /// searchable catalog instead of a settings list.
-    pub fn is_provider_add(&self) -> bool {
-        match self {
-            Dialog::Settings(settings) => matches!(
-                settings.page.as_any().downcast_ref::<ProvidersPage>(),
-                Some(ProvidersPage::Add(_))
-            ),
-            _ => false,
-        }
-    }
-
-    /// Seed the provider-add engine with a template chosen from the shell's
-    /// searchable catalog. Applies the same prefill the wizard's template
-    /// step performs (id/url/headers/env-var defaults) and advances past
-    /// the template step; the canonical `'static` template identity is
-    /// preserved unchanged.
-    pub fn seed_provider_template(
-        &mut self,
-        template: &'static cockpit_core::providers::ProviderTemplate,
-    ) {
-        let Dialog::Settings(settings) = self else {
-            return;
-        };
-        settings.seed_onboarding_template(template);
     }
 
     fn open_providers_add_mode(

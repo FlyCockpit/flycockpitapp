@@ -948,6 +948,73 @@ pub fn assert_onboarding_native_screens() {
             })
         });
     }
+    for (name, template_id, phase) in [
+        (
+            "authenticate-acknowledge",
+            "codex-oauth",
+            crate::tui::onboarding::AuthPhase::Acknowledge,
+        ),
+        (
+            "authenticate-device-code",
+            "codex-oauth",
+            crate::tui::onboarding::AuthPhase::DevicePolling,
+        ),
+        (
+            "authenticate-paste-callback",
+            "grok-oauth",
+            crate::tui::onboarding::AuthPhase::PasteCallback,
+        ),
+        (
+            "authenticate-api-key",
+            "openai-compatible",
+            crate::tui::onboarding::AuthPhase::ApiKey,
+        ),
+    ] {
+        assert_golden_sizes("onboarding", name, |width, height| {
+            let mut shell = onboarding_shell_at(OnboardingStage::Provider);
+            shell.present_authenticate(
+                cockpit_core::providers::template_by_id(template_id).expect("golden template"),
+            );
+            shell.set_auth_phase_for_golden(phase);
+            let engine = Dialog::None;
+            let mut links = crate::tui::links::LinkRegistry::default();
+            render_frame(width, height, |frame| {
+                shell.render(frame, frame.area(), &engine, &mut links)
+            })
+        });
+    }
+    for (name, outcome) in [
+        ("verify-fetching", None),
+        (
+            "verify-connected",
+            Some(crate::tui::onboarding::VerifyOutcome::Models(vec![
+                "gpt-5.4".into(),
+                "gpt-5.4-mini".into(),
+                "o4-mini".into(),
+            ])),
+        ),
+        (
+            "verify-no-endpoint",
+            Some(crate::tui::onboarding::VerifyOutcome::NoEndpoint),
+        ),
+        (
+            "verify-couldnt-verify",
+            Some(crate::tui::onboarding::VerifyOutcome::Unauthorized(401)),
+        ),
+    ] {
+        assert_golden_sizes("onboarding", name, |width, height| {
+            let mut shell = onboarding_shell_at(OnboardingStage::Provider);
+            shell.present_verify("openai".into());
+            if let Some(outcome) = outcome.clone() {
+                shell.apply_provider_verification("openai", outcome, None);
+            }
+            let engine = Dialog::None;
+            let mut links = crate::tui::links::LinkRegistry::default();
+            render_frame(width, height, |frame| {
+                shell.render(frame, frame.area(), &engine, &mut links)
+            })
+        });
+    }
 }
 
 #[cfg(test)]
@@ -967,6 +1034,7 @@ mod seed_tests {
         env.remove_var("REDUCE_MOTION");
         env.set_var("TERM", "xterm-256color");
         env.set_var("USER", "amelia");
+        env.set_var("API_KEY", "golden-provider-key");
         env
     }
 

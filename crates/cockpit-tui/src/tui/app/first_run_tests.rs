@@ -381,15 +381,15 @@ fn advance_through_secure_store(app: &mut App, _cwd: &std::path::Path) {
     );
 }
 
-/// Select a template from the searchable catalog, which mounts and seeds
-/// the provider engine.
+/// Select a template from the searchable catalog and enter native Authenticate.
 fn select_provider_template(app: &mut App, query: &str) {
     type_into_search(app, query);
     shell_key(app, KeyCode::Down);
     shell_key(app, KeyCode::Enter);
-    assert!(
-        app.dialog.is_provider_add(),
-        "selecting a search row must mount the provider add engine"
+    assert_eq!(
+        shell_screen_kind(app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Authenticate),
+        "selecting a credentialed provider must open native Authenticate"
     );
 }
 
@@ -402,10 +402,9 @@ fn first_run_chains_provider_then_model() {
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
     write_global_config(&config_with_provider("p", "m"));
-    app.dialog.test_mark_provider_add_done("p");
-
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
-    set_onboarding_stage(&mut app, OnboardingStage::Model);
+    with_untrusted_workspace(tmp.path(), || {
+        set_onboarding_stage(&mut app, OnboardingStage::Model)
+    });
 
     assert_eq!(
         shell_screen_kind(&app),
@@ -435,9 +434,6 @@ fn first_run_provider_without_catalog_offers_manual_model_entry() {
     let mut empty_catalog = config_with_provider("p", "");
     empty_catalog.providers.get_mut("p").unwrap().models.clear();
     write_global_config(&empty_catalog);
-    app.dialog.test_mark_provider_add_done("p");
-
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     assert_eq!(
         shell_screen_kind(&app),
@@ -474,9 +470,6 @@ fn first_run_flow_completes_end_to_end() {
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
     write_global_config(&config_with_provider("p", "m"));
-    app.dialog.test_mark_provider_add_done("p");
-
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
@@ -529,8 +522,6 @@ fn completion_detour_ends_when_the_added_provider_settles() {
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
     write_global_config(&config_with_provider("p", "m"));
-    app.dialog.test_mark_provider_add_done("p");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
@@ -564,14 +555,15 @@ fn completion_detour_ends_when_the_added_provider_settles() {
         Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
     );
 
-    // A second detour that adds a provider ends when the provider engine
-    // reaches its done page: the stored summary is presented again and the
-    // engine unmounts.
+    // A second detour remains native through Authenticate; verified Done
+    // returns to the stored completion summary without a daemon stage change.
     shell_key(&mut app, KeyCode::Up);
     shell_key(&mut app, KeyCode::Enter);
     select_provider_template(&mut app, "openai");
-    app.dialog.test_mark_provider_add_done("p2");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    app.onboarding_shell
+        .as_mut()
+        .expect("completion detour shell")
+        .return_to_completion();
     assert_eq!(
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
@@ -590,9 +582,6 @@ fn first_run_completes_under_an_untrusted_workspace() {
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
     write_global_config(&config_with_provider("p", "m"));
-    app.dialog.test_mark_provider_add_done("p");
-
-    assert!(with_untrusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     assert_eq!(
         shell_screen_kind(&app),
@@ -613,8 +602,6 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
     write_global_config(&config_with_provider("p", "m"));
-    app.dialog.test_mark_provider_add_done("p");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
@@ -623,13 +610,13 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
     set_onboarding_stage(&mut app, OnboardingStage::Lifetime);
     land_onboarding_complete_after_lifetime(&mut app);
 
-    // Open the detour and mount its provider engine.
+    // Open the detour and enter native Authenticate.
     shell_key(&mut app, KeyCode::Up);
     shell_key(&mut app, KeyCode::Enter);
     select_provider_template(&mut app, "compat");
-    assert!(
-        app.dialog.is_provider_add(),
-        "the detour's provider engine must be mounted"
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Authenticate)
     );
 
     // A Complete authority refresh landing mid-detour (the daemon-global
@@ -644,9 +631,10 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
         Some(crate::tui::onboarding::OnboardingScreenKind::Complete),
         "a Complete refresh must not re-present the summary over the detour"
     );
-    assert!(
-        app.dialog.is_provider_add(),
-        "the detour's engine must survive the Complete refresh"
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Authenticate),
+        "native Authenticate must survive the Complete refresh"
     );
     assert!(
         app.onboarding_shell
@@ -654,10 +642,11 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
             .is_some_and(|shell| shell.completion_detour_active())
     );
 
-    // The detour still ends through its own local path: once the added
-    // provider settles, the stored summary is presented again.
-    app.dialog.test_mark_provider_add_done("p2");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    // Verified Done ends the detour through its local completion path.
+    app.onboarding_shell
+        .as_mut()
+        .expect("completion detour shell")
+        .return_to_completion();
     assert_eq!(
         shell_screen_kind(&app),
         Some(crate::tui::onboarding::OnboardingScreenKind::Complete)
@@ -693,8 +682,6 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     write_config(tmp.path(), &cfg);
     write_global_config(&cfg);
     select_provider_template(&mut app, "openai");
-    app.dialog.test_mark_provider_add_done("p");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
@@ -756,8 +743,6 @@ fn lifetime_settlement_adopts_the_committed_choice_only_after_the_daemon_commit(
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
     write_global_config(&config_with_provider("p", "m"));
-    app.dialog.test_mark_provider_add_done("p");
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     set_onboarding_stage(&mut app, OnboardingStage::Model);
     complete_native_model(&mut app);
     set_onboarding_stage(&mut app, OnboardingStage::Agent);
@@ -987,7 +972,7 @@ fn cancel_preserves_progress_and_reopen_uses_authoritative_stage() {
 }
 
 #[test]
-fn duplicate_engine_completion_advances_exactly_once() {
+fn native_provider_screen_is_not_advanced_by_legacy_service_polling() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
@@ -995,13 +980,14 @@ fn duplicate_engine_completion_advances_exactly_once() {
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
     write_global_config(&config_with_provider("p", "m"));
-    app.dialog.test_mark_provider_add_done("p");
-
-    assert!(with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
-    // The latch holds until the authoritative revision lands: repeated
-    // wakes must not request a second advance for the same completion.
+    // Native Authenticate/Verify are reducer-driven. Repeated service wakes
+    // cannot synthesize the former embedded-engine completion.
     assert!(!with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
     assert!(!with_trusted_workspace(tmp.path(), || app.service_onboarding_shell()));
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::Authenticate)
+    );
 
     // The advanced snapshot clears the latch and mounts the model engine.
     set_onboarding_stage(&mut app, OnboardingStage::Model);
@@ -1045,20 +1031,17 @@ fn late_engine_completion_after_close_is_inert() {
 }
 
 #[test]
-fn provider_engine_escape_never_offers_an_illegal_back() {
+fn provider_authenticate_escape_never_offers_an_illegal_back() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
     let mut app = App::new(Some(tmp.path()), false);
     advance_through_secure_store(&mut app, tmp.path());
     select_provider_template(&mut app, "openai");
-    assert!(app.dialog.is_provider_add());
-
-    // The engine's Escape is intercepted by the shell. The visible menu
-    // from the provider engine offers only what the daemon accepts for the
-    // stage: Defer and Cancel — Back from Provider would reopen the
-    // committed secure-store choice, so it is never offered.
+    // First Escape returns from Authenticate to the native catalog; the next
+    // opens the Provider-stage menu. It offers Defer and Cancel, never Back.
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    shell_key(&mut app, KeyCode::Esc);
     shell_key(&mut app, KeyCode::Esc);
     terminal.draw(|frame| app.render(frame)).unwrap();
     let rendered: String = terminal

@@ -59,6 +59,113 @@ async fn onboarding_authority_endpoint(
     }
 }
 
+async fn fetch_onboarding_provider_models(
+    client: &cockpit_client::DaemonClient,
+    project_root: &str,
+    provider_id: &str,
+) -> Result<crate::tui::onboarding::VerifyOutcome, String> {
+    use cockpit_proto::{ProviderModelFetchOutcome, Request, Response};
+    let response = client
+        .request(Request::FetchProviderModels {
+            project_root: project_root.to_string(),
+            provider_id: Some(provider_id.to_string()),
+            model_id: None,
+            deep: false,
+            on_unlisted: Some(cockpit_config::config::providers::OnUnlistedModelsFetch::Keep),
+            allow_fallback: false,
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    let Response::ProviderModelsFetched { mut results, .. } = response else {
+        return Err("daemon returned the wrong provider verification response".into());
+    };
+    let result = results
+        .pop()
+        .ok_or_else(|| "daemon returned no provider verification result".to_string())?;
+    if let Some(verification) = result.verification {
+        return Ok(match verification {
+            cockpit_proto::ProviderModelVerification::NoEndpoint => {
+                crate::tui::onboarding::VerifyOutcome::NoEndpoint
+            }
+            cockpit_proto::ProviderModelVerification::Unauthorized { status } => {
+                crate::tui::onboarding::VerifyOutcome::Unauthorized(status)
+            }
+            cockpit_proto::ProviderModelVerification::NotFound => {
+                crate::tui::onboarding::VerifyOutcome::NotFound
+            }
+            cockpit_proto::ProviderModelVerification::HttpStatus { status, snippet } => {
+                crate::tui::onboarding::VerifyOutcome::HttpStatus { status, snippet }
+            }
+            cockpit_proto::ProviderModelVerification::Network { message } => {
+                crate::tui::onboarding::VerifyOutcome::Network(message)
+            }
+            cockpit_proto::ProviderModelVerification::Parse { message } => {
+                crate::tui::onboarding::VerifyOutcome::Parse(message)
+            }
+        });
+    }
+    Ok(match result.outcome {
+        ProviderModelFetchOutcome::Models { models, .. }
+        | ProviderModelFetchOutcome::FallbackAvailable { models, .. } => {
+            crate::tui::onboarding::VerifyOutcome::Models(
+                models.into_iter().map(|model| model.id).collect(),
+            )
+        }
+        ProviderModelFetchOutcome::Unsupported => crate::tui::onboarding::VerifyOutcome::NoEndpoint,
+        ProviderModelFetchOutcome::UnlistedModelsPreview { .. } => {
+            crate::tui::onboarding::VerifyOutcome::Parse(
+                "the fetched catalog requires an unlisted-model decision".into(),
+            )
+        }
+        ProviderModelFetchOutcome::Error { message } => classify_provider_fetch_error(&message),
+    })
+}
+
+fn classify_provider_fetch_error(message: &str) -> crate::tui::onboarding::VerifyOutcome {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("401") || lower.contains("unauthorized") {
+        crate::tui::onboarding::VerifyOutcome::Unauthorized(401)
+    } else if lower.contains("403") || lower.contains("forbidden") {
+        crate::tui::onboarding::VerifyOutcome::Unauthorized(403)
+    } else if lower.contains("404") || lower.contains("not found") {
+        crate::tui::onboarding::VerifyOutcome::NotFound
+    } else if lower.contains("json") || lower.contains("model array") || lower.contains("parse") {
+        crate::tui::onboarding::VerifyOutcome::Parse(bounded_provider_snippet(message))
+    } else if lower.contains("dns")
+        || lower.contains("tls")
+        || lower.contains("connect")
+        || lower.contains("timeout")
+        || lower.contains("request")
+    {
+        crate::tui::onboarding::VerifyOutcome::Network(bounded_provider_snippet(message))
+    } else {
+        let status = message
+            .split(|character: char| !character.is_ascii_digit())
+            .find_map(|part| {
+                (part.len() == 3)
+                    .then(|| part.parse::<u16>().ok())
+                    .flatten()
+            })
+            .unwrap_or(500);
+        crate::tui::onboarding::VerifyOutcome::HttpStatus {
+            status,
+            snippet: bounded_provider_snippet(message),
+        }
+    }
+}
+
+fn bounded_provider_snippet(message: &str) -> String {
+    let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 200 {
+        flat
+    } else {
+        let mut bounded = flat.chars().take(200).collect::<String>();
+        bounded.push('…');
+        bounded
+    }
+}
+
 async fn retry_onboarding_ready_construction_snapshot(
     lifecycle: &cockpit_client::LifecycleClient,
     selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
@@ -257,14 +364,9 @@ impl App {
             return;
         }
         let template = template.unwrap();
-        if !self.dialog.is_provider_add() {
-            self.dialog =
-                crate::tui::settings::Dialog::onboarding_provider_engine(&self.launch.cwd, None);
-            if let Some(shell) = self.onboarding_shell.as_mut() {
-                shell.present_embedded_settings();
-            }
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.present_authenticate(template);
         }
-        self.dialog.seed_provider_template(template);
     }
 
     /// Route `/setup` and equivalent interactive onboarding entrypoints through
@@ -310,6 +412,15 @@ impl App {
                         }
                     } else if let Some(shell) = self.onboarding_shell.as_mut() {
                         shell.begin_completion_provider_detour(None);
+                    }
+                } else if self
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.stage() == cockpit_proto::OnboardingStage::Complete)
+                {
+                    self.refresh_bootstrap_config_snapshot();
+                    if let Some(shell) = self.onboarding_shell.as_mut() {
+                        shell.return_to_completion();
                     }
                 } else {
                     let snapshot = self.onboarding_snapshot.clone().expect(
@@ -730,17 +841,11 @@ impl App {
                 self.dialog = crate::tui::settings::Dialog::None;
             }
             OnboardingStage::Provider => {
-                if self.dialog.is_provider_add() {
-                    if let Some(shell) = self.onboarding_shell.as_mut() {
-                        shell.present_embedded_settings();
-                    }
-                } else {
-                    self.dialog = crate::tui::settings::Dialog::None;
-                    if let Some(shell) = self.onboarding_shell.as_mut() {
-                        shell.present_provider_search(Some(
-                            "Pick a provider and sign in; setup resumes here.".to_string(),
-                        ));
-                    }
+                self.dialog = crate::tui::settings::Dialog::None;
+                if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.present_provider_search(Some(
+                        "Pick a provider and sign in; setup resumes here.".to_string(),
+                    ));
                 }
             }
             OnboardingStage::Model => {
@@ -1232,15 +1337,51 @@ impl App {
                 self.apply_onboarding_model(submission);
             }
             Some(OnboardingShellAction::SelectTemplate(template)) => {
-                // Mount the provider engine seeded with the canonical
-                // template chosen from the searchable catalog.
-                self.dialog = crate::tui::settings::Dialog::onboarding_provider_engine(
-                    &self.launch.cwd,
-                    None,
-                );
-                self.dialog.seed_provider_template(template);
+                if matches!(template.auth, cockpit_config::providers::AuthKind::None) {
+                    let submission = crate::tui::onboarding::AuthSubmission::NoCredential {
+                        provider_id: template.id.to_string(),
+                        base_url: template.url.to_string(),
+                    };
+                    if let Some(shell) = self.onboarding_shell.as_mut() {
+                        shell.present_verify(template.id.to_string());
+                    }
+                    self.start_onboarding_provider_authentication(template, submission);
+                } else if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.present_authenticate(template);
+                }
+            }
+            Some(OnboardingShellAction::AuthenticateProvider {
+                template,
+                submission,
+            }) => {
+                let provider_id = submission.provider_id().to_string();
                 if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.present_embedded_settings();
+                    shell.present_verify(provider_id);
+                }
+                self.start_onboarding_provider_authentication(template, submission);
+            }
+            Some(OnboardingShellAction::OAuth(action)) => {
+                self.dispatch_oauth_action(action);
+            }
+            Some(OnboardingShellAction::RetryProviderVerification { provider_id }) => {
+                self.start_onboarding_provider_verification(provider_id);
+            }
+            Some(OnboardingShellAction::FinishProvider {
+                settlement,
+                add_another,
+            }) => {
+                if add_another {
+                    if let Some(shell) = self.onboarding_shell.as_mut() {
+                        shell.present_provider_search(Some(
+                            "Provider connected. Add another, or finish from Verify.".into(),
+                        ));
+                    }
+                } else {
+                    self.refresh_bootstrap_config_snapshot();
+                    self.request_onboarding_transition(
+                        cockpit_proto::OnboardingTransitionKind::Advance,
+                        Some(settlement),
+                    );
                 }
             }
             Some(OnboardingShellAction::ReturnToCompletion) => {
@@ -1269,6 +1410,198 @@ impl App {
                 self.dispatch_onboarding_agent_authoring(action);
             }
         }
+    }
+
+    pub(super) fn start_onboarding_provider_authentication(
+        &mut self,
+        template: &'static cockpit_core::providers::ProviderTemplate,
+        submission: crate::tui::onboarding::AuthSubmission,
+    ) {
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
+        let project_root = self.launch.cwd.display().to_string();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.provider.verify"),
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new("onboarding.provider.verify"),
+            ),
+            async move {
+                use cockpit_proto::{
+                    ProviderMutationBatch, ProviderMutationUpsert, Request, Response,
+                };
+                let (provider_id, base_url, mut headers, header_secrets) = match submission {
+                    crate::tui::onboarding::AuthSubmission::ApiKey {
+                        provider_id,
+                        base_url,
+                        key,
+                    } => {
+                        let mut headers =
+                            cockpit_core::providers::headers_for_pasted_key(template, key.as_str());
+                        let key_header = template.api_key.map(|meta| meta.header_name);
+                        let secrets = headers
+                            .iter_mut()
+                            .map(|header| {
+                                if key_header
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(&header.name))
+                                {
+                                    Some(cockpit_proto::ProviderSecretValue::new(std::mem::take(
+                                        &mut header.value,
+                                    )))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        (provider_id, base_url, headers, secrets)
+                    }
+                    crate::tui::onboarding::AuthSubmission::Environment {
+                        provider_id,
+                        base_url,
+                        variable,
+                    } => {
+                        let headers = cockpit_core::providers::headers_for_pasted_key(template, "");
+                        let key_header = template.api_key.map(|meta| meta.header_name);
+                        let secrets = headers
+                            .iter()
+                            .map(|header| {
+                                key_header
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(&header.name))
+                                    .then(|| {
+                                        cockpit_proto::ProviderSecretValue::detected_environment(
+                                            template.id.to_string(),
+                                            variable.clone(),
+                                        )
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        (provider_id, base_url, headers, secrets)
+                    }
+                    crate::tui::onboarding::AuthSubmission::OAuth {
+                        provider_id,
+                        base_url,
+                    }
+                    | crate::tui::onboarding::AuthSubmission::NoCredential {
+                        provider_id,
+                        base_url,
+                    } => (provider_id, base_url, Vec::new(), Vec::new()),
+                };
+                let url = if base_url.is_empty() {
+                    template.url.to_string()
+                } else {
+                    base_url
+                };
+                let entry = cockpit_core::wizard::provider_entry_for_template(
+                    template,
+                    url,
+                    std::mem::take(&mut headers),
+                );
+                let mutation = ProviderMutationBatch {
+                    upserts: vec![ProviderMutationUpsert {
+                        provider_id: provider_id.clone(),
+                        entry,
+                        header_secrets,
+                    }],
+                    deletes: Vec::new(),
+                    metadata: None,
+                };
+                let mutation_intent_hash = mutation
+                    .sanitized_intent_hash()
+                    .map_err(|error| error.to_string())?;
+                let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let snapshot = client
+                    .request(Request::GetProviderCatalogSnapshot {
+                        project_root: project_root.clone(),
+                        provider_id: None,
+                        snapshot_session_id: snapshot_session_id.clone(),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                let Response::ProviderCatalogSnapshot {
+                    layer_id,
+                    base_revision,
+                    ..
+                } = snapshot
+                else {
+                    return Err("daemon returned the wrong provider snapshot response".to_string());
+                };
+                let client_operation_id = uuid::Uuid::new_v4().to_string();
+                let committed = client
+                    .request(Request::ApplyProviderMutation {
+                        snapshot_session_id,
+                        layer_id,
+                        expected_revision: base_revision,
+                        client_operation_id: client_operation_id.clone(),
+                        mutation_intent_hash: mutation_intent_hash.clone(),
+                        mutation,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                let Response::ProviderMutationCommitted {
+                    config_generation, ..
+                } = committed
+                else {
+                    return Err("daemon returned the wrong provider mutation response".to_string());
+                };
+                let outcome =
+                    fetch_onboarding_provider_models(&client, &project_root, &provider_id).await;
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::StartupProviderVerification(
+                        crate::tui::onboarding::ProviderVerificationCompletion {
+                            provider_id,
+                            outcome,
+                            settlement: Some(crate::tui::onboarding::ProviderSettlementEvidence {
+                                operation_id: client_operation_id,
+                                mutation_intent_hash,
+                                config_generation,
+                            }),
+                        },
+                    ),
+                )
+            },
+        );
+    }
+
+    fn start_onboarding_provider_verification(&mut self, provider_id: String) {
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone());
+        let project_root = self.launch.cwd.display().to_string();
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.provider.verify"),
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new("onboarding.provider.verify"),
+            ),
+            async move {
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let outcome =
+                    fetch_onboarding_provider_models(&client, &project_root, &provider_id).await;
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::StartupProviderVerification(
+                        crate::tui::onboarding::ProviderVerificationCompletion {
+                            provider_id,
+                            outcome,
+                            settlement: None,
+                        },
+                    ),
+                )
+            },
+        );
     }
 
     fn mount_onboarding_agent_authoring(&mut self) {
@@ -1926,12 +2259,8 @@ impl App {
         }
     }
 
-    /// Service the full-screen onboarding shell each wake: reconcile the
-    /// provider-engine pairing, advance stages whose engine settled,
-    /// commit the terminal transition once the lifetime stage settles, and
-    /// end the completion detour when its provider finishes. Key-driven
-    /// intents are applied inline in `handle_onboarding_shell_key`; this
-    /// poll covers completions that the engine reaches asynchronously.
+    /// Service snapshot-driven onboarding stage work each wake. Native
+    /// provider intents are applied inline by their reducers.
     pub(super) fn service_onboarding_shell(&mut self) -> bool {
         let Some(snapshot) = self.onboarding_snapshot.clone() else {
             return false;
@@ -1939,52 +2268,16 @@ impl App {
         let Some(shell) = self.onboarding_shell.as_mut() else {
             return false;
         };
-        // The provider engine can leave its Add page from pointer input and
-        // its own async completions, not only keys; reconcile here so every
-        // path shares one abandon detector.
-        shell.reconcile_provider_engine(&self.dialog);
         if shell.transition_pending() {
             tracing::warn!(stage = ?shell.stage(), pending_kind = ?shell.pending_transition_kind(), revision = snapshot.revision, "onboarding shell service rejected: transition is pending");
             return false;
         }
         match shell.stage() {
-            cockpit_proto::OnboardingStage::Complete => {
-                // The completion screen's "add another provider" detour:
-                // the added provider settles through the ordinary provider
-                // mutation authority; once its engine reaches its done page
-                // the detour ends and the stored summary is presented again.
-                if shell.completion_detour_active()
-                    && shell.screen_is_embedded_provider_add(&self.dialog)
-                    && self.dialog.take_completed_provider_id().is_some()
-                {
-                    shell.return_to_completion();
-                    self.dialog = crate::tui::settings::Dialog::None;
-                    return true;
-                }
-                false
-            }
+            cockpit_proto::OnboardingStage::Complete => false,
             cockpit_proto::OnboardingStage::Welcome
             | cockpit_proto::OnboardingStage::Profile
             | cockpit_proto::OnboardingStage::SecureStore => false,
-            cockpit_proto::OnboardingStage::Provider => {
-                if !shell.screen_is_embedded_provider_add(&self.dialog) {
-                    return false;
-                }
-                let settlement = self.dialog.onboarding_provider_settlement(
-                    snapshot.run_id,
-                    snapshot.attempt_id,
-                    snapshot.revision,
-                );
-                let Some(settlement) = settlement else {
-                    return false;
-                };
-                self.refresh_bootstrap_config_snapshot();
-                self.request_onboarding_transition(
-                    cockpit_proto::OnboardingTransitionKind::Advance,
-                    Some(settlement),
-                );
-                true
-            }
+            cockpit_proto::OnboardingStage::Provider => false,
             cockpit_proto::OnboardingStage::Model => false,
             cockpit_proto::OnboardingStage::Agent => {
                 let (agent_action, settlement) = {

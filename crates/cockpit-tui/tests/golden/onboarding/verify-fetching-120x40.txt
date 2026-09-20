@@ -1,0 +1,40 @@
+ ‹ Back                                                                                                                 
+                 Verifying provider · step 4/8                                                                          
+                 Checking openai through the Cockpit daemon.                                                            
+                 ────────────────────────────                                                                           
+                 ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ⠋ Fetching models from the provider…                                                                   
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                 esc cancel   ^c quit                                                                                   
+                                                                                                                        

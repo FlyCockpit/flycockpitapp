@@ -1,0 +1,24 @@
+ ‹ Back                                                                         
+  ✗ Couldn't verify · step 4/8                                                  
+  Credential rejected (401)                                                     
+  ────────────────────────────                                                  
+  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready         
+  The provider rejected this credential.                                        
+                                                                                
+  Step back to replace the credential, then retry.                              
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+  r retry   esc back   ^c quit                                       [ Retry ]  
+                                                                                

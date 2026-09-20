@@ -983,38 +983,69 @@ fn search_resize_clamps_cursor_and_viewport() {
     assert!(screen.offset() <= total.saturating_sub(capacity));
 }
 
-// ── Engine pairing ───────────────────────────────────────────────────────
+// ── Native provider sub-phases ───────────────────────────────────────────
 
 #[test]
-fn provider_engine_abandoning_add_returns_to_search() {
+fn authenticate_escape_returns_to_search() {
     let mut shell = shell_at(OnboardingStage::Provider);
     let mut engine = Dialog::None;
-    shell.present_embedded_settings();
-    // Dialog::None is not the add page: the pairing check must send the
-    // shell back to the searchable catalog rather than a settings list.
-    let action = shell.handle_key(key(KeyCode::Down), &mut engine);
+    shell.present_authenticate(cockpit_core::providers::template_by_id("openai").unwrap());
+    let action = shell.handle_key(key(KeyCode::Esc), &mut engine);
     assert!(action.is_none());
-    assert!(
-        shell.screen_kind() == OnboardingScreenKind::ProviderSearch,
-        "an abandoned provider engine returns to the catalog"
-    );
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::ProviderSearch);
 }
 
 #[test]
-fn escape_during_engine_authority_work_reaches_the_engine() {
-    // When the engine owns an unsettled authority operation the shell must
-    // not open its Back/Defer/Cancel menu; Escape flows to the engine's
-    // correlated cancellation. Dialog::None never reports pending
-    // authority, so the menu opens — the pairing under test is that the
-    // shell consults the engine rather than deciding alone.
+fn verify_retry_reprobes_the_same_provider() {
     let mut shell = shell_at(OnboardingStage::Provider);
     let mut engine = Dialog::None;
-    shell.present_embedded_settings();
-    assert!(shell.handle_key(key(KeyCode::Esc), &mut engine).is_none());
-    let rendered = render_string(&mut shell, 80, 24, &engine);
-    // The abandon check sends us back to search first; Escape there opens
-    // the menu (no engine authority pending).
-    assert!(rendered.contains("Leave setup?"));
+    shell.present_verify("localtest".into());
+    shell.apply_provider_verification("localtest", VerifyOutcome::Unauthorized(401), None);
+    let action = shell.handle_key(key(KeyCode::Char('r')), &mut engine);
+    assert!(matches!(
+        action,
+        Some(OnboardingShellAction::RetryProviderVerification { provider_id })
+            if provider_id == "localtest"
+    ));
+    assert!(matches!(
+        &shell.screen,
+        OnboardingScreen::Verify(screen)
+            if matches!(screen.phase(), verify::VerifyPhase::Fetching)
+    ));
+}
+
+#[test]
+fn verify_renders_each_daemon_failure_class_with_retry() {
+    let engine = Dialog::None;
+    for (outcome, expected) in [
+        (
+            VerifyOutcome::Unauthorized(401),
+            "Credential rejected (401)",
+        ),
+        (VerifyOutcome::NotFound, "Wrong base URL (404)"),
+        (
+            VerifyOutcome::HttpStatus {
+                status: 429,
+                snippet: "rate limited".into(),
+            },
+            "Provider returned HTTP 429",
+        ),
+        (
+            VerifyOutcome::Network("DNS lookup failed".into()),
+            "Couldn't reach the provider",
+        ),
+        (
+            VerifyOutcome::Parse("invalid model JSON".into()),
+            "Unexpected response",
+        ),
+    ] {
+        let mut shell = shell_at(OnboardingStage::Provider);
+        shell.present_verify("fake".into());
+        shell.apply_provider_verification("fake", outcome, None);
+        let rendered = render_string(&mut shell, 80, 24, &engine);
+        assert!(rendered.contains(expected), "{rendered}");
+        assert!(rendered.contains("[ Retry ]"), "{rendered}");
+    }
 }
 
 // ── Completion ───────────────────────────────────────────────────────────
@@ -1153,23 +1184,18 @@ fn chrome_shows_progress_and_limited_mode_at_both_sizes() {
 }
 
 #[test]
-fn provider_auth_engine_renders_inside_full_screen_chrome_at_narrow_and_wide_sizes() {
-    let home = tempfile::tempdir().unwrap();
-    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
+fn provider_authenticate_renders_inside_full_screen_chrome_at_narrow_and_wide_sizes() {
     let template = cockpit_core::providers::template_by_id("openai").unwrap();
-    let mut engine = Dialog::onboarding_provider_engine(home.path(), None);
-    engine.seed_provider_template(template);
+    let engine = Dialog::None;
     let mut shell = shell_at(OnboardingStage::Provider);
-    shell.present_embedded_settings();
+    shell.present_authenticate(template);
 
     for (width, height) in [(48, 18), (110, 32)] {
         let rendered = render_string(&mut shell, width, height, &engine);
-        assert!(rendered.contains("Cockpit setup"), "{rendered}");
-        assert!(rendered.contains("Template: OpenAI"), "{rendered}");
-        assert!(rendered.contains("esc: options"), "{rendered}");
-        // The progress row now carries eight steps (#425 gives Profile its
-        // own stage) with markers glued to labels, so the current step stays
-        // legible even on a 48-column terminal.
+        assert!(rendered.contains("Add your API key"), "{rendered}");
+        assert!(rendered.contains("API key"), "{rendered}");
+        assert!(rendered.contains("[ Reveal ]"), "{rendered}");
+        assert!(rendered.contains("[ Continue ]"), "{rendered}");
         assert!(rendered.contains("◐Provider"), "{rendered}");
     }
 }

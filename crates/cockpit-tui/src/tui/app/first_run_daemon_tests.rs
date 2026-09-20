@@ -535,6 +535,26 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
 }
 
 fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
+    let provider_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let provider = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut socket, _) = listener.accept().expect("accept model fetch");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).expect("read model fetch");
+        let body = r#"{"data":[{"id":"manual-model","object":"model"}],"object":"list"}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write model catalog");
+    });
+
     for ch in "compat".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
@@ -542,55 +562,49 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
     shell_key(app, KeyCode::Enter);
     pump_onboarding(
         app,
-        |app| {
-            app.dialog.is_provider_add() && app.dialog.test_provider_add_step() == Some("wire-api")
-        },
-        "the seeded provider engine",
+        |app| shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Authenticate),
+        "the native Authenticate screen",
     );
 
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_provider_add_step(), Some("id"));
     for ch in "localtest".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_provider_add_step(), Some("url"));
-    for ch in "http://127.0.0.1:9/v1".chars() {
+    shell_key(app, KeyCode::Tab);
+    for ch in provider_url.chars() {
         shell_key(app, KeyCode::Char(ch));
     }
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_provider_add_step(), Some("auth-method"));
-    shell_key(app, KeyCode::Down);
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_provider_add_step(), Some("env-var"));
+    shell_key(app, KeyCode::Tab);
+    for ch in "test-key".chars() {
+        shell_key(app, KeyCode::Char(ch));
+    }
     shell_key(app, KeyCode::Enter);
 
     pump_onboarding(
         app,
         |app| {
-            app.dialog.test_provider_add_step() == Some("test-key")
-                && !app.dialog.test_provider_add_fetch_pending()
+            shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Verify)
+                && app
+                    .onboarding_shell
+                    .as_ref()
+                    .and_then(|shell| shell.verifying_provider_id())
+                    == Some("localtest")
         },
-        "the offline validation attempt to finish against the unreachable endpoint",
+        "the native Verify screen",
     );
 
-    let mut committed = false;
-    for _ in 0..150 {
-        pump_once(app);
-        if app.dialog.test_provider_add_step() == Some("done") {
-            committed = true;
-            break;
-        }
-        if app.dialog.test_provider_add_step() == Some("test-key") {
-            shell_key(app, KeyCode::Char('m'));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        committed,
-        "manual model entry must commit the offline checkpoint; status: {:?}",
-        app.dialog.test_provider_add_status()
+    pump_onboarding(
+        app,
+        |app| {
+            app.onboarding_shell
+                .as_ref()
+                .is_some_and(|shell| shell.provider_verification_succeeded())
+        },
+        "the daemon model probe to connect the provider",
     );
+    provider
+        .join()
+        .expect("fake provider exits after verification");
+    shell_key(app, KeyCode::Enter);
 
     pump_onboarding(
         app,

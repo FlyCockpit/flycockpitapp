@@ -455,6 +455,54 @@ pub(crate) struct OAuthFlowState {
 }
 
 impl OAuthFlowState {
+    pub(crate) fn onboarding_acknowledge(&mut self) -> OAuthFlowRequest {
+        self.status = Some(Ok(
+            "Recording subscription OAuth acknowledgement...".to_string()
+        ));
+        self.request(OAuthFlowOp::Acknowledge)
+    }
+
+    pub(crate) fn onboarding_begin(&mut self) -> OAuthFlowRequest {
+        match self.provider {
+            OAuthProvider::Codex => self.polling = true,
+            OAuthProvider::Grok => self.pending = true,
+        }
+        self.request(OAuthFlowOp::Begin)
+    }
+
+    pub(crate) fn onboarding_poll(&mut self) -> Option<OAuthFlowRequest> {
+        if self.has_unsettled_authority() {
+            return None;
+        }
+        let flow_id = self.remote_flow_id()?;
+        self.polling = true;
+        Some(self.request(OAuthFlowOp::Poll { flow_id }))
+    }
+
+    pub(crate) fn onboarding_complete(
+        &mut self,
+        input: zeroize::Zeroizing<String>,
+    ) -> Option<OAuthFlowRequest> {
+        if self.has_unsettled_authority() {
+            return None;
+        }
+        let flow_id = self.remote_flow_id()?;
+        self.pending = true;
+        Some(self.request(OAuthFlowOp::Complete { flow_id, input }))
+    }
+
+    pub(crate) fn onboarding_cancel(&mut self) -> OAuthFlowRequest {
+        self.begin_cancel()
+    }
+
+    pub(crate) fn onboarding_device_login(&self) -> Option<(&str, &str)> {
+        self.device_login().map(|(_, url, code)| (url, code))
+    }
+
+    pub(crate) fn onboarding_authorize_url(&self) -> Option<&str> {
+        self.authorize_url()
+    }
+
     #[cfg(test)]
     pub(crate) fn new_without_acknowledgement_for_test(provider: OAuthProvider) -> Self {
         let mut state = Self::new(provider);

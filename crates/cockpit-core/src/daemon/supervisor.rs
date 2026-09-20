@@ -522,7 +522,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
     let _database_owner = database_owner;
 
     let mut storm = cockpit_client::RestartStormGuard::default();
-    loop {
+    'supervision: loop {
         tokio::select! {
             exit = worker.exited.recv() => {
                 match exit {
@@ -534,24 +534,32 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                 if paths.ephemeral && clean {
                     break;
                 }
-                if !storm.allow(Instant::now()) {
-                    tracing::error!(generation, "worker restart storm exhausted; supervisor is exiting");
-                    break;
-                }
-                generation = generation.saturating_add(1);
                 let respawn_binary = worker.binary.clone();
-                worker = spawn_ready_worker(WorkerSpawnRequest {
-                    endpoints: &endpoint_owner,
-                    binary: &respawn_binary,
-                    paths: &paths,
-                    log: &log,
-                    log_path: &log_path,
+                let Some(replacement) = retry_worker_spawn(
+                    &mut storm,
+                    &mut generation,
+                    |attempt_generation| spawn_ready_worker(WorkerSpawnRequest {
+                        endpoints: &endpoint_owner,
+                        binary: &respawn_binary,
+                        paths: &paths,
+                        log: &log,
+                        log_path: &log_path,
+                        generation: attempt_generation,
+                        opened_at_unix_ms,
+                        no_sandbox,
+                        resume_all_sessions,
+                    }),
+                ).await else {
+                    break 'supervision;
+                };
+                worker = replacement;
+                publish_generation(
+                    &paths,
+                    &receipt,
+                    worker.pid,
                     generation,
                     opened_at_unix_ms,
-                    no_sandbox,
-                    resume_all_sessions,
-                }).await?;
-                publish_generation(&paths, &receipt, worker.pid, generation, opened_at_unix_ms)?;
+                )?;
             }
             accepted = accept_admin(&mut admin) => {
                 let stream = accepted?;
@@ -657,6 +665,37 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
     remove_if_present(&paths.leak_reveal_socket())?;
     metadata.cleanup()?;
     Ok(())
+}
+
+async fn retry_worker_spawn<T, F, Fut>(
+    storm: &mut cockpit_client::RestartStormGuard,
+    generation: &mut u64,
+    mut spawn: F,
+) -> Option<T>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    loop {
+        if !storm.allow(Instant::now()) {
+            tracing::error!(
+                generation = *generation,
+                "worker restart storm exhausted; supervisor is exiting"
+            );
+            return None;
+        }
+        *generation = generation.saturating_add(1);
+        match spawn(*generation).await {
+            Ok(worker) => return Some(worker),
+            Err(error) => {
+                tracing::error!(
+                    generation = *generation,
+                    %error,
+                    "worker respawn failed before readiness; retrying"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1628,6 +1667,46 @@ mod tests {
             Some(Ok(()))
         );
         child.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_failures_retry_until_a_worker_is_ready() {
+        let mut storm = cockpit_client::RestartStormGuard::default();
+        let mut generation = 7;
+        let mut attempts = Vec::new();
+
+        let worker = retry_worker_spawn(&mut storm, &mut generation, |attempt_generation| {
+            attempts.push(attempt_generation);
+            std::future::ready(if attempt_generation < 10 {
+                Err(anyhow::anyhow!("controlled readiness failure"))
+            } else {
+                Ok(101_u32)
+            })
+        })
+        .await;
+
+        assert_eq!(worker, Some(101));
+        assert_eq!(generation, 10);
+        assert_eq!(attempts, vec![8, 9, 10]);
+    }
+
+    #[tokio::test]
+    async fn readiness_failures_exhaust_the_shared_restart_budget() {
+        let mut storm = cockpit_client::RestartStormGuard::default();
+        let mut generation = 11;
+        let mut attempts = Vec::new();
+
+        let worker = retry_worker_spawn(&mut storm, &mut generation, |attempt_generation| {
+            attempts.push(attempt_generation);
+            std::future::ready(Err::<u32, _>(anyhow::anyhow!(
+                "controlled readiness failure"
+            )))
+        })
+        .await;
+
+        assert_eq!(worker, None);
+        assert_eq!(generation, 14);
+        assert_eq!(attempts, vec![12, 13, 14]);
     }
 
     #[cfg(unix)]

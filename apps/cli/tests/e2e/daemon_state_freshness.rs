@@ -297,6 +297,81 @@ async fn ephemeral_supervisor_exits_after_last_lifetime_client_disconnects() {
     assert!(!socket.exists(), "supervisor must retract its endpoint");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ephemeral_supervisor_suppresses_reaping_during_worker_roll() {
+    let home = IsolatedHome::new();
+    let socket = home.socket_path();
+    let pid_file = home.pid_file();
+    let mut daemon_command = home.cockpit();
+    daemon_command
+        .args(["daemon", "start", "--foreground"])
+        .env("COCKPIT_DAEMON_LIFETIME", "ephemeral")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = daemon_command
+        .spawn()
+        .expect("spawn foreground ephemeral supervisor");
+    let supervisor = EphemeralDaemonGuard::new(child, socket.clone(), pid_file.clone());
+    wait_for_daemon_handshake_on_socket(&socket, &pid_file, DAEMON_START_HANDSHAKE_TIMEOUT, || {
+        if let Ok(Some(status)) = supervisor.try_wait() {
+            panic!("ephemeral supervisor exited before handshake: {status}");
+        }
+        None
+    })
+    .await;
+
+    let client = DaemonClient::connect(&socket)
+        .await
+        .expect("connect lifetime client before roll");
+    let before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(pid_file.with_file_name("daemon.json")).expect("read pre-roll rendezvous"),
+    )
+    .expect("decode pre-roll rendezvous");
+    let output = home
+        .cockpit()
+        .args(["daemon", "restart", "--grace", "0"])
+        .output()
+        .expect("roll ephemeral worker");
+    assert_success("roll ephemeral worker", &output, &home);
+
+    assert_eq!(
+        supervisor.try_wait().expect("poll supervisor after roll"),
+        None,
+        "the ephemeral supervisor must survive the roll reconnect gap"
+    );
+    let replacement = DaemonClient::connect(&socket)
+        .await
+        .expect("connect to rolled ephemeral worker");
+    let after: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(pid_file.with_file_name("daemon.json")).expect("read post-roll rendezvous"),
+    )
+    .expect("decode post-roll rendezvous");
+    assert_eq!(before["pid"], after["pid"]);
+    assert_eq!(before["opened_at_unix_ms"], after["opened_at_unix_ms"]);
+    assert_ne!(before["worker_pid"], after["worker_pid"]);
+    assert!(after["generation"].as_u64() > before["generation"].as_u64());
+
+    drop(client);
+    drop(replacement);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while supervisor
+        .try_wait()
+        .expect("poll ephemeral supervisor exit")
+        .is_none()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ephemeral supervisor must reap after rolled worker loses its final lifetime client"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let output = supervisor
+        .wait_with_output()
+        .expect("reap rolled ephemeral supervisor");
+    assert_success("rolled ephemeral supervisor natural reap", &output, &home);
+}
+
 #[tokio::test]
 async fn daemon_refuses_newer_migration_ledger() {
     // Doctor is read-only and never materializes SQLite. Boot (then stop) a

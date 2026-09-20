@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
@@ -444,12 +444,14 @@ fn daemon_process_watch(socket: &Path) -> Option<cockpit_client::DaemonProcessWa
         if record.socket_path != socket {
             return None;
         }
-        let receipt = record.receipt;
+        let mut receipt = record.receipt;
+        let opened_at_unix_ms = record.opened_at_unix_ms;
         let process = match acquire_verified_daemon_process(&receipt) {
             VerifiedProcessOutcome::Verified(process) => process,
             VerifiedProcessOutcome::Identity(_) => return None,
         };
         let (watch, exited) = cockpit_client::DaemonProcessWatch::channel();
+        let socket = socket.to_path_buf();
         tokio::spawn(async move {
             // Reacquire only from the same v2 receipt after a bounded wait.
             // This keeps Windows waits below their DWORD timeout ceiling and
@@ -458,8 +460,20 @@ fn daemon_process_watch(socket: &Path) -> Option<cockpit_client::DaemonProcessWa
             loop {
                 match process.wait_for_exit(Duration::from_secs(60 * 60)).await {
                     Ok(true) => {
-                        let _ = exited.send(true);
-                        return;
+                        let Some((replacement_receipt, replacement_process)) =
+                            await_reexec_supervisor(
+                                &canonical,
+                                &socket,
+                                &receipt,
+                                opened_at_unix_ms,
+                            )
+                            .await
+                        else {
+                            let _ = exited.send(true);
+                            return;
+                        };
+                        receipt = replacement_receipt;
+                        process = replacement_process;
                     }
                     Ok(false) => {
                         process = match acquire_verified_daemon_process(&receipt) {
@@ -495,6 +509,61 @@ fn daemon_process_watch(socket: &Path) -> Option<cockpit_client::DaemonProcessWa
         let _ = socket;
         None
     }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+))]
+async fn await_reexec_supervisor(
+    canonical: &crate::daemon::DaemonPaths,
+    socket: &Path,
+    previous: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+    opened_at_unix_ms: u64,
+) -> Option<(
+    cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+    cockpit_host::daemon_lifecycle::VerifiedDaemonProcess,
+)> {
+    use cockpit_host::daemon_lifecycle::{VerifiedProcessOutcome, acquire_verified_daemon_process};
+
+    let deadline = Instant::now() + super::DAEMON_SPAWN_TIMEOUT;
+    loop {
+        if let Some(receipt) = replacement_supervisor_receipt(
+            super::read_endpoint_record(canonical),
+            socket,
+            previous,
+            opened_at_unix_ms,
+        ) && let VerifiedProcessOutcome::Verified(process) =
+            acquire_verified_daemon_process(&receipt)
+        {
+            return Some((receipt, process));
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+))]
+fn replacement_supervisor_receipt(
+    record: Option<super::DaemonEndpointRecord>,
+    socket: &Path,
+    previous: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+    opened_at_unix_ms: u64,
+) -> Option<cockpit_host::daemon_lifecycle::DaemonPidReceipt> {
+    let record = record?;
+    (record.socket_path == socket
+        && record.opened_at_unix_ms == opened_at_unix_ms
+        && record.receipt != *previous)
+        .then_some(record.receipt)
 }
 
 /// Test-support composition owned below frontends. TUI tests receive only the
@@ -1582,6 +1651,68 @@ fn daemon_transport_ready(socket: &Path) -> bool {
         }
     }
     socket.exists()
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    )
+))]
+#[test]
+fn reexec_watch_accepts_only_a_replacement_with_the_same_endpoint_and_clock() {
+    let socket = PathBuf::from("daemon-endpoint");
+    let executable = std::env::current_exe().unwrap();
+    let process_start =
+        cockpit_host::daemon_lifecycle::process_start_identity(std::process::id()).unwrap();
+    let previous = cockpit_host::daemon_lifecycle::DaemonPidReceipt {
+        pid: std::process::id(),
+        executable: executable.clone(),
+        process_start: process_start.clone(),
+        publication_nonce: [1; 32],
+    };
+    let replacement = cockpit_host::daemon_lifecycle::DaemonPidReceipt {
+        pid: std::process::id(),
+        executable,
+        process_start: process_start.clone(),
+        publication_nonce: [2; 32],
+    };
+    let record = |socket_path: PathBuf, opened_at_unix_ms| super::DaemonEndpointRecord {
+        pid: replacement.pid,
+        start_time: process_start.clone(),
+        socket_path,
+        protocol_version: super::proto::PROTOCOL_VERSION,
+        daemon_version: super::proto::DAEMON_VERSION.to_string(),
+        worker_pid: Some(77),
+        generation: 4,
+        opened_at_unix_ms,
+        receipt: replacement.clone(),
+        ephemeral: false,
+    };
+
+    assert_eq!(
+        replacement_supervisor_receipt(Some(record(socket.clone(), 900)), &socket, &previous, 900),
+        Some(replacement.clone())
+    );
+    assert!(
+        replacement_supervisor_receipt(
+            Some(record(PathBuf::from("other-endpoint"), 900)),
+            &socket,
+            &previous,
+            900,
+        )
+        .is_none()
+    );
+    assert!(
+        replacement_supervisor_receipt(Some(record(socket.clone(), 901)), &socket, &previous, 900)
+            .is_none()
+    );
+    let mut unchanged = record(socket.clone(), 900);
+    unchanged.receipt = previous.clone();
+    assert!(replacement_supervisor_receipt(Some(unchanged), &socket, &previous, 900).is_none());
 }
 
 #[cfg(test)]

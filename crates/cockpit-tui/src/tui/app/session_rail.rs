@@ -413,8 +413,11 @@ mod tests {
 
         {
             let (mut picker, _env) = configured_app(&tmp);
-            picker.open_model_picker();
-            assert!(matches!(picker.overlay, Overlay::ModelPicker(_)));
+            picker.open_model_menu();
+            assert!(
+                picker.composer_controls.picker.is_some(),
+                "pill model picker opens through composer controls after #476"
+            );
             let picker_buf = render_buffer(&mut picker, 120, 40);
             assert!(picker.session_rail.rail_area().is_some());
             let picker_rail = picker.session_rail.rail_area().expect("picker rail");

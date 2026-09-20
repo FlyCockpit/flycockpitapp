@@ -216,7 +216,7 @@ fn find_runner_subagent_package(agents_root: &Path) -> Option<PathBuf> {
         }
         None
     }
-    walk(&agents_root)
+    walk(agents_root)
 }
 
 #[test]

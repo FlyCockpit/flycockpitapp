@@ -1649,7 +1649,7 @@ impl OnboardingShell {
             (OnboardingScreen::Complete { .. }, Some(1)) => {
                 PointerOutcome::acted(OnboardingShellAction::Close)
             }
-            (OnboardingScreen::AgentAuthoring(screen), Some(index)) => {
+            (OnboardingScreen::AgentAuthoring(_), Some(index)) => {
                 let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen else {
                     unreachable!()
                 };
@@ -1975,7 +1975,7 @@ impl OnboardingShell {
             OnboardingScreen::Authenticate(screen) => screen.title(),
             OnboardingScreen::Verify(screen) => screen.title(),
             OnboardingScreen::Complete { .. } => "You're ready to fly",
-            OnboardingScreen::AgentAuthoring(_) => "Create your agent",
+            OnboardingScreen::AgentAuthoring(screen) => screen.phase_title(),
             OnboardingScreen::Lifetime(_) => "Background agents",
             OnboardingScreen::Model(screen) => screen.title(),
             OnboardingScreen::EmbeddedSettings => "Cockpit setup",
@@ -1996,6 +1996,7 @@ impl OnboardingShell {
                 "Choose what happens after the last Cockpit window closes.".to_string()
             }
             OnboardingScreen::Model(screen) => screen.subtitle().to_string(),
+            OnboardingScreen::AgentAuthoring(screen) => screen.phase_subtitle(),
             OnboardingScreen::Complete { .. } => "Your setup is complete.".to_string(),
             _ => String::new(),
         };

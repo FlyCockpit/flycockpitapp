@@ -158,18 +158,6 @@ impl AgentAuthoringScreen {
         }
     }
 
-    pub fn projection(&self) -> &AgentAuthoringProjection {
-        &self.projection
-    }
-
-    pub fn client_operation_id(&self) -> &str {
-        &self.client_operation_id
-    }
-
-    pub fn review(&self) -> Option<&AuthoredAgentReview> {
-        self.review.as_ref()
-    }
-
     pub fn take_pending_action(&mut self) -> Option<AgentAuthoringAction> {
         self.pending_action.take()
     }
@@ -311,7 +299,7 @@ impl AgentAuthoringScreen {
         self.editing_child.as_mut()
     }
 
-    fn phase_title(&self) -> &'static str {
+    pub(super) fn phase_title(&self) -> &'static str {
         match self.phase {
             Phase::SourceIdentity => "Create your first agent",
             Phase::ThirdPartyLocator => "Pin a third-party agent",
@@ -336,7 +324,7 @@ impl AgentAuthoringScreen {
         }
     }
 
-    fn phase_subtitle(&self) -> String {
+    pub(super) fn phase_subtitle(&self) -> String {
         let subtitle = match self.phase {
             Phase::SourceIdentity => {
                 "An agent is a saved configuration you can fly again and again.".into()
@@ -404,15 +392,6 @@ impl AgentAuthoringScreen {
         } else {
             subtitle
         }
-    }
-
-    fn status_is_failure(&self) -> bool {
-        let Some(status) = self.status.as_deref() else {
-            return false;
-        };
-        !status.starts_with("Required tools")
-            && !status.starts_with("Requesting canonical")
-            && !status.starts_with("Creating agent")
     }
 
     #[cfg(test)]
@@ -1518,7 +1497,7 @@ impl AgentAuthoringScreen {
         }
     }
 
-    pub(crate) fn buttons(&self) -> Vec<chrome::Button<'static>> {
+    pub(super) fn buttons(&self) -> Vec<chrome::Button<'static>> {
         match self.phase {
             Phase::Review => vec![chrome::Button::primary("Create agent")],
             Phase::Create if self.status.is_some() => vec![

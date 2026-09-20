@@ -2765,7 +2765,9 @@ impl App {
         // by an unrelated writer while the add-model settings dialog remains
         // open must update the held config, but must not consume the causal
         // reopen marker or rebuild the hidden picker underneath the dialog.
-        if let Some(provider) = self.refresh_reopened_composer_model_after_settings.take()
+        if self
+            .refresh_reopened_composer_model_after_settings
+            .is_some()
             && self
                 .composer_controls
                 .picker
@@ -2774,23 +2776,10 @@ impl App {
                     picker.kind == crate::tui::composer_controls::ComposerControlKind::Model
                 })
         {
-            let draft = self.composer_controls.picker.as_ref().and_then(|picker| {
-                picker.categories.get(picker.category).and_then(|category| {
-                    category.items.get(picker.cursor).map(|item| {
-                        cockpit_config::providers::ActiveModelRef {
-                            provider: category.id.clone(),
-                            model: item.id.clone(),
-                            reasoning_effort: item.selected_reasoning_effort.clone(),
-                            thinking_mode: item.selected_thinking_mode,
-                            prompt_cache_retention: item.selected_prompt_cache_retention,
-                        }
-                    })
-                })
-            });
-            self.open_composer_model_menu_for_provider(&provider);
-            if let Some(draft) = draft {
-                self.restore_composer_model_menu_selection(&draft);
-            }
+            self.refresh_reopened_composer_model_after_settings.take();
+            // In-place refresh preserves default-only mode; reopening via the
+            // ordinary chord path would clear `default_model_settings_mode`.
+            self.refresh_open_composer_model_menu();
         }
     }
 

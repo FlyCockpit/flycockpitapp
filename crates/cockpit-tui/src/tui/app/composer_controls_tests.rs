@@ -2393,7 +2393,7 @@ fn default_model_settings_mode_clears_on_dismiss_and_ordinary_open() {
 #[test]
 fn default_model_settings_mode_survives_add_model_settings_reopen() {
     let tmp = tempfile::tempdir().unwrap();
-    let (mut app, _control_rx) = app_with_runner(&tmp);
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
     app.open_default_model_from_settings();
     assert!(app.default_model_settings_mode);
     let add_id = "\u{0}add-model";
@@ -2416,6 +2416,34 @@ fn default_model_settings_mode_survives_add_model_settings_reopen() {
         app.default_model_settings_mode,
         "Add model… reopen must not clear default-only mode from Settings → Choose default"
     );
+    assert!(app.refresh_reopened_composer_model_after_settings.is_some());
+
+    let generation = app.config_snapshot.generation.saturating_add(1);
+    app.apply_event(cockpit_client::presentation::TurnEvent::ConfigSnapshot {
+        snapshot: Box::new(cockpit_proto::ConfigSnapshot {
+            session_id: uuid::Uuid::new_v4(),
+            generation,
+            extended: app.config_snapshot.extended.clone(),
+            providers: cockpit_core::secret_ref::redact_provider_view(
+                &app.config_snapshot.providers,
+            ),
+        }),
+    });
+    assert!(app.refresh_reopened_composer_model_after_settings.is_none());
+    assert!(
+        app.default_model_settings_mode,
+        "post-save snapshot refresh must not clear default-only mode"
+    );
+    app.handle_key(press(KeyCode::Enter));
+    assert!(matches!(
+        control_rx
+            .try_recv()
+            .expect("default model request")
+            .request,
+        Request::SetDefaultModel { .. }
+    ));
+    assert!(app.pending_default_model_update_id.is_some());
+    assert!(!app.default_model_settings_mode);
 }
 
 #[test]
@@ -2512,6 +2540,7 @@ fn restore_and_reopen_composer_model_menu_skip_config_drift_row() {
     assert!(app.reopen_composer_model_after_provider_settings());
     let picker = app.composer_controls.picker.as_ref().expect("menu");
     assert_eq!(picker.level, 1);
+    assert_ne!(picker.categories[picker.category].label, "Config drift");
     assert_eq!(picker.categories[picker.category].id, "openai");
     assert!(
         picker.cursor < picker.categories[picker.category].items.len(),

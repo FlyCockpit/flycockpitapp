@@ -1845,7 +1845,7 @@ fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
         ));
     }
 
-    // The actionable source publishes both commands. Dispatch Cancel on a
+    // The actionable source publishes setup plus the ActionBar back command. Dispatch Cancel on a
     // separate fresh instance so it proves that cancellation performs no
     // setup work and preserves the parent edit state.
     let (_tmp, source) = setup_fixture(0);
@@ -1854,7 +1854,7 @@ fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
         ProvidersAction::CopilotConfirm(ProviderId("copilot".into()), ConfirmationChoice::Confirm,)
     )));
     assert!(rendered.contains(&SettingsPointerAction::Providers(
-        ProvidersAction::CopilotConfirm(ProviderId("copilot".into()), ConfirmationChoice::Cancel,)
+        ProvidersAction::LocalBack
     )));
 }
 
@@ -2202,6 +2202,7 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
                     .as_ref()
                     .is_ok_and(|message| message.contains("device code copied")))
         ));
+        super::super::pointer_acceptance_tests::record_dispatched_action(&action);
     }
 
     replay_special_provider_edit_actions("codex-oauth", edit_fixture);
@@ -2250,7 +2251,9 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
 fn pointer_add_oauth_skip_continue_sources_save_from_fresh_state() {
     let (_daemon_fixture, runtime) = provider_daemon_runtime();
     let _runtime_guard = runtime.enter();
-    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+    use super::super::pointer_actions::{
+        ProvidersAction, SettingsPointerAction, WizardControlId, WizardStepId,
+    };
 
     fn fixture(provider: OAuthProvider) -> (tempfile::TempDir, SettingsDialog) {
         let template_id = match provider {
@@ -2788,7 +2791,9 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
 
 #[test]
 fn pointer_add_api_key_field_renders_and_dispatches_from_fresh_state() {
-    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+    use super::super::pointer_actions::{
+        ProvidersAction, SettingsPointerAction, WizardControlId, WizardStepId,
+    };
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
@@ -2832,6 +2837,31 @@ fn pointer_add_api_key_field_renders_and_dispatches_from_fresh_state() {
         TestPageRef::Providers(ProvidersPage::Add(state))
             if state.is_step("api-key") && state.api_key_field.text() == "sk-stable-secret"
     ));
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let continue_action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::ApiKey,
+                        WizardControlId::Continue,
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("API key ActionBar publishes Continue");
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &continue_action);
+    assert!(fresh.config.providers.contains_key("anthropic"));
+    super::super::pointer_acceptance_tests::record_dispatched_action(&continue_action);
 }
 
 #[test]
@@ -3944,6 +3974,7 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
                     .as_ref()
                     .is_ok_and(|message| message.contains("device code copied")))
     ));
+    super::super::pointer_acceptance_tests::record_dispatched_action(&copy);
     click_rendered_provider_action(&mut poll_source, &poll);
     assert!(matches!(
         poll_source.test_page(),
@@ -6017,6 +6048,9 @@ fn onboarding_live_validation_refreshes_authority_before_final_settlement() {
     let mut add = AddState::new_with_onboarding(true);
     add.saved_provider_id = Some("p".into());
     add.run.return_to("test-key").unwrap();
+    add.verify = Some(Box::new(crate::tui::onboarding::VerifyScreen::new(
+        "p".into(),
+    )));
     dialog.set_test_page(Page::Providers(ProvidersPage::Add(add)));
 
     dialog.apply_fetch_result(
@@ -6044,6 +6078,7 @@ fn onboarding_live_validation_refreshes_authority_before_final_settlement() {
 
 #[test]
 fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offline() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
     let runtime = tokio::runtime::Handle::try_current().is_err().then(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -6058,6 +6093,9 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
     let mut add = AddState::new_with_onboarding(true);
     add.saved_provider_id = Some("p".into());
     add.run.return_to("test-key").unwrap();
+    add.verify = Some(Box::new(crate::tui::onboarding::VerifyScreen::new(
+        "p".into(),
+    )));
     dialog.set_test_page(Page::Providers(ProvidersPage::Add(add)));
 
     dialog.apply_fetch_result(
@@ -6084,7 +6122,56 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
             && !message.contains("sk-test-token")
     }));
 
-    dialog.handle_key(press(KeyCode::Char('o')));
+    let _ = render_provider_rows(&dialog, 110, 60);
+    let retry = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::RetryVerification),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("failed verification renders Retry in the ActionBar");
+    click_rendered_provider_action(&mut dialog, &retry);
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state)) if state.fetch.is_some()
+    ));
+
+    dialog.apply_fetch_result(
+        "p",
+        Ok(FetchOutcome::FallbackAvailable {
+            models: vec![model("fallback", false)],
+            catalog: ProviderModelCatalog::CodexFallback,
+            reason: "offline".into(),
+        }),
+    );
+    let _ = render_provider_rows(&dialog, 110, 60);
+    let offline = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(
+                        ProvidersAction::ContinueVerificationOffline,
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("failed verification with fallback renders Continue offline");
+
+    click_rendered_provider_action(&mut dialog, &offline);
 
     assert!(matches!(
         dialog.test_page(),

@@ -1385,10 +1385,6 @@ fn codex_oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<CodexOAuthOpt
     options
 }
 
-fn rendered_cursor(s: &OAuthFlowState, host: OAuthHost) -> usize {
-    s.cursor.min(s.option_count(host).saturating_sub(1))
-}
-
 pub(super) fn oauth_help_legend(host: OAuthHost, s: &OAuthFlowState) -> &'static str {
     if s.acknowledgement_required {
         return "enter: acknowledge  esc: back";
@@ -1471,8 +1467,8 @@ pub(super) fn oauth_help_legend(host: OAuthHost, s: &OAuthFlowState) -> &'static
 fn render_provider_oauth(
     lines: &mut Vec<Line<'static>>,
     s: &OAuthFlowState,
-    host: OAuthHost,
-    mut controls: Option<&mut Vec<(usize, usize)>>,
+    _host: OAuthHost,
+    _controls: Option<&mut Vec<(usize, usize)>>,
 ) {
     let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let yellow = Style::default().fg(resolve_color(
@@ -1536,25 +1532,6 @@ fn render_provider_oauth(
     }
 
     if s.acknowledgement_required {
-        let cursor = rendered_cursor(s, host);
-        for (i, option) in oauth_options(s, host).iter().enumerate() {
-            let marker = if i == cursor { "› " } else { "  " };
-            let style = if i == cursor {
-                yellow.add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(resolve_color(
-                    crate::tui::theme::INK,
-                    crate::tui::theme::INK_INDEX,
-                ))
-            };
-            if let Some(controls) = controls.as_deref_mut() {
-                controls.push((lines.len(), i));
-            }
-            lines.push(Line::from(vec![
-                Span::raw(marker),
-                Span::styled(format!("[{}]", option.label()), style),
-            ]));
-        }
         return;
     }
 
@@ -1575,26 +1552,8 @@ fn render_provider_oauth(
         return;
     }
 
-    let cursor = rendered_cursor(s, host);
-    for (i, option) in oauth_options(s, host).iter().enumerate() {
-        let label = option.label();
-        let marker = if i == cursor { "› " } else { "  " };
-        let style = if i == cursor {
-            yellow.add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(resolve_color(
-                crate::tui::theme::INK,
-                crate::tui::theme::INK_INDEX,
-            ))
-        };
-        if let Some(controls) = controls.as_deref_mut() {
-            controls.push((lines.len(), i));
-        }
-        lines.push(Line::from(vec![
-            Span::raw(marker),
-            Span::styled(format!("[{label}]"), style),
-        ]));
-    }
+    // OAuth options are primary controls.  Their identities are rendered by
+    // the settings help-row ActionBar, not as cursor-navigable body rows.
 }
 
 fn render_browser_callback_session(

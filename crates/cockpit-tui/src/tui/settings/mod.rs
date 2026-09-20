@@ -7662,6 +7662,7 @@ impl SettingsDialog {
                 add.id_field.set(template.id);
                 add.url_field.set(template.url);
                 add.run.return_to("api-key").expect("api-key step");
+                add.api_key_field.set("fixture-api-key");
                 add.auth_method_cursor = 0;
                 providers_page(ProvidersPage::Add(add))
             }
@@ -7673,8 +7674,23 @@ impl SettingsDialog {
                 add.id_field.set(template.id);
                 add.url_field.set(template.url);
                 add.saved_provider_id = Some(template.id.to_string());
-                add.run.return_to("fetching").expect("fetching step");
+                add.run.return_to("test-key").expect("test-key step");
+                let mut verify = crate::tui::onboarding::VerifyScreen::new(template.id.to_string());
+                verify.apply(
+                    crate::tui::onboarding::VerifyOutcome::Network(
+                        "fixture network unavailable".into(),
+                    ),
+                    None,
+                );
+                add.verify = Some(Box::new(verify));
+                add.validation_failure = Some("fixture network unavailable".into());
                 providers_page(ProvidersPage::Add(add))
+            }
+            "provider-edit" => {
+                let mut edit = providers::EditState::new("fixture".into(), fixture_entry);
+                edit.editing_field = Some(providers::EditField::Url);
+                edit.field_buf.set("https://typed.example.invalid/v1");
+                providers_page(ProvidersPage::Edit(edit))
             }
             "mcp-add" => mcp_page(McpPage::Add(Box::new(mcp_page::AddState::golden_fixture()))),
             "oauth-flow" => providers_page(ProvidersPage::OAuthSetup {
@@ -7899,6 +7915,11 @@ impl SettingsDialog {
             .downcast_mut::<dependencies_page::DependenciesPage>()
         {
             page.tick();
+        }
+        if let Some(ProvidersPage::Add(state)) = self.page.downcast_mut::<ProvidersPage>()
+            && let Some(screen) = state.verify.as_mut()
+        {
+            screen.tick();
         }
         let pending = self
             .page
@@ -8679,9 +8700,10 @@ impl SettingsDialog {
                 "Back to config picker",
             );
         }
-        let section = crate::tui::chrome::rounded_block(" Options ", false);
-        let section_inner = section.inner(layout[1]);
-        frame.render_widget(section, layout[1]);
+        // The dialog itself already owns the settings border.  Pages that
+        // need a subsection render their own rounded block; wrapping every
+        // page in a second generic “Options” frame produced nested chrome.
+        let section_inner = layout[1];
         self.page
             .render_with_links(&self.cx, frame, section_inner, links);
         #[cfg(test)]

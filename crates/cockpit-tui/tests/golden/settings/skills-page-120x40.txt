@@ -1,40 +1,40 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Skills ─────────────────────────╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││Skills                                                                            ││ │
- SESSIONS                       ││                                                                                  ││ │
- no active sessions in all pr   ││Scan dirs hold `<name>/SKILL.md` skills. Entries support `~`, `$VAR`, and relativ ││ │
-                                ││ paths. The list ships pre-seeded (~/.agents/skills + ./.agents/skills); an empty ││ │
-                              no││list scans nothing. Ancestor walk extends relative entries to every dir up to the ││ │
-                              ┊ ││git root.                                                                         ││ │
-                              ▌ ││                                                                                  ││ │
-                                ││› ▢ auto-! commands  Codex mode (default — inject !`command` verbatim; never runs ││ █
-                                ││  ▢ ancestor walk    off (default — relative entries resolve against cwd only)    ││ █
-                                ││                                                                                  ││ █
-                                ││scan directories                                                                  ││ █
-                                ││  [+ add directory]                                                               ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                               ⋯││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+  + New session               ▌R│Skills                                                                              │ │
+                              ▌ │                                                                                    │ │
+ SESSIONS                       │Scan dirs hold `<name>/SKILL.md` skills. Entries support `~`, `$VAR`, and relative  │ │
+ no active sessions in all pr   │aths. The list ships pre-seeded (~/.agents/skills + ./.agents/skills); an empty lis │ │
+                                │ scans nothing. Ancestor walk extends relative entries to every dir up to the git r │ │
+                              no│ot.                                                                                 │ │
+                              ┊ │                                                                                    │ │
+                              ▌ │› ▢ auto-! commands  Codex mode (default — inject !`command` verbatim; never runs)  │ │
+                                │  ▢ ancestor walk    off (default — relative entries resolve against cwd only)      │ █
+                                │                                                                                    │ █
+                                │scan directories                                                                    │ █
+                                │  [+ add directory]                                                                 │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                               ⋯│                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: togg [ reset to defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

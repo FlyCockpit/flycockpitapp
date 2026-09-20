@@ -1854,8 +1854,6 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     Some((SidecarAction::SetMode(choice), can_mutate, mutate_reason)),
                 ));
             }
-            rows.push(selection_save_row(page, can_mutate, mutate_reason));
-            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
         }
         SidecarPageKind::DefaultEditor => {
             let models = page.session.form.selectable_models();
@@ -1901,8 +1899,6 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                     None,
                 ));
             }
-            rows.push(selection_save_row(page, can_mutate, mutate_reason));
-            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
         }
         SidecarPageKind::OverrideEditor => {
             let models = page.session.form.selectable_models();
@@ -1924,8 +1920,6 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
                 "[clear override]".into(),
                 Some((SidecarAction::ClearOverride, can_mutate, mutate_reason)),
             ));
-            rows.push(selection_save_row(page, can_mutate, mutate_reason));
-            rows.push(("[Cancel]".into(), Some((SidecarAction::Cancel, true, None))));
         }
         SidecarPageKind::CentralPolicyEditor => {
             rows.push((page.session.effective_policy_line(), None));
@@ -2294,7 +2288,7 @@ fn selection_save_row(
         None
     };
     (
-        "[Save changes]".into(),
+        "Save changes".into(),
         Some((SidecarAction::SaveSelection, reason.is_none(), reason)),
     )
 }
@@ -2747,6 +2741,39 @@ impl SettingsPage for SidecarPage {
     }
 
     fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        if matches!(
+            self.kind,
+            SidecarPageKind::ModeEditor
+                | SidecarPageKind::DefaultEditor
+                | SidecarPageKind::OverrideEditor
+        ) {
+            let can_mutate =
+                self.session.authoritative_mutations && self.session.principal.can_mutate();
+            let mutate_reason = if self.session.authoritative_mutations {
+                self.session.principal.config_reason()
+            } else {
+                Some(REASON_AUTHORITATIVE_UNAVAILABLE)
+            };
+            let (label, binding) = selection_save_row(self, can_mutate, mutate_reason);
+            let (_, enabled, _) = binding.expect("selection editor always has a save action");
+            return super::shell::finish_help_row(
+                cx,
+                vec![
+                    super::shell::SettingsHelpAction {
+                        label: "Cancel",
+                        enabled: true,
+                        primary: false,
+                        action: SettingsPointerAction::Sidecar(SidecarAction::Cancel),
+                    },
+                    super::shell::SettingsHelpAction {
+                        label,
+                        enabled,
+                        primary: true,
+                        action: SettingsPointerAction::Sidecar(SidecarAction::SaveSelection),
+                    },
+                ],
+            );
+        }
         if self.kind != SidecarPageKind::CentralPolicyEditor {
             return super::shell::finish_help_row(cx, Vec::new());
         }

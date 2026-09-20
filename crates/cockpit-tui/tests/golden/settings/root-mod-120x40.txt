@@ -1,40 +1,40 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json ──────────────────────────────────╮e]
                               ──│[Close settings]                                                                    │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││› Default model for new sessions                                                  ││ │
- SESSIONS                       ││  Providers & Provider Models                                                     ││ │
- no active sessions in all pr   ││  Dependencies                                                                    ││ │
-                                ││  Agents                                                                          ││ │
-                              no││  Interface                                                                       ││ │
-                              ┊ ││  Behavior                                                                        ││ │
-                              ▌ ││  Privacy & Safety                                                                ││ │
-                                ││  Translation                                                                     ││ █
-                                ││  Tools                                                                           ││ █
-                                ││  Harnesses                                                                       ││ █
-                                ││  Skills                                                                          ││ █
-                                ││  Profile                                                                         ││ █
-                                ││  MCP                                                                             ││ █
-                                ││  LSP                                                                             ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││Default model for newly created sessions in the current configuration context.    ││ █
-                                ││Does not change the model of an already-running session.                          ││ █
-                                ││                                                                                  ││ █
-                                ││Guidance fixture: project instructions enabled.                                   ││ █
-                                ││Redaction fixture: secrets remain protected.                                      ││ █
-                                ││                                                                                  ││ █
-                               ⋯││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+  + New session               ▌R│› Default model for new sessions                                                    │ │
+                              ▌ │  Providers & Provider Models                                                       │ │
+ SESSIONS                       │  Dependencies                                                                      │ │
+ no active sessions in all pr   │  Agents                                                                            │ │
+                                │  Interface                                                                         │ │
+                              no│  Behavior                                                                          │ │
+                              ┊ │  Privacy & Safety                                                                  │ │
+                              ▌ │  Translation                                                                       │ │
+                                │  Tools                                                                             │ █
+                                │  Harnesses                                                                         │ █
+                                │  Skills                                                                            │ █
+                                │  Profile                                                                           │ █
+                                │  MCP                                                                               │ █
+                                │  LSP                                                                               │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                                │Default model for newly created sessions in the current configuration context. Does │ █
+                                │not change the model of an already-running session.                                 │ █
+                                │                                                                                    │ █
+                                │Guidance fixture: project instructions enabled.                                     │ █
+                                │Redaction fixture: secrets remain protected.                                        │ █
+                               ⋯│                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: open  esc/q: close        │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

@@ -567,6 +567,8 @@ pub(super) enum ProvidersAction {
     Delete(ProviderId, ProviderDeleteChoice),
     SaveProvider(ProviderId),
     LocalBack,
+    RetryVerification,
+    ContinueVerificationOffline,
     AddModel(ProviderId),
     RenameModel(ProviderId, ModelId),
     DeleteModel(ProviderId, ModelId),

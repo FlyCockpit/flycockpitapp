@@ -170,6 +170,8 @@ fixture_enum!(ProvidersFixture {
     DeleteCancel,
     SaveProvider,
     LocalBack,
+    RetryVerification,
+    ContinueVerificationOffline,
     AddModel,
     RenameModel,
     DeleteModel,
@@ -526,6 +528,8 @@ pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWiza
             | ProviderWizardStep::Fetching => false,
             #[cfg(not(feature = "grok-subscription"))]
             ProviderWizardStep::GrokOAuth => false,
+            #[cfg(feature = "grok-subscription")]
+            ProviderWizardStep::GrokOAuth => true,
             ProviderWizardStep::Template
             | ProviderWizardStep::WireApi
             | ProviderWizardStep::ProviderId
@@ -535,7 +539,6 @@ pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWiza
             | ProviderWizardStep::ApiKey
             | ProviderWizardStep::EnvVar
             | ProviderWizardStep::CopilotAuth
-            | ProviderWizardStep::GrokOAuth
             | ProviderWizardStep::CodexOAuth
             | ProviderWizardStep::Done => true,
         })
@@ -1109,7 +1112,12 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         {
             ProvidersFixture::WizardAuthCopyDetectedEnv
         }
-        ProviderWizardStep::ApiKey if matches!(control, WizardControlKind::Continue) => {
+        ProviderWizardStep::ApiKey
+            if matches!(
+                control,
+                WizardControlKind::Continue | WizardControlKind::EditText
+            ) =>
+        {
             ProvidersFixture::WizardApiKeyEdit
         }
         ProviderWizardStep::EnvVar if matches!(control, WizardControlKind::EditText) => {
@@ -1197,6 +1205,10 @@ fn provider_key(action: &ProvidersAction) -> ProvidersFixture {
         ProvidersAction::Delete(_, ProviderDeleteChoice::Cancel) => ProvidersFixture::DeleteCancel,
         ProvidersAction::SaveProvider(_) => ProvidersFixture::SaveProvider,
         ProvidersAction::LocalBack => ProvidersFixture::LocalBack,
+        ProvidersAction::RetryVerification => ProvidersFixture::RetryVerification,
+        ProvidersAction::ContinueVerificationOffline => {
+            ProvidersFixture::ContinueVerificationOffline
+        }
         ProvidersAction::AddModel(_) => ProvidersFixture::AddModel,
         ProvidersAction::RenameModel(_, _) => ProvidersFixture::RenameModel,
         ProvidersAction::DeleteModel(_, _) => ProvidersFixture::DeleteModel,

@@ -1,40 +1,40 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Behavior › Instructions Files ──╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││Instructions Files                                                                ││ │
- SESSIONS                       ││                                                                                  ││ │
- no active sessions in all pr   ││Only the first matching file (in this order) is injected into prompts. Walks up f ││ │
-                                ││om cwd to the git root.                                                           ││ │
-                              no││                                                                                  ││ │
-                              ┊ ││› AGENTS.md                                                                       ││ │
-                              ▌ ││    [Delete AGENTS.md]                                                            ││ │
-                                ││  [+ add filename]                                                                ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                               ⋯││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+  + New session               ▌R│Instructions Files                                                                  │ │
+                              ▌ │                                                                                    │ │
+ SESSIONS                       │Only the first matching file (in this order) is injected into prompts. Walks up fro │ │
+ no active sessions in all pr   │ cwd to the git root.                                                               │ │
+                                │                                                                                    │ │
+                              no│› AGENTS.md                                                                         │ │
+                              ┊ │    [Delete AGENTS.md]                                                              │ │
+                              ▌ │  [+ add filename]                                                                  │ │
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                               ⋯│                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  a: add  enter: grab to rename/re │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

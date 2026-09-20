@@ -369,6 +369,26 @@ impl SettingsPage for LspPage {
 
     fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
         use super::pointer_actions::{LspAction, SettingsPointerAction};
+        if let Some(edit) = self.editing {
+            let edit = pointer_edit(edit);
+            return super::shell::finish_help_row(
+                _cx,
+                vec![
+                    super::shell::SettingsHelpAction {
+                        label: "Cancel",
+                        enabled: true,
+                        primary: false,
+                        action: SettingsPointerAction::Lsp(LspAction::CancelEdit(edit)),
+                    },
+                    super::shell::SettingsHelpAction {
+                        label: "Save",
+                        enabled: true,
+                        primary: true,
+                        action: SettingsPointerAction::Lsp(LspAction::SaveEdit(edit)),
+                    },
+                ],
+            );
+        }
         let label = if self.reset.is_pending() {
             "confirm reset"
         } else {
@@ -577,7 +597,6 @@ fn lsp_edit_row<T: ToString>(
             Span::styled(before.to_string(), muted_style()),
             shell::cursor_marker_span(),
             Span::styled(after.to_string(), muted_style()),
-            Span::styled("  [cancel]", muted_style()),
         ])
     } else {
         lsp_row(idx, p.cursor, label, value.to_string())
@@ -670,20 +689,16 @@ impl SettingsCx {
                 LspRow::AutoInstall => Some(PointerLspAction::CycleAutoInstall),
                 LspRow::Diagnostics => Some(PointerLspAction::ToggleDiagnostics),
                 LspRow::OtherFilesLimit => {
-                    Some(lsp_edit_pointer_action(p, PointerLspEdit::OtherFilesLimit))
+                    lsp_edit_pointer_action(p, PointerLspEdit::OtherFilesLimit)
                 }
-                LspRow::PerFileLimit => {
-                    Some(lsp_edit_pointer_action(p, PointerLspEdit::PerFileLimit))
+                LspRow::PerFileLimit => lsp_edit_pointer_action(p, PointerLspEdit::PerFileLimit),
+                LspRow::DebounceMs => lsp_edit_pointer_action(p, PointerLspEdit::DebounceMs),
+                LspRow::DocumentTimeoutMs => {
+                    lsp_edit_pointer_action(p, PointerLspEdit::DocumentTimeoutMs)
                 }
-                LspRow::DebounceMs => Some(lsp_edit_pointer_action(p, PointerLspEdit::DebounceMs)),
-                LspRow::DocumentTimeoutMs => Some(lsp_edit_pointer_action(
-                    p,
-                    PointerLspEdit::DocumentTimeoutMs,
-                )),
-                LspRow::WorkspaceTimeoutMs => Some(lsp_edit_pointer_action(
-                    p,
-                    PointerLspEdit::WorkspaceTimeoutMs,
-                )),
+                LspRow::WorkspaceTimeoutMs => {
+                    lsp_edit_pointer_action(p, PointerLspEdit::WorkspaceTimeoutMs)
+                }
                 // The unavailable sentinel is explanatory text, not an
                 // enabled Check control. A real project source below supplies
                 // stable server identities and actionable controls.
@@ -706,31 +721,6 @@ impl SettingsCx {
             (&self.pointer_surface, shell::SettingsScrollRegionId("lsp")).into(),
         );
         let offset = self.scroll_states.offset_for("lsp");
-        if let Some(edit) = p.editing {
-            let line = lsp_selected_line_for_cursor(row_index(lsp_row_for_edit(edit)));
-            if let Some(screen_row) = line.checked_sub(offset)
-                && screen_row < usize::from(area.height)
-            {
-                // The overlay owns the complete rendered `  [cancel]` span,
-                // beginning immediately after marker + label + draft + caret.
-                let cancel_x = 27usize.saturating_add(p.buf.text().chars().count());
-                if cancel_x < usize::from(area.width) {
-                    self.pointer_surface.register(shell::SettingsPointerTarget {
-                        rect: Rect::new(
-                            area.x.saturating_add(cancel_x as u16),
-                            area.y.saturating_add(screen_row as u16),
-                            10.min(area.width.saturating_sub(cancel_x as u16)),
-                            1,
-                        ),
-                        action: shell::SettingsPointerAction::Page(SettingsPointerAction::Lsp(
-                            PointerLspAction::CancelEdit(pointer_edit(edit)),
-                        )),
-                        enabled: true,
-                        disabled_reason: None,
-                    });
-                }
-            }
-        }
         let server_count = row_count.saturating_sub(LSP_SERVER_ROW_START);
         for server_idx in 0..server_count {
             let Some(server) = servers.as_ref().and_then(|items| items.get(server_idx)) else {
@@ -781,11 +771,11 @@ impl SettingsCx {
     }
 }
 
-fn lsp_edit_pointer_action(p: &LspPage, edit: PointerLspEdit) -> PointerLspAction {
-    if p.editing.map(pointer_edit) == Some(edit) {
-        PointerLspAction::SaveEdit(edit)
+fn lsp_edit_pointer_action(p: &LspPage, edit: PointerLspEdit) -> Option<PointerLspAction> {
+    if p.editing.is_some() {
+        None
     } else {
-        PointerLspAction::Edit(edit)
+        Some(PointerLspAction::Edit(edit))
     }
 }
 

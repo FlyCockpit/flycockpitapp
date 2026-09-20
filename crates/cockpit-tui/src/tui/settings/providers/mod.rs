@@ -987,7 +987,8 @@ pub(super) struct AddState {
     /// matches a catalog already persisted for this provider.
     fallback_offer: Option<FallbackOffer>,
     fallback_commit_pending: bool,
-    validation_failure: Option<String>,
+    pub(super) validation_failure: Option<String>,
+    pub(super) verify: Option<Box<crate::tui::onboarding::VerifyScreen>>,
 }
 
 struct FallbackOffer;
@@ -1038,6 +1039,7 @@ impl AddState {
             fallback_offer: None,
             fallback_commit_pending: false,
             validation_failure: None,
+            verify: None,
         };
         state.restore_non_secret_inputs();
         state
@@ -1175,6 +1177,7 @@ impl SettingsDialog {
         provider_id: &str,
         result: Result<FetchOutcome, String>,
     ) {
+        let unsupported = matches!(&result, Ok(FetchOutcome::Unsupported));
         let referenced_environment = self
             .config
             .providers
@@ -1376,8 +1379,32 @@ impl SettingsDialog {
                     s.fetch = None;
                     s.fallback_commit_pending = false;
                     s.fallback_offer = fallback_offer;
-                    if validation_failure.is_some() {
-                        s.validation_failure = validation_failure;
+                    if let Some(reason) = validation_failure {
+                        s.validation_failure = Some(reason.clone());
+                        if let Some(screen) = s.verify.as_mut() {
+                            screen.apply(
+                                crate::tui::onboarding::VerifyOutcome::Network(reason),
+                                None,
+                            );
+                        }
+                    } else if live_validation_succeeded {
+                        if let Some(screen) = s.verify.as_mut() {
+                            if unsupported {
+                                screen
+                                    .apply(crate::tui::onboarding::VerifyOutcome::NoEndpoint, None);
+                            } else {
+                                let models = refreshed
+                                    .as_ref()
+                                    .map(|(models, _, _)| {
+                                        models.iter().map(|model| model.id.clone()).collect()
+                                    })
+                                    .unwrap_or_default();
+                                screen.apply(
+                                    crate::tui::onboarding::VerifyOutcome::Models(models),
+                                    None,
+                                );
+                            }
+                        }
                     }
                     if s.is_step("fetching") {
                         let _ = s.run.submit(WizardAnswer::Acknowledged);
@@ -1717,6 +1744,9 @@ impl SettingsCx {
             }
         };
         s.saved_provider_id = Some(id.clone());
+        s.verify = Some(Box::new(crate::tui::onboarding::VerifyScreen::new(
+            id.clone(),
+        )));
         let notice = self.last_secret_notice.take();
         if s.is_step("test-key") && entry.last_model_fetch.is_some() {
             let _ = s.run.submit(WizardAnswer::Acknowledged);
@@ -2141,6 +2171,9 @@ impl SettingsCx {
                     };
                     s.fallback_offer = None;
                     s.validation_failure = None;
+                    if let Some(screen) = s.verify.as_mut() {
+                        screen.retry();
+                    }
                     s.error = Some("Retrying live provider validation…".into());
                     s.fetch = Some(FetchHandle::spawn(
                         self.lifecycle.clone(),
@@ -3558,47 +3591,15 @@ impl SettingsCx {
         frame: &mut Frame,
         area: Rect,
         s: &CopilotSetupState,
-        provider_id: &str,
+        _provider_id: &str,
     ) {
         let mut lines = oauth_setup_lines(OAuthFlowView::Copilot(s), OAuthHost::Standalone);
-        let mut controls = Vec::new();
-        let copilot_id = || super::pointer_actions::ProviderId(provider_id.into());
-        let provider_action =
-            |action| super::pointer_actions::SettingsPointerAction::Providers(action);
+        let controls: Vec<(usize, super::pointer_actions::SettingsPointerAction)> = Vec::new();
         lines.push(Line::default());
-        if s.outcome.is_some() {
-            controls.push((
-                lines.len(),
-                provider_action(super::pointer_actions::ProvidersAction::CopilotConfirm(
-                    copilot_id(),
-                    super::pointer_actions::ConfirmationChoice::Confirm,
-                )),
-            ));
-            lines.push(Line::from("[Continue]"));
-        } else if s.shell.is_some() && s.rc_path.is_some() && !s.already_configured {
-            controls.push((
-                lines.len(),
-                provider_action(super::pointer_actions::ProvidersAction::CopilotConfirm(
-                    copilot_id(),
-                    super::pointer_actions::ConfirmationChoice::Confirm,
-                )),
-            ));
-            lines.push(Line::from("[Set up Copilot auth]"));
-            controls.push((
-                lines.len(),
-                provider_action(super::pointer_actions::ProvidersAction::CopilotConfirm(
-                    copilot_id(),
-                    super::pointer_actions::ConfirmationChoice::Cancel,
-                )),
-            ));
-            lines.push(Line::from("[Cancel]"));
-        } else {
-            controls.push((
-                lines.len(),
-                provider_action(super::pointer_actions::ProvidersAction::LocalBack),
-            ));
-            lines.push(Line::from("[Back]"));
-        }
+        lines.push(Line::from(Span::styled(
+            "Use the action bar to continue, apply Copilot authentication, or go back.",
+            Style::default().fg(resolve_color(FOG, FOG_INDEX)),
+        )));
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,
@@ -3942,17 +3943,6 @@ impl SettingsCx {
                     OAuthFlowView::Copilot(state),
                     OAuthHost::AddWizard,
                 );
-                controls.push((lines.len(), 0));
-                let primary_label = if state.outcome.is_none()
-                    && state.shell.is_some()
-                    && state.rc_path.is_some()
-                    && !state.already_configured
-                {
-                    "[Set up Copilot auth]"
-                } else {
-                    "[Continue]"
-                };
-                lines.push(Line::from(primary_label));
                 lines.push(Line::default());
                 lines.push(Line::from(Span::styled(
                     "After this step we'll fetch the model list automatically. \
@@ -3982,11 +3972,11 @@ impl SettingsCx {
                     OAuthHost::AddWizard,
                 ));
             }
-            Some("saving" | "fetching" | "test-key") => {
+            Some("saving" | "fetching" | "test-key" | "done") => {
                 self.render_add_verify_step(frame, area, s);
                 return;
             }
-            Some("done") | None => {
+            None => {
                 lines.push(Line::from(Span::styled(
                     "Done.".to_string(),
                     Style::default().add_modifier(Modifier::BOLD),
@@ -4058,7 +4048,7 @@ impl SettingsCx {
             {
                 frame.set_cursor_position(caret);
             }
-            if let Some(action) = provider_add_pointer_action(s, 0) {
+            if let Some(action) = provider_add_field_pointer_action(s) {
                 self.pointer_surface
                     .register(super::shell::SettingsPointerTarget {
                         rect,
@@ -4082,24 +4072,12 @@ impl SettingsCx {
     }
 
     fn render_add_verify_step(&self, frame: &mut Frame, area: Rect, s: &AddState) {
-        use crate::tui::onboarding::{VerifyOutcome, VerifyPhase, VerifyScreen};
+        use crate::tui::onboarding::VerifyPhase;
         use ratatui::layout::{Constraint, Layout};
 
-        let provider_id = s
-            .saved_provider_id
-            .as_deref()
-            .unwrap_or(s.id_field.text())
-            .to_string();
-        let mut screen = VerifyScreen::new(provider_id);
-        if s.fetch.is_none() {
-            if s.is_step("test-key")
-                && let Some(reason) = &s.validation_failure
-            {
-                screen.apply(VerifyOutcome::Network(reason.clone()), None);
-            } else if s.is_step("done") {
-                screen.apply(VerifyOutcome::NoEndpoint, None);
-            }
-        }
+        let Some(screen) = s.verify.as_deref() else {
+            return;
+        };
         let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let title_color = match screen.phase() {
             VerifyPhase::Success(_) | VerifyPhase::NoEndpoint => {
@@ -4136,7 +4114,7 @@ impl SettingsCx {
         let t = s.template.expect("template chosen");
         let mut screen = crate::tui::onboarding::AuthScreen::new(t);
         let field_rect = screen.render_api_key_external(frame, area, s.api_key_field.as_ref());
-        if let Some(action) = provider_add_pointer_action(s, 0) {
+        if let Some(action) = provider_add_field_pointer_action(s) {
             self.pointer_surface
                 .register(super::shell::SettingsPointerTarget {
                     rect: field_rect,
@@ -4304,18 +4282,14 @@ impl SettingsCx {
             }
         }
 
+        let mut edit_field_line = None;
         if let Some(field) = s.editing_field {
-            let prompt = match field {
-                EditField::Url => "URL: ",
+            let title = match field {
+                EditField::Url => "URL",
             };
             lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::styled(prompt.to_string(), muted),
-                Span::styled(
-                    s.field_buf.text().to_string(),
-                    Style::default().fg(resolve_color(INK, INK_INDEX)),
-                ),
-            ]));
+            edit_field_line = Some((lines.len(), title));
+            lines.extend([Line::default(), Line::default(), Line::default()]);
         }
 
         if let Some(status) = &s.status {
@@ -4342,6 +4316,28 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, title)) = edit_field_line {
+            let offset = self.scroll_states.offset_for("providers:edit");
+            let y = area.y.saturating_add(line.saturating_sub(offset) as u16);
+            if line >= offset && y < area.bottom() {
+                let rect = Rect::new(
+                    area.x,
+                    y,
+                    area.width,
+                    3.min(area.bottom().saturating_sub(y)),
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    title,
+                    &s.field_buf,
+                    true,
+                    "https://api.example.com/v1",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+            }
+        }
     }
 
     /// Full-pane render for the Headers sub-page. The header rows are
@@ -5691,6 +5687,23 @@ fn provider_add_pointer_action(
     ))
 }
 
+fn provider_add_field_pointer_action(
+    state: &AddState,
+) -> Option<super::pointer_actions::SettingsPointerAction> {
+    use super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+    let step = state.run.current_provider_step()?;
+    matches!(
+        step,
+        super::pointer_actions::WizardStepId::ProviderId
+            | super::pointer_actions::WizardStepId::Url
+            | super::pointer_actions::WizardStepId::ApiKey
+            | super::pointer_actions::WizardStepId::EnvVar
+    )
+    .then_some(SettingsPointerAction::Providers(
+        ProvidersAction::WizardControl(step, WizardControlId::EditText),
+    ))
+}
+
 #[cfg(test)]
 pub(super) mod tests;
 
@@ -5752,6 +5765,38 @@ impl SettingsPage for ProvidersPage {
         else {
             return Nav::Stay;
         };
+        if matches!(self, ProvidersPage::Add(_)) {
+            match &provider_action {
+                super::pointer_actions::ProvidersAction::LocalBack => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::WizardControl(
+                    super::pointer_actions::WizardStepId::ApiKey,
+                    super::pointer_actions::WizardControlId::Continue,
+                ) => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::RetryVerification => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::ContinueVerificationOffline => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                _ => {}
+            }
+        }
         if let super::pointer_actions::ProvidersAction::Delete(id, choice) = provider_action {
             let pending_matches = match self {
                 ProvidersPage::List {
@@ -6372,6 +6417,20 @@ impl SettingsPage for ProvidersPage {
             return Nav::Stay;
         }
         if let ProvidersPage::Add(state) = self {
+            if matches!(
+                &action,
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::LocalBack
+                        | super::pointer_actions::ProvidersAction::WizardControl(
+                            super::pointer_actions::WizardStepId::ApiKey,
+                            super::pointer_actions::WizardControlId::Continue,
+                        )
+                        | super::pointer_actions::ProvidersAction::RetryVerification
+                        | super::pointer_actions::ProvidersAction::ContinueVerificationOffline
+                )
+            ) {
+                return self.handle_pointer_control(cx, action);
+            }
             let (label, field): (&str, &mut TextField) = match state.run.current_step_id() {
                 Some("id") => ("id", &mut state.id_field),
                 Some("url") => ("url", &mut state.url_field),
@@ -6639,7 +6698,9 @@ impl SettingsPage for ProvidersPage {
                         oauth_help_legend(OAuthHost::AddWizard, state)
                     }
                 },
-                Some("test-key") if s.fetch.is_none() => "o: continue offline  esc: cancel",
+                Some("test-key") if s.fetch.is_none() => {
+                    "r: retry  o: continue offline  esc: cancel"
+                }
                 Some("saving" | "fetching" | "test-key") => "(in progress)  esc: cancel",
                 Some("done") | None => "enter: back to list",
                 Some(_) => "esc: cancel",
@@ -6726,7 +6787,7 @@ impl SettingsPage for ProvidersPage {
                     action: SettingsPointerAction::Providers(ProvidersAction::LocalBack),
                 });
             }
-            ProvidersPage::Add(s) if s.is_step("done") => {
+            ProvidersPage::Add(s) if s.is_step("done") && s.verify.is_none() => {
                 actions.push(super::shell::SettingsHelpAction {
                     label: "Continue",
                     enabled: true,
@@ -6736,6 +6797,45 @@ impl SettingsPage for ProvidersPage {
                         WizardControlId::DoneContinue,
                     )),
                 });
+            }
+            ProvidersPage::Add(s)
+                if matches!(s.run.current_step_id(), Some("test-key" | "done")) =>
+            {
+                if let Some(screen) = s.verify.as_deref() {
+                    for button in screen.buttons() {
+                        let action = match button.label {
+                            "Retry" => {
+                                SettingsPointerAction::Providers(ProvidersAction::RetryVerification)
+                            }
+                            "Done" => {
+                                SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                                    WizardStepId::Done,
+                                    WizardControlId::DoneContinue,
+                                ))
+                            }
+                            "Add another" => {
+                                SettingsPointerAction::Providers(ProvidersAction::LocalBack)
+                            }
+                            _ => continue,
+                        };
+                        actions.push(super::shell::SettingsHelpAction {
+                            label: button.label,
+                            enabled: button.enabled,
+                            primary: button.primary,
+                            action,
+                        });
+                    }
+                    if s.fallback_offer.is_some() {
+                        actions.push(super::shell::SettingsHelpAction {
+                            label: "Continue offline",
+                            enabled: true,
+                            primary: false,
+                            action: SettingsPointerAction::Providers(
+                                ProvidersAction::ContinueVerificationOffline,
+                            ),
+                        });
+                    }
+                }
             }
             ProvidersPage::Add(s)
                 if s.is_step("headers") && s.headers.show_continue && !s.headers.is_editing() =>
@@ -6749,6 +6849,54 @@ impl SettingsPage for ProvidersPage {
                         WizardControlId::ContinueHeaders,
                     )),
                 });
+            }
+            ProvidersPage::Add(s) if s.is_step("copilot-auth") => {
+                let state = s.copilot_auth.as_ref().expect("Copilot auth state");
+                actions.push(super::shell::SettingsHelpAction {
+                    label: if state.outcome.is_none()
+                        && state.shell.is_some()
+                        && state.rc_path.is_some()
+                        && !state.already_configured
+                    {
+                        "Set up Copilot auth"
+                    } else {
+                        "Continue"
+                    },
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::CopilotAuth,
+                        WizardControlId::CopilotContinue,
+                    )),
+                });
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+                });
+            }
+            ProvidersPage::Add(s)
+                if matches!(s.run.current_step_id(), Some("grok-oauth" | "codex-oauth")) =>
+            {
+                let state = s.oauth_auth.as_ref().expect("OAuth state");
+                let step = s.run.current_provider_step().expect("OAuth wizard step");
+                for option in oauth_options(state, OAuthHost::AddWizard) {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: option.label(),
+                        enabled: true,
+                        primary: matches!(
+                            option,
+                            OAuthOption::Acknowledge
+                                | OAuthOption::Continue
+                                | OAuthOption::SkipContinue
+                        ),
+                        action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                            step,
+                            WizardControlId::OAuth(option),
+                        )),
+                    });
+                }
             }
             ProvidersPage::Edit(s) if s.editing_field.is_some() => {
                 let id = ProviderId(s.provider_id.clone());
@@ -6816,6 +6964,55 @@ impl SettingsPage for ProvidersPage {
                         ProviderRowEditorAction::ModelSave,
                     )),
                 });
+            }
+            ProvidersPage::CopilotSetup { state, parent } => {
+                if state.outcome.is_some()
+                    || (state.shell.is_some()
+                        && state.rc_path.is_some()
+                        && !state.already_configured)
+                {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: if state.outcome.is_some() {
+                            "Continue"
+                        } else {
+                            "Set up Copilot auth"
+                        },
+                        enabled: true,
+                        primary: true,
+                        action: SettingsPointerAction::Providers(ProvidersAction::CopilotConfirm(
+                            ProviderId(parent.provider_id.clone()),
+                            super::pointer_actions::ConfirmationChoice::Confirm,
+                        )),
+                    });
+                }
+                actions.push(super::shell::SettingsHelpAction {
+                    label: if state.outcome.is_some() {
+                        "Back"
+                    } else {
+                        "Cancel"
+                    },
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+                });
+            }
+            ProvidersPage::OAuthSetup { state, parent } => {
+                for option in oauth_options(state, OAuthHost::Standalone) {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: option.label(),
+                        enabled: true,
+                        primary: matches!(
+                            option,
+                            OAuthOption::Acknowledge
+                                | OAuthOption::Continue
+                                | OAuthOption::SkipContinue
+                        ),
+                        action: SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
+                            ProviderId(parent.provider_id.clone()),
+                            option,
+                        )),
+                    });
+                }
             }
             _ => {}
         }

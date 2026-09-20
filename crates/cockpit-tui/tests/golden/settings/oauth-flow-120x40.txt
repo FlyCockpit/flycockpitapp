@@ -1,40 +1,40 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models › Co╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││Set up Codex subscription auth                                                    ││ │
- SESSIONS                       ││                                                                                  ││ │
- no active sessions in all pr   ││Status: not logged in                                                             ││ │
-                                ││Uses your ChatGPT Plus/Pro subscription quota via OpenAI's documented Codex agent ││ │
-                              no││login.                                                                            ││ │
-                              ┊ ││Separate from the Codex CLI credential store; re-login if CLI use causes refresh- ││ │
-                              ▌ ││oken contention.                                                                  ││ │
-                                ││                                                                                  ││ █
-                                ││Using subscription credentials from this third-party client may violate the provi ││ █
-                                ││er terms of service and may result in account suspension.                         ││ █
-                                ││                                                                                  ││ █
-                                ││Choose [I acknowledge the risk] to start subscription OAuth.                      ││ █
-                                ││                                                                                  ││ █
-                                ││› [I acknowledge the risk]                                                        ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                               ⋯││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  enter: acknowledge  esc: back                       │ █
+  + New session               ▌R│Set up Codex subscription auth                                                      │ │
+                              ▌ │                                                                                    │ │
+ SESSIONS                       │Status: not logged in                                                               │ │
+ no active sessions in all pr   │Uses your ChatGPT Plus/Pro subscription quota via OpenAI's documented Codex agent l │ │
+                                │gin.                                                                                │ │
+                              no│Separate from the Codex CLI credential store; re-login if CLI use causes refresh-to │ │
+                              ┊ │en contention.                                                                      │ │
+                              ▌ │                                                                                    │ │
+                                │Using subscription credentials from this third-party client may violate the provide │ █
+                                │ terms of service and may result in account suspension.                             │ █
+                                │                                                                                    │ █
+                                │Choose [I acknowledge the risk] to start subscription OAuth.                        │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                               ⋯│                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  enter: acknowledge  esc:  [ I acknowledge the risk ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

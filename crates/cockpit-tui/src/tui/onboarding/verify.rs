@@ -113,7 +113,7 @@ impl VerifyScreen {
             VerifyPhase::Error(_) => "r retry   esc back   ^c quit",
         }
     }
-    pub(super) fn buttons(&self) -> Vec<chrome::Button<'static>> {
+    pub(crate) fn buttons(&self) -> Vec<chrome::Button<'static>> {
         match self.phase {
             VerifyPhase::Fetching => vec![],
             VerifyPhase::Success(_) | VerifyPhase::NoEndpoint => vec![

@@ -54,7 +54,7 @@ use super::shell::{
     SettingsPointerTarget, TextColumnLayout, heading_style, muted_style, push_label_value_row,
     push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
-use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelSelector};
+use super::ui_page::{InstructionsPage, PickerMode, RedactPatternsPage, UtilityModelSelector};
 use cockpit_proto::Request;
 
 use super::{Nav, SettingsCx, SettingsPage, save_status};
@@ -3994,7 +3994,7 @@ impl SettingsCx {
                     } else {
                         push_label_value_row(
                             &mut lines,
-                            settings_area.width,
+                            crate::tui::chrome::scrollbar_content(settings_area).width,
                             on_cursor,
                             id.descriptor().label,
                             label_w,
@@ -4605,7 +4605,11 @@ impl SettingsPage for CategoryPage {
     }
 
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
-        if self.utility_picker.is_some() {
+        if self
+            .utility_picker
+            .as_ref()
+            .is_some_and(|picker| matches!(picker.mode, PickerMode::Custom { .. }))
+        {
             "↑/↓  enter: select  esc: back / cancel"
         } else if self.is_editing() {
             "type to edit  enter: apply  esc: cancel"
@@ -4615,9 +4619,22 @@ impl SettingsPage for CategoryPage {
     }
 
     fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
-        use super::pointer_actions::{CategoryAction, SettingsPointerAction};
+        use super::pointer_actions::{CategoryAction, SettingsPointerAction, UtilityModelAction};
         let mut actions = Vec::new();
-        if let Some(id) = self.editing {
+        if self.utility_picker.is_some() {
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::UtilityModel(UtilityModelAction::CancelCustom),
+            });
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Save custom",
+                enabled: true,
+                primary: true,
+                action: SettingsPointerAction::UtilityModel(UtilityModelAction::CommitCustom),
+            });
+        } else if let Some(id) = self.editing {
             actions.push(super::shell::SettingsHelpAction {
                 label: "Save",
                 enabled: true,

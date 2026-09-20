@@ -632,30 +632,6 @@ impl SettingsCx {
                         muted,
                     )));
                 }
-                bindings.push((
-                    lines.len(),
-                    SettingsPointerAction::UtilityModel(UtilityModelAction::CommitCustom),
-                ));
-                lines.push(Line::from(Span::styled(
-                    if pointer_enabled {
-                        "[Save custom]"
-                    } else {
-                        "Save custom"
-                    },
-                    muted,
-                )));
-                bindings.push((
-                    lines.len(),
-                    SettingsPointerAction::UtilityModel(UtilityModelAction::CancelCustom),
-                ));
-                lines.push(Line::from(Span::styled(
-                    if pointer_enabled {
-                        "[Cancel]"
-                    } else {
-                        "Cancel"
-                    },
-                    muted,
-                )));
             }
             PickerMode::List { cursor, scroll } => {
                 let cur_label = |value: &str| -> &'static str {

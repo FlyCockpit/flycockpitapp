@@ -1298,7 +1298,9 @@ fn cycle_transport(t: Transport) -> Transport {
 impl AddState {
     #[cfg(test)]
     pub(super) fn golden_fixture() -> Self {
-        Self::new()
+        let mut state = Self::new();
+        state.name.set("fixture-mcp");
+        state
     }
 
     fn new() -> Self {

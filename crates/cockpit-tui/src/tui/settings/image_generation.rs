@@ -1194,10 +1194,6 @@ impl SettingsPage for EndpointEditorPage {
                     )),
                 ));
             }
-            rows.push((
-                "[Cancel]".into(),
-                Some((GenerationAction::Cancel, true, None)),
-            ));
         }
         render_generation_page(
             cx,
@@ -1214,6 +1210,17 @@ impl SettingsPage for EndpointEditorPage {
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
         "↑/↓: navigate  ctrl+s: save  h/esc: back"
+    }
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Generation(GenerationAction::Cancel),
+            }],
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1298,10 +1305,6 @@ impl SettingsPage for TargetEditorPage {
                 "[refresh health]".into(),
                 Some((GenerationAction::RefreshHealth, true, None)),
             ));
-            rows.push((
-                "[Cancel]".into(),
-                Some((GenerationAction::Cancel, true, None)),
-            ));
         }
         render_generation_page(
             cx,
@@ -1318,6 +1321,17 @@ impl SettingsPage for TargetEditorPage {
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
         "↑/↓: navigate  ctrl+s: save  h/esc: back"
+    }
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Generation(GenerationAction::Cancel),
+            }],
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1388,10 +1402,6 @@ impl SettingsPage for WorkflowEditorPage {
                     )),
                 ));
             }
-            rows.push((
-                "[Cancel]".into(),
-                Some((GenerationAction::Cancel, true, None)),
-            ));
         }
         render_generation_page(
             cx,
@@ -1408,6 +1418,17 @@ impl SettingsPage for WorkflowEditorPage {
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
         "↑/↓: navigate  ctrl+s: save  h/esc: back"
+    }
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Generation(GenerationAction::Cancel),
+            }],
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self

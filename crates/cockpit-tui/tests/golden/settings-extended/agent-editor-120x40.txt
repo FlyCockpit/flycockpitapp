@@ -1,39 +1,39 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Agents ─────────────────────────╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││╭editing fixture-agent───────────────────────────────────────────────────────────╮││ │
- SESSIONS                       │││ # Fixture agent                                                                │││ │
- no active sessions in all pr   │││                                                                                │││ │
-                                │││ Keep settings deterministic.                                                   │││ │
-                              no│││                                                                                │││ │
-                              ┊ │││                                                                                │││ │
-                              ▌ │││                                                                                │││ │
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                              ▌ │││                                                                                │││ █
-                              ▌ │││                                                                                │││ █
-                                │││                                                                                │││ █
-                              ▌ │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                               ⋯│││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││ plain  ctrl+s: save  ctrl+g: editor  enter: newline  esc: cancel               │││ █
-                                ││╰────────────────────────────────────────────────────────────────────────────────╯││ █
+  + New session               ▌R│╭editing fixture-agent─────────────────────────────────────────────────────────────╮│ │
+                              ▌ ││ # Fixture agent                                                                  ││ │
+ SESSIONS                       ││                                                                                  ││ │
+ no active sessions in all pr   ││ Keep settings deterministic.                                                     ││ │
+                                ││                                                                                  ││ │
+                              no││                                                                                  ││ │
+                              ┊ ││                                                                                  ││ │
+                              ▌ ││                                                                                  ││ │
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                               ⋯││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││ plain  ctrl+s: save  ctrl+g: editor  enter: newline  esc: cancel                 ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  editing agen [ Save ] [ Cancel ] [ Open in $EDITOR ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █

@@ -1,39 +1,39 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — Dependencies ───────────────────────────────────────────────────────────╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││╭ Dependencies ──────────────────────────────────────────────────────────────────╮││ │
- SESSIONS                       │││Selected features                                                               │││ │
- no active sessions in all pr   │││  computer.import [Unknown/Host]: unknown (not yet probed); Install ImageMagick │││ │
-                                │││`import` (or scrot) for computer-use screenshots. Fix: sudo apt-get install     │││ │
-                              no│││imagemagick                                                                     │││ │
-                              ┊ │││  computer.scrot [Unknown/Host]: unknown (not yet probed); Install scrot (or    │││ │
-                              ▌ │││ImageMagick `import`) for computer-use screenshots. Fix: sudo apt-get install   │││ │
-                                │││scrot                                                                           │││ █
-                                │││  computer.xdotool [Unknown/Host]: unknown (not yet probed); Install xdotool for│││ █
-                                │││Linux computer-use input automation. Fix: sudo apt-get install xdotool          │││ █
-                                │││  computer.xvfb [Unknown/Host]: unknown (not yet probed); Install Xvfb for the  │││ █
-                                │││Linux computer-use virtual display. Fix: sudo apt-get install xvfb              │││ █
-                                │││  harness.claude [Unknown/Host]: unknown (not yet probed); Install the Claude   │││ █
-                                │││Code CLI (`claude`) for the claude harness preset. Fix: Install `claude` and    │││ █
-                                │││ensure it is on PATH.                                                           │││ █
-                                │││  harness.codex [Unknown/Host]: unknown (not yet probed); Install the Codex CLI │││ █
-                                │││(`codex`) for the codex harness preset. Fix: Install `codex` and ensure it is on│││ █
-                                │││PATH.                                                                           │││ █
-                              ▌ │││  harness.gemini [Unknown/Host]: unknown (not yet probed); Install the Gemini   │││ █
-                              ▌ │││CLI (`gemini`) for the gemini harness preset. Fix: Install `gemini` and ensure  │││ █
-                                │││it is on PATH.                                                                  │││ █
-                              ▌ │││  harness.opencode [Unknown/Host]: unknown (not yet probed); Install OpenCode   │││ █
-                                │││(`opencode`) for the opencode harness preset. Fix: Install `opencode` and ensure│││ █
-                                │││it is on PATH.                                                                  │││ █
-                                │││  media.ffmpeg [Unknown/Host] required rule:ffmpeg-ffprobe-compatible-pair:     │││ █
-                                │││unknown (not yet probed); Install `ffmpeg` and ensure it is on PATH.            │││ █
-                                │││  media.ffprobe [Unknown/Host] required rule:ffmpeg-ffprobe-compatible-pair:    │││ █
-                                │││unknown (not yet probed); Install `ffprobe` and ensure it is on PATH.           │││ █
-                               ⋯│││  safety.bubblewrap [Unknown/Host]: unknown (not yet probed); Install Bubblewrap│││ █
-                                │││(`bwrap`) for the host shell sandbox. Fix: sudo apt-get install bubblewrap      │││ █
-                                │││  security.keyring [Unknown/Host]: unknown (not yet probed); Install a platform │││ █
-                                ││╰────────────────────────────────────────────────────────────────────────────────╯││ █
+  + New session               ▌R│╭ Dependencies ────────────────────────────────────────────────────────────────────╮│ │
+                              ▌ ││Selected features                                                                 ││ │
+ SESSIONS                       ││  computer.import [Unknown/Host]: unknown (not yet probed); Install ImageMagick   ││ │
+ no active sessions in all pr   ││`import` (or scrot) for computer-use screenshots. Fix: sudo apt-get install       ││ │
+                                ││imagemagick                                                                       ││ │
+                              no││  computer.scrot [Unknown/Host]: unknown (not yet probed); Install scrot (or      ││ │
+                              ┊ ││ImageMagick `import`) for computer-use screenshots. Fix: sudo apt-get install     ││ │
+                              ▌ ││scrot                                                                             ││ │
+                                ││  computer.xdotool [Unknown/Host]: unknown (not yet probed); Install xdotool for  ││ █
+                                ││Linux computer-use input automation. Fix: sudo apt-get install xdotool            ││ █
+                                ││  computer.xvfb [Unknown/Host]: unknown (not yet probed); Install Xvfb for the    ││ █
+                                ││Linux computer-use virtual display. Fix: sudo apt-get install xvfb                ││ █
+                                ││  harness.claude [Unknown/Host]: unknown (not yet probed); Install the Claude Code││ █
+                                ││CLI (`claude`) for the claude harness preset. Fix: Install `claude` and ensure it ││ █
+                                ││is on PATH.                                                                       ││ █
+                                ││  harness.codex [Unknown/Host]: unknown (not yet probed); Install the Codex CLI   ││ █
+                                ││(`codex`) for the codex harness preset. Fix: Install `codex` and ensure it is on  ││ █
+                                ││PATH.                                                                             ││ █
+                                ││  harness.gemini [Unknown/Host]: unknown (not yet probed); Install the Gemini CLI ││ █
+                              ▌ ││(`gemini`) for the gemini harness preset. Fix: Install `gemini` and ensure it is  ││ █
+                              ▌ ││on PATH.                                                                          ││ █
+                                ││  harness.opencode [Unknown/Host]: unknown (not yet probed); Install OpenCode     ││ █
+                              ▌ ││(`opencode`) for the opencode harness preset. Fix: Install `opencode` and ensure  ││ █
+                                ││it is on PATH.                                                                    ││ █
+                                ││  media.ffmpeg [Unknown/Host] required rule:ffmpeg-ffprobe-compatible-pair:       ││ █
+                                ││unknown (not yet probed); Install `ffmpeg` and ensure it is on PATH.              ││ █
+                                ││  media.ffprobe [Unknown/Host] required rule:ffmpeg-ffprobe-compatible-pair:      ││ █
+                                ││unknown (not yet probed); Install `ffprobe` and ensure it is on PATH.             ││ █
+                                ││  safety.bubblewrap [Unknown/Host]: unknown (not yet probed); Install Bubblewrap  ││ █
+                               ⋯││(`bwrap`) for the host shell sandbox. Fix: sudo apt-get install bubblewrap        ││ █
+                                ││  security.keyring [Unknown/Host]: unknown (not yet probed); Install a platform   ││ █
+                                ││keyring (Linux Secret Service, macOS Keychain, or Windows Credential Manager) and ││ █
+                                ││ensure a session bus is available. Fix: sudo apt-get install gnome-keyring        ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓: scroll  r: refresh  h/esc: back                │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █

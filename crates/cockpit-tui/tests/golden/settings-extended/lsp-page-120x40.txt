@@ -1,40 +1,40 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › LSP ────────────────────────────╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││› enabled                 on                                                      ││ │
- SESSIONS                       ││  auto install            ask                                                     ││ │
- no active sessions in all pr   ││  diagnostics             on                                                      ││ │
-                                ││  other files limit       5                                                       ││ │
-                              no││  per-file limit          20                                                      ││ │
-                              ┊ ││  severity                error (errors only)                                     ││ │
-                              ▌ ││  debounce ms             150                                                     ││ │
-                                ││  document timeout ms     5000                                                    ││ █
-                                ││  workspace timeout ms    10000                                                   ││ █
-                                ││  rust-analyzer           [Check] [Install] [Uninstall] [Restart]  installed; coc ││ █
-                                ││  typescript-language-server[Check] [Install] [Uninstall] [Restart]  missing; coc ││ █
-                                ││  pyright                 [Check] [Install] [Uninstall] [Restart]  missing; cockp ││ █
-                                ││  gopls                   [Check] [Install] [Uninstall] [Restart]  missing; cockp ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                               ⋯││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+  + New session               ▌R│› ▣ enabled               on                                                        │ │
+                              ▌ │  auto install            ask                                                       │ │
+ SESSIONS                       │  ▣ diagnostics           on                                                        │ │
+ no active sessions in all pr   │  other files limit       5                                                         │ │
+                                │  per-file limit          20                                                        │ │
+                              no│  severity                error (errors only)                                       │ │
+                              ┊ │  debounce ms             150                                                       │ │
+                              ▌ │  document timeout ms     5000                                                      │ │
+                                │  workspace timeout ms    10000                                                     │ █
+                                │  rust-analyzer           [Check] [Install] [Uninstall] [Restart]  installed; cockp │ █
+                                │  typescript-language-server[Check] [Install] [Uninstall] [Restart]  missing; cockp │ █
+                                │  pyright                 [Check] [Install] [Uninstall] [Restart]  missing; cockpit │ █
+                                │  gopls                   [Check] [Install] [Uninstall] [Restart]  missing; cockpit │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                               ⋯│                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: t [ restore LSP defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

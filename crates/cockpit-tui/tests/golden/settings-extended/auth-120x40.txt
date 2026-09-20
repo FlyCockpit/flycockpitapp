@@ -1,40 +1,40 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models › Ad╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││Add your API key                                                                  ││ │
- SESSIONS                       ││Paste a key for Anthropic (Claude API).                                           ││ │
- no active sessions in all pr   ││Template: Anthropic (Claude API)                                                  ││ │
-                                ││╭ API key ───────────────────────────────────────────────────────────────────────╮││ │
-                              no│││ Paste API key                                                                  │││ │
-                              ┊ ││╰────────────────────────────────────────────────────────────────────────────────╯││ │
-                              ▌ ││Hint: starts with sk-ant- · https://console.anthropic.com/settings/keys           ││ │
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                               ⋯││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                                ││                                                                                  ││ █
-                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+  + New session               ▌R│Add your API key                                                                    │ │
+                              ▌ │Paste a key for Anthropic (Claude API).                                             │ │
+ SESSIONS                       │Template: Anthropic (Claude API)                                                    │ │
+ no active sessions in all pr   │╭ API key ─────────────────────────────────────────────────────────────────────────╮│ │
+                                ││ •••••••••••••••                                                                  ││ │
+                              no│╰──────────────────────────────────────────────────────────────────────────────────╯│ │
+                              ┊ │Hint: starts with sk-ant- · https://console.anthropic.com/settings/keys             │ │
+                              ▌ │                                                                                    │ │
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                               ⋯│                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  type/paste  enter: save  esc [ Continue ] [ Cancel ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

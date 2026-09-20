@@ -1,40 +1,40 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Interface ──────────────────────╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││Interface                                       █  How the terminal UI looks and  ││ │
- SESSIONS                       ││                                                █  how you type into it. These are││ │
- no active sessions in all pr   ││› vim mode                 hint (default — vim o█  pure display and input         ││ │
-                                ││                           , hint chip on Normal█  preferences — nothing here     ││ │
-                              no││                           entry)               █  changes what the agent does,   ││ │
-                              ┊ ││  thinking display         condensed (default — █  only what you see.             ││ │
-                              ▌ ││                           hip, ctrl+t expands e█                                 ││ │
-                                ││                           ery block)           █  vim mode                       ││ █
-                                ││  render agent markdown    ▣ on (default)       █  Keystroke model for the message││ █
-                                ││  render user markdown     ▢ off (default)      █  composer. `hint` (default)     ││ █
-                                ││  mouse                    ▣ on (default — click█  enables vim keybindings and    ││ █
-                                ││                           + drag-select)       █  shows a one-time hint chip when││ █
-                                ││  rich-text copy           ▣ on (default — Ctrl+█  you enter Normal mode;         ││ █
-                                ││                           hift+Y copies as rich█  `enabled` is vim with no hint; ││ █
-                                ││                           text)                █  `disabled` is a plain text     ││ █
-                                ││  emojis                   ▢ disabled (default —█  input with no modal editing.   ││ █
-                                ││                           text-only)           █                                 ││ █
-                                ││  file-type icons          auto (default — nerd-█                                 ││ █
-                              ▌ ││                           ont icons on kitty/We█                                 ││ █
-                              ▌ ││                           Term/Ghostty)        █                                 ││ █
-                                ││  diff style               side-by-side (default█                                 ││ █
-                              ▌ ││                           — two columns; falls █                                 ││ █
-                                ││                           ack to inline under 8█                                 ││ █
-                                ││                            cols)               │                                 ││ █
-                                ││  startup banner           ▣ on (default — show │                                 ││ █
-                                ││                           tartup banner)       │                                 ││ █
-                                ││  show cwd                 ▣ on (default — cwd i│                                 ││ █
-                                ││                            chrome)             │                                 ││ █
-                               ⋯││  show branch              ▣ on (default — branc│                                 ││ █
-                                ││                            in chrome)          │                                 ││ █
-                                ││  caffeinate display       ▢ system only (defaul│                                 ││ █
-                                ││                           )                    │                                 ││ █
-                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+  + New session               ▌R│Interface                                        █  How the terminal UI looks and   │ │
+                              ▌ │                                                 █  how you type into it. These are │ │
+ SESSIONS                       │› vim mode                 hint (default — vim on█  pure display and input          │ │
+ no active sessions in all pr   │                           , hint chip on Normal █  preferences — nothing here      │ │
+                                │                           entry)                █  changes what the agent does,    │ │
+                              no│  thinking display         condensed (default — c█  only what you see.              │ │
+                              ┊ │                           hip, ctrl+t expands ev█                                  │ │
+                              ▌ │                           ery block)            █  vim mode                        │ │
+                                │  render agent markdown    ▣ on (default)        █  Keystroke model for the message │ █
+                                │  render user markdown     ▢ off (default)       █  composer. `hint` (default)      │ █
+                                │  mouse                    ▣ on (default — click █  enables vim keybindings and     │ █
+                                │                           + drag-select)        █  shows a one-time hint chip when │ █
+                                │  rich-text copy           ▣ on (default — Ctrl+S█  you enter Normal mode; `enabled`│ █
+                                │                           hift+Y copies as rich █  is vim with no hint; `disabled` │ █
+                                │                           text)                 █  is a plain text input with no   │ █
+                                │  emojis                   ▢ disabled (default — █  modal editing.                  │ █
+                                │                           text-only)            █                                  │ █
+                                │  file-type icons          auto (default — nerd-f█                                  │ █
+                                │                           ont icons on kitty/Wez█                                  │ █
+                              ▌ │                           Term/Ghostty)         █                                  │ █
+                              ▌ │  diff style               side-by-side (default █                                  │ █
+                                │                           — two columns; falls b█                                  │ █
+                              ▌ │                           ack to inline under 80█                                  │ █
+                                │                            cols)                █                                  │ █
+                                │  startup banner           ▣ on (default — show s█                                  │ █
+                                │                           tartup banner)        █                                  │ █
+                                │  show cwd                 ▣ on (default — cwd in│                                  │ █
+                                │                            chrome)              │                                  │ █
+                                │  show branch              ▣ on (default — branch│                                  │ █
+                               ⋯│                            in chrome)           │                                  │ █
+                                │  caffeinate display       ▢ system only (default│                                  │ █
+                                │                           )                     │                                  │ █
+                                │  attention notifications  ▣ on (default — toast │                                  │ █
+                              ▌ │                           for attention events) │                                  │ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift [ reset display settings to defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

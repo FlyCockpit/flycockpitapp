@@ -1,39 +1,39 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] ⎇ ╭ Settings — Image Sidecar ──────────────────────────────────────────────────────────╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││Layout: Compact — trust does not grant egress                                     ││ │
- SESSIONS                       ││╭ Image Sidecar ─────────────────────────────────────────────────────────────────╮││ │
- no active sessions in all pr   │││› Mode                                                                          │││ │
-                                │││  Trusted / untrusted defaults                                                  │││ │
-                              no│││  Per-primary override                                                          │││ │
-                              ┊ │││  Central invocation policy                                                     │││ │
-                              ▌ │││  Resolver trace                                                                │││ │
-                                │││  Health                                                                        │││ █
-                                │││  Destination grants                                                            │││ █
-                                │││  Invocation history                                                            │││ █
-                                │││                                                                                │││ █
-                                │││[open resolver detail]                                                          │││ █
-                                │││[open health detail]                                                            │││ █
-                                │││Effective: unavailable source=authoritative_sidecar_operation_unavailable       │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                              ▌ │││                                                                                │││ █
-                              ▌ │││                                                                                │││ █
-                                │││                                                                                │││ █
-                              ▌ │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                               ⋯│││                                                                                │││ █
-                                │││                                                                                │││ █
-                                │││                                                                                │││ █
-                                ││╰────────────────────────────────────────────────────────────────────────────────╯││ █
+  + New session               ▌R│Layout: Compact — trust does not grant egress                                       │ │
+                              ▌ │╭ Image Sidecar ───────────────────────────────────────────────────────────────────╮│ │
+ SESSIONS                       ││› Mode                                                                            ││ │
+ no active sessions in all pr   ││  Trusted / untrusted defaults                                                    ││ │
+                                ││  Per-primary override                                                            ││ │
+                              no││  Central invocation policy                                                       ││ │
+                              ┊ ││  Resolver trace                                                                  ││ │
+                              ▌ ││  Health                                                                          ││ │
+                                ││  Destination grants                                                              ││ █
+                                ││  Invocation history                                                              ││ █
+                                ││                                                                                  ││ █
+                                ││[open resolver detail]                                                            ││ █
+                                ││[open health detail]                                                              ││ █
+                                ││Effective: unavailable source=authoritative_sidecar_operation_unavailable         ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                               ⋯││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
  ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓: navigate  enter: open  h/esc: back             │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █

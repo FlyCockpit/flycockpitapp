@@ -1,23 +1,23 @@
                                                                                                                ● Working
- ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models › Co╮e]
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models › fi╮e]
                               ──│[Close settings]  [Back]                                                            │──
-  + New session               ▌R│Set up Codex subscription auth                                                      │ │
+  + New session               ▌R│Provider: fixture                                                                   │ │
                               ▌ │                                                                                    │ │
- SESSIONS                       │Status: not logged in                                                               │ │
- no active sessions in all pr   │Uses your ChatGPT Plus/Pro subscription quota via OpenAI's documented Codex agent l │ │
-                                │gin.                                                                                │ │
-                              no│Separate from the Codex CLI credential store; re-login if CLI use causes refresh-to │ │
-                              ┊ │en contention.                                                                      │ │
-                              ▌ │                                                                                    │ │
-                                │Using subscription credentials from this third-party client may violate the provide │ █
-                                │ terms of service and may result in account suspension.                             │ █
+ SESSIONS                       │› URL              https://api.example.invalid/v1                                   │ │
+ no active sessions in all pr   │  Headers          (none)                                                           │ │
+                                │  Models           1 model(s)                                                       │ │
+                              no│  Settings         compact auto (shadow −10%) · nudge 60% · prune 50%/30% · cache 3 │ │
+                              ┊ │  Favorite         no                                                               │ │
+                              ▌ │  Refetch /models  1 model(s)                                                       │ │
+                                │  Deep fetch       live endpoint/context probes; confirmation required              │ █
+                                │  Delete                                                                            │ █
+                                │  Back to list                                                                      │ █
                                 │                                                                                    │ █
-                                │Choose [I acknowledge the risk] to start subscription OAuth.                        │ █
+                                │╭ URL ─────────────────────────────────────────────────────────────────────────────╮│ █
+                                ││ https://typed.example.invalid/v1                                                 ││ █
+                                │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
                                 │                                                                                    │ █
-                                │                                                                                    │ █
-                                │                                                                                    │ █
-                                │                                                                                    │ █
-                                │                                                                                    │ █
+                                │Slow model? Open Settings for first-token/idle thresholds. Without a backup they wa │ █
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                               ▌ │                                                                                    │ █
@@ -35,6 +35,6 @@
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                               ▌ │                                                                                    │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  enter: acknowledge  esc:  [ I acknowledge the risk ]│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  type to edit  enter: apply  esc: [ Save ] [ Cancel ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

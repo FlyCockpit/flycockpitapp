@@ -2658,23 +2658,31 @@ mod affordance_hover_tests {
     }
 
     #[test]
-    fn click_slash_suggestion_completes_without_dispatching() {
+    fn click_slash_suggestion_dispatches_command() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.mouse_capture = true;
-        app.composer.set("/".to_string());
+        app.composer.set("/ke".to_string());
         app.reset_slash_window();
-        let expected = app.slash_suggestions()[1].completion_text();
+        let keys_index = app
+            .slash_suggestions()
+            .iter()
+            .position(|entry| entry.name() == "keys")
+            .expect("/ke menu includes /keys");
         app.suggestion_box_area = Some(Rect::new(0, 5, 80, 8));
         app.suggestion_row_hits = vec![SuggestionBoxRowHit {
-            target: suggestion_target(SuggestionBoxKind::Slash, 1),
+            target: suggestion_target(SuggestionBoxKind::Slash, keys_index),
             rect: Rect::new(2, 6, 76, 1),
         }];
 
         app.handle_mouse(suggestion_click(6));
 
-        assert_eq!(app.composer.text(), expected);
-        assert!(app.history.is_empty());
+        assert!(
+            app.keys_overlay.is_some(),
+            "clicking /keys should run the command, not Tab-complete it"
+        );
+        assert!(app.slash_query().is_none());
+        assert!(app.composer.text().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

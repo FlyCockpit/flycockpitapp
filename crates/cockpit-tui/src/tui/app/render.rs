@@ -1452,7 +1452,6 @@ impl App {
                             frame.set_cursor_position(Position::new(x, y));
                         }
                     } else if self.composer_controls.picker.is_none()
-                        && geom.suggestions == 0
                         && !self.chat_header_more_open
                         && self.context_menu.is_none()
                         && self.pins_review.is_none()
@@ -4100,7 +4099,14 @@ impl App {
                 Span::raw("  "),
                 Span::styled(description, muted),
             ]);
-            if self.hovered_suggestion == Some(target) {
+            if is_sel {
+                let selected =
+                    crate::tui::theme::row_selection_style().add_modifier(Modifier::BOLD);
+                line.style = line.style.patch(selected);
+                for span in &mut line.spans {
+                    span.style = span.style.patch(selected);
+                }
+            } else if self.hovered_suggestion == Some(target) {
                 hover_highlight_full_line(&mut line);
             }
             lines.push(line);

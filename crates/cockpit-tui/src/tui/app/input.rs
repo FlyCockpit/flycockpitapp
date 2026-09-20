@@ -2012,8 +2012,41 @@ impl App {
                     self.slash_suggestions().len(),
                     super::AUTOCOMPLETE_ROWS as usize,
                 );
-                self.complete_slash_selection()
+                self.dispatch_slash_selection()
             }
+        }
+    }
+
+    /// Run the highlighted slash-menu entry (Enter / row click). Distinct from
+    /// [`Self::complete_slash_selection`], which only inserts text on Tab.
+    pub(super) fn dispatch_slash_selection(&mut self) -> bool {
+        if self.slash_query().is_none() {
+            return false;
+        }
+        if !self.guard_startup_workspace_effects() {
+            return false;
+        }
+        if let Some(query) = self.slash_query().map(str::to_owned)
+            && let Some(command) = super::hidden_slash_alias(&query)
+        {
+            return self.execute_slash(command);
+        }
+        let chosen: Option<Result<super::SlashCommand, String>> = {
+            let matches = self.slash_suggestions();
+            if matches.is_empty() {
+                None
+            } else {
+                let idx = self.slash_selected.min(matches.len() - 1);
+                Some(match matches[idx] {
+                    super::SlashEntry::Builtin(cmd) => Ok(*cmd),
+                    super::SlashEntry::Skill(s) => Err(s.name.clone()),
+                })
+            }
+        };
+        match chosen {
+            None => false,
+            Some(Ok(cmd)) => self.execute_slash(cmd),
+            Some(Err(name)) => self.invoke_skill_slash(&name),
         }
     }
 
@@ -2567,40 +2600,8 @@ impl App {
             }
             return false;
         }
-        if let Some(query) = self.slash_query().map(str::to_owned) {
-            if !self.guard_startup_workspace_effects() {
-                return false;
-            }
-            if let Some(command) = super::hidden_slash_alias(&query) {
-                return self.execute_slash(command);
-            }
-            // Run whatever is highlighted. The default highlight is the
-            // frequency-ranked top match (index 0), so `/foo`+Enter still
-            // runs the top match — preserving the pre-cursor muscle memory.
-            // A bare skill entry (`/<skill-name>`) seeds a deterministic skill
-            // invocation; a builtin dispatches as usual
-            // (implementation note).
-            // Resolve the highlighted entry to an owned form first so the
-            // `self`-borrow from `slash_suggestions` (it references
-            // `self.skill_commands`) is released before the `&mut self`
-            // dispatch.
-            let chosen: Option<Result<super::SlashCommand, String>> = {
-                let matches = self.slash_suggestions();
-                if matches.is_empty() {
-                    None
-                } else {
-                    let idx = self.slash_selected.min(matches.len() - 1);
-                    Some(match matches[idx] {
-                        super::SlashEntry::Builtin(cmd) => Ok(*cmd),
-                        super::SlashEntry::Skill(s) => Err(s.name.clone()),
-                    })
-                }
-            };
-            return match chosen {
-                None => false,
-                Some(Ok(cmd)) => self.execute_slash(cmd),
-                Some(Err(name)) => self.invoke_skill_slash(&name),
-            };
+        if self.slash_query().is_some() {
+            return self.dispatch_slash_selection();
         }
         self.submit_input()
     }
@@ -6084,26 +6085,31 @@ mod slash_cursor_tests {
     use crate::tui::nav::{wrap_next, wrap_prev};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    fn slash_app() -> App {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.composer.set("/".to_string());
+        app.reset_slash_window();
+        app
+    }
+
     /// The slash-menu cursor mirrors the `@`-popup: the highlight moves
     /// with the same wrap math the handler applies, and the default
     /// highlight is index 0 — the frequency-ranked top match (see
     /// `slash_rank_tests`), preserving "type `/foo` + Enter runs the top
     /// match" muscle memory.
     #[test]
-    fn cursor_default_is_top_match_and_wraps() {
-        // A fresh slash session starts on the top-ranked match.
-        let mut sel = 0usize;
-        let n = 3usize; // e.g. /settings, /session, /stats
-        assert_eq!(sel, 0, "default highlight is the top match");
-        // Up from the top wraps to the last.
-        sel = wrap_prev(sel, n);
-        assert_eq!(sel, 2);
-        // Down from the last wraps back to the top.
-        sel = wrap_next(sel, n);
-        assert_eq!(sel, 0);
-        // Interior Down steps normally.
-        sel = wrap_next(sel, n);
-        assert_eq!(sel, 1);
+    fn slash_selection_wraps_at_menu_ends() {
+        let mut app = slash_app();
+        let n = app.slash_suggestions().len();
+        assert!(n >= 3, "slash menu needs multiple entries to test wrap");
+        assert_eq!(app.slash_selected, 0, "default highlight is the top match");
+
+        app.handle_key_insert(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.slash_selected, n - 1, "Up from first row wraps to last");
+
+        app.handle_key_insert(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.slash_selected, 0, "Down from last row wraps to first");
     }
 
     /// Recall suppression is scoped to "menu visible": the handler routes
@@ -6130,14 +6136,6 @@ mod slash_cursor_tests {
     fn single_match_stays_put() {
         assert_eq!(wrap_next(0, 1), 0);
         assert_eq!(wrap_prev(0, 1), 0);
-    }
-
-    fn slash_app() -> App {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(Some(tmp.path()), false);
-        app.composer.set("/".to_string());
-        app.reset_slash_window();
-        app
     }
 
     #[test]

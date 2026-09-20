@@ -2,6 +2,7 @@ use super::{
     App, MAX_SANDBOX_NOTICE_ROWS, sandbox_down_notice_text, sandbox_notice_render_text,
     sandbox_notice_wrapped_rows,
 };
+use crate::tui::chat_header::HeaderPillKind;
 use crate::tui::composer_controls::ComposerControlKind;
 use cockpit_client::presentation::TurnEvent;
 use ratatui::Terminal;
@@ -174,12 +175,16 @@ fn waiting_for_lock_event_sets_and_clears_chrome_state() {
             .map(|(p, h)| (p.as_str(), h.as_str())),
         Some(("/repo/src/lib.rs", "builder"))
     );
-    // The chrome renders the path basename + holder.
-    let spans = crate::tui::chrome::waiting_for_lock_spans(app.waiting_for_lock.as_ref());
-    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    let lock_pill = app
+        .chat_header_state()
+        .pills
+        .into_iter()
+        .find(|pill| pill.kind == HeaderPillKind::Lock)
+        .expect("waiting lock rehomes to a header pill");
     assert!(
-        text.contains("lib.rs") && text.contains("builder"),
-        "{text}"
+        lock_pill.label.contains("lib.rs") && lock_pill.label.contains("builder"),
+        "{}",
+        lock_pill.label
     );
     // Purely client-side: nothing entered the transcript.
     assert_eq!(app.history.len(), history_len_before);
@@ -191,7 +196,12 @@ fn waiting_for_lock_event_sets_and_clears_chrome_state() {
         waiting: false,
     });
     assert!(app.waiting_for_lock.is_none());
-    assert!(crate::tui::chrome::waiting_for_lock_spans(app.waiting_for_lock.as_ref()).is_empty());
+    assert!(
+        !app.chat_header_state()
+            .pills
+            .iter()
+            .any(|pill| pill.kind == HeaderPillKind::Lock)
+    );
     assert_eq!(app.history.len(), history_len_before);
 }
 

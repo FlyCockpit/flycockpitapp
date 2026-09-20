@@ -30,6 +30,12 @@ fn write_global_config(cfg: &ProvidersConfig) {
     write_providers_at(&path, cfg);
 }
 
+/// Persist provider config on disk only (no in-memory snapshot mirror). Exercises
+/// the real `refresh_bootstrap_config_snapshot` read path when tests need it.
+fn write_global_provider_config_on_disk(cfg: &ProvidersConfig) {
+    write_global_config(cfg);
+}
+
 fn install_global_provider_config(app: &mut App, cfg: &ProvidersConfig) {
     write_global_config(cfg);
     app.config_snapshot.providers = cfg.clone();
@@ -62,6 +68,12 @@ fn complete_detour_provider_verify(app: &mut App, provider_id: &str) {
             Some(detour_provider_settlement()),
         );
     }
+    let mut cfg = app.config_snapshot.providers.clone();
+    let mut added = config_with_provider(provider_id, "detour-model");
+    if let Some(entry) = added.providers.remove(provider_id) {
+        cfg.providers.insert(provider_id.to_string(), entry);
+    }
+    write_global_provider_config_on_disk(&cfg);
     shell_key(app, KeyCode::Enter);
 }
 
@@ -605,7 +617,32 @@ fn completion_detour_ends_when_the_added_provider_settles() {
             .as_ref()
             .is_some_and(|shell| !shell.completion_detour_active())
     );
+    assert!(
+        app.config_snapshot
+            .providers
+            .providers
+            .contains_key("openai"),
+        "detour Done must refresh the bootstrap snapshot from disk"
+    );
     assert!(!app.dialog.is_active());
+}
+
+#[test]
+fn refresh_bootstrap_config_snapshot_reads_provider_config_from_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new(Some(tmp.path()), false);
+    let cfg = config_with_provider("disk-only", "m1");
+    write_global_provider_config_on_disk(&cfg);
+    with_trusted_workspace(tmp.path(), || app.refresh_bootstrap_config_snapshot());
+    assert!(
+        app.config_snapshot
+            .providers
+            .providers
+            .contains_key("disk-only"),
+        "refresh must load providers written to the global config file"
+    );
 }
 
 #[test]
@@ -688,6 +725,13 @@ fn complete_authority_refresh_preserves_the_local_provider_detour() {
         app.onboarding_shell
             .as_ref()
             .is_some_and(|shell| !shell.completion_detour_active())
+    );
+    assert!(
+        app.config_snapshot
+            .providers
+            .providers
+            .contains_key("openai-compatible"),
+        "detour Done must retain the added provider in the config snapshot"
     );
     assert!(!app.dialog.is_active());
 }

@@ -2,6 +2,8 @@
 
 use super::search::{ProviderSearchScreen, filter_catalog, onboarding_catalog};
 use super::*;
+use crate::tui::onboarding::auth::AuthPhase;
+use crate::tui::settings::{OAuthBeginResult, OAuthFlowRequest, OAuthPublicBegin};
 use cockpit_config::providers::ProvidersConfig;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
@@ -996,6 +998,88 @@ fn authenticate_escape_returns_to_search() {
 }
 
 #[test]
+fn authenticate_oauth_device_idle_escape_cancels_and_returns_to_search() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    shell.present_authenticate(cockpit_core::providers::template_by_id("codex-oauth").unwrap());
+    shell.set_auth_phase_for_golden(AuthPhase::DeviceIdle);
+    let action = shell.handle_key(key(KeyCode::Esc), &mut engine);
+    assert!(matches!(action, Some(OnboardingShellAction::OAuth(_))));
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::ProviderSearch);
+}
+
+#[test]
+fn authenticate_oauth_paste_callback_escape_cancels_and_returns_to_search() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    shell.present_authenticate(cockpit_core::providers::template_by_id("grok-oauth").unwrap());
+    shell.set_auth_phase_for_golden(AuthPhase::PasteCallback);
+    let action = shell.handle_key(key(KeyCode::Esc), &mut engine);
+    assert!(matches!(action, Some(OnboardingShellAction::OAuth(_))));
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::ProviderSearch);
+}
+
+#[test]
+fn authenticate_oauth_device_polling_escape_stays_on_authenticate() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    shell.present_authenticate(cockpit_core::providers::template_by_id("codex-oauth").unwrap());
+    shell.set_auth_phase_for_golden(AuthPhase::DevicePolling);
+    let action = shell.handle_key(key(KeyCode::Esc), &mut engine);
+    assert!(matches!(action, Some(OnboardingShellAction::OAuth(_))));
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::Authenticate);
+}
+
+#[test]
+fn authenticate_oauth_acknowledge_then_begin_enters_device_idle_without_waiting_copy() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    shell.present_authenticate(cockpit_core::providers::template_by_id("codex-oauth").unwrap());
+    let OAuthFlowRequest {
+        client_flow_id,
+        operation_id,
+        ..
+    } = match shell.handle_key(key(KeyCode::Enter), &mut engine) {
+        Some(OnboardingShellAction::OAuth(request)) => request,
+        other => panic!("acknowledge must queue OAuth, got {other:?}"),
+    };
+    let begin = shell
+        .apply_onboarding_oauth_acknowledgement(client_flow_id, operation_id, Ok(()))
+        .expect("successful acknowledgement must queue begin");
+    shell.apply_onboarding_oauth_begin(
+        begin.client_flow_id,
+        begin.operation_id,
+        OAuthBeginResult::Public(Ok(OAuthPublicBegin {
+            flow_id: "remote-flow".into(),
+            authorize_url: "https://auth.openai.com/codex/device".into(),
+            user_code: Some("WXYZ-1234".into()),
+        })),
+    );
+    assert!(matches!(
+        &shell.screen,
+        OnboardingScreen::Authenticate(screen) if screen.auth_phase() == AuthPhase::DeviceIdle
+    ));
+    let rendered = render_string(&mut shell, 80, 24, &engine);
+    assert!(!rendered.contains("Waiting for approval"), "{rendered}");
+}
+
+#[test]
+fn verify_no_endpoint_renders_full_configured_models_sentence_at_80x24() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let engine = Dialog::None;
+    shell.present_verify("no-catalog".into());
+    shell.apply_provider_verification("no-catalog", VerifyOutcome::NoEndpoint, None);
+    let rendered = render_string(&mut shell, 80, 24, &engine);
+    let body = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        body.contains(
+            "The credential is stored. This provider does not publish a model catalog, so Cockpit will use configured models."
+        ),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn verify_retry_reprobes_the_same_provider() {
     let mut shell = shell_at(OnboardingStage::Provider);
     let mut engine = Dialog::None;
@@ -1036,7 +1120,7 @@ fn verify_renders_each_daemon_failure_class_with_retry() {
         ),
         (
             VerifyOutcome::Parse("invalid model JSON".into()),
-            "Unexpected response",
+            "Couldn't parse the model list",
         ),
     ] {
         let mut shell = shell_at(OnboardingStage::Provider);

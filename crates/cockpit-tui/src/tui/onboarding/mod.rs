@@ -70,7 +70,7 @@ pub(crate) use verify::VerifyOutcome;
 use verify::VerifyScreen;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ProviderSettlementEvidence {
+pub struct ProviderSettlementEvidence {
     pub operation_id: String,
     pub mutation_intent_hash: String,
     pub mutation_config_generation: u64,
@@ -78,7 +78,7 @@ pub(crate) struct ProviderSettlementEvidence {
 }
 
 #[derive(Debug)]
-pub(crate) struct ProviderVerificationCompletion {
+pub struct ProviderVerificationCompletion {
     pub provider_id: String,
     pub outcome: Result<VerifyOutcome, String>,
     pub settlement: Option<ProviderSettlementEvidence>,
@@ -781,7 +781,7 @@ impl OnboardingShell {
 
     /// True while the completion screen's "add another provider" detour is
     /// active.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn completion_detour_active(&self) -> bool {
         self.completion_detour
     }

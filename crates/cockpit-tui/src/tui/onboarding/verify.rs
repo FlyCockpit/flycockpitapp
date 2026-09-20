@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use super::{ProviderSettlementEvidence, auth::SPINNER, chrome, theme};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum VerifyOutcome {
+pub enum VerifyOutcome {
     Models(Vec<String>),
     NoEndpoint,
     Unauthorized(u16),

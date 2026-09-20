@@ -8,16 +8,16 @@
                                 Prioritize the transcript chrome.                                                      │
                               note to self                                                                      08:45  │
                               ┊ Keep product-only transcript variants.                                                 │
-                              ▌ Agent╭ Choose a setup wizard ───────────────────────────────────────────────────╮8:45  │
-                                Model│› provider  Configure an inference provider and its authentication        │      █
-                                TTFT │  security  Review sandboxing, approvals, redaction, and workspace trust  │      █
-                                TPS  │  model  Set trust, capabilities, limits, thinking, delegation, and       │      █
-                                Cache│default model                                                             │      █
-                                ▾ Tho│                                                                          │      █
-                                Map e│                                                                          │      █
-                                The o│                                                                          │      █
+                              ▌ Agent╭ Security posture ────────────────────────────────────────────────────────╮8:45  │
+                                Model│Review sandboxing, approvals, redaction, and workspace trust              │      █
+                                TTFT │                                                                          │      █
+                                TPS  │How should Cockpit confine shell commands by default?                     │      █
+                                Cache│Keep the host shell sandbox unless you specifically need container        │      █
+                                ▾ Tho│isolation or unconfined commands. `off` means commands the model runs are │      █
+                                Map e│unconfined. Container rows are omitted when docker/podman is not          │      █
+                                The o│available. Host sandbox is omitted when the host capability is down.      │      █
                                      │                                                                          │      █
-                                ▸ rea│                                                                          │      █
+                                ▸ rea│› off  Unconfined: commands the model runs are not sandboxed.             │      █
                                      │                                                                          │      █
                                 ─ exp│                                                                          │      █
                               ▌ inter│                                                                          │      █
@@ -26,7 +26,7 @@
                               ▌ backg│                                                                          │      █
                                 Backg│                                                                          │      █
                                      │                                                                          │      █
-                                ◇ Edi│↑/↓  enter: select  esc: close                                            │      █
+                                ◇ Edi│↑/↓  space: toggle  enter: continue  esc: close    [ Cancel ] [ Continue ]│      █
                                 │ - o╰──────────────────────────────────────────────────────────────────────────╯      █
                                 │ + new line                                                                           █
                                 │   shared line                                                                        █

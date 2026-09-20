@@ -1770,19 +1770,14 @@ impl CategoryPage {
             .collect()
     }
 
-    /// Number of selectable rows: every setting plus the trailing reset
-    /// button when the category has one.
+    /// Number of selectable rows: every setting row.
     fn nav_len(&self) -> usize {
-        let settings = self.setting_ids().len();
-        settings + usize::from(self.category.reset_label().is_some())
+        self.setting_ids().len()
     }
 
-    /// Cursor index of the reset button, if this category has one (the last
-    /// selectable row).
+    /// Reset is on the help-row ActionBar, not in the list.
     fn reset_cursor(&self) -> Option<usize> {
-        self.category
-            .reset_label()
-            .map(|_| self.setting_ids().len())
+        None
     }
 }
 
@@ -2928,16 +2923,6 @@ impl SettingsCx {
                 p.status = None;
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                // Reset button is the last selectable row when present.
-                if Some(p.cursor) == p.reset_cursor() {
-                    if p.reset.activate() == ResetOutcome::Apply {
-                        self.reset_category(p);
-                        p.status = save_status(self.save_extended());
-                    } else {
-                        p.status = None;
-                    }
-                    return Nav::Stay;
-                }
                 let ids = p.setting_ids();
                 let Some(&id) = ids.get(p.cursor) else {
                     return Nav::Stay;
@@ -4058,9 +4043,8 @@ impl SettingsCx {
 
         let mut selected_line = 0usize;
         let mut sel = 0usize;
-        let mut inline_actions = None;
         let mut cursor_external_action = None;
-        let mut reset_action_line = None;
+        let mut inline_edit_field: Option<(usize, SettingId)> = None;
         for row in &p.rows {
             match row {
                 Row::Heading(heading) => {
@@ -4088,15 +4072,24 @@ impl SettingsCx {
                     }
                     let before = lines.len();
                     if p.editing == Some(*id) {
-                        push_label_text_field_row(
-                            &mut lines,
-                            settings_area.width,
-                            on_cursor,
-                            id.descriptor().label,
-                            label_w,
-                            p.buf.text(),
-                            p.buf.cursor(),
-                        );
+                        if on_cursor {
+                            selected_line = lines.len();
+                        }
+                        controls.push(Some((
+                            super::pointer_actions::SettingsPointerAction::Category(
+                                super::pointer_actions::CategoryAction::InlineEditBegin(
+                                    category_pointer_id(*id),
+                                ),
+                            ),
+                            true,
+                            None,
+                        )));
+                        lines.push(Line::default());
+                        for _ in 1..3 {
+                            lines.push(Line::default());
+                            controls.push(None);
+                        }
+                        inline_edit_field = Some((lines.len().saturating_sub(3), *id));
                     } else {
                         push_label_value_row(
                             &mut lines,
@@ -4117,31 +4110,16 @@ impl SettingsCx {
                             category_pointer_id(*id),
                         )
                     };
-                    controls.resize(
-                        lines.len(),
-                        Some((
-                            super::pointer_actions::SettingsPointerAction::Category(action),
-                            true,
-                            None,
-                        )),
-                    );
-                    if on_cursor && p.editing == Some(*id) {
-                        let line = lines.len();
-                        lines.push(Line::from(vec![
-                            Span::styled("[Save]", selected_style()),
-                            Span::raw("  "),
-                            Span::styled("[Cancel]", selected_style()),
-                            Span::raw("  "),
-                            Span::styled("[Open in $EDITOR]", selected_style()),
-                        ]));
-                        controls.push(None);
-                        inline_actions = Some((line, *id));
-                        selected_line = line;
+                    if p.editing != Some(*id) {
+                        controls.resize(
+                            lines.len(),
+                            Some((
+                                super::pointer_actions::SettingsPointerAction::Category(action),
+                                true,
+                                None,
+                            )),
+                        );
                     }
-                    // Keep the selected row's explicit external-editor action
-                    // adjacent to its source control. Appending it after the
-                    // entire category made normal focus scrolling clip the
-                    // action even while the owning setting was visible.
                     if on_cursor && p.editing.is_none() && category_external_editable(*id) {
                         let line = lines.len();
                         lines.push(Line::from("[Open selected in $EDITOR]"));
@@ -4158,26 +4136,6 @@ impl SettingsCx {
                     sel += 1;
                 }
             }
-        }
-
-        if let Some(label) = p.category.reset_label() {
-            lines.push(Line::default());
-            controls.push(None);
-            if Some(p.cursor) == p.reset_cursor() {
-                selected_line = lines.len();
-            }
-            reset_action_line = Some((lines.len(), label, Some(p.cursor) == p.reset_cursor()));
-            lines.push(
-                p.reset
-                    .render_line(Some(p.cursor) == p.reset_cursor(), label),
-            );
-            controls.push(Some((
-                super::pointer_actions::SettingsPointerAction::Category(
-                    super::pointer_actions::CategoryAction::Reset,
-                ),
-                true,
-                None,
-            )));
         }
 
         if let Some(status) = &p.status {
@@ -4199,78 +4157,41 @@ impl SettingsCx {
             )
                 .into(),
         );
-        if let Some((line, label, selected)) = reset_action_line {
+        if let Some((line, id)) = inline_edit_field {
             let key = format!("category:{:?}", p.category);
             let offset = self.scroll_states.offset_for(&key);
             if let Some(screen_row) = line
                 .checked_sub(offset)
-                .filter(|row| *row < usize::from(settings_area.height))
+                .filter(|row| *row + 3 <= usize::from(settings_area.height))
             {
-                let row = Rect::new(
-                    settings_area.x,
-                    settings_area.y.saturating_add(screen_row as u16),
-                    settings_area.width.saturating_sub(1),
-                    1,
-                );
-                for x in row.x..row.right() {
-                    frame.buffer_mut()[(x, row.y)].set_symbol(" ");
-                }
-                crate::tui::chrome::render_action_bar(
+                let field_area = Rect {
+                    x: settings_area.x,
+                    y: settings_area.y.saturating_add(screen_row as u16),
+                    width: settings_area.width.saturating_sub(1),
+                    height: 3,
+                };
+                if let Some(caret) = crate::tui::chrome::render_field(
                     frame,
-                    row,
-                    &[crate::tui::chrome::ActionButton::secondary(label)],
-                    selected.then_some(0),
-                );
-            }
-        }
-        if let Some((line, id)) = inline_actions {
-            let offset = self
-                .scroll_states
-                .offset_for(&format!("category:{:?}", p.category));
-            if let Some(screen_row) = line.checked_sub(offset)
-                && screen_row < usize::from(settings_area.height)
-            {
-                for (action, x, width) in [
-                    (
-                        super::pointer_actions::CategoryAction::InlineEditCommit(
-                            category_pointer_id(id),
-                        ),
-                        0,
-                        6,
-                    ),
-                    (
-                        super::pointer_actions::CategoryAction::InlineEditCancel(
-                            category_pointer_id(id),
-                        ),
-                        8u16,
-                        8u16,
-                    ),
-                    (
-                        super::pointer_actions::CategoryAction::ExternalEditBegin(
-                            category_pointer_id(id),
-                            super::pointer_actions::CategoryExternalSource::Inline,
-                        ),
-                        18u16,
-                        17u16,
-                    ),
-                ] {
-                    if x.saturating_add(width) > settings_area.width {
-                        continue;
-                    }
-                    self.pointer_surface.register(SettingsPointerTarget {
-                        rect: Rect::new(
-                            settings_area.x.saturating_add(x),
-                            settings_area.y.saturating_add(screen_row as u16),
-                            width,
-                            1,
-                        ),
-                        action: SettingsPointerAction::Page(
-                            super::pointer_actions::SettingsPointerAction::Category(action),
-                        ),
-                        enabled: true,
-                        disabled_reason: None,
-                    });
+                    field_area,
+                    id.descriptor().label,
+                    &p.buf,
+                    true,
+                    "",
+                ) {
+                    frame.set_cursor_position(caret);
                 }
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: field_area,
+                    action: SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Category(
+                            super::pointer_actions::CategoryAction::InlineEditBegin(
+                                category_pointer_id(id),
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
             }
         }
         if let Some((line, id)) = cursor_external_action {
@@ -4322,22 +4243,6 @@ impl SettingsCx {
                 id.descriptor().help.to_string()
             };
             help.push(Line::from(Span::styled(help_text, muted_style())));
-        } else if Some(p.cursor) == p.reset_cursor()
-            && let Some(label) = p.category.reset_label()
-        {
-            help.push(Line::default());
-            help.push(Line::from(Span::styled(
-                label.to_string(),
-                Style::default()
-                    .fg(ratatui::style::Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            help.push(Line::from(Span::styled(
-                "Restore this category's settings to their built-in defaults. \
-                 Your content (names, languages, model picks, file lists, privacy lists) is kept."
-                    .to_string(),
-                muted_style(),
-            )));
         }
         frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), help_area);
     }
@@ -4628,14 +4533,19 @@ impl SettingsPage for CategoryPage {
                     )
                 }
                 CategoryAction::Reset => {
-                    let Some(index) = self.reset_cursor() else {
+                    if self.category.reset_label().is_none() {
                         return Nav::Stay;
-                    };
-                    self.cursor = index;
-                    cx.handle_category_page_key(
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        self,
-                    )
+                    }
+                    match self.reset.activate() {
+                        ResetOutcome::Apply => {
+                            cx.reset_category(self);
+                            self.status = save_status(cx.save_extended());
+                        }
+                        ResetOutcome::Armed => {
+                            self.status = None;
+                        }
+                    }
+                    Nav::Stay
                 }
                 CategoryAction::InlineEditCommit(_)
                 | CategoryAction::InlineEditCancel(_)
@@ -4800,6 +4710,55 @@ impl SettingsPage for CategoryPage {
             "type to edit  enter: apply  esc: cancel"
         } else {
             "↑/↓/Tab/Shift+Tab  enter: edit / cycle / drill  esc/h: back  q: close"
+        }
+    }
+
+    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{CategoryAction, SettingsPointerAction};
+        let mut actions = Vec::new();
+        if let Some(id) = self.editing {
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Save",
+                enabled: true,
+                primary: true,
+                action: SettingsPointerAction::Category(CategoryAction::InlineEditCommit(
+                    category_pointer_id(id),
+                )),
+            });
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Category(CategoryAction::InlineEditCancel(
+                    category_pointer_id(id),
+                )),
+            });
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Open in $EDITOR",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
+                    category_pointer_id(id),
+                    super::pointer_actions::CategoryExternalSource::Inline,
+                )),
+            });
+        }
+        if let Some(label) = self.category.reset_label() {
+            let reset_label = if self.reset.is_pending() {
+                "confirm reset"
+            } else {
+                label
+            };
+            actions.push(super::shell::SettingsHelpAction {
+                label: reset_label,
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Category(CategoryAction::Reset),
+            });
+        }
+        super::shell::SettingsHelpRow {
+            actions,
+            hover: None,
         }
     }
 

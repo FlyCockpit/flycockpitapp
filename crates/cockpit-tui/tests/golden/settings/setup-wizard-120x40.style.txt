@@ -11,15 +11,15 @@
 8	30:Reset/Indexed(235)/- 12:Rgb(138,155,176)/Reset/ITALIC 70:Reset/Reset/- 5:Rgb(85,98,112)/Reset/- 2:Reset/Reset/- 1:Indexed(240)/Reset/-
 9	30:Reset/Indexed(235)/- 40:Rgb(138,155,176)/Reset/- 49:Reset/Reset/- 1:Indexed(240)/Reset/-
 10	30:Reset/Indexed(235)/- 2:Rgb(224,177,86)/Reset/- 5:Indexed(179)/Indexed(236)/BOLD 76:Indexed(179)/Reset/- 4:Rgb(85,98,112)/Reset/- 2:Reset/Reset/- 1:Indexed(240)/Reset/-
-11	30:Reset/Indexed(235)/- 7:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 66:Indexed(179)/Indexed(236)/BOLD 8:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
-12	30:Reset/Indexed(235)/- 7:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 12:Indexed(255)/Reset/- 60:Indexed(109)/Reset/- 2:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
-13	30:Reset/Indexed(235)/- 7:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 9:Indexed(255)/Reset/- 58:Indexed(109)/Reset/- 7:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
-14	30:Reset/Indexed(235)/- 7:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 13:Indexed(109)/Reset/- 61:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
-15	30:Reset/Indexed(235)/- 2:Reset/Reset/- 5:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
-16	30:Reset/Indexed(235)/- 2:Reset/Reset/- 5:Rgb(85,98,112)/Reset/ITALIC 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
-17	30:Reset/Indexed(235)/- 7:Rgb(244,239,230)/Reset/- 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
+11	30:Reset/Indexed(235)/- 7:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 60:Indexed(109)/Reset/- 14:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
+12	30:Reset/Indexed(235)/- 7:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
+13	30:Reset/Indexed(235)/- 7:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 53:Indexed(255)/Reset/- 21:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
+14	30:Reset/Indexed(235)/- 7:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 66:Indexed(109)/Reset/- 8:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
+15	30:Reset/Indexed(235)/- 2:Reset/Reset/- 5:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 73:Indexed(109)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
+16	30:Reset/Indexed(235)/- 2:Reset/Reset/- 5:Rgb(85,98,112)/Reset/ITALIC 1:Indexed(179)/Reset/- 64:Indexed(109)/Reset/- 10:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
+17	30:Reset/Indexed(235)/- 7:Rgb(244,239,230)/Reset/- 1:Indexed(179)/Reset/- 68:Indexed(109)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
 18	30:Reset/Indexed(235)/- 7:Reset/Reset/- 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
-19	30:Reset/Indexed(235)/- 2:Reset/Reset/- 5:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
+19	30:Reset/Indexed(235)/- 2:Reset/Reset/- 5:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 61:Indexed(179)/Indexed(236)/BOLD 13:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
 20	30:Reset/Indexed(235)/- 7:Reset/Reset/- 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
 21	30:Reset/Indexed(235)/- 7:Rgb(85,98,112)/Reset/- 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
 22	30:Reset/Indexed(235)/- 2:Rgb(78,200,196)/Reset/- 5:Rgb(138,155,176)/Reset/BOLD 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
@@ -28,7 +28,7 @@
 25	30:Reset/Indexed(235)/- 2:Rgb(138,155,176)/Reset/- 5:Rgb(138,155,176)/Reset/BOLD 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
 26	30:Reset/Indexed(235)/- 7:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
 27	30:Reset/Indexed(235)/- 7:Reset/Reset/- 1:Indexed(179)/Reset/- 74:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
-28	30:Reset/Indexed(235)/- 4:Rgb(224,177,86)/Reset/- 3:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 30:Indexed(109)/Reset/- 44:Reset/Reset/- 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
+28	30:Reset/Indexed(235)/- 4:Rgb(224,177,86)/Reset/- 3:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 47:Indexed(109)/Reset/- 4:Reset/Reset/- 10:Indexed(109)/Reset/- 1:Reset/Reset/- 12:Indexed(179)/Reset/BOLD 1:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
 29	30:Reset/Indexed(235)/- 2:Reset/Reset/- 2:Rgb(74,90,106)/Reset/- 3:Rgb(217,106,106)/Reset/- 76:Indexed(179)/Reset/- 6:Reset/Reset/- 1:Indexed(179)/Reset/-
 30	30:Reset/Indexed(235)/- 2:Reset/Reset/- 2:Rgb(74,90,106)/Reset/- 10:Rgb(127,201,138)/Reset/- 75:Reset/Reset/- 1:Indexed(179)/Reset/-
 31	30:Reset/Indexed(235)/- 2:Reset/Reset/- 2:Rgb(74,90,106)/Reset/- 13:Rgb(138,155,176)/Reset/- 72:Reset/Reset/- 1:Indexed(179)/Reset/-

@@ -3425,10 +3425,39 @@ fn populated_harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
     dialog
 }
 
-fn click_settings_action(
+pub(crate) fn click_settings_action(
     dialog: &mut SettingsDialog,
     action: &pointer_actions::SettingsPointerAction,
 ) {
+    if matches!(
+        action,
+        pointer_actions::SettingsPointerAction::Category(
+            pointer_actions::CategoryAction::InlineEditCommit(_)
+                | pointer_actions::CategoryAction::InlineEditCancel(_)
+                | pointer_actions::CategoryAction::ExternalEditBegin(
+                    _,
+                    pointer_actions::CategoryExternalSource::Inline,
+                )
+        ) | pointer_actions::SettingsPointerAction::Tools(pointer_actions::ToolsAction::Reset)
+            | pointer_actions::SettingsPointerAction::Category(
+                pointer_actions::CategoryAction::Reset
+            )
+            | pointer_actions::SettingsPointerAction::Skills(pointer_actions::SkillsAction::Reset)
+            | pointer_actions::SettingsPointerAction::Lsp(pointer_actions::LspAction::Reset)
+            | pointer_actions::SettingsPointerAction::Harnesses(
+                pointer_actions::HarnessesAction::ResetAndSeedPresets
+            )
+    ) {
+        #[cfg(test)]
+        pointer_acceptance_tests::record_rendered_action(action, true);
+        let nav = dialog
+            .page
+            .handle_pointer_control(&mut dialog.cx, action.clone());
+        dialog.apply_nav(nav);
+        #[cfg(test)]
+        pointer_acceptance_tests::record_dispatched_action(action);
+        return;
+    }
     if let pointer_actions::SettingsPointerAction::Harnesses(
         pointer_actions::HarnessesAction::Open(id) | pointer_actions::HarnessesAction::Delete(id),
     ) = action
@@ -5046,17 +5075,10 @@ fn category_short_viewport_keeps_bottom_reset_row_visible() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     d.enter_category(Category::Behavior);
-    if let TestPageMut::Category(p) = d.test_page_mut() {
-        p.cursor = p.cursor_of_reset().expect("reset row");
-    }
     let rendered = render_settings_rows(&d, 92, 12).join("\n");
     assert!(
         rendered.contains("reset behavior settings"),
-        "selected reset row should be visible:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("↑"),
-        "window should disclose hidden rows above:\n{rendered}"
+        "help-row reset action should be visible:\n{rendered}"
     );
 }
 
@@ -7319,7 +7341,7 @@ fn lsp_reset_row_and_accelerator_share_confirm_state() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     d.set_test_page(Page::Lsp(LspPage {
-        cursor: row_index(LspRow::Reset),
+        cursor: 0,
         editing: None,
         buf: TextField::default(),
         status: None,
@@ -7327,7 +7349,10 @@ fn lsp_reset_row_and_accelerator_share_confirm_state() {
     }));
     d.extended.lsp.enabled = false;
 
-    d.handle_key(press(KeyCode::Enter));
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Lsp(pointer_actions::LspAction::Reset),
+    );
     match d.test_page() {
         TestPageRef::Lsp(p) => assert!(p.reset.is_pending()),
         other => panic!("expected LSP page, got {other:?}"),
@@ -7725,12 +7750,18 @@ fn reset_with_partial_install_drops_uninstalled() {
     let n = d.extended.harnesses.len();
     // Re-enter to reset cursor to a known position.
     enter_harnesses_from_root(&mut d);
-    for _ in 0..(n + 2) {
-        d.handle_key(press(KeyCode::Down));
-    }
-    // Reset is a two-step confirm.
-    d.handle_key(press(KeyCode::Enter));
-    d.handle_key(press(KeyCode::Enter));
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Harnesses(
+            pointer_actions::HarnessesAction::ResetAndSeedPresets,
+        ),
+    );
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Harnesses(
+            pointer_actions::HarnessesAction::ResetAndSeedPresets,
+        ),
+    );
     assert!(d.extended.harnesses.contains_key("claude"));
     for name in ["codex", "opencode", "copilot", "goose", "grok"] {
         assert!(
@@ -8180,13 +8211,9 @@ fn popped_parent_renders_updated_subpage_values() {
             .any(|path| path == "STACK.md"),
         "restored category should see updated instructions config"
     );
-    let rendered = render_settings_rows(&d, 100, 24).join("\n");
-    let compact = rendered
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>();
+    let rendered = render_settings_rows(&d, 120, 40).join("\n");
     assert!(
-        compact.contains("AGENTSmdSTACKmd"),
+        rendered.contains("STACK.md"),
         "restored category should render updated instructions value; got:\n{rendered}"
     );
 }
@@ -8946,10 +8973,10 @@ fn tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools() {
         },
     );
 
-    set_tools_cursor_to_label(&mut d, "[reset to defaults]");
-
-    // First activation arms (no change yet).
-    d.handle_key(press(KeyCode::Enter));
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Tools(pointer_actions::ToolsAction::Reset),
+    );
     match d.test_page() {
         TestPageRef::Tools(p) => assert!(p.reset.is_pending(), "first activation arms"),
         other => panic!("expected Tools, got {other:?}"),
@@ -8962,7 +8989,10 @@ fn tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools() {
     assert!(d.extended.tools.contains_key("my_custom"));
 
     // Second activation applies + saves.
-    d.handle_key(press(KeyCode::Enter));
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Tools(pointer_actions::ToolsAction::Reset),
+    );
     match d.test_page() {
         TestPageRef::Tools(p) => assert!(!p.reset.is_pending(), "applying disarms"),
         other => panic!("expected Tools, got {other:?}"),
@@ -9001,8 +9031,10 @@ fn tools_reset_pending_cancelled_by_navigation() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
-    set_tools_cursor_to_label(&mut d, "[reset to defaults]");
-    d.handle_key(press(KeyCode::Enter)); // arm
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Tools(pointer_actions::ToolsAction::Reset),
+    ); // arm
     match d.test_page() {
         TestPageRef::Tools(p) => assert!(p.reset.is_pending()),
         other => panic!("expected Tools, got {other:?}"),
@@ -9464,16 +9496,16 @@ fn tools_page_custom_commands_edit_typed_fields() {
     );
 }
 
-/// Move a category page's cursor onto its reset button row (the last
-/// selectable row).
+/// Arm a category page reset through the help-row ActionBar.
 fn move_to_reset_row(d: &mut SettingsDialog) {
-    let target = match d.test_page() {
-        TestPageRef::Category(p) => p.cursor_of_reset().expect("category has a reset button"),
+    match d.test_page() {
+        TestPageRef::Category(_) => {}
         _ => panic!("not on a category page"),
-    };
-    if let TestPageMut::Category(p) = d.test_page_mut() {
-        p.cursor = target;
     }
+    click_settings_action(
+        d,
+        &pointer_actions::SettingsPointerAction::Category(pointer_actions::CategoryAction::Reset),
+    );
 }
 
 #[test]
@@ -9501,7 +9533,6 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     d.extended.agent_guidance_files = vec!["MINE.md".into()];
 
     move_to_reset_row(&mut d);
-    d.handle_key(press(KeyCode::Enter)); // arm
     match d.test_page() {
         TestPageRef::Category(p) => assert!(p.reset.is_pending()),
         other => panic!("expected Category, got {other:?}"),
@@ -9509,7 +9540,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     // Arming must not change anything.
     assert_eq!(d.extended.tui.vim_mode, VimModeSetting::Disabled);
 
-    d.handle_key(press(KeyCode::Enter)); // apply
+    move_to_reset_row(&mut d);
     match d.test_page() {
         TestPageRef::Category(p) => {
             assert!(!p.reset.is_pending(), "applying disarms");
@@ -9586,8 +9617,7 @@ fn privacy_reset_restores_knobs_but_preserves_redaction_content() {
     d.extended.gitignore_allow = vec!["fixtures/secrets.env".into(), "docs/*.md".into()];
 
     move_to_reset_row(&mut d);
-    d.handle_key(press(KeyCode::Enter)); // arm
-    d.handle_key(press(KeyCode::Enter)); // apply
+    move_to_reset_row(&mut d);
 
     let def = ExtendedConfig::default();
     assert_eq!(d.extended.redact.enabled, def.redact.enabled);
@@ -9645,7 +9675,6 @@ fn category_reset_pending_cancelled_by_navigation() {
     let mut d = fresh_dialog(&tmp);
     enter_root_node(&mut d, "Interface");
     move_to_reset_row(&mut d);
-    d.handle_key(press(KeyCode::Enter)); // arm
     match d.test_page() {
         TestPageRef::Category(p) => assert!(p.reset.is_pending()),
         other => panic!("expected Category, got {other:?}"),

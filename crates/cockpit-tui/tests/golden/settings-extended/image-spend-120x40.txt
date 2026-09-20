@@ -4,11 +4,11 @@
   + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
                               ▌ ││Image generation spend policy                                                     ││ │
  SESSIONS                       ││Suggestions are display-only until you select and save them.                      ││ │
- no active sessions in all pr   ││> Request: unconfigured (blocked)  [suggestion $1]                                ││ │
-                                ││  Session: unconfigured (blocked)  [suggestion $10]                               ││ │
-                              no││  Project: unconfigured (blocked)  [suggestion $100]                              ││ │
-                              ┊ ││  Project window: unconfigured (blocked when project is finite)                   ││ │
-                              ▌ ││  Save reviewed choices                                                           ││ │
+ no active sessions in all pr   ││›  Request: unconfigured (blocked)  [suggestion $1]                               ││ │
+                                ││   Session: unconfigured (blocked)  [suggestion $10]                              ││ │
+                              no││   Project: unconfigured (blocked)  [suggestion $100]                             ││ │
+                              ┊ ││   Project window: unconfigured (blocked when project is finite)                  ││ │
+                              ▌ ││   Save reviewed choices                                                          ││ │
                                 ││Status: Policy operation failed: the disk-backed test daemon fake does not handle ││ █
                                 ││`get_image_spend_policy`                                                          ││ █
                                 ││                                                                                  ││ █
@@ -35,6 +35,6 @@
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓: select  enter: choose/save  e: exact u64 micros│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓: select  enter: choose/save  e: exact u64 micro │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

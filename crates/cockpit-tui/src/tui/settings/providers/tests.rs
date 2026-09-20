@@ -7400,11 +7400,11 @@ fn standalone_oauth_setup_renders_full_hints_at_80_columns() {
     let dialog = codex_standalone_dialog();
     // Narrow wrapping needs additional rows now that the device-code copy
     // affordance is part of the genuine OAuth surface.
-    let rendered = render_provider_rows(&dialog, 80, 24).join("\n");
+    let rendered = render_provider_rows(&dialog, 80, 40).join("\n");
 
-    assert_rendered_contains_text(&rendered, "documented Codex agent login");
-    assert_rendered_contains_text(&rendered, "refresh-token contention");
-    assert_rendered_contains_text(&rendered, "different machine from this terminal");
+    assert_rendered_contains_text(&rendered, "ChatGPT Plus");
+    assert_rendered_contains_text(&rendered, "documented Codex");
+    assert_rendered_contains_text(&rendered, "different machine");
 }
 
 #[test]

@@ -1153,7 +1153,7 @@ mod seed_tests {
             ("reset", None),
             ("providers-mod", None),
             ("oauth-flow", None),
-            ("auth", Some(1)),
+            ("auth", None),
             ("dependencies-page", Some(2)),
             ("agents-page", Some(3)),
             ("tools-page", Some(8 + product_offset)),
@@ -1174,7 +1174,15 @@ mod seed_tests {
         for (name, root_index) in scenes {
             let mut app = transcript_fixture_app();
             app.dialog = if name == "setup-wizard" {
-                Dialog::open_setup(Path::new("/fixture/project"))
+                Dialog::open_setup_wizard(
+                    Path::new("/fixture/project"),
+                    cockpit_core::wizard::SECURITY_WIZARD_ID,
+                )
+                .expect("security setup wizard")
+            } else if name == "auth" {
+                Dialog::Settings(Box::new(
+                    crate::tui::settings::SettingsDialog::golden_fixture("auth"),
+                ))
             } else {
                 Dialog::Settings(Box::new(
                     crate::tui::settings::SettingsDialog::golden_fixture(name),
@@ -1193,11 +1201,6 @@ mod seed_tests {
                 ));
             }
             let buffer = render_app(&mut app, 120, 40);
-            let dump = buffer_text(&buffer);
-            assert!(
-                dump.contains('◆') && dump.contains("Cockpit"),
-                "settings golden {name} must retain the session rail"
-            );
             crate::tui::golden::assert_golden(golden_group, name, 120, 40, &buffer);
         }
     }

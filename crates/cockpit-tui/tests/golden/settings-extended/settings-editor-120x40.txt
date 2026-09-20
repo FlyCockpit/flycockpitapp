@@ -29,12 +29,12 @@
                                 ││  Hint tool-call corrections     inherit                                          ││ █
                                 ││[save changes]                                                                    ││ █
                                 ││                                                                                  ││ █
-                                ││auto uses provider defaults and learned endpoint; completions POSTs /chat/completi││ █
-                               ⋯││Without a backup model, exceeding thresholds shows a slow-stream warning and keeps││ █
+                                ││auto uses provider defaults and learned endpoint; completions POSTs /chat/complet ││ █
+                               ⋯││Without a backup model, exceeding thresholds shows a slow-stream warning and keep ││ █
                                 ││enter: edit/cycle   h: back                                                       ││ █
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit/cycle  h: back  q: cl│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit/cycle  h: back  q: c │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

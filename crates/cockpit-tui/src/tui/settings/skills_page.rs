@@ -82,8 +82,7 @@ impl SettingsCx {
         // entries, then the `[+ add]` synthetic row, then the
         // `[reset to defaults]` button (the last navigable index).
         let add_cursor = TOGGLE_ROWS + dir_count;
-        let reset_cursor = add_cursor + 1;
-        let nav_len = reset_cursor + 1;
+        let nav_len = add_cursor + 1;
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
@@ -114,20 +113,7 @@ impl SettingsCx {
                 }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if p.cursor == reset_cursor {
-                    // Page-level reset: arm on first activation, apply on
-                    // the second.
-                    if p.reset.activate() == ResetOutcome::Apply {
-                        self.extended.skills =
-                            cockpit_config::extended::SkillsConfig::seeded_default();
-                        p.cursor = p
-                            .cursor
-                            .min(TOGGLE_ROWS + self.extended.skills.scan_dirs.len());
-                        p.status = save_status(self.save_extended());
-                    } else {
-                        p.status = None;
-                    }
-                } else if p.cursor == 0 {
+                if p.cursor == 0 {
                     // Toggle auto-`!`.
                     self.extended.skills.auto_bang_commands =
                         !self.extended.skills.auto_bang_commands;
@@ -382,20 +368,6 @@ impl SettingsCx {
                 true,
                 None,
             )));
-
-            // `[reset to defaults]` button — the last navigable row, just
-            // below `[+ add directory]`. Hidden (like `[+ add]`) while a
-            // row is grabbed.
-            let reset_idx = TOGGLE_ROWS + self.extended.skills.scan_dirs.len() + 1;
-            lines.push(
-                p.reset
-                    .render_line(p.cursor == reset_idx, "reset to defaults"),
-            );
-            controls.push(Some((
-                SettingsPointerAction::Skills(SkillsAction::Reset),
-                true,
-                None,
-            )));
         }
 
         if p.grabbed.is_some() {
@@ -461,6 +433,21 @@ impl SettingsPage for SkillsPage {
         let SettingsPointerAction::Skills(action) = action else {
             return Nav::Stay;
         };
+        if matches!(action, SkillsAction::Reset) {
+            match self.reset.activate() {
+                ResetOutcome::Apply => {
+                    cx.extended.skills = cockpit_config::extended::SkillsConfig::seeded_default();
+                    self.cursor = self
+                        .cursor
+                        .min(TOGGLE_ROWS + cx.extended.skills.scan_dirs.len());
+                    self.status = save_status(cx.save_extended());
+                }
+                ResetOutcome::Armed => {
+                    self.status = None;
+                }
+            }
+            return Nav::Stay;
+        }
         if let SkillsAction::ConfirmDeleteScanDirectory(
             ScanDirectoryId(path),
             ConfirmationChoice::Confirm,
@@ -520,7 +507,7 @@ impl SettingsPage for SkillsPage {
                 TOGGLE_ROWS + index
             }
             SkillsAction::AddScanDirectory => TOGGLE_ROWS + cx.extended.skills.scan_dirs.len(),
-            SkillsAction::Reset => TOGGLE_ROWS + cx.extended.skills.scan_dirs.len() + 1,
+            SkillsAction::Reset => return Nav::Stay,
             SkillsAction::DeleteScanDirectory(_)
             | SkillsAction::ConfirmDeleteScanDirectory(_, _) => return Nav::Stay,
         };
@@ -537,7 +524,7 @@ impl SettingsPage for SkillsPage {
     ) -> Nav {
         if region == SettingsScrollRegionId("skills") && self.grabbed.is_none() {
             self.pointer_delete_pending = None;
-            let last = TOGGLE_ROWS + cx.extended.skills.scan_dirs.len() + 1;
+            let last = TOGGLE_ROWS + cx.extended.skills.scan_dirs.len();
             self.reset.disarm();
             self.cursor = self.cursor.saturating_add_signed(delta).min(last);
         }
@@ -561,6 +548,30 @@ impl SettingsPage for SkillsPage {
             "type to edit dir  enter: save  esc: cancel"
         } else {
             "↑/↓/Tab/Shift+Tab  enter: toggle / edit  a: add dir  d: delete  esc/h: back  q: close"
+        }
+    }
+
+    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{SettingsPointerAction, SkillsAction};
+        if self.grabbed.is_some() {
+            return super::shell::SettingsHelpRow {
+                actions: Vec::new(),
+                hover: None,
+            };
+        }
+        let label = if self.reset.is_pending() {
+            "confirm reset"
+        } else {
+            "reset to defaults"
+        };
+        super::shell::SettingsHelpRow {
+            actions: vec![super::shell::SettingsHelpAction {
+                label,
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Skills(SkillsAction::Reset),
+            }],
+            hover: None,
         }
     }
 
@@ -781,15 +792,13 @@ mod tests {
         assert_eq!(dir_index(TOGGLE_ROWS + 2, 2), None);
     }
 
-    /// Place the cursor on the `[reset to defaults]` row for the current
-    /// scan-dir count.
-    fn put_on_reset_row(d: &mut SettingsDialog) {
-        let reset_cursor = TOGGLE_ROWS + d.extended.skills.scan_dirs.len() + 1;
-        if let TestPageMut::Skills(p) = d.test_page_mut() {
-            p.cursor = reset_cursor;
-        } else {
-            panic!("expected Skills page");
-        }
+    /// Arm or apply the help-row reset action.
+    fn click_skills_reset(d: &mut SettingsDialog) {
+        use crate::tui::settings::pointer_actions::{SettingsPointerAction, SkillsAction};
+        super::super::tests::click_settings_action(
+            d,
+            &SettingsPointerAction::Skills(SkillsAction::Reset),
+        );
     }
 
     #[test]
@@ -802,10 +811,9 @@ mod tests {
         d.extended.skills.ancestor_walk = true;
         d.extended.skills.auto_bang_commands = true;
 
-        put_on_reset_row(&mut d);
+        click_skills_reset(&mut d);
 
         // First activation arms only.
-        d.handle_key(press(KeyCode::Enter));
         match d.test_page() {
             TestPageRef::Skills(p) => assert!(p.reset.is_pending(), "first activation arms"),
             other => panic!("expected Skills, got {other:?}"),
@@ -817,7 +825,7 @@ mod tests {
         );
 
         // Second activation applies + saves.
-        d.handle_key(press(KeyCode::Enter));
+        click_skills_reset(&mut d);
         match d.test_page() {
             TestPageRef::Skills(p) => assert!(!p.reset.is_pending(), "applying disarms"),
             other => panic!("expected Skills, got {other:?}"),
@@ -839,8 +847,7 @@ mod tests {
     fn skills_reset_pending_cancelled_by_navigation() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_skills_dialog(&tmp);
-        put_on_reset_row(&mut d);
-        d.handle_key(press(KeyCode::Enter)); // arm
+        click_skills_reset(&mut d); // arm
         match d.test_page() {
             TestPageRef::Skills(p) => assert!(p.reset.is_pending()),
             other => panic!("expected Skills, got {other:?}"),

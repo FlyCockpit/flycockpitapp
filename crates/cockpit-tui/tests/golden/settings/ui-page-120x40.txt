@@ -4,7 +4,7 @@
   + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
                               ▌ ││Instructions Files                                                                ││ │
  SESSIONS                       ││                                                                                  ││ │
- no active sessions in all pr   ││Only the first matching file (in this order) is injected into prompts. Walks up fr││ │
+ no active sessions in all pr   ││Only the first matching file (in this order) is injected into prompts. Walks up f ││ │
                                 ││om cwd to the git root.                                                           ││ │
                               no││                                                                                  ││ │
                               ┊ ││› AGENTS.md                                                                       ││ │
@@ -35,6 +35,6 @@
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  a: add  enter: grab to rename/reo│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  a: add  enter: grab to rename/re │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

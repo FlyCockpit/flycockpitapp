@@ -687,7 +687,7 @@ impl SettingsPage for ImageSpendPage {
     }
 
     fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        let marker = |row| if self.cursor == row { ">" } else { " " };
+        let marker = |row| super::shell::marker(self.cursor == row);
         let suggestions = ImageSpendSuggestions::DISPLAY_ONLY;
         let epoch = match &self.draft.project_epoch {
             None => "unconfigured (blocked when project is finite)".into(),

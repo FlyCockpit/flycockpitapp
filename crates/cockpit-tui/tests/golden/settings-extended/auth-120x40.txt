@@ -1,14 +1,14 @@
                                                                                                                ● Working
- ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models ────╮e]
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models › Ad╮e]
                               ──│[Close settings]  [Back]                                                            │──
   + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
-                              ▌ ││  [refetch provider models]                                                       ││ │
- SESSIONS                       ││  [+ add provider]                                                                ││ │
- no active sessions in all pr   ││  on unlisted models (m): ask (default — prompt each fetch)                       ││ │
-                                ││                                                                                  ││ │
-                              no││› fixture    https://api.example.invalid/v1  1 models                             ││ │
-                              ┊ ││  [Delete]                                                                        ││ │
-                              ▌ ││                                                                                  ││ │
+                              ▌ ││Add your API key                                                                  ││ │
+ SESSIONS                       ││Paste a key for Anthropic (Claude API).                                           ││ │
+ no active sessions in all pr   ││Template: Anthropic (Claude API)                                                  ││ │
+                                ││╭ API key ───────────────────────────────────────────────────────────────────────╮││ │
+                              no│││ Paste API key                                                                  │││ │
+                              ┊ ││╰────────────────────────────────────────────────────────────────────────────────╯││ │
+                              ▌ ││Hint: starts with sk-ant- · https://console.anthropic.com/settings/keys           ││ │
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
@@ -35,6 +35,6 @@
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit/refetch-all  R: refet│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  type/paste  enter: save  esc: cancel                │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

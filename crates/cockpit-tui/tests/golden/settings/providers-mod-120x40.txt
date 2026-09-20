@@ -21,7 +21,7 @@
                                 ││  Anthropic (Claude API)  (anthropic)                                             ││ █
                                 ││  Xiaomi MiMo  (xiaomi-mimo)                                                      ││ █
                               ▌ ││                                                                                  ││ █
-                              ▌ ││Subscription login via device code at auth.openai.com/codex/device; no OPENAI_API_││ █
+                              ▌ ││Subscription login via device code at auth.openai.com/codex/device; no OPENAI_API ││ █
                                 ││                                                                                  ││ █
                               ▌ ││                                                                                  ││ █
                                 ││                                                                                  ││ █

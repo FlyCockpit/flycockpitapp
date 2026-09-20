@@ -4,7 +4,7 @@
   + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
                               ▌ ││Skills                                                                            ││ │
  SESSIONS                       ││                                                                                  ││ │
- no active sessions in all pr   ││Scan dirs hold `<name>/SKILL.md` skills. Entries support `~`, `$VAR`, and relative││ │
+ no active sessions in all pr   ││Scan dirs hold `<name>/SKILL.md` skills. Entries support `~`, `$VAR`, and relativ ││ │
                                 ││ paths. The list ships pre-seeded (~/.agents/skills + ./.agents/skills); an empty ││ │
                               no││list scans nothing. Ancestor walk extends relative entries to every dir up to the ││ │
                               ┊ ││git root.                                                                         ││ │
@@ -14,7 +14,7 @@
                                 ││                                                                                  ││ █
                                 ││scan directories                                                                  ││ █
                                 ││  [+ add directory]                                                               ││ █
-                                ││  [reset to defaults]  enter: reset                                               ││ █
+                                ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
@@ -35,6 +35,6 @@
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: toggle / edit  a: add dir │ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: togg [ reset to defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

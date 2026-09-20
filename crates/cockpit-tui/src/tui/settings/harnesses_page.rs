@@ -352,8 +352,7 @@ impl SettingsCx {
         // Rows: 0..n harnesses, then [+ add], [seed presets], [reset].
         let add_row = n;
         let seed_row = n + 1;
-        let reset_row = n + 2;
-        let total = n + 3;
+        let total = n + 2;
 
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
@@ -400,13 +399,6 @@ impl SettingsCx {
                     s.adding = Some(TextField::default());
                 } else if s.cursor == seed_row {
                     s.status = self.seed_presets_status();
-                } else if s.cursor == reset_row {
-                    if s.reset.activate() == ResetOutcome::Apply {
-                        self.extended.harnesses.clear();
-                        s.status = self.seed_presets_status();
-                    } else {
-                        s.status = None;
-                    }
                 }
             }
             _ => {}
@@ -583,7 +575,6 @@ impl SettingsCx {
 
         let add_row = names.len();
         let seed_row = names.len() + 1;
-        let reset_row = names.len() + 2;
         lines.push(Line::default());
         bindings.push((lines.len(), super::pointer_actions::HarnessesAction::Add));
         lines.push(synthetic_row("[+ add harness]", s.cursor == add_row));
@@ -595,14 +586,6 @@ impl SettingsCx {
             "[seed installed presets]",
             s.cursor == seed_row,
         ));
-        bindings.push((
-            lines.len(),
-            super::pointer_actions::HarnessesAction::ResetAndSeedPresets,
-        ));
-        lines.push(
-            s.reset
-                .render_line(s.cursor == reset_row, "reset to verified presets"),
-        );
         if let Some(name) = names.get(s.cursor) {
             lines.push(Line::default());
             if s.delete_pending {
@@ -909,7 +892,18 @@ impl SettingsPage for HarnessesPage {
             (
                 HarnessesPage::List(state),
                 super::pointer_actions::HarnessesAction::ResetAndSeedPresets,
-            ) => state.cursor = cx.harness_names().len() + 2,
+            ) => {
+                match state.reset.activate() {
+                    ResetOutcome::Apply => {
+                        cx.extended.harnesses.clear();
+                        state.status = cx.seed_presets_status();
+                    }
+                    ResetOutcome::Armed => {
+                        state.status = None;
+                    }
+                }
+                return Nav::Stay;
+            }
             (
                 HarnessesPage::Edit(state),
                 super::pointer_actions::HarnessesAction::EditField(id),
@@ -1021,6 +1015,30 @@ impl SettingsPage for HarnessesPage {
                     "↑/↓/Tab/Shift+Tab  enter: edit / cycle  esc/h: back to list  q: close"
                 }
             }
+        }
+    }
+
+    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{HarnessesAction, SettingsPointerAction};
+        let HarnessesPage::List(state) = self else {
+            return super::shell::SettingsHelpRow {
+                actions: Vec::new(),
+                hover: None,
+            };
+        };
+        let label = if state.reset.is_pending() {
+            "confirm reset"
+        } else {
+            "reset to verified presets"
+        };
+        super::shell::SettingsHelpRow {
+            actions: vec![super::shell::SettingsHelpAction {
+                label,
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Harnesses(HarnessesAction::ResetAndSeedPresets),
+            }],
+            hover: None,
         }
     }
 

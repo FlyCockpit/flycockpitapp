@@ -11,11 +11,11 @@
                               ▌ ││  debounce ms             150                                                     ││ │
                                 ││  document timeout ms     5000                                                    ││ █
                                 ││  workspace timeout ms    10000                                                   ││ █
-                                ││  [restore LSP defaults]  enter: reset                                            ││ █
-                                ││  rust-analyzer           [Check] [Install] [Uninstall] [Restart]  installed; cock││ █
-                                ││  typescript-language-server[Check] [Install] [Uninstall] [Restart]  missing; cock││ █
-                                ││  pyright                 [Check] [Install] [Uninstall] [Restart]  missing; cockpi││ █
-                                ││  gopls                   [Check] [Install] [Uninstall] [Restart]  missing; cockpi││ █
+                                ││  rust-analyzer           [Check] [Install] [Uninstall] [Restart]  installed; coc ││ █
+                                ││  typescript-language-server[Check] [Install] [Uninstall] [Restart]  missing; coc ││ █
+                                ││  pyright                 [Check] [Install] [Uninstall] [Restart]  missing; cockp ││ █
+                                ││  gopls                   [Check] [Install] [Uninstall] [Restart]  missing; cockp ││ █
+                                ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
@@ -35,6 +35,6 @@
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: toggle / edit  r: reset  e│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: t [ restore LSP defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

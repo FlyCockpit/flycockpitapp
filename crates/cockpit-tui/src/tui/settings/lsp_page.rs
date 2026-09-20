@@ -43,11 +43,10 @@ pub(super) enum LspRow {
     DebounceMs,
     DocumentTimeoutMs,
     WorkspaceTimeoutMs,
-    Reset,
     Server(usize),
 }
 
-pub(super) const LSP_NAV_ROWS: [LspRow; 9] = [
+pub(super) const LSP_NAV_ROWS: [LspRow; 8] = [
     LspRow::Enabled,
     LspRow::AutoInstall,
     LspRow::Diagnostics,
@@ -56,7 +55,6 @@ pub(super) const LSP_NAV_ROWS: [LspRow; 9] = [
     LspRow::DebounceMs,
     LspRow::DocumentTimeoutMs,
     LspRow::WorkspaceTimeoutMs,
-    LspRow::Reset,
 ];
 
 pub(super) const LSP_SERVER_ROW_START: usize = LSP_NAV_ROWS.len();
@@ -242,7 +240,6 @@ impl SettingsPage for LspPage {
                             cx.extended.lsp.diagnostics.workspace_timeout_ms,
                         );
                     }
-                    LspRow::Reset => cx.activate_lsp_reset(self),
                     LspRow::Server(idx) => {
                         self.reset.disarm();
                         cx.queue_lsp_action(idx, LspControlAction::Check, self);
@@ -318,7 +315,10 @@ impl SettingsPage for LspPage {
                 }
                 return Nav::Stay;
             }
-            PointerLspAction::Reset => row_index(LspRow::Reset),
+            PointerLspAction::Reset => {
+                cx.activate_lsp_reset(self);
+                return Nav::Stay;
+            }
             PointerLspAction::Check(_)
             | PointerLspAction::Install(_)
             | PointerLspAction::Uninstall(_)
@@ -364,6 +364,24 @@ impl SettingsPage for LspPage {
             "type value  enter: save  esc: cancel"
         } else {
             "↑/↓/Tab/Shift+Tab  enter: toggle / edit  r: reset  esc/h: back  q: close"
+        }
+    }
+
+    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{LspAction, SettingsPointerAction};
+        let label = if self.reset.is_pending() {
+            "confirm reset"
+        } else {
+            "restore LSP defaults"
+        };
+        super::shell::SettingsHelpRow {
+            actions: vec![super::shell::SettingsHelpAction {
+                label,
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Lsp(LspAction::Reset),
+            }],
+            hover: None,
         }
     }
 
@@ -444,8 +462,6 @@ pub(super) fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>,
             "workspace timeout ms",
             d.workspace_timeout_ms,
         ),
-        p.reset
-            .render_line(p.cursor == row_index(LspRow::Reset), "restore LSP defaults"),
     ];
     if let Some(cwd) = project_context.project_root() {
         for (idx, server) in cockpit_core::daemon::lsp::builtin_server_views(cwd, &dialog.extended)
@@ -653,7 +669,6 @@ impl SettingsCx {
                     p,
                     PointerLspEdit::WorkspaceTimeoutMs,
                 )),
-                LspRow::Reset => Some(PointerLspAction::Reset),
                 // The unavailable sentinel is explanatory text, not an
                 // enabled Check control. A real project source below supplies
                 // stable server identities and actionable controls.

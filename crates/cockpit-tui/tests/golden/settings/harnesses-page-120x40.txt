@@ -9,9 +9,9 @@
                               no││                                                                                  ││ │
                               ┊ ││› [+ add harness]                                                                 ││ │
                               ▌ ││  [seed installed presets]                                                        ││ │
-                                ││  [reset to verified presets]  enter: reset                                       ││ █
                                 ││                                                                                  ││ █
                                 ││settings target is not a daemon-discovered layer                                  ││ █
+                                ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
@@ -35,6 +35,6 @@
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit/seed  a: add  d: dele│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  ent [ reset to verified presets ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

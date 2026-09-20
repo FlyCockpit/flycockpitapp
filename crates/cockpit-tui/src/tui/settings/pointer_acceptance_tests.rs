@@ -136,6 +136,9 @@ pub(super) fn record_dispatched_action(action: &SettingsPointerAction) {
 }
 
 fn click_target(dialog: &mut super::SettingsDialog, target: &SettingsPointerTarget) {
+    if let RenderAction::Page(action) = &target.action {
+        record_rendered_action(action, target.enabled);
+    }
     for kind in [
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         MouseEventKind::Up(crossterm::event::MouseButton::Left),

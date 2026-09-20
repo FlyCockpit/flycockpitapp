@@ -2896,6 +2896,14 @@ pub(super) trait SettingsPage: Any {
     }
     fn title(&self, cx: &SettingsCx) -> String;
     fn help_text(&self, cx: &SettingsCx) -> &'static str;
+    /// Optional help-row ActionBar actions (Save/Cancel/Reset). When empty,
+    /// the dialog footer shows help text only.
+    fn help_row_actions(&self, _cx: &SettingsCx) -> shell::SettingsHelpRow<'_> {
+        shell::SettingsHelpRow {
+            actions: Vec::new(),
+            hover: None,
+        }
+    }
     /// Resolve a semantic control registered by this page. Implementations
     /// must validate the stable identity against current state before
     /// mutating; stale targets therefore become inert after reloads.
@@ -7617,11 +7625,7 @@ impl SettingsDialog {
         settings.page = match scene {
             "ui-page" => instructions_page(ui_page::InstructionsPage::new()),
             "string-list" => string_list_page(string_list::StringListPage::agent_dirs()),
-            "reset" => {
-                let mut page = CategoryPage::new(Category::Behavior);
-                page.cursor = page.cursor_of_reset().expect("Behavior reset row");
-                category_page(page)
-            }
+            "reset" => category_page(CategoryPage::new(Category::Behavior)),
             "settings-editor" => providers_page(ProvidersPage::ProviderSettings {
                 editor: settings_editor::SettingsEditor::for_provider("fixture", &fixture_entry),
                 parent: Box::new(providers::EditState::new(
@@ -7640,6 +7644,17 @@ impl SettingsDialog {
                 agents_page(page)
             }
             "providers-mod" => providers_page(ProvidersPage::Add(providers::AddState::new())),
+            "auth" => {
+                let template = cockpit_core::providers::template_by_id("anthropic")
+                    .expect("anthropic template");
+                let mut add = providers::AddState::new();
+                add.template = Some(template);
+                add.id_field.set(template.id);
+                add.url_field.set(template.url);
+                add.run.return_to("api-key").expect("api-key step");
+                add.auth_method_cursor = 0;
+                providers_page(ProvidersPage::Add(add))
+            }
             "oauth-flow" => providers_page(ProvidersPage::OAuthSetup {
                 state: Box::new(providers::OAuthFlowState::new(
                     providers::OAuthProvider::Codex,
@@ -8655,11 +8670,55 @@ impl SettingsDialog {
         let help = if self.pointer_surface.enabled.get() {
             // Pointer hints stay leftmost so an 80-column pane still shows
             // both phrases when the page help string is the longer picker form.
-            format!("click: activate  wheel: scroll  {}", self.help_text())
+            format!(
+                "click: activate  wheel: scroll  {}",
+                self.page.help_text(&self.cx)
+            )
         } else {
-            self.help_text().to_string()
+            self.page.help_text(&self.cx).to_string()
         };
-        frame.render_widget(help_line(&help), layout[2]);
+        let help_row = self.page.help_row_actions(&self.cx);
+        shell::render_settings_help_row(frame, layout[2], &help, &help_row);
+        if self.pointer_surface.enabled.get() {
+            let bar_width = if help_row.actions.is_empty() {
+                0
+            } else {
+                let buttons: Vec<_> = help_row
+                    .actions
+                    .iter()
+                    .map(|action| crate::tui::chrome::ActionButton {
+                        label: action.label,
+                        enabled: action.enabled,
+                        primary: action.primary,
+                    })
+                    .collect();
+                crate::tui::chrome::action_bar_width(&buttons)
+            };
+            let bar_x = layout[2].right().saturating_sub(bar_width).max(layout[2].x);
+            for (index, action) in help_row.actions.iter().enumerate() {
+                let label = format!("[{}]", action.label);
+                let width = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 2;
+                let x = bar_x.saturating_add(
+                    help_row
+                        .actions
+                        .iter()
+                        .take(index)
+                        .map(|prior| {
+                            unicode_width::UnicodeWidthStr::width(
+                                format!("[{}]", prior.label).as_str(),
+                            ) as u16
+                                + 2
+                        })
+                        .sum(),
+                );
+                self.pointer_surface.register(shell::SettingsPointerTarget {
+                    rect: Rect::new(x, layout[2].y, width, 1),
+                    action: shell::SettingsPointerAction::Page(action.action.clone()),
+                    enabled: action.enabled,
+                    disabled_reason: None,
+                });
+            }
+        }
     }
 
     fn title(&self) -> String {
@@ -10352,7 +10411,7 @@ fn render_model_setup_choice(
     pending: Option<&(String, String)>,
     cursor: usize,
 ) {
-    let block = product_dialog_block(" Setup — model ");
+    let block = product_dialog_block(" Configure model ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);

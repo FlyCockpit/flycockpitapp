@@ -506,7 +506,6 @@ impl SettingsCx {
             rows.push(ToolRow::McpTool { server, tool });
         }
         rows.push(ToolRow::McpJump);
-        rows.push(ToolRow::Reset);
         rows
     }
 
@@ -563,14 +562,6 @@ impl SettingsCx {
 
         push_section(&mut lines, "MCP tools");
         self.push_mcp_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
-
-        lines.push(Line::default());
-        let reset_row = row_idx;
-        bindings.push((lines.len(), SettingsControlId(reset_row as u64)));
-        lines.push(
-            p.reset
-                .render_line(p.cursor == reset_row, "reset to defaults"),
-        );
 
         if let Some(row) = self.tools_page_rows().get(p.cursor) {
             match row {
@@ -1171,6 +1162,16 @@ impl SettingsPage for ToolsPage {
             return Nav::Stay;
         };
         use super::pointer_actions::{ToolFieldId, ToolsAction};
+        if matches!(action, ToolsAction::Reset) {
+            match self.reset.activate() {
+                ResetOutcome::Apply => {
+                    cx.reset_tools_to_defaults();
+                    self.status = save_status(cx.save_extended());
+                }
+                ResetOutcome::Armed => {}
+            }
+            return Nav::Stay;
+        }
         let key = match &action {
             ToolsAction::DeleteUserTool(_) if self.delete_pending.is_some() => {
                 Some(KeyCode::Char('d'))
@@ -1277,6 +1278,24 @@ impl SettingsPage for ToolsPage {
             "type to edit  enter: apply  esc: cancel"
         } else {
             "↑/↓/Tab/Shift+Tab  enter: edit/cycle  t: toggle  d: remove  r: reset row  esc/h: back  q: close"
+        }
+    }
+
+    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{SettingsPointerAction, ToolsAction};
+        let label = if self.reset.is_pending() {
+            "confirm reset"
+        } else {
+            "reset to defaults"
+        };
+        super::shell::SettingsHelpRow {
+            actions: vec![super::shell::SettingsHelpAction {
+                label,
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Tools(ToolsAction::Reset),
+            }],
+            hover: None,
         }
     }
 

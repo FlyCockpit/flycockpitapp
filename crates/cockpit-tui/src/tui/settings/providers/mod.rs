@@ -55,7 +55,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::tui::settings::provider_entries_equal;
 use crate::tui::textfield::TextField;
-use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
+use crate::tui::theme::{FOG, FOG_INDEX, INK, INK_INDEX, resolve_color};
 use cockpit_config::providers::{
     HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy, OnUnlistedModelsFetch,
     ProviderEntry, ProviderModelCatalog, WireApi, format_model_fetch_age,
@@ -3697,6 +3697,11 @@ impl SettingsCx {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut controls = Vec::new();
 
+        if s.is_step("api-key") {
+            self.render_add_api_key_step(frame, area, s);
+            return;
+        }
+
         match s.run.current_step_id() {
             Some("template") => {
                 lines.push(Line::from(Span::styled(
@@ -3835,31 +3840,6 @@ impl SettingsCx {
                         "Local vault mode is machine-bound; losing its private wrapping-key file makes stored credentials unrecoverable.",
                         muted,
                     )));
-                }
-                if s.is_step("api-key") {
-                    lines.push(Line::default());
-                    let (title, subtitle) = crate::tui::onboarding::provider_api_key_copy(t);
-                    lines.push(Line::from(Span::styled(
-                        title.to_string(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                    lines.push(Line::from(Span::styled(subtitle, muted)));
-                    let masked = if s.api_key_field.text().is_empty() {
-                        ""
-                    } else {
-                        "••••••••"
-                    };
-                    controls.push((lines.len(), 0));
-                    lines.push(Line::from(vec![
-                        Span::styled("api key: ", muted),
-                        Span::styled(masked.to_string(), Style::default().fg(Color::White)),
-                    ]));
-                    if let Some(meta) = t.api_key {
-                        lines.push(Line::from(Span::styled(
-                            format!("Hint: {} · {}", meta.format_hint, meta.console_url),
-                            muted,
-                        )));
-                    }
                 }
                 if s.is_step("env-var") {
                     lines.push(Line::default());
@@ -4051,6 +4031,68 @@ impl SettingsCx {
         }
         if s.is_step("headers") && s.headers.is_editing() {
             render_header_edit_popup(self, frame, area, &s.headers);
+        }
+    }
+
+    fn render_add_api_key_step(&self, frame: &mut Frame, area: Rect, s: &AddState) {
+        use ratatui::layout::{Constraint, Layout};
+        let t = s.template.expect("template chosen");
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let (title, subtitle) = crate::tui::onboarding::provider_api_key_copy(t);
+        let layout = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(area);
+        frame.render_widget(
+            Line::from(Span::styled(
+                title.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            layout[0],
+        );
+        frame.render_widget(Line::from(Span::styled(subtitle, muted)), layout[1]);
+        frame.render_widget(
+            Line::from(vec![
+                Span::styled("Template: ", muted),
+                Span::styled(
+                    t.display.to_string(),
+                    Style::default().fg(resolve_color(INK, INK_INDEX)),
+                ),
+            ]),
+            layout[2],
+        );
+        if let Some(caret) = crate::tui::chrome::render_field_masked(
+            frame,
+            layout[3],
+            "API key",
+            s.api_key_field.as_ref(),
+            true,
+            "Paste API key",
+            true,
+        ) {
+            frame.set_cursor_position(caret);
+        }
+        if let Some(action) = provider_add_pointer_action(s, 0) {
+            self.pointer_surface
+                .register(super::shell::SettingsPointerTarget {
+                    rect: layout[3],
+                    action: super::shell::SettingsPointerAction::Page(action),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+        }
+        if let Some(meta) = t.api_key {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("Hint: {} · {}", meta.format_hint, meta.console_url),
+                    muted,
+                ))),
+                layout[4],
+            );
         }
     }
 

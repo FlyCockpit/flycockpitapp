@@ -7,10 +7,10 @@
  no active sessions in all pr   ││Status: not logged in                                                             ││ │
                                 ││Uses your ChatGPT Plus/Pro subscription quota via OpenAI's documented Codex agent ││ │
                               no││login.                                                                            ││ │
-                              ┊ ││Separate from the Codex CLI credential store; re-login if CLI use causes refresh-t││ │
+                              ┊ ││Separate from the Codex CLI credential store; re-login if CLI use causes refresh- ││ │
                               ▌ ││oken contention.                                                                  ││ │
                                 ││                                                                                  ││ █
-                                ││Using subscription credentials from this third-party client may violate the provid││ █
+                                ││Using subscription credentials from this third-party client may violate the provi ││ █
                                 ││er terms of service and may result in account suspension.                         ││ █
                                 ││                                                                                  ││ █
                                 ││Choose [I acknowledge the risk] to start subscription OAuth.                      ││ █

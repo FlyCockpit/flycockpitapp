@@ -35,6 +35,6 @@
                                 │││ plain  ctrl+s: save  ctrl+g: editor  enter: newline  esc: cancel               │││ █
                                 ││[Save]  [Cancel]  [Open in $EDITOR]──────────────────────────────────────────────╯││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  editing agent — ctrl+s: save  e: $EDITOR  esc: cance│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  editing agent — ctrl+s: save  e: $EDITOR  esc: canc │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

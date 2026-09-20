@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::button::{
@@ -121,6 +121,57 @@ pub(super) fn error_style() -> Style {
 
 pub(super) fn marker(selected: bool) -> &'static str {
     if selected { SELECTED_MARKER } else { "  " }
+}
+
+/// One footer action on the settings help row (excoc ActionBar idiom).
+pub(super) struct SettingsHelpAction<'a> {
+    pub label: &'a str,
+    pub enabled: bool,
+    pub primary: bool,
+    pub action: super::pointer_actions::SettingsPointerAction,
+}
+
+pub(super) struct SettingsHelpRow<'a> {
+    pub actions: Vec<SettingsHelpAction<'a>>,
+    pub hover: Option<usize>,
+}
+
+pub(super) fn render_settings_help_row(
+    frame: &mut Frame,
+    area: Rect,
+    help: &str,
+    row: &SettingsHelpRow<'_>,
+) {
+    let buttons: Vec<crate::tui::chrome::ActionButton<'_>> = row
+        .actions
+        .iter()
+        .map(|action| crate::tui::chrome::ActionButton {
+            label: action.label,
+            enabled: action.enabled,
+            primary: action.primary,
+        })
+        .collect();
+    let bar_width = if buttons.is_empty() {
+        0
+    } else {
+        crate::tui::chrome::action_bar_width(&buttons)
+    };
+    let help_width = area.width.saturating_sub(bar_width.saturating_add(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            help.to_string(),
+            Style::default().fg(resolve_color(FOG, FOG_INDEX)),
+        ))),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: help_width,
+            height: 1,
+        },
+    );
+    if !buttons.is_empty() {
+        crate::tui::chrome::render_action_bar(frame, area, &buttons, row.hover);
+    }
 }
 
 pub(super) fn selected_line_from_marker(lines: &[Line<'static>]) -> Option<usize> {
@@ -418,20 +469,8 @@ impl SettingsScrollStates {
         let mut states = self.states.borrow_mut();
         let state = states.entry(key.into()).or_default();
         state.select(selected);
-        // The enclosing rounded section owns the column immediately to the
-        // right of `area`; use that border column as the permanently reserved
-        // scrollbar track so page wrapping retains the full inner width.
-        let track_area = Rect {
-            width: area.width.saturating_add(1),
-            ..area
-        };
-        let content = crate::tui::chrome::scrollbar(
-            frame,
-            track_area,
-            item_count,
-            usize::from(area.height),
-            state.offset(),
-        );
+        let view_h = usize::from(area.height);
+        let content = crate::tui::chrome::scrollbar_content(area);
         frame.render_stateful_widget(
             List::new(items)
                 .scroll_padding(1)
@@ -439,6 +478,7 @@ impl SettingsScrollStates {
             content,
             state,
         );
+        crate::tui::chrome::scrollbar(frame, area, item_count, view_h, state.offset());
     }
 
     /// Render a list and publish its page-declared semantic controls from the

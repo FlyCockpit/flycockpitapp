@@ -1650,6 +1650,39 @@ const AUTOMATIC_RESTARTS_PER_MINUTE: usize = 3;
 /// Bounded wait for lifecycle resolution after the user accepts `[ Restart ]`.
 /// Persistent failure re-presents the restart decision instead of spinning forever.
 const DAEMON_RESTART_RESOLVE_ATTEMPTS: usize = 120;
+/// After transport/process-exit wins the inner `select!`, the reader may still
+/// enqueue `DaemonDraining` for a graceful `cockpit daemon restart`.
+const POST_DROP_DRAINING_DRAIN: Duration = Duration::from_millis(100);
+
+async fn absorb_late_daemon_draining(
+    client: &cockpit_client::DaemonClient,
+    saw_draining: bool,
+) -> bool {
+    if saw_draining {
+        return true;
+    }
+    let deadline = Instant::now() + POST_DROP_DRAINING_DRAIN;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        if matches!(event, proto::Event::DaemonDraining { .. }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn post_drop_trusted_restart(
+    saw_draining: bool,
+    guard: &mut AutomaticRestartGuard,
+    now: Instant,
+) -> bool {
+    saw_draining && guard.allow(now)
+}
 
 struct AutomaticRestartGuard {
     attempts: VecDeque<Instant>,
@@ -3306,7 +3339,9 @@ async fn try_spawn_inner(
                 // replacement attach must always install a fresh watcher.
                 process_watch = None;
 
-                let trusted_restart = saw_draining && automatic_restarts.allow(Instant::now());
+                saw_draining = absorb_late_daemon_draining(&client, saw_draining).await;
+                let trusted_restart =
+                    post_drop_trusted_restart(saw_draining, &mut automatic_restarts, Instant::now());
                 let mut recovery_lifetime_client = None;
                 if !trusted_restart {
                     push_turn_event(
@@ -7963,18 +7998,72 @@ mod tests {
         assert!(!guard.allow(start + Duration::from_secs(61)));
     }
 
+    fn test_client_with_events(
+        events: mpsc::Receiver<proto::Event>,
+    ) -> cockpit_client::DaemonClient {
+        let (requests, _requests_rx) = mpsc::channel(1);
+        cockpit_client::DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+            requests,
+            events,
+        })
+    }
+
+    #[tokio::test]
+    async fn absorb_late_daemon_draining_after_process_exit_waits_for_draining_frame() {
+        let (event_tx, event_rx) = mpsc::channel(4);
+        let client = test_client_with_events(event_rx);
+        let (mut watch, exited) = cockpit_client::DaemonProcessWatch::channel();
+        exited.send(true).expect("watch receiver remains live");
+        assert_eq!(watch.wait_for_exit().await, Ok(()));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            event_tx
+                .send(proto::Event::DaemonDraining { forced: false })
+                .await
+                .ok();
+        });
+        assert!(absorb_late_daemon_draining(&client, false).await);
+        let mut guard = AutomaticRestartGuard::new();
+        assert!(post_drop_trusted_restart(true, &mut guard, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn absorb_late_daemon_draining_without_draining_frame_stays_untrusted() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let client = test_client_with_events(event_rx);
+        assert!(!absorb_late_daemon_draining(&client, false).await);
+        let mut guard = AutomaticRestartGuard::new();
+        assert!(!post_drop_trusted_restart(
+            false,
+            &mut guard,
+            Instant::now()
+        ));
+    }
+
     #[test]
     fn fourth_trusted_daemon_drop_requires_restart_prompt() {
         let start = Instant::now();
         let mut guard = AutomaticRestartGuard::new();
-        let saw_draining = true;
-        assert!(saw_draining && guard.allow(start));
-        assert!(saw_draining && guard.allow(start + Duration::from_secs(10)));
-        assert!(saw_draining && guard.allow(start + Duration::from_secs(20)));
+        for secs in [0_u64, 10, 20] {
+            assert!(
+                post_drop_trusted_restart(true, &mut guard, start + Duration::from_secs(secs)),
+                "trusted draining drop {secs}s must auto-reconnect"
+            );
+        }
+        let trusted = post_drop_trusted_restart(true, &mut guard, start + Duration::from_secs(30));
         assert!(
-            !(saw_draining && guard.allow(start + Duration::from_secs(30))),
+            !trusted,
             "fourth trusted restart in one minute must present the restart decision"
         );
+        let fourth_drop_event = if trusted {
+            TurnEvent::DaemonLinkReconnecting {
+                restarting: true,
+                attempt: 1,
+            }
+        } else {
+            TurnEvent::DaemonRestartPrompt
+        };
+        assert!(matches!(fourth_drop_event, TurnEvent::DaemonRestartPrompt));
     }
 
     #[tokio::test]

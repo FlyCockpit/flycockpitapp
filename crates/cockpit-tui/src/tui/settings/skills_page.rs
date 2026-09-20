@@ -21,7 +21,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::tui::textfield::TextField;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 
 use super::grab;
 use super::pointer_actions::{
@@ -210,7 +210,7 @@ impl SettingsCx {
     }
 
     pub(super) fn render_skills_page(&self, frame: &mut Frame, area: Rect, p: &SkillsPage) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(Span::styled(
@@ -236,7 +236,7 @@ impl SettingsCx {
 
         // Row 0: auto-`!` toggle.
         let toggle_on_cursor = p.cursor == 0;
-        let toggle_marker = if toggle_on_cursor { "▸ " } else { "  " };
+        let toggle_marker = if toggle_on_cursor { "› " } else { "  " };
         let toggle_label_style = if toggle_on_cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {
@@ -260,7 +260,7 @@ impl SettingsCx {
 
         // Row 1: ancestor-walk toggle.
         let walk_on_cursor = p.cursor == 1;
-        let walk_marker = if walk_on_cursor { "▸ " } else { "  " };
+        let walk_marker = if walk_on_cursor { "› " } else { "  " };
         let walk_label_style = if walk_on_cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {
@@ -367,7 +367,7 @@ impl SettingsCx {
         if p.grabbed.is_none() {
             let add_idx = TOGGLE_ROWS + self.extended.skills.scan_dirs.len();
             let add_selected = p.cursor == add_idx;
-            let marker = if add_selected { "▸ " } else { "  " };
+            let marker = if add_selected { "› " } else { "  " };
             let style = if add_selected {
                 yellow.add_modifier(Modifier::BOLD)
             } else {

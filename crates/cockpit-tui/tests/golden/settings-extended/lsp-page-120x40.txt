@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › LSP ────────────────────────────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
+                              ▌ ││› enabled                 on                                                      ││ │
+ SESSIONS                       ││  auto install            ask                                                     ││ │
+ no active sessions in all pr   ││  diagnostics             on                                                      ││ │
+                                ││  other files limit       5                                                       ││ │
+                              no││  per-file limit          20                                                      ││ │
+                              ┊ ││  severity                error (errors only)                                     ││ │
+                              ▌ ││  debounce ms             150                                                     ││ │
+                                ││  document timeout ms     5000                                                    ││ █
+                                ││  workspace timeout ms    10000                                                   ││ █
+                                ││  [restore LSP defaults]  enter: reset                                            ││ █
+                                ││  rust-analyzer           [Check] [Install] [Uninstall] [Restart]  installed; cock││ █
+                                ││  typescript-language-server[Check] [Install] [Uninstall] [Restart]  missing; cock││ █
+                                ││  pyright                 [Check] [Install] [Uninstall] [Restart]  missing; cockpi││ █
+                                ││  gopls                   [Check] [Install] [Uninstall] [Restart]  missing; cockpi││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                               ⋯││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: toggle / edit  r: reset  e│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

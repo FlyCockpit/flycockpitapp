@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Skills ─────────────────────────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
+                              ▌ ││Skills                                                                            ││ │
+ SESSIONS                       ││                                                                                  ││ │
+ no active sessions in all pr   ││Scan dirs hold `<name>/SKILL.md` skills. Entries support `~`, `$VAR`, and relative││ │
+                                ││ paths. The list ships pre-seeded (~/.agents/skills + ./.agents/skills); an empty ││ │
+                              no││list scans nothing. Ancestor walk extends relative entries to every dir up to the ││ │
+                              ┊ ││git root.                                                                         ││ │
+                              ▌ ││                                                                                  ││ │
+                                ││› auto-! commands  Codex mode (default — inject !`command` verbatim; never runs)  ││ █
+                                ││  ancestor walk    off (default — relative entries resolve against cwd only)      ││ █
+                                ││                                                                                  ││ █
+                                ││scan directories                                                                  ││ █
+                                ││  [+ add directory]                                                               ││ █
+                                ││  [reset to defaults]  enter: reset                                               ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                               ⋯││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: toggle / edit  a: add dir │ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

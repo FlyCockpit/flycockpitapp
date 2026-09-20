@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › MCP ────────────────────────────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
+                              ▌ ││MCP servers — space: toggle  a: authenticate  d: delete                           ││ │
+ SESSIONS                       ││                                                                                  ││ │
+ no active sessions in all pr   ││No MCP servers configured.                                                        ││ │
+                                ││› [+ add server]                                                                  ││ │
+                              no││                                                                                  ││ │
+                              ┊ ││                                                                                  ││ │
+                              ▌ ││                                                                                  ││ │
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                               ⋯││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  space: toggle  m: mode  a: authen│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

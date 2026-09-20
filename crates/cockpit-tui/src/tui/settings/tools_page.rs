@@ -1095,7 +1095,7 @@ fn push_selectable_row(
 ) {
     let first_line = lines.len();
     let selected = p.cursor == *row_idx;
-    let marker = if selected { "▸ " } else { "  " };
+    let marker = if selected { "› " } else { "  " };
     let label_style = if selected {
         selected_style()
     } else {

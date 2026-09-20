@@ -470,7 +470,7 @@ async fn restart_daemon_gracefully(daemon: &SpawnedDaemon) {
     let output = daemon.restart_via_command(2).await;
     let text = output_text(&output);
     assert!(output.status.success(), "daemon restart failed: {text}");
-    assert!(text.contains("daemon: restarted"));
+    assert!(text.contains("daemon: rolled worker"));
     daemon.wait_for_handshake().await;
 }
 

@@ -496,6 +496,20 @@ impl SpawnedDaemon {
         grace_secs: u64,
         socket_reachable: bool,
     ) -> Output {
+        if socket_reachable {
+            let grace = grace_secs.to_string();
+            let output = self
+                .home
+                .cockpit()
+                .args(["daemon", "restart", "--grace", &grace])
+                .env("COCKPIT_LOG", "warn,cockpit::startup=info")
+                .output()
+                .expect("daemon restart command");
+            assert_success("daemon restart", &output, &self.home);
+            self.wait_for_handshake().await;
+            return output;
+        }
+
         let had_owned_child = self.process.has_current();
         let grace = grace_secs.to_string();
         let mut command = self.home.cockpit();
@@ -513,7 +527,7 @@ impl SpawnedDaemon {
             .expect("coordinate daemon restart with exact child");
         assert!(
             !had_owned_child || owned_child_exited,
-            "daemon restart command exited before its owned daemon (socket reachable: {socket_reachable}); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
+            "daemon restart command exited before its owned daemon (socket reachable: false); stdout:\n{}\nstderr:\n{}\nlog tail:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
             log_tail(&self.home)

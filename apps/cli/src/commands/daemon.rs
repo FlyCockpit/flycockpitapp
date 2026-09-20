@@ -170,8 +170,10 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             no_sandbox,
         } => {
             validate_grace(grace)?;
-            if let Ok(response) =
-                daemon::supervisor::request(&paths, daemon::supervisor::AdminCommand::Roll).await
+            if paths.socket.exists()
+                && let Ok(response) =
+                    daemon::supervisor::request(&paths, daemon::supervisor::AdminCommand::Roll)
+                        .await
             {
                 match response {
                     daemon::supervisor::AdminResponse::Rolled {
@@ -330,18 +332,43 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 } = status
             {
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "status": "running",
-                            "supervisor_pid": supervisor_pid,
-                            "worker_pid": worker_pid,
-                            "generation": generation,
-                            "uptime_ms": uptime_ms,
-                            "socket_path": paths.socket.display().to_string(),
-                            "database_path": crate::db::Db::default_path()?.display().to_string(),
-                        })
-                    );
+                    let worker_status = DaemonClient::connect(&paths.socket)
+                        .await?
+                        .request_ok(Request::DaemonStatus)
+                        .await?;
+                    let Response::DaemonStatus {
+                        pid,
+                        uptime_secs,
+                        active_sessions,
+                        paused_sessions,
+                        socket_path,
+                        daemon_version,
+                        protocol_version,
+                        database_path,
+                        schema_version,
+                    } = worker_status
+                    else {
+                        bail!("unexpected supervised daemon status response: {worker_status:?}");
+                    };
+                    let mut value = running_json_status(RunningJsonStatus {
+                        pid,
+                        uptime_secs,
+                        active_sessions,
+                        paused_sessions,
+                        socket_path,
+                        daemon_version,
+                        protocol_version,
+                        database_path,
+                        schema_version,
+                    });
+                    let object = value
+                        .as_object_mut()
+                        .expect("running daemon status is a JSON object");
+                    object.insert("supervisor_pid".into(), supervisor_pid.into());
+                    object.insert("worker_pid".into(), worker_pid.into());
+                    object.insert("generation".into(), generation.into());
+                    object.insert("uptime_ms".into(), uptime_ms.into());
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
                     println!(
                         "daemon: running\n  supervisor pid: {supervisor_pid}\n  worker pid: {worker_pid}\n  generation: {generation}\n  uptime: {:.3}s\n  socket: {}",

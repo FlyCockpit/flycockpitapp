@@ -10,17 +10,26 @@ const HISTORY_MARKER: &str = "watchdog-history-marker-437";
 const SECOND_HISTORY_MARKER: &str = "watchdog-second-marker-437";
 
 fn session_id_with_durable_marker(db_path: &Path, marker: &str) -> Uuid {
-    let session_id: String = Connection::open(db_path)
-        .expect("open hermetic session db")
-        .query_row(
-            "SELECT session_id FROM session_events \
-             WHERE type = 'user_message' AND data_json LIKE ?1 \
-             ORDER BY seq DESC LIMIT 1",
-            params![format!("%{marker}%")],
-            |row| row.get(0),
-        )
-        .expect("durable user message with history marker");
-    Uuid::parse_str(&session_id).expect("session id in sqlite")
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let session_id = Connection::open(db_path)
+            .expect("open hermetic session db")
+            .query_row(
+                "SELECT session_id FROM session_events \
+                 WHERE type = 'user_message' AND data_json LIKE ?1 \
+                 ORDER BY seq DESC LIMIT 1",
+                params![format!("%{marker}%")],
+                |row| row.get::<_, String>(0),
+            );
+        if let Ok(session_id) = session_id {
+            return Uuid::parse_str(&session_id).expect("session id in sqlite");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "durable user message with history marker {marker} did not commit within 20s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn session_has_durable_user_message(db_path: &Path, session_id: Uuid, marker: &str) -> bool {

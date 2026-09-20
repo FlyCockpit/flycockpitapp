@@ -21,7 +21,7 @@ use ratatui::widgets::{Clear, Paragraph, Wrap};
 use uuid::Uuid;
 
 const ADD_MODEL_ITEM_ID: &str = "\u{0}add-model";
-const PICKER_STATUS_MAX_ROWS: u16 = 4;
+const PICKER_STATUS_MAX_ROWS: u16 = 8;
 
 fn picker_status_wrapped_rows(status: &str, width: u16) -> u16 {
     super::word_wrap_line_count(status, width.max(1)).min(PICKER_STATUS_MAX_ROWS)
@@ -384,7 +384,11 @@ impl App {
         self.composer_controls.layout = Some(layout);
     }
 
-    pub(super) fn paint_composer_picker(&mut self, frame: &mut Frame<'_>) {
+    pub(super) fn paint_composer_picker(
+        &mut self,
+        frame: &mut Frame<'_>,
+        chat_body: ratatui::layout::Rect,
+    ) {
         self.composer_controls.picker_rect = None;
         self.composer_controls.picker_scrollbar_rect = None;
         self.composer_controls.picker_view = 0;
@@ -424,7 +428,7 @@ impl App {
             .max(44);
         let width = inner_w
             .saturating_add(3)
-            .min(layout.area.width.max(16))
+            .min(chat_body.width.max(16))
             .max(16);
         let body_rows = rows.len().max(1) as u16;
         let status_inner_w = width.saturating_sub(2).max(1);
@@ -438,12 +442,18 @@ impl App {
             .saturating_add(status_h)
             .saturating_add(footer_h)
             .min(16);
-        let screen = frame.area();
+        let frame_area = frame.area();
+        let picker_screen = ratatui::layout::Rect {
+            x: chat_body.x,
+            y: chat_body.y,
+            width: chat_body.width,
+            height: frame_area.bottom().saturating_sub(chat_body.y).max(1),
+        };
         let popover = crate::tui::chrome::place_popover(
             anchor,
             width,
             height,
-            screen,
+            picker_screen,
             crate::tui::chrome::PopoverSide::Above,
         );
         frame.render_widget(Clear, popover);

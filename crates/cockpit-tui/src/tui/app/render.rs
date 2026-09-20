@@ -1442,7 +1442,7 @@ impl App {
                     } else {
                         self.clear_suggestion_box_hits();
                     }
-                    self.paint_composer_picker(frame);
+                    self.paint_composer_picker(frame, chat_body);
                     // Park the real cursor: in the focused pane (when the child
                     // shows one), otherwise in the composer.
                     if self.pane.is_some() && self.pane_focused {
@@ -4080,7 +4080,7 @@ impl App {
             .map(|(i, cmd)| (i, cmd.name().to_string(), cmd.description(self).to_string()))
             .collect();
         drop(matches);
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let hint_style = Style::default().fg(FOG);
         let mut lines = Vec::new();
         for (row, (i, name, description)) in visible.into_iter().enumerate() {
             let is_sel = i == selected;
@@ -4097,7 +4097,7 @@ impl App {
                 Span::raw(marker),
                 Span::styled(name_padded, name_style),
                 Span::raw("  "),
-                Span::styled(description, muted),
+                Span::styled(description, hint_style),
             ]);
             if is_sel {
                 let selected =

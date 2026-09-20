@@ -27,14 +27,14 @@
                                 ││  Default thinking mode          inherit                                          ││ █
                                 ││  Extract inline <think> tags    inherit default                                  ││ █
                                 ││  Hint tool-call corrections     inherit                                          ││ █
-                                ││[save changes]                                                                    ││ █
                                 ││                                                                                  ││ █
                                 ││auto uses provider defaults and learned endpoint; completions POSTs /chat/complet ││ █
-                               ⋯││Without a backup model, exceeding thresholds shows a slow-stream warning and keep ││ █
-                                ││enter: edit/cycle   h: back                                                       ││ █
+                                ││Without a backup model, exceeding thresholds shows a slow-stream warning and keep ││ █
+                               ⋯││enter: edit/cycle   h: back                                                       ││ █
+                                ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                                 ││                                                                                  ││ █
                               ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit/cycle  h: back  q: c │ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit/cycl [ save changes ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

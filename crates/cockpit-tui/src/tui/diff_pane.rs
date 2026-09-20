@@ -1104,6 +1104,7 @@ fn truncate_path(path: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::history::DiffVerb;
 
     fn list_state(selected: usize, offset: usize) -> ListState {
         let mut state = ListState::default();
@@ -1468,12 +1469,14 @@ Binary files a/logo.png and b/logo.png differ\n";
                 path: "old.rs".into(),
                 old: "x\n".into(),
                 new: "y\n".into(),
+                verb: DiffVerb::Edited,
             },
             HistoryEntry::Diff {
                 tool: "edit".into(),
                 path: "new.rs".into(),
                 old: "a\nb\n".into(),
                 new: "a\nB\n".into(),
+                verb: DiffVerb::Edited,
             },
         ];
         let loaded = last_edit_loaded(&history);

@@ -1601,22 +1601,15 @@ impl App {
                     self.pending_edit_args.insert(call_id, captured);
                     return;
                 }
+                if is_write_tool(&tool)
+                    && let Some(captured) = extract_write_args(&args)
+                {
+                    self.pending_write_args.insert(call_id, captured);
+                    return;
+                }
                 let mcp_child = mcp_child_meta_from_args(&args);
                 let (summary, full_input) =
                     tool_invocation_with_meta(&tool, &args, mcp_child.as_ref());
-                // Write tools are conceptually diffs too — render them as
-                // a standalone line that breaks the box (no diff body
-                // until the engine surfaces pre-write content).
-                if is_write_tool(&tool) {
-                    self.history.push(HistoryEntry::ToolLine {
-                        call_id,
-                        tool,
-                        summary,
-                        icon_path: None,
-                        state: ToolCallState::Processing,
-                    });
-                    return;
-                }
                 let call = ToolCall {
                     call_id,
                     tool,
@@ -1663,6 +1656,8 @@ impl App {
                 truncated,
                 call_id,
                 hint,
+                pre_write_content,
+                write_applied,
                 ..
             } => {
                 if let Some(args) = self.pending_edit_args.remove(&call_id) {
@@ -1671,6 +1666,24 @@ impl App {
                         path: args.path,
                         old: args.old,
                         new: args.new,
+                        verb: DiffVerb::Edited,
+                    });
+                    return;
+                }
+                if let Some(args) = self.pending_write_args.remove(&call_id)
+                    && write_applied
+                {
+                    let verb = if pre_write_content.is_some() {
+                        DiffVerb::Edited
+                    } else {
+                        DiffVerb::Created
+                    };
+                    self.history.push(HistoryEntry::Diff {
+                        tool,
+                        path: args.path,
+                        old: pre_write_content.unwrap_or_default(),
+                        new: args.new,
+                        verb,
                     });
                     return;
                 }
@@ -1744,6 +1757,7 @@ impl App {
                 // produced a ToolEnd — the diff would be misleading on a
                 // hard failure.
                 let pending_edit = self.pending_edit_args.remove(&call_id);
+                let pending_write = self.pending_write_args.remove(&call_id);
                 // Bold red when the model built the call badly; plain red
                 // when the tool failed for another reason.
                 let state = match kind {
@@ -1758,7 +1772,9 @@ impl App {
                         call_id,
                         tool,
                         summary: cockpit_host::text::first_line(&error, 200),
-                        icon_path: pending_edit.map(|args| args.path),
+                        icon_path: pending_edit
+                            .map(|args| args.path)
+                            .or_else(|| pending_write.map(|args| args.path)),
                         state,
                     });
                 }
@@ -2998,9 +3014,7 @@ fn backup_failure_reason(error_class: &cockpit_proto::InferenceErrorClass) -> St
     }
 }
 
-/// True for write tools rendered as a standalone line (they'd be diffs,
-/// but the engine doesn't surface pre-write content yet — see
-/// [`crate::tui::diff`]).
+/// True for write tools whose successful applied results render as diffs.
 fn is_write_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -3082,6 +3096,12 @@ fn extract_edit_args(args: &serde_json::Value) -> Option<PendingEditArgs> {
     let old = args.get("old_string")?.as_str()?.to_string();
     let new = args.get("new_string")?.as_str()?.to_string();
     Some(PendingEditArgs { path, old, new })
+}
+
+fn extract_write_args(args: &serde_json::Value) -> Option<PendingWriteArgs> {
+    let path = args.get("path")?.as_str()?.to_string();
+    let new = args.get("content")?.as_str()?.to_string();
+    Some(PendingWriteArgs { path, new })
 }
 
 /// Epoch-millis → local wall clock, falling back to "now" for a missing/zero
@@ -3210,6 +3230,8 @@ pub(super) fn wire_history_to_entries(wire: Vec<cockpit_proto::HistoryEntry>) ->
                 output,
                 hard_fail,
                 hint,
+                pre_write_content,
+                write_applied,
                 ..
             } => {
                 let state = restored_tool_state(hard_fail);
@@ -3238,17 +3260,25 @@ pub(super) fn wire_history_to_entries(wire: Vec<cockpit_proto::HistoryEntry>) ->
                         path: args.path,
                         old: args.old,
                         new: args.new,
+                        verb: DiffVerb::Edited,
                     });
                     continue;
                 }
-                // Write tools render as a standalone line that breaks the box.
-                if is_write_tool(&tool) {
-                    out.push(HistoryEntry::ToolLine {
-                        call_id,
+                if write_applied
+                    && is_write_tool(&tool)
+                    && let Some(args) = extract_write_args(&original_input)
+                {
+                    let verb = if pre_write_content.is_some() {
+                        DiffVerb::Edited
+                    } else {
+                        DiffVerb::Created
+                    };
+                    out.push(HistoryEntry::Diff {
                         tool,
-                        summary,
-                        icon_path: None,
-                        state,
+                        path: args.path,
+                        old: pre_write_content.unwrap_or_default(),
+                        new: args.new,
+                        verb,
                     });
                     continue;
                 }
@@ -4519,6 +4549,8 @@ mod tests {
             truncated: false,
             seq: None,
             hint: None,
+            pre_write_content: None,
+            write_applied: false,
         });
         app.apply_event(TurnEvent::ToolProgress(
             cockpit_client::presentation::ToolProgress {
@@ -4720,6 +4752,8 @@ mod tests {
             hard_fail: false,
             truncated: false,
             hint: None,
+            pre_write_content: None,
+            write_applied: false,
         };
         let parent = cockpit_proto::HistoryEntry::ToolCall {
             seq: 2,
@@ -4739,6 +4773,8 @@ mod tests {
             hard_fail: false,
             truncated: false,
             hint: None,
+            pre_write_content: None,
+            write_applied: false,
         };
 
         let restored = wire_history_to_entries(vec![child, parent]);

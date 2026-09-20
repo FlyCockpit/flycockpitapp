@@ -504,8 +504,10 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             path,
             old,
             new,
+            verb,
         } => {
             hash_len(&mut hasher, tool);
+            hash_len(&mut hasher, &format!("{verb:?}"));
             hash_len(&mut hasher, path);
             hash_len(&mut hasher, old);
             hash_len(&mut hasher, new);
@@ -5671,8 +5673,7 @@ fn wrap_ghost_line_chunks(
 }
 
 /// True for tools that take an `old_string` / `new_string` pair we can render
-/// as a diff. `write` is not in here because the engine doesn't surface the
-/// pre-write file content.
+/// as a diff. Writes use their separate applied-result path.
 pub(super) fn is_edit_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -6007,6 +6008,7 @@ mod render_history_spacing_tests {
         AffordanceTarget, HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES, HistoryEntryId,
         HistoryLog, PendingRenderCacheEntry, SandboxDownNotice, SideConversation,
     };
+    use crate::tui::history::DiffVerb;
 
     async fn await_at_suggestions(app: &mut App) {
         let kind = app.autocomplete_blocking_operation().action_kind();
@@ -6183,6 +6185,7 @@ mod render_history_spacing_tests {
             path: path.to_string(),
             old: "old line\n".to_string(),
             new: "new line\n".to_string(),
+            verb: DiffVerb::Edited,
         }
     }
 

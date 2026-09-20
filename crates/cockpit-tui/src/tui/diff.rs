@@ -1,4 +1,4 @@
-//! Diff rendering for `edit` tool calls.
+//! Diff rendering for `edit` and `write` tool calls.
 //!
 //! Three modes (config `tui.diff_style`):
 //!
@@ -16,15 +16,14 @@
 //! large unchanged regions don't drown out the meaningful changes
 //! (the limit is [`CONTEXT_LINES`]).
 //!
-//! `write` diffs are deferred — the tool doesn't currently surface the
-//! pre-write file content to the TUI.
-
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use cockpit_config::extended::DiffStyle;
+
+use crate::tui::history::DiffVerb;
 
 /// Minimum terminal width (in columns) for [`DiffStyle::SideBySide`].
 /// Below this, [`render_diff`] falls back to [`DiffStyle::Inline`].
@@ -51,13 +50,13 @@ const COL_SEPARATOR: &str = " │ ";
 /// indent the existing `Plain` history entries use.
 const LEFT_INDENT: &str = "  ";
 
-/// Render an `edit` tool call as a diff.
+/// Render a file diff for the transcript.
 ///
 /// `width` is the chat-pane width in terminal columns; the side-by-side
 /// renderer uses it to size the two columns. `path` is the edited
 /// file's path (displayed in the header).
 pub fn render_diff(
-    tool: &str,
+    verb: DiffVerb,
     path: &str,
     old: &str,
     new: &str,
@@ -68,9 +67,8 @@ pub fn render_diff(
 ) -> Vec<Line<'static>> {
     let diff = TextDiff::from_lines(old, new);
     let (added, removed) = count_changes(&diff);
-    let style = effective_style(tool, style);
 
-    let mut out = vec![header_line(tool, path, added, removed, emojis, file_icons)];
+    let mut out = vec![header_line(verb, path, added, removed, emojis, file_icons)];
     match style {
         DiffStyle::Hidden => {}
         DiffStyle::Inline => {
@@ -88,50 +86,18 @@ pub fn render_diff(
     out
 }
 
-fn effective_style(tool: &str, style: DiffStyle) -> DiffStyle {
-    if is_write_diff_tool(tool) && matches!(style, DiffStyle::SideBySide) {
-        DiffStyle::Inline
-    } else {
-        style
-    }
-}
-
-fn is_write_diff_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "write"
-            // Historical display only: pre-rename persisted sessions used this
-            // retired verb name in tool-call rows.
-            | "writeunlock"
-    )
-}
-
-#[cfg(test)]
-fn is_diff_renderable_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "edit"
-            // Historical display only: pre-rename persisted sessions used
-            // retired verb names in tool-call rows.
-            | "editunlock"
-            | "write"
-            | "writeunlock"
-    )
-}
-
 /// Diff header matching the transcript reference chrome.
 fn header_line(
-    tool: &str,
+    verb: DiffVerb,
     path: &str,
     added: usize,
     removed: usize,
     _emojis: bool,
     _file_icons: bool,
 ) -> Line<'static> {
-    let label = if matches!(tool, "write" | "writeunlock") {
-        "Created"
-    } else {
-        "Edited"
+    let label = match verb {
+        DiffVerb::Created => "Created",
+        DiffVerb::Edited => "Edited",
     };
     let mut spans = vec![Span::styled(
         "  ◇ ",
@@ -449,6 +415,7 @@ fn strip_trailing_newline(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::history::DiffVerb;
 
     fn lines_to_strings(lines: &[Line<'static>]) -> Vec<String> {
         lines
@@ -465,7 +432,7 @@ mod tests {
     #[test]
     fn hidden_returns_one_line() {
         let lines = render_diff(
-            "edit",
+            DiffVerb::Edited,
             "src/foo.rs",
             "a\nb\nc\n",
             "a\nB\nc\n",
@@ -482,7 +449,7 @@ mod tests {
     #[test]
     fn inline_renders_with_plus_minus_prefixes() {
         let lines = render_diff(
-            "edit",
+            DiffVerb::Edited,
             "src/foo.rs",
             "alpha\nbeta\ngamma\n",
             "alpha\nBETA\ngamma\n",
@@ -502,7 +469,7 @@ mod tests {
     #[test]
     fn inline_uses_exact_six_column_chrome_and_semantic_colors() {
         let lines = render_diff(
-            "edit",
+            DiffVerb::Edited,
             "src/foo.rs",
             "alpha\nbeta\ngamma\n",
             "alpha\nBETA\ngamma\n",
@@ -541,7 +508,7 @@ mod tests {
     #[test]
     fn side_by_side_falls_back_to_inline_when_narrow() {
         let narrow = render_diff(
-            "edit",
+            DiffVerb::Edited,
             "x.rs",
             "a\nb\n",
             "a\nB\n",
@@ -558,7 +525,7 @@ mod tests {
     #[test]
     fn side_by_side_uses_separator_when_wide() {
         let wide = render_diff(
-            "edit",
+            DiffVerb::Edited,
             "x.rs",
             "alpha\nbeta\n",
             "alpha\nBETA\n",
@@ -575,35 +542,76 @@ mod tests {
     }
 
     #[test]
-    fn diff_renderer_accepts_new_and_historical_write_names() {
-        // Historical display only: include pre-rename persisted tool-call names.
-        for tool in ["write", "edit", "writeunlock", "editunlock"] {
-            assert!(
-                is_diff_renderable_tool(tool),
-                "{tool} should be diff-renderable for current or historical rows"
-            );
-        }
+    fn write_created_side_by_side_places_additions_in_right_column() {
+        let rendered = lines_to_strings(&render_diff(
+            DiffVerb::Created,
+            "new.txt",
+            "",
+            "alpha\nbeta\n",
+            DiffStyle::SideBySide,
+            120,
+            false,
+            false,
+        ));
+        assert_eq!(rendered[0], "  ◇ Created new.txt  +2");
+        let first = rendered[1].split_once(COL_SEPARATOR).unwrap();
+        let second = rendered[2].split_once(COL_SEPARATOR).unwrap();
+        assert_eq!(first.0.trim(), "");
+        assert_eq!(first.1.trim(), "1 alpha");
+        assert_eq!(second.0.trim(), "");
+        assert_eq!(second.1.trim(), "2 beta");
+    }
 
-        // Historical display only: include the pre-rename write tool name.
-        for tool in ["write", "writeunlock"] {
-            let lines = render_diff(
-                tool,
-                "x.rs",
-                "",
-                "alpha\nbeta\n",
-                DiffStyle::SideBySide,
-                120,
-                false,
-                false,
-            );
-            let rendered = lines_to_strings(&lines).join("\n");
-            assert!(
-                rendered.contains("◇ Created x.rs  +2"),
-                "{tool}: {rendered}"
-            );
-            assert!(rendered.contains("+ alpha"), "{tool}: {rendered}");
-            assert!(rendered.contains("+ beta"), "{tool}: {rendered}");
-        }
+    #[test]
+    fn write_created_renders_all_additions() {
+        let lines = render_diff(
+            DiffVerb::Created,
+            "fixtures/new.txt",
+            "",
+            "alpha\nbeta\n",
+            DiffStyle::Inline,
+            120,
+            false,
+            false,
+        );
+        let rendered = lines_to_strings(&lines);
+        assert_eq!(rendered[0], "  ◇ Created fixtures/new.txt  +2");
+        assert!(rendered.iter().any(|line| line.contains("+ alpha")));
+        assert!(rendered.iter().any(|line| line.contains("+ beta")));
+    }
+
+    #[test]
+    fn write_edited_renders_correct_plus_minus_counts() {
+        let lines = render_diff(
+            DiffVerb::Edited,
+            "fixtures/existing.txt",
+            "keep\nold line\n",
+            "keep\nnew line\n",
+            DiffStyle::Inline,
+            120,
+            false,
+            false,
+        );
+        let rendered = lines_to_strings(&lines);
+        assert_eq!(rendered[0], "  ◇ Edited fixtures/existing.txt  +1 -1");
+        assert!(rendered.iter().any(|line| line == "  │ - old line"));
+        assert!(rendered.iter().any(|line| line == "  │ + new line"));
+    }
+
+    #[test]
+    fn write_created_hidden_mode_is_summary_only() {
+        let lines = render_diff(
+            DiffVerb::Created,
+            "x.rs",
+            "",
+            "line\n",
+            DiffStyle::Hidden,
+            120,
+            false,
+            false,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines_to_strings(&lines)[0], "  ◇ Created x.rs  +1");
     }
 
     #[test]

@@ -43495,3 +43495,63 @@ async fn global_vault_mutation_revokes_coverage() {
         .expect("vault mutation publisher");
     assert!(publisher.contains("publisher_authority.invalidate()"));
 }
+#[test]
+fn write_pre_image_is_scrubbed_at_live_event_and_history_boundaries() {
+    const SECRET: &str = "sk-write-boundary-secret-xyzzy";
+    let table = crate::redact::RedactionTable::empty()
+        .with_forced_literal(SECRET.to_string(), "$redacted:write-boundary".to_string())
+        .unwrap();
+    let session_id = uuid::Uuid::new_v4();
+    let mut event = crate::daemon::proto::Event::ToolEnd {
+        session_id,
+        agent: "Build".into(),
+        call_id: "write-1".into(),
+        tool: "write".into(),
+        output: "wrote".into(),
+        truncated: false,
+        seq: Some(1),
+        hint: None,
+        pre_write_content: Some(format!("before {SECRET}\n")),
+        write_applied: true,
+    };
+    super::scrub_event_free_text(&mut event, &table);
+    let crate::daemon::proto::Event::ToolEnd {
+        pre_write_content: Some(event_old),
+        ..
+    } = event
+    else {
+        panic!("expected tool-end pre-image");
+    };
+    assert!(!event_old.contains(SECRET));
+
+    let mut history = crate::daemon::proto::HistoryEntry::ToolCall {
+        seq: 1,
+        agent: "Build".into(),
+        call_id: "write-1".into(),
+        parent_call_id: None,
+        parent_child_index: None,
+        tool: "write".into(),
+        mcp_server: None,
+        mcp_builtin: None,
+        mcp_kind: None,
+        original_input: serde_json::json!({"path": "file.txt", "content": "after\n"}),
+        wire_input: serde_json::json!({"path": "file.txt", "content": "after\n"}),
+        recovery_kind: None,
+        recovery_stage: None,
+        output: "wrote".into(),
+        hard_fail: false,
+        truncated: false,
+        hint: None,
+        pre_write_content: Some(format!("before {SECRET}\n")),
+        write_applied: true,
+    };
+    super::scrub_history_entry_free_text(&mut history, &table);
+    let crate::daemon::proto::HistoryEntry::ToolCall {
+        pre_write_content: Some(history_old),
+        ..
+    } = history
+    else {
+        panic!("expected history pre-image");
+    };
+    assert!(!history_old.contains(SECRET));
+}

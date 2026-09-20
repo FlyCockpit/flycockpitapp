@@ -156,11 +156,18 @@ pub async fn write(args: &Value, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
             "stale `expected_revision`: the plan changed while this write was pending; read it and retry",
         ));
     };
-    Ok(Some(ToolOutput::text(format!(
+    let pre_write_content = observed
+        .as_ref()
+        .map(|doc| doc.content.as_bytes())
+        .and_then(|body| super::write::bounded_pre_write_content(&ctx.redact, Some(body)));
+    let mut output = ToolOutput::text(format!(
         "wrote `{path}` (revision {}, {} bytes)",
         doc.revision,
         content.len()
-    ))))
+    ));
+    output.pre_write_content = pre_write_content;
+    output.write_applied = true;
+    Ok(Some(output))
 }
 
 pub async fn glob(pattern: &str, path: Option<&str>, ctx: &ToolCtx) -> Result<Option<ToolOutput>> {
@@ -905,16 +912,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(wrote.content.model_text().contains("revision 1"));
+        assert!(wrote.write_applied);
+        assert!(wrote.pre_write_content.is_none());
 
         let read = self::read(&json!({ "path": path.clone() }), &ctx)
             .await
             .unwrap();
         assert!(read.content.model_text().contains("[revision=1]\n# Plan"));
 
-        let error = write(&json!({ "path": path, "content": "# Revised" }), &ctx)
-            .await
-            .unwrap_err();
+        let error = write(
+            &json!({ "path": path.clone(), "content": "# Revised" }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("expected_revision"));
+
+        let revised = write(
+            &json!({ "path": path, "content": "# Revised", "expected_revision": 1 }),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(revised.write_applied);
+        assert_eq!(revised.pre_write_content.as_deref(), Some("# Plan"));
     }
 
     #[tokio::test]

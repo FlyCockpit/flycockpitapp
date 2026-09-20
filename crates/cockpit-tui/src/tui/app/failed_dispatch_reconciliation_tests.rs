@@ -150,6 +150,13 @@ fn seed_session_live_state(app: &mut App) {
             new: "new".to_string(),
         },
     );
+    app.pending_write_args.insert(
+        "write-cid".to_string(),
+        super::PendingWriteArgs {
+            path: "src/new.rs".to_string(),
+            new: "new body".to_string(),
+        },
+    );
 }
 
 fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
@@ -625,6 +632,7 @@ fn reset_session_live_state_clears_hidden_per_session_state() {
     assert!(app.pending_git_blocks.is_empty());
     assert!(app.accepted_tags.is_empty());
     assert!(app.pending_edit_args.is_empty());
+    assert!(app.pending_write_args.is_empty());
     assert_eq!(app.composer.text(), "visible draft");
     assert_eq!(app.prompt_history, vec!["cross-session recall"]);
     assert_eq!(app.history.len(), 1, "history is reset by each caller");

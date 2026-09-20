@@ -42,7 +42,7 @@ fn golden_model_config() -> cockpit_config::config::providers::ProvidersConfig {
 }
 
 use crate::tui::history::{
-    HistoryEntry, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCallState,
+    DiffVerb, HistoryEntry, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCallState,
 };
 
 /// Clear mouse-hover unless the test opted in via [`GoldenPins::allow_hover`].
@@ -212,6 +212,7 @@ fn transcript_fixture_app() -> App {
             path: "src/transcript.rs".to_string(),
             old: "old line\nshared line\n".to_string(),
             new: "new line\nshared line\n".to_string(),
+            verb: DiffVerb::Edited,
         },
         HistoryEntry::CompactBoundary {
             predecessor_short_id: "abc123".to_string(),

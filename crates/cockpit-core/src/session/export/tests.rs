@@ -91,8 +91,7 @@ async fn build_redacted_transcript_json_bytes(
     let extended = crate::config::extended::load_for_cwd(&root);
     let base =
         RedactionTable::build_with_env_and_credential_store(&extended.redact, &root, &env, &store)?;
-    super::build_redacted_transcript_json_bytes(db, target, vault, resolver, Arc::new(base))
-        .await
+    super::build_redacted_transcript_json_bytes(db, target, vault, resolver, Arc::new(base)).await
 }
 
 async fn trusted_build_zip_with_options(
@@ -5858,4 +5857,119 @@ async fn assistant_message_export_retains_response_performance() {
     assert_eq!(arr[0]["response_performance"]["encoding"], "cl100k_base");
     // attempt_id must not appear in export.
     assert!(arr[0].get("attempt_id").is_none());
+}
+
+#[tokio::test]
+async fn write_pre_write_content_scrubbed_in_transcript_and_export_json() {
+    const SECRET: &str = "sk-write-pre-write-redact-xyzzy";
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+    ctx.redact = Arc::new(
+        RedactionTable::empty()
+            .with_forced_literal(SECRET.to_string(), "$redacted:pre-write".to_string())
+            .unwrap(),
+    );
+    let path = tmp.path().join("existing.txt");
+    std::fs::write(&path, format!("before {SECRET}\n")).unwrap();
+    ctx.locks
+        .note_read(&path, &ctx.lock_identity, ctx.session.id)
+        .await;
+    let args = json!({"path": "existing.txt", "content": "after\n"});
+    let output = crate::tools::write::WriteTool
+        .call(args.clone(), &ctx)
+        .await
+        .unwrap();
+    let captured = output
+        .pre_write_content
+        .clone()
+        .expect("overwrite captures pre-image");
+    assert!(!captured.contains(SECRET));
+
+    ctx.session
+        .record_tool_call(ToolCallRow {
+            event_id: Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            agent: "Build".into(),
+            call_id: "write-1".into(),
+            parent_call_id: None,
+            parent_child_index: None,
+            identity: ToolCallProviderIdentity::synthetic_cockpit_call("write-1", None),
+            tool: "write".into(),
+            mcp_server: None,
+            path: Some(path.display().to_string()),
+            original_input_json: args.clone(),
+            wire_input_json: args.clone(),
+            recovery: Recovery::Clean,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            output: output.content.model_text().to_string(),
+            truncated: false,
+            duration_ms: 1,
+            shape_fingerprint: None,
+            hint: None,
+        })
+        .await
+        .unwrap();
+    ctx.session
+        .record_event(
+            SessionEventKind::ToolCall,
+            Some("Build"),
+            Some("write-1"),
+            &json!({
+                "tool": "write",
+                "original_input": args.clone(),
+                "wire_input": args,
+                "output": output.content.model_text(),
+                "hard_fail": false,
+                "truncated": false,
+                "pre_write_content": captured,
+                "write_applied": true,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let history = crate::engine::rehydrate::history_snapshot(&db, ctx.session.id, "Build")
+        .await
+        .unwrap();
+    let persisted_old = history
+        .iter()
+        .find_map(|entry| match entry {
+            proto::HistoryEntry::ToolCall {
+                pre_write_content, ..
+            } => pre_write_content.as_deref(),
+            _ => None,
+        })
+        .expect("persisted write pre-image");
+    assert!(!persisted_old.contains(SECRET));
+
+    let transcript = super::transcript_json_from_history(&history);
+    let diff = transcript
+        .as_array()
+        .and_then(|turns| turns.first())
+        .expect("write diff turn");
+    assert_eq!(diff["type"], "diff");
+    assert_eq!(diff["verb"], "edited");
+    assert!(!diff["old"].as_str().unwrap().contains(SECRET));
+
+    let target = get_test_session(&db, ctx.session.id).await;
+    let bundle = build_bundle_zip_bytes(
+        &db,
+        &target,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+        crate::session::test_redaction_key_resolver(),
+        HashMap::from([("WRITE_SECRET".to_string(), SECRET.to_string())]),
+    )
+    .await
+    .unwrap();
+    let events = read_zip_entry(&bundle.bytes, "events.json").expect("events.json member");
+    assert!(events.contains("pre_write_content"));
+    assert!(
+        !events.contains(SECRET),
+        "redacted export leaked pre-image secret"
+    );
 }

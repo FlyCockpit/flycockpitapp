@@ -141,8 +141,8 @@ use crate::tui::async_action::{
 use crate::tui::composer::{RegisteredComposer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
 use crate::tui::history::{
-    HistoryEntry, MarkdownOpts, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCall,
-    ToolCallState, classify_subagent_status,
+    DiffVerb, HistoryEntry, MarkdownOpts, PendingMsg, SubagentOutcome, SubagentRoutingChips,
+    ToolCall, ToolCallState, classify_subagent_status,
 };
 use crate::tui::input_source::{MAX_DRAIN_PER_PASS, ObservedTerminalEvent, TerminalInput};
 use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
@@ -2099,6 +2099,9 @@ pub struct App {
     /// behind (e.g. a tool that errored before emitting `ToolEnd`)
     /// gets cleaned up on the next `finalize_pending`.
     pub(super) pending_edit_args: HashMap<String, PendingEditArgs>,
+    /// `write` call args cached at `ToolStart` until `ToolEnd` supplies the
+    /// pre-write body from the tool result.
+    pub(super) pending_write_args: HashMap<String, PendingWriteArgs>,
     /// Messages typed and submitted while an agent turn is in flight.
     /// Mirrors the daemon's authoritative queue (GOALS §1c) for display
     /// and edit controls. Daemon `QueueUpdated` events are the source of
@@ -3407,6 +3410,14 @@ struct PendingEditArgs {
     new: String,
 }
 
+/// Args cached at `ToolStart` for a `write` call so the matching `ToolEnd` can
+/// build a `HistoryEntry::Diff` once the engine returns the pre-write body.
+#[derive(Debug, Clone)]
+struct PendingWriteArgs {
+    path: String,
+    new: String,
+}
+
 /// Inclusive highlight span in absolute terminal coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SelectionSpan {
@@ -4031,6 +4042,7 @@ impl App {
             file_icons,
             hide_tool_calls: false,
             pending_edit_args: HashMap::new(),
+            pending_write_args: HashMap::new(),
             queue: Vec::new(),
             queue_focus: None,
             queue_hover: None,

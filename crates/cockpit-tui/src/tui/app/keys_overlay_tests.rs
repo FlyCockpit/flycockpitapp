@@ -359,6 +359,8 @@ fn orphan_tool_end_renders_standalone_success_line() {
         truncated: false,
         seq: None,
         hint: None,
+        pre_write_content: None,
+        write_applied: false,
     });
 
     assert!(matches!(
@@ -392,6 +394,8 @@ fn read_tool_end_stores_captured_output_but_unlock_does_not() {
             truncated: false,
             seq: None,
             hint: None,
+            pre_write_content: None,
+            write_applied: false,
         });
     }
 

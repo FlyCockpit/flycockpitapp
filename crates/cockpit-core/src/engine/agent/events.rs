@@ -443,6 +443,10 @@ pub enum TurnEvent {
         /// otherwise. UI-only — the model's copy carries the separate wire
         /// `--- hint(…)` line (wire-vs-user split, GOALS §14).
         hint: Option<String>,
+        /// Pre-write file body for `write` tool calls (`None` when the path did
+        /// not exist). UI/timeline only.
+        pre_write_content: Option<String>,
+        write_applied: bool,
     },
     /// A resource-managed tool call is waiting for scheduler permits.
     ResourceWait {

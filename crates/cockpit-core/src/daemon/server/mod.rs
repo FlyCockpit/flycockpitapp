@@ -1455,9 +1455,12 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             truncated: _,
             seq: _,
             hint,
+            pre_write_content,
+            write_applied: _,
         } => {
             scrub_string(output, redact);
             scrub_option_string(hint, redact);
+            scrub_option_string(pre_write_content, redact);
         }
         proto::Event::ResourceWait {
             session_id: _,
@@ -1828,11 +1831,14 @@ fn scrub_history_entry_free_text(entry: &mut proto::HistoryEntry, redact: &Redac
             hard_fail: _,
             truncated: _,
             hint,
+            pre_write_content,
+            write_applied: _,
         } => {
             scrub_json_strings(original_input, redact);
             scrub_json_strings(wire_input, redact);
             scrub_string(output, redact);
             scrub_option_string(hint, redact);
+            scrub_option_string(pre_write_content, redact);
         }
         proto::HistoryEntry::InferenceError {
             seq: _,

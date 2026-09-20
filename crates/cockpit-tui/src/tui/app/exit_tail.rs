@@ -114,6 +114,7 @@ fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
             path,
             old,
             new,
+            verb: _,
         } => {
             // Plain-lines is what the "spill to scrollback" path uses
             // on `/new`. Reduce the diff to a tool-result-style

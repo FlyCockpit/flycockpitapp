@@ -4749,6 +4749,8 @@ pub(crate) fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent
             truncated,
             seq,
             hint,
+            pre_write_content,
+            write_applied,
             ..
         } => TurnEvent::ToolEnd {
             agent,
@@ -4758,6 +4760,8 @@ pub(crate) fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent
             truncated,
             seq,
             hint,
+            pre_write_content,
+            write_applied,
         },
         ResourceWait {
             agent,
@@ -7676,6 +7680,8 @@ mod tests {
                         hard_fail: false,
                         truncated: false,
                         hint: None,
+                        pre_write_content: None,
+                        write_applied: false,
                     },
                     proto::HistoryEntry::Assistant {
                         agent: "Build".to_string(),
@@ -7702,6 +7708,8 @@ mod tests {
                 truncated: false,
                 seq: Some(8),
                 hint: None,
+                pre_write_content: None,
+                write_applied: false,
             },
             &incoming,
         );
@@ -7717,6 +7725,8 @@ mod tests {
                 truncated: false,
                 seq: Some(9),
                 hint: None,
+                pre_write_content: None,
+                write_applied: false,
             },
             &incoming,
         );

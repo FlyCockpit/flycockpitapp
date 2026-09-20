@@ -56,6 +56,14 @@ pub struct SubagentRoutingChips {
     pub fallback: Option<String>,
 }
 
+/// How a [`HistoryEntry::Diff`] should label its header chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffVerb {
+    #[default]
+    Edited,
+    Created,
+}
+
 /// The user's own message and the assistant's response carry
 /// timestamps; engine events (tool calls, errors, subagent
 /// spawn/report) don't — they're scoped within the surrounding
@@ -221,6 +229,7 @@ pub enum HistoryEntry {
         path: String,
         old: String,
         new: String,
+        verb: DiffVerb,
     },
     /// A run of consecutive boxable tool calls (read, unlock, bash,
     /// webfetch, …) rendered inside a light-grey rounded sidebar. Diff tools
@@ -238,10 +247,8 @@ pub enum HistoryEntry {
         /// they scroll back to the end.
         follow: bool,
     },
-    /// A standalone tool call rendered as one styled line outside any
-    /// box. Used for `write`: conceptually diffs that break the box, but the
-    /// engine doesn't surface pre-write file content yet (see
-    /// [`crate::tui::diff`]), so they render as a one-liner until that lands.
+    /// A standalone tool call rendered as one styled line outside any box.
+    /// Applied writes render as diffs; failed or refused writes use this row.
     ToolLine {
         call_id: String,
         tool: String,
@@ -1052,13 +1059,14 @@ pub fn render_entry(
             }
         }
         HistoryEntry::Diff {
-            tool,
+            tool: _,
             path,
             old,
             new,
+            verb,
         } => {
             let lines = crate::tui::diff::render_diff(
-                tool, path, old, new, diff_style, width, emojis, file_icons,
+                *verb, path, old, new, diff_style, width, emojis, file_icons,
             );
             let continuations = vec![false; lines.len()];
             Rendered {

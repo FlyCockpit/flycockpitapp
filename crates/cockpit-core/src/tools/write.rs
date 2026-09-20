@@ -89,7 +89,8 @@ impl Tool for WriteTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         // The recall provider owns its sole writable pseudofile (plan) and
         // must run before every host-path guard.
-        if let Some(output) = crate::tools::recall::write(&args, ctx).await? {
+        if let Some(mut output) = crate::tools::recall::write(&args, ctx).await? {
+            output.write_applied = true;
             return Ok(output);
         }
         let path_arg = args
@@ -295,6 +296,9 @@ impl Tool for WriteTool {
             message.push('\n');
             message.push_str(&created);
         }
+        let write_applied = human_knowledge_outcome
+            .as_ref()
+            .is_none_or(|outcome| outcome.applied);
         if let Some(outcome) = human_knowledge_outcome {
             message.push('\n');
             message.push_str(&crate::knowledge::human_knowledge_edit_outcome_note(
@@ -329,8 +333,45 @@ impl Tool for WriteTool {
             message.push_str(&validation.confirmation_note());
         }
 
-        Ok(ToolOutput::text(message))
+        let pre_write_content = bounded_pre_write_content(&ctx.redact, existing_before.as_deref());
+        let mut output = ToolOutput::text(message);
+        if write_applied {
+            output.pre_write_content = pre_write_content;
+            output.write_applied = true;
+        }
+        Ok(output)
     }
+}
+
+/// Byte cap for pre-write bodies surfaced to the TUI diff renderer (matches the
+/// approval write-preview diff budget).
+pub(crate) const PRE_WRITE_CONTENT_BYTE_CAP: usize = 12 * 1024;
+
+/// Capture the on-disk body immediately before a `write`, normalized to LF,
+/// redacted, and capped. `None` means the path did not exist (new file).
+pub(crate) fn bounded_pre_write_content(
+    redact: &crate::redact::RedactionTable,
+    existing: Option<&[u8]>,
+) -> Option<String> {
+    let bytes = existing?;
+    if crate::tools::common::looks_binary(bytes) {
+        return Some(format!("… [binary file, {} bytes]", bytes.len()));
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let normalized = normalize_line_endings(text.as_ref(), false);
+    let scrubbed = redact.scrub(&normalized);
+    if scrubbed.len() <= PRE_WRITE_CONTENT_BYTE_CAP {
+        return Some(scrubbed);
+    }
+    let truncated = crate::tools::common::truncate_head_tail_redacted(
+        redact,
+        &scrubbed,
+        PRE_WRITE_CONTENT_BYTE_CAP,
+    );
+    let omitted = scrubbed.len().saturating_sub(truncated.len());
+    Some(format!(
+        "{truncated}\n… [pre-write content truncated; {omitted} bytes omitted]"
+    ))
 }
 
 #[async_trait]
@@ -383,9 +424,11 @@ impl Tool for PlanWriteTool {
                 "Plan may write only its current session plan pseudofile",
             ));
         }
-        crate::tools::recall::write(&args, ctx)
+        let mut output = crate::tools::recall::write(&args, ctx)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("recall plan write was not dispatched"))
+            .ok_or_else(|| anyhow::anyhow!("recall plan write was not dispatched"))?;
+        output.write_applied = true;
+        Ok(output)
     }
 }
 
@@ -2355,6 +2398,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_new_file_omits_pre_write_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "created.md", "content": "hello\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.pre_write_content.is_none());
+        assert!(out.write_applied);
+    }
+
+    #[tokio::test]
+    async fn write_existing_file_surfaces_pre_write_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("existing.md");
+        std::fs::write(&file, "before\n").unwrap();
+        note_read(&ctx, &file).await;
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "existing.md", "content": "after\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.pre_write_content.as_deref(), Some("before\n"));
+        assert!(out.write_applied);
+    }
+
+    #[tokio::test]
+    async fn write_existing_crlf_file_surfaces_lf_normalized_pre_write_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let file = tmp.path().join("existing.md");
+        std::fs::write(&file, "keep\r\nold line\r\n").unwrap();
+        note_read(&ctx, &file).await;
+
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "existing.md", "content": "keep\nnew line\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.pre_write_content.as_deref(), Some("keep\nold line\n"));
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"keep\r\nnew line\r\n",
+            "the surfaced diff body is canonical LF, while the write preserves the file's CRLF convention"
+        );
+        assert!(out.write_applied);
+    }
+
+    #[tokio::test]
+    async fn write_existing_file_scrubs_pre_write_content_at_capture() {
+        const SECRET: &str = "sk-write-capture-secret-xyzzy";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        ctx.redact = Arc::new(
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "$redacted:pre-write".to_string())
+                .unwrap(),
+        );
+        let file = tmp.path().join("existing.md");
+        std::fs::write(&file, format!("before {SECRET}\n")).unwrap();
+        note_read(&ctx, &file).await;
+
+        let out = WriteTool
+            .call(
+                serde_json::json!({"path": "existing.md", "content": "after\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let captured = out.pre_write_content.expect("existing-file pre-image");
+        assert!(
+            !captured.contains(SECRET),
+            "capture leaked classified secret"
+        );
+        assert!(captured.contains("before "));
+        assert!(out.write_applied);
+    }
+
+    #[tokio::test]
     async fn write_outside_scope_hard_denied_read_unclamped() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
@@ -3520,6 +3652,8 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("soul_edit_mode=human_only"), "{out:?}");
+        assert!(!out.write_applied);
+        assert!(out.pre_write_content.is_none());
         assert!(identity_ctx.locks.holder(&soul).is_none());
 
         #[cfg(unix)]

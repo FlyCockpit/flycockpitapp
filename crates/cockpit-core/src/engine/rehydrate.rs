@@ -1503,6 +1503,8 @@ pub(crate) fn history_snapshot_from_events_conn(
                             // Post-result hint chip (`engine::bash_hints`), from
                             // the persisted `hint` JSON's `text` field.
                             hint: hint_text(tc.hint.as_ref()),
+                            pre_write_content: pre_write_content_from_event_data(&ev.data),
+                            write_applied: write_applied_from_event_data(&ev.data),
                         }
                     }
                     None => {
@@ -1567,6 +1569,8 @@ pub(crate) fn history_snapshot_from_events_conn(
                             // The interrupted call's audit row never landed; the
                             // timeline event still carries `data.hint`.
                             hint: hint_text(ev.data.get("hint")),
+                            pre_write_content: pre_write_content_from_event_data(&ev.data),
+                            write_applied: write_applied_from_event_data(&ev.data),
                         }
                     }
                 };
@@ -2037,6 +2041,8 @@ fn subagent_history_entries_from_events(
                             hard_fail: tc.hard_fail,
                             truncated: tc.truncated,
                             hint: hint_text(tc.hint.as_ref()),
+                            pre_write_content: pre_write_content_from_event_data(&ev.data),
+                            write_applied: write_applied_from_event_data(&ev.data),
                         }
                     }
                     None => {
@@ -2099,6 +2105,8 @@ fn subagent_history_entries_from_events(
                             hard_fail: false,
                             truncated: false,
                             hint: hint_text(ev.data.get("hint")),
+                            pre_write_content: pre_write_content_from_event_data(&ev.data),
+                            write_applied: write_applied_from_event_data(&ev.data),
                         }
                     }
                 };
@@ -2205,6 +2213,18 @@ fn hint_text(hint: Option<&serde_json::Value>) -> Option<String> {
         .get("text")
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+fn pre_write_content_from_event_data(data: &serde_json::Value) -> Option<String> {
+    data.get("pre_write_content")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn write_applied_from_event_data(data: &serde_json::Value) -> bool {
+    data.get("write_applied")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn load_ledger_conn(conn: &Connection, session_id: Uuid) -> Option<PruneLedger> {

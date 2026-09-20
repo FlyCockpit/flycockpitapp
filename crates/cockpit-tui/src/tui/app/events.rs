@@ -1670,22 +1670,22 @@ impl App {
                     });
                     return;
                 }
-                if let Some(args) = self.pending_write_args.remove(&call_id) {
-                    if write_applied {
-                        let verb = if pre_write_content.is_some() {
-                            DiffVerb::Edited
-                        } else {
-                            DiffVerb::Created
-                        };
-                        self.history.push(HistoryEntry::Diff {
-                            tool,
-                            path: args.path,
-                            old: pre_write_content.unwrap_or_default(),
-                            new: args.new,
-                            verb,
-                        });
-                        return;
-                    }
+                if let Some(args) = self.pending_write_args.remove(&call_id)
+                    && write_applied
+                {
+                    let verb = if pre_write_content.is_some() {
+                        DiffVerb::Edited
+                    } else {
+                        DiffVerb::Created
+                    };
+                    self.history.push(HistoryEntry::Diff {
+                        tool,
+                        path: args.path,
+                        old: pre_write_content.unwrap_or_default(),
+                        new: args.new,
+                        verb,
+                    });
+                    return;
                 }
                 if !self.update_tool_state(
                     &call_id,

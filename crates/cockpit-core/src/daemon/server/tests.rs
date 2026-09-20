@@ -32020,6 +32020,13 @@ fn provider_verification_errors_are_categorized_and_bounded_for_daemon_clients()
             },
         ),
         (
+            "provider returned HTTP 500: model endpoint not found in registry",
+            ProviderModelVerification::HttpStatus {
+                status: 500,
+                snippet: "provider returned HTTP 500: model endpoint not found in registry".into(),
+            },
+        ),
+        (
             "request error: DNS connect failed",
             ProviderModelVerification::Network {
                 message: "request error: DNS connect failed".into(),

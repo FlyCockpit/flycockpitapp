@@ -24090,17 +24090,31 @@ pub(super) fn categorize_provider_model_fetch_error(
     let message = crate::config::providers::redact_model_fetch_reason(error.to_string());
     let lower = message.to_ascii_lowercase();
     let status = provider_http_status(&lower);
-    if status == Some(401) || lower.contains("unauthorized") {
+    if let Some(401) = status {
         return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 401 };
     }
-    if status == Some(403) || lower.contains("forbidden") || lower.contains("credentials rejected")
-    {
+    if let Some(403) = status {
         return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 403 };
     }
-    if status == Some(404) || lower.contains("not found") {
+    if status == Some(404) {
         return crate::daemon::proto::ProviderModelVerification::NotFound;
     }
+    if let Some(status) = status.filter(|value| *value >= 400) {
+        return crate::daemon::proto::ProviderModelVerification::HttpStatus {
+            status,
+            snippet: bounded_provider_model_error(&message),
+        };
+    }
     let message = bounded_provider_model_error(&message);
+    if lower.contains("unauthorized") {
+        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 401 };
+    }
+    if lower.contains("forbidden") || lower.contains("credentials rejected") {
+        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 403 };
+    }
+    if lower.contains("not found") {
+        return crate::daemon::proto::ProviderModelVerification::NotFound;
+    }
     if lower.contains("json")
         || lower.contains("model array")
         || lower.contains("model list")

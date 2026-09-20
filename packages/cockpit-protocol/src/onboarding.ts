@@ -146,6 +146,7 @@ export const onboardingStageSettlementSchema = z
     mutation_intent_hash: z.string().optional(),
     wizard_id: z.string().optional(),
     config_generation: z.number().int().nonnegative(),
+    provider_mutation_config_generation: z.number().int().nonnegative().optional(),
   })
   .strict();
 export type OnboardingStageSettlement = z.infer<typeof onboardingStageSettlementSchema>;

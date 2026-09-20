@@ -662,6 +662,7 @@ impl SupervisorDatabaseOwner {
     /// `fd` must be the uniquely transferred descriptor returned by
     /// [`Self::raw_fd`] before the exec.
     #[cfg(unix)]
+    // SAFETY: callers transfer the uniquely owned database-lock descriptor.
     pub unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
         Self {
             // SAFETY: upheld by this function's caller contract.

@@ -2027,6 +2027,7 @@ impl ForegroundMetadataGuard {
     /// Both descriptors must be uniquely owned inherited file descriptors
     /// produced by [`Self::prepare_for_reexec`].
     #[cfg(unix)]
+    // SAFETY: callers transfer unique ownership of both inherited descriptors.
     pub unsafe fn resume_after_reexec(
         pid_file: PathBuf,
         socket: PathBuf,

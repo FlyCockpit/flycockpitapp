@@ -68,6 +68,7 @@ impl DatabaseOwnerLock {
     }
 
     #[cfg(unix)]
+    // SAFETY: callers transfer the uniquely owned database-lock descriptor.
     pub(crate) unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
         use std::os::fd::FromRawFd as _;
         Self {

@@ -669,6 +669,7 @@ impl UnixEndpointOwner {
         Ok((control, reveal))
     }
 
+    // SAFETY: callers transfer unique ownership of both inherited descriptors.
     unsafe fn resume(
         paths: &DaemonPaths,
         control_fd: std::os::fd::RawFd,
@@ -1260,6 +1261,7 @@ fn prepare_admin_for_reexec(listener: &AdminListener) -> Result<std::os::fd::Raw
 }
 
 #[cfg(unix)]
+// SAFETY: callers transfer unique ownership of the inherited admin descriptor.
 unsafe fn resume_admin(fd: std::os::fd::RawFd) -> Result<AdminListener> {
     use std::os::fd::FromRawFd as _;
     // SAFETY: upheld by this function's caller contract.

@@ -264,7 +264,6 @@ impl SessionRail {
         }
         let selected_id = self.selected_id();
         let show_project = matches!(self.scope, Scope::All) || self.levels.len() > 1;
-        let mut selected_span = None;
         let mut spans: Vec<(usize, usize, usize)> = Vec::new();
         for (index, (summary, tier)) in cards.iter().enumerate() {
             let start = lines.len();
@@ -278,9 +277,6 @@ impl SessionRail {
                 self.use_emojis,
             );
             let end = start + card.len();
-            if selected {
-                selected_span = Some((start, end));
-            }
             spans.push((index, start, end));
             lines.extend(card);
         }
@@ -323,23 +319,19 @@ impl SessionRail {
         }
         self.last_content_rows = lines.len();
         self.last_body_height = body.height as usize;
-        let mut scroll = self
-            .current()
-            .row_offset
-            .min(self.last_content_rows.saturating_sub(self.last_body_height));
-        if let Some((start, end)) = selected_span {
-            scroll = crate::tui::pane_shared::clamp_scroll_to_visible_span(
-                scroll,
-                self.last_body_height,
-                self.last_content_rows,
-                start,
-                end,
-            );
-        }
+        let stale_rows = if self.stale { 1 } else { 0 };
+        self.last_session_view = (self.last_body_height.saturating_sub(stale_rows) / 2).max(1);
+        let card_count = cards.len();
+        let max_session_scroll = card_count.saturating_sub(self.last_session_view);
         if let Some(level) = self.levels.last_mut() {
-            level.row_offset = scroll;
+            level.session_scroll = level.session_scroll.min(max_session_scroll);
         }
-        let overflowing = self.last_content_rows > self.last_body_height;
+        let scroll = spans
+            .get(self.current().session_scroll)
+            .map(|(_, start, _)| *start)
+            .unwrap_or(stale_rows);
+        let session_overflowing = card_count > self.last_session_view;
+        let overflowing = session_overflowing || self.last_content_rows > self.last_body_height;
         let content_body = if overflowing && body.width > 1 {
             Rect {
                 width: body.width - 1,
@@ -353,13 +345,13 @@ impl SessionRail {
             Paragraph::new(lines).scroll((scroll as u16, 0)),
             content_body,
         );
-        if overflowing && body.width > 1 && body.height > 0 {
+        if session_overflowing && body.width > 1 && body.height > 0 {
             scrollbar(
                 frame,
                 body,
-                self.last_content_rows,
-                self.last_body_height,
-                scroll,
+                max_session_scroll + 1,
+                self.last_session_view,
+                self.current().session_scroll,
             );
         }
         self.paint_hover_actions(frame, content_body, scroll, &spans, &cards);
@@ -654,11 +646,10 @@ pub fn card_lines(
     ]);
 
     let when = fmt_time(s.last_active_at_unix_ms);
-    let when_text = format!("{prefix}  {when}");
+    let when_text = format!("{prefix}{when}");
     let when_padding = " ".repeat(width.saturating_sub(text_width(&when_text)));
     let when_line = Line::from(vec![
         Span::styled(prefix, row_style),
-        Span::styled("  ", row_style),
         Span::styled(
             when,
             if selected {
@@ -707,11 +698,10 @@ pub fn card_lines(
         meta.push_str(&format!("  {} windows", s.lineage_window_count));
     }
     let meta = truncate_text(&meta, width.saturating_sub(3));
-    let meta_text = format!("{prefix}  {meta}");
+    let meta_text = format!("{prefix}{meta}");
     let padding = " ".repeat(width.saturating_sub(text_width(&meta_text)));
     out.push(Line::from(vec![
         Span::styled(prefix, row_style),
-        Span::styled("  ", row_style),
         Span::styled(meta, row_style),
         Span::styled(padding, row_style),
     ]));

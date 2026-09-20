@@ -4444,7 +4444,6 @@ impl App {
         self.composer_controls.selection = None;
         let visible = self.session_rail.toggle_visibility();
         self.config_snapshot.extended.tui.session_rail_visible = visible;
-        #[cfg(not(test))]
         match cockpit_config::extended::persist_global_session_rail_visible(visible) {
             Ok(()) => self.resync_config_after_local_write(),
             Err(error) => {

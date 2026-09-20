@@ -131,7 +131,8 @@ struct Level {
     lineage_root: Option<Uuid>,
     cards: Vec<(SessionSummary, Tier)>,
     selected_session_id: Option<Uuid>,
-    row_offset: usize,
+    /// First visible session index in the filtered list (excoc `sidebar_scroll`).
+    session_scroll: usize,
 }
 
 impl Level {
@@ -141,7 +142,7 @@ impl Level {
             lineage_root: None,
             cards: Vec::new(),
             selected_session_id: None,
-            row_offset: 0,
+            session_scroll: 0,
         }
     }
 
@@ -278,6 +279,7 @@ pub struct SessionRail {
     last_preview_height: usize,
     last_preview_rows: usize,
     last_preview_reached_top: bool,
+    last_session_view: usize,
     card_hits: Vec<CardHit>,
     action_hits: Vec<ActionHit>,
     list_area: Option<Rect>,
@@ -338,6 +340,7 @@ impl SessionRail {
             last_preview_height: 0,
             last_preview_rows: 0,
             last_preview_reached_top: false,
+            last_session_view: 1,
             card_hits: Vec::new(),
             action_hits: Vec::new(),
             list_area: None,
@@ -755,7 +758,8 @@ impl SessionRail {
                     }) {
                         level.selected_session_id = None;
                     }
-                    level.row_offset = 0;
+                    level.session_scroll = 0;
+                    self.ensure_session_scroll_shows_selected();
                 }
                 if self.selected_id() != self.preview.as_ref().map(|preview| preview.session_id) {
                     self.preview = None;
@@ -1377,6 +1381,7 @@ impl SessionRail {
                     if let Some(level) = self.levels.last_mut() {
                         level.select(index);
                     }
+                    self.ensure_session_scroll_shows_selected();
                     return self.preview_for_selection();
                 }
                 if self
@@ -1412,6 +1417,7 @@ impl SessionRail {
         if let Some(level) = self.levels.last_mut() {
             level.selected_session_id = Some(summary.session_id);
         }
+        self.ensure_session_scroll_shows_selected();
         match action {
             CardAction::Select => self.preview_for_selection(),
             CardAction::Open => {
@@ -1432,7 +1438,8 @@ impl SessionRail {
                     },
                 ),
             CardAction::Preview => self.preview_for_selection(),
-            CardAction::Archive | CardAction::Delete => {
+            CardAction::Archive => self.archive_selected(),
+            CardAction::Delete => {
                 self.open_confirm();
                 None
             }
@@ -1490,6 +1497,7 @@ impl SessionRail {
         if let Some(level) = self.levels.last_mut() {
             level.restore_selection(selected);
         }
+        self.ensure_session_scroll_shows_selected();
         if self.selected_id() != self.preview.as_ref().map(|preview| preview.session_id) {
             self.preview = None;
         }
@@ -1628,6 +1636,9 @@ impl SessionRail {
         };
         if let Some(level) = self.levels.last_mut() {
             level.selected_session_id = Some(cards[next].0.session_id);
+        }
+        if next != prev {
+            self.ensure_session_scroll_shows_selected();
         }
         next != prev
     }
@@ -1802,13 +1813,68 @@ impl SessionRail {
 
     fn scroll_up(&mut self) {
         let level = self.current_mut();
-        level.row_offset = level.row_offset.saturating_sub(1);
+        level.session_scroll = level.session_scroll.saturating_sub(1);
     }
 
     fn scroll_down(&mut self) {
-        let max = self.last_content_rows.saturating_sub(self.last_body_height);
+        let cards = self.filtered_cards().len();
+        let view = self.last_session_view.max(1);
+        let max = cards.saturating_sub(view);
         let level = self.current_mut();
-        level.row_offset = level.row_offset.saturating_add(1).min(max);
+        level.session_scroll = (level.session_scroll + 1).min(max);
+    }
+
+    /// Keep the selected session inside the sidebar window after a selection change.
+    fn ensure_session_scroll_shows_selected(&mut self) {
+        let cards = self.filtered_cards();
+        let selected_id = self.current().selected_session_id;
+        let pos = selected_id.and_then(|id| {
+            cards
+                .iter()
+                .position(|(summary, _)| summary.session_id == id)
+        });
+        let Some(pos) = pos else {
+            return;
+        };
+        let view = self.last_session_view.max(1);
+        let level = self.current_mut();
+        if pos < level.session_scroll {
+            level.session_scroll = pos;
+        } else if pos >= level.session_scroll + view {
+            level.session_scroll = pos + 1 - view;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_scroll_for_test(&self) -> usize {
+        self.current().session_scroll
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_viewport_for_test(&self) -> usize {
+        self.last_session_view
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_area_for_test(&self) -> Option<Rect> {
+        self.list_area
+    }
+
+    fn archive_selected(&mut self) -> Option<RailOutcome> {
+        if !self.daemon_connected {
+            self.notice = Some(DAEMON_UNAVAILABLE_HINT.to_string());
+            return None;
+        }
+        let s = self.selected()?.clone();
+        self.error = None;
+        Some(RailOutcome::Mutate(Box::new(self.begin_mutation(
+            s.session_id,
+            "archive",
+            cockpit_proto::Request::ArchiveSession {
+                session_id: s.session_id,
+                cascade: true,
+            },
+        ))))
     }
 
     fn scroll_preview_up(&mut self) -> Option<RailOutcome> {

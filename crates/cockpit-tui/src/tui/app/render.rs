@@ -1443,11 +1443,16 @@ impl App {
         let overlay_rail = self.session_rail.overlay_rail_rect(chat_body, frame_width);
         let render_session_rail = self.onboarding_shell.is_none();
         let popover_max_height = chat_body.height.saturating_sub(2).max(1);
+        let popover_height = if geom.dialog > 0 {
+            geom.dialog
+                .clamp(12.min(popover_max_height), popover_max_height)
+        } else {
+            popover_max_height
+        };
         let popover_body = crate::tui::chrome::place_popover(
             chat_body,
             chat_body.width.saturating_sub(4).clamp(1, 96),
-            geom.dialog
-                .clamp(12.min(popover_max_height), popover_max_height),
+            popover_height,
             chat_body,
             crate::tui::chrome::PopoverSide::Center,
         );

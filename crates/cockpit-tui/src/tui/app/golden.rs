@@ -1020,6 +1020,39 @@ pub fn assert_onboarding_native_screens() {
             })
         });
     }
+    let projection = crate::tui::onboarding::agent::golden_sample_projection();
+    let review = crate::tui::onboarding::agent::golden_sample_review();
+    for (name, phase, review, status) in [
+        (
+            "agent-authoring-subagents",
+            crate::tui::onboarding::agent::Phase::SubagentsList,
+            None,
+            None,
+        ),
+        (
+            "agent-authoring-review",
+            crate::tui::onboarding::agent::Phase::Review,
+            Some(review.clone()),
+            None,
+        ),
+        (
+            "agent-authoring-conflict",
+            crate::tui::onboarding::agent::Phase::Conflict,
+            None,
+            Some("Policy revision conflict — projection refreshed; review again.".into()),
+        ),
+    ] {
+        assert_golden_sizes("onboarding", name, |width, height| {
+            let mut shell = onboarding_shell_at(OnboardingStage::Agent);
+            shell.present_agent_authoring(projection.clone(), "golden-op".into());
+            shell.configure_agent_authoring_for_golden(phase, review.clone(), status.clone());
+            let engine = Dialog::None;
+            let mut links = crate::tui::links::LinkRegistry::default();
+            render_frame(width, height, |frame| {
+                shell.render(frame, frame.area(), &engine, &mut links)
+            })
+        });
+    }
 }
 
 #[cfg(test)]

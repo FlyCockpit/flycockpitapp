@@ -399,6 +399,23 @@ impl AgentAuthoringScreen {
         self.phase
     }
 
+    pub(super) fn header_is_failure(&self) -> bool {
+        matches!(self.phase, Phase::Conflict | Phase::Unknown)
+            || matches!(self.phase, Phase::Create) && self.status.is_some()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn configure_for_golden(
+        &mut self,
+        phase: Phase,
+        review: Option<AuthoredAgentReview>,
+        status: Option<String>,
+    ) {
+        self.phase = phase;
+        self.review = review;
+        self.status = status;
+    }
+
     pub fn help_text(&self) -> &'static str {
         match self.phase {
             Phase::SourceIdentity => "type name   enter continue   esc back   ^c quit",
@@ -524,7 +541,7 @@ impl AgentAuthoringScreen {
             }
             KeyCode::Char(' ') => {
                 self.toggle_selection();
-                None
+                self.pending_action.take()
             }
             KeyCode::Char('r') if self.phase == Phase::Review => self.request_preview(),
             KeyCode::Char('d')
@@ -2217,6 +2234,88 @@ fn enable_required_tools(tiers: &mut std::collections::BTreeMap<String, ToolTier
         .filter(|item| tool_section(item) == REQUIRED_TOOL_SECTION)
     {
         tiers.insert(item.name.to_string(), ToolTier::Enabled);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn golden_sample_projection() -> AgentAuthoringProjection {
+    use cockpit_proto::{
+        AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
+        AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute, AgentPolicySnapshot,
+        AgentPolicyTrustClassification,
+    };
+    AgentAuthoringProjection {
+        dto_version: AGENT_AUTHORING_DTO_VERSION,
+        policy: AgentPolicySnapshot {
+            policy_revision: "golden-rev".into(),
+            routes: vec![
+                AgentPolicyRoute {
+                    provider_id: "vendor".into(),
+                    model_id: "exact-a".into(),
+                    trust: AgentPolicyTrustClassification::Unset,
+                    confirmation_required: true,
+                    trust_is_shared: true,
+                    capabilities: vec!["text_generation".into()],
+                    location: Some("remote".into()),
+                    auto_prune: false,
+                    sidecar_eligible: false,
+                    remote_sidecar_egress_required: false,
+                },
+                AgentPolicyRoute {
+                    provider_id: "vendor".into(),
+                    model_id: "exact-b".into(),
+                    trust: AgentPolicyTrustClassification::Trusted,
+                    confirmation_required: false,
+                    trust_is_shared: true,
+                    capabilities: vec!["text_generation".into()],
+                    location: Some("remote".into()),
+                    auto_prune: false,
+                    sidecar_eligible: false,
+                    remote_sidecar_egress_required: false,
+                },
+            ],
+            catalog_origin: AgentAuthoringCatalogOrigin::Cached,
+            catalog_revision: "catalog-rev".into(),
+            bundled_frontier_slug: "frontier".into(),
+        },
+        sources: vec![AgentAuthoringSource {
+            kind: AgentAuthoringSourceKind::BundledFrontier,
+            slug: Some("navigator".into()),
+            display_name: "Navigator".into(),
+            source_locator: Some("catalog/frontier@rev".into()),
+            compatible_routes: vec![AgentAuthoringCompatibleRoute {
+                provider_id: "vendor".into(),
+                model_id: "exact-a".into(),
+            }],
+            definition_frontmatter_yaml: None,
+        }],
+        review_trust_disclosure: "Trust classification is shared global provider/model policy."
+            .into(),
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn golden_sample_review() -> AuthoredAgentReview {
+    use cockpit_proto::AgentPolicyTrustClassification;
+    AuthoredAgentReview {
+        agent_name: "navigator".into(),
+        grants: vec![cockpit_proto::AuthoredAgentReviewGrant {
+            provider_id: "vendor".into(),
+            model_id: "exact-a".into(),
+            is_default: true,
+            trust: AgentPolicyTrustClassification::Untrusted,
+            trust_is_shared: true,
+        }],
+        tool_tier_preferences: vec![("read".into(), "enabled".into())],
+        verification_label: Some("Self-verification (1 rules)".into()),
+        interactive_subagents: true,
+        goal_skeptics_label: "2 goal skeptics".into(),
+        children: vec![],
+        sidecars: vec![],
+        source: "catalog/frontier@rev".into(),
+        make_default: true,
+        trust_is_shared: true,
+        trust_disclosure: "Trust classification is shared global provider/model policy.".into(),
     }
 }
 

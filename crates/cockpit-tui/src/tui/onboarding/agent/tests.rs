@@ -198,9 +198,20 @@ fn stale_review_refresh_after_projection_revision_change() {
     advance_to_subagents(&mut screen);
     screen.apply_outcome(ApplyAuthoredAgentPackageOutcome::Review(sample_review()));
     assert!(screen.review.is_some());
+    assert_eq!(screen.draft.children[0].name, "runner");
+    assert_eq!(
+        screen.draft.tool_tiers["transcribe_audio"],
+        cockpit_core::agents::ToolTier::Disabled,
+        "model-gated tool pins must survive until explicitly chosen"
+    );
     screen.replace_projection(sample_projection("rev-b"));
     assert!(screen.review.is_none());
     assert!(matches!(screen.phase, Phase::Review));
+    assert_eq!(screen.draft.children[0].name, "runner");
+    assert_eq!(
+        screen.draft.tool_tiers["transcribe_audio"],
+        cockpit_core::agents::ToolTier::Disabled
+    );
     assert!(
         screen
             .status
@@ -434,6 +445,134 @@ fn model_tool_optimization_and_subagent_rows_activate_on_first_click() {
         screen.phase,
         Phase::SubagentEdit(SubagentPhase::Identity)
     ));
+}
+
+#[test]
+fn review_row_click_stashes_preview_package() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "preview-click".into());
+    advance_to_subagents(&mut screen);
+    screen.cursor = screen.draft.children.len();
+    render_buffer(&mut screen, 120, 40);
+    let review_row = screen.list_row_rects[screen.draft.children.len()];
+    assert!(screen.handle_mouse(click_at(Position::new(review_row.x, review_row.y))));
+    let action = screen
+        .take_pending_action()
+        .expect("clicking Review agent package must stash preview intent");
+    assert!(matches!(action, AgentAuthoringAction::PreviewPackage(_)));
+}
+
+#[test]
+fn space_on_review_row_returns_preview_package_immediately() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "preview-space".into());
+    advance_to_subagents(&mut screen);
+    screen.cursor = screen.draft.children.len();
+    let action = screen
+        .handle_key(key(KeyCode::Char(' ')))
+        .expect("space on Review agent package must emit preview immediately");
+    assert!(matches!(action, AgentAuthoringAction::PreviewPackage(_)));
+    assert!(screen.take_pending_action().is_none());
+}
+
+#[test]
+fn nested_subagent_required_tool_lock_does_not_cycle_tier() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "nested-tools".into());
+    advance_to_subagents(&mut screen);
+    screen.cursor = 0;
+    screen.handle_key(key(KeyCode::Char('e')));
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::Identity)
+    ));
+    screen.handle_key(key(KeyCode::Enter));
+    screen.handle_key(key(KeyCode::Enter));
+    while !matches!(screen.phase, Phase::SubagentEdit(SubagentPhase::ToolTiers)) {
+        if matches!(screen.phase, Phase::SubagentEdit(SubagentPhase::ModelTrust)) {
+            screen.handle_key(key(KeyCode::Char(' ')));
+        }
+        screen.handle_key(key(KeyCode::Enter));
+    }
+    let catalog = tool_surface_catalog();
+    let read_index = catalog
+        .iter()
+        .position(|item| item.name == "read")
+        .expect("read tool");
+    screen.cursor = tool_presentation_order()
+        .iter()
+        .position(|index| *index == read_index)
+        .expect("read row");
+    let bash_before = screen
+        .current_child()
+        .expect("nested editor")
+        .tool_tiers
+        .get("bash")
+        .copied()
+        .unwrap_or(ToolTier::Disabled);
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert_eq!(
+        screen.current_child().expect("nested editor").tool_tiers["read"],
+        ToolTier::Enabled
+    );
+    assert_eq!(
+        screen
+            .current_child()
+            .expect("nested editor")
+            .tool_tiers
+            .get("bash")
+            .copied()
+            .unwrap_or(ToolTier::Disabled),
+        bash_before,
+        "required-tool activation must not fall through into tier cycling"
+    );
+}
+
+#[test]
+fn tool_model_picker_click_uses_picker_row_index_after_tools_scroll() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "picker-scroll".into());
+    screen.phase = Phase::ToolTiers;
+    let catalog = tool_surface_catalog();
+    let tool_index = catalog
+        .iter()
+        .position(|item| item.name == "transcribe_audio")
+        .expect("model-gated tool");
+    screen.cursor = tool_presentation_order()
+        .iter()
+        .position(|index| *index == tool_index)
+        .expect("tool row");
+    for _ in 0..4 {
+        assert!(screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+    screen.handle_key(key(KeyCode::Char(' ')));
+    render_buffer(&mut screen, 80, 24);
+    assert_eq!(screen.model_picker_row_rects.len(), 2);
+    let second_route = screen.model_picker_row_rects[1];
+    assert!(screen.handle_mouse(click_at(Position::new(second_route.x, second_route.y))));
+    assert_eq!(screen.tool_models["transcribe_audio"], 1);
+    assert_eq!(
+        screen.draft.tool_tiers["transcribe_audio"],
+        cockpit_core::agents::ToolTier::Enabled
+    );
+}
+
+#[test]
+fn trust_first_mouse_click_renders_selected_radio() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "trust-radio".into());
+    screen.handle_key(key(KeyCode::Enter));
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelTrust));
+    render_buffer(&mut screen, 120, 40);
+    let trust_row = screen.list_row_rects[0];
+    assert!(screen.handle_mouse(click_at(Position::new(trust_row.x, trust_row.y))));
+    let rendered = render_string(&mut screen, 120, 40);
+    assert!(
+        rendered.contains('◉'),
+        "first trust click must paint the selected radio before confirmation: {rendered}"
+    );
+    assert!(!screen.draft.trust_confirmations[0]);
 }
 
 #[test]

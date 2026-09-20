@@ -702,6 +702,18 @@ impl OnboardingShell {
         self.escape = None;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn configure_agent_authoring_for_golden(
+        &mut self,
+        phase: agent::Phase,
+        review: Option<cockpit_proto::AuthoredAgentReview>,
+        status: Option<String>,
+    ) {
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            screen.configure_for_golden(phase, review, status);
+        }
+    }
+
     pub(crate) fn present_model(
         &mut self,
         config: &cockpit_config::config::providers::ProvidersConfig,
@@ -1911,6 +1923,7 @@ impl OnboardingShell {
                 verify::VerifyPhase::Error(_) => BAD,
                 verify::VerifyPhase::Fetching => INK,
             },
+            OnboardingScreen::AgentAuthoring(screen) if screen.header_is_failure() => BAD,
             _ => INK,
         };
         ui::render_header_colored(frame, rows[0], &title, &subtitle, title_color);

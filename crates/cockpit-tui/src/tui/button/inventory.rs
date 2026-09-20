@@ -155,13 +155,6 @@ pub(crate) fn button_inventory() -> Vec<InventoryAssignment> {
     for surface in overlay_surfaces() {
         match surface {
             OverlaySurface::Help | OverlaySurface::Usage | OverlaySurface::Context => {}
-            OverlaySurface::ModelPicker => {
-                push_row(
-                    &mut out,
-                    "model_picker",
-                    RowControlId::ModelPicker { cursor: 0 },
-                );
-            }
             OverlaySurface::Multireview => {
                 push_row(
                     &mut out,
@@ -258,9 +251,8 @@ fn push_row(out: &mut Vec<InventoryAssignment>, surface: &'static str, id: RowCo
     });
 }
 
-fn overlay_surfaces() -> [OverlaySurface; 15] {
+fn overlay_surfaces() -> [OverlaySurface; 14] {
     [
-        OverlaySurface::ModelPicker,
         OverlaySurface::Multireview,
         OverlaySurface::Stats,
         OverlaySurface::Usage,
@@ -294,7 +286,6 @@ fn dialog_surfaces() -> [DialogSurface; 9] {
 
 fn overlay_name(surface: OverlaySurface) -> &'static str {
     match surface {
-        OverlaySurface::ModelPicker => "model_picker",
         OverlaySurface::Multireview => "multireview",
         OverlaySurface::Stats => "stats",
         OverlaySurface::Usage => "usage",

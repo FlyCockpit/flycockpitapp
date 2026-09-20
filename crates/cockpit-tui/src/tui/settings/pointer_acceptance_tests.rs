@@ -408,7 +408,7 @@ fn settings_button_dispatch_precedence() {
         choose.rect.y,
     ));
     assert!(
-        !dialog.pending_default_model_picker,
+        !dialog.pending_default_model_from_settings,
         "blank/clipped cells do not activate"
     );
     dialog.handle_pointer(settings_mouse(
@@ -422,7 +422,7 @@ fn settings_button_dispatch_precedence() {
         choose.rect.y,
     ));
     assert_eq!(outcome, SettingsPointerOutcome::Close);
-    assert!(dialog.pending_default_model_picker);
+    assert!(dialog.pending_default_model_from_settings);
 }
 
 #[test]

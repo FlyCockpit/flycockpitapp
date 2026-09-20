@@ -76,7 +76,6 @@ impl ButtonId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OverlaySurface {
-    ModelPicker,
     Multireview,
     Stats,
     Usage,
@@ -117,9 +116,6 @@ pub(crate) enum RowControlId {
     Settings(SettingsPointerAction),
     ContextMenu {
         index: usize,
-    },
-    ModelPicker {
-        cursor: usize,
     },
     QuickTab {
         index: usize,

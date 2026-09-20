@@ -616,6 +616,9 @@ impl App {
     }
 
     pub(super) fn close_composer_picker(&mut self) {
+        self.default_model_settings_mode = false;
+        self.submit_after_model_selection = false;
+        self.refresh_reopened_composer_model_after_settings = None;
         self.invalidate_composer_control_ownership(false, true);
     }
 
@@ -635,6 +638,7 @@ impl App {
             self.close_composer_picker();
             return;
         }
+        self.default_model_settings_mode = false;
         self.open_composer_picker(kind);
         if kind == ComposerControlKind::Model {
             self.request_session_setup_snapshot_refresh();
@@ -650,6 +654,7 @@ impl App {
         // src/tui.rs:172` / `:178`), and the popover anchors to the
         // composer, which a full-screen pane would cover.
         self.overlay = Overlay::None;
+        self.default_model_settings_mode = false;
         self.composer_controls.selection = Some(kind);
         self.open_composer_picker(kind);
         if kind == ComposerControlKind::Model {
@@ -684,7 +689,7 @@ impl App {
         };
         match kind {
             ComposerControlKind::Agent => self.fill_agent_picker(&mut picker),
-            ComposerControlKind::Model => self.fill_model_picker(&mut picker),
+            ComposerControlKind::Model => self.populate_model_menu(&mut picker),
             ComposerControlKind::Effort => self.fill_effort_picker(&mut picker),
             ComposerControlKind::Approval => self.fill_approval_picker(&mut picker),
             ComposerControlKind::Sandbox => self.fill_sandbox_picker(&mut picker),
@@ -828,7 +833,7 @@ impl App {
         }
     }
 
-    fn fill_model_picker(&self, picker: &mut ComposerPicker) {
+    fn populate_model_menu(&self, picker: &mut ComposerPicker) {
         let current = self.launch.active_model.clone();
         let mut by_provider: std::collections::BTreeMap<String, Vec<ComposerPickerItem>> =
             std::collections::BTreeMap::new();
@@ -1002,7 +1007,7 @@ impl App {
                 })
                 .then_with(|| a.id.cmp(&b.id))
         });
-        if let Some(drift) = self.model_picker_drift() {
+        if let Some(drift) = self.model_drift() {
             picker.status_text = Some(format!(
                 "Session: {} · config: {}",
                 drift.session_label, drift.config_label
@@ -1034,7 +1039,7 @@ impl App {
         picker.categories = categories;
     }
 
-    pub(super) fn refresh_open_composer_model_picker(&mut self) {
+    pub(super) fn refresh_open_composer_model_menu(&mut self) {
         let Some(previous) = self
             .composer_controls
             .picker
@@ -1077,7 +1082,7 @@ impl App {
             status_text: None,
             ..previous
         };
-        self.fill_model_picker(&mut refreshed);
+        self.populate_model_menu(&mut refreshed);
         if let Some((category_id, category_label)) = category_identity
             && let Some(category) = refreshed
                 .categories
@@ -1102,26 +1107,33 @@ impl App {
         self.composer_controls.picker = Some(refreshed);
     }
 
-    pub(super) fn reopen_composer_model_picker_after_provider_settings(&mut self) -> bool {
-        let Some(provider) = self.reopen_composer_model_picker_after_settings.take() else {
+    pub(super) fn reopen_composer_model_after_provider_settings(&mut self) -> bool {
+        let Some(provider) = self.reopen_composer_model_after_settings.take() else {
             return false;
         };
+        let preserve_default_only = self.default_model_settings_mode;
         self.open_composer_picker_from_chord(ComposerControlKind::Model);
+        if preserve_default_only {
+            self.default_model_settings_mode = true;
+        }
         let current = current_id_for(ComposerControlKind::Model, self);
         if let Some(picker) = self.composer_controls.picker.as_mut()
             && let Some(category) = picker
                 .categories
                 .iter()
-                .position(|category| category.id == provider)
+                .position(|category| category.id == provider && category.label != "Config drift")
         {
             picker.level = 1;
             picker.category = category;
+            let item_count = picker.categories[category].items.len();
             picker.cursor = picker.categories[category]
                 .items
                 .iter()
                 .position(|item| item.id == current)
-                .unwrap_or(0);
+                .unwrap_or(0)
+                .min(item_count.saturating_sub(1));
         }
+        self.refresh_reopened_composer_model_after_settings = Some(provider);
         true
     }
 
@@ -1459,7 +1471,7 @@ impl App {
         if picker.kind == ComposerControlKind::Model && item.id == ADD_MODEL_ITEM_ID {
             self.composer_controls.selection = None;
             self.composer_controls.picker = None;
-            self.reopen_composer_model_picker_after_settings = Some(category.id.clone());
+            self.reopen_composer_model_after_settings = Some(category.id.clone());
             self.dialog =
                 crate::tui::settings::Dialog::open_provider_models(&self.launch.cwd, &category.id);
             return;
@@ -1531,11 +1543,35 @@ impl App {
                     thinking_mode,
                     prompt_cache_retention,
                 };
-                let _ = self.notify_active_model_selected(
+                if self.default_model_settings_mode {
+                    self.default_model_settings_mode = false;
+                    self.request_default_model_only(active);
+                    self.composer_controls.picker = None;
+                    self.composer_controls.selection = None;
+                    self.composer_controls.pending = None;
+                    self.composer_controls.dispatch_armed = false;
+                    return;
+                }
+                let dispatched = self.notify_active_model_selected(
                     active,
                     persist_as_default,
                     cockpit_proto::ActiveModelSwitchTrigger::Picker,
                 );
+                if !dispatched {
+                    self.composer_controls.pending = None;
+                    self.composer_controls.dispatch_armed = false;
+                    return;
+                }
+                if self.composer_model_selection_waiting_for_runner_attach() {
+                    self.composer_controls.dispatch_armed = false;
+                    return;
+                }
+                self.finish_composer_control_dispatch();
+                if self.submit_after_model_selection {
+                    self.submit_after_model_selection = false;
+                    let _ = self.submit_input();
+                }
+                return;
             }
             ComposerControlKind::Effort => self.commit_effort_item(&item.id),
             ComposerControlKind::Approval => {
@@ -1674,6 +1710,19 @@ impl App {
         if !self.composer_controls.dispatch_armed {
             return;
         }
+        if self
+            .composer_controls
+            .pending
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.request_id.is_none()
+                    && pending.kind == ComposerControlKind::Model
+                    && self.composer_model_selection_waiting_for_runner_attach()
+            })
+        {
+            self.composer_controls.dispatch_armed = false;
+            return;
+        }
         self.composer_controls.dispatch_armed = false;
         if self
             .composer_controls
@@ -1686,6 +1735,17 @@ impl App {
                 ComposerPickerStatus::Unavailable,
             );
         }
+    }
+
+    fn composer_model_selection_waiting_for_runner_attach(&self) -> bool {
+        self.pending_runner_attach.as_ref().is_some_and(|pending| {
+            pending.continuations.iter().any(|continuation| {
+                matches!(
+                    continuation,
+                    super::RunnerAttachContinuation::SelectModel { .. }
+                )
+            })
+        })
     }
 
     /// True when this receipt still sits in `composer_controls.pending` but

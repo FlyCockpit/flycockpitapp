@@ -2780,7 +2780,7 @@ fn pointer_default_model_actions_dispatch_from_fresh_sources() {
         match action {
             SettingsPointerAction::DefaultModel(DefaultModelAction::Choose) => {
                 assert_eq!(up, SettingsPointerOutcome::Close);
-                assert!(dialog.pending_default_model_picker);
+                assert!(dialog.pending_default_model_from_settings);
                 assert!(dialog.pending_daemon_request.is_none());
             }
             SettingsPointerAction::DefaultModel(DefaultModelAction::Clear) => {
@@ -6399,7 +6399,7 @@ fn default_model_row_shows_the_effective_default_and_opens_the_shared_picker() {
 
     // Enter opens the same provider-scoped picker `/model` uses.
     d.handle_key(press(KeyCode::Enter));
-    assert!(d.pending_default_model_picker);
+    assert!(d.pending_default_model_from_settings);
     assert!(
         d.pending_daemon_request.take().is_none(),
         "opening the picker must not mutate anything"
@@ -7799,7 +7799,7 @@ pub(super) fn open_utility_picker(d: &mut SettingsDialog) {
     d.handle_key(press(KeyCode::Enter)); // open picker
 }
 
-fn utility_picker(d: &SettingsDialog) -> &ui_page::UtilityModelPicker {
+fn utility_picker(d: &SettingsDialog) -> &ui_page::UtilityModelSelector {
     match d.test_page() {
         TestPageRef::Category(p) => p.utility_picker.as_ref().expect("picker open"),
         other => panic!("expected Category page, got {other:?}"),

@@ -993,6 +993,25 @@ impl App {
                         },
                     );
                 }
+                if applied {
+                    if self
+                        .composer_controls
+                        .picker
+                        .as_ref()
+                        .is_some_and(|picker| {
+                            picker.kind == crate::tui::composer_controls::ComposerControlKind::Model
+                        })
+                    {
+                        self.composer_controls.picker = None;
+                        self.composer_controls.selection = None;
+                        self.composer_controls.pending = None;
+                        self.composer_controls.dispatch_armed = false;
+                    }
+                    if self.submit_after_model_selection {
+                        self.submit_after_model_selection = false;
+                        let _ = self.submit_input();
+                    }
+                }
                 self.dispatch_next_ready_paste_fence();
             }
             TurnEvent::HostCapabilitiesChanged { snapshot } => {
@@ -2746,28 +2765,21 @@ impl App {
         // by an unrelated writer while the add-model settings dialog remains
         // open must update the held config, but must not consume the causal
         // reopen marker or rebuild the hidden picker underneath the dialog.
-        if !self.dialog.is_active()
-            && let Some(provider) = self.reopen_model_picker_after_settings.take()
+        if self
+            .refresh_reopened_composer_model_after_settings
+            .is_some()
+            && self
+                .composer_controls
+                .picker
+                .as_ref()
+                .is_some_and(|picker| {
+                    picker.kind == crate::tui::composer_controls::ComposerControlKind::Model
+                })
         {
-            self.open_model_picker_for_provider(&provider);
-            if let (Some(draft), Overlay::ModelPicker(picker)) = (
-                self.reopen_model_picker_draft_after_settings.take(),
-                &mut self.overlay,
-            ) {
-                picker.restore_requested_selection(&draft);
-            }
-        }
-        if let Some(provider) = self.refresh_reopened_model_picker_after_settings.take()
-            && matches!(self.overlay, Overlay::ModelPicker(_))
-        {
-            let draft = match &self.overlay {
-                Overlay::ModelPicker(picker) => picker.draft_active_model().cloned(),
-                _ => None,
-            };
-            self.open_model_picker_for_provider(&provider);
-            if let (Some(draft), Overlay::ModelPicker(picker)) = (draft, &mut self.overlay) {
-                picker.restore_requested_selection(&draft);
-            }
+            self.refresh_reopened_composer_model_after_settings.take();
+            // In-place refresh preserves default-only mode; reopening via the
+            // ordinary chord path would clear `default_model_settings_mode`.
+            self.refresh_open_composer_model_menu();
         }
     }
 

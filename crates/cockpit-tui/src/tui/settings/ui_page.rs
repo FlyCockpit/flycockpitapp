@@ -5,7 +5,7 @@
 //!     `extended.agent_guidance_files` (drilled from Behavior),
 //!   - [`RedactPatternsPage`] — grab/reorder editor for
 //!     `extended.redact.dotenv_patterns` (drilled from Privacy & Safety),
-//!   - [`UtilityModelPicker`] — the utility-model overlay opened on the
+//!   - [`UtilityModelSelector`] — the utility-model overlay opened on the
 //!     Behavior page's `utility model` row.
 //!
 //! These were originally hung off the old flat `UiPage`; that page was split
@@ -63,7 +63,7 @@ const UTILITY_MODEL_WINDOW: usize = 10;
 ///
 /// Opens in Custom mode when there are no models to list, so the field still
 /// works with an empty/unfetched config.
-pub(crate) struct UtilityModelPicker {
+pub(crate) struct UtilityModelSelector {
     /// Configured models in provider-grouped natural order.
     pub(crate) entries: Vec<UtilityModelEntry>,
     /// `provider:model-id` currently stored, if any. Indicated in the list
@@ -87,7 +87,7 @@ pub(super) const PICKER_ACTION_ROWS: usize = 2;
 pub(super) const PICKER_CLEAR_ROW: usize = 0;
 pub(super) const PICKER_CUSTOM_ROW: usize = 1;
 
-impl UtilityModelPicker {
+impl UtilityModelSelector {
     /// Build the picker from the configured providers. Models are listed in
     /// provider order (the config's `BTreeMap` iteration), each provider's
     /// models in their stored order — no sort/rank. With no models
@@ -576,7 +576,7 @@ impl SettingsCx {
         &self,
         frame: &mut Frame,
         area: Rect,
-        picker: &UtilityModelPicker,
+        picker: &UtilityModelSelector,
         target: super::category::SettingId,
     ) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));

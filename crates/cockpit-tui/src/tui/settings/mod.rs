@@ -3288,7 +3288,7 @@ pub struct SettingsCx {
     pending_daemon_request: Option<Request>,
     pending_oauth_action: Option<OAuthFlowRequest>,
     /// Close settings and open the model picker for default-only mutation.
-    pub(super) pending_default_model_picker: bool,
+    pub(super) pending_default_model_from_settings: bool,
     /// Correlation id of a staged `SetDefaultModel`, so the app can match the
     /// terminal `DefaultModelUpdateResult` to this exact operation.
     pub(super) pending_default_model_update_id: Option<uuid::Uuid>,
@@ -5469,7 +5469,7 @@ impl SettingsPage for DefaultModelPage {
             | KeyCode::Char('h')
             | KeyCode::Backspace => Nav::Back,
             KeyCode::Enter | KeyCode::Char('c') => {
-                cx.pending_default_model_picker = true;
+                cx.pending_default_model_from_settings = true;
                 Nav::Close
             }
             // Clearing is a daemon-verified operation: it succeeds only when
@@ -6787,11 +6787,11 @@ impl Dialog {
         }
     }
 
-    pub fn take_pending_default_model_picker(&mut self) -> bool {
+    pub fn take_pending_default_model_from_settings(&mut self) -> bool {
         match self {
             Dialog::Settings(s) => {
-                let pending = s.pending_default_model_picker;
-                s.pending_default_model_picker = false;
+                let pending = s.pending_default_model_from_settings;
+                s.pending_default_model_from_settings = false;
                 pending
             }
             _ => false,
@@ -7777,7 +7777,7 @@ impl SettingsDialog {
                 secret_inventory_pending: Arc::new(Mutex::new(BTreeSet::new())),
                 pending_daemon_request: None,
                 pending_oauth_action: None,
-                pending_default_model_picker: false,
+                pending_default_model_from_settings: false,
                 pending_default_model_update_id: None,
                 host_capabilities: crate::tui::capability_gate::empty_capability_snapshot(),
                 capability_refresh_queue: Vec::new(),

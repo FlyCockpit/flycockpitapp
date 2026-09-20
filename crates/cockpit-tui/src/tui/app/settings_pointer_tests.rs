@@ -187,7 +187,7 @@ fn settings_hover_is_not_stolen_by_session_rail() {
 }
 
 #[test]
-fn settings_mouse_default_model_picker_matches_keyboard() {
+fn settings_mouse_default_model_menu_matches_keyboard() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut app = App::new(Some(tmp.path()), false);
     app.dialog = Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
@@ -236,12 +236,14 @@ fn settings_mouse_default_model_picker_matches_keyboard() {
         target.y,
     ));
     assert!(
-        matches!(app.overlay, super::Overlay::ModelPicker(_)),
-        "mouse Up must open the same default-model picker as keyboard"
+        app.composer_controls.picker.as_ref().is_some_and(|picker| {
+            picker.kind == crate::tui::composer_controls::ComposerControlKind::Model
+        }),
+        "mouse Up must open the same default-model menu as keyboard"
     );
     assert!(
-        app.default_model_picker_mode,
-        "mouse close path must consume take_pending_default_model_picker"
+        app.default_model_settings_mode,
+        "mouse close path must consume take_pending_default_model_from_settings"
     );
 }
 
@@ -290,19 +292,6 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
     };
 
     let overlay_cases: Vec<(OverlaySurface, Overlay)> = vec![
-        (
-            OverlaySurface::ModelPicker,
-            Overlay::ModelPicker(
-                crate::tui::model_picker::ModelPickerDialog::open_with_failures(
-                    app.config_snapshot.providers.clone(),
-                    None,
-                    &Default::default(),
-                    &Default::default(),
-                    0,
-                )
-                .expect("model picker"),
-            ),
-        ),
         (
             OverlaySurface::Multireview,
             match crate::tui::multireview_dialog::MultireviewDialog::open(
@@ -425,7 +414,6 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         rendered_surfaces.push(OverlaySurface::GoalSettings);
     }
     for required in [
-        OverlaySurface::ModelPicker,
         OverlaySurface::Multireview,
         OverlaySurface::Stats,
         OverlaySurface::Usage,

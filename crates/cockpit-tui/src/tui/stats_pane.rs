@@ -10,7 +10,7 @@
 //! schedules async refreshes whenever the pane opens or its scope/range
 //! toggles change.
 //!
-//! Mirrors the [`crate::tui::model_picker`] dialog's shape: a struct
+//! Mirrors the stats overlay shape: a struct
 //! with `open` / `handle_key` / `render`, opened over the chat body by
 //! `App` and routed input/render like the other full-body overlays.
 

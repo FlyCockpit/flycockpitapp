@@ -74,33 +74,33 @@ impl App {
         self.swap_primary_agent(&next);
     }
 
-    pub(super) fn open_model_picker(&mut self) {
-        self.default_model_picker_mode = false;
-        self.open_model_picker_highlighting(None);
+    pub(super) fn open_model_menu(&mut self) {
+        self.default_model_settings_mode = false;
+        self.open_model_menu_highlighting(None);
         // Slot ordering is daemon-owned session state. `/model` is available
         // without first visiting `/session-setup`, so refresh that snapshot
-        // whenever the ordinary picker opens; the completion updates this
-        // already-open picker in place.
+        // whenever the ordinary menu opens; the completion updates this
+        // already-open menu in place.
         self.request_session_setup_snapshot_refresh();
     }
 
-    pub(super) fn open_default_model_picker_from_settings(&mut self) {
-        self.default_model_picker_mode = true;
+    pub(super) fn open_default_model_from_settings(&mut self) {
         if self.config_snapshot.providers.providers.is_empty() {
             // First-paint startup can show attached runner chrome before the
             // daemon provider catalog lands in `config_snapshot`. Read the
-            // bootstrap layer so the default-model picker can open immediately
+            // bootstrap layer so the default-model menu can open immediately
             // after settings closes instead of waiting for a later push.
             self.refresh_bootstrap_config_snapshot();
         }
         let current = self.config_snapshot.providers.active_model.clone();
-        self.open_model_picker_highlighting(current.as_ref());
+        self.open_model_menu_highlighting(current.as_ref());
+        self.default_model_settings_mode = true;
         self.push_plain(
             "Choose the default model for new sessions (does not switch this session).",
         );
     }
 
-    pub(super) fn open_model_picker_highlighting(
+    pub(super) fn open_model_menu_highlighting(
         &mut self,
         requested: Option<&cockpit_config::providers::ActiveModelRef>,
     ) {
@@ -109,28 +109,13 @@ impl App {
             self.current_model_selection_retry()
                 .map(|retry| retry.requested.clone())
         });
-        match crate::tui::model_picker::ModelPickerDialog::open_with_failures(
-            self.config_snapshot.providers.clone(),
-            self.launch.active_model.clone(),
-            &self.usage_models,
-            &self.auth_failure_annotations,
-            chrono::Utc::now().timestamp(),
-        ) {
-            Ok(mut picker) => {
-                picker.set_active_slot_models(
-                    self.prepared_slot_models.clone(),
-                    self.prepared_slot_default.clone(),
-                    &self.usage_models,
-                );
-                picker.set_config_drift(self.model_picker_drift());
-                if let Some(requested) = requested.as_ref() {
-                    picker.restore_requested_selection(requested);
-                }
-                self.overlay = Overlay::ModelPicker(picker);
-            }
-            Err(e) => {
-                self.push_plain(format!("/model: {e}"));
-            }
+        if let Some(requested) = requested.as_ref() {
+            self.open_composer_model_menu_for_provider(&requested.provider);
+            self.restore_composer_model_menu_selection(requested);
+        } else {
+            self.open_composer_picker_from_chord(
+                crate::tui::composer_controls::ComposerControlKind::Model,
+            );
         }
     }
 
@@ -181,35 +166,60 @@ impl App {
         Some(pending.requested)
     }
 
-    pub(super) fn open_model_picker_for_provider(&mut self, provider: &str) {
-        match crate::tui::model_picker::ModelPickerDialog::open_for_provider_with_failures(
-            self.config_snapshot.providers.clone(),
-            provider,
-            self.launch.active_model.clone(),
-            &self.usage_models,
-            &self.auth_failure_annotations,
-            chrono::Utc::now().timestamp(),
-        ) {
-            Ok(mut picker) => {
-                let prepared_allowed = self
-                    .prepared_slot_models
-                    .iter()
-                    .filter(|(active_provider, _)| active_provider == provider)
-                    .cloned()
-                    .collect();
-                let prepared_default = self
-                    .prepared_slot_default
-                    .clone()
-                    .filter(|(active_provider, _)| active_provider == provider);
-                picker.set_active_slot_models(
-                    prepared_allowed,
-                    prepared_default,
-                    &self.usage_models,
-                );
-                picker.set_config_drift(self.model_picker_drift());
-                self.overlay = Overlay::ModelPicker(picker);
-            }
-            Err(error) => self.push_plain(format!("/model: {error}")),
+    pub(super) fn open_composer_model_menu_for_provider(&mut self, provider: &str) {
+        self.open_composer_picker_from_chord(
+            crate::tui::composer_controls::ComposerControlKind::Model,
+        );
+        if let Some(picker) = self.composer_controls.picker.as_mut()
+            && let Some(index) = picker
+                .categories
+                .iter()
+                .position(|category| category.id == provider && category.label != "Config drift")
+        {
+            picker.cursor = index;
+            picker.category = index;
+            picker.level = 1;
+            picker.cursor = picker
+                .categories
+                .get(index)
+                .and_then(|category| {
+                    category.items.iter().position(|item| {
+                        self.launch
+                            .active_model
+                            .as_ref()
+                            .is_some_and(|(active_provider, model)| {
+                                active_provider == &category.id && &item.id == model
+                            })
+                    })
+                })
+                .unwrap_or(0);
+        }
+    }
+
+    pub(super) fn restore_composer_model_menu_selection(
+        &mut self,
+        requested: &cockpit_config::providers::ActiveModelRef,
+    ) {
+        let Some(picker) = self.composer_controls.picker.as_mut() else {
+            return;
+        };
+        if let Some(index) = picker.categories.iter().position(|category| {
+            category.id == requested.provider && category.label != "Config drift"
+        }) {
+            picker.category = index;
+            picker.level = 1;
+            let item_count = picker.categories[index].items.len();
+            picker.cursor = picker
+                .categories
+                .get(index)
+                .and_then(|category| {
+                    category
+                        .items
+                        .iter()
+                        .position(|item| item.id == requested.model)
+                })
+                .unwrap_or(picker.cursor)
+                .min(item_count.saturating_sub(1));
         }
     }
 
@@ -269,16 +279,12 @@ impl App {
     }
 
     pub(super) fn refresh_config_drift_surfaces(&mut self) {
-        let drift = self.model_picker_drift();
-        if let Overlay::ModelPicker(picker) = &mut self.overlay {
-            picker.set_config_drift(drift);
-        }
-        self.refresh_open_composer_model_picker();
+        self.refresh_open_composer_model_menu();
     }
 
-    pub(super) fn model_picker_drift(&self) -> Option<crate::tui::model_picker::ModelPickerDrift> {
+    pub(super) fn model_drift(&self) -> Option<crate::tui::model_choice::ModelDrift> {
         let state = self.config_drift.as_ref()?;
-        Some(crate::tui::model_picker::ModelPickerDrift {
+        Some(crate::tui::model_choice::ModelDrift {
             session_label: self.session_model_label(),
             config_label: state.config_label(),
             config_model: state.config_active_model(),
@@ -384,63 +390,6 @@ impl App {
             &notice.provider,
             oauth_expired,
         );
-    }
-
-    pub(super) fn close_model_picker(&mut self, accepted: bool) {
-        self.refresh_reopened_model_picker_after_settings = None;
-        self.reopen_model_picker_draft_after_settings = None;
-        if !accepted {
-            self.submit_after_model_selection = false;
-        }
-        let selected = match std::mem::take(&mut self.overlay) {
-            Overlay::ModelPicker(picker) if accepted => picker
-                .selected_active_model()
-                .map(|active| (active, picker.persists_as_default())),
-            other => {
-                self.overlay = other;
-                None
-            }
-        };
-        self.overlay = Overlay::None;
-        if selected.is_none() {
-            self.submit_after_model_selection = false;
-        }
-        if let Some((active, explicitly_persist_as_default)) = selected {
-            if self.default_model_picker_mode {
-                self.default_model_picker_mode = false;
-                self.request_default_model_only(active);
-                return;
-            }
-            // Plain Enter is the consciously separate session-only action: it
-            // never invokes the effective-default mutation API and cannot
-            // alter `active_model` in any layer. Establishing a first default
-            // is an explicit act (`Ctrl+Enter`, `/settings`, `/setup model`).
-            let persist_as_default = explicitly_persist_as_default;
-            let provider = active.provider.clone();
-            let model = active.model.clone();
-            if self.notify_active_model_selected(
-                active.clone(),
-                persist_as_default,
-                cockpit_proto::ActiveModelSwitchTrigger::Picker,
-            ) {
-                if self.pending_runner_attach.is_some() {
-                    // Attach is still in flight. Keep the picker so a bootstrap
-                    // failure cannot look like a successful close.
-                    self.open_model_picker_highlighting(Some(&active));
-                    return;
-                }
-                let scope = if persist_as_default {
-                    format!("Selecting {provider}/{model} for this session; saving default…")
-                } else {
-                    format!("Selecting {provider}/{model} for this session…")
-                };
-                self.push_plain(scope);
-                if self.submit_after_model_selection {
-                    self.submit_after_model_selection = false;
-                    let _ = self.submit_input();
-                }
-            }
-        }
     }
 
     pub(super) fn notify_active_model_selected(
@@ -610,9 +559,10 @@ impl App {
         message: String,
     ) {
         if matches!(trigger, cockpit_proto::ActiveModelSwitchTrigger::Picker) {
-            self.open_model_picker_highlighting(Some(active));
-            if let Overlay::ModelPicker(picker) = &mut self.overlay {
-                picker.set_error(message);
+            self.open_model_menu_highlighting(Some(active));
+            if let Some(picker) = self.composer_controls.picker.as_mut() {
+                picker.status = super::composer_controls::ComposerPickerStatus::Unavailable;
+                picker.status_text = Some(message);
             }
             return;
         }
@@ -620,7 +570,7 @@ impl App {
     }
 
     pub(super) fn open_quick_dialog(&mut self) {
-        let models = crate::tui::model_picker::ordered_model_choices_from_inventory(
+        let models = crate::tui::model_choice::ordered_model_choices_from_inventory(
             &self.inventory_models(),
             &self.usage_models,
         )
@@ -1191,16 +1141,6 @@ impl App {
         self.retry_model_selections
             .remove(&session_id)
             .filter(|retry| retry.session_id == session_id)
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_current_model_selection_retry(
-        &mut self,
-        mut retry: super::ModelSelectionRetry,
-    ) {
-        retry.session_id = self.launch.session_id;
-        self.retry_model_selections
-            .insert(self.launch.session_id, retry);
     }
 
     /// Start a fresh runner/session model-state epoch. Every pending model

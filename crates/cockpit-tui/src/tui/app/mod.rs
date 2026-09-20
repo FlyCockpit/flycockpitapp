@@ -43,8 +43,12 @@ pub(crate) use response_metrics_tokenizer::{TokenizerConfirmOutcome, TokenizerCo
 pub(crate) use response_metrics_tokenizer::{
     response_metrics_tokenizer_choices, response_metrics_tokenizer_help,
 };
+#[cfg(test)]
+mod composer_model_menu_input_tests;
 mod local_commands;
 mod model_controls;
+#[cfg(test)]
+mod model_selection_input_tests;
 mod models_refresh;
 mod mouse;
 mod mouse_gesture;
@@ -1421,7 +1425,6 @@ pub(super) struct PendingResumeRepair {
 pub(super) enum Overlay {
     #[default]
     None,
-    ModelPicker(crate::tui::model_picker::ModelPickerDialog),
     Multireview(crate::tui::multireview_dialog::MultireviewDialog),
     Stats(crate::tui::stats_pane::StatsPane),
     Usage(crate::tui::usage_pane::UsagePane),
@@ -1459,7 +1462,6 @@ impl Overlay {
 
     pub(super) fn dialog_height(&self) -> u16 {
         match self {
-            Self::ModelPicker(_) => crate::tui::model_picker::DIALOG_HEIGHT,
             Self::Quick(_) => 14,
             Self::Multireview(_) => crate::tui::multireview_dialog::DIALOG_HEIGHT,
             _ => 0,
@@ -1470,7 +1472,6 @@ impl Overlay {
         use crate::tui::keys_overlay::KeyContext;
         match self {
             Self::None => None,
-            Self::ModelPicker(_) => Some(KeyContext::ModelPicker),
             Self::Multireview(_) => Some(KeyContext::Settings),
             Self::Permissions(_) => Some(KeyContext::Permissions),
             Self::Resources(_) => Some(KeyContext::Resources),
@@ -2706,7 +2707,7 @@ pub struct App {
     pub(super) prepared_slot_models: Vec<(String, String)>,
     pub(super) prepared_slot_default: Option<(String, String)>,
     /// When true, the open model picker saves via SetDefaultModel only.
-    pub(super) default_model_picker_mode: bool,
+    pub(super) default_model_settings_mode: bool,
     pub(super) pending_default_model_update_id: Option<uuid::Uuid>,
     /// Exact send intent retained after a rejected/expired model selection.
     /// The next picker selection adopts it so git blocks, tag expansions,
@@ -2715,11 +2716,8 @@ pub struct App {
     /// Provider whose model editor was opened from the picker. Closing the
     /// editor restores the picker immediately; a later daemon snapshot may
     /// refresh that still-open picker's inventory exactly once.
-    pub(super) reopen_model_picker_after_settings: Option<String>,
-    pub(super) reopen_composer_model_picker_after_settings: Option<String>,
-    pub(super) reopen_model_picker_draft_after_settings:
-        Option<cockpit_config::providers::ActiveModelRef>,
-    pub(super) refresh_reopened_model_picker_after_settings: Option<String>,
+    pub(super) reopen_composer_model_after_settings: Option<String>,
+    pub(super) refresh_reopened_composer_model_after_settings: Option<String>,
     /// A send opened the model picker; after a confirmed choice, rerun the
     /// untouched composer through the normal submit path and hold it behind
     /// the correlated model transaction.
@@ -4245,13 +4243,11 @@ impl App {
             pending_model_selection: None,
             prepared_slot_models: Vec::new(),
             prepared_slot_default: None,
-            default_model_picker_mode: false,
+            default_model_settings_mode: false,
             pending_default_model_update_id: None,
             retry_model_selections: HashMap::new(),
-            reopen_model_picker_after_settings: None,
-            reopen_composer_model_picker_after_settings: None,
-            reopen_model_picker_draft_after_settings: None,
-            refresh_reopened_model_picker_after_settings: None,
+            reopen_composer_model_after_settings: None,
+            refresh_reopened_composer_model_after_settings: None,
             submit_after_model_selection: false,
             next_control_request_seq: 0,
             elided_event_ids: std::collections::HashSet::new(),
@@ -5218,7 +5214,6 @@ mod keys_overlay_tests;
 #[cfg(test)]
 mod local_cmd_tests;
 #[cfg(test)]
-mod model_picker_input_tests;
 #[cfg(test)]
 mod new_session_swap_tests;
 #[cfg(test)]

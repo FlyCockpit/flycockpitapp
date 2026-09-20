@@ -48,7 +48,7 @@ pub mod links;
 pub mod markdown;
 pub mod math_render;
 mod message_block;
-pub mod model_picker;
+pub mod model_choice;
 pub mod multireview_dialog;
 pub mod nav;
 pub mod notes_pane;

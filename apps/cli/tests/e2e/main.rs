@@ -28,6 +28,8 @@ mod run_noninteractive;
 #[cfg(unix)]
 mod tui_mouse_gesture_pty;
 #[cfg(unix)]
+mod tui_pty_agent_authoring_mouse;
+#[cfg(unix)]
 mod tui_pty_cold_first_run;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 mod tui_pty_daemon_recovery;

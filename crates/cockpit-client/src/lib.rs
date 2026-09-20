@@ -12,11 +12,11 @@
 //! through one socket while also reading the event stream, without
 //! any locking ceremony in user code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(any(unix, windows))]
 use anyhow::Context;
@@ -43,6 +43,35 @@ pub mod image_upload;
 pub mod launch_provenance;
 pub mod presentation;
 pub mod submission;
+
+/// One shared restart-storm policy for both the stable supervisor and attached
+/// clients. Three automatic worker replacements in a rolling minute are
+/// tolerated; the fourth exhausts supervision and leaves the existing #437
+/// restart decision as the fallback.
+pub const AUTOMATIC_RESTARTS_PER_MINUTE: usize = 3;
+
+#[derive(Debug, Default)]
+pub struct RestartStormGuard {
+    attempts: VecDeque<Instant>,
+}
+
+impl RestartStormGuard {
+    pub fn allow(&mut self, now: Instant) -> bool {
+        let window = Duration::from_secs(60);
+        while self
+            .attempts
+            .front()
+            .is_some_and(|attempt| now.saturating_duration_since(*attempt) >= window)
+        {
+            self.attempts.pop_front();
+        }
+        if self.attempts.len() >= AUTOMATIC_RESTARTS_PER_MINUTE {
+            return false;
+        }
+        self.attempts.push_back(now);
+        true
+    }
+}
 
 /// A cloneable, capability-bearing endpoint for opening fresh in-process
 /// client connections. Unlike the former pathname registry, possession of
@@ -1589,6 +1618,17 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use tokio::net::UnixListener;
+
+    #[test]
+    fn restart_storm_guard_has_one_rolling_window_policy() {
+        let start = Instant::now();
+        let mut guard = RestartStormGuard::default();
+        for offset in 0..AUTOMATIC_RESTARTS_PER_MINUTE {
+            assert!(guard.allow(start + Duration::from_secs(offset as u64)));
+        }
+        assert!(!guard.allow(start + Duration::from_secs(59)));
+        assert!(guard.allow(start + Duration::from_secs(60)));
+    }
 
     #[tokio::test]
     async fn daemon_process_watch_reports_only_explicit_exit_signal() {

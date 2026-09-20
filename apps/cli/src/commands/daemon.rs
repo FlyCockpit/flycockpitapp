@@ -21,6 +21,31 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
     .then(|| tokio::time::Instant::now() + daemon::restart_release_timeout(None));
     let paths = DaemonPaths::resolve()?;
     match cmd {
+        DaemonCommand::Supervise {
+            no_sandbox,
+            resume_all_sessions,
+            reexec_child: _,
+        } => daemon::supervisor::run(paths, no_sandbox, resume_all_sessions).await,
+        DaemonCommand::Worker {
+            no_sandbox,
+            resume_all_sessions,
+        } => {
+            if !daemon::supervisor::is_worker_process() {
+                bail!("`cockpit daemon worker` may only be launched by the supervisor");
+            }
+            if no_sandbox {
+                // SAFETY: set before the worker boots any session tasks.
+                unsafe {
+                    std::env::set_var(crate::daemon::session_worker::DAEMON_NO_SANDBOX_ENV, "1");
+                }
+            }
+            let terminal_factory = crate::terminal_host::factory();
+            if resume_all_sessions {
+                daemon::run_foreground_with_resume(paths, true, terminal_factory).await
+            } else {
+                daemon::run_foreground(paths, terminal_factory).await
+            }
+        }
         DaemonCommand::Start {
             foreground,
             detach,
@@ -36,35 +61,35 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 );
                 return Ok(());
             }
-            // Foreground mode: blocks until SIGINT/SIGTERM. A daemon
-            // launched `--no-sandbox` disables filesystem sandboxing for
-            // ALL its sessions (sandboxing part 2): export the marker env
-            // var the session workers read at spawn (Layer B style).
-            if no_sandbox {
-                // SAFETY: set before the runtime spins up worker tasks; a
-                // process-global read-only marker thereafter.
-                unsafe {
-                    std::env::set_var(crate::daemon::session_worker::DAEMON_NO_SANDBOX_ENV, "1");
-                }
-            }
             println!(
-                "daemon: starting in foreground (pid {})\n  socket: {}\n  pid file: {}",
+                "daemon: starting supervisor in foreground (pid {})\n  socket: {}\n  pid file: {}",
                 std::process::id(),
                 paths.socket.display(),
                 paths.pid_file.display()
             );
-            let terminal_factory = crate::terminal_host::factory();
-            if resume_all_sessions {
-                daemon::run_foreground_with_resume(paths, true, terminal_factory).await
-            } else {
-                daemon::run_foreground(paths, terminal_factory).await
-            }
+            daemon::supervisor::run(paths, no_sandbox, resume_all_sessions).await
         }
         DaemonCommand::Stop { grace } => {
             validate_grace(grace)?;
             let deadline = lifecycle_deadline.expect("stop command deadline");
             let old_pid = daemon::daemon_pid(&paths);
             let mut release = daemon::capture_restart_release(&paths, old_pid);
+            if let Ok(response) =
+                daemon::supervisor::request(&paths, daemon::supervisor::AdminCommand::Stop).await
+                && matches!(response, daemon::supervisor::AdminResponse::Stopping { .. })
+            {
+                if daemon::wait_for_restart_release(
+                    &paths,
+                    release,
+                    remaining_command_budget(deadline),
+                )
+                .await
+                {
+                    println!("daemon: stopped");
+                    return Ok(());
+                }
+                bail!("timed out waiting for the supervisor and worker to drain and exit");
+            }
             let mut stop_acknowledged = false;
             if let Ok(Ok(client)) = tokio::time::timeout(
                 remaining_command_budget(deadline),
@@ -145,6 +170,27 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             no_sandbox,
         } => {
             validate_grace(grace)?;
+            if let Ok(response) =
+                daemon::supervisor::request(&paths, daemon::supervisor::AdminCommand::Roll).await
+            {
+                match response {
+                    daemon::supervisor::AdminResponse::Rolled {
+                        old_worker_pid,
+                        worker_pid,
+                        generation,
+                        ..
+                    } => {
+                        println!(
+                            "daemon: rolled worker {old_worker_pid} -> {worker_pid} (generation {generation}); attached clients will reconnect"
+                        );
+                        return Ok(());
+                    }
+                    daemon::supervisor::AdminResponse::Error { message, .. } => {
+                        bail!("supervisor roll failed: {message}")
+                    }
+                    _ => bail!("supervisor returned an unexpected roll response"),
+                }
+            }
             let deadline = lifecycle_deadline.expect("restart command deadline");
             let old_pid = daemon::daemon_pid(&paths);
             let release = daemon::capture_restart_release(&paths, old_pid);
@@ -233,7 +279,78 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             println!("{}", restart_started_message(restarted, pid, &paths.socket));
             Ok(())
         }
+        DaemonCommand::Upgrade { binary } => {
+            let response = daemon::supervisor::request(
+                &paths,
+                daemon::supervisor::AdminCommand::Upgrade { binary },
+            )
+            .await?;
+            match response {
+                daemon::supervisor::AdminResponse::Rolled {
+                    old_worker_pid,
+                    worker_pid,
+                    generation,
+                    ..
+                } => {
+                    println!(
+                        "daemon: upgraded worker {old_worker_pid} -> {worker_pid} (generation {generation})"
+                    );
+                    Ok(())
+                }
+                daemon::supervisor::AdminResponse::Error { message, .. } => {
+                    bail!("supervisor upgrade failed: {message}")
+                }
+                _ => bail!("supervisor returned an unexpected upgrade response"),
+            }
+        }
+        DaemonCommand::Reexec => {
+            let response =
+                daemon::supervisor::request(&paths, daemon::supervisor::AdminCommand::Reexec)
+                    .await?;
+            match response {
+                daemon::supervisor::AdminResponse::Reexecing { .. } => {
+                    println!("daemon: supervisor reexec started");
+                    Ok(())
+                }
+                daemon::supervisor::AdminResponse::Error { message, .. } => {
+                    bail!("supervisor reexec failed: {message}")
+                }
+                _ => bail!("supervisor returned an unexpected reexec response"),
+            }
+        }
         DaemonCommand::Status { json } => {
+            if let Ok(status) =
+                daemon::supervisor::request(&paths, daemon::supervisor::AdminCommand::Status).await
+                && let daemon::supervisor::AdminResponse::Status {
+                    supervisor_pid,
+                    worker_pid,
+                    generation,
+                    uptime_ms,
+                    ..
+                } = status
+            {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "running",
+                            "supervisor_pid": supervisor_pid,
+                            "worker_pid": worker_pid,
+                            "generation": generation,
+                            "uptime_ms": uptime_ms,
+                            "socket_path": paths.socket.display().to_string(),
+                            "database_path": crate::db::Db::default_path()?.display().to_string(),
+                        })
+                    );
+                } else {
+                    println!(
+                        "daemon: running\n  supervisor pid: {supervisor_pid}\n  worker pid: {worker_pid}\n  generation: {generation}\n  uptime: {:.3}s\n  socket: {}",
+                        uptime_ms as f64 / 1000.0,
+                        paths.socket.display(),
+                    );
+                }
+                return Ok(());
+            }
             let probe = daemon::discover().await;
             if json {
                 return print_json_status(&probe).await;

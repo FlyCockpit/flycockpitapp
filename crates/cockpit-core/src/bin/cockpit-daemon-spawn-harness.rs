@@ -20,18 +20,17 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    cockpit_core::daemon::supervisor::prepare_process_entry_environment()?;
     let args: Vec<String> = std::env::args().collect();
+    let role = args.get(2).map(String::as_str);
     if args.get(1).map(String::as_str) != Some("daemon")
-        || args.get(2).map(String::as_str) != Some("start")
+        || !matches!(role, Some("start" | "supervise" | "worker"))
     {
         let argv0 = args
             .first()
             .map(String::as_str)
             .unwrap_or("cockpit-daemon-spawn-harness");
-        bail!("usage: {argv0} daemon start --foreground");
-    }
-    if !args.iter().any(|arg| arg == "--foreground") {
-        bail!("daemon spawn harness requires --foreground");
+        bail!("usage: {argv0} daemon <supervise|worker>");
     }
     let no_sandbox = args.iter().any(|arg| arg == "--no-sandbox");
     let resume_all_sessions = args.iter().any(|arg| arg == "--resume-all-sessions");
@@ -53,11 +52,16 @@ fn run() -> Result<()> {
         .thread_stack_size(cockpit_core::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
         .build()
         .context("building daemon spawn harness runtime")?;
-    runtime.block_on(async {
-        if resume_all_sessions {
-            cockpit_core::daemon::run_foreground_with_resume(paths, true, terminal_factory).await
+    runtime.block_on(async move {
+        if role == Some("worker") {
+            if resume_all_sessions {
+                cockpit_core::daemon::run_foreground_with_resume(paths, true, terminal_factory)
+                    .await
+            } else {
+                cockpit_core::daemon::run_foreground(paths, terminal_factory).await
+            }
         } else {
-            cockpit_core::daemon::run_foreground(paths, terminal_factory).await
+            cockpit_core::daemon::supervisor::run(paths, no_sandbox, resume_all_sessions).await
         }
     })
 }

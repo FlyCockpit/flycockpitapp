@@ -1184,6 +1184,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             target: _,
         }
         | proto::Event::ActiveModelState { .. }
+        | proto::Event::Reconnect { .. }
         | proto::Event::ModelSelectionResult { .. }
         | proto::Event::DefaultModelUpdateResult { .. }
         | proto::Event::PreflightStarted { .. }
@@ -5663,6 +5664,26 @@ pub(crate) async fn boot(
     Ok(services)
 }
 
+/// Bootstrap a worker whose stable supervisor owns the process-independent
+/// database lifetime witness.
+pub(crate) async fn boot_supervised_worker(
+    paths: DaemonPaths,
+    terminal_factory: crate::daemon::terminal::TerminalHostFactory,
+) -> Result<BootServices> {
+    let mut timer = crate::startup::PhaseTimer::start("daemon::boot");
+    let db = Db::open_default_supervised_worker().context("opening supervised session DB")?;
+    let services = boot_with_db(
+        paths,
+        db,
+        &mut timer,
+        terminal_factory,
+        crate::daemon::config_source::ConfigSource::production(),
+    )
+    .await?;
+    timer.done();
+    Ok(services)
+}
+
 pub(crate) async fn boot_with_db(
     paths: DaemonPaths,
     db: Db,
@@ -8058,8 +8079,8 @@ where
     let hello = Envelope::response(
         Uuid::nil(),
         Response::DaemonStatus {
-            pid: std::process::id(),
-            uptime_secs: ctx.started_at.elapsed().as_secs(),
+            pid: super::supervisor::published_owner_pid(&ctx.paths),
+            uptime_secs: super::supervisor::published_uptime_secs(ctx.started_at.elapsed()),
             active_sessions: ctx.registry.active_session_ids().len() as u32,
             socket_path: ctx.paths.socket.display().to_string(),
             daemon_version: proto::DAEMON_VERSION.to_string(),

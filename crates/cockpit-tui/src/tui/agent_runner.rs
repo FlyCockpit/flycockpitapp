@@ -1643,10 +1643,6 @@ impl LocalReconnectDriver {
     }
 }
 
-/// Match Syncthing's bounded-restart principle with a deliberately small TUI
-/// budget: three trusted daemon restarts in any rolling minute reconnect
-/// automatically; the fourth requires the visible restart decision.
-const AUTOMATIC_RESTARTS_PER_MINUTE: usize = 3;
 /// Bounded wait for lifecycle resolution after the user accepts `[ Restart ]`.
 /// Persistent failure re-presents the restart decision instead of spinning forever.
 const DAEMON_RESTART_RESOLVE_ATTEMPTS: usize = 120;
@@ -1678,7 +1674,7 @@ async fn absorb_late_daemon_draining(
 
 fn post_drop_trusted_restart(
     saw_draining: bool,
-    guard: &mut AutomaticRestartGuard,
+    guard: &mut cockpit_client::RestartStormGuard,
     now: Instant,
 ) -> bool {
     saw_draining && guard.allow(now)
@@ -1686,7 +1682,7 @@ fn post_drop_trusted_restart(
 
 fn push_restart_prompt_if_untrusted_drop(
     saw_draining: bool,
-    automatic_restarts: &mut AutomaticRestartGuard,
+    automatic_restarts: &mut cockpit_client::RestartStormGuard,
     now: Instant,
     events: &Arc<Mutex<Vec<QueuedTurnEvent>>>,
     event_notify: &Arc<Notify>,
@@ -1701,34 +1697,6 @@ fn push_restart_prompt_if_untrusted_drop(
         );
     }
     trusted_restart
-}
-
-struct AutomaticRestartGuard {
-    attempts: VecDeque<Instant>,
-}
-
-impl AutomaticRestartGuard {
-    fn new() -> Self {
-        Self {
-            attempts: VecDeque::new(),
-        }
-    }
-
-    fn allow(&mut self, now: Instant) -> bool {
-        let window = Duration::from_secs(60);
-        while self
-            .attempts
-            .front()
-            .is_some_and(|attempt| now.saturating_duration_since(*attempt) >= window)
-        {
-            self.attempts.pop_front();
-        }
-        if self.attempts.len() >= AUTOMATIC_RESTARTS_PER_MINUTE {
-            return false;
-        }
-        self.attempts.push_back(now);
-        true
-    }
 }
 
 struct IncomingEventContext<'a> {
@@ -3274,8 +3242,9 @@ async fn try_spawn_inner(
             };
             let mut saw_draining = false;
             let mut process_watch = process_watch;
-            let mut automatic_restarts = AutomaticRestartGuard::new();
+            let mut automatic_restarts = cockpit_client::RestartStormGuard::default();
             loop {
+                let mut watched_owner_exited = false;
                 let client_epoch = *client_epoch_rx.borrow_and_update();
                 event_state.client_epoch = client_epoch;
                 let client = current_client.read().await.clone();
@@ -3298,7 +3267,10 @@ async fn try_spawn_inner(
                             }
                         } => {
                             match process_exit {
-                                Ok(()) => None,
+                                Ok(()) => {
+                                    watched_owner_exited = true;
+                                    None
+                                },
                                 Err(error) => {
                                     tracing::debug!(%error, "daemon process watch unavailable; retaining socket EOF fallback");
                                     process_watch = None;
@@ -3322,6 +3294,19 @@ async fn try_spawn_inner(
                     };
                     if matches!(event, proto::Event::DaemonDraining { .. }) {
                         saw_draining = true;
+                    }
+                    if let proto::Event::Reconnect { .. } = event {
+                        saw_draining = true;
+                        push_turn_event(
+                            &events,
+                            &event_notify,
+                            GLOBAL_ATTACHMENT_EPOCH,
+                            TurnEvent::DaemonLinkReconnecting {
+                                restarting: true,
+                                attempt: 1,
+                            },
+                        );
+                        continue;
                     }
                     let resync_driver = driver.clone();
                     let resync_current_client = current_client.clone();
@@ -3356,11 +3341,13 @@ async fn try_spawn_inner(
                 // The old generation's watcher is spent even when socket EOF
                 // wins the race with its process notification. A successful
                 // replacement attach must always install a fresh watcher.
+                let supervisor_survived_worker_drop =
+                    !watched_owner_exited && process_watch.is_some();
                 process_watch = None;
 
                 saw_draining = absorb_late_daemon_draining(&client, saw_draining).await;
                 let trusted_restart = push_restart_prompt_if_untrusted_drop(
-                    saw_draining,
+                    saw_draining || supervisor_survived_worker_drop,
                     &mut automatic_restarts,
                     Instant::now(),
                     &events,
@@ -4323,6 +4310,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         // client regardless of attachment.
         OnboardingBootstrap(..)
         | CaffeinateState { .. }
+        | Reconnect { .. }
         | DaemonDraining { .. }
         | DaemonLifetimeChanged { .. }
         | TerminalOutput { .. }
@@ -5415,6 +5403,7 @@ pub(crate) fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent
             | proto::WorkspaceTrustReconciliationState::StopRetrying => return None,
         },
         InterruptRaised { .. }
+        | Reconnect { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }
@@ -8007,7 +7996,7 @@ mod tests {
     #[test]
     fn automatic_restart_guard_allows_three_per_rolling_minute() {
         let start = Instant::now();
-        let mut guard = AutomaticRestartGuard::new();
+        let mut guard = cockpit_client::RestartStormGuard::default();
         assert!(guard.allow(start));
         assert!(guard.allow(start + Duration::from_secs(10)));
         assert!(guard.allow(start + Duration::from_secs(20)));
@@ -8041,7 +8030,7 @@ mod tests {
                 .ok();
         });
         assert!(absorb_late_daemon_draining(&client, false).await);
-        let mut guard = AutomaticRestartGuard::new();
+        let mut guard = cockpit_client::RestartStormGuard::default();
         assert!(post_drop_trusted_restart(true, &mut guard, Instant::now()));
     }
 
@@ -8050,7 +8039,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let client = test_client_with_events(event_rx);
         assert!(!absorb_late_daemon_draining(&client, false).await);
-        let mut guard = AutomaticRestartGuard::new();
+        let mut guard = cockpit_client::RestartStormGuard::default();
         assert!(!post_drop_trusted_restart(
             false,
             &mut guard,
@@ -8063,7 +8052,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
         let start = Instant::now();
-        let mut automatic_restarts = AutomaticRestartGuard::new();
+        let mut automatic_restarts = cockpit_client::RestartStormGuard::default();
         for secs in [0_u64, 10, 20] {
             assert!(
                 push_restart_prompt_if_untrusted_drop(

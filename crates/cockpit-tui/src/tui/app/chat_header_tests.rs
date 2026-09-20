@@ -343,6 +343,21 @@ fn header_session_status_tracks_real_state() {
     drop(_truecolor);
     app.reconnect = None;
 
+    // A daemon-generation reconnect uses the same brief header state even
+    // when a higher-precedence setup warning occupies the footer status row.
+    app.daemon_link = Some(super::DaemonLinkStatus {
+        restarting: true,
+        attempt: 1,
+        started_at: Instant::now(),
+    });
+    let buf = render(&mut app, 100, 30);
+    let title = row_text(&buf, 0);
+    assert!(
+        title.contains("Reconnecting"),
+        "daemon reconnect reaches the header: {title:?}"
+    );
+    app.daemon_link = None;
+
     // Nothing in flight over a transcript that has carried a turn: done,
     // the reference resting rule — not idle.
     app.busy = false;

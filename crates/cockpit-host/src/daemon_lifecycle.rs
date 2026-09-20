@@ -854,6 +854,34 @@ pub fn reclaim_stale_and_reserve(
     })
 }
 
+/// Replace a demonstrably stale daemon receipt without retiring its endpoint.
+///
+/// This narrow Windows supervisor-reexec operation is safe only when the
+/// endpoint is worker-owned and intentionally survives replacement of its
+/// wrapper process. Ordinary startup must use [`reclaim_stale_and_reserve`].
+#[cfg(windows)]
+pub fn reclaim_stale_and_reserve_preserving_endpoint(
+    pid_file: &Path,
+    pid: u32,
+    executable: &Path,
+) -> anyhow::Result<DaemonPidReceipt> {
+    with_lifecycle_lock(pid_file, || {
+        let incumbent = read_daemon_pid_record(pid_file)
+            .ok_or_else(|| anyhow::anyhow!("existing daemon PID reservation is malformed"))?;
+        let DaemonPidRecord::Receipt(receipt) = &incumbent else {
+            anyhow::bail!("Windows supervisor reexec requires a v2 PID receipt");
+        };
+        if verify_cockpit_daemon_receipt_identity(receipt) != PidIdentity::Missing {
+            anyhow::bail!("previous supervisor is still live or unverifiable");
+        }
+        if read_daemon_pid_record(pid_file) != Some(incumbent) {
+            anyhow::bail!("daemon lifecycle reservation changed during supervisor reexec");
+        }
+        std::fs::remove_file(pid_file)?;
+        write_pid_file_locked(pid_file, pid, executable)
+    })
+}
+
 #[cfg(any(unix, windows))]
 fn retire_incumbent_locked(
     pid_file: &Path,
@@ -1095,7 +1123,8 @@ pub fn remove_dead_legacy_metadata(
 }
 
 /// Verify that a live PID is the exact approved Cockpit executable and its
-/// argv is a daemon-start invocation. The approved executable is explicit so
+/// argv is one of the daemon lifecycle process roles (`start`, `supervise`, or
+/// `worker`). The approved executable is explicit so
 /// production can bind verification to the executable that published the
 /// lifecycle metadata; tests must pass their own test-binary path deliberately.
 ///
@@ -1123,9 +1152,9 @@ pub fn verify_cockpit_daemon_receipt_identity(receipt: &DaemonPidReceipt) -> Pid
             Ok(args) => args,
             Err(_) => return PidIdentity::Unverified,
         };
-        let daemon_argv = args
-            .windows(2)
-            .any(|pair| pair[0] == "daemon" && pair[1] == "start");
+        let daemon_argv = args.windows(2).any(|pair| {
+            pair[0] == "daemon" && matches!(pair[1].as_str(), "start" | "supervise" | "worker")
+        });
         if cmdline_is_cockpit_daemon(&args, &executable, &receipt.executable) {
             PidIdentity::VerifiedDaemon
         } else if daemon_argv {
@@ -1846,9 +1875,9 @@ pub fn cmdline_is_cockpit_daemon(
         return false;
     }
     exact_executable_identity(observed_executable, approved_executable)
-        && args
-            .windows(2)
-            .any(|pair| pair[0] == "daemon" && pair[1] == "start")
+        && args.windows(2).any(|pair| {
+            pair[0] == "daemon" && matches!(pair[1].as_str(), "start" | "supervise" | "worker")
+        })
 }
 
 #[cfg(any(unix, windows, test))]
@@ -1965,6 +1994,93 @@ impl ForegroundMetadataGuard {
             std::mem::forget(pid_lock);
         }
     }
+
+    /// Keep the two ownership descriptors live across an in-place Unix exec.
+    ///
+    /// The returned descriptors remain owned by this guard if exec fails. A
+    /// successful exec does not run destructors; the successor must reconstruct
+    /// the guard with [`Self::resume_after_reexec`].
+    #[cfg(unix)]
+    pub fn prepare_for_reexec(&self) -> std::io::Result<(std::os::fd::RawFd, std::os::fd::RawFd)> {
+        use std::os::fd::AsRawFd as _;
+
+        let lifetime = self
+            .lifetime
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("daemon lifetime ownership was transferred"))?
+            ._file
+            .as_raw_fd();
+        let pid_lock = self
+            .pid_lock
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("daemon pid lock ownership was transferred"))?
+            .as_raw_fd();
+        clear_close_on_exec(lifetime)?;
+        clear_close_on_exec(pid_lock)?;
+        Ok((lifetime, pid_lock))
+    }
+
+    /// Reconstruct foreground metadata ownership after an in-place Unix exec.
+    ///
+    /// # Safety
+    ///
+    /// Both descriptors must be uniquely owned inherited file descriptors
+    /// produced by [`Self::prepare_for_reexec`].
+    #[cfg(unix)]
+    pub unsafe fn resume_after_reexec(
+        pid_file: PathBuf,
+        socket: PathBuf,
+        endpoint_record: Option<PathBuf>,
+        receipt: DaemonPidReceipt,
+        lifetime_fd: std::os::fd::RawFd,
+        pid_lock_fd: std::os::fd::RawFd,
+    ) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd as _;
+
+        set_close_on_exec(lifetime_fd)?;
+        set_close_on_exec(pid_lock_fd)?;
+        Ok(Self {
+            pid_file,
+            socket,
+            endpoint_record,
+            receipt,
+            lifetime: Some(DaemonLifetimeGuard {
+                // SAFETY: upheld by this function's caller contract.
+                _file: unsafe { std::fs::File::from_raw_fd(lifetime_fd) },
+            }),
+            // SAFETY: upheld by this function's caller contract.
+            pid_lock: Some(unsafe { std::fs::File::from_raw_fd(pid_lock_fd) }),
+            armed: true,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn clear_close_on_exec(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: callers pass a live descriptor and F_GETFD does not mutate it.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd remains live and the updated flags differ only by FD_CLOEXEC.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_close_on_exec(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: callers pass a live descriptor and F_GETFD does not mutate it.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd remains live and the updated flags differ only by FD_CLOEXEC.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2235,6 +2351,13 @@ mod tests {
             &approved,
             &approved,
         ));
+        for role in ["supervise", "worker"] {
+            assert!(cmdline_is_cockpit_daemon(
+                &[approved.display().to_string(), "daemon".into(), role.into(),],
+                &approved,
+                &approved,
+            ));
+        }
         assert!(!cmdline_is_cockpit_daemon(
             &[
                 lookalike.display().to_string(),

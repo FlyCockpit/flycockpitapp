@@ -48,6 +48,15 @@ impl BoundRevealSocket {
             path,
         }
     }
+
+    #[cfg(unix)]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.listener
+            .as_ref()
+            .expect("bound reveal listener")
+            .as_raw_fd()
+    }
 }
 
 impl Drop for BoundRevealSocket {
@@ -440,7 +449,11 @@ pub fn bind_reveal_socket(
     paths: &crate::daemon::DaemonPaths,
     #[cfg(windows)] control: &cockpit_host::named_pipe::PipeName,
 ) -> Result<BoundRevealSocket> {
-    let path = paths.leak_reveal_socket();
+    let canonical_path = paths.leak_reveal_socket();
+    #[cfg(unix)]
+    let path = canonical_path;
+    #[cfg(windows)]
+    let path = crate::daemon::supervisor::worker_reveal_identity(&canonical_path);
     let _ = std::fs::remove_file(&path);
     #[cfg(unix)]
     {

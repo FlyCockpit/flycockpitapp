@@ -2063,6 +2063,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         // one-shot run, so they're filtered out by the session check.
         OnboardingBootstrap(..)
         | CaffeinateState { .. }
+        | Reconnect { .. }
         | DaemonDraining { .. }
         | DaemonLifetimeChanged { .. }
         | TerminalOutput { .. }

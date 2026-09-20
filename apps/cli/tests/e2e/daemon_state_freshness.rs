@@ -292,6 +292,6 @@ async fn daemon_refuses_newer_migration_ledger() {
         .pid_file()
         .parent()
         .expect("daemon state dir")
-        .join("daemon-endpoint.json");
+        .join("daemon.json");
     assert!(!endpoint.exists(), "newer-ledger daemon endpoint survived");
 }

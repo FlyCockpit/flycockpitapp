@@ -15,22 +15,29 @@ use serde::{Deserialize, Serialize};
 /// lock while this guard remains held without self-deadlocking.
 #[derive(Debug)]
 pub struct DaemonLifetimeGuard {
+    #[cfg(not(windows))]
     _file: std::fs::File,
+    #[cfg(windows)]
+    _mutex: WindowsMutexGuard,
 }
 
 #[derive(Debug)]
 pub struct DaemonLifetimeReleaseWitness {
+    #[cfg(not(windows))]
     file: std::fs::File,
+    #[cfg(windows)]
+    mutex: WindowsMutexHandle,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum AcquireDaemonLifetimeError {
     #[error("another daemon already owns the lifetime lock")]
     Busy,
-    #[error("opening or locking the daemon lifetime file: {0}")]
+    #[error("opening or locking daemon lifetime ownership: {0}")]
     Io(#[from] std::io::Error),
 }
 
+#[cfg(not(windows))]
 fn lifetime_lock_path(pid_file: &Path) -> PathBuf {
     pid_file.with_extension("lifetime.lock")
 }
@@ -40,20 +47,43 @@ fn lifetime_lock_path(pid_file: &Path) -> PathBuf {
 pub fn acquire_daemon_lifetime(
     pid_file: &Path,
 ) -> Result<DaemonLifetimeGuard, AcquireDaemonLifetimeError> {
-    let file = open_lifetime_lock(&lifetime_lock_path(pid_file))?;
-    if try_lock_lifetime_file(&file)? {
-        Ok(DaemonLifetimeGuard { _file: file })
-    } else {
-        Err(AcquireDaemonLifetimeError::Busy)
+    #[cfg(not(windows))]
+    {
+        let file = open_lifetime_lock(&lifetime_lock_path(pid_file))?;
+        if try_lock_lifetime_file(&file)? {
+            Ok(DaemonLifetimeGuard { _file: file })
+        } else {
+            Err(AcquireDaemonLifetimeError::Busy)
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mutex = WindowsMutexHandle::open(pid_file)?;
+        if mutex.try_acquire()? {
+            Ok(DaemonLifetimeGuard {
+                _mutex: WindowsMutexGuard { mutex },
+            })
+        } else {
+            Err(AcquireDaemonLifetimeError::Busy)
+        }
     }
 }
 
 pub fn capture_daemon_lifetime_release(
     pid_file: &Path,
 ) -> std::io::Result<DaemonLifetimeReleaseWitness> {
-    Ok(DaemonLifetimeReleaseWitness {
-        file: open_lifetime_lock(&lifetime_lock_path(pid_file))?,
-    })
+    #[cfg(not(windows))]
+    {
+        Ok(DaemonLifetimeReleaseWitness {
+            file: open_lifetime_lock(&lifetime_lock_path(pid_file))?,
+        })
+    }
+    #[cfg(windows)]
+    {
+        Ok(DaemonLifetimeReleaseWitness {
+            mutex: WindowsMutexHandle::open(pid_file)?,
+        })
+    }
 }
 
 impl DaemonLifetimeReleaseWitness {
@@ -62,7 +92,18 @@ impl DaemonLifetimeReleaseWitness {
     /// daemon may already own the same path, and waiting for that replacement
     /// would conflate generations and strand an uncancellable helper thread.
     pub fn released(self) -> std::io::Result<bool> {
-        try_lock_lifetime_file(&self.file)
+        #[cfg(not(windows))]
+        {
+            try_lock_lifetime_file(&self.file)
+        }
+        #[cfg(windows)]
+        {
+            let acquired = self.mutex.try_acquire()?;
+            if acquired {
+                self.mutex.release()?;
+            }
+            Ok(acquired)
+        }
     }
 }
 
@@ -74,15 +115,6 @@ fn open_lifetime_lock(path: &Path) -> std::io::Result<std::fs::File> {
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(path)
-}
-
-#[cfg(windows)]
-fn open_lifetime_lock(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
         .open(path)
 }
 
@@ -104,34 +136,82 @@ fn try_lock_lifetime_file(file: &std::fs::File) -> std::io::Result<bool> {
 }
 
 #[cfg(windows)]
-fn try_lock_lifetime_file(file: &std::fs::File) -> std::io::Result<bool> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
-    use windows_sys::Win32::Storage::FileSystem::{
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    };
-    let mut overlapped = unsafe { std::mem::zeroed() };
-    // SAFETY: the file and stack OVERLAPPED remain live for this synchronous,
-    // nonblocking call.
-    if unsafe {
-        LockFileEx(
-            file.as_raw_handle(),
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    } != 0
-    {
-        Ok(true)
-    } else {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
-            Ok(false)
-        } else {
-            Err(error)
+#[derive(Debug)]
+struct WindowsMutexHandle(std::os::windows::io::OwnedHandle);
+
+#[cfg(windows)]
+impl WindowsMutexHandle {
+    fn open(pid_file: &Path) -> std::io::Result<Self> {
+        use sha2::{Digest as _, Sha256};
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        let mut hasher = Sha256::new();
+        for unit in pid_file.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
         }
+        let digest = hasher.finalize();
+        let digest_hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let name = format!("Global\\CockpitDaemon-{digest_hex}");
+        let wide = name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: `wide` is NUL-terminated and remains live for the call.
+        let raw = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+        if raw.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: CreateMutexW returned a new owned handle.
+        Ok(Self(unsafe {
+            std::os::windows::io::OwnedHandle::from_raw_handle(raw)
+        }))
+    }
+
+    fn try_acquire(&self) -> std::io::Result<bool> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{
+            WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        // SAFETY: the owned mutex handle remains live for this call.
+        match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(std::io::Error::last_os_error()),
+            other => Err(std::io::Error::other(format!(
+                "unexpected named-mutex wait result {other:#x}"
+            ))),
+        }
+    }
+
+    fn release(&self) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        // SAFETY: callers invoke this only after this thread acquired the mutex.
+        if unsafe { ReleaseMutex(self.0.as_raw_handle()) } != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsMutexGuard {
+    mutex: WindowsMutexHandle,
+}
+
+#[cfg(windows)]
+impl Drop for WindowsMutexGuard {
+    fn drop(&mut self) {
+        let _ = self.mutex.release();
     }
 }
 
@@ -1068,7 +1148,7 @@ pub fn verify_cockpit_daemon_receipt_identity(receipt: &DaemonPidReceipt) -> Pid
 }
 
 #[cfg(target_os = "linux")]
-fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
+pub fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let suffix = stat
         .rsplit_once(')')
@@ -1148,7 +1228,7 @@ fn read_macos_proc_bsd_info(pid: u32) -> std::io::Result<MacosProcBsdInfo> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
+pub fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
     let info = read_macos_proc_bsd_info(pid)?;
     Ok(ProcessStartIdentity {
         primary: info.start_sec,
@@ -1157,7 +1237,7 @@ fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity
 }
 
 #[cfg(windows)]
-fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
+pub fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
     #[repr(C)]
     struct FileTime {
         low: u32,
@@ -1201,7 +1281,7 @@ fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity
     unix,
     not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
 ))]
-fn read_process_start_identity(_pid: u32) -> std::io::Result<ProcessStartIdentity> {
+pub fn read_process_start_identity(_pid: u32) -> std::io::Result<ProcessStartIdentity> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "stable process-start identity is unsupported on this platform",
@@ -1209,7 +1289,7 @@ fn read_process_start_identity(_pid: u32) -> std::io::Result<ProcessStartIdentit
 }
 
 #[cfg(target_os = "freebsd")]
-fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
+pub fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
     let proc = read_kinfo_proc(pid)?;
     Ok(ProcessStartIdentity {
         primary: proc.ki_start.tv_sec as u64,
@@ -1798,6 +1878,7 @@ pub fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EndpointRecord {
+    #[serde(rename = "socket_path", alias = "socket")]
     socket: PathBuf,
     receipt: DaemonPidReceipt,
 }
@@ -1810,6 +1891,7 @@ pub struct ForegroundMetadataGuard {
     endpoint_record: Option<PathBuf>,
     receipt: DaemonPidReceipt,
     lifetime: Option<DaemonLifetimeGuard>,
+    pid_lock: Option<std::fs::File>,
     armed: bool,
 }
 
@@ -1827,13 +1909,7 @@ impl ForegroundMetadataGuard {
         let lifetime = acquire_daemon_lifetime(&pid_file).with_context(|| {
             format!("acquiring daemon lifetime lock for {}", pid_file.display())
         })?;
-        Ok(Self::new_with_lifetime(
-            pid_file,
-            socket,
-            endpoint_record,
-            receipt,
-            lifetime,
-        ))
+        Self::new_with_lifetime(pid_file, socket, endpoint_record, receipt, lifetime)
     }
 
     pub fn new_with_lifetime(
@@ -1842,15 +1918,18 @@ impl ForegroundMetadataGuard {
         endpoint_record: Option<PathBuf>,
         receipt: DaemonPidReceipt,
         lifetime: DaemonLifetimeGuard,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let pid_lock = lock_published_pid_file(&pid_file)
+            .with_context(|| format!("locking published daemon pid file {}", pid_file.display()))?;
+        Ok(Self {
             pid_file,
             socket,
             endpoint_record,
             receipt,
             lifetime: Some(lifetime),
+            pid_lock: Some(pid_lock),
             armed: true,
-        }
+        })
     }
 
     /// Arm cleanup for an endpoint only after its publication transaction has
@@ -1882,7 +1961,61 @@ impl ForegroundMetadataGuard {
         if let Some(lifetime) = self.lifetime.take() {
             std::mem::forget(lifetime);
         }
+        if let Some(pid_lock) = self.pid_lock.take() {
+            std::mem::forget(pid_lock);
+        }
     }
+}
+
+#[cfg(unix)]
+fn lock_published_pid_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    // SAFETY: `file` owns a live descriptor retained by the returned guard.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(file)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn lock_published_pid_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    // SAFETY: OVERLAPPED is a plain C record whose all-zero state is valid for
+    // a synchronous whole-file lock.
+    let mut overlapped = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle and synchronous OVERLAPPED are valid for this call.
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    } != 0
+    {
+        Ok(file)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_published_pid_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 impl Drop for ForegroundMetadataGuard {
@@ -1912,6 +2045,45 @@ mod tests {
 
         drop(owner);
         acquire_daemon_lifetime(&pid_file).expect("ownership after exact owner release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_guard_holds_pid_file_flock_until_release() {
+        use std::os::fd::AsRawFd as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("cockpit.sock");
+        let receipt = write_pid_file(
+            &pid_file,
+            std::process::id(),
+            &std::env::current_exe().expect("test executable"),
+        )
+        .expect("pid receipt");
+        let guard = ForegroundMetadataGuard::new(pid_file.clone(), socket, None, receipt)
+            .expect("foreground guard");
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pid_file)
+            .expect("pid contender");
+
+        // SAFETY: contender owns a live descriptor for this nonblocking probe.
+        let locked = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(locked, -1, "a second pid-file owner must be excluded");
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        drop(guard);
+        // SAFETY: the original guard released its lock and contender remains live.
+        let relocked = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(
+            relocked, 0,
+            "pid-file lock must be reusable after daemon ownership ends"
+        );
     }
 
     #[cfg(target_os = "linux")]

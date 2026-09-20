@@ -1105,17 +1105,46 @@ mod tests {
         let env = crate::test_env::lock_async().await;
 
         let cwd = tempfile::tempdir().unwrap();
-        let runtime_home = cwd.path().join("xdg-runtime");
         let state_home = cwd.path().join("xdg-state");
-        std::fs::create_dir_all(&runtime_home).unwrap();
+        let data_home = cwd.path().join("xdg-data");
         std::fs::create_dir_all(&state_home).unwrap();
-        env.set_var("XDG_RUNTIME_DIR", &runtime_home);
+        std::fs::create_dir_all(&data_home).unwrap();
+        env.remove_var("XDG_RUNTIME_DIR");
+        env.set_var("TMPDIR", cwd.path());
         env.set_var("XDG_STATE_HOME", &state_home);
+        env.set_var("XDG_DATA_HOME", &data_home);
 
-        let cockpit_runtime = runtime_home.join("cockpit");
-        std::fs::create_dir_all(&cockpit_runtime).unwrap();
-        let socket = cockpit_runtime.join("cockpit.sock");
-        let capability = cockpit_runtime.join("cockpit.owner-capability");
+        let canonical = crate::daemon::DaemonPaths::resolve_canonical()
+            .expect("resolve fallback daemon control plane");
+        let cockpit_runtime = canonical.socket.parent().unwrap().to_path_buf();
+        // With no XDG runtime root, rendezvous must fall back beneath the
+        // allowed cwd. The nested deny is therefore the load-bearing boundary.
+        assert!(
+            cockpit_runtime.starts_with(cwd.path()),
+            "{cockpit_runtime:?}"
+        );
+        let per_user_root = cockpit_runtime
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("fallback rendezvous has a per-user root");
+        assert_eq!(per_user_root.parent(), Some(cwd.path()));
+        assert!(
+            per_user_root
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("cockpit-"))
+        );
+        assert_eq!(
+            cockpit_runtime.parent().and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new("cockpit"))
+        );
+        assert!(
+            cockpit_runtime
+                .file_name()
+                .is_some_and(|name| name.len() == 24)
+        );
+
+        let capability = canonical.owner_capability_path();
+        let socket = canonical.socket;
         let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind test socket");
         std::fs::write(&capability, "owner-capability-must-not-leak\n").unwrap();
 
@@ -1125,7 +1154,7 @@ mod tests {
         let denied = crate::daemon::control_plane_deny_paths();
         assert!(
             denied.contains(&cockpit_runtime),
-            "runtime dir must resolve to the test control plane: {denied:?}"
+            "fallback rendezvous dir must resolve to the test control plane: {denied:?}"
         );
         assert!(
             denied.contains(&state_home.join("cockpit")),

@@ -37,7 +37,7 @@ pub(crate) mod daemon {
         pub(crate) use cockpit_core::daemon::client::{
             OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient, acquire_acp_socket_daemon,
             ensure_persistent_daemon, promote_attached_owner_in_place, run_assistant_daemon,
-            run_one_shot_daemon, run_owned_daemon,
+            run_one_shot_daemon, run_owned_daemon, set_spawn_disabled,
         };
     }
     #[cfg(test)]
@@ -939,6 +939,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
     let cli: crate::cli::Cli =
         crate::cli::PublicCli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?
             .into();
+    daemon::client::set_spawn_disabled(cli.no_spawn);
 
     let interactive_shell = std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()

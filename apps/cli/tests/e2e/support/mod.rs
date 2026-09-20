@@ -185,11 +185,16 @@ impl IsolatedHome {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        self.runtime_dir.join("cockpit").join("cockpit.sock")
+        self.runtime_dir
+            .join("cockpit")
+            .join(cockpit_core::daemon::rendezvous::identity_hash(
+                &self.db_path(),
+            ))
+            .join("cockpit.sock")
     }
 
     pub fn pid_file(&self) -> PathBuf {
-        self.state_home.join("cockpit").join("daemon.pid")
+        self.socket_path().with_file_name("daemon.pid")
     }
 
     pub fn log_file(&self) -> PathBuf {
@@ -1127,7 +1132,7 @@ impl EphemeralDaemonGuard {
         let endpoint = pid_file
             .parent()
             .expect("isolated daemon pid file has a state directory")
-            .join("daemon-endpoint.json");
+            .join("daemon.json");
         Self {
             child: std::sync::Mutex::new(Some(child)),
             socket,

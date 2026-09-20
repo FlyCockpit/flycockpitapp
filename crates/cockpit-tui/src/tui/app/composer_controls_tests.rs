@@ -500,6 +500,8 @@ fn ctrl_e_opens_effort_picker_through_router() {
 #[test]
 fn ctrl_b_and_ctrl_n_route_to_session_seams() {
     let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    cockpit_config::config::dirs::ensure_global_config_dir().unwrap();
     let mut app = app(&tmp);
     assert!(!app.session_rail.is_focused());
     assert!(!app.pending_new_session);
@@ -516,6 +518,8 @@ fn ctrl_b_and_ctrl_n_route_to_session_seams() {
 #[test]
 fn ctrl_b_dismisses_an_open_picker_before_hiding_the_session_rail() {
     let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    cockpit_config::config::dirs::ensure_global_config_dir().unwrap();
     let mut app = app(&tmp);
     let _ = render(&mut app, 120, 24);
     app.handle_key(ctrl(KeyCode::Char('p')));

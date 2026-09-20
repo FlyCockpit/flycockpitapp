@@ -4,11 +4,11 @@
   + New session                                                                                                         
                                                                                                                         
  SESSIONS                                                                                                               
- ▌● ★ Build session rail                                                                                                
- ▌Jan 15, 12:00                                                                                                         
- ▌● working  [alpha]  pin 2                                                                                             
+  ● ★ Build session rail                                                                                                
+  Jan 15, 12:00                                                                                                         
   ● Waiting for approval                                                                                                
   Jan 15, 12:00                                                                                                         
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

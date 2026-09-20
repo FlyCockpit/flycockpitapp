@@ -2346,3 +2346,231 @@ fn composer_parity_table_names_retained_surfaces_and_proofs() {
         );
     }
 }
+
+#[test]
+fn default_model_settings_mode_clears_on_dismiss_and_ordinary_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    app.open_default_model_from_settings();
+    assert!(app.default_model_settings_mode);
+    app.close_composer_picker();
+    assert!(!app.default_model_settings_mode);
+
+    app.open_default_model_from_settings();
+    assert!(app.default_model_settings_mode);
+    app.handle_key(press(KeyCode::Esc));
+    assert!(!app.default_model_settings_mode);
+
+    app.open_default_model_from_settings();
+    assert!(app.default_model_settings_mode);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    assert!(
+        !app.default_model_settings_mode,
+        "ordinary Ctrl+P open must exit default-only mode"
+    );
+    if app
+        .composer_controls
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.level == 0)
+    {
+        app.handle_key(press(KeyCode::Enter));
+    }
+    app.handle_key(press(KeyCode::Enter));
+    assert!(matches!(
+        control_rx
+            .try_recv()
+            .expect("session switch request")
+            .request,
+        cockpit_proto::Request::SetActiveModel {
+            persist_as_default: false,
+            ..
+        }
+    ));
+    assert_eq!(app.pending_default_model_update_id, None);
+}
+
+#[test]
+fn default_model_settings_mode_survives_add_model_settings_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    app.open_default_model_from_settings();
+    assert!(app.default_model_settings_mode);
+    let add_id = "\u{0}add-model";
+    if let Some(picker) = app.composer_controls.picker.as_mut()
+        && picker.level == 0
+    {
+        app.handle_key(press(KeyCode::Enter));
+    }
+    if let Some(picker) = app.composer_controls.picker.as_mut()
+        && let Some(category) = picker.categories.get(picker.category)
+        && let Some(index) = category.items.iter().position(|item| item.id == add_id)
+    {
+        picker.cursor = index;
+    }
+    app.handle_key(press(KeyCode::Enter));
+    assert!(app.dialog.is_active());
+    app.dialog = crate::tui::settings::Dialog::None;
+    assert!(app.reopen_composer_model_after_provider_settings());
+    assert!(
+        app.default_model_settings_mode,
+        "Add model… reopen must not clear default-only mode from Settings → Choose default"
+    );
+}
+
+#[test]
+fn submit_after_model_selection_submits_on_pick_and_clears_on_cancel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut control_rx) = app_with_runner(&tmp);
+    app.launch.active_model = None;
+    app.active_model_selection = None;
+    app.composer.set("hold this draft".to_string());
+    assert!(!app.submit_input());
+    assert!(app.submit_after_model_selection);
+    assert!(app.composer_controls.picker.is_some());
+    if app
+        .composer_controls
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.level == 0)
+    {
+        app.handle_key(press(KeyCode::Enter));
+    }
+    app.handle_key(press(KeyCode::Enter));
+    control_rx.try_recv().expect("model switch request");
+    let selection_id = app
+        .pending_model_selection
+        .as_ref()
+        .expect("pending selection")
+        .selection_id;
+    app.apply_event(
+        cockpit_client::presentation::TurnEvent::ModelSelectionResult {
+            selection_id,
+            provider: "openai".into(),
+            model: "gpt-test".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+                active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
+                    selection: ActiveModelRef {
+                        provider: "openai".into(),
+                        model: "gpt-test".into(),
+                        reasoning_effort: None,
+                        thinking_mode: None,
+                        prompt_cache_retention: None,
+                    },
+                    default_selection: None,
+                    diverged: false,
+                    generation: 1,
+                }),
+                default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
+            },
+        },
+    );
+    assert!(!app.submit_after_model_selection);
+    assert!(app.composer.text().is_empty());
+
+    app.launch.active_model = None;
+    app.active_model_selection = None;
+    app.composer.set("second draft".to_string());
+    assert!(!app.submit_input());
+    assert!(app.submit_after_model_selection);
+    app.close_composer_picker();
+    assert!(!app.submit_after_model_selection);
+    assert_eq!(app.composer.text(), "second draft");
+}
+
+#[test]
+fn restore_and_reopen_composer_model_menu_skip_config_drift_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.config_drift = Some(super::ConfigDriftState {
+        config_provider: Some("openai".to_string()),
+        config_model: Some("configured-model".to_string()),
+    });
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    let picker = app.composer_controls.picker.as_ref().expect("menu");
+    assert_eq!(picker.categories[0].label, "Config drift");
+    let requested = ActiveModelRef {
+        provider: "openai".to_string(),
+        model: "gpt-other".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    app.restore_composer_model_menu_selection(&requested);
+    let picker = app.composer_controls.picker.as_ref().expect("menu");
+    assert_eq!(picker.categories[picker.category].label, "openai");
+    assert_eq!(
+        picker.categories[picker.category].items[picker.cursor].id,
+        "gpt-other"
+    );
+
+    app.reopen_composer_model_after_settings = Some("openai".to_string());
+    app.refresh_reopened_composer_model_after_settings = Some("openai".to_string());
+    assert!(app.reopen_composer_model_after_provider_settings());
+    let picker = app.composer_controls.picker.as_ref().expect("menu");
+    assert_eq!(picker.level, 1);
+    assert_eq!(picker.categories[picker.category].id, "openai");
+    assert!(
+        picker.cursor < picker.categories[picker.category].items.len(),
+        "cursor must stay on a real model row, not Config drift"
+    );
+}
+
+#[test]
+fn add_model_save_refreshes_reopened_composer_menu_from_post_save_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _control_rx) = app_with_runner(&tmp);
+    app.handle_key(ctrl(KeyCode::Char('p')));
+    if app
+        .composer_controls
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.level == 0)
+    {
+        app.handle_key(press(KeyCode::Enter));
+    }
+    let add_id = "\u{0}add-model";
+    if let Some(picker) = app.composer_controls.picker.as_mut()
+        && let Some(category) = picker.categories.get(picker.category)
+        && let Some(index) = category.items.iter().position(|item| item.id == add_id)
+    {
+        picker.cursor = index;
+    }
+    app.handle_key(press(KeyCode::Enter));
+    assert!(app.reopen_composer_model_after_settings.is_some());
+    app.dialog = crate::tui::settings::Dialog::None;
+    assert!(app.reopen_composer_model_after_provider_settings());
+    assert!(app.refresh_reopened_composer_model_after_settings.is_some());
+
+    let mut providers = app.config_snapshot.providers.clone();
+    providers
+        .providers
+        .get_mut("openai")
+        .expect("provider")
+        .models
+        .push(ModelEntry {
+            id: "gpt-added".to_string(),
+            ..Default::default()
+        });
+    let generation = app.config_snapshot.generation.saturating_add(1);
+    app.apply_event(cockpit_client::presentation::TurnEvent::ConfigSnapshot {
+        snapshot: Box::new(cockpit_proto::ConfigSnapshot {
+            session_id: uuid::Uuid::new_v4(),
+            generation,
+            extended: app.config_snapshot.extended.clone(),
+            providers: cockpit_core::secret_ref::redact_provider_view(&providers),
+        }),
+    });
+    assert!(app.refresh_reopened_composer_model_after_settings.is_none());
+    let picker = app.composer_controls.picker.as_ref().expect("menu");
+    assert!(
+        picker
+            .categories
+            .iter()
+            .any(|category| category.items.iter().any(|item| item.id == "gpt-added")),
+        "post-save snapshot must rebuild inventory once"
+    );
+}

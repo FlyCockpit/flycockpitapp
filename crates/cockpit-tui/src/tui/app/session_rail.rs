@@ -413,7 +413,18 @@ mod tests {
 
         {
             let (mut picker, _env) = configured_app(&tmp);
-            picker.open_model_menu();
+            picker.launch.active_model = Some(("p".to_string(), "m".to_string()));
+            picker.config_snapshot.providers.providers.insert(
+                "p".to_string(),
+                cockpit_config::providers::ProviderEntry {
+                    models: vec![cockpit_config::providers::ModelEntry {
+                        id: "m".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            picker.handle_key(ctrl('p'));
             assert!(
                 picker.composer_controls.picker.is_some(),
                 "pill model picker opens through composer controls after #476"
@@ -426,7 +437,7 @@ mod tests {
             assert!(picker_popover.x >= rail_right);
             assert!(picker_popover.height > 12);
             assert!(
-                chat_column_text(&picker_buf, rail_right, 120).contains("model"),
+                chat_column_text(&picker_buf, rail_right, 120).contains('m'),
                 "model picker paints in the chat column beside the rail"
             );
         }

@@ -42,7 +42,7 @@ ALLOWLIST: tuple[tuple[str, int], ...] = (
     ("crates/cockpit-core/src/computer/mod.rs", 3),
     ("crates/cockpit-core/src/computer/target_tests.rs", 2),
     ("crates/cockpit-core/src/credentials.rs", 2),
-    ("crates/cockpit-core/src/daemon/agent_authoring.rs", 11),
+    ("crates/cockpit-core/src/daemon/agent_authoring.rs", 10),
     ("crates/cockpit-core/src/daemon/agent_installation.rs", 1),
     ("crates/cockpit-core/src/daemon/client_tests.rs", 1),
     ("crates/cockpit-core/src/daemon/fs_api.rs", 2),

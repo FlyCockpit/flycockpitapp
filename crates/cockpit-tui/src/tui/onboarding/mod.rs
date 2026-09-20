@@ -116,33 +116,7 @@ fn welcome_cloud_seed() -> u64 {
     nanos ^ u64::from(std::process::id()).rotate_left(32)
 }
 
-/// Which onboarding stage the embedded settings-dialog engine renders.
-/// The engine itself is owned by the app and driven through the ordinary
-/// `Dialog` daemon-effect accessors; the shell records the pairing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EngineStage {
-    Generic,
-    Provider,
-    Agent,
-    Lifetime,
-}
-
-impl EngineStage {
-    fn for_stage(stage: OnboardingStage) -> Option<Self> {
-        match stage {
-            OnboardingStage::Provider => Some(Self::Provider),
-            OnboardingStage::Agent => Some(Self::Agent),
-            OnboardingStage::Lifetime => Some(Self::Lifetime),
-            OnboardingStage::Welcome
-            | OnboardingStage::Profile
-            | OnboardingStage::SecureStore
-            | OnboardingStage::Model
-            | OnboardingStage::Complete => None,
-        }
-    }
-}
-
-/// The screen the shell is presenting. `Engine` screens delegate their
+/// The screen the shell is presenting. `EmbeddedSettings` screens delegate their
 /// content area to the app-held settings dialog (provider add wizard or
 /// setup wizard); the shell still owns chrome, navigation, and semantics.
 pub(crate) enum OnboardingScreen {
@@ -153,7 +127,7 @@ pub(crate) enum OnboardingScreen {
     AgentAuthoring(Box<agent::AgentAuthoringScreen>),
     Model(Box<ModelScreen>),
     Lifetime(LifetimeScreen),
-    Engine(EngineStage),
+    EmbeddedSettings,
     Complete { summary: String, cursor: usize },
 }
 
@@ -168,7 +142,7 @@ pub(crate) enum OnboardingScreenKind {
     AgentAuthoring,
     Model,
     Lifetime,
-    Engine,
+    EmbeddedSettings,
     Complete,
 }
 
@@ -184,7 +158,7 @@ impl std::fmt::Debug for OnboardingScreen {
             Self::AgentAuthoring(_) => formatter.write_str("AgentAuthoring"),
             Self::Model(_) => formatter.write_str("Model"),
             Self::Lifetime(_) => formatter.write_str("Lifetime"),
-            Self::Engine(stage) => formatter.debug_tuple("Engine").field(stage).finish(),
+            Self::EmbeddedSettings => formatter.write_str("EmbeddedSettings"),
             Self::Complete { .. } => formatter.write_str("Complete"),
         }
     }
@@ -512,12 +486,11 @@ impl OnboardingShell {
                     cursor: 1,
                 }
             }
-            // Engine stages are mounted by the app, which owns the settings
-            // dialog; `present_engine` pairs the screen with that mount
-            // before the next render.
-            stage => OnboardingScreen::Engine(
-                EngineStage::for_stage(stage).expect("engine stages map onto engine screens"),
-            ),
+            OnboardingStage::Agent => {
+                // The app mounts nested authoring asynchronously; keep the
+                // embedded-settings pairing until `present_agent_authoring`.
+                OnboardingScreen::EmbeddedSettings
+            }
         }
     }
 
@@ -530,8 +503,8 @@ impl OnboardingShell {
         matches!(self.screen, OnboardingScreen::Complete { .. })
     }
 
-    pub(crate) fn screen_is_engine(&self, stage: EngineStage) -> bool {
-        matches!(self.screen, OnboardingScreen::Engine(current) if current == stage)
+    pub(crate) fn screen_is_embedded_provider_add(&self, engine: &Dialog) -> bool {
+        matches!(self.screen, OnboardingScreen::EmbeddedSettings) && engine.is_provider_add()
     }
 
     pub(crate) fn screen_is_agent_authoring(&self) -> bool {
@@ -612,7 +585,7 @@ impl OnboardingShell {
             OnboardingScreen::AgentAuthoring(_) => OnboardingScreenKind::AgentAuthoring,
             OnboardingScreen::Model(_) => OnboardingScreenKind::Model,
             OnboardingScreen::Lifetime(_) => OnboardingScreenKind::Lifetime,
-            OnboardingScreen::Engine(_) => OnboardingScreenKind::Engine,
+            OnboardingScreen::EmbeddedSettings => OnboardingScreenKind::EmbeddedSettings,
             OnboardingScreen::Complete { .. } => OnboardingScreenKind::Complete,
         }
     }
@@ -650,8 +623,8 @@ impl OnboardingShell {
 
     /// The app mounts the engine dialog for wizard/provider stages; call
     /// this when the mount happens so the shell presents it.
-    pub(crate) fn present_engine(&mut self, stage: EngineStage) {
-        self.screen = OnboardingScreen::Engine(stage);
+    pub(crate) fn present_embedded_settings(&mut self) {
+        self.screen = OnboardingScreen::EmbeddedSettings;
         self.escape = None;
     }
 
@@ -804,7 +777,8 @@ impl OnboardingShell {
     /// wizard never leaves its Add page on Done; the daemon transition
     /// owns that exit.
     pub(crate) fn reconcile_provider_engine(&mut self, engine: &Dialog) {
-        if matches!(self.screen, OnboardingScreen::Engine(EngineStage::Provider))
+        if matches!(self.screen, OnboardingScreen::EmbeddedSettings)
+            && self.stage == OnboardingStage::Provider
             && !engine.is_provider_add()
         {
             self.present_provider_search(Some(
@@ -951,15 +925,12 @@ impl OnboardingShell {
                     Some(OnboardingShellAction::Close)
                 }
             }
-            OnboardingScreen::Engine(current) => {
-                let stage = *current;
+            OnboardingScreen::EmbeddedSettings => {
                 let closed = engine.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                 if closed {
                     self.open_escape_menu(engine);
                 }
-                if stage == EngineStage::Provider {
-                    self.reconcile_provider_engine(engine);
-                }
+                self.reconcile_provider_engine(engine);
                 None
             }
         }
@@ -1127,8 +1098,7 @@ impl OnboardingShell {
                 }
                 None
             }
-            OnboardingScreen::Engine(current) => {
-                let stage = *current;
+            OnboardingScreen::EmbeddedSettings => {
                 if matches!(key.code, KeyCode::Esc) {
                     // While the engine owns an unsettled authority operation,
                     // Escape belongs to its correlated handling (the engine
@@ -1145,9 +1115,7 @@ impl OnboardingShell {
                     // the flow; present the visible choice instead.
                     self.open_escape_menu(engine);
                 }
-                if stage == EngineStage::Provider {
-                    self.reconcile_provider_engine(engine);
-                }
+                self.reconcile_provider_engine(engine);
                 None
             }
         }
@@ -1527,7 +1495,7 @@ impl OnboardingShell {
             OnboardingScreen::Complete { summary, .. } => {
                 Self::render_complete(frame, rows[2], summary, &mut self.list_row_rects);
             }
-            OnboardingScreen::Engine(_) => {
+            OnboardingScreen::EmbeddedSettings => {
                 engine.render(frame, rows[2], links);
             }
         }
@@ -1560,7 +1528,7 @@ impl OnboardingShell {
             OnboardingScreen::AgentAuthoring(_) => "Create your agent",
             OnboardingScreen::Lifetime(_) => "Background agents",
             OnboardingScreen::Model(screen) => screen.title(),
-            OnboardingScreen::Engine(_) => "Cockpit setup",
+            OnboardingScreen::EmbeddedSettings => "Cockpit setup",
         }
     }
 
@@ -1610,8 +1578,7 @@ impl OnboardingShell {
                 "↑↓ move   click choose   enter continue   esc options"
             }
             OnboardingScreen::Model(screen) => screen.help_text(),
-            OnboardingScreen::Engine(EngineStage::Provider) => "wizard  esc: options",
-            OnboardingScreen::Engine(_) => "wizard  esc: options",
+            OnboardingScreen::EmbeddedSettings => "wizard  esc: options",
             OnboardingScreen::Complete { .. } => "↑/↓  enter: choose",
         }
     }
@@ -1637,7 +1604,7 @@ impl OnboardingShell {
             OnboardingScreen::AgentAuthoring(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Lifetime(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Model(_) => vec![chrome::Button::primary("Continue")],
-            OnboardingScreen::Engine(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::EmbeddedSettings => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Complete { cursor, .. } if *cursor == 0 => vec![
                 chrome::Button::primary("Add another provider"),
                 chrome::Button::secondary("Start coding"),

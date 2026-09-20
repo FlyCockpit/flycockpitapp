@@ -86,7 +86,8 @@ impl App {
                 return;
             }
             let engine_screen = self.onboarding_shell.as_ref().is_some_and(|shell| {
-                shell.screen_kind() == crate::tui::onboarding::OnboardingScreenKind::Engine
+                shell.screen_kind()
+                    == crate::tui::onboarding::OnboardingScreenKind::EmbeddedSettings
             });
             if engine_screen {
                 self.hovered_suggestion = None;

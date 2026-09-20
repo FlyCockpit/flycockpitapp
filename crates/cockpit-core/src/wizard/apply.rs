@@ -200,9 +200,6 @@ pub fn descriptor_for_cwd_with_caps(
             &current, None,
         ));
     }
-    if id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
-        return Some(crate::wizard::onboarding_profile_descriptor());
-    }
     if id == LIFETIME_SETUP_WIZARD_ID {
         return Some(lifetime_setup_wizard_descriptor());
     }
@@ -260,7 +257,6 @@ pub fn apply_setup_wizard_answers(
         crate::wizard::SECURITY_WIZARD_ID
             | crate::wizard::MODEL_WIZARD_ID
             | MODEL_SETUP_WIZARD_ID
-            | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
             | LIFETIME_SETUP_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
@@ -268,10 +264,6 @@ pub fn apply_setup_wizard_answers(
     let descriptor = descriptor_for_cwd(wizard_id, cwd)
         .ok_or_else(|| anyhow!("unknown setup wizard `{wizard_id}`"))?;
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
-    if wizard_id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
-        let changed = apply_onboarding_profile_answers(&run)?.is_some();
-        return Ok((changed, false, None));
-    }
     if wizard_id == LIFETIME_SETUP_WIZARD_ID {
         let changed = apply_onboarding_lifetime_answers(&run)?.is_some();
         return Ok((changed, false, None));
@@ -301,7 +293,6 @@ pub async fn apply_setup_wizard_answers_authoritative(
         crate::wizard::SECURITY_WIZARD_ID
             | crate::wizard::MODEL_WIZARD_ID
             | MODEL_SETUP_WIZARD_ID
-            | crate::wizard::ONBOARDING_PROFILE_WIZARD_ID
             | LIFETIME_SETUP_WIZARD_ID
     ) {
         return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
@@ -310,10 +301,6 @@ pub async fn apply_setup_wizard_answers_authoritative(
     let descriptor = descriptor_for_cwd_with_caps(wizard_id, cwd, Some(&caps))
         .ok_or_else(|| anyhow!("unknown setup wizard `{wizard_id}`"))?;
     let run = WizardRun::from_answers_json(descriptor, answers_json)?;
-    if wizard_id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID {
-        let changed = apply_onboarding_profile_answers(&run)?.is_some();
-        return Ok((changed, false, None));
-    }
     if wizard_id == LIFETIME_SETUP_WIZARD_ID {
         let changed = apply_onboarding_lifetime_answers(&run)?.is_some();
         return Ok((changed, false, None));
@@ -336,18 +323,28 @@ fn ensure_global_layer_for_write() -> Result<()> {
     Ok(())
 }
 
-fn apply_onboarding_profile_answers(run: &WizardRun) -> Result<Option<PathBuf>> {
+/// Persist the native onboarding profile display name through the global layer.
+pub fn apply_onboarding_profile_display_name(display_name: &str) -> Result<bool> {
+    let trimmed = display_name.trim();
+    if !trimmed.is_empty() {
+        if trimmed.chars().count() > 80 {
+            anyhow::bail!("name must be 80 characters or fewer");
+        }
+        if trimmed.chars().any(char::is_control) {
+            anyhow::bail!("name cannot contain control characters");
+        }
+    }
+    let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
     let target = global_config_file().context("resolving global config for onboarding profile")?;
     let mut doc = ExtendedConfigDoc::load(&target)?;
     let mut config = doc.config();
-    let next = crate::wizard::onboarding_name_answer(run);
     if config.name == next {
-        return Ok(None);
+        return Ok(false);
     }
     config.name = next;
     ensure_global_layer_for_write()?;
     doc.write(&config)?;
-    Ok(Some(target))
+    Ok(true)
 }
 
 fn apply_onboarding_lifetime_answers(run: &WizardRun) -> Result<Option<PathBuf>> {
@@ -1003,21 +1000,11 @@ mod tests {
     fn onboarding_profile_apply_writes_name_from_client_answers() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CockpitConfigEnvGuard::set(tmp.path());
-        let mut run = WizardRun::new(crate::wizard::onboarding_profile_descriptor()).unwrap();
-        run.submit(WizardAnswer::Text("Ada".to_string())).unwrap();
-        assert_eq!(run.current_step_id(), Some("profile-save"));
-        let answers_json = run.answers_json().unwrap();
 
-        let (changed, model_file_written, default_scope) = apply_setup_wizard_answers(
-            tmp.path(),
-            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-            &answers_json,
-        )
-        .expect("daemon apply reconstructs profile-save and writes the name");
+        let changed = apply_onboarding_profile_display_name("Ada")
+            .expect("profile display name apply writes the global config");
 
         assert!(changed);
-        assert!(!model_file_written);
-        assert_eq!(default_scope, None);
         let config = ExtendedConfigDoc::load(&global_config_file().unwrap())
             .unwrap()
             .config();
@@ -1642,27 +1629,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_setup_wizard_answers_persists_onboarding_profile_from_client_answers_json() {
+    fn apply_onboarding_profile_display_name_persists_from_native_screen() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CockpitConfigEnvGuard::set(tmp.path());
-        let mut run = WizardRun::new(crate::wizard::onboarding_profile_descriptor()).unwrap();
-        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
-        assert_eq!(run.current_step_id(), Some("profile-save"));
-        let answers_json = run.answers_json().expect("client answers_json");
 
-        let (changed, model_file_written, default_scope) = apply_setup_wizard_answers(
-            tmp.path(),
-            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-            &answers_json,
-        )
-        .expect("daemon apply infers profile-save and persists the name");
+        let changed = apply_onboarding_profile_display_name("Ada")
+            .expect("native profile apply persists the name");
         assert!(changed);
-        assert!(!model_file_written);
-        assert!(default_scope.is_none());
-
-        run.submit(WizardAnswer::Acknowledged)
-            .expect("TUI completion submit after daemon apply");
-        assert!(run.is_complete());
 
         let config_path = global_config_file().unwrap();
         let cfg = crate::config::extended::ExtendedConfigDoc::load(&config_path)
@@ -1672,26 +1645,33 @@ mod tests {
     }
 
     #[test]
-    fn apply_setup_wizard_answers_accepts_blank_onboarding_profile_name() {
+    fn apply_onboarding_profile_display_name_accepts_blank_skip() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CockpitConfigEnvGuard::set(tmp.path());
-        let mut run = WizardRun::new(crate::wizard::onboarding_profile_descriptor()).unwrap();
-        run.submit(WizardAnswer::Text(String::new())).unwrap();
-        let answers_json = run.answers_json().expect("client answers_json");
 
-        let (changed, model_file_written, default_scope) = apply_setup_wizard_answers(
-            tmp.path(),
-            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-            &answers_json,
-        )
-        .expect("blank name is a skip, not a missing saving step");
+        let changed =
+            apply_onboarding_profile_display_name("").expect("blank name is a skip, not an error");
         assert!(!changed);
-        assert!(!model_file_written);
-        assert!(default_scope.is_none());
+    }
 
-        run.submit(WizardAnswer::Acknowledged)
-            .expect("TUI completion submit after skipped name");
-        assert!(run.is_complete());
+    #[test]
+    fn apply_onboarding_profile_display_name_rejects_control_characters() {
+        let err = apply_onboarding_profile_display_name("A\nda")
+            .expect_err("control characters must not persist");
+        assert!(
+            err.to_string().contains("control characters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_onboarding_profile_display_name_rejects_long_names() {
+        let err = apply_onboarding_profile_display_name(&"x".repeat(81))
+            .expect_err("overlong names must not persist");
+        assert!(
+            err.to_string().contains("80 characters"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1728,27 +1708,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_setup_wizard_answers_persists_onboarding_profile_name() {
+    fn apply_onboarding_profile_display_name_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CockpitConfigEnvGuard::set(tmp.path());
         let config_path = global_config_file().unwrap();
-        let mut run = WizardRun::new(crate::wizard::onboarding_profile_descriptor()).unwrap();
-        run.submit(WizardAnswer::Text("Ada".into())).unwrap();
-        assert_eq!(run.current_step_id(), Some("profile-save"));
-        let answers_json = run.answers_json().unwrap();
 
-        let (changed, model_file, default_scope) = apply_setup_wizard_answers(
-            tmp.path(),
-            crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-            &answers_json,
-        )
-        .expect("profile apply must replay the inferred save acknowledgement");
-
-        assert!(changed);
-        assert!(!model_file);
-        assert_eq!(default_scope, None);
+        assert!(apply_onboarding_profile_display_name("Ada").unwrap());
         let cfg = ExtendedConfigDoc::load(&config_path).unwrap().config();
         assert_eq!(cfg.name.as_deref(), Some("Ada"));
+
+        assert!(!apply_onboarding_profile_display_name("Ada").unwrap());
     }
 
     #[test]

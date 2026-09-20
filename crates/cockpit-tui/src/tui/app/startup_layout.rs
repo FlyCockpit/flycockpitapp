@@ -261,7 +261,7 @@ impl App {
             self.dialog =
                 crate::tui::settings::Dialog::onboarding_provider_engine(&self.launch.cwd, None);
             if let Some(shell) = self.onboarding_shell.as_mut() {
-                shell.present_engine(crate::tui::onboarding::EngineStage::Provider);
+                shell.present_embedded_settings();
             }
         }
         self.dialog.seed_provider_template(template);
@@ -346,34 +346,6 @@ impl App {
                     None,
                 );
             }
-            Some(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID) => {
-                if !self.require_onboarding_snapshot_for_named_route(
-                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                ) {
-                    return;
-                }
-                if !self
-                    .focus_named_setup_wizard(cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID)
-                {
-                    return;
-                }
-                self.mount_named_setup_wizard_in_onboarding_shell(
-                    cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-                    None,
-                );
-            }
-            Some(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID) => {
-                if !self.require_onboarding_snapshot_for_named_route(
-                    cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID,
-                ) {
-                    return;
-                }
-                if !self.focus_named_setup_wizard(cockpit_core::wizard::ONBOARDING_AGENT_WIZARD_ID)
-                {
-                    return;
-                }
-                self.mount_onboarding_agent_authoring();
-            }
             Some(other) => {
                 self.push_plain(format!(
                     "Unknown setup wizard `{other}`; run `/setup` to list named wizards."
@@ -397,15 +369,11 @@ impl App {
                 crate::tui::onboarding::reduced_motion_enabled(),
             )));
         }
-        if wizard_id == cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID {
-            self.dialog = Dialog::None;
-            return;
-        }
-        match Dialog::onboarding_wizard_engine(wizard_id, preselected_model, None) {
+        match Dialog::shell_setup_wizard_engine(wizard_id, preselected_model, None) {
             Ok(dialog) => {
                 self.dialog = dialog;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.present_engine(crate::tui::onboarding::EngineStage::Generic);
+                    shell.present_embedded_settings();
                 }
             }
             Err(error) => self.show_toast(error, super::ToastKind::Error),
@@ -764,7 +732,7 @@ impl App {
             OnboardingStage::Provider => {
                 if self.dialog.is_provider_add() {
                     if let Some(shell) = self.onboarding_shell.as_mut() {
-                        shell.present_engine(crate::tui::onboarding::EngineStage::Provider);
+                        shell.present_embedded_settings();
                     }
                 } else {
                     self.dialog = crate::tui::settings::Dialog::None;
@@ -1272,7 +1240,7 @@ impl App {
                 );
                 self.dialog.seed_provider_template(template);
                 if let Some(shell) = self.onboarding_shell.as_mut() {
-                    shell.present_engine(crate::tui::onboarding::EngineStage::Provider);
+                    shell.present_embedded_settings();
                 }
             }
             Some(OnboardingShellAction::ReturnToCompletion) => {
@@ -1583,42 +1551,6 @@ impl App {
             );
             return;
         };
-        let mut run = match cockpit_core::wizard::WizardRun::new(
-            cockpit_core::wizard::onboarding_profile_descriptor(),
-        ) {
-            Ok(run) => run,
-            Err(error) => {
-                self.show_toast(
-                    format!("Could not prepare profile: {error}"),
-                    super::ToastKind::Error,
-                );
-                return;
-            }
-        };
-        if let Err(error) = run.submit(cockpit_core::wizard::WizardAnswer::Text(name)) {
-            self.show_toast(error, super::ToastKind::Error);
-            return;
-        }
-        let answers_json = match run.answers_json() {
-            Ok(answers) => answers,
-            Err(error) => {
-                self.show_toast(
-                    format!("Could not prepare profile: {error}"),
-                    super::ToastKind::Error,
-                );
-                return;
-            }
-        };
-        let project_root = match cockpit_config::config::dirs::global_config_dir() {
-            Ok(root) => root.display().to_string(),
-            Err(error) => {
-                self.show_toast(
-                    format!("Could not resolve global Cockpit config: {error}"),
-                    super::ToastKind::Error,
-                );
-                return;
-            }
-        };
         let generation = self.startup_background.generation;
         let run_id = snapshot.run_id;
         let attempt_id = snapshot.attempt_id;
@@ -1648,12 +1580,12 @@ impl App {
                     .await
                     .map_err(|error| error.to_string())?;
                 let response = client
-                    .request(cockpit_proto::Request::ApplySetupWizard {
-                        client_operation_id: uuid::Uuid::new_v4().to_string(),
-                        project_root,
-                        wizard_id: cockpit_core::wizard::ONBOARDING_PROFILE_WIZARD_ID.to_string(),
-                        answers_json,
-                    })
+                    .request(cockpit_proto::Request::ApplyOnboardingProfile(
+                        cockpit_proto::ApplyOnboardingProfile {
+                            client_operation_id: uuid::Uuid::new_v4().to_string(),
+                            display_name: name,
+                        },
+                    ))
                     .await
                     .map_err(|error| error.to_string())?;
                 match response {
@@ -2022,7 +1954,7 @@ impl App {
                 // mutation authority; once its engine reaches its done page
                 // the detour ends and the stored summary is presented again.
                 if shell.completion_detour_active()
-                    && shell.screen_is_engine(crate::tui::onboarding::EngineStage::Provider)
+                    && shell.screen_is_embedded_provider_add(&self.dialog)
                     && self.dialog.take_completed_provider_id().is_some()
                 {
                     shell.return_to_completion();
@@ -2035,7 +1967,7 @@ impl App {
             | cockpit_proto::OnboardingStage::Profile
             | cockpit_proto::OnboardingStage::SecureStore => false,
             cockpit_proto::OnboardingStage::Provider => {
-                if !shell.screen_is_engine(crate::tui::onboarding::EngineStage::Provider) {
+                if !shell.screen_is_embedded_provider_add(&self.dialog) {
                     return false;
                 }
                 let settlement = self.dialog.onboarding_provider_settlement(

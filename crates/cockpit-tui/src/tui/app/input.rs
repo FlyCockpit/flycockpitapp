@@ -3827,7 +3827,8 @@ impl App {
             // Engine stages keep the dialog's field focus; native shell
             // screens take the paste themselves.
             if self.onboarding_shell.as_ref().is_some_and(|shell| {
-                shell.screen_kind() == crate::tui::onboarding::OnboardingScreenKind::Engine
+                shell.screen_kind()
+                    == crate::tui::onboarding::OnboardingScreenKind::EmbeddedSettings
             }) && self.dialog.is_active()
             {
                 self.dialog.paste(&data);

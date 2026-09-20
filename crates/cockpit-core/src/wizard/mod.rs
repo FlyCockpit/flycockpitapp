@@ -12,8 +12,8 @@ mod apply;
 
 pub use apply::{
     LIFETIME_SETUP_WIZARD_ID, MODEL_SETUP_WIZARD_ID, ModelAnswersOutcome,
-    OnboardingModelSubmission, apply_model_answers, apply_security_answers,
-    apply_security_answers_with_caps, apply_setup_wizard_answers,
+    OnboardingModelSubmission, apply_model_answers, apply_onboarding_profile_display_name,
+    apply_security_answers, apply_security_answers_with_caps, apply_setup_wizard_answers,
     apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
     descriptor_for_cwd_with_caps, model_descriptor_for_cwd,
     onboarding_lifetime_client_answers_json, onboarding_model_client_answers_json,
@@ -49,12 +49,6 @@ named_setup_wizard_rows! {
     MODEL_WIZARD_ID = "model",
     stage: None,
     complete: true,
-    ONBOARDING_PROFILE_WIZARD_ID = "onboarding-profile",
-    stage: Some(cockpit_proto::OnboardingStage::Profile),
-    complete: false,
-    ONBOARDING_AGENT_WIZARD_ID = "onboarding-agent",
-    stage: Some(cockpit_proto::OnboardingStage::Agent),
-    complete: false,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -633,7 +627,7 @@ pub fn named_setup_wizard_allows_complete_stage(wizard_id: &str) -> bool {
 /// An empty name is a deliberate skip, not an omitted screen.
 pub fn onboarding_profile_descriptor() -> WizardDescriptor {
     WizardDescriptor {
-        id: ONBOARDING_PROFILE_WIZARD_ID,
+        id: "onboarding-profile",
         title: "What should Cockpit call you?",
         description: "Set an optional display name",
         write_policy: WritePolicy::CommitAtEnd,

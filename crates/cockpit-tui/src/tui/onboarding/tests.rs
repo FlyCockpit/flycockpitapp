@@ -989,7 +989,7 @@ fn search_resize_clamps_cursor_and_viewport() {
 fn provider_engine_abandoning_add_returns_to_search() {
     let mut shell = shell_at(OnboardingStage::Provider);
     let mut engine = Dialog::None;
-    shell.present_engine(EngineStage::Provider);
+    shell.present_embedded_settings();
     // Dialog::None is not the add page: the pairing check must send the
     // shell back to the searchable catalog rather than a settings list.
     let action = shell.handle_key(key(KeyCode::Down), &mut engine);
@@ -1009,7 +1009,7 @@ fn escape_during_engine_authority_work_reaches_the_engine() {
     // shell consults the engine rather than deciding alone.
     let mut shell = shell_at(OnboardingStage::Provider);
     let mut engine = Dialog::None;
-    shell.present_engine(EngineStage::Provider);
+    shell.present_embedded_settings();
     assert!(shell.handle_key(key(KeyCode::Esc), &mut engine).is_none());
     let rendered = render_string(&mut shell, 80, 24, &engine);
     // The abandon check sends us back to search first; Escape there opens
@@ -1160,7 +1160,7 @@ fn provider_auth_engine_renders_inside_full_screen_chrome_at_narrow_and_wide_siz
     let mut engine = Dialog::onboarding_provider_engine(home.path(), None);
     engine.seed_provider_template(template);
     let mut shell = shell_at(OnboardingStage::Provider);
-    shell.present_engine(EngineStage::Provider);
+    shell.present_embedded_settings();
 
     for (width, height) in [(48, 18), (110, 32)] {
         let rendered = render_string(&mut shell, width, height, &engine);

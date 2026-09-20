@@ -128,6 +128,14 @@ pub struct ApplyOnboardingTransition {
     pub settlement: Option<OnboardingStageSettlement>,
 }
 
+/// Persist the optional display name during locked-bootstrap Profile stage.
+/// An empty string is a deliberate skip, matching the native profile screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyOnboardingProfile {
+    pub client_operation_id: String,
+    pub display_name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingBootstrapEvent {
     pub run_id: Uuid,

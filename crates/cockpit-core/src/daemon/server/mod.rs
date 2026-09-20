@@ -4717,28 +4717,19 @@ fn spawn_locked_in_process_client(
     }
 }
 
-/// Settle the onboarding profile wizard's save through the locked bootstrap.
+/// Settle the native onboarding profile display name through the locked bootstrap.
 ///
 /// The ordered onboarding screens (#391) put the profile stage before the
-/// secure-store choice, so the profile wizard's settlement RPC is the one
-/// config write whose only success path necessarily arrives while the daemon
-/// still owns no vault. The admission is scoped to exactly that contract —
-/// only the onboarding profile wizard, only while the authoritative stage is
-/// `Profile` — and it runs through the same user-level write gates,
-/// daemon-wide config publication lock, and post-commit generation
-/// publication the ready dispatch enforces. Every other wizard apply (and
-/// this wizard at any other stage) stays on the deny-by-default locked
-/// matrix (#388); callers map those denials to the bounded `BootstrapLocked`
-/// error like every other locked refusal.
-async fn apply_locked_onboarding_profile_wizard(
+/// secure-store choice, so the profile write is the one config mutation whose
+/// only success path necessarily arrives while the daemon still owns no vault.
+/// The admission is scoped to exactly that contract — only while the
+/// authoritative stage is `Profile` — and it runs through the same user-level
+/// write gates, daemon-wide config publication lock, and post-commit generation
+/// publication the ready dispatch enforces.
+async fn apply_locked_onboarding_profile(
     locked: &LockedServices,
-    wizard_id: &str,
-    answers_json: &str,
+    display_name: &str,
 ) -> Result<Response> {
-    anyhow::ensure!(
-        wizard_id == crate::wizard::ONBOARDING_PROFILE_WIZARD_ID,
-        "bootstrap is locked"
-    );
     let current = locked
         .onboarding
         .snapshot(locked.host_capabilities.clone())
@@ -4752,32 +4743,18 @@ async fn apply_locked_onboarding_profile_wizard(
         .context("resolving the global Cockpit config for the onboarding profile")?;
     refuse_ephemeral_missing_global_layer(locked.paths.ephemeral, &global_config)?;
     ensure_authorized_global_layer(&global_config)?;
-    let config_dir = global_config
-        .parent()
-        .map(Path::to_path_buf)
-        .context("the global config file always has a parent directory")?;
-    // Serialized against every other config publication: the write shares
-    // the daemon-wide gate so it cannot interleave with a concurrent
-    // provider or wizard publication on the ready side of the handoff.
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
-    let result = crate::wizard::apply_setup_wizard_answers_authoritative(
-        &config_dir,
-        wizard_id,
-        answers_json,
-    )
-    .await?;
-    // Publish only when the apply durably changed config: a no-op receipt
-    // keeps the current generation, mirroring the ready dispatch's apply.
-    let config_generation = if result.0 || result.1 {
+    let changed = crate::wizard::apply_onboarding_profile_display_name(display_name)?;
+    let config_generation = if changed {
         inventory::publish_committed_config_generation()
     } else {
         inventory::current_config_generation()
     };
     Ok(Response::SetupWizardApplied {
-        wizard_id: wizard_id.to_string(),
-        changed: result.0,
-        model_file_written: result.1,
-        default_scope: result.2,
+        wizard_id: String::new(),
+        changed,
+        model_file_written: false,
+        default_scope: None,
         config_generation,
     })
 }
@@ -4903,16 +4880,11 @@ async fn handle_locked_in_process_request(
                 locked.end_locked_mutation();
                 outcome
             }
-            Request::ApplySetupWizard {
-                wizard_id,
-                answers_json,
-                ..
-            } => {
+            Request::ApplyOnboardingProfile(request) => {
                 if !locked.begin_locked_mutation() {
                     anyhow::bail!("bootstrap is locked");
                 }
-                let outcome =
-                    apply_locked_onboarding_profile_wizard(locked, &wizard_id, &answers_json).await;
+                let outcome = apply_locked_onboarding_profile(locked, &request.display_name).await;
                 locked.end_locked_mutation();
                 outcome
             }
@@ -6931,17 +6903,11 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                 locked.end_locked_mutation();
                 outcome
             }
-            Request::ApplySetupWizard {
-                wizard_id,
-                answers_json,
-                ..
-            } => {
+            Request::ApplyOnboardingProfile(request) => {
                 if !locked.begin_locked_mutation() {
                     anyhow::bail!("bootstrap is locked");
                 }
-                let outcome =
-                    apply_locked_onboarding_profile_wizard(&locked, &wizard_id, &answers_json)
-                        .await;
+                let outcome = apply_locked_onboarding_profile(&locked, &request.display_name).await;
                 locked.end_locked_mutation();
                 outcome
             }

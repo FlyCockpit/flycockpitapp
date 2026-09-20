@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
 use cockpit_core::agents::{AgentDef, ToolSurfaceSelection, ToolTier};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{
+    FOG, FOG_INDEX, GREEN, GREEN_INDEX, INK, INK_INDEX, RED, RED_INDEX, YELLOW, YELLOW_INDEX,
+    resolve_color,
+};
 
 #[derive(Default, Clone)]
 pub(crate) struct ToolSurfacePicker {
@@ -177,11 +180,11 @@ pub(crate) fn tool_surface_lines(
     draft: &ToolSurfaceDraft,
     opts: ToolSurfaceRender<'_>,
 ) -> ToolSurfaceLines {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
-    let red = Style::default().fg(Color::Red);
-    let green = Style::default().fg(Color::Green);
-    let cyan = Style::default().fg(Color::Cyan);
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+    let yellow = Style::default().fg(resolve_color(YELLOW, YELLOW_INDEX));
+    let red = Style::default().fg(resolve_color(RED, RED_INDEX));
+    let green = Style::default().fg(resolve_color(GREEN, GREEN_INDEX));
+    let ink = Style::default().fg(resolve_color(INK, INK_INDEX));
     let disabled = muted.add_modifier(Modifier::DIM);
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
@@ -207,7 +210,7 @@ pub(crate) fn tool_surface_lines(
             last_family = item.family;
         }
         let on_cursor = index == picker.cursor();
-        let marker = if on_cursor { "▸ " } else { "  " };
+        let marker = if on_cursor { "› " } else { "  " };
         let granted = draft.granted(item.name);
         let check = if granted { "[x]" } else { "[ ]" };
         let tier = if granted {
@@ -219,9 +222,9 @@ pub(crate) fn tool_surface_lines(
         let name_style = if safety_blocked {
             disabled
         } else if on_cursor {
-            yellow.add_modifier(Modifier::BOLD)
+            crate::tui::chrome::chip_style(ink, true)
         } else {
-            Style::default().fg(Color::White)
+            ink
         };
         let state_style = if safety_blocked {
             disabled
@@ -230,24 +233,25 @@ pub(crate) fn tool_surface_lines(
         } else {
             muted
         };
+        let row_style = |style| crate::tui::chrome::chip_style(style, on_cursor);
         let mut spans = vec![
-            Span::raw(marker),
-            Span::styled(check.to_string(), state_style),
-            Span::raw(" "),
+            Span::styled(marker, row_style(Style::default())),
+            Span::styled(check.to_string(), row_style(state_style)),
+            Span::styled(" ", row_style(Style::default())),
             Span::styled(item.name.to_string(), name_style),
-            Span::raw("  "),
-            Span::styled(format!("tier: {tier}"), cyan),
+            Span::styled("  ", row_style(Style::default())),
+            Span::styled(format!("tier: {tier}"), row_style(muted)),
         ];
         if item.tiers.len() == 1 {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled("locked enabled", muted));
+            spans.push(Span::styled("  ", row_style(Style::default())));
+            spans.push(Span::styled("locked enabled", row_style(muted)));
         } else if item.tiers.len() == 2 {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled("no discoverable", muted));
+            spans.push(Span::styled("  ", row_style(Style::default())));
+            spans.push(Span::styled("no discoverable", row_style(muted)));
         }
         if let Some(error) = opts.row_errors.get(item.name) {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(error.clone(), red));
+            spans.push(Span::styled("  ", row_style(Style::default())));
+            spans.push(Span::styled(error.clone(), row_style(red)));
         }
         semantic_rows.push((lines.len(), index, !safety_blocked));
         lines.push(Line::from(spans));
@@ -259,7 +263,7 @@ pub(crate) fn tool_surface_lines(
     let selected_line = lines.iter().position(|line| {
         line.spans
             .first()
-            .is_some_and(|span| span.content.starts_with('▸'))
+            .is_some_and(|span| span.content.starts_with('›'))
     });
     (lines, selected_line, semantic_rows)
 }

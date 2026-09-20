@@ -361,15 +361,12 @@ mod tests {
             );
             let chat_body = popover_chat_body(&tools, 120, 40);
             let popover = tools.last_popover_rect_for_tests();
-            assert!(
-                popover.height > 12,
-                "zero-dialog overlays must not clamp to the legacy 12-row popover"
-            );
             assert_eq!(
                 popover.height,
-                chat_body.height.saturating_sub(2).max(1),
-                "tools popover height tracks the chat body, not a fixed dialog slot"
+                tools.geometry().dialog,
+                "tools uses the compact product-popover height"
             );
+            assert!(popover.height < chat_body.height, "tools stays compact");
             assert!(popover.x >= rail_right, "popover sits in the chat column");
         }
 

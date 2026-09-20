@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] /tmp/project                                                                              
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session               ▌Continue with every transcript element.                                                 │
+                              note to self                                                                      12:00  │
+ SESSIONS                     ┊ Keep product-only transcript variants.                                                 │
+ no active sessions in all pr ▌ Agent                                                             [Pin] [Fork]  12:00  │
+                                Model  Agent                                                                           │
+                                TTFT   0.9s                                                                            │
+                                TPS    40                                                                              │
+                                Cache  —                                                                               │
+                                ▾ Thought                                                                              │
+                                Map each requested row to its owning renderer.                                         │
+                                The open thought is followed by tool work.                                             █
+                                                                                                                       █
+                                ▸ read  crates/cockpit-tui/src/tui/history/mod.rs                                      █
+                                                                                                                       █
+                                ─ explore                                                                              █
+                              ▌ interactive ✓ explore worked for 3s [u]             ╭────────────────────╮             █
+                              ▌ Interactive child inspected the rendering seam.     │› Open in $EDITOR   │             █
+                                                                                    │  Copy as rich text │             █
+                              ▌ background ✓ runner worked for 4s [u]               │  Copy as markdown  │             █
+                                Background child returned a compact report.         │  Copy as plain text│             █
+                                                                                    ╰────────────────────╯             █
+                                ◇ Edited src/transcript.rs  +1 -1                                                      █
+                                │ - old line                                                                           █
+                                │ + new line                                                                           █
+                                │   shared line                                                                        █
+                               ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 ·  ⋯ █
+                                                               ⋯ 2 seed tools (~42) ⋯                                  █
+                                [show summary]                                                                         █
+                                                                                                                       █
+                              ▌ Agent                                                                           12:00  █
+ ● working  ● waiting  ● done   Thinking                                                                               █
+                                Check the final visual hierarchy.                                                      █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys                                           113 tokens│
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯
+Setup: Code                                                                                                             

@@ -32,11 +32,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::tui::theme::{
-    CONTEXT_BLOCK_INDEX, CONTEXT_GUIDANCE_INDEX, CONTEXT_MESSAGES_INDEX, CONTEXT_SYSTEM_INDEX,
-    MUTED_COLOR_INDEX,
+    CONTEXT_BLOCK_INDEX, CONTEXT_GUIDANCE_INDEX, CONTEXT_MESSAGES_INDEX, CONTEXT_SYSTEM_INDEX, FOG,
+    FOG_INDEX, MUTED_COLOR_INDEX, resolve_color,
 };
 
 /// Solid block glyph for both the bar segments and the legend swatches.
@@ -161,9 +161,7 @@ impl ContextPane {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(" /context "));
+        let block = crate::tui::chrome::rounded_block(" /context ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -175,7 +173,7 @@ impl ContextPane {
         let lines = body_lines(&self.snapshot, body.width);
         frame.render_widget(Paragraph::new(lines), body);
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled("q quit".to_string(), muted))),
             help_area,
@@ -315,7 +313,7 @@ pub fn bar_segments(
 /// then the legend. Pure (no `App`, no terminal) so the layout/edge-case
 /// logic is unit-testable. `width` is the interior body width in cells.
 fn body_lines(snapshot: &ContextSnapshot, width: u16) -> Vec<Line<'static>> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let mut out: Vec<Line<'static>> = Vec::new();
 
     // Header total.

@@ -28,7 +28,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use zeroize::Zeroizing;
 
 use cockpit_core::sealed::identity::SealedScopeKind;
@@ -708,9 +708,7 @@ impl SealedWriteOverlay {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" /sealed — no-echo sensitive frame ");
+        let block = crate::tui::chrome::rounded_block(" /sealed — no-echo sensitive frame ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -820,9 +818,7 @@ impl SealedRevealOverlay {
         if self.reveal.check_timeout() {
             self.pending_clear = true;
         }
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" /sealed recover — reveal ");
+        let block = crate::tui::chrome::rounded_block(" /sealed recover — reveal ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 

@@ -30,12 +30,11 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
 use crate::tui::pane::Pane;
-use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, resolve_color};
 use cockpit_core::approval::store::{
     ManagedGrantKind, ManagedGrants, delete_managed_grant, global_approvals_dir,
     list_managed_grants, project_approvals_dir,
@@ -317,9 +316,7 @@ impl PermissionsPane {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(" /permissions "));
+        let block = crate::tui::chrome::rounded_block(" /permissions ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -353,7 +350,7 @@ impl PermissionsPane {
             self.list.offset(),
         );
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let help = match &self.status {
             Some(s) => s.clone(),
             None => "q quit  ↑/↓ move  d/del remove".to_string(),
@@ -547,11 +544,11 @@ fn load_scope(scope: Scope, dir: Option<PathBuf>) -> ScopeView {
 // ---- pure render helpers ----------------------------------------------------
 
 fn scope_heading(sv: &ScopeView) -> Line<'static> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let mut spans = vec![Span::styled(
         sv.scope.label().to_string(),
         Style::default()
-            .fg(Color::Indexed(ACCENT_BLUE_INDEX))
+            .fg(resolve_color(BRASS, BRASS_INDEX))
             .add_modifier(Modifier::BOLD),
     )];
     if let Some(dir) = &sv.dir {
@@ -571,14 +568,14 @@ fn unavailable_line(scope: Scope) -> Line<'static> {
     };
     Line::from(Span::styled(
         msg,
-        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        Style::default().fg(resolve_color(FOG, FOG_INDEX)),
     ))
 }
 
 fn empty_scope_line() -> Line<'static> {
     Line::from(Span::styled(
         "  No grants in this scope.".to_string(),
-        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        Style::default().fg(resolve_color(FOG, FOG_INDEX)),
     ))
 }
 
@@ -608,29 +605,21 @@ fn path_grant_row(
 }
 
 fn grant_row_spans(key: &str, mode: Option<&str>, selected: bool) -> Line<'static> {
-    let prefix = if selected { "  › " } else { "    " };
-    let mut spans = vec![Span::styled(
-        prefix.to_string(),
-        if selected {
-            Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX))
-        } else {
-            Style::default()
-        },
-    )];
-    let key_style = if selected {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    spans.push(Span::styled(key.to_string(), key_style));
+    let prefix = if selected { "› " } else { "  " };
+    let row = |style| crate::tui::chrome::chip_style(style, selected);
+    let ink = Style::default().fg(crate::tui::theme::resolve_color(
+        crate::tui::theme::INK,
+        crate::tui::theme::INK_INDEX,
+    ));
+    let muted = Style::default().fg(crate::tui::theme::resolve_color(
+        crate::tui::theme::FOG,
+        crate::tui::theme::FOG_INDEX,
+    ));
+    let mut spans = vec![Span::styled(prefix.to_string(), row(ink))];
+    spans.push(Span::styled(key.to_string(), row(ink)));
     if let Some(mode) = mode {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            mode.to_string(),
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-        ));
+        spans.push(Span::styled("  ", row(ink)));
+        spans.push(Span::styled(mode.to_string(), row(muted)));
     }
     Line::from(spans)
 }

@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] /tmp/project                                                                              
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session               ▌Restyle the complete transcript surface.                                                │
+                                                                                                                       │
+ SESSIONS                       ▸ You                                                                                  │
+ no active sessions in all pr   Prioritize the transcript chrome.                                                      │
+                              note to self                                                                      12:00  │
+                              ┊ Keep product-only transcript variants.                                                 │
+                              ▌ Agent╭ Help ────────────────────────────────────────────────────────────────────╮2:00  │
+                                Model│Getting started                                                           │      │
+                                TTFT │Type a message, then press Enter to send it.                              │      │
+                                TPS  │/ opens the command menu; Ctrl+K opens keybindings.                       │      █
+                                Cache│/setup lists provider, model-configuration, and workspace setup wizards;  │      █
+                                ▾ Tho│use /setup model to configure models.                                     │      █
+                                Map e│Esc closes overlays and dialogs. Ctrl+C interrupts the running agent.     │      █
+                                The o│                                                                          │      █
+                                     │Slash commands                                                            │      █
+                                ▸ rea│/caffeinate        Keep the machine awake so agents survive a closed lid  │      █
+                                     │                   (arg: on/off/until-idle)                               │      █
+                                ─ exp│/agent             Switch the primary agent (arg: name; bare lists the    │      █
+                              ▌ inter│                   chat-owning agents)                                    │      █
+                              ▌ Inter│/assistant         Open or create the latest session for a persistent     │      █
+                                     │                   assistant                                              │      █
+                              ▌ backg│/build             Switch the primary agent to Build (make changes)       │      █
+                                Backg│/btw               Open a persistent side conversation pane (arg:         │      █
+                                     │                   question/new/tangent/end)                              │      █
+                                ◇ Edi│/clear             Clear the chat and start a fresh session (alias of     │      █
+                                │ - o╰──────────────────────────────────────────────────────────────────────────╯      █
+                                │ + new line                                                                           █
+                                │   shared line                                                                        █
+                               ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 ·  ⋯ █
+                                                               ⋯ 2 seed tools (~42) ⋯                                  █
+                                [show summary]                                                                         █
+                                                                                                                       █
+                              ▌ Agent                                                                           12:00  █
+ ● working  ● waiting  ● done   Thinking                                                                               █
+                                Check the final visual hierarchy.                                                      █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
+Setup: Code                                                                                                             

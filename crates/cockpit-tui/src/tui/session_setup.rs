@@ -14,7 +14,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState};
 
 use crate::tui::textfield::TextField;
 use cockpit_core::agents::{ToolSurfaceSelection, ToolTier};
@@ -809,7 +809,7 @@ impl SessionSetupPane {
         } else {
             " Session setup "
         };
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = crate::tui::chrome::rounded_block(title, true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -843,7 +843,10 @@ impl SessionSetupPane {
         }
 
         let items: Vec<ListItem<'static>> = lines.into_iter().map(ListItem::new).collect();
-        let list = List::new(items).highlight_symbol("› ");
+        let list = List::new(items)
+            .highlight_symbol("› ")
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
+            .highlight_style(crate::tui::chrome::chip_style(Style::default(), true));
         frame.render_stateful_widget(list, inner, &mut self.list);
     }
 

@@ -27,7 +27,10 @@ use crate::tui::dialog::{Answer, DialogOption, DialogOutcome, DialogState, Page,
 use crate::tui::geometry::{MIN_HISTORY_HEIGHT, STATUS_HEIGHT};
 use crate::tui::keys_overlay::{DialogBindingId, dialog_binding, dialog_footer_bindings};
 use crate::tui::pane::Pane;
-use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use crate::tui::theme::{
+    BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, NIGHT, NIGHT_INDEX, RED, RED_INDEX, YELLOW,
+    YELLOW_INDEX, resolve_color,
+};
 use cockpit_proto::{
     CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
     SandboxEscalation,
@@ -57,10 +60,10 @@ const MIN_ANSWER_ROWS: usize = 3;
 
 const CUSTOM_LABEL: &str = "Other…";
 
-/// Leading hover/cursor glyph on every option row: "▸ " when focused,
+/// Leading hover/cursor glyph on every option row: "› " when focused,
 /// two spaces otherwise. Both render two cells wide, so the column a row's
 /// content starts at is fixed regardless of focus.
-const OPTION_CURSOR_HOVERED: &str = "▸ ";
+const OPTION_CURSOR_HOVERED: &str = "› ";
 const OPTION_CURSOR_PLAIN: &str = "  ";
 /// Rendered width (terminal cells) of the leading cursor glyph. Used to
 /// park the real terminal cursor by display column rather than byte length
@@ -533,9 +536,9 @@ impl QuestionDialog {
         let locked = self.state.locked();
         let risk_color = self.current_risk_color();
         let border_color = if locked {
-            Color::Indexed(MUTED_COLOR_INDEX)
+            resolve_color(NIGHT, NIGHT_INDEX)
         } else {
-            risk_color.unwrap_or(Color::White)
+            risk_color.unwrap_or(resolve_color(BRASS, BRASS_INDEX))
         };
         let title_base = if self.is_approval() {
             "approval"
@@ -559,8 +562,9 @@ impl QuestionDialog {
         }
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(Style::default().fg(border_color))
-            .title(title);
+            .title(Span::styled(title, Style::default().fg(border_color)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -613,7 +617,7 @@ impl QuestionDialog {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(resolve_color(FOG, FOG_INDEX)),
             ))),
             layout[1],
         );
@@ -637,7 +641,7 @@ impl QuestionDialog {
         rect: Rect,
         region_h: usize,
     ) -> Vec<Line<'static>> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let total = wrapped_height(&lines, rect.width);
         if region_h == 0 || total <= region_h {
             return lines;
@@ -795,7 +799,7 @@ impl QuestionDialog {
     /// longer separately collapsible (it lives here and the whole region
     /// scrolls / expands).
     fn prompt_region_lines(&self) -> Vec<Line<'static>> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let page_idx = self.state.current_page();
         let page = &self.state.pages()[page_idx];
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -844,7 +848,7 @@ impl QuestionDialog {
         esc: &SandboxEscalation,
         rememberable: bool,
     ) -> Vec<Line<'static>> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let mut out: Vec<Line<'static>> = Vec::new();
 
         // Honest framing — failed WHILE sandboxed, not blocked BY it.
@@ -906,8 +910,8 @@ impl QuestionDialog {
     fn render_answer(&self, area: Rect) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         let page_idx = self.state.current_page();
         let page = &self.state.pages()[page_idx];
-        let accent = Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX));
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let accent = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut cursor: Option<(u16, u16)> = None;
         let mut hovered_rows: Option<(usize, usize)> = None;
@@ -923,7 +927,7 @@ impl QuestionDialog {
                 let style = if self.state.is_typing() {
                     accent
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(resolve_color(INK, INK_INDEX))
                 };
                 let row = lines.len() as u16;
                 lines.push(Line::from(vec![
@@ -1072,7 +1076,7 @@ impl QuestionDialog {
     /// prompt region scrolls (PageUp/PageDown) and expands (`Tab`) to
     /// reveal long / multi-line commands.
     fn command_block_lines(&self, cd: &CommandDetail) -> Vec<Line<'static>> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let mut out: Vec<Line<'static>> = Vec::new();
 
         // Step indicator (compound commands only).
@@ -1088,7 +1092,10 @@ impl QuestionDialog {
         if let Some(key) = cd.remembered_key.as_deref() {
             out.push(Line::from(vec![
                 Span::styled("remembers: ", muted),
-                Span::styled(format!("`{key}`"), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("`{key}`"),
+                    Style::default().fg(resolve_color(INK, INK_INDEX)),
+                ),
             ]));
         }
 
@@ -1114,7 +1121,7 @@ impl QuestionDialog {
                 for line in truncated_preview_lines(&content) {
                     out.push(Line::from(Span::styled(
                         format!("  {line}"),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
                     )));
                 }
             }
@@ -1135,7 +1142,7 @@ impl QuestionDialog {
     /// pending dispatch`, `cost: unknown`) rather than a fabricated value. No
     /// credential, provider URL, workflow JSON, or host path is ever shown.
     fn command_image_plan_lines(&self, cd: &CommandDetail) -> Vec<Line<'static>> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let mut out: Vec<Line<'static>> = Vec::new();
         let Some(review) = cd.image_plan_review.as_ref() else {
             return out;
@@ -1211,7 +1218,7 @@ impl QuestionDialog {
     }
 
     fn command_risk_lines(&self, cd: &CommandDetail) -> Vec<Line<'static>> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let mut out = Vec::new();
         let Some(tier) = cd.risk_tier.as_deref() else {
             return out;
@@ -1221,8 +1228,7 @@ impl QuestionDialog {
             Span::styled("risk: ", muted),
             Span::styled(
                 tier.to_string(),
-                Style::default()
-                    .fg(risk_tier_color(tier).unwrap_or(Color::Indexed(MUTED_COLOR_INDEX))),
+                Style::default().fg(risk_tier_color(tier).unwrap_or(resolve_color(FOG, FOG_INDEX))),
             ),
         ]));
         if !cd.risk_reasons.is_empty() {
@@ -1261,9 +1267,9 @@ impl QuestionDialog {
     ) -> Line<'static> {
         // Indent so the command reads as a distinct quoted block.
         let indent = "  ";
-        let plain = Style::default().fg(Color::White);
+        let plain = Style::default().fg(resolve_color(INK, INK_INDEX));
         let hot = Style::default()
-            .fg(Color::Indexed(ACCENT_BLUE_INDEX))
+            .fg(resolve_color(BRASS, BRASS_INDEX))
             .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
 
         let line_start = char_base;
@@ -1311,11 +1317,9 @@ impl QuestionDialog {
             OPTION_CURSOR_PLAIN
         };
         let style = if hovered {
-            Style::default()
-                .fg(Color::Indexed(ACCENT_BLUE_INDEX))
-                .add_modifier(Modifier::BOLD)
+            crate::tui::chrome::chip_style(Style::default(), true)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(INK, INK_INDEX))
         };
         Line::from(vec![
             Span::raw(cursor.to_string()),
@@ -1324,8 +1328,8 @@ impl QuestionDialog {
     }
 
     fn render_confirm(&self) -> Vec<Line<'static>> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let red = Style::default().fg(Color::Red);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let red = Style::default().fg(resolve_color(RED, RED_INDEX));
         let flags = self.state.answered_flags();
         let answers = self.state.collect_answers();
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1347,7 +1351,7 @@ impl QuestionDialog {
                 let summary = summarize_answer(answers.get(i), q);
                 lines.push(Line::from(vec![
                     Span::styled(format!("{prompt}: "), muted),
-                    Span::styled(summary, Style::default().fg(Color::White)),
+                    Span::styled(summary, Style::default().fg(resolve_color(INK, INK_INDEX))),
                 ]));
             } else {
                 lines.push(Line::from(vec![
@@ -1424,16 +1428,16 @@ fn option_description_indent(row_idx: usize, radio: bool) -> usize {
 
 fn risk_tier_color(tier: &str) -> Option<Color> {
     match tier {
-        "destructive" | "privileged" => Some(Color::Red),
-        "mutating" => Some(Color::Yellow),
-        "ordinary" => Some(Color::Indexed(MUTED_COLOR_INDEX)),
+        "destructive" | "privileged" => Some(resolve_color(RED, RED_INDEX)),
+        "mutating" => Some(resolve_color(YELLOW, YELLOW_INDEX)),
+        "ordinary" => Some(resolve_color(FOG, FOG_INDEX)),
         _ => None,
     }
 }
 
 fn risk_tier_border_color(tier: &str) -> Option<Color> {
     match tier {
-        "destructive" | "privileged" => Some(Color::Red),
+        "destructive" | "privileged" => Some(resolve_color(RED, RED_INDEX)),
         _ => None,
     }
 }
@@ -2876,23 +2880,38 @@ mod tests {
     fn risk_tier_border_color_is_destructive_only_but_value_color_is_full_tier() {
         assert_eq!(risk_tier_border_color("ordinary"), None);
         assert_eq!(risk_tier_border_color("mutating"), None);
-        assert_eq!(risk_tier_border_color("destructive"), Some(Color::Red));
-        assert_eq!(risk_tier_border_color("privileged"), Some(Color::Red));
+        assert_eq!(
+            risk_tier_border_color("destructive"),
+            Some(resolve_color(RED, RED_INDEX))
+        );
+        assert_eq!(
+            risk_tier_border_color("privileged"),
+            Some(resolve_color(RED, RED_INDEX))
+        );
         assert_eq!(risk_tier_border_color("unknown"), None);
 
         assert_eq!(
             risk_tier_color("ordinary"),
-            Some(Color::Indexed(MUTED_COLOR_INDEX))
+            Some(resolve_color(FOG, FOG_INDEX))
         );
-        assert_eq!(risk_tier_color("mutating"), Some(Color::Yellow));
-        assert_eq!(risk_tier_color("destructive"), Some(Color::Red));
-        assert_eq!(risk_tier_color("privileged"), Some(Color::Red));
+        assert_eq!(
+            risk_tier_color("mutating"),
+            Some(resolve_color(YELLOW, YELLOW_INDEX))
+        );
+        assert_eq!(
+            risk_tier_color("destructive"),
+            Some(resolve_color(RED, RED_INDEX))
+        );
+        assert_eq!(
+            risk_tier_color("privileged"),
+            Some(resolve_color(RED, RED_INDEX))
+        );
 
         for (tier, expected) in [
             ("ordinary", None),
             ("mutating", None),
-            ("destructive", Some(Color::Red)),
-            ("privileged", Some(Color::Red)),
+            ("destructive", Some(resolve_color(RED, RED_INDEX))),
+            ("privileged", Some(resolve_color(RED, RED_INDEX))),
         ] {
             let mut detail = base_command_detail();
             detail.risk_tier = Some(tier.to_string());
@@ -2965,6 +2984,40 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    #[test]
+    fn lockout_border_uses_night_while_locked() {
+        let mut d = QuestionDialog::new(
+            Uuid::new_v4(),
+            String::new(),
+            InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Single {
+                    prompt: "Pick?".into(),
+                    options: vec![opt("a", "A")],
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: false,
+                    approval_class: None,
+                    sandbox_escalation: None,
+                }],
+            },
+            Duration::from_secs(300),
+        );
+        assert!(d.locked());
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(50, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| d.render(frame, Rect::new(0, 0, 50, 10)))
+            .expect("draw");
+        let night = resolve_color(NIGHT, NIGHT_INDEX);
+        let buf = terminal.backend().buffer();
+        let has_night_border = buf.content().iter().any(|cell| {
+            cell.fg == night && matches!(cell.symbol(), "╭" | "╮" | "╰" | "╯" | "─" | "│")
+        });
+        assert!(has_night_border, "locked dialog border must use NIGHT");
     }
 
     #[test]

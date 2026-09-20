@@ -83,12 +83,18 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+#[cfg(test)]
+use ratatui::style::Color;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
 use crate::tui::textfield::TextField;
+#[cfg(test)]
 use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{
+    BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, YELLOW, YELLOW_INDEX, resolve_color,
+};
 use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
     cwd_scoped_creatable_dirs, discover_config_dirs, ensure_config_layer_dir, global_config_dir,
@@ -10224,22 +10230,36 @@ fn list_key_action(key: KeyEvent, cursor: &mut usize, len: usize) -> ListAction 
     }
 }
 
+fn product_dialog_block(title: impl Into<Line<'static>>) -> Block<'static> {
+    let style = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(style)
+        .title(title)
+        .title_style(style)
+}
+
+fn product_ink() -> Style {
+    Style::default().fg(resolve_color(INK, INK_INDEX))
+}
+
+fn product_muted() -> Style {
+    Style::default().fg(resolve_color(FOG, FOG_INDEX))
+}
+
 fn render_workspace_trust(
     frame: &mut Frame,
     area: Rect,
     root: &cockpit_config::trust::TrustRoot,
     cursor: usize,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Workspace trust ");
+    let block = product_dialog_block(" Workspace trust ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let selected = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let muted = product_muted();
+    let ink = product_ink();
     let options = [
         (
             "trust",
@@ -10266,20 +10286,22 @@ fn render_workspace_trust(
         Line::default(),
         Line::from(Span::styled("Choose workspace trust:", muted)),
     ];
-    for (index, (label, description, _)) in options.iter().enumerate() {
-        let marker = if index == cursor { "▸ " } else { "  " };
-        let style = if index == cursor {
-            selected
-        } else {
-            Style::default().fg(Color::White)
-        };
-        lines.push(Line::from(vec![
-            Span::raw(marker),
-            Span::styled(format!("{}. {label}", index + 1), style),
-            Span::raw(" - "),
-            Span::styled((*description).to_string(), muted),
-        ]));
-    }
+    lines.extend(
+        options
+            .iter()
+            .enumerate()
+            .map(|(index, (label, description, _))| {
+                let hovered = index == cursor;
+                let marker = if hovered { "› " } else { "  " };
+                let row = |style| crate::tui::chrome::chip_style(style, hovered);
+                Line::from(vec![
+                    Span::styled(marker, row(ink)),
+                    Span::styled(format!("{}. {label}", index + 1), row(ink)),
+                    Span::styled(" - ", row(ink)),
+                    Span::styled((*description).to_string(), row(muted)),
+                ])
+            }),
+    );
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
     frame.render_widget(help_line("↑/↓  enter: choose  esc: untrusted"), layout[1]);
 }
@@ -10293,9 +10315,7 @@ fn render_picker(
     status: Option<&str>,
     help: &str,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Settings — {subtitle} "));
+    let block = product_dialog_block(format!(" Settings — {subtitle} "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
@@ -10304,7 +10324,7 @@ fn render_picker(
     if entries.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no candidates)",
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            product_muted(),
         )));
     } else {
         let path_w = entries
@@ -10313,34 +10333,24 @@ fn render_picker(
             .max()
             .unwrap_or(0);
         for (i, entry) in entries.iter().enumerate() {
-            let marker = if i == cursor { "▸ " } else { "  " };
+            let hovered = i == cursor;
+            let marker = if hovered { "› " } else { "  " };
+            let row = |style| crate::tui::chrome::chip_style(style, hovered);
             let path_str = cockpit_core::welcome::display_path(&entry.path);
             let kind_str = kind_label(&entry.kind);
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            spans.push(Span::raw(marker));
-            spans.push(Span::styled(
-                pad_right(&path_str, path_w),
-                if i == cursor {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            ));
-            spans.push(Span::raw("   "));
-            spans.push(Span::styled(
-                kind_str.to_string(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-            ));
-            lines.push(Line::from(spans));
+            lines.push(Line::from(vec![
+                Span::styled(marker, row(product_ink())),
+                Span::styled(pad_right(&path_str, path_w), row(product_ink())),
+                Span::styled("   ", row(product_ink())),
+                Span::styled(kind_str.to_string(), row(product_muted())),
+            ]));
         }
     }
     if let Some(msg) = status {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             msg.to_string(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(resolve_color(YELLOW, YELLOW_INDEX)),
         )));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
@@ -10353,32 +10363,25 @@ fn render_wizard_menu(
     wizards: &[cockpit_core::wizard::WizardDescriptor],
     cursor: usize,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Setup — choose a wizard ");
+    let block = product_dialog_block(" Setup — choose a wizard ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let selected = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let muted = product_muted();
+    let ink = product_ink();
     let mut lines: Vec<Line<'static>> = Vec::new();
     if wizards.is_empty() {
         lines.push(Line::from(Span::styled("  (no wizards registered)", muted)));
     } else {
         for (index, wizard) in wizards.iter().enumerate() {
-            let marker = if index == cursor { "▸ " } else { "  " };
-            let style = if index == cursor {
-                selected
-            } else {
-                Style::default().fg(Color::White)
-            };
+            let hovered = index == cursor;
+            let marker = if hovered { "› " } else { "  " };
+            let row = |style| crate::tui::chrome::chip_style(style, hovered);
             lines.push(Line::from(vec![
-                Span::raw(marker),
-                Span::styled(wizard.id.to_string(), style),
-                Span::raw("  "),
-                Span::styled(wizard.description.to_string(), muted),
+                Span::styled(marker, row(ink)),
+                Span::styled(wizard.id.to_string(), row(ink)),
+                Span::styled("  ", row(ink)),
+                Span::styled(wizard.description.to_string(), row(muted)),
             ]));
         }
     }
@@ -10393,21 +10396,14 @@ fn render_model_setup_choice(
     pending: Option<&(String, String)>,
     cursor: usize,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Setup — model ");
+    let block = product_dialog_block(" Setup — model ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let selected = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let muted = product_muted();
+    let ink = product_ink();
     let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(
-            "Configure which model?",
-            Style::default().fg(Color::White),
-        )),
+        Line::from(Span::styled("Configure which model?", product_ink())),
         Line::default(),
     ];
     if let Some((provider, model)) = confirmed {
@@ -10424,17 +10420,14 @@ fn render_model_setup_choice(
         .into_iter()
         .enumerate()
         {
-            let marker = if index == cursor { "▸ " } else { "  " };
-            let style = if index == cursor {
-                selected
-            } else {
-                Style::default().fg(Color::White)
-            };
+            let hovered = index == cursor;
+            let marker = if hovered { "› " } else { "  " };
+            let row = |style| crate::tui::chrome::chip_style(style, hovered);
             lines.push(Line::from(vec![
-                Span::raw(marker),
-                Span::styled(label, style),
-                Span::raw("  "),
-                Span::styled(description, muted),
+                Span::styled(marker, row(ink)),
+                Span::styled(label, row(ink)),
+                Span::styled("  ", row(ink)),
+                Span::styled(description, row(muted)),
             ]));
         }
     } else {
@@ -10450,18 +10443,15 @@ fn render_model_setup_choice(
             )));
         }
         lines.push(Line::default());
-        let style = if cursor == 0 {
-            selected
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let hovered = cursor == 0;
+        let row = |style| crate::tui::chrome::chip_style(style, hovered);
         lines.push(Line::from(vec![
-            Span::raw(if cursor == 0 { "▸ " } else { "  " }),
-            Span::styled("Choose a different model", style),
-            Span::raw("  "),
+            Span::styled(if hovered { "› " } else { "  " }, row(ink)),
+            Span::styled("Choose a different model", row(ink)),
+            Span::styled("  ", row(ink)),
             Span::styled(
                 "Choose a provider, then one of that provider’s models.",
-                muted,
+                row(muted),
             ),
         ]));
     }
@@ -10481,16 +10471,12 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
         status,
         ..
     } = wizard;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Setup — {} ", run.descriptor().title));
+    let block = product_dialog_block(format!(" Setup — {} ", run.descriptor().title));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let selected = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let muted = product_muted();
+    let ink = product_ink();
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
         run.descriptor().description.to_string(),
@@ -10508,7 +10494,7 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
     } else if let Some(step) = run.current_step() {
         lines.push(Line::from(Span::styled(
             step.prompt.to_string(),
-            Style::default().fg(Color::White),
+            product_ink(),
         )));
         let help = run.help();
         if !help.is_empty() {
@@ -10519,17 +10505,14 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
             cockpit_core::wizard::StepKind::Select { .. } => {
                 let options = run.select_options();
                 for (index, option) in options.iter().enumerate() {
-                    let marker = if index == *cursor { "▸ " } else { "  " };
-                    let style = if index == *cursor {
-                        selected
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
+                    let hovered = index == *cursor;
+                    let marker = if hovered { "› " } else { "  " };
+                    let row = |style| crate::tui::chrome::chip_style(style, hovered);
                     lines.push(Line::from(vec![
-                        Span::raw(marker),
-                        Span::styled(option.label.to_string(), style),
-                        Span::raw("  "),
-                        Span::styled(option.description.to_string(), muted),
+                        Span::styled(marker, row(ink)),
+                        Span::styled(option.label.to_string(), row(ink)),
+                        Span::styled("  ", row(ink)),
+                        Span::styled(option.description.to_string(), row(muted)),
                     ]));
                 }
             }
@@ -10561,24 +10544,21 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                     }
                 };
                 for (index, option) in options.iter().enumerate() {
-                    let marker = if index == *cursor { "▸ " } else { "  " };
+                    let hovered = index == *cursor;
+                    let marker = if hovered { "› " } else { "  " };
                     let checked = prefill_values
                         .as_ref()
                         .map(|values| values.iter().any(|value| value == option.id.as_ref()))
                         .unwrap_or_else(|| multi.contains(option.id.as_ref()));
                     let check = if checked { "[x]" } else { "[ ]" };
-                    let style = if index == *cursor {
-                        selected
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
+                    let row = |style| crate::tui::chrome::chip_style(style, hovered);
                     lines.push(Line::from(vec![
-                        Span::raw(marker),
-                        Span::styled(check.to_string(), style),
-                        Span::raw(" "),
-                        Span::styled(option.label.to_string(), style),
-                        Span::raw("  "),
-                        Span::styled(option.description.to_string(), muted),
+                        Span::styled(marker, row(ink)),
+                        Span::styled(check.to_string(), row(ink)),
+                        Span::styled(" ", row(ink)),
+                        Span::styled(option.label.to_string(), row(ink)),
+                        Span::styled("  ", row(ink)),
+                        Span::styled(option.description.to_string(), row(muted)),
                     ]));
                 }
             }
@@ -10603,7 +10583,8 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                         lines.push(Line::from(Span::styled(item.family.to_string(), muted)));
                         last_family = item.family;
                     }
-                    let marker = if index == *cursor { "▸ " } else { "  " };
+                    let hovered = index == *cursor;
+                    let marker = if hovered { "› " } else { "  " };
                     let checked = surface.tools.iter().any(|tool| tool == item.name);
                     let tier = if checked {
                         surface
@@ -10615,18 +10596,14 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                     } else {
                         "-"
                     };
-                    let style = if index == *cursor {
-                        selected
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
+                    let row = |style| crate::tui::chrome::chip_style(style, hovered);
                     lines.push(Line::from(vec![
-                        Span::raw(marker),
-                        Span::styled(if checked { "[x]" } else { "[ ]" }.to_string(), style),
-                        Span::raw(" "),
-                        Span::styled(item.name.to_string(), style),
-                        Span::raw("  "),
-                        Span::styled(format!("tier: {tier}"), muted),
+                        Span::styled(marker, row(ink)),
+                        Span::styled(if checked { "[x]" } else { "[ ]" }.to_string(), row(ink)),
+                        Span::styled(" ", row(ink)),
+                        Span::styled(item.name.to_string(), row(ink)),
+                        Span::styled("  ", row(ink)),
+                        Span::styled(format!("tier: {tier}"), row(muted)),
                     ]));
                 }
             }
@@ -10647,10 +10624,7 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
 }
 
 fn help_line(text: &str) -> Paragraph<'static> {
-    Paragraph::new(Line::from(Span::styled(
-        text.to_string(),
-        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-    )))
+    Paragraph::new(Line::from(Span::styled(text.to_string(), product_muted())))
 }
 
 /// The `config.json` path of the **nearest project** `.cockpit/` layer for

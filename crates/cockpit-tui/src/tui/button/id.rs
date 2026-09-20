@@ -101,7 +101,6 @@ pub(crate) enum DialogSurface {
     WizardMenu,
     ModelSetupChoice,
     SetupWizard,
-    FirstRunComplete,
     Settings,
 }
 

@@ -6,8 +6,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -158,7 +157,7 @@ impl ResourcesPane {
         area: Rect,
         mut buttons: Option<&mut crate::tui::button::ButtonRegistry>,
     ) {
-        let block = Block::default().borders(Borders::ALL).title(" /resources ");
+        let block = crate::tui::chrome::rounded_block(" /resources ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -459,16 +458,12 @@ fn queued_line(
     selected: bool,
     show_inline_action: bool,
 ) -> Line<'static> {
-    let marker = if selected { ">" } else { " " };
+    let marker = if selected { "› " } else { "  " };
     let state = match entry.state {
         ResourceQueuedState::Queued => "queued",
         ResourceQueuedState::Promoted => "promoted",
     };
-    let style = if selected {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
+    let style = crate::tui::chrome::chip_style(Style::default(), selected);
     let action = if show_inline_action {
         "  [promote]"
     } else {
@@ -476,7 +471,7 @@ fn queued_line(
     };
     Line::from(vec![Span::styled(
         format!(
-            "{marker} {}  {}  {}  {}  wait {}ms  {}{action}",
+            "{marker}{}  {}  {}  {}  wait {}ms  {}{action}",
             entry.display_id,
             actor_label(
                 entry.metadata.agent_id.as_deref(),

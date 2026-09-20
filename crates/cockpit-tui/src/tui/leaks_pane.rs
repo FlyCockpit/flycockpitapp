@@ -21,7 +21,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use zeroize::Zeroizing;
 
 use cockpit_proto::{
@@ -619,9 +619,7 @@ impl LeaksPane {
             self.pending_clear = true;
         }
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" /leaks — contained leak reports ");
+        let block = crate::tui::chrome::rounded_block(" /leaks — contained leak reports ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -667,12 +665,9 @@ impl LeaksPane {
             }
             LeaksPaneState::Ready => {
                 for (i, report) in self.reports.iter().enumerate() {
-                    let marker = if i == self.selected { "▶ " } else { "  " };
-                    let style = if i == self.selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
+                    let marker = if i == self.selected { "› " } else { "  " };
+                    let style =
+                        crate::tui::chrome::chip_style(Style::default(), i == self.selected);
                     list_lines.push(Line::from(Span::styled(
                         format!(
                             "{marker}{} | {} | {} | {} | {}",
@@ -987,7 +982,7 @@ mod tests {
         // Assert the selected LIST row (marker + id) is co-visible — not merely
         // the id echoed inside the footer confirmation text.
         assert!(
-            joined.contains("▶ rpt-25"),
+            joined.contains("› rpt-25"),
             "the report being deleted must stay visible on a list row:\n{joined}"
         );
     }

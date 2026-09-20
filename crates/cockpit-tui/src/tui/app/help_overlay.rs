@@ -2,16 +2,18 @@ use super::slash::SLASH_COMMANDS;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::message_block::{slice_spans_at_width, wrap_lines_to_width};
-use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, resolve_color};
 
 const TITLE: &str = " Help ";
+#[cfg(test)]
 const MIN_WIDTH: u16 = 30;
+#[cfg(test)]
 const MIN_HEIGHT: u16 = 8;
 const NAME_GUTTER: usize = 2;
 const MAX_NAME_COLUMN: usize = 24;
@@ -73,11 +75,8 @@ impl HelpOverlay {
     }
 
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        let rect = centered_rect(area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(TITLE)
-            .border_style(Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX)));
+        let rect = area;
+        let block = crate::tui::chrome::rounded_block(TITLE, true);
         let inner = block.inner(rect);
         let lines = help_lines(inner.width);
         self.last_content_rows = lines.len() as u16;
@@ -118,6 +117,7 @@ impl HelpOverlay {
     }
 }
 
+#[cfg(test)]
 fn centered_rect(area: Rect) -> Rect {
     let width = area.width.saturating_sub(2).max(MIN_WIDTH).min(area.width);
     let height = area
@@ -132,9 +132,9 @@ fn centered_rect(area: Rect) -> Rect {
 
 fn help_lines(inner_width: u16) -> Vec<Line<'static>> {
     let heading = Style::default().add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let command = Style::default()
-        .fg(Color::Indexed(ACCENT_BLUE_INDEX))
+        .fg(resolve_color(BRASS, BRASS_INDEX))
         .add_modifier(Modifier::BOLD);
 
     let width = usize::from(inner_width).max(1);
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn help_overlay_name_column_fits_longest_command() {
         let command_style = Style::default()
-            .fg(Color::Indexed(ACCENT_BLUE_INDEX))
+            .fg(resolve_color(BRASS, BRASS_INDEX))
             .add_modifier(Modifier::BOLD);
         let lines = command_lines(
             SLASH_COMMANDS

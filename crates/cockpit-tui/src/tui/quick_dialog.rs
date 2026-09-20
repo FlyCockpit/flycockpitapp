@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use cockpit_config::extended::ApprovalMode;
 use cockpit_config::providers::{CapabilityStatus, ModelTrust, PromptCacheRetention};
@@ -199,7 +199,7 @@ impl QuickDialog {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title(" /quick ");
+        let block = crate::tui::chrome::rounded_block(" /quick ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -569,44 +569,49 @@ impl QuickDialog {
         disabled: bool,
     ) -> Line<'static> {
         let selected = self.cursors[self.tab] == index;
-        let marker = if selected { ">" } else { " " };
+        let marker = if selected { "› " } else { "  " };
+        let row = |style| crate::tui::chrome::chip_style(style, selected);
         let mut spans = vec![
-            Span::styled(
-                format!("{marker} "),
-                if selected {
-                    Style::default()
-                        .fg(Color::Indexed(crate::tui::theme::ACCENT_BLUE_INDEX))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            ),
+            Span::styled(marker, row(Style::default())),
             Span::styled(
                 label.to_string(),
                 if disabled {
-                    Style::default().fg(Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX))
-                } else if selected {
-                    Style::default().add_modifier(Modifier::BOLD)
+                    row(Style::default().fg(crate::tui::theme::resolve_color(
+                        crate::tui::theme::FOG,
+                        crate::tui::theme::FOG_INDEX,
+                    )))
                 } else {
-                    Style::default()
+                    row(Style::default())
                 },
             ),
         ];
         if !description.is_empty() {
             spans.push(Span::styled(
                 format!("  {description}"),
-                Style::default().fg(Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX)),
+                row(Style::default().fg(crate::tui::theme::resolve_color(
+                    crate::tui::theme::FOG,
+                    crate::tui::theme::FOG_INDEX,
+                ))),
             ));
         }
         if current {
-            spans.push(Span::styled("  current", Style::default().fg(Color::Green)));
+            spans.push(Span::styled(
+                "  current",
+                row(Style::default().fg(crate::tui::theme::resolve_color(
+                    crate::tui::theme::GREEN,
+                    crate::tui::theme::GREEN_INDEX,
+                ))),
+            ));
         }
         if staged {
             spans.push(Span::styled(
                 "  staged",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                row(Style::default()
+                    .fg(crate::tui::theme::resolve_color(
+                        crate::tui::theme::YELLOW,
+                        crate::tui::theme::YELLOW_INDEX,
+                    ))
+                    .add_modifier(Modifier::BOLD)),
             ));
         }
         Line::from(spans)
@@ -924,7 +929,7 @@ mod tests {
         dialog.handle_key(key(KeyCode::Up));
         dialog.handle_key(key(KeyCode::Char(' ')));
         let snapshot = dialog.snapshot();
-        assert!(snapshot.contains("> 1"));
+        assert!(snapshot.contains("› 1"));
         assert!(snapshot.contains("2"));
         assert!(snapshot.contains("current"));
         assert!(snapshot.contains("staged"));

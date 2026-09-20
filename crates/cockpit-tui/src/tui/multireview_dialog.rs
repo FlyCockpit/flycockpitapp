@@ -6,10 +6,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::tui::textfield::TextField;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 use cockpit_config::extended::persist_review_default_participants;
 use unicode_width::UnicodeWidthStr;
 
@@ -167,7 +167,7 @@ mod tests {
             .join("\n");
 
         assert!(!rendered.contains("reviewer-0"), "{rendered}");
-        assert!(rendered.contains("> [ ] reviewer-19"), "{rendered}");
+        assert!(rendered.contains("› [ ] reviewer-19"), "{rendered}");
     }
 }
 
@@ -541,7 +541,7 @@ impl MultireviewDialog {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title("/multireview");
+        let block = crate::tui::chrome::rounded_block(" /multireview ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
@@ -569,14 +569,21 @@ impl MultireviewDialog {
         let mut lines = vec![Line::from("Change sources")];
         for (i, row) in self.sources.iter().enumerate() {
             let mark = if row.selected { "[x]" } else { "[ ]" };
-            let cursor = if i == self.source_cursor { "> " } else { "  " };
+            let cursor = if i == self.source_cursor {
+                "› "
+            } else {
+                "  "
+            };
             let extra = row
                 .pr
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map(|s| format!(" {s}"))
                 .unwrap_or_default();
-            lines.push(Line::from(format!("{cursor}{mark} {}{extra}", row.label)));
+            lines.push(Line::from(Span::styled(
+                format!("{cursor}{mark} {}{extra}", row.label),
+                crate::tui::chrome::chip_style(Style::default(), i == self.source_cursor),
+            )));
         }
         lines
     }
@@ -604,11 +611,14 @@ impl MultireviewDialog {
                 "[ ]"
             };
             let cursor = if i == self.participant_cursor {
-                "> "
+                "› "
             } else {
                 "  "
             };
-            lines.push(Line::from(format!("{cursor}{mark} {}", row.label)));
+            lines.push(Line::from(Span::styled(
+                format!("{cursor}{mark} {}", row.label),
+                crate::tui::chrome::chip_style(Style::default(), i == self.participant_cursor),
+            )));
         }
         lines
     }
@@ -620,7 +630,7 @@ impl MultireviewDialog {
             Line::from(vec![
                 Span::styled(
                     "focus: ",
-                    Style::default().fg(ratatui::style::Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(resolve_color(FOG, FOG_INDEX)),
                 ),
                 Span::raw(before.to_string()),
                 Span::raw(after.to_string()),

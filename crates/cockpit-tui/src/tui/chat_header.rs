@@ -372,7 +372,12 @@ pub(crate) fn paint_chat_header(
             pill.label.clone(),
             ButtonDispatch::HeaderPill(*kind),
         )
-        .focused(selected == Some(*kind));
+        .focused(selected == Some(*kind))
+        .kind(if *kind == HeaderPillKind::Attention {
+            crate::tui::button::ButtonKind::Destructive
+        } else {
+            crate::tui::button::ButtonKind::Default
+        });
         let _ = buttons.paint(frame, rect.x, rect.y, rect.width, spec);
     }
     if let Some((collapsed, rect)) = layout.more_button {

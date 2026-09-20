@@ -1,40 +1,40 @@
-╭ sessions all ──────────────╮                                                                                      idle
-│ search                     │~/project                                                                                 
-│no active sessions in all pr│──────────────────────────────────────────────────────────────────────────────────────────
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                     ╭─────────────────────────────────────────────╮                      
-│                            │                     │ ▗▖          ▄█▛                             │                      
-│                            │                     │ ▐█▖▄     ▗▄▀▝▀   ▘   FlyCockpit v0.1.0      │                      
-│                            │                     │ ▀▀▀██▛▀▜█▀▀▀▟▛▀▀▘▘   Daemon failed to start │                      
-│                            │                     │      ▀▀▀████▀▝▀▀▘▘   ~/project              │                      
-│                            │                     │      ▄▜█▀▘       ▘                          │                      
-│                            │                     │     ▝▀▀                                     │                      
-│                            │                     │ Tip: /help gets you oriented                │                      
-│                            │                     ╰─────────────────────────────────────────────╯                      
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│browse only — no daemon     │                                                                                          
-╰────────────────────────────╯                                                                                          
+                                                                                                                  ● Idle
+ ◆ Cockpit             [Hide] ~/project                                                                                 
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session                                                                                                         
+                                                                                                                        
+ SESSIONS                                                                                                               
+ no active sessions in all pr                                                                                           
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                   ╭─────────────────────────────────────────────╮                      
+                                                   │ ▗▖          ▄█▛                             │                      
+                                                   │ ▐█▖▄     ▗▄▀▝▀   ▘   FlyCockpit v0.1.0      │                      
+                                                   │ ▀▀▀██▛▀▜█▀▀▀▟▛▀▀▘▘   Daemon failed to start │                      
+                                                   │      ▀▀▀████▀▝▀▀▘▘   ~/project              │                      
+                                                   │      ▄▜█▀▘       ▘                          │                      
+                                                   │     ▝▀▀                                     │                      
+                                                   │ Tip: /help gets you oriented                │                      
+                                                   ╰─────────────────────────────────────────────╯                      
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+ ● working  ● waiting  ● done                                                                                           
+                                                                                                                        
+                                                                daemon socket address already in use: /tmp/cockpit.sock 
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│❯ Message FlyCockpit — / commands · Ctrl+K keys · /setup                                                      0 tokens│
+│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys                                             0 tokens│
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯
- daemon socket address already in use: /tmp/cockpit.sock                                                                
+Setup: Code                                                                                                             

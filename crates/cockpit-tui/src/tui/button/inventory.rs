@@ -270,7 +270,7 @@ fn overlay_surfaces() -> [OverlaySurface; 14] {
     ]
 }
 
-fn dialog_surfaces() -> [DialogSurface; 9] {
+fn dialog_surfaces() -> [DialogSurface; 8] {
     [
         DialogSurface::WorkspaceTrust,
         DialogSurface::PickConfig,
@@ -279,7 +279,6 @@ fn dialog_surfaces() -> [DialogSurface; 9] {
         DialogSurface::WizardMenu,
         DialogSurface::ModelSetupChoice,
         DialogSurface::SetupWizard,
-        DialogSurface::FirstRunComplete,
         DialogSurface::Settings,
     ]
 }
@@ -312,7 +311,6 @@ fn dialog_name(surface: DialogSurface) -> &'static str {
         DialogSurface::WizardMenu => "wizard_menu",
         DialogSurface::ModelSetupChoice => "model_setup_choice",
         DialogSurface::SetupWizard => "setup_wizard",
-        DialogSurface::FirstRunComplete => "first_run_complete",
         DialogSurface::Settings => "settings",
     }
 }

@@ -14,7 +14,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState};
 use uuid::Uuid;
 
 use cockpit_config::config::sandbox_mode::SandboxMode;
@@ -397,7 +397,7 @@ impl AgentTreePane {
         } else {
             format!(" Agent tree — {} ", self.breadcrumb)
         };
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = crate::tui::chrome::rounded_block(title, true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -417,7 +417,10 @@ impl AgentTreePane {
                 .collect(),
         };
         let items: Vec<ListItem<'static>> = lines.into_iter().map(ListItem::new).collect();
-        let list = List::new(items).highlight_symbol("› ");
+        let list = List::new(items)
+            .highlight_symbol("› ")
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
+            .highlight_style(crate::tui::chrome::chip_style(Style::default(), true));
         frame.render_stateful_widget(list, inner, &mut self.list);
     }
 
@@ -426,9 +429,7 @@ impl AgentTreePane {
         let Some(view) = self.override_view.as_mut() else {
             return;
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} ", view.title));
+        let block = crate::tui::chrome::rounded_block(format!(" {} ", view.title), true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -461,7 +462,10 @@ impl AgentTreePane {
         let preamble = usize::from(view.error.is_some()) * 2 + usize::from(view.terminal);
         let mut render_state = ListState::default();
         render_state.select(view.list.selected().map(|index| index + preamble));
-        let list = List::new(items).highlight_symbol("› ");
+        let list = List::new(items)
+            .highlight_symbol("› ")
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
+            .highlight_style(crate::tui::chrome::chip_style(Style::default(), true));
         frame.render_stateful_widget(list, inner, &mut render_state);
     }
 }

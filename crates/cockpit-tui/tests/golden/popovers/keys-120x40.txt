@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] /tmp/project                                                                              
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session               ▌Continue with every transcript element.                                                 │
+                              note to self                                                                      12:00  │
+ SESSIONS                     ┊ Keep product-only transcript variants.                                                 │
+ no active sessions in all pr ▌ Agent╭ keybindings — Composer ──────────────────────────────────────────────────╮2:00  │
+                                Model│Composer                                                                  │      │
+                                TTFT │  Enter        send           submit the message                          │      │
+                                TPS  │  Shift+Enter  newline        insert a newline (Alt+Enter also)           │      │
+                                Cache│  Ctrl+P       model          open the composer model picker              │      │
+                                ▾ Tho│  Ctrl+E       effort         open the composer effort picker             │      │
+                                Map e│  Ctrl+B       sessions       toggle the session sidebar                  │      │
+                                The o│  Ctrl+N       new session    start a fresh session                       │      █
+                                     │  Alt+↑/↓      switch session resume the previous or next session         │      █
+                                ▸ rea│  Ctrl+↑       enter queue    focus queued messages from an empty composer│      █
+                                     │  Ctrl+K b     btw focus      toggle focus for an open /btw pane          │      █
+                                ─ exp│  Ctrl+K n     scratchpad     open the project scratchpad                 │      █
+                              ▌ inter│  Ctrl+K r     reveal         toggle original inputs and compact briefs   │      █
+                              ▌ Inter│  Ctrl+T       thinking       toggle reasoning blocks                     │      █
+                                     │  Ctrl+Y       copy pick      pick a message or code block to copy        │      █
+                              ▌ backg│  Shift+Tab    cycle agent    switch the primary agent                    │      █
+                                Backg│  @            file tag       tag a file into the message                 │      █
+                                     │Global                                                                    │      █
+                                ◇ Edi│  Ctrl+K       keys           open/close this which-key overlay (also /key│      █
+                                │ - o│  Ctrl+C       interrupt      stop the running agent; press twice to quit │      █
+                                │ + n│  Ctrl+D       quit           exit when idle; guarded while work is active│      █
+                                │   s│  /            commands       open the slash-command menu                 │      █
+                               ⋯ Comp│Esc/q/Ctrl+K close  ↑/↓ scroll  g/G top/bottom                            │ ·  ⋯ █
+                                     ╰──────────────────────────────────────────────────────────────────────────╯      █
+                                [show summary]                                                                         █
+                                                                                                                       █
+                              ▌ Agent                                                                           12:00  █
+ ● working  ● waiting  ● done   Thinking                                                                               █
+                                Check the final visual hierarchy.                                                      █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys                                           113 tokens│
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯
+Setup: Code                                                                                                             

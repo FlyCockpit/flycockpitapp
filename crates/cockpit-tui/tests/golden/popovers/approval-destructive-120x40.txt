@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] /tmp/project                                                                              
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session               ▌Continue with every transcript element.                                                 │
+                                ─ explore                                                                              │
+ SESSIONS                     ▌ interactive ✓ explore worked for 3s [u]                                                │
+ no active sessions in all pr ▌ Interactive child inspected the rendering seam.                                        │
+                                                                                                                       │
+                              ▌ background ✓ runner worked for 4s [u]                                                  │
+                                Background child returned a compact report.                                            │
+                                                                                                                       │
+                                ◇ Edited src/transcript.rs  +1 -1                                                      │
+                                │ - old line                                                                           │
+                                │ + new line                                                                           │
+                                │   shared line                                                                        │
+                               ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 ·  ⋯ █
+                                                               ⋯ 2 seed tools (~42) ⋯                                  █
+                                [show summary]                                                                         █
+                                                                                                                       █
+                              ▌ Agent                                                                           12:00  █
+ ● working  ● waiting  ● done   Thinking                                                                               █
+                                Check the final visual hierarchy.                                                      █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
+╭ approval ────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│The agent needs your input.                                                                                           │
+│                                                                                                                      │
+│Run this command?                                                                                                     │
+│                                                                                                                      │
+│cwd: ~/project                                                                                                        │
+│  rm -rf target/debug/example                                                                                         │
+│                                                                                                                      │
+│risk: destructive                                                                                                     │
+│                                                                                                                      │
+│                                                                                                                      │
+│› 1. ◯ Approve once                                                                                                   │
+│       Run only this time                                                                                             │
+│                                                                                                                      │
+│esc: cancel  ·  enter again: confirm  ·  1-9/enter: select  ·  ↑/↓: move  ·  shift+pgup/pgdn: chat                    │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Setup: Code                                                                                                             

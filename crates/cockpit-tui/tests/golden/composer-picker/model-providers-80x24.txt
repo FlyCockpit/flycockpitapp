@@ -1,23 +1,23 @@
-╭ sessions all ────────────╮                                              ● Idle
-│ search                   │~/project                                           
-│no active sessions in all │────────────────────────────────────────────────────
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│          ╭ model ──────────────────────────────────────╮                      
-│browse onl│› openai  2 models · 1 favorite  ›           │                      
-╰──────────│  anthropic  2 models · 1 favorite  ›        │                      
+                                                                          ● Idle
+ ◆ Cockpit           [Hide] ~/project                                           
+                            ────────────────────────────────────────────────────
+  + New session                                                                 
+                                                                                
+ SESSIONS                                                                       
+ no active sessions in all                                                      
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ ● working  ● waiting  ● do──────────────────────────────╮                      
+           │› openai  2 models · 1 favorite  ›           │                      
+           │  anthropic  2 models · 1 favorite  ›        │                      
 ╭──────────│↑/↓ move · enter choose · ctrl+enter default │─────────────────────╮
 │❯ Message ╰─────────────────────────────────────────────╯l+K keys     0 tokens│
 ╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───[Send]╯

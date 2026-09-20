@@ -20,15 +20,14 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tui::pane::Pane;
 use crate::tui::pane_shared::{resolve_project_id, short_id};
 use crate::tui::progress::render_bar;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 use cockpit_proto::{
     LanguageSection, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
 };
@@ -412,7 +411,7 @@ impl StatsPane {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         let title = self.title();
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = crate::tui::chrome::rounded_block(title, true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -458,7 +457,7 @@ impl StatsPane {
             self.list.offset(),
         );
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "q quit  s scope  r range  ↑/↓ move  e/enter expand  g/G top/bottom".to_string(),
@@ -499,7 +498,7 @@ impl StatsPane {
             StatsPaneState::Loading => {
                 lines.push(Line::from(Span::styled(
                     "loading stats...",
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(resolve_color(FOG, FOG_INDEX)),
                 )));
             }
             StatsPaneState::Error(e) => {
@@ -688,7 +687,7 @@ fn section_recovery(rec: &RecoverySection, expanded: &[bool], cursor: usize) -> 
     }
     let widths = column_widths(&header, &rows);
     // Header (indented two cols to align with the marker gutter).
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     out.push(Line::from(Span::styled(
         format!("  {}", join_row(&header_strings(&header), &widths)),
         muted.add_modifier(Modifier::BOLD),
@@ -699,7 +698,7 @@ fn section_recovery(rec: &RecoverySection, expanded: &[bool], cursor: usize) -> 
         let marker = if is_expanded {
             "▾ "
         } else if is_cursor {
-            "▸ "
+            "› "
         } else {
             "  "
         };
@@ -725,7 +724,7 @@ fn section_recovery(rec: &RecoverySection, expanded: &[bool], cursor: usize) -> 
 /// expand-on-Enter detail (GOALS §15a.2). Both come pre-aggregated from
 /// the roll-up layer; this only filters to `model` and formats.
 fn recovery_drilldown(rec: &RecoverySection, model: &str) -> Vec<Line<'static>> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let mut out: Vec<Line<'static>> = Vec::new();
 
     let tools: Vec<_> = rec.by_tool.iter().filter(|t| t.model == model).collect();
@@ -806,7 +805,7 @@ fn section_language(lang: &LanguageSection, width: usize) -> Vec<Line<'static>> 
             .unwrap_or(0);
         let tail = label_w + 22; // "  <label>  99.9%  9999 calls"
         let bar_w = scaled_bar_width(width, tail);
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         for l in &lang.languages {
             let bar = render_bar(l.pct, bar_w);
             out.push(Line::from(vec![
@@ -834,7 +833,7 @@ fn section_language(lang: &LanguageSection, width: usize) -> Vec<Line<'static>> 
         out.push(Line::default());
         out.push(Line::from(Span::styled(
             format!("  Non-file activity: {}", parts.join(" / ")),
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            Style::default().fg(resolve_color(FOG, FOG_INDEX)),
         )));
     }
     out
@@ -854,7 +853,7 @@ fn section_header(title: &str) -> Line<'static> {
 fn no_data() -> Line<'static> {
     Line::from(Span::styled(
         "  (no data)".to_string(),
-        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        Style::default().fg(resolve_color(FOG, FOG_INDEX)),
     ))
 }
 
@@ -862,7 +861,7 @@ fn no_data() -> Line<'static> {
 /// [`Line`]s, indented two columns to match the section bodies.
 fn aligned_table(header: &[&str], rows: &[Vec<String>]) -> Vec<Line<'static>> {
     let widths = column_widths(header, rows);
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let mut out = vec![Line::from(Span::styled(
         format!("  {}", join_row(&header_strings(header), &widths)),
         muted.add_modifier(Modifier::BOLD),

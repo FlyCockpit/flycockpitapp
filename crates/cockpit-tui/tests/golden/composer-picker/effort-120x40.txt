@@ -1,39 +1,39 @@
-╭ sessions all ──────────────╮                                                                                    ● Idle
-│ search                     │~/project                                                                                 
-│no active sessions in all pr│──────────────────────────────────────────────────────────────────────────────────────────
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                            │                                                                                          
-│                         ╭ Effort ─────────────────────────────────────╮                                               
-│                         │  Fast  short reasoning pass                 │                                               
-│browse only — no daemon  │› Balanced  balanced speed and depth         │                                               
-╰─────────────────────────│  Thorough  deep reasoning pass              │                                               
+                                                                                                                  ● Idle
+ ◆ Cockpit             [Hide] ~/project                                                                                 
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session                                                                                                         
+                                                                                                                        
+ SESSIONS                                                                                                               
+ no active sessions in all pr                                                                                           
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                          ╭ Effort ─────────────────────────────────────╮                                               
+ ● working  ● waiting  ● doneFast  short reasoning pass                 │                                               
+                          │› Balanced  balanced speed and depth         │                                               
+                          │  Thorough  deep reasoning pass              │                                               
 ╭─────────────────────────│↑/↓ move · enter choose · esc back           │──────────────────────────────────────────────╮
 │❯ Message FlyCockpit — Ct╰─────────────────────────────────────────────╯                                      0 tokens│
 ╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───────────────────────────────────────────[Send]╯

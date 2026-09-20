@@ -1,5 +1,5 @@
-                                                                                                                  ● Idle
- ◆ Cockpit             [Hide] ⎇ ~/project                                                                  [Setup: Code]
+                              fixture-session                                                                     ● Idle
+ ◆ Cockpit             [Hide] ⎇ ~/project   issue-449 ● 2 changes                                          [Setup: Code]
                               ──────────────────────────────────────────────────────────────────────────────────────────
   + New session                                                                                                         
                                                                                                                         
@@ -13,15 +13,15 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                   ╭─────────────────────────────────────────────╮                      
-                                                   │ ▗▖          ▄█▛                             │                      
-                                                   │ ▐█▖▄     ▗▄▀▝▀   ▘   FlyCockpit v0.1.0      │                      
-                                                   │ ▀▀▀██▛▀▜█▀▀▀▟▛▀▀▘▘   Daemon failed to start │                      
-                                                   │      ▀▀▀████▀▝▀▀▘▘   ⎇ ~/project            │                      
-                                                   │      ▄▜█▀▘       ▘                          │                      
-                                                   │     ▝▀▀                                     │                      
-                                                   │ Tip: /help gets you oriented                │                      
-                                                   ╰─────────────────────────────────────────────╯                      
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -34,7 +34,7 @@
                                                                                                                         
  ● working  ● waiting  ● done                                                                                           
                                                                                                                         
- daemon socket address already in use: /tmp/cockpit.sock                                                                
+                                                                                                                        
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │Ask anything, ⇧↵ for a newline, or / for commands…                                                            0 tokens│
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯

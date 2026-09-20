@@ -1,0 +1,24 @@
+                            fixture-session                               ● Idle
+ ◆ Cockpit           [Hide] ⎇ ~/project   issue-449 ● 2 changes    [Setup: Code]
+                            ────────────────────────────────────────────────────
+  + New session                                                                 
+                                                                                
+ SESSIONS                                                                       
+ no active sessions in all                                                      
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+╭ Sandbox ─────────────────────────────────────────────────────────────────────╮
+│ ⚠ shell sandbox can't start: sandbox host is unavailable. Run /sandbox off in│
+│  off                                                                         │
+│● working  ● waiting  ● do                                                    │
+│  container  unavailable                                                      │
+│  container-readonly  unavailable                                             │
+│↑/↓ move · enter choose · esc back                                            │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯

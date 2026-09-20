@@ -1,5 +1,5 @@
-                                                                          ● Idle
- ◆ Cockpit           [Hide] ⎇ ~/project                            [Setup: Code]
+                            fixture-session                               ● Idle
+ ◆ Cockpit           [Hide] ⎇ ~/project   issue-449 ● 2 changes    [Setup: Code]
                             ────────────────────────────────────────────────────
   + New session                                                                 
                                                                                 
@@ -15,10 +15,10 @@
                                                                                 
                                                                                 
                                                                                 
-                          ╭ Effort ─────────────────────────────────────╮       
- ● working  ● waiting  ● do  Fast  short reasoning pass                 │       
-                          │› Balanced  balanced speed and depth         │       
-                          │  Thorough  deep reasoning pass              │       
-╭─────────────────────────│↑/↓ move · enter choose · esc back           │──────╮
-│Ask anything, ⇧↵ for a ne╰─────────────────────────────────────────────╯tokens│
-╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───[Send]╯
+                                                                                
+ ● working  ● waiting  ● do                                                     
+                                                                                
+                                                                                
+╭──────────────────────────────────────────────────────────────────────────────╮
+│Ask anything, ⇧↵ for a newline, or / for commands…                    0 tokens│
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯

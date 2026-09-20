@@ -1,5 +1,5 @@
-                                                                                                                  ● Idle
- ◆ Cockpit             [Hide] ⎇ ~/project                                                                  [Setup: Code]
+                              fixture-session                                                                     ● Idle
+ ◆ Cockpit             [Hide] ⎇ ~/project   issue-449 ● 2 changes                                          [Setup: Code]
                               ──────────────────────────────────────────────────────────────────────────────────────────
   + New session                                                                                                         
                                                                                                                         
@@ -13,15 +13,10 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                   ╭─────────────────────────────────────────────╮                      
-                                                   │ ▗▖          ▄█▛                             │                      
-                                                   │ ▐█▖▄     ▗▄▀▝▀   ▘   FlyCockpit v0.1.0      │                      
-                                                   │ ▀▀▀██▛▀▜█▀▀▀▟▛▀▀▘▘   Daemon failed to start │                      
-                                                   │      ▀▀▀████▀▝▀▀▘▘   ⎇ ~/project            │                      
-                                                   │      ▄▜█▀▘       ▘                          │                      
-                                                   │     ▝▀▀                                     │                      
-                                                   │ Tip: /help gets you oriented                │                      
-                                                   ╰─────────────────────────────────────────────╯                      
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -34,7 +29,12 @@
                                                                                                                         
  ● working  ● waiting  ● done                                                                                           
                                                                                                                         
- daemon socket address already in use: /tmp/cockpit.sock                                                                
+                                                                                                                        
+╭ Commands ────────────────────────────────────────────╮                                                                
+│› /pin          Pick a message to pin (↑/↓ move, enter│                                                                
+│  /pins         Review pinned messages (↑/↓ jump, d/✓ │                                                                
+│  /pin-context  Pin verbatim text so it survives /comp│                                                                
+╰──────────────────────────────────────────────────────╯                                                                
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│Ask anything, ⇧↵ for a newline, or / for commands…                                                            0 tokens│
+│/pi                                                                                                                   │
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯

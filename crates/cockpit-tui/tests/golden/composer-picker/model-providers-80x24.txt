@@ -1,5 +1,5 @@
                                                                           ● Idle
- ◆ Cockpit           [Hide] ~/project                                           
+ ◆ Cockpit           [Hide] ⎇ ~/project                            [Setup: Code]
                             ────────────────────────────────────────────────────
   + New session                                                                 
                                                                                 
@@ -15,10 +15,10 @@
                                                                                 
                                                                                 
                                                                                 
+                                                                                
  ● working  ● waiting  ● do──────────────────────────────╮                      
            │› openai  2 models · 1 favorite  ›           │                      
            │  anthropic  2 models · 1 favorite  ›        │                      
 ╭──────────│↑/↓ move · enter choose · ctrl+enter default │─────────────────────╮
-│❯ Message ╰─────────────────────────────────────────────╯l+K keys     0 tokens│
+│Ask anythi╰─────────────────────────────────────────────╯             0 tokens│
 ╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───[Send]╯
-Setup: Code                                                                     

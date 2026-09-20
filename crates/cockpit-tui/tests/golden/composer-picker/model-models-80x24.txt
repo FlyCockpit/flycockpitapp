@@ -15,10 +15,10 @@
                                                                                 
                                                                                 
                                                                                 
-           ╭ openai ─────────────────────────────────────╮                      
- ● working  ● waiting  ● doent · 12 uses                 │                      
-           │  gpt-5-mini                                 │                      
-           │  Add model…  configure openai               │                      
-╭──────────│↑/↓ move · enter choose · ctrl+enter default │─────────────────────╮
-│Ask anythi╰─────────────────────────────────────────────╯             0 tokens│
+                            ╭ openai ─────────────────────────────────────╮     
+ ● working  ● waiting  ● do │› ★ gpt-5  current · 12 uses                 │     
+                            │  gpt-5-mini                                 │     
+                            │  Add model…  configure openai               │     
+╭───────────────────────────│↑/↓ move · enter choose · ctrl+enter default │────╮
+│Ask anything, ⇧↵ for a newl╰─────────────────────────────────────────────╯kens│
 ╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───[Send]╯

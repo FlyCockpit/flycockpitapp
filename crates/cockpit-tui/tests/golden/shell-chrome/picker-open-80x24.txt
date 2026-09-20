@@ -16,9 +16,9 @@
                                                                                 
                                                                                 
                                                                                 
- ● working  ● waiting  ● do ─────────────────────────────────────╮              
-                   │No active model.                             │              
-                   │(none)                                       │              
-╭──────────────────│↑/↓ move · enter choose · esc back           │─────────────╮
-│Ask anything, ⇧↵ f╰─────────────────────────────────────────────╯     0 tokens│
+ ● working  ● waiting  ● do ╭ effort ─────────────────────────────────────╮     
+                            │No active model.                             │     
+                            │(none)                                       │     
+╭───────────────────────────│↑/↓ move · enter choose · esc back           │────╮
+│Ask anything, ⇧↵ for a newl╰─────────────────────────────────────────────╯kens│
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯

@@ -15,10 +15,10 @@
                                                                                 
                                                                                 
                                                                                 
-                          ╭ Effort ─────────────────────────────────────╮       
- ● working  ● waiting  ● do  Fast  short reasoning pass                 │       
-                          │› Balanced  balanced speed and depth         │       
-                          │  Thorough  deep reasoning pass              │       
-╭─────────────────────────│↑/↓ move · enter choose · esc back           │──────╮
-│Ask anything, ⇧↵ for a ne╰─────────────────────────────────────────────╯tokens│
+                            ╭ Effort ─────────────────────────────────────╮     
+ ● working  ● waiting  ● do │  Fast  short reasoning pass                 │     
+                            │› Balanced  balanced speed and depth         │     
+                            │  Thorough  deep reasoning pass              │     
+╭───────────────────────────│↑/↓ move · enter choose · esc back           │────╮
+│Ask anything, ⇧↵ for a newl╰─────────────────────────────────────────────╯kens│
 ╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───[Send]╯

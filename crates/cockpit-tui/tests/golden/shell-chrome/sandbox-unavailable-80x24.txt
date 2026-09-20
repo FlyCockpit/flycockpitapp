@@ -8,17 +8,17 @@
                                                                                 
                                                                                 
                                                                                 
-                                                                                
-                                                                                
-╭ Sandbox ─────────────────────────────────────────────────────────────────────╮
-│ [copy] ⚠ shell sandbox can't start: unprivileged user namespaces are         │
-│restricted by AppArmor (Ubuntu 23.10+); `sudo sysctl -w                       │
-│kernel.apparmor_restrict_unprivileged_userns=0` re-enables confinement. Run   │
-│/sandbox off in the composer to continue.                                     │
-│  off                                                                         │
-│● working  ● waiting  ● do                                                    │
-│  container  unavailable                                                      │
-│  container-readonly  unavailable                                             │
-│↑/↓ move · enter choose · esc back                                            │
-╰──────────────────────────────────────────────────────────────────────────────╯
+                            ╭ Sandbox ─────────────────────────────────────────╮
+                            │ [copy] ⚠ shell sandbox can't start: unprivileged │
+                            │user namespaces are restricted by AppArmor (Ubuntu│
+                            │23.10+); `sudo sysctl -w                          │
+                            │kernel.apparmor_restrict_unprivileged_userns=0`   │
+                            │re-enables confinement. Run /sandbox off in the   │
+                            │composer to continue.                             │
+                            │  off                                             │
+ ● working  ● waiting  ● do │› on  unavailable                                 │
+                            │  container  unavailable                          │
+                            │  container-readonly  unavailable                 │
+╭───────────────────────────│↑/↓ move · enter choose · esc back                │
+│Ask anything, ⇧↵ for a newl╰──────────────────────────────────────────────────╯
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯

@@ -32,9 +32,9 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
- ● working  ● waiting  ● done────────────────────────────╮                                                              
-           │› openai  2 models · 1 favorite  ›           │                                                              
-           │  anthropic  2 models · 1 favorite  ›        │                                                              
-╭──────────│↑/↓ move · enter choose · ctrl+enter default │─────────────────────────────────────────────────────────────╮
-│Ask anythi╰─────────────────────────────────────────────╯                                                     0 tokens│
+ ● working  ● waiting  ● done ╭ model ──────────────────────────────────────╮                                           
+                              │› openai  2 models · 1 favorite  ›           │                                           
+                              │  anthropic  2 models · 1 favorite  ›        │                                           
+╭─────────────────────────────│↑/↓ move · enter choose · ctrl+enter default │──────────────────────────────────────────╮
+│Ask anything, ⇧↵ for a newlin╰─────────────────────────────────────────────╯                                  0 tokens│
 ╰[Cockpit]─[openai/gpt-5]─[medium]─[permissions: manual]─[sandbox: on]───────────────────────────────────────────[Send]╯

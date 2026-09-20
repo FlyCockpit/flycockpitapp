@@ -33,10 +33,10 @@
 30	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
 31	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
 32	30:Reset/Rgb(28,38,48)/- 90:Reset/Reset/-
-33	26:Reset/Rgb(28,38,48)/- 4:Rgb(224,177,86)/Rgb(28,38,48)/- 43:Rgb(224,177,86)/Reset/- 47:Reset/Reset/-
-34	1:Reset/Rgb(28,38,48)/- 2:Rgb(224,177,86)/Rgb(28,38,48)/- 9:Indexed(109)/Rgb(28,38,48)/- 2:Rgb(217,106,106)/Rgb(28,38,48)/- 9:Indexed(109)/Rgb(28,38,48)/- 2:Rgb(127,201,138)/Rgb(28,38,48)/- 4:Indexed(109)/Rgb(28,38,48)/- 1:Indexed(255)/Rgb(28,38,48)/- 3:Indexed(255)/Reset/- 22:Indexed(109)/Reset/- 17:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 47:Reset/Reset/-
-35	26:Reset/Rgb(28,38,48)/- 1:Rgb(224,177,86)/Rgb(28,38,48)/- 3:Rgb(224,177,86)/Rgb(28,38,48)/BOLD 41:Rgb(224,177,86)/Rgb(44,56,70)/BOLD 1:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 47:Reset/Reset/-
-36	26:Reset/Rgb(28,38,48)/- 1:Rgb(224,177,86)/Rgb(28,38,48)/- 2:Reset/Rgb(28,38,48)/- 1:Indexed(255)/Rgb(28,38,48)/- 7:Indexed(255)/Reset/- 21:Indexed(109)/Reset/- 14:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 47:Reset/Reset/-
-37	26:Rgb(74,90,106)/Reset/- 1:Rgb(224,177,86)/Reset/- 34:Indexed(109)/Reset/- 11:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 47:Rgb(74,90,106)/Reset/-
-38	1:Rgb(74,90,106)/Reset/- 25:Rgb(106,122,138)/Reset/ITALIC 47:Rgb(224,177,86)/Reset/- 38:Reset/Reset/- 8:Rgb(138,155,176)/Reset/- 1:Rgb(74,90,106)/Reset/-
+33	30:Reset/Rgb(28,38,48)/- 47:Rgb(224,177,86)/Reset/- 43:Reset/Reset/-
+34	1:Reset/Rgb(28,38,48)/- 2:Rgb(224,177,86)/Rgb(28,38,48)/- 9:Indexed(109)/Rgb(28,38,48)/- 2:Rgb(217,106,106)/Rgb(28,38,48)/- 9:Indexed(109)/Rgb(28,38,48)/- 2:Rgb(127,201,138)/Rgb(28,38,48)/- 4:Indexed(109)/Rgb(28,38,48)/- 1:Reset/Rgb(28,38,48)/- 1:Rgb(224,177,86)/Reset/- 2:Reset/Reset/- 4:Indexed(255)/Reset/- 22:Indexed(109)/Reset/- 17:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 43:Reset/Reset/-
+35	30:Reset/Rgb(28,38,48)/- 1:Rgb(224,177,86)/Reset/- 44:Rgb(224,177,86)/Rgb(44,56,70)/BOLD 1:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 43:Reset/Reset/-
+36	30:Reset/Rgb(28,38,48)/- 1:Rgb(224,177,86)/Reset/- 2:Reset/Reset/- 8:Indexed(255)/Reset/- 21:Indexed(109)/Reset/- 14:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 43:Reset/Reset/-
+37	30:Rgb(74,90,106)/Reset/- 1:Rgb(224,177,86)/Reset/- 34:Indexed(109)/Reset/- 11:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 43:Rgb(74,90,106)/Reset/-
+38	1:Rgb(74,90,106)/Reset/- 29:Rgb(106,122,138)/Reset/ITALIC 47:Rgb(224,177,86)/Reset/- 34:Reset/Reset/- 8:Rgb(138,155,176)/Reset/- 1:Rgb(74,90,106)/Reset/-
 39	1:Rgb(74,90,106)/Reset/- 9:Rgb(138,155,176)/Reset/- 1:Rgb(74,90,106)/Reset/- 14:Rgb(138,155,176)/Reset/- 1:Rgb(74,90,106)/Reset/- 8:Rgb(224,177,86)/Rgb(44,56,70)/BOLD 1:Rgb(74,90,106)/Reset/- 21:Rgb(138,155,176)/Reset/- 1:Rgb(74,90,106)/Reset/- 13:Rgb(138,155,176)/Reset/- 43:Rgb(74,90,106)/Reset/- 6:Rgb(224,177,86)/Reset/BOLD 1:Rgb(74,90,106)/Reset/-

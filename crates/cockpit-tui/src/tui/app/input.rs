@@ -1574,8 +1574,8 @@ impl App {
                     self.move_slash_selection_by(1);
                     return false;
                 }
-                // Plain Tab completes the composer to the highlighted
-                // command (cycling forward on repeat) without submitting
+                // Plain Tab completes the highlighted slash command with a
+                // trailing space without submitting
                 // (`slash-command-tab-completion.md`). Scoped to a plain
                 // Tab inside the open slash menu: Shift+Tab is reserved for
                 // agent cycling, and the `@`-popup / prediction-ghost Tab

@@ -134,7 +134,6 @@ use crossterm::event::{
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-#[cfg(test)]
 use unicode_width::UnicodeWidthChar;
 
 use crate::tui::agent_runner::{self, AgentRunner};
@@ -1845,8 +1844,7 @@ pub(super) fn sandbox_notice_wrapped_rows(text: &str, width: u16) -> u16 {
     word_wrap_line_count(&sandbox_notice_render_text(text), width).min(MAX_SANDBOX_NOTICE_ROWS)
 }
 
-#[cfg(test)]
-fn word_wrap_line_count(line: &str, width: u16) -> u16 {
+pub(super) fn word_wrap_line_count(line: &str, width: u16) -> u16 {
     let mut rows = 0u16;
     let mut line_width = 0u16;
     let mut word_width = 0u16;

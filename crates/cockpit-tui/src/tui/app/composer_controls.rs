@@ -17,10 +17,15 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use uuid::Uuid;
 
 const ADD_MODEL_ITEM_ID: &str = "\u{0}add-model";
+const PICKER_STATUS_MAX_ROWS: u16 = 4;
+
+fn picker_status_wrapped_rows(status: &str, width: u16) -> u16 {
+    super::word_wrap_line_count(status, width.max(1)).min(PICKER_STATUS_MAX_ROWS)
+}
 
 fn point_in(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
@@ -351,6 +356,7 @@ impl App {
                 ButtonDispatch::ComposerPill(*kind),
             );
             let hovered = self.button_registry.hover() == Some(&spec.id);
+            let keyboard_focus = self.composer_controls.selection == Some(*kind);
             let color = match kind {
                 ComposerControlKind::Sandbox if self.sandbox_down_notice.is_some() => {
                     crate::tui::theme::RED
@@ -371,7 +377,7 @@ impl App {
                 *rect,
                 &crate::tui::button::bracketed_label(&label),
                 Style::default().fg(color),
-                hovered,
+                hovered || keyboard_focus,
             );
             self.button_registry.register(*rect, spec);
         }
@@ -421,7 +427,11 @@ impl App {
             .min(layout.area.width.max(16))
             .max(16);
         let body_rows = rows.len().max(1) as u16;
-        let status_h = u16::from(status_line.is_some());
+        let status_inner_w = width.saturating_sub(2).max(1);
+        let status_h = status_line
+            .as_ref()
+            .map(|status| picker_status_wrapped_rows(status, status_inner_w))
+            .unwrap_or(0);
         let footer_h = 1;
         let height = body_rows
             .saturating_add(2)
@@ -454,15 +464,16 @@ impl App {
                 Paragraph::new(ratatui::text::Line::from(Span::styled(
                     status,
                     Style::default().fg(crate::tui::theme::MUTED_TEXT),
-                ))),
+                )))
+                .wrap(Wrap { trim: false }),
                 Rect {
                     x: inner.x,
                     y: row_y,
                     width: inner.width,
-                    height: 1,
+                    height: status_h.max(1),
                 },
             );
-            row_y = row_y.saturating_add(1);
+            row_y = row_y.saturating_add(status_h.max(1));
         }
         let body_height = inner
             .bottom()

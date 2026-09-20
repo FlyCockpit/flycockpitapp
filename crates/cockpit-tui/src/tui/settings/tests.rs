@@ -7745,9 +7745,6 @@ fn reset_with_partial_install_drops_uninstalled() {
     // Now only `claude` is on PATH; reset clears all then re-seeds
     // only the installed presets.
     d.command_installed = |cmd| cmd == "claude";
-    // Reset row sits two below the seed row; navigate from the current
-    // List page. n harnesses + [+ add] + [seed] = reset at n + 2.
-    let n = d.extended.harnesses.len();
     // Re-enter to reset cursor to a known position.
     enter_harnesses_from_root(&mut d);
     click_settings_action(

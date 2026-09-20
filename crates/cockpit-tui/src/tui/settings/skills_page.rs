@@ -31,7 +31,7 @@ use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker};
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 #[cfg(test)]
-use super::{Page, SettingsDialog, TestPageMut, TestPageRef};
+use super::{Page, SettingsDialog, TestPageRef};
 
 /// Number of leading toggle rows before the scan-dir list: row 0 is the
 /// auto-`!`-command toggle, row 1 is the ancestor-walk toggle.

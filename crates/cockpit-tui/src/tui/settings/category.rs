@@ -51,8 +51,8 @@ use super::reset::{ResetButton, ResetOutcome};
 use super::secret_display;
 use super::shell::{
     PointerOperationGate, PointerOperationId, SettingsPointerAction, SettingsPointerSurface,
-    SettingsPointerTarget, TextColumnLayout, heading_style, muted_style, push_label_text_field_row,
-    push_label_value_row, push_wrapped_text, selected_style, settings_text_columns, warning_style,
+    SettingsPointerTarget, TextColumnLayout, heading_style, muted_style, push_label_value_row,
+    push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
 use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelSelector};
 use cockpit_proto::Request;

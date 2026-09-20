@@ -709,7 +709,7 @@ fn shell_chrome_app(scene: &str) -> App {
         }
         "eight-row-composer" => {
             app.composer
-                .set("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+                .replace_buffer("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
         }
         "sandbox-unavailable" => {
             app.sandbox_down_notice = Some(super::SandboxDownNotice {
@@ -722,7 +722,7 @@ fn shell_chrome_app(scene: &str) -> App {
             app.open_composer_picker(ComposerControlKind::Effort);
         }
         "slash-three" => {
-            app.composer.set("/pi");
+            app.composer.replace_buffer("/pi");
             app.reset_slash_window();
             assert_eq!(app.slash_suggestions().len(), 3);
         }

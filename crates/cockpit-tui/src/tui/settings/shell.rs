@@ -136,12 +136,22 @@ pub(super) struct SettingsHelpRow<'a> {
     pub hover: Option<usize>,
 }
 
+pub(super) fn finish_help_row<'a>(
+    cx: &super::SettingsCx,
+    actions: Vec<SettingsHelpAction<'a>>,
+) -> SettingsHelpRow<'a> {
+    SettingsHelpRow {
+        actions,
+        hover: cx.pointer_surface.help_row_hover.get(),
+    }
+}
+
 pub(super) fn render_settings_help_row(
     frame: &mut Frame,
     area: Rect,
     help: &str,
     row: &SettingsHelpRow<'_>,
-) {
+) -> Vec<Rect> {
     let buttons: Vec<crate::tui::chrome::ActionButton<'_>> = row
         .actions
         .iter()
@@ -169,8 +179,10 @@ pub(super) fn render_settings_help_row(
             height: 1,
         },
     );
-    if !buttons.is_empty() {
-        crate::tui::chrome::render_action_bar(frame, area, &buttons, row.hover);
+    if buttons.is_empty() {
+        Vec::new()
+    } else {
+        crate::tui::chrome::render_action_bar(frame, area, &buttons, row.hover)
     }
 }
 
@@ -293,6 +305,8 @@ pub(super) struct SettingsPointerSurface {
     pub buttons: RefCell<ButtonRegistry>,
     pub rows: RefCell<RowControlRegistry>,
     pub surface_generation: std::cell::Cell<u64>,
+    pub help_row_hover: std::cell::Cell<Option<usize>>,
+    help_row_action_rects: RefCell<Vec<Rect>>,
 }
 
 impl Default for SettingsPointerSurface {
@@ -309,7 +323,19 @@ impl Default for SettingsPointerSurface {
             buttons: RefCell::new(ButtonRegistry::default()),
             rows: RefCell::new(RowControlRegistry::default()),
             surface_generation: std::cell::Cell::new(0),
+            help_row_hover: std::cell::Cell::new(None),
+            help_row_action_rects: RefCell::new(Vec::new()),
         }
+    }
+}
+
+impl SettingsPointerSurface {
+    pub(super) fn set_help_row_action_rects(&self, rects: Vec<Rect>) {
+        *self.help_row_action_rects.borrow_mut() = rects;
+    }
+
+    pub(super) fn help_row_action_at(&self, pos: ratatui::layout::Position) -> Option<usize> {
+        crate::tui::chrome::action_button_at(&self.help_row_action_rects.borrow(), pos)
     }
 }
 

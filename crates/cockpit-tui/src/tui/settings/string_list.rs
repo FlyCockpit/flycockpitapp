@@ -569,18 +569,6 @@ impl SettingsCx {
                 can_down,
                 (!can_down).then_some("already last"),
             )));
-            lines.push(Line::from("[Save]"));
-            controls.push(Some((
-                SettingsPointerAction::List(ListAction::Save),
-                true,
-                None,
-            )));
-            lines.push(Line::from("[Cancel]"));
-            controls.push(Some((
-                SettingsPointerAction::List(ListAction::Cancel),
-                true,
-                None,
-            )));
             lines.push(grab::grab_hint_line(grab::GRAB_HINT));
             controls.push(None);
         }
@@ -737,6 +725,29 @@ impl SettingsPage for StringListPage {
             cockpit_core::welcome::display_path(&cx.config_path),
             self.crumb()
         )
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{ListAction, SettingsPointerAction};
+        let actions = if self.grabbed.is_some() {
+            vec![
+                super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::List(ListAction::Save),
+                },
+                super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::List(ListAction::Cancel),
+                },
+            ]
+        } else {
+            Vec::new()
+        };
+        super::shell::finish_help_row(cx, actions)
     }
 
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {

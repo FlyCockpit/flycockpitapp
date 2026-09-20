@@ -1474,7 +1474,7 @@ fn render_resize_blocker(frame: &mut Frame, area: Rect) {
     ];
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" Resize "))
+            .block(crate::tui::chrome::rounded_block(" Resize ", false))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1495,9 +1495,7 @@ fn render_sidecar_page(
         return;
     }
     let content = sidecar_layout(frame, area, mode);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "));
+    let block = crate::tui::chrome::rounded_block(format!(" {title} "), false);
     let inner = block.inner(content);
     frame.render_widget(block, content);
     let mut lines = Vec::with_capacity(rows.len());

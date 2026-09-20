@@ -808,14 +808,14 @@ impl SettingsEditor {
         self.field_count()
     }
 
-    /// Total selectable rows: the fields plus the `[save changes]` row.
+    /// Total selectable rows: editable fields only (save is on the help row).
     fn row_count(&self) -> usize {
-        self.field_count() + 1
+        self.field_count()
     }
 
-    /// True when the cursor is on the `[save changes]` row (not a field).
+    /// Deprecated list-row save cursor; save uses the help-row ActionBar.
     pub(super) fn on_save_row(&self) -> bool {
-        self.cursor == self.save_idx()
+        false
     }
 
     /// The field at a row index (clamped to the last on overflow).
@@ -1733,9 +1733,6 @@ impl SettingsEditor {
                 SettingsResult::Stay
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.on_save_row() {
-                    return SettingsResult::Save;
-                }
                 let field = self.field_at(self.cursor);
                 if field == ProviderSettingId::TrustPolicy
                     && matches!(self.scope, SettingsScope::Provider)

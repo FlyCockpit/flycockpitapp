@@ -258,13 +258,10 @@ impl SettingsPage for DependenciesPage {
             (content_rows.saturating_sub(inner_height as usize)).min(u16::MAX as usize) as u16;
         self.max_scroll.set(max_scroll);
         let scroll = self.scroll.min(max_scroll);
+        use crate::tui::chrome::rounded_block;
         frame.render_widget(
             Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Dependencies "),
-                )
+                .block(rounded_block(" Dependencies ", false))
                 .wrap(Wrap { trim: false })
                 .scroll((scroll, 0)),
             area,

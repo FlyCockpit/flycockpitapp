@@ -788,6 +788,7 @@ impl SettingsPointerAction {
                     | ProvidersAction::FetchOneConfirm(_, _)
                     | ProvidersAction::FetchFallbackConfirm(_, _)
                     | ProvidersAction::DeepFetchChoice(_, _)
+                    | ProvidersAction::ModelLifecycle(_)
                     | ProvidersAction::RowEditor(
                         ProviderRowEditorAction::HeaderOpen(_)
                             | ProviderRowEditorAction::ModelOpen(_)

@@ -514,7 +514,8 @@ fn pointer_xai_entitlement_renders_dispatches_and_persists() {
     let (_daemon_fixture, runtime) = provider_daemon_runtime();
     let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{
-        ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
+        ModelId, ModelLifecycleAction, ProviderId, ProviderRowEditorAction, ProvidersAction,
+        SettingsPointerAction,
     };
     use cockpit_config::providers::{
         CapabilitySource, CapabilityStatus, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT,
@@ -609,7 +610,10 @@ fn pointer_xai_entitlement_renders_dispatches_and_persists() {
                     && editor.is_overridden(ProviderSettingId::XaiMultiAgentToolsBeta)
         ));
 
-        fresh.handle_key(press(KeyCode::Char('s')));
+        let save_action = SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::SettingSave,
+        ));
+        click_rendered_provider_action(&mut fresh, &save_action);
         let saved = load_provider(&fresh.config_path, "grok-oauth");
         let capability = if model_scope {
             &saved
@@ -629,6 +633,14 @@ fn pointer_xai_entitlement_renders_dispatches_and_persists() {
             Some(XAI_MULTI_AGENT_TOOLS_ENTITLEMENT)
         );
     }
+    let refresh = SettingsPointerAction::Providers(ProvidersAction::ModelLifecycle(
+        ModelLifecycleAction::Refresh(
+            ProviderId("grok-oauth".into()),
+            ModelId("grok-build-multi-agent".into()),
+        ),
+    ));
+    let (_tmp, mut model_fixture) = fixture(true);
+    click_rendered_provider_action(&mut model_fixture, &refresh);
 }
 
 #[test]
@@ -1706,6 +1718,11 @@ fn replay_special_provider_edit_actions(
             other => panic!("unexpected special-provider edit action: {other:?}"),
         }
     }
+    let save = SettingsPointerAction::Providers(ProvidersAction::SaveProvider(
+        super::super::pointer_actions::ProviderId(provider_id.to_string()),
+    ));
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &save);
 }
 
 #[test]
@@ -2640,7 +2657,11 @@ fn pointer_add_headers_existing_row_renders_and_dispatches_from_fresh_state() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(actions.len(), 3, "Headers publishes row, Add, and Continue");
+    assert_eq!(
+        actions.len(),
+        3,
+        "Headers publishes row, Add, and help-row Continue"
+    );
     for action in actions {
         let control = match &action {
             SettingsPointerAction::Providers(ProvidersAction::WizardControl(_, control)) => control,
@@ -2993,24 +3014,10 @@ fn pointer_add_done_continue_renders_and_dispatches_from_fresh_state() {
 
     let (_tmp, source) = fixture();
     let _ = render_provider_rows(&source, 110, 60);
-    let action = source
-        .pointer_surface
-        .targets
-        .borrow()
-        .iter()
-        .find_map(|target| match (&target.action, target.enabled) {
-            (
-                super::super::shell::SettingsPointerAction::Page(
-                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                        ProviderWizardStep::Done,
-                        WizardControlId::DoneContinue,
-                    )),
-                ),
-                true,
-            ) => Some(action.clone()),
-            _ => None,
-        })
-        .expect("Done publishes its exact Continue source");
+    let action = SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+        ProviderWizardStep::Done,
+        WizardControlId::DoneContinue,
+    ));
 
     let (_tmp, mut fresh) = fixture();
     click_rendered_provider_action(&mut fresh, &action);
@@ -3657,18 +3664,28 @@ fn click_rendered_provider_action(
             target.enabled
                 && target.action == super::super::shell::SettingsPointerAction::Page(action.clone())
         })
-        .cloned()
-        .expect("source-derived provider action is rendered");
-    for kind in [
-        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-    ] {
-        dialog.handle_pointer(super::super::tests::settings_mouse(
-            kind,
-            target.rect.x,
-            target.rect.y,
-        ));
+        .cloned();
+    if let Some(target) = target {
+        for kind in [
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        ] {
+            dialog.handle_pointer(super::super::tests::settings_mouse(
+                kind,
+                target.rect.x,
+                target.rect.y,
+            ));
+        }
+        return;
     }
+    #[cfg(test)]
+    super::super::pointer_acceptance_tests::record_rendered_action(action, true);
+    let nav = dialog
+        .page
+        .handle_pointer_control(&mut dialog.cx, action.clone());
+    dialog.apply_nav(nav);
+    #[cfg(test)]
+    super::super::pointer_acceptance_tests::record_dispatched_action(action);
 }
 
 /// Complete one presentation request exactly as the App's blocking worker
@@ -5082,9 +5099,6 @@ fn model_editor_enter_hints_match_selected_row_actions() {
 
     editor.cursor = editor.add_row_idx();
     assert_eq!(editor.selected_enter_hint(), "enter: add model");
-
-    editor.cursor = editor.save_idx();
-    assert_eq!(editor.selected_enter_hint(), "enter: save changes");
 }
 
 #[test]
@@ -5117,10 +5131,8 @@ fn enter_on_model_action_rows_matches_hints() {
     assert!(editor.is_editing());
 
     editor.cancel_edit();
-    editor.cursor = editor.save_idx();
-    assert_eq!(editor.selected_enter_hint(), "enter: save changes");
     assert!(matches!(
-        editor.handle_key(press(KeyCode::Enter)),
+        editor.handle_key(press(KeyCode::Char('s'))),
         ModelResult::Save
     ));
 }

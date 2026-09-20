@@ -715,31 +715,6 @@ impl SettingsCx {
                     enabled: true,
                     disabled_reason: None,
                 });
-            let action_line = lines.len();
-            lines.push(Line::from(vec![
-                Span::styled("[Save]", selected_style()),
-                Span::raw("  "),
-                Span::styled("[Cancel]", selected_style()),
-            ]));
-            for (action, x, width) in [
-                (super::pointer_actions::HarnessesAction::Save, 0, 6),
-                (super::pointer_actions::HarnessesAction::Cancel, 8, 8),
-            ] {
-                self.pointer_surface
-                    .register(super::shell::SettingsPointerTarget {
-                        rect: Rect::new(
-                            area.x + x,
-                            area.y.saturating_add(action_line as u16),
-                            width,
-                            1,
-                        ),
-                        action: super::shell::SettingsPointerAction::Page(
-                            super::pointer_actions::SettingsPointerAction::Harnesses(action),
-                        ),
-                        enabled: true,
-                        disabled_reason: None,
-                    });
-            }
         }
         if let Some(status) = &s.status {
             lines.push(Line::default());
@@ -1018,12 +993,33 @@ impl SettingsPage for HarnessesPage {
         }
     }
 
-    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
         use super::pointer_actions::{HarnessesAction, SettingsPointerAction};
         let HarnessesPage::List(state) = self else {
+            if let HarnessesPage::Edit(s) = self
+                && s.editing.is_some()
+            {
+                return super::shell::finish_help_row(
+                    cx,
+                    vec![
+                        super::shell::SettingsHelpAction {
+                            label: "Save",
+                            enabled: true,
+                            primary: true,
+                            action: SettingsPointerAction::Harnesses(HarnessesAction::Save),
+                        },
+                        super::shell::SettingsHelpAction {
+                            label: "Cancel",
+                            enabled: true,
+                            primary: false,
+                            action: SettingsPointerAction::Harnesses(HarnessesAction::Cancel),
+                        },
+                    ],
+                );
+            }
             return super::shell::SettingsHelpRow {
                 actions: Vec::new(),
-                hover: None,
+                hover: cx.pointer_surface.help_row_hover.get(),
             };
         };
         let label = if state.reset.is_pending() {
@@ -1038,7 +1034,7 @@ impl SettingsPage for HarnessesPage {
                 primary: false,
                 action: SettingsPointerAction::Harnesses(HarnessesAction::ResetAndSeedPresets),
             }],
-            hover: None,
+            hover: cx.pointer_surface.help_row_hover.get(),
         }
     }
 

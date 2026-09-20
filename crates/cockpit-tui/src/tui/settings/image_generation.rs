@@ -924,7 +924,7 @@ fn generation_layout(frame: &mut Frame, area: Rect, mode: GenerationViewportMode
                 Line::from("No secret, provider URL,"),
                 Line::from("or host path is rendered."),
             ])
-            .block(Block::default().borders(Borders::ALL).title(" Context "))
+            .block(crate::tui::chrome::rounded_block(" Context ", false))
             .wrap(Wrap { trim: false });
             frame.render_widget(info, cols[1]);
             cols[0]
@@ -964,9 +964,7 @@ fn render_generation_page(
         return;
     }
     let content = generation_layout(frame, area, mode);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "));
+    let block = crate::tui::chrome::rounded_block(format!(" {title} "), false);
     let inner = block.inner(content);
     frame.render_widget(block, content);
     let mut lines = Vec::with_capacity(rows.len());
@@ -2162,7 +2160,7 @@ fn render_resize_blocker(frame: &mut Frame, area: Rect) {
     ];
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" Resize "))
+            .block(crate::tui::chrome::rounded_block(" Resize ", false))
             .wrap(Wrap { trim: false }),
         area,
     );

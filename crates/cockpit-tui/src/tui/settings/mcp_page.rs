@@ -152,8 +152,7 @@ const FIELD_OAUTH_SCOPES: usize = 14;
 const FIELD_CACHE_TTL: usize = 15;
 const FIELD_CONNECT_TIMEOUT: usize = 16;
 const FIELD_REQUEST_TIMEOUT: usize = 17;
-const FIELD_SAVE: usize = 18;
-const ADD_FIELDS: usize = 19;
+const ADD_FIELDS: usize = 18;
 
 macro_rules! push_pointer_text_field {
     ($bindings:expr, $id:expr, $($args:expr),+ $(,)?) => {{
@@ -183,7 +182,6 @@ fn mcp_add_action(index: usize) -> super::pointer_actions::McpAction {
         FIELD_CACHE_TTL => McpAction::EditCacheTtl,
         FIELD_CONNECT_TIMEOUT => McpAction::EditConnectTimeout,
         FIELD_REQUEST_TIMEOUT => McpAction::EditRequestTimeout,
-        FIELD_SAVE => McpAction::Save,
         _ => unreachable!("sealed MCP add field index"),
     }
 }
@@ -209,7 +207,7 @@ fn mcp_add_index(action: &super::pointer_actions::McpAction) -> Option<usize> {
         McpAction::EditCacheTtl => FIELD_CACHE_TTL,
         McpAction::EditConnectTimeout => FIELD_CONNECT_TIMEOUT,
         McpAction::EditRequestTimeout => FIELD_REQUEST_TIMEOUT,
-        McpAction::Save => FIELD_SAVE,
+        McpAction::Save => return None,
         McpAction::Cancel
         | McpAction::Open(_)
         | McpAction::Add
@@ -785,9 +783,9 @@ impl SettingsCx {
                     }
                 }
                 FIELD_AUTH => s.auth = s.auth.cycle_for_transport(s.transport),
-                FIELD_SAVE => return self.commit_add(s),
                 _ => s.cursor = crate::tui::nav::wrap_next(s.cursor, ADD_FIELDS),
             },
+            KeyCode::Char('s') if !editing_text => return self.commit_add(s),
             KeyCode::Char(' ') if s.cursor == FIELD_ENABLED => s.enabled = !s.enabled,
             KeyCode::Char(' ') if s.cursor == FIELD_TRANSPORT => {
                 s.transport = cycle_transport(s.transport);
@@ -1231,8 +1229,7 @@ impl SettingsCx {
             s.cursor == FIELD_REQUEST_TIMEOUT,
             Some("seconds, remote"),
         );
-        bindings.push((lines.len(), mcp_add_action(FIELD_SAVE)));
-        lines.push(save_button_line("[ save ]", s.cursor == FIELD_SAVE));
+        bindings.push((lines.len(), mcp_add_action(FIELD_REQUEST_TIMEOUT)));
         if !s.auth.is_compatible(s.transport) {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -1277,6 +1274,11 @@ fn cycle_transport(t: Transport) -> Transport {
 }
 
 impl AddState {
+    #[cfg(test)]
+    pub(super) fn golden_fixture() -> Self {
+        Self::new()
+    }
+
     fn new() -> Self {
         Self {
             original_name: None,
@@ -1682,6 +1684,11 @@ impl SettingsPage for McpPage {
         let super::pointer_actions::SettingsPointerAction::Mcp(action) = action else {
             return Nav::Stay;
         };
+        if let McpPage::Add(s) = self
+            && matches!(action, super::pointer_actions::McpAction::Save)
+        {
+            return cx.commit_add(s);
+        }
         if let McpPage::List(state) = self {
             let key = match &action {
                 super::pointer_actions::McpAction::Cancel if state.delete_pending => {
@@ -1818,6 +1825,20 @@ impl SettingsPage for McpPage {
         if let McpPage::List(state) = self {
             state.delete_pending = false;
         }
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{McpAction, SettingsPointerAction};
+        let actions = match self {
+            McpPage::Add(_) => vec![super::shell::SettingsHelpAction {
+                label: "save",
+                enabled: true,
+                primary: true,
+                action: SettingsPointerAction::Mcp(McpAction::Save),
+            }],
+            _ => Vec::new(),
+        };
+        super::shell::finish_help_row(cx, actions)
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

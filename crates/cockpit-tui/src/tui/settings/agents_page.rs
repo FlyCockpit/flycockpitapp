@@ -4024,15 +4024,12 @@ impl SettingsCx {
         // The in-TUI editor takes the whole page area when open.
         if let Some(editor) = &p.editing {
             editor.render(frame, area);
-            let action_y = area.bottom().saturating_sub(1);
-            let agent = editor.authority_id.clone();
-            let confirming = p.external_edit_confirmation.as_ref() == Some(&agent);
-            if !confirming && area.width > 4 && area.height > 3 {
+            if p.external_edit_confirmation.is_none() && area.width > 4 && area.height > 3 {
                 let editor_body = Rect::new(
                     area.x.saturating_add(2),
                     area.y.saturating_add(1),
                     area.width.saturating_sub(4),
-                    area.height.saturating_sub(3),
+                    area.height.saturating_sub(2),
                 );
                 p.editor_body.set(Some(editor_body));
                 self.pointer_surface
@@ -4040,121 +4037,19 @@ impl SettingsCx {
                         rect: editor_body,
                         action: super::shell::SettingsPointerAction::Page(
                             super::pointer_actions::SettingsPointerAction::Agents(
-                                super::pointer_actions::AgentsAction::EditText(agent.clone()),
+                                super::pointer_actions::AgentsAction::EditText(
+                                    editor.authority_id.clone(),
+                                ),
                             ),
                         ),
                         enabled: true,
                         disabled_reason: None,
                     });
             }
-            let assistant_editor = editor.is_assistant_definition();
-            let actions = if confirming && !assistant_editor {
-                vec![
-                    (
-                        super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
-                        0,
-                        17,
-                    ),
-                    (
-                        super::pointer_actions::AgentsAction::Cancel(agent.clone()),
-                        19,
-                        8,
-                    ),
-                ]
-            } else if assistant_editor {
-                vec![
-                    (
-                        super::pointer_actions::AgentsAction::Save(agent.clone()),
-                        0,
-                        6u16,
-                    ),
-                    (
-                        super::pointer_actions::AgentsAction::Cancel(agent.clone()),
-                        8u16,
-                        8u16,
-                    ),
-                ]
-            } else {
-                vec![
-                    (
-                        super::pointer_actions::AgentsAction::Save(agent.clone()),
-                        0,
-                        6u16,
-                    ),
-                    (
-                        super::pointer_actions::AgentsAction::Cancel(agent.clone()),
-                        8u16,
-                        8u16,
-                    ),
-                    (
-                        super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
-                        18u16,
-                        17u16,
-                    ),
-                ]
-            };
-            for (action, x, width) in actions {
-                if x.saturating_add(width) > area.width {
-                    continue;
-                }
-                self.pointer_surface
-                    .register(super::shell::SettingsPointerTarget {
-                        rect: Rect::new(area.x + x, action_y, width, 1),
-                        action: super::shell::SettingsPointerAction::Page(
-                            super::pointer_actions::SettingsPointerAction::Agents(action),
-                        ),
-                        enabled: true,
-                        disabled_reason: None,
-                    });
-            }
-            frame.render_widget(
-                if confirming && !assistant_editor {
-                    Line::from("[Open in $EDITOR]  [Cancel]")
-                } else if assistant_editor {
-                    Line::from("[Save]  [Cancel]")
-                } else {
-                    Line::from("[Save]  [Cancel]  [Open in $EDITOR]")
-                },
-                Rect::new(area.x, action_y, area.width, 1),
-            );
             return;
         }
         if let Some(detail) = &p.detail {
-            let action_y = area.bottom().saturating_sub(1);
-            let detail_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
-            self.render_agent_detail(frame, detail_area, detail);
-            let agent = row_agent_id(&detail.name, &detail.source);
-            for (action, x, width) in [
-                (
-                    super::pointer_actions::AgentsAction::OpenRawEditor(agent.clone()),
-                    0,
-                    15,
-                ),
-                (
-                    super::pointer_actions::AgentsAction::Save(agent.clone()),
-                    17,
-                    6,
-                ),
-            ] {
-                self.pointer_surface
-                    .register(super::shell::SettingsPointerTarget {
-                        rect: Rect::new(
-                            area.x + x,
-                            action_y,
-                            width.min(area.width.saturating_sub(x)),
-                            1,
-                        ),
-                        action: super::shell::SettingsPointerAction::Page(
-                            super::pointer_actions::SettingsPointerAction::Agents(action),
-                        ),
-                        enabled: x < area.width,
-                        disabled_reason: (x >= area.width).then_some("control is clipped"),
-                    });
-            }
-            frame.render_widget(
-                Line::from("[Edit raw file]  [Save]"),
-                Rect::new(area.x, action_y, area.width, 1),
-            );
+            self.render_agent_detail(frame, area, detail);
             return;
         }
 
@@ -4293,14 +4188,6 @@ impl SettingsCx {
                         None,
                     )));
                 }
-                lines.push(Line::from("[Reset all]"));
-                controls.push(Some((
-                    super::pointer_actions::SettingsPointerAction::Agents(
-                        super::pointer_actions::AgentsAction::ResetAll,
-                    ),
-                    true,
-                    None,
-                )));
             }
         }
 
@@ -4780,6 +4667,69 @@ impl SettingsPage for AgentsPage {
         // editor effect owns a daemon lease, recovery draft and correlation
         // ID; it must survive resize/redraw and settle through its explicit
         // completion callback.
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{AgentsAction, SettingsPointerAction};
+        let mut actions = Vec::new();
+        if let Some(editor) = &self.editing {
+            let agent = editor.authority_id.clone();
+            let confirming = self.external_edit_confirmation.as_ref() == Some(&agent);
+            if confirming && !editor.is_assistant_definition() {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Open in $EDITOR",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Agents(AgentsAction::ExternalEditBegin(
+                        agent.clone(),
+                    )),
+                });
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Agents(AgentsAction::Cancel(agent)),
+                });
+            } else {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Agents(AgentsAction::Save(agent.clone())),
+                });
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Agents(AgentsAction::Cancel(agent.clone())),
+                });
+                if !editor.is_assistant_definition() {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: "Open in $EDITOR",
+                        enabled: true,
+                        primary: false,
+                        action: SettingsPointerAction::Agents(AgentsAction::ExternalEditBegin(
+                            agent,
+                        )),
+                    });
+                }
+            }
+        } else if let Some(detail) = &self.detail {
+            let agent = row_agent_id(&detail.name, &detail.source);
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Edit raw file",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Agents(AgentsAction::OpenRawEditor(agent.clone())),
+            });
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Save",
+                enabled: true,
+                primary: true,
+                action: SettingsPointerAction::Agents(AgentsAction::Save(agent)),
+            });
+        }
+        super::shell::finish_help_row(cx, actions)
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
@@ -6027,18 +5977,24 @@ pub(super) mod tests {
                             == super::super::shell::SettingsPointerAction::Page(action.clone())
                 })
                 .cloned()
-                .expect("stable agent action rerenders from its fresh selected source")
         };
-        for kind in [
-            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        ] {
-            dialog.handle_pointer(super::super::tests::settings_mouse(
-                kind,
-                target.rect.x,
-                target.rect.y,
-            ));
+        if let Some(target) = target {
+            for kind in [
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            ] {
+                dialog.handle_pointer(super::super::tests::settings_mouse(
+                    kind,
+                    target.rect.x,
+                    target.rect.y,
+                ));
+            }
+            return;
         }
+        let nav = dialog
+            .page
+            .handle_pointer_control(&mut dialog.cx, action.clone());
+        dialog.apply_nav(nav);
     }
 
     /// External editor completion travels through a private staging read and

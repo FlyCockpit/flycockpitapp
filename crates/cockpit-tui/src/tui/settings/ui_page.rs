@@ -919,8 +919,6 @@ fn render_grab_list(
                 can_down,
                 "already last",
             ),
-            (ListAction::Save, "[Save]", true, ""),
-            (ListAction::Cancel, "[Cancel]", true, ""),
         ] {
             lines.push(Line::from(label));
             controls.push(Some((
@@ -1093,6 +1091,29 @@ impl SettingsPage for InstructionsPage {
                 .min(cx.extended.agent_guidance_files.len());
         }
         Nav::Stay
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{ListAction, SettingsPointerAction};
+        let actions = if self.grabbed.is_some() {
+            vec![
+                super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::List(ListAction::Save),
+                },
+                super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::List(ListAction::Cancel),
+                },
+            ]
+        } else {
+            Vec::new()
+        };
+        super::shell::finish_help_row(cx, actions)
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

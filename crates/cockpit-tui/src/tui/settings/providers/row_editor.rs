@@ -109,7 +109,7 @@ pub(in crate::tui::settings) trait RowListEditor {
                 self.begin_add();
                 Self::stay_result()
             }
-            KeyCode::Char('s') if self.save_idx().is_some() => self.handle_save_shortcut(),
+            KeyCode::Char('s') => self.handle_save_shortcut(),
             KeyCode::Char('d') | KeyCode::Delete => self.handle_delete_key(),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.handle_activate_key(),
             _ => {
@@ -282,23 +282,15 @@ impl RowListEditor for HeaderEditor {
         self.rows.remove(index);
     }
 
-    /// The `[continue ->]` row index (Add wizard only).
+    /// Synthetic continue row index (Add wizard only; help-row ActionBar owns the label).
     fn continue_idx(&self) -> Option<usize> {
-        if self.show_continue {
-            Some(self.n_rows() + 1)
-        } else {
-            None
-        }
+        self.show_continue
+            .then(|| self.add_row_idx().saturating_add(1))
     }
 
-    /// The `[save changes]` row index (Edit-page sub-page only - mutually
-    /// exclusive with `[continue ->]`, which only the Add wizard shows).
+    /// Save lives on the dialog help-row ActionBar (`s` / pointer still work).
     fn save_idx(&self) -> Option<usize> {
-        if self.show_continue {
-            None
-        } else {
-            Some(self.n_rows() + 1)
-        }
+        None
     }
 
     fn start_add(&mut self) {
@@ -558,10 +550,9 @@ impl RowListEditor for ModelEditor {
         self.rows.remove(index);
     }
 
-    /// The `[save changes]` row index (always present - the Models page is only
-    /// reached from the provider Edit page).
+    /// Save lives on the dialog help-row ActionBar (`s` / pointer still work).
     fn save_idx(&self) -> Option<usize> {
-        Some(self.n_rows() + 1)
+        None
     }
 
     fn start_add(&mut self) {
@@ -773,8 +764,8 @@ impl ModelEditor {
         <Self as RowListEditor>::add_row_idx(self)
     }
 
-    pub(in crate::tui::settings) fn save_idx(&self) -> usize {
-        <Self as RowListEditor>::save_idx(self).expect("model editor has a save row")
+    pub(in crate::tui::settings) fn save_idx(&self) -> Option<usize> {
+        None
     }
 
     pub(in crate::tui::settings) fn selected_enter_hint(&self) -> &'static str {
@@ -786,8 +777,6 @@ impl ModelEditor {
             }
         } else if self.cursor == self.add_row_idx() {
             "enter: add model"
-        } else if self.cursor == self.save_idx() {
-            "enter: save changes"
         } else {
             "enter: settings"
         }

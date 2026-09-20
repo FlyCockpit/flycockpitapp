@@ -126,7 +126,6 @@ pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec
         EditAction::Refetch,
         EditAction::DeepFetch,
         EditAction::Delete,
-        EditAction::Save,
         EditAction::Back,
     ]);
     actions
@@ -3933,37 +3932,8 @@ impl SettingsCx {
                 ));
             }
             Some("saving" | "fetching" | "test-key") => {
-                let provider_id = s.id_field.text();
-                let (title, subtitle) = crate::tui::onboarding::provider_verify_copy(
-                    provider_id,
-                    !s.is_step("test-key") || s.fetch.is_some(),
-                );
-                lines.push(Line::from(Span::styled(
-                    title.to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(Span::styled(subtitle, muted)));
-                lines.push(Line::from(Span::styled(
-                    if s.is_step("saving") {
-                        "Saving config…"
-                    } else if s.is_step("test-key") {
-                        "Testing key…"
-                    } else {
-                        "Fetching /models…"
-                    }
-                    .to_string(),
-                    yellow,
-                )));
-                if s.is_step("test-key") && s.fetch.is_none() {
-                    lines.push(Line::from(Span::styled(
-                        if s.fallback_offer.is_some() {
-                            "Validation failed. o: persist fallback catalog offline  r: retry  m: manual model  esc: options"
-                        } else {
-                            "Validation failed. r: retry  m: manual model  esc: back/defer/cancel (offline needs an existing fallback catalog)"
-                        },
-                        muted,
-                    )));
-                }
+                self.render_add_verify_step(frame, area, s);
+                return;
             }
             Some("done") | None => {
                 lines.push(Line::from(Span::styled(
@@ -3972,7 +3942,6 @@ impl SettingsCx {
                 )));
                 if s.is_step("done") {
                     controls.push((lines.len(), 0));
-                    lines.push(Line::from("[Continue]"));
                 }
             }
             Some(other) => {
@@ -4032,6 +4001,57 @@ impl SettingsCx {
         if s.is_step("headers") && s.headers.is_editing() {
             render_header_edit_popup(self, frame, area, &s.headers);
         }
+    }
+
+    fn render_add_verify_step(&self, frame: &mut Frame, area: Rect, s: &AddState) {
+        use crate::tui::onboarding::{VerifyOutcome, VerifyPhase, VerifyScreen};
+        use ratatui::layout::{Constraint, Layout};
+
+        let provider_id = s
+            .saved_provider_id
+            .as_deref()
+            .unwrap_or(s.id_field.text())
+            .to_string();
+        let mut screen = VerifyScreen::new(provider_id);
+        if s.fetch.is_none() {
+            if s.is_step("test-key")
+                && let Some(reason) = &s.validation_failure
+            {
+                screen.apply(VerifyOutcome::Network(reason.clone()), None);
+            } else if s.is_step("done") {
+                screen.apply(VerifyOutcome::NoEndpoint, None);
+            }
+        }
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let title_color = match screen.phase() {
+            VerifyPhase::Success(_) | VerifyPhase::NoEndpoint => {
+                resolve_color(crate::tui::theme::GOOD, crate::tui::theme::GOOD_INDEX)
+            }
+            VerifyPhase::Error(_) => {
+                resolve_color(crate::tui::theme::BAD, crate::tui::theme::RED_INDEX)
+            }
+            VerifyPhase::Fetching => resolve_color(INK, INK_INDEX),
+        };
+        let layout = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(area);
+        frame.render_widget(
+            Line::from(Span::styled(
+                screen.title().to_string(),
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            layout[0],
+        );
+        frame.render_widget(
+            Line::from(Span::styled(screen.subtitle(), muted)),
+            layout[1],
+        );
+        screen.render(frame, layout[2]);
     }
 
     fn render_add_api_key_step(&self, frame: &mut Frame, area: Rect, s: &AddState) {
@@ -4206,7 +4226,6 @@ impl SettingsCx {
             let selected = idx == s.cursor;
             bindings.push((lines.len(), provider_edit_pointer_action(s, *action)));
             if *action == EditAction::Save {
-                lines.push(save_button_line("[save changes]", selected));
                 continue;
             }
             let (label, value) = row(*action);
@@ -4544,17 +4563,6 @@ impl SettingsCx {
             ));
             lines.push(Line::from(spans));
         }
-
-        // `[save changes]` row, styled like MCP Add's button.
-        bindings.push((
-            lines.len(),
-            super::pointer_actions::SettingsPointerAction::Providers(
-                super::pointer_actions::ProvidersAction::RowEditor(
-                    super::pointer_actions::ProviderRowEditorAction::SettingSave,
-                ),
-            ),
-        ));
-        lines.push(save_button_line("[save changes]", editor.on_save_row()));
 
         if let (Some(_), super::settings_editor::SettingsScope::Model { model_id }) =
             (editor.multimodal(), &editor.scope)
@@ -5101,27 +5109,6 @@ fn render_header_editor(
         Span::styled("[+ add header]".to_string(), add_style),
     ]));
 
-    if let Some(cont_idx) = h.continue_idx() {
-        let cont_cursor = h.cursor == cont_idx;
-        let marker = if cont_cursor { "  › " } else { "    " };
-        let style = if cont_cursor {
-            yellow.add_modifier(Modifier::BOLD)
-        } else {
-            muted
-        };
-        bindings.push((lines.len(), SettingsControlId(cont_idx as u64)));
-        lines.push(Line::from(vec![
-            Span::raw(marker.to_string()),
-            Span::styled("[continue → save & fetch /models]".to_string(), style),
-        ]));
-    }
-
-    // `[save changes]` row on the Edit-page sub-page (mutually exclusive
-    // with `[continue →]`). Styled like MCP Add's button.
-    if let Some(save_idx) = h.save_idx() {
-        bindings.push((lines.len(), SettingsControlId(save_idx as u64)));
-        lines.push(save_button_line("[save changes]", h.cursor == save_idx));
-    }
     if let Some(status) = &h.status {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(status.clone(), yellow)));
@@ -5140,8 +5127,6 @@ fn provider_header_pointer_action(
         ProviderRowEditorAction::HeaderOpen(HeaderName(row.name.clone()))
     } else if index == editor.add_row_idx() {
         ProviderRowEditorAction::HeaderAdd
-    } else if editor.save_idx() == Some(index) {
-        ProviderRowEditorAction::HeaderSave
     } else {
         return None;
     };
@@ -5324,9 +5309,6 @@ fn render_model_editor(
         Span::styled("[+ add model]".to_string(), add_style),
     ]));
 
-    // `[save changes]` row, styled like MCP Add's button.
-    bindings.push((lines.len(), SettingsControlId(m.save_idx() as u64)));
-    lines.push(save_button_line("[save changes]", m.cursor == m.save_idx()));
     bindings
 }
 
@@ -5341,8 +5323,6 @@ fn provider_model_pointer_action(
         ProviderRowEditorAction::ModelOpen(ModelId(row.id.clone()))
     } else if index == editor.add_row_idx() {
         ProviderRowEditorAction::ModelAdd
-    } else if index == editor.save_idx() {
-        ProviderRowEditorAction::ModelSave
     } else {
         return None;
     };
@@ -6037,6 +6017,12 @@ impl SettingsPage for ProvidersPage {
             }
         }
         let index = match (&*self, &provider_action) {
+            (ProvidersPage::Edit(_), super::pointer_actions::ProvidersAction::SaveProvider(_)) => {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                    self,
+                );
+            }
             (ProvidersPage::List { .. }, super::pointer_actions::ProvidersAction::RefetchAll) => 0,
             (ProvidersPage::List { .. }, super::pointer_actions::ProvidersAction::Open(id)) => {
                 let Some(index) = cx
@@ -6075,10 +6061,10 @@ impl SettingsPage for ProvidersPage {
                 }
                 super::pointer_actions::ProviderRowEditorAction::HeaderAdd => editor.add_row_idx(),
                 super::pointer_actions::ProviderRowEditorAction::HeaderSave => {
-                    let Some(index) = editor.save_idx() else {
-                        return Nav::Stay;
-                    };
-                    index
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                        self,
+                    );
                 }
                 _ => return Nav::Stay,
             },
@@ -6093,7 +6079,12 @@ impl SettingsPage for ProvidersPage {
                     index
                 }
                 super::pointer_actions::ProviderRowEditorAction::ModelAdd => editor.add_row_idx(),
-                super::pointer_actions::ProviderRowEditorAction::ModelSave => editor.save_idx(),
+                super::pointer_actions::ProviderRowEditorAction::ModelSave => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
                 _ => return Nav::Stay,
             },
             (
@@ -6108,7 +6099,10 @@ impl SettingsPage for ProvidersPage {
                     index
                 }
                 super::pointer_actions::ProviderRowEditorAction::SettingSave => {
-                    editor.fields().len()
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                        self,
+                    );
                 }
                 _ => return Nav::Stay,
             },
@@ -6198,17 +6192,12 @@ impl SettingsPage for ProvidersPage {
                 editor.cursor = index;
             }
             ProvidersPage::Headers { editor, .. }
-                if !editor.is_editing()
-                    && index
-                        <= editor
-                            .save_idx()
-                            .or_else(|| editor.continue_idx())
-                            .unwrap_or_else(|| editor.add_row_idx()) =>
+                if !editor.is_editing() && index <= editor.add_row_idx() =>
             {
                 editor.cursor = index;
             }
             ProvidersPage::Models { editor, .. }
-                if !editor.is_editing() && index <= editor.save_idx() =>
+                if !editor.is_editing() && index <= editor.add_row_idx() =>
             {
                 editor.cursor = index;
             }
@@ -6392,10 +6381,7 @@ impl SettingsPage for ProvidersPage {
             && let ProvidersPage::Headers { editor, .. } = self
             && !editor.is_editing()
         {
-            let last = editor
-                .save_idx()
-                .or_else(|| editor.continue_idx())
-                .unwrap_or_else(|| editor.add_row_idx());
+            let last = editor.add_row_idx();
             editor.cursor = editor.cursor.saturating_add_signed(delta).min(last);
         } else if region == SettingsScrollRegionId("providers:models")
             && let ProvidersPage::Models { editor, .. } = self
@@ -6404,7 +6390,7 @@ impl SettingsPage for ProvidersPage {
             editor.cursor = editor
                 .cursor
                 .saturating_add_signed(delta)
-                .min(editor.save_idx());
+                .min(editor.add_row_idx());
         } else {
             match self {
                 ProvidersPage::FetchAll(state)
@@ -6658,6 +6644,126 @@ impl SettingsPage for ProvidersPage {
                 oauth_help_legend(OAuthHost::Standalone, state)
             }
         }
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{
+            ProviderId, ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
+            WizardControlId, WizardStepId,
+        };
+        let mut actions = Vec::new();
+        match self {
+            ProvidersPage::Add(s) if s.is_step("api-key") => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Continue",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::ApiKey,
+                        WizardControlId::EditText,
+                    )),
+                });
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+                });
+            }
+            ProvidersPage::Add(s) if s.is_step("done") => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Continue",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::Done,
+                        WizardControlId::DoneContinue,
+                    )),
+                });
+            }
+            ProvidersPage::Add(s)
+                if s.is_step("headers") && s.headers.show_continue && !s.headers.is_editing() =>
+            {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Continue",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::Headers,
+                        WizardControlId::ContinueHeaders,
+                    )),
+                });
+            }
+            ProvidersPage::Edit(s) if s.editing_field.is_some() => {
+                let id = ProviderId(s.provider_id.clone());
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::SaveProvider(id)),
+                });
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+                });
+            }
+            ProvidersPage::ProviderSettings { .. } => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "save changes",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                        ProviderRowEditorAction::SettingSave,
+                    )),
+                });
+            }
+            ProvidersPage::ModelSettings { .. } => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "save changes",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                        ProviderRowEditorAction::SettingSave,
+                    )),
+                });
+            }
+            ProvidersPage::Headers { editor: h, .. } => {
+                if h.show_continue {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: "Continue",
+                        enabled: true,
+                        primary: true,
+                        action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                            WizardStepId::Headers,
+                            WizardControlId::ContinueHeaders,
+                        )),
+                    });
+                } else {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: "save changes",
+                        enabled: true,
+                        primary: true,
+                        action: SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                            ProviderRowEditorAction::HeaderSave,
+                        )),
+                    });
+                }
+            }
+            ProvidersPage::Models { .. } => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "save changes",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                        ProviderRowEditorAction::ModelSave,
+                    )),
+                });
+            }
+            _ => {}
+        }
+        super::shell::finish_help_row(cx, actions)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

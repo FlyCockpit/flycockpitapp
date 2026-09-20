@@ -82,7 +82,7 @@ use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
@@ -7655,6 +7655,18 @@ impl SettingsDialog {
                 add.auth_method_cursor = 0;
                 providers_page(ProvidersPage::Add(add))
             }
+            "provider-verify" => {
+                let template = cockpit_core::providers::template_by_id("anthropic")
+                    .expect("anthropic template");
+                let mut add = providers::AddState::new();
+                add.template = Some(template);
+                add.id_field.set(template.id);
+                add.url_field.set(template.url);
+                add.saved_provider_id = Some(template.id.to_string());
+                add.run.return_to("fetching").expect("fetching step");
+                providers_page(ProvidersPage::Add(add))
+            }
+            "mcp-add" => mcp_page(McpPage::Add(Box::new(mcp_page::AddState::golden_fixture()))),
             "oauth-flow" => providers_page(ProvidersPage::OAuthSetup {
                 state: Box::new(providers::OAuthFlowState::new(
                     providers::OAuthProvider::Codex,
@@ -8338,6 +8350,11 @@ impl SettingsDialog {
                     .buttons
                     .borrow_mut()
                     .handle_mouse(mouse);
+                let help_hover = self.cx.pointer_surface.help_row_action_at(Position {
+                    x: mouse.column,
+                    y: mouse.row,
+                });
+                self.cx.pointer_surface.help_row_hover.set(help_hover);
                 let action = match button_outcome {
                     Some(_) => self
                         .pointer_surface
@@ -8677,46 +8694,31 @@ impl SettingsDialog {
         } else {
             self.page.help_text(&self.cx).to_string()
         };
-        let help_row = self.page.help_row_actions(&self.cx);
-        shell::render_settings_help_row(frame, layout[2], &help, &help_row);
+        let mut help_row = self.page.help_row_actions(&self.cx);
+        help_row.hover = self.cx.pointer_surface.help_row_hover.get();
+        let help_action_rects =
+            shell::render_settings_help_row(frame, layout[2], &help, &help_row);
+        self.cx
+            .pointer_surface
+            .set_help_row_action_rects(help_action_rects.clone());
         if self.pointer_surface.enabled.get() {
-            let bar_width = if help_row.actions.is_empty() {
-                0
-            } else {
-                let buttons: Vec<_> = help_row
-                    .actions
-                    .iter()
-                    .map(|action| crate::tui::chrome::ActionButton {
-                        label: action.label,
-                        enabled: action.enabled,
-                        primary: action.primary,
-                    })
-                    .collect();
-                crate::tui::chrome::action_bar_width(&buttons)
-            };
-            let bar_x = layout[2].right().saturating_sub(bar_width).max(layout[2].x);
-            for (index, action) in help_row.actions.iter().enumerate() {
-                let label = format!("[{}]", action.label);
-                let width = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 2;
-                let x = bar_x.saturating_add(
-                    help_row
-                        .actions
-                        .iter()
-                        .take(index)
-                        .map(|prior| {
-                            unicode_width::UnicodeWidthStr::width(
-                                format!("[{}]", prior.label).as_str(),
-                            ) as u16
-                                + 2
-                        })
-                        .sum(),
-                );
+            for (index, (rect, action)) in help_action_rects
+                .into_iter()
+                .zip(help_row.actions.iter())
+                .enumerate()
+            {
+                if rect.width == 0 || rect.height == 0 {
+                    continue;
+                }
                 self.pointer_surface.register(shell::SettingsPointerTarget {
-                    rect: Rect::new(x, layout[2].y, width, 1),
+                    rect,
                     action: shell::SettingsPointerAction::Page(action.action.clone()),
                     enabled: action.enabled,
                     disabled_reason: None,
                 });
+                #[cfg(test)]
+                pointer_acceptance_tests::record_rendered_action(&action.action, action.enabled);
+                let _ = index;
             }
         }
     }

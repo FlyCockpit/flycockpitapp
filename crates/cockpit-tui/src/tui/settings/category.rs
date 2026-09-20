@@ -1372,32 +1372,35 @@ impl CategoryPathEditor {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, surface: &SettingsPointerSurface) {
-        let mut lines = vec![
-            Line::from(Span::styled(
-                format!("editing {}", self.id.descriptor().label),
-                heading_style(),
-            )),
+        use ratatui::layout::{Constraint, Layout};
+        let label = self.id.descriptor().label;
+        let chunks = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(area);
+        let heading = vec![
+            Line::from(Span::styled(format!("editing {label}"), heading_style())),
             Line::default(),
         ];
-        let field_line = lines.len();
-        super::shell::push_text_field_at_cursor(
-            &mut lines,
-            area.width,
-            self.id.descriptor().label,
-            self.text(),
-            self.cursor(),
-            true,
-            None,
+        frame.render_widget(
+            Paragraph::new(heading).wrap(Wrap { trim: false }),
+            chunks[0],
         );
-        let field_x = self.id.descriptor().label.chars().count().saturating_add(2);
+        let field_area = chunks[1];
+        if let Some(caret) = crate::tui::chrome::render_field(
+            frame,
+            field_area,
+            label,
+            &self.buf,
+            true,
+            "tab: accept  right: complete",
+        ) {
+            frame.set_cursor_position(caret);
+        }
         surface.register(SettingsPointerTarget {
-            rect: Rect::new(
-                area.x.saturating_add(field_x.min(u16::MAX as usize) as u16),
-                area.y.saturating_add(field_line as u16),
-                area.width
-                    .saturating_sub(field_x.min(u16::MAX as usize) as u16),
-                1,
-            ),
+            rect: field_area,
             action: SettingsPointerAction::Page(
                 super::pointer_actions::SettingsPointerAction::Category(
                     super::pointer_actions::CategoryAction::PathEditBegin(category_pointer_id(
@@ -1408,13 +1411,9 @@ impl CategoryPathEditor {
             enabled: true,
             disabled_reason: None,
         });
-        if let Some(ghost) = self.suggest.ghost_for(self.text())
-            && let Some(last) = lines.last_mut()
-        {
-            last.spans.push(Span::styled(
-                ghost.to_string(),
-                muted_style().add_modifier(Modifier::DIM),
-            ));
+        let mut lines = Vec::new();
+        if let Some(ghost) = self.suggest.ghost_for(self.text()) {
+            lines.push(Line::from(Span::styled(ghost.to_string(), muted_style())));
         }
         if !self.suggest.entries.is_empty() {
             for (i, entry) in self
@@ -1441,9 +1440,9 @@ impl CategoryPathEditor {
                 ]));
                 surface.register(SettingsPointerTarget {
                     rect: Rect::new(
-                        area.x,
-                        area.y.saturating_add(suggestion_line as u16),
-                        area.width,
+                        chunks[2].x,
+                        chunks[2].y.saturating_add(suggestion_line as u16),
+                        chunks[2].width,
                         1,
                     ),
                     action: SettingsPointerAction::Page(
@@ -1468,58 +1467,7 @@ impl CategoryPathEditor {
                 )));
             }
         }
-        lines.push(Line::default());
-        let action_line = lines.len();
-        lines.push(Line::from(vec![
-            Span::styled("[Save]", selected_style()),
-            Span::raw("  "),
-            Span::styled("[Cancel]", selected_style()),
-            Span::raw("  "),
-            Span::styled("[Open in $EDITOR]", selected_style()),
-            Span::styled("  tab: accept  right: complete", muted_style()),
-        ]));
-        for (action, x, width) in [
-            (
-                super::pointer_actions::CategoryAction::PathEditCommit(category_pointer_id(
-                    self.id,
-                )),
-                0u16,
-                6u16,
-            ),
-            (
-                super::pointer_actions::CategoryAction::PathEditCancel(category_pointer_id(
-                    self.id,
-                )),
-                8u16,
-                8u16,
-            ),
-            (
-                super::pointer_actions::CategoryAction::ExternalEditBegin(
-                    category_pointer_id(self.id),
-                    super::pointer_actions::CategoryExternalSource::PathEditor,
-                ),
-                18u16,
-                17u16,
-            ),
-        ] {
-            if x.saturating_add(width) > area.width {
-                continue;
-            }
-            surface.register(SettingsPointerTarget {
-                rect: Rect::new(
-                    area.x + x,
-                    area.y.saturating_add(action_line as u16),
-                    width,
-                    1,
-                ),
-                action: SettingsPointerAction::Page(
-                    super::pointer_actions::SettingsPointerAction::Category(action),
-                ),
-                enabled: true,
-                disabled_reason: None,
-            });
-        }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[2]);
     }
 }
 
@@ -3959,53 +3907,6 @@ impl SettingsCx {
 
         if let Some(editor) = &p.text_editor {
             editor.render(frame, area);
-            let action_y = area.bottom().saturating_sub(1);
-            for (action, x, width) in [
-                (
-                    super::pointer_actions::CategoryAction::TextEditorSave(category_pointer_id(
-                        editor.id,
-                    )),
-                    0,
-                    6,
-                ),
-                (
-                    super::pointer_actions::CategoryAction::TextEditorCancel(category_pointer_id(
-                        editor.id,
-                    )),
-                    8u16,
-                    8u16,
-                ),
-                (
-                    super::pointer_actions::CategoryAction::ExternalEditBegin(
-                        category_pointer_id(editor.id),
-                        super::pointer_actions::CategoryExternalSource::TextEditor,
-                    ),
-                    18u16,
-                    17u16,
-                ),
-            ] {
-                if x.saturating_add(width) > area.width {
-                    continue;
-                }
-                self.pointer_surface.register(SettingsPointerTarget {
-                    rect: Rect::new(area.x + x, action_y, width, 1),
-                    action: SettingsPointerAction::Page(
-                        super::pointer_actions::SettingsPointerAction::Category(action),
-                    ),
-                    enabled: true,
-                    disabled_reason: None,
-                });
-            }
-            frame.render_widget(
-                Line::from(vec![
-                    Span::styled("[Save]", selected_style()),
-                    Span::raw("  "),
-                    Span::styled("[Cancel]", selected_style()),
-                    Span::raw("  "),
-                    Span::styled("[Open in $EDITOR]", selected_style()),
-                ]),
-                Rect::new(area.x, action_y, area.width, 1),
-            );
             return;
         }
 
@@ -4742,6 +4643,52 @@ impl SettingsPage for CategoryPage {
                     super::pointer_actions::CategoryExternalSource::Inline,
                 )),
             });
+        } else if let Some(editor) = &self.path_editor {
+            let id = category_pointer_id(editor.id);
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Save",
+                enabled: true,
+                primary: true,
+                action: SettingsPointerAction::Category(CategoryAction::PathEditCommit(id)),
+            });
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Category(CategoryAction::PathEditCancel(id)),
+            });
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Open in $EDITOR",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
+                    id,
+                    super::pointer_actions::CategoryExternalSource::PathEditor,
+                )),
+            });
+        } else if let Some(editor) = &self.text_editor {
+            let id = category_pointer_id(editor.id);
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Save",
+                enabled: true,
+                primary: true,
+                action: SettingsPointerAction::Category(CategoryAction::TextEditorSave(id)),
+            });
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Category(CategoryAction::TextEditorCancel(id)),
+            });
+            actions.push(super::shell::SettingsHelpAction {
+                label: "Open in $EDITOR",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
+                    id,
+                    super::pointer_actions::CategoryExternalSource::TextEditor,
+                )),
+            });
         }
         if let Some(label) = self.category.reset_label() {
             let reset_label = if self.reset.is_pending() {
@@ -4756,10 +4703,7 @@ impl SettingsPage for CategoryPage {
                 action: SettingsPointerAction::Category(CategoryAction::Reset),
             });
         }
-        super::shell::SettingsHelpRow {
-            actions,
-            hover: None,
-        }
+        super::shell::finish_help_row(_cx, actions)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

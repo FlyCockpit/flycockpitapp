@@ -1154,6 +1154,8 @@ mod seed_tests {
             ("providers-mod", None),
             ("oauth-flow", None),
             ("auth", None),
+            ("provider-verify", None),
+            ("mcp-add", None),
             ("dependencies-page", Some(2)),
             ("agents-page", Some(3)),
             ("tools-page", Some(8 + product_offset)),

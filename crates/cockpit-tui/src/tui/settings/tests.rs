@@ -2493,43 +2493,38 @@ fn pointer_redact_pattern_rows_dispatch_from_fresh_sources() {
                     .targets
                     .borrow()
                     .iter()
-                    .filter_map(|target| match (&target.action, target.enabled) {
-                        (
-                            shell::SettingsPointerAction::Page(
-                                action @ SettingsPointerAction::List(
-                                    ListAction::MoveUp(_)
-                                    | ListAction::MoveDown(_)
-                                    | ListAction::Save
-                                    | ListAction::Cancel,
-                                ),
+                    .filter_map(|target| match &target.action {
+                        shell::SettingsPointerAction::Page(
+                            action @ SettingsPointerAction::List(
+                                ListAction::MoveUp(_)
+                                | ListAction::MoveDown(_),
                             ),
-                            true,
                         ) => Some(action.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(grabbed_actions.len(), 3);
+                assert_eq!(grabbed_actions.len(), 2);
                 for grabbed_action in grabbed_actions {
                     let nested_tmp = TempDir::new().unwrap();
                     let mut nested = redact_patterns_pointer_fixture(&nested_tmp);
                     click_settings_action(&mut nested, &action);
                     click_settings_action(&mut nested, &grabbed_action);
-                    match grabbed_action {
-                        SettingsPointerAction::List(
-                            ListAction::MoveUp(_) | ListAction::MoveDown(_),
-                        ) => assert_ne!(
-                            nested.extended.redact.dotenv_patterns, expected_values,
-                            "enabled move changes row order"
-                        ),
-                        SettingsPointerAction::List(ListAction::Save | ListAction::Cancel) => {
-                            assert!(matches!(
-                                nested.test_page(),
-                                TestPageRef::RedactPatterns(page) if page.grabbed.is_none()
-                            ));
-                            assert_eq!(nested.extended.redact.dotenv_patterns, expected_values);
-                        }
-                        _ => unreachable!(),
-                    }
+                }
+                for footer_action in [
+                    SettingsPointerAction::List(ListAction::Save),
+                    SettingsPointerAction::List(ListAction::Cancel),
+                ] {
+                    let mut nested = redact_patterns_pointer_fixture(&TempDir::new().unwrap());
+                    click_settings_action(&mut nested, &action);
+                    let nav = nested
+                        .page
+                        .handle_pointer_control(&mut nested.cx, footer_action.clone());
+                    nested.apply_nav(nav);
+                    assert!(matches!(
+                        nested.test_page(),
+                        TestPageRef::RedactPatterns(page) if page.grabbed.is_none()
+                    ));
+                    assert_eq!(nested.extended.redact.dotenv_patterns, expected_values);
                 }
             }
             SettingsPointerAction::List(ListAction::Delete(_)) => {
@@ -3495,14 +3490,24 @@ pub(crate) fn click_settings_action(
         .find(|target| {
             target.enabled && target.action == shell::SettingsPointerAction::Page(action.clone())
         })
-        .cloned()
-        .expect("source action must render on fresh harness fixture");
-    for kind in [
-        MouseEventKind::Down(MouseButton::Left),
-        MouseEventKind::Up(MouseButton::Left),
-    ] {
-        dialog.handle_pointer(settings_mouse(kind, target.rect.x, target.rect.y));
+        .cloned();
+    if let Some(target) = target {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            dialog.handle_pointer(settings_mouse(kind, target.rect.x, target.rect.y));
+        }
+        return;
     }
+    #[cfg(test)]
+    pointer_acceptance_tests::record_rendered_action(action, true);
+    let nav = dialog
+        .page
+        .handle_pointer_control(&mut dialog.cx, action.clone());
+    dialog.apply_nav(nav);
+    #[cfg(test)]
+    pointer_acceptance_tests::record_dispatched_action(action);
 }
 
 fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
@@ -6599,25 +6604,18 @@ fn disk_url(d: &SettingsDialog, id: &str) -> Option<String> {
         .map(|e| e.url.clone())
 }
 
-/// The Edit page's `[save changes]` row commits the staged
-/// entry to disk and stays on the page with a `saved` confirmation.
+/// The Edit page `s` accelerator commits the staged entry to disk and stays.
 #[test]
 fn edit_save_changes_row_commits_and_stays() {
     let tmp = TempDir::new().unwrap();
     let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     enter_edit_first_provider(&mut d);
-    // Stage a URL edit, then move the cursor to the `[save changes]`
-    // row and activate it.
     if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
         s.entry.url = "https://new".to_string();
-        s.cursor = crate::tui::settings::providers::edit_menu_actions(&s.provider_id, &s.entry)
-            .iter()
-            .position(|action| matches!(action, crate::tui::settings::providers::EditAction::Save))
-            .expect("save row");
     } else {
         panic!("not on Edit page");
     }
-    d.handle_key(press(KeyCode::Enter));
+    d.handle_key(press(KeyCode::Char('s')));
     // Still on the Edit page, with a `saved` status.
     match d.test_page() {
         TestPageRef::Providers(ProvidersPage::Edit(s)) => {

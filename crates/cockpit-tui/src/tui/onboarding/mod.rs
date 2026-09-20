@@ -68,7 +68,8 @@ use search::{ProviderSearchScreen, onboarding_catalog};
 use secure_store::SecureStoreScreen;
 use theme::{BAD, BRASS, FOG, GOOD, HOVER_BG, INK, NIGHT};
 pub(crate) use verify::VerifyOutcome;
-use verify::VerifyScreen;
+pub(crate) use verify::VerifyPhase;
+pub(crate) use verify::VerifyScreen;
 pub(crate) use verify::provider_verify_copy;
 
 #[derive(Debug, Clone)]

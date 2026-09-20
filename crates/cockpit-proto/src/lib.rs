@@ -555,12 +555,28 @@ pub enum ProviderModelFetchOutcome {
     },
 }
 
+/// Onboarding-safe categorization of a provider verification result. This is
+/// additive to the settings-oriented fetch outcome so existing refresh callers
+/// keep their established behavior while the purpose-built Verify screen gets
+/// stable copy without parsing daemon error strings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProviderModelVerification {
+    NoEndpoint,
+    Unauthorized { status: u16 },
+    NotFound,
+    HttpStatus { status: u16, snippet: String },
+    Network { message: String },
+    Parse { message: String },
+}
+
 /// One provider result from a daemon-owned catalog refresh.  The request can
 /// intentionally target one provider or the complete configured catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderModelFetchResult {
     pub provider_id: String,
     pub outcome: ProviderModelFetchOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<ProviderModelVerification>,
 }
 
 /// Safe provider usage data. No credential, header, or opaque response body

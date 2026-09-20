@@ -1341,6 +1341,15 @@ impl App {
                             "Provider connected. Add another, or finish from Verify.".into(),
                         ));
                     }
+                } else if self
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.completion_detour_active())
+                {
+                    if let Some(shell) = self.onboarding_shell.as_mut() {
+                        shell.return_to_completion();
+                    }
+                    self.dialog = crate::tui::settings::Dialog::None;
                 } else {
                     self.refresh_bootstrap_config_snapshot();
                     self.request_onboarding_transition(

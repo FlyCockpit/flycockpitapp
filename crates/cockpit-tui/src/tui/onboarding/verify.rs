@@ -1,13 +1,13 @@
 //! Native provider verification step. Network ownership stays in the daemon.
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
-use super::{ProviderSettlementEvidence, auth::SPINNER, chrome, theme};
+use super::{ProviderSettlementEvidence, auth::SPINNER, chrome, theme, ui};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyOutcome {
@@ -77,6 +77,7 @@ impl VerifyScreen {
             VerifyOutcome::NoEndpoint => VerifyPhase::NoEndpoint,
             error => VerifyPhase::Error(error),
         };
+        self.offset = 0;
     }
     pub(crate) fn tick(&mut self) {
         self.spinner = (self.spinner + 1) % SPINNER.len();
@@ -132,18 +133,92 @@ impl VerifyScreen {
             }
         }
     }
-    pub(crate) fn handle_mouse(&mut self, _mouse: MouseEvent) {}
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(self.phase, VerifyPhase::Success(_)) {
+            return;
+        }
+        let VerifyPhase::Success(models) = &self.phase else {
+            return;
+        };
+        let max = models.len().saturating_sub(1);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.offset = self.offset.saturating_sub(1),
+            MouseEventKind::ScrollDown => self.offset = (self.offset + 1).min(max),
+            _ => {}
+        }
+    }
     pub(crate) fn render(&self, frame: &mut Frame, area: Rect) {
         match &self.phase {
             VerifyPhase::Fetching => frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("{} ", SPINNER[self.spinner]), Style::new().fg(theme::BRASS)), Span::styled("Fetching models from the provider…", Style::new().fg(theme::FOG))])), area),
             VerifyPhase::Success(models) => {
                 let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::GOOD)).title(Span::styled(" Models ", Style::new().fg(theme::GOOD)));
-                let inner = block.inner(area); frame.render_widget(block, area);
-                let lines = models.iter().skip(self.offset).take(usize::from(inner.height)).map(|model| Line::from(vec![Span::styled("✓ ", Style::new().fg(theme::GOOD)), Span::styled(model.clone(), Style::new().fg(theme::INK))])).collect::<Vec<_>>();
-                frame.render_widget(Paragraph::new(lines), inner);
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let count = models.len();
+                let view_h = usize::from(inner.height);
+                let overflow = count > view_h;
+                let row_width = inner.width.saturating_sub(u16::from(overflow));
+                for row in 0..view_h {
+                    let index = self.offset + row;
+                    if index >= count {
+                        break;
+                    }
+                    let rect = Rect {
+                        x: inner.x,
+                        y: inner.y + row as u16,
+                        width: row_width,
+                        height: 1,
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled("✓ ", Style::new().fg(theme::GOOD)),
+                            Span::styled(
+                                models[index].clone(),
+                                Style::new().fg(theme::INK),
+                            ),
+                        ])),
+                        rect,
+                    );
+                }
+                if overflow {
+                    ui::render_scrollbar(
+                        frame,
+                        Rect {
+                            x: inner.right() - 1,
+                            y: inner.y,
+                            width: 1,
+                            height: inner.height,
+                        },
+                        count,
+                        view_h,
+                        self.offset,
+                        false,
+                    );
+                }
             }
-            VerifyPhase::NoEndpoint => frame.render_widget(Paragraph::new("The credential is stored. This provider does not publish a model catalog, so Cockpit will use configured models." ).style(Style::new().fg(theme::FOG)), area),
-            VerifyPhase::Error(error) => { let (_, detail, hint) = error_copy(error); frame.render_widget(Paragraph::new(vec![Line::from(Span::styled(detail, Style::new().fg(theme::BAD))), Line::default(), Line::from(Span::styled(hint, Style::new().fg(theme::FOG).add_modifier(Modifier::ITALIC)))]), area); }
+            VerifyPhase::NoEndpoint => frame.render_widget(
+                Paragraph::new(
+                    "The credential is stored. This provider does not publish a model catalog, so Cockpit will use configured models.",
+                )
+                .style(Style::new().fg(theme::FOG))
+                .wrap(Wrap { trim: true }),
+                area,
+            ),
+            VerifyPhase::Error(error) => {
+                let (_, detail, hint) = error_copy(error);
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(detail, Style::new().fg(theme::BAD))),
+                        Line::default(),
+                        Line::from(Span::styled(
+                            hint,
+                            Style::new().fg(theme::FOG).add_modifier(Modifier::ITALIC),
+                        )),
+                    ])
+                    .wrap(Wrap { trim: true }),
+                    area,
+                );
+            }
         }
     }
 }
@@ -168,17 +243,15 @@ fn error_copy(outcome: &VerifyOutcome) -> (String, String, String) {
         VerifyOutcome::Network(message) => (
             "Couldn't reach the provider".into(),
             message.clone(),
-            "Check DNS, TLS, connectivity, and the base URL, then retry.".into(),
+            "Check your network connection, then retry.".into(),
         ),
         VerifyOutcome::Parse(message) => (
-            "Unexpected response".into(),
+            "Couldn't parse the model list".into(),
             message.clone(),
-            "The endpoint answered, but its model list could not be read.".into(),
+            "The provider returned an unexpected response format.".into(),
         ),
-        _ => (
-            "Verification failed".into(),
-            "The provider could not be verified.".into(),
-            "Retry or step back.".into(),
-        ),
+        VerifyOutcome::Models(_) | VerifyOutcome::NoEndpoint => {
+            (String::new(), String::new(), String::new())
+        }
     }
 }

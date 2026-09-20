@@ -1048,6 +1048,39 @@ fn verify_renders_each_daemon_failure_class_with_retry() {
     }
 }
 
+#[test]
+fn verify_add_another_keeps_provider_stage_during_completion_detour() {
+    let mut shell = shell_at(OnboardingStage::Complete);
+    let mut engine = Dialog::None;
+    shell.present_completion("summary".into());
+    shell.begin_completion_provider_detour(None);
+    shell.present_verify("openai".into());
+    shell.apply_provider_verification(
+        "openai",
+        VerifyOutcome::Models(vec!["gpt-4o".into()]),
+        Some(ProviderSettlementEvidence {
+            operation_id: "op".into(),
+            mutation_intent_hash: "00".repeat(32),
+            mutation_config_generation: 1,
+            config_generation: 1,
+        }),
+    );
+    let action = shell.handle_key(key(KeyCode::Char('a')), &mut engine);
+    assert!(matches!(
+        action,
+        Some(OnboardingShellAction::FinishProvider {
+            add_another: true,
+            ..
+        })
+    ));
+    shell.present_provider_search(Some(
+        "Provider connected. Add another, or finish from Verify.".into(),
+    ));
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::ProviderSearch);
+    assert_eq!(shell.stage(), OnboardingStage::Complete);
+    assert!(shell.completion_detour_active());
+}
+
 // ── Completion ───────────────────────────────────────────────────────────
 
 #[test]

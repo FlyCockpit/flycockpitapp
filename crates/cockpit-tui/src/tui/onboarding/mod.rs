@@ -781,7 +781,6 @@ impl OnboardingShell {
 
     /// True while the completion screen's "add another provider" detour is
     /// active.
-    #[cfg(test)]
     pub(crate) fn completion_detour_active(&self) -> bool {
         self.completion_detour
     }
@@ -1315,8 +1314,22 @@ impl OnboardingShell {
             }
             OnboardingScreen::Authenticate(screen) => {
                 if matches!(key.code, KeyCode::Esc) {
-                    if let Some(action) = screen.cancel_oauth() {
-                        return Some(OnboardingShellAction::OAuth(action));
+                    let phase = screen.auth_phase();
+                    if phase == auth::AuthPhase::DevicePolling {
+                        if let Some(action) = screen.cancel_oauth() {
+                            return Some(OnboardingShellAction::OAuth(action));
+                        }
+                        return None;
+                    }
+                    if matches!(
+                        phase,
+                        auth::AuthPhase::DeviceIdle
+                            | auth::AuthPhase::PasteCallback
+                            | auth::AuthPhase::ApiKey
+                    ) {
+                        if let Some(action) = screen.cancel_oauth() {
+                            return Some(OnboardingShellAction::OAuth(action));
+                        }
                     }
                     self.present_provider_search(None);
                     return None;

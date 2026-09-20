@@ -152,12 +152,19 @@ impl AuthScreen {
     pub(crate) fn template(&self) -> &'static ProviderTemplate {
         self.template
     }
+
+    pub(crate) fn auth_phase(&self) -> AuthPhase {
+        self.phase
+    }
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_phase_for_golden(&mut self, phase: AuthPhase) {
         self.phase = phase;
         if matches!(phase, AuthPhase::DeviceIdle | AuthPhase::DevicePolling) {
             self.authorize_url = "https://auth.openai.com/codex/device".into();
             self.user_code = "ABCD-EFGH".into();
+        }
+        if matches!(phase, AuthPhase::PasteCallback) {
+            self.authorize_url = "https://auth.example.com/oauth/authorize".into();
         }
     }
     pub(crate) fn title(&self) -> &'static str {
@@ -349,7 +356,6 @@ impl AuthScreen {
         operation_id: crate::tui::settings::PointerOperationId,
         result: Result<(), String>,
     ) -> Option<OAuthFlowRequest> {
-        let device = self.is_device();
         let state = self.oauth.as_mut()?;
         if !state.accepts_result(client_flow_id, operation_id) {
             return None;
@@ -357,11 +363,6 @@ impl AuthScreen {
         let succeeded = result.is_ok();
         state.apply_acknowledgement(result);
         if succeeded {
-            self.phase = if device {
-                AuthPhase::DevicePolling
-            } else {
-                AuthPhase::PasteCallback
-            };
             Some(state.onboarding_begin())
         } else {
             self.error = state
@@ -456,7 +457,9 @@ impl AuthScreen {
         };
         if state.accepts_result(client_flow_id, operation_id) {
             state.apply_cancel(result);
-            self.phase = AuthPhase::DeviceIdle;
+            if self.phase == AuthPhase::DevicePolling {
+                self.phase = AuthPhase::DeviceIdle;
+            }
         }
     }
 

@@ -85,7 +85,6 @@ impl App {
     }
 
     pub(super) fn open_default_model_from_settings(&mut self) {
-        self.default_model_settings_mode = true;
         if self.config_snapshot.providers.providers.is_empty() {
             // First-paint startup can show attached runner chrome before the
             // daemon provider catalog lands in `config_snapshot`. Read the
@@ -95,6 +94,7 @@ impl App {
         }
         let current = self.config_snapshot.providers.active_model.clone();
         self.open_model_menu_highlighting(current.as_ref());
+        self.default_model_settings_mode = true;
         self.push_plain(
             "Choose the default model for new sessions (does not switch this session).",
         );
@@ -203,13 +203,12 @@ impl App {
         let Some(picker) = self.composer_controls.picker.as_mut() else {
             return;
         };
-        if let Some(index) = picker
-            .categories
-            .iter()
-            .position(|category| category.id == requested.provider)
-        {
+        if let Some(index) = picker.categories.iter().position(|category| {
+            category.id == requested.provider && category.label != "Config drift"
+        }) {
             picker.category = index;
             picker.level = 1;
+            let item_count = picker.categories[index].items.len();
             picker.cursor = picker
                 .categories
                 .get(index)
@@ -219,7 +218,8 @@ impl App {
                         .iter()
                         .position(|item| item.id == requested.model)
                 })
-                .unwrap_or(picker.cursor);
+                .unwrap_or(picker.cursor)
+                .min(item_count.saturating_sub(1));
         }
     }
 

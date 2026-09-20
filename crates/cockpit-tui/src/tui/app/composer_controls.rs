@@ -616,6 +616,8 @@ impl App {
     }
 
     pub(super) fn close_composer_picker(&mut self) {
+        self.default_model_settings_mode = false;
+        self.submit_after_model_selection = false;
         self.invalidate_composer_control_ownership(false, true);
     }
 
@@ -635,6 +637,7 @@ impl App {
             self.close_composer_picker();
             return;
         }
+        self.default_model_settings_mode = false;
         self.open_composer_picker(kind);
         if kind == ComposerControlKind::Model {
             self.request_session_setup_snapshot_refresh();
@@ -650,6 +653,7 @@ impl App {
         // src/tui.rs:172` / `:178`), and the popover anchors to the
         // composer, which a full-screen pane would cover.
         self.overlay = Overlay::None;
+        self.default_model_settings_mode = false;
         self.composer_controls.selection = Some(kind);
         self.open_composer_picker(kind);
         if kind == ComposerControlKind::Model {
@@ -1112,16 +1116,19 @@ impl App {
             && let Some(category) = picker
                 .categories
                 .iter()
-                .position(|category| category.id == provider)
+                .position(|category| category.id == provider && category.label != "Config drift")
         {
             picker.level = 1;
             picker.category = category;
+            let item_count = picker.categories[category].items.len();
             picker.cursor = picker.categories[category]
                 .items
                 .iter()
                 .position(|item| item.id == current)
-                .unwrap_or(0);
+                .unwrap_or(0)
+                .min(item_count.saturating_sub(1));
         }
+        self.refresh_reopened_composer_model_after_settings = Some(provider);
         true
     }
 
@@ -1536,13 +1543,30 @@ impl App {
                     self.request_default_model_only(active);
                     self.composer_controls.picker = None;
                     self.composer_controls.selection = None;
+                    self.composer_controls.pending = None;
+                    self.composer_controls.dispatch_armed = false;
                     return;
                 }
-                let _ = self.notify_active_model_selected(
+                let dispatched = self.notify_active_model_selected(
                     active,
                     persist_as_default,
                     cockpit_proto::ActiveModelSwitchTrigger::Picker,
                 );
+                if !dispatched {
+                    self.composer_controls.pending = None;
+                    self.composer_controls.dispatch_armed = false;
+                    return;
+                }
+                if self.composer_model_selection_waiting_for_runner_attach() {
+                    self.composer_controls.dispatch_armed = false;
+                    return;
+                }
+                self.finish_composer_control_dispatch();
+                if self.submit_after_model_selection {
+                    self.submit_after_model_selection = false;
+                    let _ = self.submit_input();
+                }
+                return;
             }
             ComposerControlKind::Effort => self.commit_effort_item(&item.id),
             ComposerControlKind::Approval => {
@@ -1681,6 +1705,19 @@ impl App {
         if !self.composer_controls.dispatch_armed {
             return;
         }
+        if self
+            .composer_controls
+            .pending
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.request_id.is_none()
+                    && pending.kind == ComposerControlKind::Model
+                    && self.composer_model_selection_waiting_for_runner_attach()
+            })
+        {
+            self.composer_controls.dispatch_armed = false;
+            return;
+        }
         self.composer_controls.dispatch_armed = false;
         if self
             .composer_controls
@@ -1693,6 +1730,17 @@ impl App {
                 ComposerPickerStatus::Unavailable,
             );
         }
+    }
+
+    fn composer_model_selection_waiting_for_runner_attach(&self) -> bool {
+        self.pending_runner_attach.as_ref().is_some_and(|pending| {
+            pending.continuations.iter().any(|continuation| {
+                matches!(
+                    continuation,
+                    super::RunnerAttachContinuation::SelectModel { .. }
+                )
+            })
+        })
     }
 
     /// True when this receipt still sits in `composer_controls.pending` but

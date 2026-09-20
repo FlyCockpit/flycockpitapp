@@ -993,6 +993,25 @@ impl App {
                         },
                     );
                 }
+                if applied {
+                    if self
+                        .composer_controls
+                        .picker
+                        .as_ref()
+                        .is_some_and(|picker| {
+                            picker.kind == crate::tui::composer_controls::ComposerControlKind::Model
+                        })
+                    {
+                        self.composer_controls.picker = None;
+                        self.composer_controls.selection = None;
+                        self.composer_controls.pending = None;
+                        self.composer_controls.dispatch_armed = false;
+                    }
+                    if self.submit_after_model_selection {
+                        self.submit_after_model_selection = false;
+                        let _ = self.submit_input();
+                    }
+                }
                 self.dispatch_next_ready_paste_fence();
             }
             TurnEvent::HostCapabilitiesChanged { snapshot } => {

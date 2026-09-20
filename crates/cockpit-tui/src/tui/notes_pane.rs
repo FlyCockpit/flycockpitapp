@@ -38,7 +38,7 @@ use uuid::Uuid;
 use crate::tui::composer::Composer;
 use crate::tui::markdown;
 use crate::tui::pane::Pane;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, resolve_color};
 use cockpit_proto::{ProjectNote, Request, Response};
 
 static NEXT_NOTES_PANE_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -959,7 +959,7 @@ impl NotesPane {
             scrollbar_areas(list_area, row_count > list_area.height as usize);
         let label_width = usize::from(list_content.width.saturating_sub(2));
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let selected_index = self.selected_index();
         let mut items = self
             .notes
@@ -989,7 +989,7 @@ impl NotesPane {
                     "  "
                 }
             ),
-            Style::default().fg(Color::Indexed(crate::tui::theme::ACCENT_BLUE_INDEX)),
+            Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
         ))));
 
         let highlight = if matches!(
@@ -1146,11 +1146,11 @@ impl NotesPane {
                     }
                     Some(_) => vec![Line::from(Span::styled(
                         "(empty note — press e or ↵ to edit)",
-                        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                        Style::default().fg(resolve_color(FOG, FOG_INDEX)),
                     ))],
                     None => vec![Line::from(Span::styled(
                         "Select a note, or create one with `+ new note`.",
-                        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                        Style::default().fg(resolve_color(FOG, FOG_INDEX)),
                     ))],
                 };
                 let full_width = area.width.max(1) as usize;

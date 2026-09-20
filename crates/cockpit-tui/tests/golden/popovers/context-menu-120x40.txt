@@ -1,30 +1,27 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] /tmp/project                                                                              
                               ──────────────────────────────────────────────────────────────────────────────────────────
-  + New session               ▌Restyle the complete transcript surface.                                                │
-                                                                                                                       │
- SESSIONS                       ▸ You                                                                                  │
- no active sessions in all pr   Prioritize the transcript chrome.                                                      │
+  + New session               ▌Continue with every transcript element.                                                 │
                               note to self                                                                      12:00  │
-                              ┊ Keep product-only transcript variants.                                                 │
-                              ▌ Agent                                                             [Pin] [Fork]  12:00  │
+ SESSIONS                     ┊ Keep product-only transcript variants.                                                 │
+ no active sessions in all pr ▌ Agent                                                             [Pin] [Fork]  12:00  │
                                 Model  Agent                                                                           │
                                 TTFT   0.9s                                                                            │
-                                TPS    40                                                                              █
-                                Cache  —                                                                               █
-                                ▾ Thought                                                                              █
-                                Map each requested row to its owning renderer.                                         █
+                                TPS    40                                                                              │
+                                Cache  —                                                                               │
+                                ▾ Thought                                                                              │
+                                Map each requested row to its owning renderer.                                         │
                                 The open thought is followed by tool work.                                             █
                                                                                                                        █
-                                ▸ read  crates/cockpit-tui/src/tui/history/mod.rs   ╭────────────────────╮             █
-                                                                                    │› Open in $EDITOR   │             █
-                                ─ explore                                           │  Copy as rich text │             █
-                              ▌ interactive ✓ explore worked for 3s [u]             │  Copy as markdown  │             █
-                              ▌ Interactive child inspected the rendering seam.     │  Copy as plain text│             █
-                                                                                    ╰────────────────────╯             █
-                              ▌ background ✓ runner worked for 4s [u]                                                  █
-                                Background child returned a compact report.                                            █
+                                ▸ read  crates/cockpit-tui/src/tui/history/mod.rs                                      █
                                                                                                                        █
+                                ─ explore                                                                              █
+                              ▌ interactive ✓ explore worked for 3s [u]             ╭────────────────────╮             █
+                              ▌ Interactive child inspected the rendering seam.     │› Open in $EDITOR   │             █
+                                                                                    │  Copy as rich text │             █
+                              ▌ background ✓ runner worked for 4s [u]               │  Copy as markdown  │             █
+                                Background child returned a compact report.         │  Copy as plain text│             █
+                                                                                    ╰────────────────────╯             █
                                 ◇ Edited src/transcript.rs  +1 -1                                                      █
                                 │ - old line                                                                           █
                                 │ + new line                                                                           █
@@ -37,4 +34,7 @@
  ● working  ● waiting  ● done   Thinking                                                                               █
                                 Check the final visual hierarchy.                                                      █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys                                           113 tokens│
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯
 Setup: Code                                                                                                             

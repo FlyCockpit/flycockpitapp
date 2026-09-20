@@ -401,6 +401,11 @@ pub fn assert_product_popovers() {
     ] {
         let mut app = popover_fixture(name);
         let buffer = render_app(&mut app, 120, 40);
+        let dump = buffer_text(&buffer);
+        assert!(
+            dump.contains('◆') && dump.contains("Cockpit"),
+            "popover golden {name} must show the session rail marker"
+        );
         crate::tui::golden::assert_golden("popovers", name, 120, 40, &buffer);
     }
 }

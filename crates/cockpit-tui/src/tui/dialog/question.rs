@@ -2987,6 +2987,40 @@ mod tests {
     }
 
     #[test]
+    fn lockout_border_uses_night_while_locked() {
+        let mut d = QuestionDialog::new(
+            Uuid::new_v4(),
+            String::new(),
+            InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Single {
+                    prompt: "Pick?".into(),
+                    options: vec![opt("a", "A")],
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: false,
+                    approval_class: None,
+                    sandbox_escalation: None,
+                }],
+            },
+            Duration::from_secs(300),
+        );
+        assert!(d.locked());
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(50, 10);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| d.render(frame, Rect::new(0, 0, 50, 10)))
+            .expect("draw");
+        let night = resolve_color(NIGHT, NIGHT_INDEX);
+        let buf = terminal.backend().buffer();
+        let has_night_border = buf.content().iter().any(|cell| {
+            cell.fg == night && matches!(cell.symbol(), "╭" | "╮" | "╰" | "╯" | "─" | "│")
+        });
+        assert!(has_night_border, "locked dialog border must use NIGHT");
+    }
+
+    #[test]
     fn approval_title_and_plain_question_title_diverge() {
         let d = approval_dialog(CommandDetail {
             full_command: "rm foo".into(),

@@ -20,7 +20,7 @@ use ratatui::widgets::{
 };
 
 use crate::tui::pane::Pane;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 use cockpit_proto::SkillSummary;
 use unicode_width::UnicodeWidthStr;
 
@@ -195,7 +195,7 @@ impl SkillsPane {
             );
         }
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "q quit  ↑/↓ scroll  g/G top/bottom".to_string(),
@@ -213,7 +213,7 @@ impl SkillsPane {
             SkillsPaneState::Loading => wrap_line(
                 Line::from(Span::styled(
                     "Loading skills...".to_string(),
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(resolve_color(FOG, FOG_INDEX)),
                 )),
                 width,
                 "",
@@ -274,7 +274,7 @@ fn ready_lines(
         lines.extend(wrap_line(
             Line::from(Span::styled(
                 "local view - session-specific activation unavailable".to_string(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(resolve_color(FOG, FOG_INDEX)),
             )),
             width,
             "",
@@ -286,7 +286,7 @@ fn ready_lines(
         lines.extend(wrap_line(
             Line::from(Span::styled(
                 "No skills found in the configured scan directories.".to_string(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(resolve_color(FOG, FOG_INDEX)),
             )),
             width,
             "",
@@ -302,7 +302,7 @@ fn ready_lines(
 /// (source muted), then the indented description underneath, with a blank
 /// separator between entries.
 fn skill_lines(skills: &[SkillSummary], width: usize) -> Vec<Line<'static>> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let mut out: Vec<Line<'static>> = Vec::new();
     for (i, s) in skills.iter().enumerate() {
         if i > 0 {

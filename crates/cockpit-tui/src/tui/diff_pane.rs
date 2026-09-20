@@ -46,7 +46,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::tui::diff::SIDE_BY_SIDE_MIN_WIDTH;
 use crate::tui::history::HistoryEntry;
 use crate::tui::pane::Pane;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 use cockpit_config::extended::DiffStyle;
 
 /// Minimum total body width for the two-column (list + diff) layout. Below
@@ -534,7 +534,7 @@ impl DiffPane {
             self.scroll,
         );
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 help_text(help_area.width).to_string(),
@@ -560,7 +560,7 @@ impl DiffPane {
         match &self.loaded {
             Loaded::State(msg) => vec![Line::from(Span::styled(
                 msg.clone(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(resolve_color(FOG, FOG_INDEX)),
             ))],
             Loaded::Files(files) => files
                 .iter()
@@ -604,7 +604,7 @@ impl DiffPane {
             Loaded::State(msg) => {
                 return vec![Line::from(Span::styled(
                     msg.clone(),
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(resolve_color(FOG, FOG_INDEX)),
                 ))];
             }
             Loaded::Files(files) => files,
@@ -612,7 +612,7 @@ impl DiffPane {
         let Some(file) = files.get(self.selected_file_index()) else {
             return vec![Line::from(Span::styled(
                 "no file selected".to_string(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(resolve_color(FOG, FOG_INDEX)),
             ))];
         };
 
@@ -620,7 +620,7 @@ impl DiffPane {
         if matches!(file.kind, ChangeKind::Binary) {
             out.push(Line::from(Span::styled(
                 "  binary file changed".to_string(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(resolve_color(FOG, FOG_INDEX)),
             )));
             return out;
         }
@@ -849,7 +849,7 @@ fn render_vertical_scrollbar(
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
         .end_symbol(None)
-        .track_style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)))
+        .track_style(Style::default().fg(resolve_color(FOG, FOG_INDEX)))
         .thumb_style(Style::default().fg(Color::Cyan));
     frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
 }
@@ -891,10 +891,7 @@ fn file_list_row(file: &FileDiff, selected: bool, width: usize) -> Line<'static>
         Span::raw(" "),
         Span::styled(path, path_style),
         Span::raw(" "),
-        Span::styled(
-            counts,
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-        ),
+        Span::styled(counts, Style::default().fg(resolve_color(FOG, FOG_INDEX))),
     ])
 }
 
@@ -904,7 +901,7 @@ fn kind_color(kind: ChangeKind) -> Color {
         ChangeKind::Deleted => COL_REMOVED,
         ChangeKind::Renamed => COL_HUNK,
         ChangeKind::Modified => Color::Yellow,
-        ChangeKind::Binary => Color::Indexed(MUTED_COLOR_INDEX),
+        ChangeKind::Binary => resolve_color(FOG, FOG_INDEX),
     }
 }
 
@@ -915,7 +912,7 @@ fn file_header_line(file: &FileDiff) -> Line<'static> {
         Span::raw(" "),
         Span::styled(
             format!("(+{} −{})", file.added, file.removed),
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            Style::default().fg(resolve_color(FOG, FOG_INDEX)),
         ),
     ])
 }
@@ -931,7 +928,7 @@ fn render_rows_inline(rows: &[Row]) -> Vec<Line<'static>> {
             Row::Note(s) => Line::from(Span::styled(
                 s.clone(),
                 Style::default()
-                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .fg(resolve_color(FOG, FOG_INDEX))
                     .add_modifier(Modifier::DIM),
             )),
         })
@@ -974,7 +971,7 @@ fn render_rows_side_by_side(rows: &[Row], width: u16) -> Vec<Line<'static>> {
                 out.push(Line::from(Span::styled(
                     s.clone(),
                     Style::default()
-                        .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                        .fg(resolve_color(FOG, FOG_INDEX))
                         .add_modifier(Modifier::DIM),
                 )));
             }
@@ -1009,7 +1006,7 @@ fn side_row(left: String, ls: Option<Style>, right: String, rs: Option<Style>) -
         Span::styled(left, ls.unwrap_or_default()),
         Span::styled(
             COL_SEPARATOR.to_string(),
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            Style::default().fg(resolve_color(FOG, FOG_INDEX)),
         ),
         Span::styled(right, rs.unwrap_or_default()),
     ])

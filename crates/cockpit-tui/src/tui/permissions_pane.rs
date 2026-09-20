@@ -34,7 +34,7 @@ use ratatui::widgets::{
 };
 
 use crate::tui::pane::Pane;
-use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, resolve_color};
 use cockpit_core::approval::store::{
     ManagedGrantKind, ManagedGrants, delete_managed_grant, global_approvals_dir,
     list_managed_grants, project_approvals_dir,
@@ -350,7 +350,7 @@ impl PermissionsPane {
             self.list.offset(),
         );
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let help = match &self.status {
             Some(s) => s.clone(),
             None => "q quit  ↑/↓ move  d/del remove".to_string(),
@@ -544,11 +544,11 @@ fn load_scope(scope: Scope, dir: Option<PathBuf>) -> ScopeView {
 // ---- pure render helpers ----------------------------------------------------
 
 fn scope_heading(sv: &ScopeView) -> Line<'static> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let mut spans = vec![Span::styled(
         sv.scope.label().to_string(),
         Style::default()
-            .fg(Color::Indexed(ACCENT_BLUE_INDEX))
+            .fg(resolve_color(BRASS, BRASS_INDEX))
             .add_modifier(Modifier::BOLD),
     )];
     if let Some(dir) = &sv.dir {
@@ -568,14 +568,14 @@ fn unavailable_line(scope: Scope) -> Line<'static> {
     };
     Line::from(Span::styled(
         msg,
-        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        Style::default().fg(resolve_color(FOG, FOG_INDEX)),
     ))
 }
 
 fn empty_scope_line() -> Line<'static> {
     Line::from(Span::styled(
         "  No grants in this scope.".to_string(),
-        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        Style::default().fg(resolve_color(FOG, FOG_INDEX)),
     ))
 }
 

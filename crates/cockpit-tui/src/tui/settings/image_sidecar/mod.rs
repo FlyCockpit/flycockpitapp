@@ -1811,7 +1811,7 @@ fn build_rows(page: &SidecarPage) -> Vec<(String, SidecarBinding)> {
         SidecarPageKind::Overview => {
             for (i, title) in SIDECAR_NODE_TITLES.iter().enumerate() {
                 let marker = if i == page.session.cursor.get() {
-                    "▸ "
+                    "› "
                 } else {
                     "  "
                 };

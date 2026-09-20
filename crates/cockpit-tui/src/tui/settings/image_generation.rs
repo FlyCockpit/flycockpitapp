@@ -1097,7 +1097,7 @@ impl SettingsPage for GenerationListPage {
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         for (i, title) in GENERATION_NODE_TITLES.iter().enumerate() {
-            let marker = if i == self.cursor { "▸ " } else { "  " };
+            let marker = if i == self.cursor { "› " } else { "  " };
             let node = match i {
                 0 => super::pointer_actions::GenerationNodeId::Endpoints,
                 1 => super::pointer_actions::GenerationNodeId::Targets,
@@ -1844,7 +1844,7 @@ impl SettingsPage for JobListPage {
             rows.push(("No jobs.".into(), None));
         } else {
             for (i, job) in self.reducer.jobs.iter().enumerate() {
-                let marker = if i == self.cursor { "▸ " } else { "  " };
+                let marker = if i == self.cursor { "› " } else { "  " };
                 let stale = if job.stale { " (stale)" } else { "" };
                 rows.push((
                     format!(

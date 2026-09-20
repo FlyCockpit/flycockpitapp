@@ -1485,9 +1485,24 @@ impl Overlay {
     pub(super) fn dialog_height(&self) -> u16 {
         match self {
             Self::Quick(_) => 14,
-            Self::Multireview(_) => crate::tui::multireview_dialog::DIALOG_HEIGHT,
-            _ => 0,
+            Self::Multireview(_)
+            | Self::Notes(_)
+            | Self::Diff(_)
+            | Self::SessionSetup(_)
+            | Self::AgentTree(_) => 0,
+            _ => 20,
         }
+    }
+
+    pub(super) fn is_large_popover(&self) -> bool {
+        matches!(
+            self,
+            Self::Multireview(_)
+                | Self::Notes(_)
+                | Self::Diff(_)
+                | Self::SessionSetup(_)
+                | Self::AgentTree(_)
+        )
     }
 
     pub(super) fn key_context(&self) -> Option<crate::tui::keys_overlay::KeyContext> {

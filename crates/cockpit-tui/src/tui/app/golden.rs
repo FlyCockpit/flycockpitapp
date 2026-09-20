@@ -19,6 +19,7 @@ use cockpit_config::providers::{
 };
 use cockpit_proto::{OnboardingBootstrapSnapshot, OnboardingStage};
 use crossterm::event::{KeyCode, KeyEvent};
+use uuid::Uuid;
 
 fn golden_model_config() -> cockpit_config::config::providers::ProvidersConfig {
     let mut config = cockpit_config::config::providers::ProvidersConfig::default();
@@ -259,6 +260,149 @@ fn transcript_fixture_app() -> App {
         response_performance: None,
     });
     app
+}
+
+fn run_slash(app: &mut App, name: &str) {
+    let command = *super::slash::SLASH_COMMANDS
+        .iter()
+        .find(|command| command.name == name)
+        .unwrap_or_else(|| panic!("missing /{name}"));
+    app.execute_slash(command);
+}
+
+fn popover_fixture(name: &str) -> App {
+    use cockpit_proto::{
+        BtwForkInfo, CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet,
+    };
+
+    let mut app = transcript_fixture_app();
+    match name {
+        "tools" | "permissions" | "diff" | "help" | "keys" => run_slash(&mut app, name),
+        "agent-tree" => app.open_agent_tree(),
+        "approval" | "approval-destructive" | "question" => {
+            let approval = name != "question";
+            let detail = approval.then(|| {
+                Box::new(CommandDetail {
+                    full_command: "rm -rf target/debug/example".to_string(),
+                    highlight: None,
+                    step: 1,
+                    step_count: 1,
+                    cwd: Some("~/project".to_string()),
+                    remembered_key: None,
+                    write_content: None,
+                    risk_tier: (name == "approval-destructive").then(|| "destructive".to_string()),
+                    risk_reasons: Vec::new(),
+                    affected_targets: Vec::new(),
+                    native_tool_hints: Vec::new(),
+                    offered_scopes: Vec::new(),
+                    policy_cap: None,
+                    image_plan_review: None,
+                })
+            });
+            let options = if approval {
+                vec![
+                    InterruptOption {
+                        id: cockpit_core::approval::ID_APPROVE_ONCE.to_string(),
+                        label: "Approve once".to_string(),
+                        description: Some("Run only this time".to_string()),
+                        secondary: false,
+                    },
+                    InterruptOption {
+                        id: "deny".to_string(),
+                        label: "Deny".to_string(),
+                        description: None,
+                        secondary: true,
+                    },
+                ]
+            } else {
+                vec![
+                    InterruptOption {
+                        id: "postgres".to_string(),
+                        label: "Postgres".to_string(),
+                        description: Some("Use the shared database".to_string()),
+                        secondary: false,
+                    },
+                    InterruptOption {
+                        id: "sqlite".to_string(),
+                        label: "SQLite".to_string(),
+                        description: Some("Keep the project self-contained".to_string()),
+                        secondary: false,
+                    },
+                ]
+            };
+            app.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
+                Uuid::nil(),
+                "The agent needs your input.".to_string(),
+                InterruptQuestionSet {
+                    questions: vec![InterruptQuestion::Single {
+                        prompt: if approval {
+                            "Run this command?".to_string()
+                        } else {
+                            "Which database should this project use?".to_string()
+                        },
+                        options,
+                        allow_freetext: !approval,
+                        command_detail: detail,
+                        permission: approval,
+                        approval_class: None,
+                        sandbox_escalation: None,
+                    }],
+                },
+                Duration::ZERO,
+            ));
+        }
+        "btw" => app.open_btw_pane_from_info(
+            BtwForkInfo {
+                session_id: Uuid::from_u128(2),
+                parent_session_id: Uuid::from_u128(1),
+                short_id: Some("btw001".to_string()),
+                tangent: false,
+                created_at: 1,
+                message_count: 0,
+            },
+            false,
+        ),
+        "context-menu" => {
+            app.context_menu = Some(crate::tui::context_menu::ContextMenu {
+                preferred_origin: (84, 18),
+                clicked_chat_row: 2,
+                cursor: 0,
+                items: crate::tui::context_menu::ContextMenu::build_items(false, true),
+            });
+        }
+        "workspace-trust" => {
+            let root = Path::new("/tmp/project").to_path_buf();
+            app.dialog = Dialog::open_workspace_trust(cockpit_config::trust::TrustRoot {
+                opened_path: root.clone(),
+                root,
+                kind: cockpit_config::trust::TrustRootKind::Directory,
+            });
+        }
+        _ => panic!("unknown popover fixture {name}"),
+    }
+    app
+}
+
+fn assert_product_popovers() {
+    let _pins = GoldenPins::install();
+    for name in [
+        "tools",
+        "permissions",
+        "diff",
+        "agent-tree",
+        "help",
+        "approval",
+        "approval-destructive",
+        "question",
+        "keys",
+        "btw",
+        "context-menu",
+        "workspace-trust",
+    ] {
+        let mut app = popover_fixture(name);
+        let buffer = render_app(&mut app, 120, 40);
+        crate::tui::golden::assert_golden("popovers", name, 120, 40, &buffer);
+    }
 }
 
 pub fn render_transcript_fixture(width: u16, height: u16) -> Buffer {
@@ -749,5 +893,11 @@ mod seed_tests {
     fn golden_composer_pickers() {
         let _env = isolate_render_env();
         assert_composer_pickers();
+    }
+
+    #[test]
+    fn golden_product_popovers() {
+        let _env = isolate_render_env();
+        assert_product_popovers();
     }
 }

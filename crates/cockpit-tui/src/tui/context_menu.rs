@@ -21,10 +21,12 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
+
+use crate::tui::theme::{BRASS, BRASS_INDEX, INK, INK_INDEX, resolve_color};
 
 /// Actions the user can pick from the context menu. Resolved by the
 /// App in [`crate::tui::app::App::execute_context_menu_action`]. All
@@ -183,20 +185,18 @@ pub fn render_context_menu(frame: &mut Frame, full_area: Rect, menu: &ContextMen
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::White));
+        .border_style(Style::default().fg(resolve_color(BRASS, BRASS_INDEX)));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, action) in menu.items.iter().enumerate() {
         let focused = i == menu.cursor;
-        let marker = if focused { "▸ " } else { "  " };
+        let marker = if focused { "› " } else { "  " };
         let style = if focused {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            crate::tui::chrome::chip_style(Style::default(), true)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(INK, INK_INDEX))
         };
         lines.push(Line::from(vec![
             Span::raw(marker),

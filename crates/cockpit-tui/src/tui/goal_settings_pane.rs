@@ -893,6 +893,9 @@ impl GoalSettingsPane {
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let block = crate::tui::chrome::rounded_block(" goal settings ", true);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         let items = self
             .lines()
             .into_iter()
@@ -900,7 +903,7 @@ impl GoalSettingsPane {
             .collect::<Vec<_>>();
         let mut state = ListState::default();
         state.select(Some(self.cursor + 3));
-        frame.render_stateful_widget(List::new(items).scroll_padding(1), area, &mut state);
+        frame.render_stateful_widget(List::new(items).scroll_padding(1), inner, &mut state);
     }
 
     #[cfg(test)]

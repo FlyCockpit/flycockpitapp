@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] /tmp/project                                                                              
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session               ▌Restyle the complete transcript surface.                                                │
+                                                                                                                       │
+ SESSIONS                       ▸ You                                                                                  │
+ no active sessions in all pr   Prioritize the transcript chrome.                                                      │
+                              note to self                                                                      12:00  │
+                              ┊ Keep product-only transcript variants.                                                 │
+                              ▌ Agent╭ /permissions ────────────────────────────────────────────────────────────╮2:00  │
+                                Model│Project                                                                   │      │
+                                TTFT │  (no project root for the current directory)                             │      │
+                                TPS  │                                                                          │      █
+                                Cache│Global  /dev/shm/.tmpOe0YsI/home/.config/cockpit/approvals.json           │      █
+                                ▾ Tho│  No grants in this scope.                                                │      █
+                                Map e│                                                                          │      █
+                                The o│                                                                          │      █
+                                     │                                                                          │      █
+                                ▸ rea│                                                                          │      █
+                                     │                                                                          │      █
+                                ─ exp│                                                                          │      █
+                              ▌ inter│                                                                          │      █
+                              ▌ Inter│                                                                          │      █
+                                     │                                                                          │      █
+                              ▌ backg│                                                                          │      █
+                                Backg│                                                                          │      █
+                                     │                                                                          │      █
+                                ◇ Edi│q quit  ↑/↓ move  d/del remove                                            │      █
+                                │ - o╰──────────────────────────────────────────────────────────────────────────╯      █
+                                │ + new line                                                                           █
+                                │   shared line                                                                        █
+                               ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 ·  ⋯ █
+                                                               ⋯ 2 seed tools (~42) ⋯                                  █
+                                [show summary]                                                                         █
+                                                                                                                       █
+                              ▌ Agent                                                                           12:00  █
+ ● working  ● waiting  ● done   Thinking                                                                               █
+                                Check the final visual hierarchy.                                                      █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
+Setup: Code                                                                                                             

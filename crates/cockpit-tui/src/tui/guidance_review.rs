@@ -16,7 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::Rect,
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
 };
 use std::sync::{Arc, Mutex};
 
@@ -318,14 +318,7 @@ impl GuidanceReviewPane {
 
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.poll();
-        let width = area.width.saturating_sub(8).min(88);
-        let height = area.height.saturating_sub(4).min(30);
-        let popup = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + (area.height - height) / 2,
-            width,
-            height,
-        );
+        let popup = area;
         frame.render_widget(Clear, popup);
         let mut lines = vec![self.status.clone(), String::new()];
         if let Some(proposal) = self.proposals.get(self.selected) {
@@ -334,11 +327,7 @@ impl GuidanceReviewPane {
         frame.render_widget(
             Paragraph::new(lines.join("\n"))
                 .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .title(" Guidance review ")
-                        .borders(Borders::ALL),
-                ),
+                .block(crate::tui::chrome::rounded_block(" Guidance review ", true)),
             popup,
         );
     }

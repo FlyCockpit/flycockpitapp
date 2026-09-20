@@ -32,7 +32,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::tui::theme::{
     CONTEXT_BLOCK_INDEX, CONTEXT_GUIDANCE_INDEX, CONTEXT_MESSAGES_INDEX, CONTEXT_SYSTEM_INDEX,
@@ -161,9 +161,7 @@ impl ContextPane {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(" /context "));
+        let block = crate::tui::chrome::rounded_block(" /context ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 

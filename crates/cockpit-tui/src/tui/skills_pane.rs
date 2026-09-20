@@ -16,8 +16,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
 use crate::tui::pane::Pane;
@@ -152,9 +151,7 @@ impl SkillsPane {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(" /skills "));
+        let block = crate::tui::chrome::rounded_block(" /skills ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 

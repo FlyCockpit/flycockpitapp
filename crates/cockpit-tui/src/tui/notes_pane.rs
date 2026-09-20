@@ -904,9 +904,7 @@ impl NotesPane {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(" /scratchpad "));
+        let block = crate::tui::chrome::rounded_block(" /scratchpad ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -956,20 +954,41 @@ impl NotesPane {
         let list_area = layout[0];
         let status_area = layout[1];
         let help_area = layout[2];
+        let row_count = self.notes.len() + 1;
+        let (list_content, scrollbar_area) =
+            scrollbar_areas(list_area, row_count > list_area.height as usize);
+        let label_width = usize::from(list_content.width.saturating_sub(2));
 
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let selected_index = self.selected_index();
         let mut items = self
             .notes
             .iter()
-            .map(|note| {
+            .enumerate()
+            .map(|(index, note)| {
                 ListItem::new(Line::from(Span::styled(
-                    format!(" {} ", note.name),
+                    format!(
+                        "{}{}",
+                        if index == selected_index {
+                            "› "
+                        } else {
+                            "  "
+                        },
+                        sidebar_note_label(&note.name, label_width)
+                    ),
                     Style::default().fg(Color::White),
                 )))
             })
             .collect::<Vec<_>>();
         items.push(ListItem::new(Line::from(Span::styled(
-            " + new note ",
+            format!(
+                "{}+ new note",
+                if selected_index == self.notes.len() {
+                    "› "
+                } else {
+                    "  "
+                }
+            ),
             Style::default().fg(Color::Indexed(crate::tui::theme::ACCENT_BLUE_INDEX)),
         ))));
 
@@ -977,14 +996,11 @@ impl NotesPane {
             self.mode,
             Mode::Browsing | Mode::Editing { .. } | Mode::ConfirmingDelete { .. }
         ) {
-            crate::tui::theme::row_selection_style()
+            crate::tui::chrome::chip_style(Style::default(), true)
         } else {
             Style::default()
         };
-        let row_count = self.notes.len() + 1;
         self.sidebar.select(Some(self.selected_index()));
-        let (list_content, scrollbar_area) =
-            scrollbar_areas(list_area, row_count > list_area.height as usize);
         frame.render_stateful_widget(
             List::new(items)
                 .highlight_style(highlight)
@@ -1180,6 +1196,26 @@ impl NotesPane {
             }
         }
     }
+}
+
+fn sidebar_note_label(name: &str, max_width: usize) -> String {
+    if name.width() <= max_width {
+        return name.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut width = 1usize;
+    let mut reversed = String::new();
+    for ch in name.chars().rev() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(ch_width) > max_width {
+            break;
+        }
+        reversed.push(ch);
+        width = width.saturating_add(ch_width);
+    }
+    format!("…{}", reversed.chars().rev().collect::<String>())
 }
 
 impl Pane for NotesPane {

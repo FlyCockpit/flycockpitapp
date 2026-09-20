@@ -10,7 +10,11 @@ use cockpit_core::agents::{AgentDef, ToolSurfaceSelection, ToolTier};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::widgets::{List, ListItem};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph};
+
+use crate::tui::theme::{BRASS, BRASS_INDEX, YELLOW, YELLOW_INDEX, resolve_color};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolsSaveTarget {
@@ -874,6 +878,21 @@ impl ToolsPane {
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(resolve_color(BRASS, BRASS_INDEX)))
+            .title(Span::styled(
+                " tools ",
+                Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let footer_height = u16::from(inner.height > 1);
+        let body = Rect {
+            height: inner.height.saturating_sub(footer_height),
+            ..inner
+        };
         let (lines, selected_line, _) = tool_surface_lines(
             &self.picker,
             &self.draft,
@@ -888,7 +907,16 @@ impl ToolsPane {
         let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
         let mut state = ratatui::widgets::ListState::default();
         state.select(selected_line);
-        frame.render_stateful_widget(List::new(items).scroll_padding(1), area, &mut state);
+        frame.render_stateful_widget(List::new(items).scroll_padding(1), body, &mut state);
+        if footer_height > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " Enabling/disabling busts the prompt cache.",
+                    Style::default().fg(resolve_color(YELLOW, YELLOW_INDEX)),
+                ))),
+                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            );
+        }
     }
 
     fn cache_break_delta(&self) -> bool {

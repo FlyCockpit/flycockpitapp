@@ -23,12 +23,12 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::tui::pane::Pane;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, resolve_color};
 
 /// The leader key shown in help text. `Ctrl+X` is taken (embedded-pane
 /// force-close, `crate::tui::app::input`), so the which-key overlay uses
@@ -780,32 +780,29 @@ impl KeysOverlay {
         self.context
     }
 
-    /// Render the overlay into `area`. Bottom-anchored over the chat body so
-    /// the fixed chrome (cwd + git branch + context + active agent) stays
-    /// visible — never permanently covered. The context group scrolls in
+    /// Render the overlay into the centered popover rect chosen by App. The
+    /// context group scrolls in
     /// the body; the always-live Global group is pinned above the help row
     /// so globals stay visible no matter how long the context group is
     /// (the #445 chords grew Composer past a 24-row body).
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        // A clear under the overlay so the chat doesn't bleed through, then a
-        // titled, rounded box. Anchored to the bottom of the body, capped to
-        // the body height so it can never cover the fixed chrome above.
         if area.width == 0 || area.height == 0 {
             self.last_body_height = 0;
             return;
         }
         let context_lines = self.context_lines();
         let global_lines = self.global_lines();
-        let want = (context_lines.len() + global_lines.len()).saturating_add(3); // borders + help row
-        let h = (want as u16).min(area.height);
-        let y = area.y + area.height.saturating_sub(h);
-        let rect = Rect::new(area.x, y, area.width, h);
+        let rect = area;
 
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .title(Line::from(format!(" keybindings — {} ", self.title())));
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(resolve_color(BRASS, BRASS_INDEX)))
+            .title(Line::from(Span::styled(
+                format!(" keybindings — {} ", self.title()),
+                Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
+            )));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
 
@@ -825,7 +822,7 @@ impl KeysOverlay {
         );
         frame.render_widget(Paragraph::new(global_lines), globals);
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("Esc/q/{LEADER_HINT} close  ↑/↓ scroll  g/G top/bottom"),
@@ -945,17 +942,17 @@ impl KeysOverlay {
     /// One group as rendered rows: its styled heading, then a
     /// key/action/desc row per binding.
     fn group_lines(group: &OwnedKeyGroup, key_w: usize) -> Vec<Line<'static>> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let key_style = Style::default()
-            .fg(Color::Yellow)
+            .fg(resolve_color(BRASS, BRASS_INDEX))
             .add_modifier(Modifier::BOLD);
         let action_style = Style::default()
-            .fg(Color::White)
+            .fg(resolve_color(INK, INK_INDEX))
             .add_modifier(Modifier::BOLD);
         let mut out = vec![Line::from(Span::styled(
             group.title.to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(resolve_color(BRASS, BRASS_INDEX))
                 .add_modifier(Modifier::BOLD),
         ))];
         for b in &group.bindings {

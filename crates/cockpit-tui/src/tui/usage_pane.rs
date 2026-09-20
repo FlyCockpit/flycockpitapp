@@ -6,8 +6,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -83,9 +82,7 @@ impl UsagePane {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(" /usage vendor plan limits "));
+        let block = crate::tui::chrome::rounded_block(" /usage vendor plan limits ", true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);

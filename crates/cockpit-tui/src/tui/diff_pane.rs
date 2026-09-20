@@ -39,8 +39,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -475,7 +474,7 @@ impl DiffPane {
         self.file_hits.clear();
         self.file_list_area = None;
         let title = self.title();
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = crate::tui::chrome::rounded_block(title, true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 

@@ -33,9 +33,10 @@ use crate::tui::history::{
     format_status_elapsed, render_entry, render_pending_incremental, thinking_dots_padded,
 };
 use crate::tui::theme::{
-    BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, IDLE_BORDER, INFO_TEXT,
-    MUTED_COLOR_INDEX, MUTED_TEXT, SHELL_MODE_BADGE_BG, SHELL_MODE_BORDER, SUCCESS_TEXT,
-    WARNING_TEXT,
+    BRASS, BRASS_INDEX, BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, FOG,
+    FOG_INDEX, HOVER_BG, HOVER_BG_INDEX, IDLE_BORDER, INFO_TEXT, MUTED_COLOR_INDEX, MUTED_TEXT,
+    PLACEHOLDER, PLACEHOLDER_INDEX, SHELL_MODE_BADGE_BG, SHELL_MODE_BORDER, SUCCESS_TEXT,
+    WARNING_TEXT, resolve_color,
 };
 
 use super::{
@@ -1444,15 +1445,20 @@ impl App {
         let overlay_rail = self.session_rail.overlay_rail_rect(chat_body, frame_width);
         let render_session_rail = self.onboarding_shell.is_none();
         let popover_max_height = chat_body.height.saturating_sub(2).max(1);
-        let popover_height = if geom.dialog > 0 {
+        let large_popover = self.overlay.is_large_popover()
+            || matches!(self.dialog, crate::tui::settings::Dialog::Settings(_));
+        let popover_height = if large_popover {
+            popover_max_height
+        } else if geom.dialog > 0 {
             geom.dialog
                 .clamp(12.min(popover_max_height), popover_max_height)
         } else {
-            popover_max_height
+            20.min(popover_max_height)
         };
+        let popover_width = if large_popover { 96 } else { 76 };
         let popover_body = crate::tui::chrome::place_popover(
             chat_body,
-            chat_body.width.saturating_sub(4).clamp(1, 96),
+            chat_body.width.saturating_sub(4).clamp(1, popover_width),
             popover_height,
             chat_body,
             crate::tui::chrome::PopoverSide::Center,
@@ -1669,11 +1675,12 @@ impl App {
         self.paint_chat_header_more_popover(frame);
         self.render_status(frame, rects.status);
 
-        // Toast sits on top of the status line. Rendered before the
+        // Toast sits at the bottom-right of the transcript, immediately
+        // above the composer. Rendered before the
         // context menu / text popup so those still cover it if both
         // happen to be active at the same time.
         if let Some(toast) = self.toast.clone() {
-            render_toast(frame, rects.status, &toast);
+            render_toast(frame, chat_body, &toast);
         }
 
         // `/pins` review checklist overlay (`pinned-messages`): a compact
@@ -1695,18 +1702,24 @@ impl App {
             crate::tui::context_menu::render_context_menu(frame, frame.area(), menu);
         }
 
-        // Which-key overlay (`which-key-overlay.md`): a bottom-anchored,
-        // scrollable, informational panel over the chat body. Rendered last so
-        // it sits on top, but anchored to the body so the fixed chrome (status
-        // line below, header above) is never permanently covered. Take/restore
+        // Which-key overlay (`which-key-overlay.md`): a centred, scrollable,
+        // informational popover over the chat body. Rendered last so it sits
+        // on top without covering the session rail. Take/restore
         // to satisfy the borrow checker (its render is `&mut self`), like the
         // other panes. It's only ever open when no required-decision dialog is
         // up (the leader is guarded; `/keys` can't be typed during a dialog),
         // so it never obscures a required decision.
         if self.keys_overlay.is_some() {
+            let keys_rect = crate::tui::chrome::place_popover(
+                chat_body,
+                chat_body.width.saturating_sub(4).clamp(1, 76),
+                chat_body.height.saturating_sub(2).clamp(1, 24),
+                chat_body,
+                crate::tui::chrome::PopoverSide::Center,
+            );
             let mut overlay = self.keys_overlay.take();
             if let Some(o) = overlay.as_mut() {
-                o.render(frame, rects.body);
+                o.render(frame, keys_rect);
             }
             self.keys_overlay = overlay;
         }
@@ -3900,7 +3913,7 @@ impl App {
 
     /// Split a rendered composer chunk (`text`, whose first char is at
     /// absolute buffer byte `chunk_byte_start`) into styled spans, giving
-    /// any bytes covered by a paste-block placeholder a distinct dim-cyan
+    /// any bytes covered by a paste-block placeholder a distinct FOG chip
     /// style (composer-paste-handling). Non-block text keeps the default
     /// white. Returns one span when no block overlaps the chunk (the
     /// common case), so ordinary typing renders exactly as before.
@@ -3923,7 +3936,9 @@ impl App {
         {
             return plain();
         }
-        let block_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+        let block_style = Style::default()
+            .fg(resolve_color(FOG, FOG_INDEX))
+            .add_modifier(Modifier::BOLD);
         let normal = Style::default().fg(Color::White);
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut cur = String::new();
@@ -4543,8 +4558,12 @@ impl App {
             if let Some(rect) = layout.pty
                 && let Some(pane) = self.pane.as_mut()
             {
-                pane.resize(rect.height, rect.width);
-                pane.render(frame, rect);
+                let block = crate::tui::chrome::rounded_block(" terminal ", self.pane_focused);
+                let inner = block.inner(rect);
+                frame.render_widget(block, rect);
+                pane.resize(inner.height, inner.width);
+                pane.render(frame, inner);
+                self.pane_rect = Some(inner);
             }
             if let Some(hidden) = layout.hidden_live {
                 let label = match hidden {
@@ -4565,17 +4584,20 @@ impl App {
             return layout.main;
         }
         let (chat_rect, pane_rect, divider) = split_body(self.pane_side, self.pane_ratio, body);
+        let terminal_block = crate::tui::chrome::rounded_block(" terminal ", self.pane_focused);
+        let terminal_inner = terminal_block.inner(pane_rect);
         if let Some(pane) = self.pane.as_mut() {
-            pane.resize(pane_rect.height, pane_rect.width);
+            pane.resize(terminal_inner.height, terminal_inner.width);
         }
-        self.pane_rect = Some(pane_rect);
+        self.pane_rect = Some(terminal_inner);
         self.divider = divider;
         self.pane_body = Some(body);
         if let Some((drect, vertical)) = divider {
             self.render_divider(frame, drect, vertical);
         }
         if let Some(pane) = self.pane.as_ref() {
-            pane.render(frame, pane_rect);
+            frame.render_widget(terminal_block, pane_rect);
+            pane.render(frame, terminal_inner);
         }
         chat_rect
     }
@@ -4585,11 +4607,7 @@ impl App {
             return;
         };
         pane.body_rect = Some(area);
-        let border = if pane.focused {
-            DIVIDER_FOCUSED
-        } else {
-            DIVIDER_DIM
-        };
+        let border = resolve_color(BRASS, BRASS_INDEX);
         let mode = match pane.mode() {
             crate::tui::app::btw_pane::BtwMode::Seeded => "seeded",
             crate::tui::app::btw_pane::BtwMode::Tangent => "tangent",
@@ -4601,8 +4619,9 @@ impl App {
         };
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border))
-            .title(title);
+            .title(Span::styled(title, Style::default().fg(border)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height == 0 || inner.width == 0 {
@@ -4654,6 +4673,7 @@ impl App {
 
         let input_block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border))
             .title(" btw message ");
         let input_inner = input_block.inner(input_area);
@@ -4662,7 +4682,7 @@ impl App {
             Line::from(Span::styled(
                 "Ask a side question…",
                 Style::default()
-                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .fg(resolve_color(PLACEHOLDER, PLACEHOLDER_INDEX))
                     .add_modifier(Modifier::ITALIC),
             ))
         } else {
@@ -4757,18 +4777,21 @@ fn toast_fg(kind: ToastKind) -> Color {
     }
 }
 
-/// Render a toast over the status-line rect. Single line; left-padded
-/// one cell; foreground color encodes intent (green/yellow/red/grey).
-/// Uses `Clear` so the status text underneath doesn't bleed through.
-fn render_toast(frame: &mut ratatui::Frame, status_rect: Rect, toast: &Toast) {
+/// Render a compact toast at bottom-right above the composer.
+fn render_toast(frame: &mut ratatui::Frame, chat_body: Rect, toast: &Toast) {
     use ratatui::widgets::Clear;
-    if status_rect.height == 0 || status_rect.width == 0 {
+    if chat_body.height == 0 || chat_body.width == 0 {
         return;
     }
-    let fg = toast_fg(toast.kind);
     let text = format!(" {} ", toast.text);
-    // Truncate to fit if the message is longer than the status row.
-    let max = status_rect.width as usize;
+    let width = (text.chars().count() as u16).min(chat_body.width).max(1);
+    let rect = Rect::new(
+        chat_body.right().saturating_sub(width),
+        chat_body.bottom().saturating_sub(1),
+        width,
+        1,
+    );
+    let max = rect.width as usize;
     let display: String = if text.chars().count() > max {
         let cap = max.saturating_sub(1);
         let truncated: String = text.chars().take(cap).collect();
@@ -4776,12 +4799,16 @@ fn render_toast(frame: &mut ratatui::Frame, status_rect: Rect, toast: &Toast) {
     } else {
         text
     };
-    frame.render_widget(Clear, status_rect);
+    frame.render_widget(Clear, rect);
+    crate::tui::chrome::fill_bg(frame, rect, resolve_color(HOVER_BG, HOVER_BG_INDEX));
     let para = Paragraph::new(Line::from(Span::styled(
         display,
-        Style::default().fg(fg).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(resolve_color(BRASS, BRASS_INDEX))
+            .bg(resolve_color(HOVER_BG, HOVER_BG_INDEX))
+            .add_modifier(Modifier::BOLD),
     )));
-    frame.render_widget(para, status_rect);
+    frame.render_widget(para, rect);
 }
 
 fn prewrap_entry_rows(

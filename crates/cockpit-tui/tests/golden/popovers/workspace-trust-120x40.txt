@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] /tmp/project                                                                              
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session               ▌Restyle the complete transcript surface.                                                │
+                                                                                                                       │
+ SESSIONS                       ▸ You                                                                                  │
+ no active sessions in all pr   Prioritize the transcript chrome.                                                      │
+                              note to self                                                                      12:00  │
+                              ┊ Keep product-only transcript variants.                                                 │
+                              ▌ Agent╭ Workspace trust ─────────────────────────────────────────────────────────╮2:00  │
+                                Model│Cockpit has not seen this workspace before:                               │      │
+                                TTFT │  /tmp/project                                                            │      │
+                                TPS  │                                                                          │      █
+                                Cache│Choose workspace trust:                                                   │      █
+                                ▾ Tho│› 1. trust - open and honor project .cockpit config                       │      █
+                                Map e│  2. ignore-config - open but ignore project .cockpit config and approvals│      █
+                                The o│  3. untrusted - refuse to open                                           │      █
+                                     │                                                                          │      █
+                                ▸ rea│                                                                          │      █
+                                     │                                                                          │      █
+                                ─ exp│                                                                          │      █
+                              ▌ inter│                                                                          │      █
+                              ▌ Inter│                                                                          │      █
+                                     │                                                                          │      █
+                              ▌ backg│                                                                          │      █
+                                Backg│                                                                          │      █
+                                     │                                                                          │      █
+                                ◇ Edi│↑/↓  enter: choose  esc: untrusted                                        │      █
+                                │ - o╰──────────────────────────────────────────────────────────────────────────╯      █
+                                │ + new line                                                                           █
+                                │   shared line                                                                        █
+                               ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 ·  ⋯ █
+                                                               ⋯ 2 seed tools (~42) ⋯                                  █
+                                [show summary]                                                                         █
+                                                                                                                       █
+                              ▌ Agent                                                                           12:00  █
+ ● working  ● waiting  ● done   Thinking                                                                               █
+                                Check the final visual hierarchy.                                                      █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
+Setup: Code                                                                                                             

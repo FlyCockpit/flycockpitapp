@@ -1,24 +1,24 @@
-╭ sessions all ────────────╮                                                idle
-│ search                   │~/project                                           
-│no active sessions in all │────────────────────────────────────────────────────
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │                                                    
-│                          │  ╭─────────────────────────────────────────────╮   
-│                          │  │ ▗▖          ▄█▛                             │   
-│                          │  │ ▐█▖▄     ▗▄▀▝▀   ▘   FlyCockpit v0.1.0      │   
-│                          │  │ ▀▀▀██▛▀▜█▀▀▀▟▛▀▀▘▘   Daemon failed to start │   
-│                          │  │      ▀▀▀████▀▝▀▀▘▘   ~/project              │   
-│                          │  │      ▄▜█▀▘       ▘                          │   
-│                          │  │     ▝▀▀                                     │   
-│                          │  │ Tip: /help gets you oriented                │   
-│                          │  ╰─────────────────────────────────────────────╯   
-│                          │                                                    
-│                          │                                                    
-│browse only — no daemon   │                                                    
-╰──────────────────────────╯                                                    
-╭──────────────────────────────────────────────────────────────────────────────╮
-│❯ Message FlyCockpit — / commands · Ctrl+K keys · /setup              0 tokens│
-╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯
- daemon socket address already in use: /tmp/cockpit.sock                        
+                                                                          ● Idle
+ ◆ Cockpit           [Hide] ~/project                                           
+                            ────────────────────────────────────────────────────
+  + New session                                                                 
+                                                                                
+ SESSIONS                                                                       
+ no active sessions in all                                                      
+                              ╭─────────────────────────────────────────────╮   
+                              │ ▗▖          ▄█▛                             │   
+                              │ ▐█▖▄     ▗▄▀▝▀   ▘   FlyCockpit v0.1.0      │   
+                              │ ▀▀▀██▛▀▜█▀▀▀▟▛▀▀▘▘   Daemon failed to start │   
+                              │      ▀▀▀████▀▝▀▀▘▘   ~/project              │   
+                              │      ▄▜█▀▘       ▘                          │   
+                              │     ▝▀▀                                     │   
+                              │ Tip: /help gets you oriented                │   
+                              ╰─────────────────────────────────────────────╯   
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ ● working  ● waiting  ● do                                                     
+                                                                                
+                             daemon socket address already in use: /tmp/cockpit…
+Setup: Code                                                                     

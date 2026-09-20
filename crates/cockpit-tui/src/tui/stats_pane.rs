@@ -20,8 +20,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -412,7 +411,7 @@ impl StatsPane {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         let title = self.title();
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = crate::tui::chrome::rounded_block(title, true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -699,7 +698,7 @@ fn section_recovery(rec: &RecoverySection, expanded: &[bool], cursor: usize) -> 
         let marker = if is_expanded {
             "▾ "
         } else if is_cursor {
-            "▸ "
+            "› "
         } else {
             "  "
         };

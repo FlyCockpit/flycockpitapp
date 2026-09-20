@@ -182,6 +182,7 @@ fn assert_excoc_open_selected_rail_cells(buffer: &ratatui::buffer::Buffer) {
         "excoc sessions label row"
     );
     assert_cell(buffer, 1, 6, "▌", brass, hover, Modifier::BOLD);
+    assert_cell(buffer, 1, 7, "▌", brass, hover, Modifier::BOLD);
     let datetime = crate::tui::golden::PINNED_DATETIME;
     assert!(
         rail_row_text(buffer, 7).contains(datetime),

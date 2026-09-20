@@ -511,6 +511,21 @@ mod tests {
         assert!(!first.session_rail.is_visible());
         assert!(!first.config_snapshot.extended.tui.session_rail_visible);
 
+        first.clear_model_and_config_chrome_for_empty_session();
+        let mut attach_extended = first.config_snapshot.extended.clone();
+        attach_extended.tui.session_rail_visible = false;
+        first.apply_config_snapshot(cockpit_proto::ConfigSnapshot {
+            session_id: uuid::Uuid::new_v4(),
+            generation: 1,
+            extended: attach_extended,
+            providers: cockpit_proto::ProviderConfigView::default(),
+        });
+        assert!(
+            !first.session_rail.is_visible(),
+            "hide must survive config-snapshot epoch then daemon apply (attach path)"
+        );
+        assert!(!first.config_snapshot.extended.tui.session_rail_visible);
+
         let global = cockpit_config::config::dirs::global_config_file().unwrap();
         let persisted = cockpit_config::extended::ExtendedConfigDoc::load(&global)
             .unwrap()

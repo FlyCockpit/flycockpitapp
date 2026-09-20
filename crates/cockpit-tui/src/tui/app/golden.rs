@@ -98,6 +98,16 @@ bind-line\n";
     app
 }
 
+pub fn daemon_restart_prompt_app() -> App {
+    let mut app = empty_chat_banner_app();
+    app.launch.banner_enabled = false;
+    app.push_plain("Durable transcript remains visible behind the decision.");
+    app.overlay =
+        Overlay::SessionSetup(crate::tui::session_setup::SessionSetupPane::loading(false));
+    app.apply_event(cockpit_client::presentation::TurnEvent::DaemonRestartPrompt);
+    app
+}
+
 fn transcript_fixture_app() -> App {
     let mut app = App::new(Some(Path::new("/tmp/project")), false);
     app.dialog = Dialog::None;
@@ -400,6 +410,18 @@ pub fn assert_spawn_error() {
     );
 }
 
+pub fn assert_daemon_restart_prompt() {
+    let _pins = GoldenPins::install();
+    let mut app = daemon_restart_prompt_app();
+    assert_golden_sizes("chat", "daemon-restart-prompt", |width, height| {
+        render_app(&mut app, width, height)
+    });
+    let preview = buffer_text(&render_app(&mut app, 80, 24));
+    assert!(preview.contains("The daemon stopped unexpectedly. Restart it?"));
+    assert!(preview.contains("[ Restart ]") && preview.contains("[ Quit ]"));
+    assert!(!preview.contains("Loading session setup"));
+}
+
 fn composer_picker_app(kind: ComposerControlKind, model_level: u8) -> App {
     let mut app = empty_chat_banner_app();
     app.launch.banner_enabled = false;
@@ -691,6 +713,12 @@ mod seed_tests {
     fn golden_spawn_error() {
         let _env = isolate_render_env();
         assert_spawn_error();
+    }
+
+    #[test]
+    fn golden_daemon_restart_prompt() {
+        let _env = isolate_render_env();
+        assert_daemon_restart_prompt();
     }
 
     #[test]

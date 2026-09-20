@@ -593,6 +593,7 @@ async fn accepted_promotion_terminal_failure_releases_the_lifecycle_host() {
                                 endpoint: cockpit_client::ClientEndpoint::Wire(
                                     paths.socket.clone(),
                                 ),
+                                process_watch: None,
                                 lifetime_client: None,
                                 owns_daemon: false,
                                 ephemeral_owner: false,

@@ -650,13 +650,9 @@ impl HermeticCockpit {
             .expect("hermetic cockpit trust set");
         assert_success("hermetic cockpit trust set", &trust, &self.home);
 
-        let start = self
-            .spec
-            .launch_path(HermeticLaunchKind::DaemonStart)
-            .std_command()
-            .output()
-            .expect("hermetic cockpit daemon start --detach");
-        assert_success("hermetic cockpit daemon start --detach", &start, &self.home);
+        // `trust set` is daemon-owned and acquires a persistent owner before
+        // writing the decision. Adopt that owner instead of issuing a second
+        // `daemon start --detach` against its already-bound endpoint.
         self.wait_for_daemon(DEFAULT_DAEMON_TIMEOUT);
         #[cfg(any(
             target_os = "linux",
@@ -703,6 +699,51 @@ impl HermeticCockpit {
             self.daemon_pid = self.pid_from_file();
         }
         output
+    }
+
+    /// Kill the exact receipt-verified daemon generation retained by this
+    /// fixture. The stable kernel witness proves that the process observed
+    /// exiting after signal delivery is the generation captured by setup.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    pub fn sigkill_daemon(&mut self) {
+        let generation = self
+            .daemon_generation
+            .as_ref()
+            .expect("receipt-verified daemon generation");
+        let pid = libc::pid_t::try_from(generation.receipt.pid).expect("daemon pid fits pid_t");
+        assert!(
+            !generation
+                .process
+                .has_exited()
+                .expect("observe live daemon generation before SIGKILL")
+        );
+        // SAFETY: pid was range-checked and this hermetic fixture has just
+        // verified its retained generation is live before signal delivery.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !generation
+            .process
+            .has_exited()
+            .expect("observe killed daemon generation")
+        {
+            assert!(Instant::now() < deadline, "SIGKILLed daemon did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Adopt the replacement generation spawned by the attached TUI after a
+    /// crash prompt. This refreshes the fixture's cleanup witness only after
+    /// the new endpoint answers its receipt-bound hello.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
+    pub fn adopt_current_daemon_generation(&mut self) {
+        self.wait_for_daemon(DEFAULT_DAEMON_TIMEOUT);
+        self.install_current_daemon_generation(true)
+            .expect("adopt TUI-restarted daemon generation");
     }
 
     /// Stop a daemon the PTY child spawned itself (cold first-run). `reap()`

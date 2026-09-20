@@ -12,12 +12,13 @@ use std::time::Duration;
 
 use super::Overlay;
 
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::{border, merge::MergeStrategy};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1709,7 +1710,81 @@ impl App {
             }
             self.keys_overlay = overlay;
         }
+        self.render_daemon_restart_prompt(frame);
         self.button_registry.end_frame();
+    }
+
+    fn render_daemon_restart_prompt(&mut self, frame: &mut ratatui::Frame) {
+        let Some(prompt) = self.daemon_restart_prompt.as_mut() else {
+            return;
+        };
+        let screen = frame.area();
+        let width = 52u16.min(screen.width.saturating_sub(2)).max(24);
+        let height = 7u16.min(screen.height);
+        let rect = Rect::new(
+            screen.x + screen.width.saturating_sub(width) / 2,
+            screen.y + screen.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(crate::tui::theme::BRASS))
+            .title(Span::styled(
+                " Daemon stopped ",
+                Style::default().fg(crate::tui::theme::BRASS),
+            ));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        frame.render_widget(
+            Paragraph::new("The daemon stopped unexpectedly. Restart it?")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(crate::tui::theme::INK)),
+            Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+        );
+
+        let restart_width = 11u16;
+        let quit_width = 8u16;
+        let gap = 1u16;
+        let actions_width = restart_width + gap + quit_width;
+        let actions_x = inner.x + inner.width.saturating_sub(actions_width) / 2;
+        let actions_y = inner.bottom().saturating_sub(2);
+        prompt.restart_rect = Rect::new(actions_x, actions_y, restart_width, 1);
+        prompt.quit_rect = Rect::new(actions_x + restart_width + gap, actions_y, quit_width, 1);
+        let focused = |selected: bool, primary: bool| {
+            if selected {
+                Style::default()
+                    .fg(if primary {
+                        crate::tui::theme::BRASS
+                    } else {
+                        crate::tui::theme::INK
+                    })
+                    .bg(crate::tui::theme::HOVER_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else if primary {
+                Style::default()
+                    .fg(crate::tui::theme::BRASS)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(crate::tui::theme::FOG)
+            }
+        };
+        frame.render_widget(
+            Paragraph::new("[ Restart ]").style(focused(
+                prompt.focus == super::DaemonRestartFocus::Restart,
+                true,
+            )),
+            prompt.restart_rect,
+        );
+        frame.render_widget(
+            Paragraph::new("[ Quit ]").style(focused(
+                prompt.focus == super::DaemonRestartFocus::Quit,
+                false,
+            )),
+            prompt.quit_rect,
+        );
     }
 
     /// Render the below-input pin-count indicator (`pinned-messages`):

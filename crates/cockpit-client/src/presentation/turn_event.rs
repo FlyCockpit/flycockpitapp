@@ -101,6 +101,9 @@ pub enum TurnEvent {
     },
     /// The TUI lost its daemon socket and is retrying the local link.
     DaemonLinkReconnecting { restarting: bool, attempt: u32 },
+    /// The receipt-bound process watch or an unannounced socket EOF observed
+    /// daemon death. The TUI must hold recovery behind an explicit decision.
+    DaemonRestartPrompt,
     /// The TUI reattached to the daemon after a socket drop. The attach
     /// snapshot starts a new worker-local model-generation epoch even when
     /// the durable session id is unchanged.

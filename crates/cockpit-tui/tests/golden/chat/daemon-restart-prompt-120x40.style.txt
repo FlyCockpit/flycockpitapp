@@ -1,0 +1,42 @@
+# style runs: count:fg/bg/mod  (mod is - or BOLD+DIM+…)
+120x40
+0	120:Reset/Reset/-
+1	120:Reset/Reset/-
+2	120:Reset/Reset/-
+3	120:Reset/Reset/-
+4	120:Reset/Reset/-
+5	120:Reset/Reset/-
+6	120:Reset/Reset/-
+7	120:Reset/Reset/-
+8	120:Reset/Reset/-
+9	120:Reset/Reset/-
+10	120:Reset/Reset/-
+11	120:Reset/Reset/-
+12	120:Reset/Reset/-
+13	120:Reset/Reset/-
+14	120:Reset/Reset/-
+15	120:Reset/Reset/-
+16	34:Reset/Reset/- 52:Rgb(224,177,86)/Reset/- 34:Reset/Reset/-
+17	34:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 50:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 34:Reset/Reset/-
+18	34:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 50:Rgb(244,239,230)/Reset/- 1:Rgb(224,177,86)/Reset/- 34:Reset/Reset/-
+19	34:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 50:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 34:Reset/Reset/-
+20	34:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 15:Reset/Reset/- 11:Rgb(224,177,86)/Rgb(44,56,70)/BOLD 1:Reset/Reset/- 8:Rgb(138,155,176)/Reset/- 15:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 34:Reset/Reset/-
+21	34:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 50:Reset/Reset/- 1:Rgb(224,177,86)/Reset/- 34:Reset/Reset/-
+22	34:Reset/Reset/- 52:Rgb(224,177,86)/Reset/- 34:Reset/Reset/-
+23	120:Reset/Reset/-
+24	120:Reset/Reset/-
+25	120:Reset/Reset/-
+26	120:Reset/Reset/-
+27	120:Reset/Reset/-
+28	120:Reset/Reset/-
+29	120:Reset/Reset/-
+30	120:Reset/Reset/-
+31	120:Reset/Reset/-
+32	120:Reset/Reset/-
+33	120:Reset/Reset/-
+34	120:Reset/Reset/-
+35	120:Reset/Reset/-
+36	120:Reset/Reset/-
+37	120:Reset/Reset/-
+38	120:Reset/Reset/-
+39	11:Indexed(109)/Reset/- 109:Reset/Reset/-

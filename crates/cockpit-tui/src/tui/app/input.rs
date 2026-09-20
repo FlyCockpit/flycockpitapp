@@ -450,6 +450,10 @@ impl App {
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
+        if self.daemon_restart_prompt.is_some() {
+            self.handle_daemon_restart_prompt_key(key);
+            return false;
+        }
         if key.code == KeyCode::Esc && self.cancel_queued_message_edit() {
             return false;
         }
@@ -478,6 +482,56 @@ impl App {
             }
         }
         exit
+    }
+
+    fn handle_daemon_restart_prompt_key(&mut self, key: KeyEvent) {
+        let Some(prompt) = self.daemon_restart_prompt.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Left | KeyCode::BackTab | KeyCode::Char('r') => {
+                prompt.focus = super::DaemonRestartFocus::Restart;
+                if matches!(key.code, KeyCode::Char('r')) {
+                    self.accept_daemon_restart();
+                }
+            }
+            KeyCode::Right | KeyCode::Tab => prompt.focus = super::DaemonRestartFocus::Quit,
+            KeyCode::Char('q') | KeyCode::Esc => self.quit_after_daemon_stop(),
+            KeyCode::Enter => match prompt.focus {
+                super::DaemonRestartFocus::Restart => self.accept_daemon_restart(),
+                super::DaemonRestartFocus::Quit => self.quit_after_daemon_stop(),
+            },
+            _ => {}
+        }
+    }
+
+    pub(super) fn accept_daemon_restart(&mut self) {
+        let Some(runner) = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+        else {
+            self.show_toast("Daemon restart is unavailable", super::ToastKind::Error);
+            return;
+        };
+        match runner.daemon_restart_tx.try_send(()) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                self.daemon_restart_prompt = None;
+                self.daemon_link = Some(super::DaemonLinkStatus {
+                    restarting: true,
+                    attempt: 1,
+                    started_at: Instant::now(),
+                });
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                self.show_toast("Daemon restart is unavailable", super::ToastKind::Error);
+            }
+        }
+    }
+
+    pub(super) fn quit_after_daemon_stop(&mut self) {
+        self.daemon_restart_prompt = None;
+        self.exit_requested = true;
     }
 
     /// The single precedence funnel for the chat shell's overlapping key

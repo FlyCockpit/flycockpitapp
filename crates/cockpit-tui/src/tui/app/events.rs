@@ -532,23 +532,36 @@ impl App {
             TurnEvent::DaemonLinkReconnecting {
                 restarting,
                 attempt,
-            } => match &mut self.daemon_link {
-                Some(status) => {
-                    status.restarting = restarting;
-                    status.attempt = attempt;
+            } => {
+                if let Overlay::SessionSetup(pane) = &mut self.overlay {
+                    pane.set_error("Reconnecting to daemon…");
                 }
-                None => {
-                    self.daemon_link = Some(super::DaemonLinkStatus {
-                        restarting,
-                        attempt,
-                        started_at: Instant::now(),
-                    });
+                if let Some(pane) = self.session_setup_inline.as_mut() {
+                    pane.set_error("Reconnecting to daemon…");
                 }
-            },
+                match &mut self.daemon_link {
+                    Some(status) => {
+                        status.restarting = restarting;
+                        status.attempt = attempt;
+                    }
+                    None => {
+                        self.daemon_link = Some(super::DaemonLinkStatus {
+                            restarting,
+                            attempt,
+                            started_at: Instant::now(),
+                        });
+                    }
+                }
+            }
             TurnEvent::DaemonLinkReconnected { .. } => {
                 if self.daemon_link.take().is_some() {
                     self.daemon_draining = false;
                 }
+            }
+            TurnEvent::DaemonRestartPrompt => {
+                self.daemon_link = None;
+                self.daemon_draining = false;
+                self.daemon_restart_prompt = Some(super::DaemonRestartPrompt::default());
             }
             TurnEvent::DaemonLinkResynced { .. } => {}
             TurnEvent::DaemonLinkTerminal { .. } => {
@@ -714,6 +727,12 @@ impl App {
                 attempt,
             } => {
                 self.finalize_pending();
+                if let Overlay::SessionSetup(pane) = &mut self.overlay {
+                    pane.set_error("Reconnecting to daemon…");
+                }
+                if let Some(pane) = self.session_setup_inline.as_mut() {
+                    pane.set_error("Reconnecting to daemon…");
+                }
                 match &mut self.daemon_link {
                     Some(status) => {
                         status.restarting = restarting;
@@ -728,7 +747,21 @@ impl App {
                     }
                 }
             }
+            TurnEvent::DaemonRestartPrompt => {
+                self.daemon_link = None;
+                self.daemon_draining = false;
+                self.finalize_pending();
+                self.end_working_span();
+                if let Overlay::SessionSetup(pane) = &mut self.overlay {
+                    pane.set_error("Daemon stopped; choose Restart or Quit.");
+                }
+                if let Some(pane) = self.session_setup_inline.as_mut() {
+                    pane.set_error("Daemon stopped; choose Restart or Quit.");
+                }
+                self.daemon_restart_prompt = Some(super::DaemonRestartPrompt::default());
+            }
             TurnEvent::DaemonLinkReconnected { active_model_state } => {
+                self.daemon_restart_prompt = None;
                 self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
@@ -747,6 +780,7 @@ impl App {
                 self.invalidate_session_rail_for_reconnect();
             }
             TurnEvent::DaemonLinkTerminal { error } => {
+                self.daemon_restart_prompt = None;
                 self.cancel_model_controls_for_terminal_link();
                 self.daemon_link = None;
                 self.daemon_draining = false;

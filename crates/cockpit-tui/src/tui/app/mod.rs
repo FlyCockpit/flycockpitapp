@@ -43,6 +43,8 @@ pub(crate) use response_metrics_tokenizer::{TokenizerConfirmOutcome, TokenizerCo
 pub(crate) use response_metrics_tokenizer::{
     response_metrics_tokenizer_choices, response_metrics_tokenizer_help,
 };
+#[cfg(test)]
+mod composer_model_menu_input_tests;
 mod local_commands;
 mod model_controls;
 #[cfg(test)]
@@ -2714,10 +2716,7 @@ pub struct App {
     /// Provider whose model editor was opened from the picker. Closing the
     /// editor restores the picker immediately; a later daemon snapshot may
     /// refresh that still-open picker's inventory exactly once.
-    pub(super) reopen_composer_model_after_add_model: Option<String>,
     pub(super) reopen_composer_model_after_settings: Option<String>,
-    pub(super) reopen_composer_model_draft_after_settings:
-        Option<cockpit_config::providers::ActiveModelRef>,
     pub(super) refresh_reopened_composer_model_after_settings: Option<String>,
     /// A send opened the model picker; after a confirmed choice, rerun the
     /// untouched composer through the normal submit path and hold it behind
@@ -4247,9 +4246,7 @@ impl App {
             default_model_settings_mode: false,
             pending_default_model_update_id: None,
             retry_model_selections: HashMap::new(),
-            reopen_composer_model_after_add_model: None,
             reopen_composer_model_after_settings: None,
-            reopen_composer_model_draft_after_settings: None,
             refresh_reopened_composer_model_after_settings: None,
             submit_after_model_selection: false,
             next_control_request_seq: 0,

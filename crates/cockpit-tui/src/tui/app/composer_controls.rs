@@ -618,6 +618,7 @@ impl App {
     pub(super) fn close_composer_picker(&mut self) {
         self.default_model_settings_mode = false;
         self.submit_after_model_selection = false;
+        self.refresh_reopened_composer_model_after_settings = None;
         self.invalidate_composer_control_ownership(false, true);
     }
 
@@ -1110,7 +1111,11 @@ impl App {
         let Some(provider) = self.reopen_composer_model_after_settings.take() else {
             return false;
         };
+        let preserve_default_only = self.default_model_settings_mode;
         self.open_composer_picker_from_chord(ComposerControlKind::Model);
+        if preserve_default_only {
+            self.default_model_settings_mode = true;
+        }
         let current = current_id_for(ComposerControlKind::Model, self);
         if let Some(picker) = self.composer_controls.picker.as_mut()
             && let Some(category) = picker

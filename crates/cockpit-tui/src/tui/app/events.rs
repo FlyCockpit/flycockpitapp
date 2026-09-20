@@ -2765,14 +2765,6 @@ impl App {
         // by an unrelated writer while the add-model settings dialog remains
         // open must update the held config, but must not consume the causal
         // reopen marker or rebuild the hidden picker underneath the dialog.
-        if !self.dialog.is_active()
-            && let Some(provider) = self.reopen_composer_model_after_add_model.take()
-        {
-            self.open_composer_model_menu_for_provider(&provider);
-            if let Some(draft) = self.reopen_composer_model_draft_after_settings.take() {
-                self.restore_composer_model_menu_selection(&draft);
-            }
-        }
         if let Some(provider) = self.refresh_reopened_composer_model_after_settings.take()
             && self
                 .composer_controls

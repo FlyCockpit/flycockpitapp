@@ -738,15 +738,8 @@ impl App {
             self.invalidate_primary_paste();
             self.sync_mouse_capture_from_dialog();
             self.resync_config_after_local_write();
-            if self.reopen_composer_model_after_provider_settings() {
-                self.reopen_composer_model_draft_after_settings = None;
-            } else if let Some(provider) = self.reopen_composer_model_after_add_model.take() {
-                self.open_composer_model_menu_for_provider(&provider);
-                if let Some(draft) = self.reopen_composer_model_draft_after_settings.take() {
-                    self.restore_composer_model_menu_selection(&draft);
-                }
-                self.refresh_reopened_composer_model_after_settings = Some(provider);
-            } else if open_default_model_from_settings {
+            self.reopen_composer_model_after_provider_settings();
+            if open_default_model_from_settings {
                 self.open_default_model_from_settings();
             }
         }

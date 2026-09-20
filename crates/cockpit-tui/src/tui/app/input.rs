@@ -996,20 +996,7 @@ impl App {
                 // cancel, so never make picker restoration depend on a push.
                 // If a changed snapshot already restored it, the marker is
                 // gone and this is a no-op.
-                if self.reopen_composer_model_after_provider_settings() {
-                    self.reopen_composer_model_draft_after_settings = None;
-                } else if let Some(provider) = self.reopen_composer_model_after_add_model.take() {
-                    self.open_composer_model_menu_for_provider(&provider);
-                    if let Some(draft) = self.reopen_composer_model_draft_after_settings.take() {
-                        self.restore_composer_model_menu_selection(&draft);
-                    }
-                    // A save may close before the daemon's changed snapshot
-                    // arrives. Keep a refresh marker only while this picker
-                    // remains open; the correlated/newer snapshot rebuilds
-                    // its inventory without unexpectedly reopening a picker
-                    // the user has since dismissed.
-                    self.refresh_reopened_composer_model_after_settings = Some(provider);
-                }
+                self.reopen_composer_model_after_provider_settings();
                 if open_default_model_from_settings {
                     self.open_default_model_from_settings();
                 }

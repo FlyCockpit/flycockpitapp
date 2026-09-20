@@ -141,7 +141,8 @@ Opened from the model pill, `Ctrl+P`, or `/model`. The session rail stays visibl
 | --- | --- | --- |
 | `↑/↓` | move | highlight a provider or model |
 | `Enter` | choose | drill into a provider or switch to the highlighted model |
-| `Ctrl+Enter` | default | set the highlighted model as the default for new sessions (settings default-model flow) |
+| `Ctrl+Enter` | default | set the highlighted model as the session model and save it as the default for new sessions |
+| `Enter` (settings default-model flow) | default only | while choosing from Settings → default model, set the default for new sessions without switching this session |
 | `Esc` | back / close | go up a level or dismiss the menu without changing the model |
 
 ## Settings

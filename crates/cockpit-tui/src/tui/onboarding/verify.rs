@@ -52,6 +52,11 @@ impl VerifyScreen {
     pub(crate) fn settlement(&self) -> Option<&ProviderSettlementEvidence> {
         self.settlement.as_ref()
     }
+    pub(crate) fn update_settlement_generation(&mut self, config_generation: u64) {
+        if let Some(settlement) = &mut self.settlement {
+            settlement.config_generation = config_generation;
+        }
+    }
     pub(crate) fn phase(&self) -> &VerifyPhase {
         &self.phase
     }

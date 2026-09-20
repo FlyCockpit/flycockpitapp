@@ -9815,6 +9815,7 @@ fn oversized_provider_model_fetch_response_is_rejected_before_persistence() {
             verification: None,
         }],
         config: crate::daemon::proto::ProviderConfigView::default(),
+        config_generation: u64::MAX,
     };
     let error = bounded_provider_response(response).expect_err("oversized fetch response");
     assert_eq!(error.code, ErrorCode::BadRequest);

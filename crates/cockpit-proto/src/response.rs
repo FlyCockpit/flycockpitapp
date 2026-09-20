@@ -680,6 +680,10 @@ pub enum Response {
     ProviderModelsFetched {
         results: Vec<ProviderModelFetchResult>,
         config: ProviderConfigView,
+        /// Config authority after any fetched catalog was durably published.
+        /// Older archived fixtures predate this field.
+        #[serde(default)]
+        config_generation: u64,
     },
     ProviderUsageSnapshot {
         snapshots: Vec<ProviderUsageSnapshotView>,

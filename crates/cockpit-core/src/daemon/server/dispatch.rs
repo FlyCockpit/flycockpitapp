@@ -288,6 +288,11 @@ async fn validate_onboarding_stage_settlement(
                 .ok_or_else(|| {
                     bad_request("provider advance requires a settled mutation intent hash")
                 })?;
+            let mutation_config_generation = settlement
+                .provider_mutation_config_generation
+                .ok_or_else(|| {
+                    bad_request("provider advance requires the provider mutation config generation")
+                })?;
             let (identity, response_json) = validate_terminal_local_operation_settlement(
                 ctx,
                 owner,
@@ -306,7 +311,7 @@ async fn validate_onboarding_stage_settlement(
                     status: proto::ConfigCommitStatus::Committed,
                     ..
                 } if client_operation_id == operation_id
-                    && config_generation == settlement.config_generation
+                    && config_generation == mutation_config_generation
                     && committed_intent_hash == mutation_intent_hash
                     && upserted_provider_ids.iter().any(|id| id == provider_id) =>
                 {
@@ -23759,6 +23764,7 @@ pub(super) async fn provider_models_fetch(
         return bounded_provider_response(Response::ProviderModelsFetched {
             results: Vec::new(),
             config: crate::secret_ref::redact_provider_view(&config),
+            config_generation: inventory::current_config_generation(),
         });
     }
     // Owner-scoped resolution: model-fetch requests may only resolve `$secret:`
@@ -24020,11 +24026,14 @@ pub(super) async fn provider_models_fetch(
     // Build and bound the exact response before any persistence. Otherwise a
     // large fetched catalog could become durable while the caller receives an
     // error and therefore cannot distinguish a safe retry from a replay.
+    // Size-check the worst-case generation width before any durable write.
+    // The exact generation is installed after publication below.
     let response = Response::ProviderModelsFetched {
         results,
         config: crate::secret_ref::redact_provider_view(&config),
+        config_generation: u64::MAX,
     };
-    let response =
+    let mut response =
         bounded_provider_response(scrub_provider_response(response, &config, &store, &env)?)?;
     let config_changed =
         !changed_provider_ids.is_empty() || on_unlisted.is_some_and(|_| !aggregate_fetch_failed);
@@ -24045,9 +24054,19 @@ pub(super) async fn provider_models_fetch(
             on_unlisted,
         )?;
     }
-    if config_changed {
-        inventory::publish_committed_config_generation();
-    }
+    let config_generation = if config_changed {
+        inventory::publish_committed_config_generation()
+    } else {
+        inventory::current_config_generation()
+    };
+    let Response::ProviderModelsFetched {
+        config_generation: response_generation,
+        ..
+    } = &mut response
+    else {
+        unreachable!("provider model fetch built the wrong response")
+    };
+    *response_generation = config_generation;
     Ok(response)
 }
 

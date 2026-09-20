@@ -1320,6 +1320,12 @@ impl App {
             AsyncActionKind::DaemonRpc("onboarding.provider.verify") => match result.payload {
                 Ok(AsyncActionPayload::StartupProviderVerification(completion)) => {
                     if let Some(shell) = self.onboarding_shell.as_mut() {
+                        if let Some(config_generation) = completion.config_generation {
+                            shell.update_provider_settlement_generation(
+                                &completion.provider_id,
+                                config_generation,
+                            );
+                        }
                         match completion.outcome {
                             Ok(outcome) => shell.apply_provider_verification(
                                 &completion.provider_id,

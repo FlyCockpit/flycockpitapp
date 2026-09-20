@@ -63,7 +63,7 @@ async fn fetch_onboarding_provider_models(
     client: &cockpit_client::DaemonClient,
     project_root: &str,
     provider_id: &str,
-) -> Result<crate::tui::onboarding::VerifyOutcome, String> {
+) -> Result<(crate::tui::onboarding::VerifyOutcome, u64), String> {
     use cockpit_proto::{ProviderModelFetchOutcome, Request, Response};
     let response = client
         .request(Request::FetchProviderModels {
@@ -77,14 +77,19 @@ async fn fetch_onboarding_provider_models(
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
-    let Response::ProviderModelsFetched { mut results, .. } = response else {
+    let Response::ProviderModelsFetched {
+        mut results,
+        config_generation,
+        ..
+    } = response
+    else {
         return Err("daemon returned the wrong provider verification response".into());
     };
     let result = results
         .pop()
         .ok_or_else(|| "daemon returned no provider verification result".to_string())?;
     if let Some(verification) = result.verification {
-        return Ok(match verification {
+        let outcome = match verification {
             cockpit_proto::ProviderModelVerification::NoEndpoint => {
                 crate::tui::onboarding::VerifyOutcome::NoEndpoint
             }
@@ -103,9 +108,10 @@ async fn fetch_onboarding_provider_models(
             cockpit_proto::ProviderModelVerification::Parse { message } => {
                 crate::tui::onboarding::VerifyOutcome::Parse(message)
             }
-        });
+        };
+        return Ok((outcome, config_generation));
     }
-    Ok(match result.outcome {
+    let outcome = match result.outcome {
         ProviderModelFetchOutcome::Models { models, .. }
         | ProviderModelFetchOutcome::FallbackAvailable { models, .. } => {
             crate::tui::onboarding::VerifyOutcome::Models(
@@ -118,52 +124,11 @@ async fn fetch_onboarding_provider_models(
                 "the fetched catalog requires an unlisted-model decision".into(),
             )
         }
-        ProviderModelFetchOutcome::Error { message } => classify_provider_fetch_error(&message),
-    })
-}
-
-fn classify_provider_fetch_error(message: &str) -> crate::tui::onboarding::VerifyOutcome {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("401") || lower.contains("unauthorized") {
-        crate::tui::onboarding::VerifyOutcome::Unauthorized(401)
-    } else if lower.contains("403") || lower.contains("forbidden") {
-        crate::tui::onboarding::VerifyOutcome::Unauthorized(403)
-    } else if lower.contains("404") || lower.contains("not found") {
-        crate::tui::onboarding::VerifyOutcome::NotFound
-    } else if lower.contains("json") || lower.contains("model array") || lower.contains("parse") {
-        crate::tui::onboarding::VerifyOutcome::Parse(bounded_provider_snippet(message))
-    } else if lower.contains("dns")
-        || lower.contains("tls")
-        || lower.contains("connect")
-        || lower.contains("timeout")
-        || lower.contains("request")
-    {
-        crate::tui::onboarding::VerifyOutcome::Network(bounded_provider_snippet(message))
-    } else {
-        let status = message
-            .split(|character: char| !character.is_ascii_digit())
-            .find_map(|part| {
-                (part.len() == 3)
-                    .then(|| part.parse::<u16>().ok())
-                    .flatten()
-            })
-            .unwrap_or(500);
-        crate::tui::onboarding::VerifyOutcome::HttpStatus {
-            status,
-            snippet: bounded_provider_snippet(message),
+        ProviderModelFetchOutcome::Error { .. } => {
+            return Err("daemon omitted provider verification categorization".into());
         }
-    }
-}
-
-fn bounded_provider_snippet(message: &str) -> String {
-    let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= 200 {
-        flat
-    } else {
-        let mut bounded = flat.chars().take(200).collect::<String>();
-        bounded.push('…');
-        bounded
-    }
+    };
+    Ok((outcome, config_generation))
 }
 
 async fn retry_onboarding_ready_construction_snapshot(
@@ -1552,8 +1517,13 @@ impl App {
                 else {
                     return Err("daemon returned the wrong provider mutation response".to_string());
                 };
-                let outcome =
-                    fetch_onboarding_provider_models(&client, &project_root, &provider_id).await;
+                let (outcome, verification_generation) =
+                    match fetch_onboarding_provider_models(&client, &project_root, &provider_id)
+                        .await
+                    {
+                        Ok((outcome, generation)) => (Ok(outcome), Some(generation)),
+                        Err(error) => (Err(error), None),
+                    };
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::StartupProviderVerification(
                         crate::tui::onboarding::ProviderVerificationCompletion {
@@ -1562,8 +1532,11 @@ impl App {
                             settlement: Some(crate::tui::onboarding::ProviderSettlementEvidence {
                                 operation_id: client_operation_id,
                                 mutation_intent_hash,
-                                config_generation,
+                                mutation_config_generation: config_generation,
+                                config_generation: verification_generation
+                                    .unwrap_or(config_generation),
                             }),
+                            config_generation: verification_generation,
                         },
                     ),
                 )
@@ -1589,14 +1562,20 @@ impl App {
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
                     .map_err(|error| error.to_string())?;
-                let outcome =
-                    fetch_onboarding_provider_models(&client, &project_root, &provider_id).await;
+                let (outcome, config_generation) =
+                    match fetch_onboarding_provider_models(&client, &project_root, &provider_id)
+                        .await
+                    {
+                        Ok((outcome, generation)) => (Ok(outcome), Some(generation)),
+                        Err(error) => (Err(error), None),
+                    };
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::StartupProviderVerification(
                         crate::tui::onboarding::ProviderVerificationCompletion {
                             provider_id,
                             outcome,
                             settlement: None,
+                            config_generation,
                         },
                     ),
                 )
@@ -2060,6 +2039,7 @@ impl App {
                     settlement_operation_id: apply_operation_id,
                     provider_id: None,
                     mutation_intent_hash: None,
+                    provider_mutation_config_generation: None,
                     wizard_id: Some(cockpit_core::wizard::MODEL_SETUP_WIZARD_ID.to_string()),
                     config_generation,
                 };

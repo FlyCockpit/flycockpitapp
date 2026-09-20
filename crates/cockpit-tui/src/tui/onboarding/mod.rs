@@ -73,6 +73,7 @@ use verify::VerifyScreen;
 pub(crate) struct ProviderSettlementEvidence {
     pub operation_id: String,
     pub mutation_intent_hash: String,
+    pub mutation_config_generation: u64,
     pub config_generation: u64,
 }
 
@@ -81,6 +82,7 @@ pub(crate) struct ProviderVerificationCompletion {
     pub provider_id: String,
     pub outcome: Result<VerifyOutcome, String>,
     pub settlement: Option<ProviderSettlementEvidence>,
+    pub config_generation: Option<u64>,
 }
 
 pub use secure_store::SecureStoreSubmission;
@@ -851,6 +853,18 @@ impl OnboardingShell {
         }
     }
 
+    pub(crate) fn update_provider_settlement_generation(
+        &mut self,
+        provider_id: &str,
+        config_generation: u64,
+    ) {
+        if let OnboardingScreen::Verify(screen) = &mut self.screen
+            && screen.provider_id() == provider_id
+        {
+            screen.update_settlement_generation(config_generation);
+        }
+    }
+
     pub(crate) fn onboarding_oauth_provider(&self) -> Option<crate::tui::settings::OAuthProvider> {
         match &self.screen {
             OnboardingScreen::Authenticate(screen) => screen.oauth_provider(),
@@ -970,6 +984,7 @@ impl OnboardingShell {
             settlement_operation_id: evidence.operation_id.clone(),
             provider_id: Some(screen.provider_id().to_string()),
             mutation_intent_hash: Some(evidence.mutation_intent_hash.clone()),
+            provider_mutation_config_generation: Some(evidence.mutation_config_generation),
             wizard_id: None,
             config_generation: evidence.config_generation,
         })

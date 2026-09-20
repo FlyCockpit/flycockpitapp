@@ -6244,6 +6244,7 @@ impl Dialog {
             settlement_operation_id: operation_id,
             provider_id: Some(provider_id),
             mutation_intent_hash: Some(mutation_intent_hash),
+            provider_mutation_config_generation: Some(config_generation),
             wizard_id: None,
             config_generation,
         })

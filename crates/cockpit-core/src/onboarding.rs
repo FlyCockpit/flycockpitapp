@@ -1011,6 +1011,7 @@ mod tests {
                                 settlement_operation_id: "provider-settled".into(),
                                 provider_id: Some("provider".into()),
                                 mutation_intent_hash: Some("aa".repeat(32)),
+                                provider_mutation_config_generation: Some(1),
                                 wizard_id: None,
                                 config_generation: 1,
                             }),

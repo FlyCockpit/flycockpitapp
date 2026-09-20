@@ -2275,7 +2275,7 @@ fn selection_save_row(
     page: &SidecarPage,
     can_mutate: bool,
     mutate_reason: Option<&'static str>,
-) -> (String, SidecarBinding) {
+) -> (&'static str, SidecarBinding) {
     let reason = if !can_mutate {
         mutate_reason
     } else if page.session.requires_reload_before_reapply() {
@@ -2288,7 +2288,7 @@ fn selection_save_row(
         None
     };
     (
-        "Save changes".into(),
+        "Save changes",
         Some((SidecarAction::SaveSelection, reason.is_none(), reason)),
     )
 }

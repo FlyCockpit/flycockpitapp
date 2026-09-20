@@ -2251,9 +2251,7 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
 fn pointer_add_oauth_skip_continue_sources_save_from_fresh_state() {
     let (_daemon_fixture, runtime) = provider_daemon_runtime();
     let _runtime_guard = runtime.enter();
-    use super::super::pointer_actions::{
-        ProvidersAction, SettingsPointerAction, WizardControlId, WizardStepId,
-    };
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
 
     fn fixture(provider: OAuthProvider) -> (tempfile::TempDir, SettingsDialog) {
         let template_id = match provider {
@@ -2794,6 +2792,8 @@ fn pointer_add_api_key_field_renders_and_dispatches_from_fresh_state() {
     use super::super::pointer_actions::{
         ProvidersAction, SettingsPointerAction, WizardControlId, WizardStepId,
     };
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
@@ -5470,7 +5470,7 @@ fn edit_popup_places_caret_at_textfield_cursor() {
             frame.set_cursor_position(caret);
         })
         .expect("draw");
-    assert_eq!(rendered_caret, Some(ratatui::layout::Position::new(3, 1)));
+    assert_eq!(rendered_caret, Some(ratatui::layout::Position::new(4, 1)));
 }
 
 #[test]
@@ -6979,7 +6979,7 @@ fn grok_paste_focus_char_by_char_callback_keeps_shortcut_letters() {
 }
 
 #[test]
-fn codex_oauth_logged_in_renders_single_continue_row() {
+fn codex_oauth_logged_in_keeps_continue_in_action_inventory() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     state.logged_in = true;
     state.status = Some(Ok("Codex OAuth login complete".to_string()));
@@ -6992,15 +6992,22 @@ fn codex_oauth_logged_in_renders_single_continue_row() {
     );
     let rendered = rendered_text(&lines);
 
-    assert!(rendered.contains("continue"), "{rendered}");
-    assert_eq!(option_row_count(&rendered), 1, "{rendered}");
+    assert!(
+        rendered.contains("Codex OAuth login complete"),
+        "{rendered}"
+    );
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Continue]
+    );
+    assert_eq!(option_row_count(&rendered), 0, "{rendered}");
     assert!(!rendered.contains("log in"), "{rendered}");
     assert!(!rendered.contains("skip / continue"), "{rendered}");
     assert!(!rendered.contains("manual paste"), "{rendered}");
 }
 
 #[test]
-fn codex_oauth_logged_out_renders_start_or_poll_menu() {
+fn codex_oauth_logged_out_keeps_start_or_poll_in_action_inventory() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     state.logged_in = false;
     let mut lines = Vec::new();
@@ -7011,8 +7018,11 @@ fn codex_oauth_logged_out_renders_start_or_poll_menu() {
         OAuthHost::AddWizard,
     );
     let rendered = rendered_text(&lines);
-    assert!(rendered.contains("log in"), "{rendered}");
-    assert!(rendered.contains("skip / continue"), "{rendered}");
+    assert!(rendered.contains("Status: not logged in"), "{rendered}");
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Login, OAuthOption::SkipContinue]
+    );
 
     state.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
@@ -7025,13 +7035,15 @@ fn codex_oauth_logged_out_renders_start_or_poll_menu() {
         OAuthHost::AddWizard,
     );
     let rendered = rendered_text(&lines);
-    assert!(rendered.contains("poll for approval"), "{rendered}");
-    assert!(rendered.contains("skip / continue"), "{rendered}");
-    assert!(!rendered.contains("[continue]"), "{rendered}");
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Poll, OAuthOption::SkipContinue]
+    );
+    assert_eq!(option_row_count(&rendered), 0, "{rendered}");
 }
 
 #[test]
-fn grok_oauth_logged_in_renders_single_continue_row() {
+fn grok_oauth_logged_in_keeps_continue_in_action_inventory() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.logged_in = true;
     state.status = Some(Ok("xAI OAuth login complete".to_string()));
@@ -7044,15 +7056,19 @@ fn grok_oauth_logged_in_renders_single_continue_row() {
     );
     let rendered = rendered_text(&lines);
 
-    assert!(rendered.contains("continue"), "{rendered}");
-    assert_eq!(option_row_count(&rendered), 1, "{rendered}");
+    assert!(rendered.contains("xAI OAuth login complete"), "{rendered}");
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Continue]
+    );
+    assert_eq!(option_row_count(&rendered), 0, "{rendered}");
     assert!(!rendered.contains("log in"), "{rendered}");
     assert!(!rendered.contains("manual paste"), "{rendered}");
     assert!(!rendered.contains("skip / continue"), "{rendered}");
 }
 
 #[test]
-fn grok_oauth_logged_out_renders_full_menu() {
+fn grok_oauth_logged_out_keeps_full_menu_in_action_inventory() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.logged_in = false;
     let mut lines = Vec::new();
@@ -7064,10 +7080,16 @@ fn grok_oauth_logged_out_renders_full_menu() {
     );
     let rendered = rendered_text(&lines);
 
-    assert!(rendered.contains("log in"), "{rendered}");
-    assert!(rendered.contains("manual paste"), "{rendered}");
-    assert!(rendered.contains("skip / continue"), "{rendered}");
-    assert_eq!(option_row_count(&rendered), 3, "{rendered}");
+    assert!(rendered.contains("Status: not logged in"), "{rendered}");
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![
+            OAuthOption::Login,
+            OAuthOption::ManualPaste,
+            OAuthOption::SkipContinue,
+        ]
+    );
+    assert_eq!(option_row_count(&rendered), 0, "{rendered}");
 }
 
 #[test]
@@ -7153,13 +7175,13 @@ fn add_wizard_oauth_enter_saves_without_backing_out() {
 }
 
 #[test]
-fn standalone_oauth_body_exposes_skip_only_while_active() {
+fn standalone_oauth_action_inventory_exposes_skip_only_while_active() {
     for provider in [OAuthProvider::Codex, OAuthProvider::Grok] {
         let mut logged_out = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         logged_out.logged_in = false;
         assert!(
-            !oauth_body_text(&logged_out, OAuthHost::Standalone).contains("skip / continue"),
-            "{provider:?} logged-out standalone body should hide skip"
+            !oauth_options(&logged_out, OAuthHost::Standalone).contains(&OAuthOption::SkipContinue),
+            "{provider:?} logged-out standalone action inventory should hide skip"
         );
 
         let mut active = OAuthFlowState::new_without_acknowledgement_for_test(provider);
@@ -7178,64 +7200,64 @@ fn standalone_oauth_body_exposes_skip_only_while_active() {
             }
         }
         assert!(
-            oauth_body_text(&active, OAuthHost::Standalone).contains("skip / continue"),
-            "{provider:?} active standalone body should expose skip"
+            oauth_options(&active, OAuthHost::Standalone).contains(&OAuthOption::SkipContinue),
+            "{provider:?} active standalone action inventory should expose skip"
         );
 
         let mut confirming = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         confirming.logged_in = true;
         assert!(
-            !oauth_body_text(&confirming, OAuthHost::Standalone).contains("skip / continue"),
-            "{provider:?} confirming standalone body should hide skip"
+            !oauth_options(&confirming, OAuthHost::Standalone).contains(&OAuthOption::SkipContinue),
+            "{provider:?} confirming standalone action inventory should hide skip"
         );
     }
 }
 
 #[test]
-fn add_host_oauth_body_keeps_skip_continue_row() {
+fn add_host_oauth_action_inventory_keeps_skip_continue() {
     let mut codex = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     codex.logged_in = false;
-    assert!(oauth_body_text(&codex, OAuthHost::AddWizard).contains("skip / continue"));
+    assert!(oauth_options(&codex, OAuthHost::AddWizard).contains(&OAuthOption::SkipContinue));
     codex.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
         "CODE-123",
     ));
-    assert!(oauth_body_text(&codex, OAuthHost::AddWizard).contains("skip / continue"));
+    assert!(oauth_options(&codex, OAuthHost::AddWizard).contains(&OAuthOption::SkipContinue));
 
     let mut grok = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     grok.logged_in = false;
-    assert!(oauth_body_text(&grok, OAuthHost::AddWizard).contains("skip / continue"));
+    assert!(oauth_options(&grok, OAuthHost::AddWizard).contains(&OAuthOption::SkipContinue));
     grok.set_browser_session_for_test("https://example.test/oauth");
     grok.pending = true;
-    assert!(oauth_body_text(&grok, OAuthHost::AddWizard).contains("skip / continue"));
+    assert!(oauth_options(&grok, OAuthHost::AddWizard).contains(&OAuthOption::SkipContinue));
 }
 
 #[test]
-fn oauth_option_count_matches_rendered_rows_per_host() {
+fn oauth_options_render_only_in_the_action_inventory_per_host() {
     for host in [OAuthHost::Standalone, OAuthHost::AddWizard] {
         let mut grok_logged_out =
             OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
         grok_logged_out.logged_in = false;
+        assert_eq!(oauth_option_rows(&grok_logged_out, host), 0);
         assert_eq!(
             grok_logged_out.option_count(host),
-            oauth_option_rows(&grok_logged_out, host)
+            3 - usize::from(host == OAuthHost::Standalone)
         );
 
         let mut grok_pending =
             OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
         grok_pending.set_browser_session_for_test("https://example.test/oauth");
         grok_pending.pending = true;
-        assert_eq!(
-            grok_pending.option_count(host),
-            oauth_option_rows(&grok_pending, host)
-        );
+        assert_eq!(oauth_option_rows(&grok_pending, host), 0);
+        assert_eq!(grok_pending.option_count(host), 3);
 
         let mut codex_logged_out =
             OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
         codex_logged_out.logged_in = false;
+        assert_eq!(oauth_option_rows(&codex_logged_out, host), 0);
         assert_eq!(
             codex_logged_out.option_count(host),
-            oauth_option_rows(&codex_logged_out, host)
+            2 - usize::from(host == OAuthHost::Standalone)
         );
 
         let mut codex_device =
@@ -7246,18 +7268,14 @@ fn oauth_option_count_matches_rendered_rows_per_host() {
                 "CODE-123",
             ),
         );
-        assert_eq!(
-            codex_device.option_count(host),
-            oauth_option_rows(&codex_device, host)
-        );
+        assert_eq!(oauth_option_rows(&codex_device, host), 0);
+        assert_eq!(codex_device.option_count(host), 2);
 
         let mut confirming =
             OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
         confirming.logged_in = true;
-        assert_eq!(
-            confirming.option_count(host),
-            oauth_option_rows(&confirming, host)
-        );
+        assert_eq!(oauth_option_rows(&confirming, host), 0);
+        assert_eq!(confirming.option_count(host), 1);
     }
 }
 

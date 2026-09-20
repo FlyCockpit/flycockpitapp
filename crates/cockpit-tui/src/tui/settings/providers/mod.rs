@@ -1379,31 +1379,23 @@ impl SettingsDialog {
                     s.fetch = None;
                     s.fallback_commit_pending = false;
                     s.fallback_offer = fallback_offer;
-                    if let Some(reason) = validation_failure {
+                    if let Some(reason) = validation_failure.as_ref() {
                         s.validation_failure = Some(reason.clone());
-                        if let Some(screen) = s.verify.as_mut() {
-                            screen.apply(
-                                crate::tui::onboarding::VerifyOutcome::Network(reason),
-                                None,
-                            );
-                        }
-                    } else if live_validation_succeeded {
-                        if let Some(screen) = s.verify.as_mut() {
-                            if unsupported {
-                                screen
-                                    .apply(crate::tui::onboarding::VerifyOutcome::NoEndpoint, None);
-                            } else {
-                                let models = refreshed
-                                    .as_ref()
-                                    .map(|(models, _, _)| {
-                                        models.iter().map(|model| model.id.clone()).collect()
-                                    })
-                                    .unwrap_or_default();
-                                screen.apply(
-                                    crate::tui::onboarding::VerifyOutcome::Models(models),
-                                    None,
-                                );
-                            }
+                    }
+                    if let (Some(reason), Some(screen)) = (validation_failure, s.verify.as_mut()) {
+                        screen.apply(crate::tui::onboarding::VerifyOutcome::Network(reason), None);
+                    } else if live_validation_succeeded && let Some(screen) = s.verify.as_mut() {
+                        if unsupported {
+                            screen.apply(crate::tui::onboarding::VerifyOutcome::NoEndpoint, None);
+                        } else {
+                            let models = refreshed
+                                .as_ref()
+                                .map(|(models, _, _)| {
+                                    models.iter().map(|model| model.id.clone()).collect()
+                                })
+                                .unwrap_or_default();
+                            screen
+                                .apply(crate::tui::onboarding::VerifyOutcome::Models(models), None);
                         }
                     }
                     if s.is_step("fetching") {

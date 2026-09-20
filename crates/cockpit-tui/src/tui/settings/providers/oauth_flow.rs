@@ -20,28 +20,27 @@ pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSet
             "Press Enter to continue.".to_string(),
             muted,
         )));
-        return;
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Copilot authentication is managed by the Cockpit daemon.".to_string(),
+            muted,
+        )));
+        lines.push(Line::from(Span::styled(
+            "The TUI does not inspect or copy credentials and never edits shell startup files."
+                .to_string(),
+            muted,
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Ensure the daemon's environment already contains the approved Copilot credential, then retry the provider request.".to_string(),
+            muted,
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Press Enter or Esc to return.".to_string(),
+            muted,
+        )));
     }
-
-    lines.push(Line::from(Span::styled(
-        "Copilot authentication is managed by the Cockpit daemon.".to_string(),
-        muted,
-    )));
-    lines.push(Line::from(Span::styled(
-        "The TUI does not inspect or copy credentials and never edits shell startup files."
-            .to_string(),
-        muted,
-    )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "Ensure the daemon's environment already contains the approved Copilot credential, then retry the provider request.".to_string(),
-        muted,
-    )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "Press Enter or Esc to return.".to_string(),
-        muted,
-    )));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1531,25 +1530,22 @@ fn render_provider_oauth(
         lines.push(Line::default());
     }
 
-    if s.acknowledgement_required {
-        return;
-    }
+    if !s.acknowledgement_required {
+        match s.provider {
+            OAuthProvider::Grok => render_browser_callback_session(lines, s, muted, yellow, cyan),
+            OAuthProvider::Codex => render_device_code_session(lines, s, muted, yellow, cyan),
+        }
 
-    match s.provider {
-        OAuthProvider::Grok => render_browser_callback_session(lines, s, muted, yellow, cyan),
-        OAuthProvider::Codex => render_device_code_session(lines, s, muted, yellow, cyan),
-    }
-
-    if s.paste_focused {
-        lines.push(Line::from(Span::styled(
-            "Paste callback URL, ?code=...&state=..., or bare code:".to_string(),
-            muted,
-        )));
-        lines.push(Line::from(vec![
-            Span::styled(s.manual_input.text().to_string(), cyan),
-            crate::tui::settings::shell::cursor_marker_span(),
-        ]));
-        return;
+        if s.paste_focused {
+            lines.push(Line::from(Span::styled(
+                "Paste callback URL, ?code=...&state=..., or bare code:".to_string(),
+                muted,
+            )));
+            lines.push(Line::from(vec![
+                Span::styled(s.manual_input.text().to_string(), cyan),
+                crate::tui::settings::shell::cursor_marker_span(),
+            ]));
+        }
     }
 
     // OAuth options are primary controls.  Their identities are rendered by

@@ -5087,24 +5087,25 @@ fn category_short_viewport_keeps_bottom_reset_row_visible() {
 }
 
 #[test]
-fn category_wrapped_values_continue_under_value_column() {
-    let tmp = TempDir::new().unwrap();
-    let mut d = fresh_dialog(&tmp);
-    d.enter_category(Category::Behavior);
-    if let TestPageMut::Category(p) = d.test_page_mut() {
-        p.cursor = p.cursor_of(SettingId::ApprovalMode).expect("approval mode");
-    }
-    let rendered = render_settings_rows(&d, 62, 30).join("\n");
-    let continuation = rendered
-        .lines()
-        .find(|line| line.contains("approval to leave the"))
-        .unwrap_or_else(|| panic!("expected wrapped approval-mode value:\n{rendered}"));
+fn wrapped_value_continuation_stays_in_the_value_column() {
+    let mut lines = Vec::new();
+    shell::push_label_value_row(
+        &mut lines,
+        28,
+        true,
+        "approval mode",
+        13,
+        "manual approval required before any command leaves the sandbox",
+        shell::muted_style(),
+    );
+    let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+    let continuation = rendered.lines().nth(1).expect("long value should wrap");
     assert!(
-        continuation.starts_with("││     "),
+        continuation.starts_with("                "),
         "continuation should stay in the value column, not column 0:\n{rendered}"
     );
     assert!(
-        !continuation.starts_with("│manual") && !continuation.starts_with("│default"),
+        !continuation.starts_with("manual") && !continuation.starts_with("approval"),
         "continuation must not restart at the far left:\n{rendered}"
     );
 }

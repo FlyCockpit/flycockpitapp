@@ -2693,6 +2693,9 @@ pub struct App {
     pub(super) row_registry: crate::tui::button::RowControlRegistry,
     pub(super) button_surface_generation: u64,
     pub(super) last_button_frame_key: Option<(u16, u16, bool, bool)>,
+    /// Popover body rect from the latest [`Self::render`] (for acceptance tests).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) last_popover_rect: ratatui::layout::Rect,
 
     /// Mutable confirmation row for rapid agent switching before the next turn.
     pub(super) pending_agent_switch_log: Option<PendingAgentSwitchLog>,
@@ -3897,6 +3900,11 @@ impl App {
         self.dialog.is_workspace_trust()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn last_popover_rect_for_tests(&self) -> ratatui::layout::Rect {
+        self.last_popover_rect
+    }
+
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,
@@ -3910,7 +3918,10 @@ impl App {
         // current-directory, config, trust, daemon, clipboard, or export I/O.
         let launch = safe_shell_launch_info(project);
         let providers = cockpit_config::providers::ProvidersConfig::default();
-        let extended = cockpit_config::extended::ExtendedConfig::default();
+        let mut extended = cockpit_config::extended::ExtendedConfig::default();
+        if let Ok(visible) = cockpit_config::extended::load_global_session_rail_visible() {
+            extended.tui.session_rail_visible = visible;
+        }
         let config_snapshot = HeldConfig::from_view(
             0,
             false,
@@ -4095,9 +4106,7 @@ impl App {
                     false,
                     use_emojis,
                 );
-                if let Ok(visible) = cockpit_config::extended::load_global_session_rail_visible() {
-                    session_rail.set_visible(visible);
-                }
+                session_rail.set_visible(extended.tui.session_rail_visible);
                 session_rail
             },
             session_setup_inline: Some(
@@ -4241,6 +4250,8 @@ impl App {
             row_registry: crate::tui::button::RowControlRegistry::default(),
             button_surface_generation: 0,
             last_button_frame_key: None,
+            #[cfg(any(test, feature = "test-support"))]
+            last_popover_rect: ratatui::layout::Rect::default(),
 
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),

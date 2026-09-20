@@ -1684,6 +1684,25 @@ fn post_drop_trusted_restart(
     saw_draining && guard.allow(now)
 }
 
+fn push_restart_prompt_if_untrusted_drop(
+    saw_draining: bool,
+    automatic_restarts: &mut AutomaticRestartGuard,
+    now: Instant,
+    events: &Arc<Mutex<Vec<QueuedTurnEvent>>>,
+    event_notify: &Arc<Notify>,
+) -> bool {
+    let trusted_restart = post_drop_trusted_restart(saw_draining, automatic_restarts, now);
+    if !trusted_restart {
+        push_turn_event(
+            events,
+            event_notify,
+            GLOBAL_ATTACHMENT_EPOCH,
+            TurnEvent::DaemonRestartPrompt,
+        );
+    }
+    trusted_restart
+}
+
 struct AutomaticRestartGuard {
     attempts: VecDeque<Instant>,
 }
@@ -3340,16 +3359,15 @@ async fn try_spawn_inner(
                 process_watch = None;
 
                 saw_draining = absorb_late_daemon_draining(&client, saw_draining).await;
-                let trusted_restart =
-                    post_drop_trusted_restart(saw_draining, &mut automatic_restarts, Instant::now());
+                let trusted_restart = push_restart_prompt_if_untrusted_drop(
+                    saw_draining,
+                    &mut automatic_restarts,
+                    Instant::now(),
+                    &events,
+                    &event_notify,
+                );
                 let mut recovery_lifetime_client = None;
                 if !trusted_restart {
-                    push_turn_event(
-                        &events,
-                        &event_notify,
-                        GLOBAL_ATTACHMENT_EPOCH,
-                        TurnEvent::DaemonRestartPrompt,
-                    );
                     if daemon_restart_rx.recv().await.is_none() {
                         return;
                     }
@@ -8042,28 +8060,35 @@ mod tests {
 
     #[test]
     fn fourth_trusted_daemon_drop_requires_restart_prompt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
         let start = Instant::now();
-        let mut guard = AutomaticRestartGuard::new();
+        let mut automatic_restarts = AutomaticRestartGuard::new();
         for secs in [0_u64, 10, 20] {
             assert!(
-                post_drop_trusted_restart(true, &mut guard, start + Duration::from_secs(secs)),
+                push_restart_prompt_if_untrusted_drop(
+                    true,
+                    &mut automatic_restarts,
+                    start + Duration::from_secs(secs),
+                    &events,
+                    &notify,
+                ),
                 "trusted draining drop {secs}s must auto-reconnect"
             );
         }
-        let trusted = post_drop_trusted_restart(true, &mut guard, start + Duration::from_secs(30));
         assert!(
-            !trusted,
+            !push_restart_prompt_if_untrusted_drop(
+                true,
+                &mut automatic_restarts,
+                start + Duration::from_secs(30),
+                &events,
+                &notify,
+            ),
             "fourth trusted restart in one minute must present the restart decision"
         );
-        let fourth_drop_event = if trusted {
-            TurnEvent::DaemonLinkReconnecting {
-                restarting: true,
-                attempt: 1,
-            }
-        } else {
-            TurnEvent::DaemonRestartPrompt
-        };
-        assert!(matches!(fourth_drop_event, TurnEvent::DaemonRestartPrompt));
+        let drained = drain_turn_events(&events);
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(drained[0].event, TurnEvent::DaemonRestartPrompt));
     }
 
     #[tokio::test]

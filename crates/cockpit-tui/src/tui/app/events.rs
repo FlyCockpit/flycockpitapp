@@ -554,8 +554,10 @@ impl App {
                 }
             }
             TurnEvent::DaemonLinkReconnected { .. } => {
-                if self.daemon_link.take().is_some() {
-                    self.daemon_draining = false;
+                let had_link = self.daemon_link.take().is_some();
+                self.daemon_draining = false;
+                if had_link {
+                    self.show_toast("daemon reconnected", ToastKind::Success);
                 }
             }
             TurnEvent::DaemonRestartPrompt => {
@@ -773,8 +775,9 @@ impl App {
                 self.retry_parked_model_selection_after_reconnect();
                 self.retry_pending_queue_edit();
                 self.invalidate_session_rail_for_reconnect();
-                if self.daemon_link.take().is_some() {
-                    self.daemon_draining = false;
+                let had_link = self.daemon_link.take().is_some();
+                self.daemon_draining = false;
+                if had_link {
                     self.show_toast("daemon reconnected", ToastKind::Success);
                 }
             }

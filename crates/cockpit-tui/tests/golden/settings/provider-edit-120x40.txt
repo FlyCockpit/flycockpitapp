@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models › fi╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│Provider: fixture                                                                   │ │
+                              ▌ │                                                                                    │ │
+ SESSIONS                       │› URL              https://api.example.invalid/v1                                   │ │
+ no active sessions in all pr   │  Headers          (none)                                                           │ │
+                                │  Models           1 model(s)                                                       │ │
+                              no│  Settings         compact auto (shadow −10%) · nudge 60% · prune 50%/30% · cache 3 │ │
+                              ┊ │  Favorite         no                                                               │ │
+                              ▌ │  Refetch /models  1 model(s)                                                       │ │
+                                │  Deep fetch       live endpoint/context probes; confirmation required              │ █
+                                │  Delete                                                                            │ █
+                                │  Back to list                                                                      │ █
+                                │                                                                                    │ █
+                                │╭ URL ─────────────────────────────────────────────────────────────────────────────╮│ █
+                                ││ https://typed.example.invalid/v1                                                 ││ █
+                                │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+                                │                                                                                    │ █
+                                │Slow model? Open Settings for first-token/idle thresholds. Without a backup they wa │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                               ⋯│                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  type to edit  enter: apply  esc: [ Save ] [ Cancel ]│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

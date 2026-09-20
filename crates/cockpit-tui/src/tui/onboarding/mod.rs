@@ -7,9 +7,8 @@
 //!
 //! * stage authority lives in the daemon `OnboardingBootstrapSnapshot`
 //!   consumed through [`OnboardingShell::sync_snapshot`];
-//! * provider auth, validation, and config writes stay in the embedded
-//!   settings provider engine (a [`settings::Dialog`] driven through the
-//!   ordinary daemon effect plumbing);
+//! * provider auth and validation use native screens over the existing daemon
+//!   provider and OAuth operations; the TUI never owns network I/O;
 //! * every Back / Defer / Cancel / Advance intent is emitted as an
 //!   [`OnboardingShellAction`] for the app to map onto the daemon
 //!   transition RPCs. Escape never silently defers: when work is
@@ -24,6 +23,7 @@
 //! deterministic static alternative.
 
 pub(crate) mod agent;
+mod auth;
 mod chrome;
 mod lifetime;
 mod model;
@@ -32,6 +32,7 @@ mod search;
 mod secure_store;
 mod theme;
 mod ui;
+mod verify;
 pub(crate) mod welcome;
 
 #[cfg(test)]
@@ -47,6 +48,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 
 use crate::tui::settings::Dialog;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use auth::AuthPhase;
+use auth::AuthScreen;
+pub(crate) use auth::AuthSubmission;
 use chrome::ActionBar;
 use cockpit_core::providers::ProviderTemplate;
 use cockpit_proto::{
@@ -60,7 +65,25 @@ use model::ModelScreen;
 use profile::ProfileScreen;
 use search::{ProviderSearchScreen, onboarding_catalog};
 use secure_store::SecureStoreScreen;
-use theme::{BRASS, FOG, GOOD, HOVER_BG, INK, NIGHT};
+use theme::{BAD, BRASS, FOG, GOOD, HOVER_BG, INK, NIGHT};
+pub(crate) use verify::VerifyOutcome;
+use verify::VerifyScreen;
+
+#[derive(Debug, Clone)]
+pub struct ProviderSettlementEvidence {
+    pub operation_id: String,
+    pub mutation_intent_hash: String,
+    pub mutation_config_generation: u64,
+    pub config_generation: u64,
+}
+
+#[derive(Debug)]
+pub struct ProviderVerificationCompletion {
+    pub provider_id: String,
+    pub outcome: Result<VerifyOutcome, String>,
+    pub settlement: Option<ProviderSettlementEvidence>,
+    pub config_generation: Option<u64>,
+}
 
 pub use secure_store::SecureStoreSubmission;
 
@@ -116,14 +139,15 @@ fn welcome_cloud_seed() -> u64 {
     nanos ^ u64::from(std::process::id()).rotate_left(32)
 }
 
-/// The screen the shell is presenting. `EmbeddedSettings` screens delegate their
-/// content area to the app-held settings dialog (provider add wizard or
-/// setup wizard); the shell still owns chrome, navigation, and semantics.
+/// The screen the shell is presenting. `EmbeddedSettings` remains only for
+/// non-provider setup surfaces that still delegate to the app-held dialog.
 pub(crate) enum OnboardingScreen {
     Welcome,
     Profile(ProfileScreen),
     SecureStore(Box<SecureStoreScreen>),
     ProviderSearch(Box<ProviderSearchScreen>),
+    Authenticate(Box<AuthScreen>),
+    Verify(Box<VerifyScreen>),
     AgentAuthoring(Box<agent::AgentAuthoringScreen>),
     Model(Box<ModelScreen>),
     Lifetime(LifetimeScreen),
@@ -139,6 +163,8 @@ pub(crate) enum OnboardingScreenKind {
     Profile,
     SecureStore,
     ProviderSearch,
+    Authenticate,
+    Verify,
     AgentAuthoring,
     Model,
     Lifetime,
@@ -155,6 +181,8 @@ impl std::fmt::Debug for OnboardingScreen {
             Self::Profile(_) => formatter.write_str("Profile"),
             Self::SecureStore(_) => formatter.write_str("SecureStore([REDACTED])"),
             Self::ProviderSearch(_) => formatter.write_str("ProviderSearch"),
+            Self::Authenticate(_) => formatter.write_str("Authenticate([REDACTED])"),
+            Self::Verify(_) => formatter.write_str("Verify"),
             Self::AgentAuthoring(_) => formatter.write_str("AgentAuthoring"),
             Self::Model(_) => formatter.write_str("Model"),
             Self::Lifetime(_) => formatter.write_str("Lifetime"),
@@ -179,8 +207,22 @@ pub(crate) enum OnboardingShellAction {
     ApplyLifetime(bool),
     /// Apply all six native model choices through the setup-wizard authority.
     ApplyModel(cockpit_core::wizard::OnboardingModelSubmission),
-    /// Seed the provider engine with the selected canonical template.
+    /// Present native authentication for the selected canonical template.
     SelectTemplate(&'static ProviderTemplate),
+    /// Persist a provider credential and begin daemon-owned verification.
+    AuthenticateProvider {
+        template: &'static ProviderTemplate,
+        submission: AuthSubmission,
+    },
+    /// Continue a real daemon-owned OAuth state machine for the native screen.
+    OAuth(crate::tui::settings::OAuthFlowRequest),
+    /// Re-run the daemon-owned verification request.
+    RetryProviderVerification { provider_id: String },
+    /// Settle this provider stage, or loop back to the catalog.
+    FinishProvider {
+        settlement: OnboardingStageSettlement,
+        add_another: bool,
+    },
     /// Leave the "add another provider" detour and present the stored
     /// completion summary again. Purely shell-local: the daemon stage is
     /// already `Complete`.
@@ -212,6 +254,27 @@ impl std::fmt::Debug for OnboardingShellAction {
             Self::SelectTemplate(template) => formatter
                 .debug_tuple("SelectTemplate")
                 .field(&template.id)
+                .finish(),
+            Self::AuthenticateProvider { template, .. } => formatter
+                .debug_struct("AuthenticateProvider")
+                .field("template", &template.id)
+                .field("submission", &"[REDACTED]")
+                .finish(),
+            Self::OAuth(action) => formatter
+                .debug_tuple("OAuth")
+                .field(&action.provider)
+                .finish(),
+            Self::RetryProviderVerification { provider_id } => formatter
+                .debug_tuple("RetryProviderVerification")
+                .field(provider_id)
+                .finish(),
+            Self::FinishProvider {
+                settlement,
+                add_another,
+            } => formatter
+                .debug_struct("FinishProvider")
+                .field("provider_id", &settlement.provider_id)
+                .field("add_another", add_another)
                 .finish(),
             Self::ReturnToCompletion => formatter.write_str("ReturnToCompletion"),
             Self::Close => formatter.write_str("Close"),
@@ -413,7 +476,7 @@ pub struct OnboardingShell {
     /// lands, and again when the "add another provider" detour ends.
     completion_summary: Option<String>,
     /// True while the shell is in the completion screen's local "add
-    /// another provider" detour (search + provider engine). The daemon
+    /// another provider" detour (search + native auth/verify). The daemon
     /// stage stays `Complete`; Escape offers a local return instead of a
     /// daemon transition.
     completion_detour: bool,
@@ -503,10 +566,6 @@ impl OnboardingShell {
         matches!(self.screen, OnboardingScreen::Complete { .. })
     }
 
-    pub(crate) fn screen_is_embedded_provider_add(&self, engine: &Dialog) -> bool {
-        matches!(self.screen, OnboardingScreen::EmbeddedSettings) && engine.is_provider_add()
-    }
-
     pub(crate) fn screen_is_agent_authoring(&self) -> bool {
         matches!(self.screen, OnboardingScreen::AgentAuthoring(_))
     }
@@ -582,6 +641,8 @@ impl OnboardingShell {
             OnboardingScreen::Profile(_) => OnboardingScreenKind::Profile,
             OnboardingScreen::SecureStore(_) => OnboardingScreenKind::SecureStore,
             OnboardingScreen::ProviderSearch(_) => OnboardingScreenKind::ProviderSearch,
+            OnboardingScreen::Authenticate(_) => OnboardingScreenKind::Authenticate,
+            OnboardingScreen::Verify(_) => OnboardingScreenKind::Verify,
             OnboardingScreen::AgentAuthoring(_) => OnboardingScreenKind::AgentAuthoring,
             OnboardingScreen::Model(_) => OnboardingScreenKind::Model,
             OnboardingScreen::Lifetime(_) => OnboardingScreenKind::Lifetime,
@@ -725,8 +786,8 @@ impl OnboardingShell {
     }
 
     /// Enter the completion screen's local "add another provider" detour:
-    /// the searchable catalog (and, after a selection, the provider
-    /// engine) with a shell-local return path. The daemon stage stays
+    /// the searchable catalog and native authentication/verification screens
+    /// with a shell-local return path. The daemon stage stays
     /// `Complete`; the added provider settles through the ordinary
     /// provider mutation authority, not an onboarding transition.
     pub(crate) fn begin_completion_provider_detour(&mut self, status: Option<String>) {
@@ -737,15 +798,195 @@ impl OnboardingShell {
         self.escape = None;
     }
 
-    /// Return to the provider catalog. Used when a provider engine mounted
-    /// from the `Provider` stage abandons its Add page. The completion
-    /// detour flag is preserved: abandoning the detour's engine stays
-    /// inside the detour, whose Escape offers a local return.
+    /// Return to the provider catalog while preserving completion-detour state.
     pub(crate) fn present_provider_search(&mut self, status: Option<String>) {
         let mut screen = ProviderSearchScreen::new();
         screen.set_status(status);
         self.screen = OnboardingScreen::ProviderSearch(Box::new(screen));
         self.escape = None;
+    }
+
+    pub(crate) fn present_authenticate(&mut self, template: &'static ProviderTemplate) {
+        self.screen = OnboardingScreen::Authenticate(Box::new(AuthScreen::new(template)));
+        self.escape = None;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_auth_phase_for_golden(&mut self, phase: AuthPhase) {
+        if let OnboardingScreen::Authenticate(screen) = &mut self.screen {
+            screen.set_phase_for_golden(phase);
+        }
+    }
+
+    pub(crate) fn present_verify(&mut self, provider_id: String) {
+        self.screen = OnboardingScreen::Verify(Box::new(VerifyScreen::new(provider_id)));
+        self.escape = None;
+    }
+
+    pub(crate) fn verifying_provider_id(&self) -> Option<&str> {
+        match &self.screen {
+            OnboardingScreen::Verify(screen) => Some(screen.provider_id()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_verification_succeeded(&self) -> bool {
+        matches!(
+            &self.screen,
+            OnboardingScreen::Verify(screen)
+                if matches!(screen.phase(), verify::VerifyPhase::Success(_))
+        )
+    }
+
+    pub(crate) fn apply_provider_verification(
+        &mut self,
+        provider_id: &str,
+        outcome: VerifyOutcome,
+        evidence: Option<ProviderSettlementEvidence>,
+    ) {
+        if let OnboardingScreen::Verify(screen) = &mut self.screen
+            && screen.provider_id() == provider_id
+        {
+            screen.apply(outcome, evidence);
+        }
+    }
+
+    pub(crate) fn update_provider_settlement_generation(
+        &mut self,
+        provider_id: &str,
+        config_generation: u64,
+    ) {
+        if let OnboardingScreen::Verify(screen) = &mut self.screen
+            && screen.provider_id() == provider_id
+        {
+            screen.update_settlement_generation(config_generation);
+        }
+    }
+
+    pub(crate) fn onboarding_oauth_provider(&self) -> Option<crate::tui::settings::OAuthProvider> {
+        match &self.screen {
+            OnboardingScreen::Authenticate(screen) => screen.oauth_provider(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_onboarding_oauth_acknowledgement(
+        &mut self,
+        client_flow_id: crate::tui::settings::OAuthFlowId,
+        operation_id: crate::tui::settings::PointerOperationId,
+        result: Result<(), String>,
+    ) -> Option<crate::tui::settings::OAuthFlowRequest> {
+        match &mut self.screen {
+            OnboardingScreen::Authenticate(screen) => {
+                screen.apply_oauth_acknowledgement(client_flow_id, operation_id, result)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_onboarding_oauth_begin(
+        &mut self,
+        client_flow_id: crate::tui::settings::OAuthFlowId,
+        operation_id: crate::tui::settings::PointerOperationId,
+        result: crate::tui::settings::OAuthBeginResult,
+    ) -> Option<crate::tui::settings::OAuthFlowRequest> {
+        match &mut self.screen {
+            OnboardingScreen::Authenticate(screen) => {
+                screen.apply_oauth_begin(client_flow_id, operation_id, result)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_onboarding_oauth_present(
+        &mut self,
+        client_flow_id: crate::tui::settings::OAuthFlowId,
+        operation_id: crate::tui::settings::PointerOperationId,
+        result: Result<crate::tui::settings::OAuthPresentationResult, String>,
+    ) -> Option<crate::tui::settings::OAuthFlowRequest> {
+        match &mut self.screen {
+            OnboardingScreen::Authenticate(screen) => {
+                screen.apply_oauth_present(client_flow_id, operation_id, result)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_onboarding_oauth_complete(
+        &mut self,
+        client_flow_id: crate::tui::settings::OAuthFlowId,
+        operation_id: crate::tui::settings::PointerOperationId,
+        result: Result<bool, String>,
+    ) -> Option<(&'static ProviderTemplate, AuthSubmission)> {
+        match &mut self.screen {
+            OnboardingScreen::Authenticate(screen) => {
+                let template = screen.template();
+                screen
+                    .apply_oauth_complete(client_flow_id, operation_id, result)
+                    .map(|submission| (template, submission))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_onboarding_oauth_cancel(
+        &mut self,
+        client_flow_id: crate::tui::settings::OAuthFlowId,
+        operation_id: crate::tui::settings::PointerOperationId,
+        result: Result<bool, String>,
+    ) {
+        if let OnboardingScreen::Authenticate(screen) = &mut self.screen {
+            screen.apply_oauth_cancel(client_flow_id, operation_id, result);
+        }
+    }
+
+    pub(crate) fn apply_onboarding_oauth_settlement_unknown(
+        &mut self,
+        client_flow_id: crate::tui::settings::OAuthFlowId,
+        operation_id: crate::tui::settings::PointerOperationId,
+        error: String,
+        acknowledgement: bool,
+    ) {
+        if let OnboardingScreen::Authenticate(screen) = &mut self.screen {
+            screen.apply_oauth_settlement_unknown(
+                client_flow_id,
+                operation_id,
+                error,
+                acknowledgement,
+            );
+        }
+    }
+
+    pub(crate) fn apply_onboarding_oauth_cancel_authoritative_failure(
+        &mut self,
+        client_flow_id: crate::tui::settings::OAuthFlowId,
+        operation_id: crate::tui::settings::PointerOperationId,
+        error: String,
+    ) {
+        if let OnboardingScreen::Authenticate(screen) = &mut self.screen {
+            screen.apply_oauth_cancel_authoritative_failure(client_flow_id, operation_id, error);
+        }
+    }
+
+    fn provider_settlement_for(
+        run_id: uuid::Uuid,
+        attempt_id: uuid::Uuid,
+        revision: u64,
+        screen: &VerifyScreen,
+    ) -> Option<OnboardingStageSettlement> {
+        let evidence = screen.settlement()?;
+        Some(OnboardingStageSettlement {
+            run_id,
+            attempt_id,
+            stage_revision: revision,
+            settlement_operation_id: evidence.operation_id.clone(),
+            provider_id: Some(screen.provider_id().to_string()),
+            mutation_intent_hash: Some(evidence.mutation_intent_hash.clone()),
+            provider_mutation_config_generation: Some(evidence.mutation_config_generation),
+            wizard_id: None,
+            config_generation: evidence.config_generation,
+        })
     }
 
     /// Latch a requested transition so duplicate completions cannot double
@@ -768,23 +1009,6 @@ impl OnboardingShell {
     /// Clear the latch after a failed transition so the stage can retry.
     pub(crate) fn clear_pending_transition(&mut self) {
         self.pending_transition = None;
-    }
-
-    /// Reconcile the provider-engine pairing after any input path (key,
-    /// pointer, tick): an engine that left its Add page abandoned provider
-    /// setup, so the shell returns to the searchable catalog instead of a
-    /// settings list. Completion is *not* an abandon — the onboarding
-    /// wizard never leaves its Add page on Done; the daemon transition
-    /// owns that exit.
-    pub(crate) fn reconcile_provider_engine(&mut self, engine: &Dialog) {
-        if matches!(self.screen, OnboardingScreen::EmbeddedSettings)
-            && self.stage == OnboardingStage::Provider
-            && !engine.is_provider_add()
-        {
-            self.present_provider_search(Some(
-                "Provider setup was cancelled; nothing was saved.".into(),
-            ));
-        }
     }
 
     /// Feed live host capabilities to the secure-store screen. Placement is
@@ -824,6 +1048,14 @@ impl OnboardingShell {
     /// freezes. Reduced motion never ticks — its static scene is drawn
     /// landed with the prompt from frame 0.
     pub(crate) fn tick(&mut self) -> bool {
+        if let OnboardingScreen::Authenticate(screen) = &mut self.screen {
+            screen.tick();
+            return true;
+        }
+        if let OnboardingScreen::Verify(screen) = &mut self.screen {
+            screen.tick();
+            return true;
+        }
         if !self.welcome_animation_active() {
             return false;
         }
@@ -864,6 +1096,12 @@ impl OnboardingShell {
         if let OnboardingScreen::SecureStore(screen) = &self.screen {
             return !matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice);
         }
+        if matches!(
+            self.screen,
+            OnboardingScreen::Authenticate(_) | OnboardingScreen::Verify(_)
+        ) {
+            return true;
+        }
         !matches!(
             self.stage,
             OnboardingStage::Welcome | OnboardingStage::Provider
@@ -880,6 +1118,7 @@ impl OnboardingShell {
     }
 
     fn activate_primary(&mut self, engine: &mut Dialog) -> Option<OnboardingShellAction> {
+        let correlation = (self.run_id, self.attempt_id, self.revision);
         match &mut self.screen {
             OnboardingScreen::Welcome => {
                 if !self.welcome_prompt_visible() {
@@ -906,6 +1145,38 @@ impl OnboardingShell {
             OnboardingScreen::ProviderSearch(screen) => screen
                 .activate_focused()
                 .map(OnboardingShellAction::SelectTemplate),
+            OnboardingScreen::Authenticate(screen) => {
+                let template = screen.template();
+                let last = screen.buttons().len().saturating_sub(1);
+                if let Some(submission) = screen.action(last) {
+                    Some(OnboardingShellAction::AuthenticateProvider {
+                        template,
+                        submission,
+                    })
+                } else {
+                    screen.take_oauth_action().map(OnboardingShellAction::OAuth)
+                }
+            }
+            OnboardingScreen::Verify(screen) => match screen.phase() {
+                verify::VerifyPhase::Success(_) | verify::VerifyPhase::NoEndpoint => {
+                    Self::provider_settlement_for(
+                        correlation.0,
+                        correlation.1,
+                        correlation.2,
+                        screen,
+                    )
+                    .map(|settlement| OnboardingShellAction::FinishProvider {
+                        settlement,
+                        add_another: false,
+                    })
+                }
+                verify::VerifyPhase::Error(_) => {
+                    let provider_id = screen.provider_id().to_string();
+                    screen.retry();
+                    Some(OnboardingShellAction::RetryProviderVerification { provider_id })
+                }
+                verify::VerifyPhase::Fetching => None,
+            },
             OnboardingScreen::AgentAuthoring(screen) => screen
                 .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .map(OnboardingShellAction::AgentAuthoring),
@@ -930,7 +1201,6 @@ impl OnboardingShell {
                 if closed {
                     self.open_escape_menu(engine);
                 }
-                self.reconcile_provider_engine(engine);
                 None
             }
         }
@@ -951,6 +1221,13 @@ impl OnboardingShell {
         if let OnboardingScreen::Model(screen) = &mut self.screen
             && screen.back()
         {
+            return None;
+        }
+        if matches!(
+            self.screen,
+            OnboardingScreen::Authenticate(_) | OnboardingScreen::Verify(_)
+        ) {
+            self.present_provider_search(None);
             return None;
         }
         Some(OnboardingShellAction::Transition(
@@ -984,6 +1261,7 @@ impl OnboardingShell {
             });
         }
 
+        let correlation = (self.run_id, self.attempt_id, self.revision);
         match &mut self.screen {
             OnboardingScreen::Welcome => {
                 if matches!(key.code, KeyCode::Esc) {
@@ -1033,6 +1311,95 @@ impl OnboardingShell {
                 screen
                     .handle_key(key)
                     .map(OnboardingShellAction::SelectTemplate)
+            }
+            OnboardingScreen::Authenticate(screen) => {
+                if matches!(key.code, KeyCode::Esc) {
+                    let phase = screen.auth_phase();
+                    if phase == auth::AuthPhase::DevicePolling {
+                        if let Some(action) = screen.cancel_oauth() {
+                            return Some(OnboardingShellAction::OAuth(action));
+                        }
+                        return None;
+                    }
+                    let oauth_cancel = if matches!(
+                        phase,
+                        auth::AuthPhase::DeviceIdle
+                            | auth::AuthPhase::PasteCallback
+                            | auth::AuthPhase::ApiKey
+                    ) {
+                        screen.cancel_oauth()
+                    } else {
+                        None
+                    };
+                    self.present_provider_search(None);
+                    return oauth_cancel.map(OnboardingShellAction::OAuth);
+                }
+                let template = screen.template();
+                if let Some(submission) = screen.handle_key(key) {
+                    Some(OnboardingShellAction::AuthenticateProvider {
+                        template,
+                        submission,
+                    })
+                } else {
+                    screen.take_oauth_action().map(OnboardingShellAction::OAuth)
+                }
+            }
+            OnboardingScreen::Verify(screen) => {
+                if matches!(key.code, KeyCode::Esc) {
+                    self.present_provider_search(None);
+                    return None;
+                }
+                match key.code {
+                    KeyCode::Char('r')
+                        if matches!(screen.phase(), verify::VerifyPhase::Error(_)) =>
+                    {
+                        let provider_id = screen.provider_id().to_string();
+                        screen.retry();
+                        Some(OnboardingShellAction::RetryProviderVerification { provider_id })
+                    }
+                    KeyCode::Char('a')
+                        if matches!(
+                            screen.phase(),
+                            verify::VerifyPhase::Success(_) | verify::VerifyPhase::NoEndpoint
+                        ) =>
+                    {
+                        Self::provider_settlement_for(
+                            correlation.0,
+                            correlation.1,
+                            correlation.2,
+                            screen,
+                        )
+                        .map(|settlement| {
+                            OnboardingShellAction::FinishProvider {
+                                settlement,
+                                add_another: true,
+                            }
+                        })
+                    }
+                    KeyCode::Enter
+                        if matches!(
+                            screen.phase(),
+                            verify::VerifyPhase::Success(_) | verify::VerifyPhase::NoEndpoint
+                        ) =>
+                    {
+                        Self::provider_settlement_for(
+                            correlation.0,
+                            correlation.1,
+                            correlation.2,
+                            screen,
+                        )
+                        .map(|settlement| {
+                            OnboardingShellAction::FinishProvider {
+                                settlement,
+                                add_another: false,
+                            }
+                        })
+                    }
+                    _ => {
+                        screen.handle_key(key);
+                        None
+                    }
+                }
             }
             OnboardingScreen::AgentAuthoring(screen) => {
                 if matches!(key.code, KeyCode::Esc) {
@@ -1115,7 +1482,6 @@ impl OnboardingShell {
                     // the flow; present the visible choice instead.
                     self.open_escape_menu(engine);
                 }
-                self.reconcile_provider_engine(engine);
                 None
             }
         }
@@ -1206,6 +1572,58 @@ impl OnboardingShell {
         engine: &mut Dialog,
     ) -> PointerOutcome {
         match (&self.screen, index) {
+            (OnboardingScreen::Authenticate(_), Some(index)) => {
+                let OnboardingScreen::Authenticate(screen) = &mut self.screen else {
+                    unreachable!()
+                };
+                let template = screen.template();
+                match screen.action(index) {
+                    Some(submission) => {
+                        PointerOutcome::acted(OnboardingShellAction::AuthenticateProvider {
+                            template,
+                            submission,
+                        })
+                    }
+                    None => screen
+                        .take_oauth_action()
+                        .map(OnboardingShellAction::OAuth)
+                        .map(PointerOutcome::acted)
+                        .unwrap_or_else(PointerOutcome::consumed),
+                }
+            }
+            (OnboardingScreen::Verify(screen), Some(0))
+                if matches!(screen.phase(), verify::VerifyPhase::Error(_)) =>
+            {
+                let OnboardingScreen::Verify(screen) = &mut self.screen else {
+                    unreachable!()
+                };
+                let provider_id = screen.provider_id().to_string();
+                screen.retry();
+                PointerOutcome::acted(OnboardingShellAction::RetryProviderVerification {
+                    provider_id,
+                })
+            }
+            (OnboardingScreen::Verify(screen), Some(index))
+                if matches!(
+                    screen.phase(),
+                    verify::VerifyPhase::Success(_) | verify::VerifyPhase::NoEndpoint
+                ) =>
+            {
+                match Self::provider_settlement_for(
+                    self.run_id,
+                    self.attempt_id,
+                    self.revision,
+                    screen,
+                ) {
+                    Some(settlement) => {
+                        PointerOutcome::acted(OnboardingShellAction::FinishProvider {
+                            settlement,
+                            add_another: index == 0,
+                        })
+                    }
+                    None => PointerOutcome::consumed(),
+                }
+            }
             (OnboardingScreen::SecureStore(screen), Some(0))
                 if !matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice) =>
             {
@@ -1352,6 +1770,14 @@ impl OnboardingShell {
                     None => PointerOutcome::ignored(),
                 }
             }
+            OnboardingScreen::Authenticate(screen) => {
+                screen.handle_mouse(mouse);
+                PointerOutcome::consumed()
+            }
+            OnboardingScreen::Verify(screen) => {
+                screen.handle_mouse(mouse);
+                PointerOutcome::consumed()
+            }
             OnboardingScreen::AgentAuthoring(screen) => {
                 if screen.handle_mouse(mouse) {
                     if let Some(action) = screen.take_pending_action() {
@@ -1402,6 +1828,7 @@ impl OnboardingShell {
         match &mut self.screen {
             OnboardingScreen::Profile(screen) => screen.paste(text),
             OnboardingScreen::ProviderSearch(screen) => screen.paste_query(text),
+            OnboardingScreen::Authenticate(screen) => screen.paste(text),
             OnboardingScreen::SecureStore(screen) => screen.paste(text),
             OnboardingScreen::AgentAuthoring(screen) => screen.paste(text),
             OnboardingScreen::Model(screen) => screen.paste(text),
@@ -1467,7 +1894,15 @@ impl OnboardingShell {
             PROGRESS_STEPS.len()
         );
         let subtitle = self.screen_subtitle();
-        ui::render_header(frame, rows[0], &title, &subtitle);
+        let title_color = match &self.screen {
+            OnboardingScreen::Verify(screen) => match screen.phase() {
+                verify::VerifyPhase::Success(_) | verify::VerifyPhase::NoEndpoint => GOOD,
+                verify::VerifyPhase::Error(_) => BAD,
+                verify::VerifyPhase::Fetching => INK,
+            },
+            _ => INK,
+        };
+        ui::render_header_colored(frame, rows[0], &title, &subtitle, title_color);
         self.render_progress(frame, rows[1]);
         self.list_area = rows[2];
         match &mut self.screen {
@@ -1485,6 +1920,8 @@ impl OnboardingShell {
                 self.list_area =
                     Self::render_search(frame, rows[2], screen, &mut self.list_row_rects);
             }
+            OnboardingScreen::Authenticate(screen) => screen.render(frame, rows[2]),
+            OnboardingScreen::Verify(screen) => screen.render(frame, rows[2]),
             OnboardingScreen::AgentAuthoring(screen) => {
                 screen.render(frame, rows[2]);
             }
@@ -1524,6 +1961,8 @@ impl OnboardingShell {
             OnboardingScreen::Profile(_) => "What should Cockpit call you?",
             OnboardingScreen::SecureStore(_) => "Secure your secrets",
             OnboardingScreen::ProviderSearch(_) => "Let's add a provider",
+            OnboardingScreen::Authenticate(screen) => screen.title(),
+            OnboardingScreen::Verify(screen) => screen.title(),
             OnboardingScreen::Complete { .. } => "You're ready to fly",
             OnboardingScreen::AgentAuthoring(_) => "Create your agent",
             OnboardingScreen::Lifetime(_) => "Background agents",
@@ -1540,6 +1979,8 @@ impl OnboardingShell {
                 "Choose how Cockpit protects your API keys and sealed values.".to_string()
             }
             OnboardingScreen::ProviderSearch(_) => "Pick who you'll fly with.".to_string(),
+            OnboardingScreen::Authenticate(screen) => screen.subtitle(),
+            OnboardingScreen::Verify(screen) => screen.subtitle(),
             OnboardingScreen::Lifetime(_) => {
                 "Choose what happens after the last Cockpit window closes.".to_string()
             }
@@ -1573,6 +2014,8 @@ impl OnboardingShell {
             }
             OnboardingScreen::SecureStore(screen) => screen.help_text(),
             OnboardingScreen::ProviderSearch(screen) => screen.help_text(),
+            OnboardingScreen::Authenticate(screen) => screen.help_text(),
+            OnboardingScreen::Verify(screen) => screen.help_text(),
             OnboardingScreen::AgentAuthoring(screen) => screen.help_text(),
             OnboardingScreen::Lifetime(_) => {
                 "↑↓ move   click choose   enter continue   esc options"
@@ -1601,6 +2044,8 @@ impl OnboardingShell {
             OnboardingScreen::ProviderSearch(screen) => {
                 vec![chrome::Button::primary("Choose").enabled(screen.choose_enabled())]
             }
+            OnboardingScreen::Authenticate(screen) => screen.buttons(),
+            OnboardingScreen::Verify(screen) => screen.buttons(),
             OnboardingScreen::AgentAuthoring(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Lifetime(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Model(_) => vec![chrome::Button::primary("Continue")],

@@ -200,7 +200,10 @@ async fn run_deep_fetch(
             .await
             .map_err(|error| format!("deep fetch failed: {error}"))?
             .map_err(|error| format!("deep fetch failed: {error}"))?;
-        let cockpit_proto::Response::ProviderModelsFetched { results, config } = response else {
+        let cockpit_proto::Response::ProviderModelsFetched {
+            results, config, ..
+        } = response
+        else {
             return Err("deep fetch failed: daemon returned unexpected response".into());
         };
         let result = results

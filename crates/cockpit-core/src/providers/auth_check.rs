@@ -108,7 +108,7 @@ pub async fn check_provider_auth_with_store(
                     reason,
                 }),
                 FetchOutcome::Unsupported => Err(AuthCheckError::Other(
-                    "credential validation endpoint is unsupported; no authenticated response was received"
+                    "credential validation endpoint returned 404; no authenticated response was received"
                         .to_string(),
                 )),
             }

@@ -288,6 +288,11 @@ async fn validate_onboarding_stage_settlement(
                 .ok_or_else(|| {
                     bad_request("provider advance requires a settled mutation intent hash")
                 })?;
+            let mutation_config_generation = settlement
+                .provider_mutation_config_generation
+                .ok_or_else(|| {
+                    bad_request("provider advance requires the provider mutation config generation")
+                })?;
             let (identity, response_json) = validate_terminal_local_operation_settlement(
                 ctx,
                 owner,
@@ -306,7 +311,7 @@ async fn validate_onboarding_stage_settlement(
                     status: proto::ConfigCommitStatus::Committed,
                     ..
                 } if client_operation_id == operation_id
-                    && config_generation == settlement.config_generation
+                    && config_generation == mutation_config_generation
                     && committed_intent_hash == mutation_intent_hash
                     && upserted_provider_ids.iter().any(|id| id == provider_id) =>
                 {
@@ -23723,7 +23728,7 @@ fn write_mcp_raw_private(path: &std::path::Path, json: &str) -> anyhow::Result<(
 // flags and the resolved env; bundling them into a struct buys nothing but
 // churn for a cosmetic lint, so allow the count.
 #[allow(clippy::too_many_arguments)]
-async fn provider_models_fetch(
+pub(super) async fn provider_models_fetch(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: Option<&str>,
@@ -23759,6 +23764,7 @@ async fn provider_models_fetch(
         return bounded_provider_response(Response::ProviderModelsFetched {
             results: Vec::new(),
             config: crate::secret_ref::redact_provider_view(&config),
+            config_generation: inventory::current_config_generation(),
         });
     }
     // Owner-scoped resolution: model-fetch requests may only resolve `$secret:`
@@ -23870,12 +23876,13 @@ async fn provider_models_fetch(
                 .and_then(|outcome| match outcome {
                     crate::providers::models_fetch::FetchOutcome::Unsupported => Err(
                         anyhow::anyhow!(
-                            "credential validation endpoint is unsupported; no authenticated response was received"
+                            "provider models endpoint returned 404; no authenticated response was received"
                         ),
                     ),
                     outcome => Ok(outcome),
                 })
             };
+            let mut verification = None;
             let outcome = match fetched {
                 Ok(crate::providers::models_fetch::FetchOutcome::Models { models, catalog }) => {
                     let mut updated = entry.clone();
@@ -23895,6 +23902,7 @@ async fn provider_models_fetch(
                             outcome: crate::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
                                 unlisted_count: u32::try_from(unlisted.len()).unwrap_or(u32::MAX),
                             },
+                            verification: None,
                         });
                         continue;
                     }
@@ -23924,6 +23932,9 @@ async fn provider_models_fetch(
                     catalog,
                     reason,
                 }) => {
+                    verification = Some(categorize_provider_model_fetch_error(&anyhow::anyhow!(
+                        reason.clone()
+                    )));
                     let reason = crate::config::providers::redact_model_fetch_reason(reason);
                     if allow_fallback {
                         let mut updated = entry.clone();
@@ -23963,15 +23974,32 @@ async fn provider_models_fetch(
                     }
                 }
                 Ok(crate::providers::models_fetch::FetchOutcome::Unsupported) => {
+                    let declared_no_endpoint = entry
+                        .effective_template(&provider_id)
+                        .and_then(crate::providers::template_by_id)
+                        .is_some_and(|template| !template.supports_models_endpoint);
+                    if declared_no_endpoint {
+                        verification =
+                            Some(crate::daemon::proto::ProviderModelVerification::NoEndpoint);
+                    } else {
+                        verification =
+                            Some(crate::daemon::proto::ProviderModelVerification::NotFound);
+                    }
                     crate::daemon::proto::ProviderModelFetchOutcome::Unsupported
                 }
-                Err(error) => crate::daemon::proto::ProviderModelFetchOutcome::Error {
-                    message: crate::config::providers::redact_model_fetch_reason(error.to_string()),
-                },
+                Err(error) => {
+                    verification = Some(categorize_provider_model_fetch_error(&error));
+                    crate::daemon::proto::ProviderModelFetchOutcome::Error {
+                        message: crate::config::providers::redact_model_fetch_reason(
+                            error.to_string(),
+                        ),
+                    }
+                }
             };
             results.push(crate::daemon::proto::ProviderModelFetchResult {
                 provider_id,
                 outcome,
+                verification,
             });
         }
         results
@@ -23998,11 +24026,14 @@ async fn provider_models_fetch(
     // Build and bound the exact response before any persistence. Otherwise a
     // large fetched catalog could become durable while the caller receives an
     // error and therefore cannot distinguish a safe retry from a replay.
+    // Size-check the worst-case generation width before any durable write.
+    // The exact generation is installed after publication below.
     let response = Response::ProviderModelsFetched {
         results,
         config: crate::secret_ref::redact_provider_view(&config),
+        config_generation: u64::MAX,
     };
-    let response =
+    let mut response =
         bounded_provider_response(scrub_provider_response(response, &config, &store, &env)?)?;
     let config_changed =
         !changed_provider_ids.is_empty() || on_unlisted.is_some_and(|_| !aggregate_fetch_failed);
@@ -24023,10 +24054,114 @@ async fn provider_models_fetch(
             on_unlisted,
         )?;
     }
-    if config_changed {
-        inventory::publish_committed_config_generation();
-    }
+    let config_generation = if config_changed {
+        inventory::publish_committed_config_generation()
+    } else {
+        inventory::current_config_generation()
+    };
+    let Response::ProviderModelsFetched {
+        config_generation: response_generation,
+        ..
+    } = &mut response
+    else {
+        unreachable!("provider model fetch built the wrong response")
+    };
+    *response_generation = config_generation;
     Ok(response)
+}
+
+pub(super) fn categorize_provider_model_fetch_error(
+    error: &anyhow::Error,
+) -> crate::daemon::proto::ProviderModelVerification {
+    if let Some(auth_error) = error.downcast_ref::<crate::providers::auth_check::AuthCheckError>() {
+        match auth_error {
+            crate::providers::auth_check::AuthCheckError::CredentialsRejected(message) => {
+                let status = provider_http_status(&message.to_ascii_lowercase()).unwrap_or(401);
+                return crate::daemon::proto::ProviderModelVerification::Unauthorized { status };
+            }
+            crate::providers::auth_check::AuthCheckError::Network(message) => {
+                return crate::daemon::proto::ProviderModelVerification::Network {
+                    message: bounded_provider_model_error(message),
+                };
+            }
+            crate::providers::auth_check::AuthCheckError::Other(_) => {}
+        }
+    }
+    let message = crate::config::providers::redact_model_fetch_reason(error.to_string());
+    let lower = message.to_ascii_lowercase();
+    let status = provider_http_status(&lower);
+    if let Some(401) = status {
+        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 401 };
+    }
+    if let Some(403) = status {
+        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 403 };
+    }
+    if status == Some(404) {
+        return crate::daemon::proto::ProviderModelVerification::NotFound;
+    }
+    if let Some(status) = status.filter(|value| *value >= 400) {
+        return crate::daemon::proto::ProviderModelVerification::HttpStatus {
+            status,
+            snippet: bounded_provider_model_error(&message),
+        };
+    }
+    let message = bounded_provider_model_error(&message);
+    if lower.contains("unauthorized") {
+        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 401 };
+    }
+    if lower.contains("forbidden") || lower.contains("credentials rejected") {
+        return crate::daemon::proto::ProviderModelVerification::Unauthorized { status: 403 };
+    }
+    if lower.contains("not found") {
+        return crate::daemon::proto::ProviderModelVerification::NotFound;
+    }
+    if lower.contains("json")
+        || lower.contains("model array")
+        || lower.contains("model list")
+        || lower.contains("parse")
+    {
+        return crate::daemon::proto::ProviderModelVerification::Parse { message };
+    }
+    if lower.contains("dns")
+        || lower.contains("tls")
+        || lower.contains("connect")
+        || lower.contains("timeout")
+        || lower.contains("sending request")
+        || lower.contains("request error")
+    {
+        return crate::daemon::proto::ProviderModelVerification::Network { message };
+    }
+    crate::daemon::proto::ProviderModelVerification::HttpStatus {
+        status: status.unwrap_or(500),
+        snippet: message,
+    }
+}
+
+fn provider_http_status(message: &str) -> Option<u16> {
+    ["returned http ", "returned ", "rejected (", "http "]
+        .into_iter()
+        .find_map(|marker| {
+            let tail = message.split_once(marker)?.1;
+            let digits = tail
+                .trim_start_matches(|character: char| !character.is_ascii_digit())
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            (digits.len() == 3)
+                .then(|| digits.parse::<u16>().ok())
+                .flatten()
+        })
+}
+
+fn bounded_provider_model_error(message: &str) -> String {
+    let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 200 {
+        flat
+    } else {
+        let mut bounded = flat.chars().take(199).collect::<String>();
+        bounded.push('…');
+        bounded
+    }
 }
 
 async fn daemon_deep_provider_fetch(
@@ -24151,6 +24286,7 @@ async fn daemon_deep_provider_fetch(
                     crate::daemon::proto::ProviderModelFetchResult {
                         provider_id: provider_id.clone(),
                         outcome,
+                        verification: None,
                     }
                 })
             })

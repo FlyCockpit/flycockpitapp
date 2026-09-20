@@ -184,6 +184,7 @@ impl AgentAuthoringScreen {
             settlement_operation_id: self.client_operation_id.clone(),
             provider_id: None,
             mutation_intent_hash: None,
+            provider_mutation_config_generation: None,
             wizard_id: None,
             config_generation,
         })

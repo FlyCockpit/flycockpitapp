@@ -1157,54 +1157,6 @@ impl EditState {
 // ── Handlers ─────────────────────────────────────────────────────────────
 
 impl SettingsDialog {
-    /// Seed the add wizard with a template selected from the onboarding
-    /// shell's searchable catalog. Mirrors the template step's Enter
-    /// prefill exactly so the engine behaves identically whether the
-    /// template was picked from the cursor list or the search screen.
-    pub(super) fn seed_onboarding_template(&mut self, template: &'static ProviderTemplate) {
-        let Some(page) = self.page.downcast_mut::<ProvidersPage>() else {
-            return;
-        };
-        let ProvidersPage::Add(s) = page else {
-            return;
-        };
-        if s.run.current_step_id() != Some("template") {
-            return;
-        }
-        s.template = Some(template);
-        // Pre-fill id only for templates that map 1:1 to a single vendor;
-        // `openai-compatible` keeps its empty id for the user to name.
-        if template.use_id_as_default {
-            s.id_field.set(template.id);
-        } else {
-            s.id_field.set("");
-        }
-        s.url_field.set(template.url);
-        *s.headers = HeaderEditor::new_for_provider(
-            s.id_field.text(),
-            templates::default_headers_for(template),
-            /* show_continue */ true,
-        );
-        s.env_var_field.set(
-            cockpit_core::providers::detected_env_var(template)
-                .or(template.default_env_var)
-                .or_else(|| template.env_var_candidates.first().copied())
-                .unwrap_or("API_KEY"),
-        );
-        if let Some(detected) = cockpit_core::providers::detected_env_var(template) {
-            s.auth_method_cursor = 1;
-            s.detected_env_offer = Some(detected.to_string());
-        }
-        s.wire_api_cursor = 0;
-        s.error = None;
-        if let Err(error) = s.run.submit(WizardAnswer::Select(template.id.to_string())) {
-            // The template came from the same registry the descriptor
-            // validates against, so this is unreachable in practice — but a
-            // registry/descriptor drift must surface, not panic the TUI.
-            s.error = Some(error);
-        }
-    }
-
     pub(super) fn apply_fetch_result(
         &mut self,
         provider_id: &str,

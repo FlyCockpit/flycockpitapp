@@ -225,6 +225,7 @@
       "config": {
         "providers": {}
       },
+      "config_generation": 1,
       "results": []
     },
     "response": "provider_models_fetched"

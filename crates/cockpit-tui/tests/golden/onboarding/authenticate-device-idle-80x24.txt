@@ -1,0 +1,24 @@
+ ‹ Back                                                                         
+  Sign in to your subscription · step 4/8                                       
+  A device code links this client to your account.                              
+  ────────────────────────────                                                  
+  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready         
+  Open this URL in a browser and enter the code:                                
+                                                                                
+  https://auth.openai.com/codex/device                                          
+                                                                                
+  ╭ One-time code ───────────────────────────────────────────────────────────╮  
+  │                                 ABCD-EFGH                                │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  Press Enter once you've opened the page to start polling.                     
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+  enter open & poll   esc back   ^c quit                       [ Open & poll ]  
+                                                                                

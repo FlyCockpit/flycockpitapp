@@ -116,7 +116,7 @@ fn pump_onboarding(app: &mut App, mut ready: impl FnMut(&App) -> bool, context: 
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!(
-        "onboarding pump timed out waiting for {context}; retry={:?}, snapshot={:?}, shell={}, pending={}, setup_step={:?}, setup_status={:?}",
+        "onboarding pump timed out waiting for {context}; retry={:?}, snapshot={:?}, shell={}, pending={}, setup_step={:?}, setup_status={:?}, toast={:?}",
         app.startup_background.retry,
         app.onboarding_snapshot
             .as_ref()
@@ -125,6 +125,7 @@ fn pump_onboarding(app: &mut App, mut ready: impl FnMut(&App) -> bool, context: 
         app.pending_startup_onboarding_operations.len(),
         app.dialog.test_setup_step(),
         app.dialog.test_setup_status(),
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
     );
 }
 
@@ -136,6 +137,8 @@ struct RealDaemonOnboarding {
 
 fn real_daemon_onboarding(cwd: &std::path::Path) -> RealDaemonOnboarding {
     let env = TestEnvGuard::isolate_cockpit_home_at(cwd);
+    env.set_current_dir(cwd)
+        .expect("enter the isolated onboarding workspace");
     // The profile wizard prefills its name field from USER/USERNAME; clear
     // both so the typed "Ada" is exactly the committed name (the guard
     // snapshots and restores them on drop).
@@ -223,7 +226,7 @@ fn real_first_run_app(cwd: &std::path::Path) -> App {
 fn seed_computer_use_catalog_capabilities() {
     use cockpit_config::providers::{
         CapabilityStatus, ComputerUseCapability, ComputerUseContract, ModelCapabilities,
-        ModelEntry, ModelLocation,
+        ModelLocation,
     };
     let global = cockpit_config::dirs::global_config_file().expect("isolated global config path");
     let model_target =
@@ -235,25 +238,22 @@ fn seed_computer_use_catalog_capabilities() {
         .providers
         .get_mut("localtest")
         .expect("the committed provider owns its model file");
-    assert!(
-        entry.models.iter().all(|model| model.id != "manual-model"),
-        "the fixture seeds catalog capability metadata onto a fresh model entry"
-    );
-    entry.models.push(ModelEntry {
-        id: "manual-model".to_string(),
-        manual: true,
-        location: Some(ModelLocation::Remote),
-        capabilities: ModelCapabilities {
-            context_tokens: Some(200_000),
-            tool_calling: CapabilityStatus::Supported,
-            computer_use: ComputerUseCapability {
-                contract: Some(ComputerUseContract::OpenAiResponses),
-                ..ComputerUseCapability::default()
-            },
-            ..ModelCapabilities::default()
+    let model = entry
+        .models
+        .iter_mut()
+        .find(|model| model.id == "manual-model")
+        .expect("the verification probe persisted its fetched model");
+    model.manual = true;
+    model.location = Some(ModelLocation::Remote);
+    model.capabilities = ModelCapabilities {
+        context_tokens: Some(200_000),
+        tool_calling: CapabilityStatus::Supported,
+        computer_use: ComputerUseCapability {
+            contract: Some(ComputerUseContract::OpenAiResponses),
+            ..ComputerUseCapability::default()
         },
-        ..ModelEntry::default()
-    });
+        ..ModelCapabilities::default()
+    };
     doc.write(&providers)
         .expect("seeding catalog capability metadata onto the provider file");
 }
@@ -427,7 +427,7 @@ fn complete_real_first_run_lifetime(app: &mut App, persistent_background_agents:
 /// admission, followed by an ordinary stage advance in the same job) → the real
 /// sensitive secure-store intent that materializes the vault and hands the
 /// daemon off to ready services → the Provider stage's catalog.
-fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
+fn advance_real_first_run_to_provider(app: &mut App) {
     pump_onboarding(
         app,
         |app| shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Welcome),
@@ -529,12 +529,33 @@ fn advance_real_first_run_to_provider(app: &mut App, root: &std::path::Path) {
         "the real secure-store placement to materialize the vault and reach the provider catalog",
     );
 
-    // The vault exists and the daemon is ready: ordinary RPCs (workspace
-    // trust, provider mutations, wizard applies) are servicable from here.
-    seed_workspace_trust(root);
+    // The vault exists and the daemon is ready. Workspace resolution remains
+    // deferred during onboarding, so keep the provider mutation user-level;
+    // the harness admits project work only after provider setup, matching the
+    // production startup order.
 }
 
-fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
+fn advance_real_first_run_from_provider_search_to_agent(app: &mut App, root: &std::path::Path) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
+    let provider_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let provider = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut socket, _) = listener.accept().expect("accept model fetch");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).expect("read model fetch");
+        let body = r#"{"data":[{"id":"manual-model","object":"model"}],"object":"list"}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write model catalog");
+    });
+
     for ch in "compat".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
@@ -542,55 +563,49 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
     shell_key(app, KeyCode::Enter);
     pump_onboarding(
         app,
-        |app| {
-            app.dialog.is_provider_add() && app.dialog.test_provider_add_step() == Some("wire-api")
-        },
-        "the seeded provider engine",
+        |app| shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Authenticate),
+        "the native Authenticate screen",
     );
 
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_provider_add_step(), Some("id"));
     for ch in "localtest".chars() {
         shell_key(app, KeyCode::Char(ch));
     }
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_provider_add_step(), Some("url"));
-    for ch in "http://127.0.0.1:9/v1".chars() {
+    shell_key(app, KeyCode::Tab);
+    for ch in provider_url.chars() {
         shell_key(app, KeyCode::Char(ch));
     }
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_provider_add_step(), Some("auth-method"));
-    shell_key(app, KeyCode::Down);
-    shell_key(app, KeyCode::Enter);
-    assert_eq!(app.dialog.test_provider_add_step(), Some("env-var"));
+    shell_key(app, KeyCode::Tab);
+    for ch in "test-key".chars() {
+        shell_key(app, KeyCode::Char(ch));
+    }
     shell_key(app, KeyCode::Enter);
 
     pump_onboarding(
         app,
         |app| {
-            app.dialog.test_provider_add_step() == Some("test-key")
-                && !app.dialog.test_provider_add_fetch_pending()
+            shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Verify)
+                && app
+                    .onboarding_shell
+                    .as_ref()
+                    .and_then(|shell| shell.verifying_provider_id())
+                    == Some("localtest")
         },
-        "the offline validation attempt to finish against the unreachable endpoint",
+        "the native Verify screen",
     );
 
-    let mut committed = false;
-    for _ in 0..150 {
-        pump_once(app);
-        if app.dialog.test_provider_add_step() == Some("done") {
-            committed = true;
-            break;
-        }
-        if app.dialog.test_provider_add_step() == Some("test-key") {
-            shell_key(app, KeyCode::Char('m'));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        committed,
-        "manual model entry must commit the offline checkpoint; status: {:?}",
-        app.dialog.test_provider_add_status()
+    pump_onboarding(
+        app,
+        |app| {
+            app.onboarding_shell
+                .as_ref()
+                .is_some_and(|shell| shell.provider_verification_succeeded())
+        },
+        "the daemon model probe to connect the provider",
     );
+    provider
+        .join()
+        .expect("fake provider exits after verification");
+    shell_key(app, KeyCode::Enter);
 
     pump_onboarding(
         app,
@@ -608,6 +623,7 @@ fn advance_real_first_run_from_provider_search_to_agent(app: &mut App) {
         "the daemon-committed provider must be visible in the refreshed config"
     );
 
+    seed_workspace_trust(root);
     seed_computer_use_catalog_capabilities();
 
     for ch in "manual-model".chars() {
@@ -778,8 +794,8 @@ fn first_run_settles_stages_against_the_real_daemon_offline() {
                 .unwrap();
 
             let mut app = real_first_run_app(tmp.path());
-            advance_real_first_run_to_provider(&mut app, tmp.path());
-            advance_real_first_run_from_provider_search_to_agent(&mut app);
+            advance_real_first_run_to_provider(&mut app);
+            advance_real_first_run_from_provider_search_to_agent(&mut app, tmp.path());
 
             complete_real_first_run_lifetime(&mut app, true);
 
@@ -824,8 +840,8 @@ fn real_daemon_first_run_ephemeral_lifetime_persists_background_agents_false() {
                 .unwrap();
 
             let mut app = real_first_run_app(tmp.path());
-            advance_real_first_run_to_provider(&mut app, tmp.path());
-            advance_real_first_run_from_provider_search_to_agent(&mut app);
+            advance_real_first_run_to_provider(&mut app);
+            advance_real_first_run_from_provider_search_to_agent(&mut app, tmp.path());
             complete_real_first_run_lifetime(&mut app, false);
         },
     );
@@ -913,7 +929,7 @@ fn concurrent_client_defer_is_followed_by_the_read_only_refresh() {
         .unwrap();
 
     let mut app = real_first_run_app(tmp.path());
-    advance_real_first_run_to_provider(&mut app, tmp.path());
+    advance_real_first_run_to_provider(&mut app);
 
     // A second client defers onboarding directly through the daemon.
     let deferred_authority = tokio::runtime::Handle::current().block_on(async {

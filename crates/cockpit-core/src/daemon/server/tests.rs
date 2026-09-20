@@ -9812,8 +9812,10 @@ fn oversized_provider_model_fetch_response_is_rejected_before_persistence() {
             outcome: crate::daemon::proto::ProviderModelFetchOutcome::Error {
                 message: "x".repeat(proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES),
             },
+            verification: None,
         }],
         config: crate::daemon::proto::ProviderConfigView::default(),
+        config_generation: u64::MAX,
     };
     let error = bounded_provider_response(response).expect_err("oversized fetch response");
     assert_eq!(error.code, ErrorCode::BadRequest);
@@ -31995,6 +31997,233 @@ fn message_attachment_exactly_once_local_v2_replay_preserves_durable_reference()
         .build()
         .expect("production-equivalent image retry runtime");
     runtime.block_on(Box::pin(image_submission_exact_retry_case()));
+}
+
+#[test]
+fn provider_verification_errors_are_categorized_and_bounded_for_daemon_clients() {
+    use crate::daemon::proto::ProviderModelVerification;
+
+    let cases = [
+        (
+            "provider returned HTTP 401 Unauthorized",
+            ProviderModelVerification::Unauthorized { status: 401 },
+        ),
+        (
+            "provider returned HTTP 404 Not Found",
+            ProviderModelVerification::NotFound,
+        ),
+        (
+            "provider returned HTTP 429: rate limited",
+            ProviderModelVerification::HttpStatus {
+                status: 429,
+                snippet: "provider returned HTTP 429: rate limited".into(),
+            },
+        ),
+        (
+            "provider returned HTTP 500: model endpoint not found in registry",
+            ProviderModelVerification::HttpStatus {
+                status: 500,
+                snippet: "provider returned HTTP 500: model endpoint not found in registry".into(),
+            },
+        ),
+        (
+            "request error: DNS connect failed",
+            ProviderModelVerification::Network {
+                message: "request error: DNS connect failed".into(),
+            },
+        ),
+        (
+            "could not parse JSON model list",
+            ProviderModelVerification::Parse {
+                message: "could not parse JSON model list".into(),
+            },
+        ),
+    ];
+    for (message, expected) in cases {
+        assert_eq!(
+            super::dispatch::categorize_provider_model_fetch_error(&anyhow::anyhow!(message)),
+            expected,
+            "classification must preserve the daemon's stable failure class"
+        );
+    }
+
+    let long = format!("HTTP 500 {}", "response-fragment ".repeat(30));
+    let ProviderModelVerification::HttpStatus { snippet, .. } =
+        super::dispatch::categorize_provider_model_fetch_error(&anyhow::anyhow!(long))
+    else {
+        panic!("500 response must remain an HTTP-status failure");
+    };
+    assert_eq!(snippet.chars().count(), 200);
+    assert!(snippet.ends_with('…'));
+}
+
+async fn one_shot_models_response(status: u16, reason: &str, body: &str) -> String {
+    use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::TcpListener};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let reason = reason.to_string();
+    let body = body.to_string();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+    format!("http://{address}/v1")
+}
+
+async fn daemon_provider_probe_returns_all_stable_verification_classes_case() {
+    use crate::config::providers::{AuthKind, ConfigDoc, ProviderEntry, ProvidersConfig};
+    use crate::daemon::proto::ProviderModelVerification;
+
+    let config_file = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+    let project_root = config_file.parent().unwrap().to_string_lossy().to_string();
+    let cases = [
+        (401, "Unauthorized", "{}", "unauthorized"),
+        (404, "Not Found", "{}", "not_found"),
+        (418, "I'm a Teapot", "provider detail", "http_status"),
+        (200, "OK", "not-json", "parse"),
+    ];
+    for (status, reason, body, expected) in cases {
+        let url = one_shot_models_response(status, reason, body).await;
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "fake".into(),
+            ProviderEntry {
+                template: Some("openai-compatible".into()),
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                ..ProviderEntry::default()
+            },
+        );
+        ConfigDoc::load(&config_file)
+            .unwrap()
+            .write(&config)
+            .unwrap();
+        let ctx = test_ctx();
+        let response = provider_models_fetch(
+            &ctx,
+            &project_root,
+            Some("fake"),
+            None,
+            false,
+            None,
+            false,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let Response::ProviderModelsFetched { results, .. } = response else {
+            panic!("daemon returned wrong response");
+        };
+        let verification = results.into_iter().next().unwrap().verification.unwrap();
+        assert!(
+            matches!(
+                (expected, &verification),
+                (
+                    "unauthorized",
+                    ProviderModelVerification::Unauthorized { status: 401 }
+                ) | ("not_found", ProviderModelVerification::NotFound)
+                    | (
+                        "http_status",
+                        ProviderModelVerification::HttpStatus { status: 418, .. }
+                    )
+                    | ("parse", ProviderModelVerification::Parse { .. })
+            ),
+            "unexpected class for {expected}: {verification:?}"
+        );
+    }
+
+    let mut config = ProvidersConfig::default();
+    config.providers.insert(
+        "fake".into(),
+        ProviderEntry {
+            template: Some("openai-compatible".into()),
+            url: "http://127.0.0.1:9/v1".into(),
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            ..ProviderEntry::default()
+        },
+    );
+    ConfigDoc::load(&config_file)
+        .unwrap()
+        .write(&config)
+        .unwrap();
+    let ctx = test_ctx();
+    let response = provider_models_fetch(
+        &ctx,
+        &project_root,
+        Some("fake"),
+        None,
+        false,
+        None,
+        false,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let Response::ProviderModelsFetched { results, .. } = response else {
+        panic!("daemon returned wrong response");
+    };
+    assert!(matches!(
+        results[0].verification,
+        Some(ProviderModelVerification::Network { .. })
+    ));
+
+    let url = one_shot_models_response(200, "OK", "{}").await;
+    let mut config = ProvidersConfig::default();
+    config.providers.insert(
+        "fake".into(),
+        ProviderEntry {
+            template: Some("z-ai".into()),
+            url,
+            allow_insecure_http: true,
+            auth: Some(AuthKind::None),
+            ..ProviderEntry::default()
+        },
+    );
+    ConfigDoc::load(&config_file)
+        .unwrap()
+        .write(&config)
+        .unwrap();
+    let ctx = test_ctx();
+    let response = provider_models_fetch(
+        &ctx,
+        &project_root,
+        Some("fake"),
+        None,
+        false,
+        None,
+        false,
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let Response::ProviderModelsFetched { results, .. } = response else {
+        panic!("daemon returned wrong response");
+    };
+    assert!(matches!(
+        results[0].verification,
+        Some(ProviderModelVerification::NoEndpoint)
+    ));
+}
+
+#[test]
+fn daemon_provider_probe_returns_all_stable_verification_classes() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("provider verification test runtime");
+    runtime.block_on(daemon_provider_probe_returns_all_stable_verification_classes_case());
 }
 
 async fn attach_fake_secure_key_actor(ctx: &mut Arc<DaemonContext>) {

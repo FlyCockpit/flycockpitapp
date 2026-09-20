@@ -5413,7 +5413,7 @@ fn render_field_row_places_caret_at_textfield_cursor() {
 
     render_field_row(&mut lines, "Name", &field, true);
 
-    assert_eq!(line_text(&lines[0]), "▸ Name: al\u{E000}pha");
+    assert_eq!(line_text(&lines[0]), "› Name: al\u{E000}pha");
 }
 
 #[test]

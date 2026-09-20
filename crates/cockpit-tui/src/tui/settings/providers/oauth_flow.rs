@@ -6,7 +6,7 @@ use cockpit_core::auth::codex_oauth;
 use cockpit_core::auth::xai_oauth;
 
 pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let red = Style::default().fg(Color::Red);
     let green = Style::default().fg(Color::Green);
 
@@ -1474,7 +1474,7 @@ fn render_provider_oauth(
     host: OAuthHost,
     mut controls: Option<&mut Vec<(usize, usize)>>,
 ) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let green = Style::default().fg(Color::Green);
     let red = Style::default().fg(Color::Red);
@@ -1535,7 +1535,7 @@ fn render_provider_oauth(
     if s.acknowledgement_required {
         let cursor = rendered_cursor(s, host);
         for (i, option) in oauth_options(s, host).iter().enumerate() {
-            let marker = if i == cursor { "▸ " } else { "  " };
+            let marker = if i == cursor { "› " } else { "  " };
             let style = if i == cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
@@ -1572,7 +1572,7 @@ fn render_provider_oauth(
     let cursor = rendered_cursor(s, host);
     for (i, option) in oauth_options(s, host).iter().enumerate() {
         let label = option.label();
-        let marker = if i == cursor { "▸ " } else { "  " };
+        let marker = if i == cursor { "› " } else { "  " };
         let style = if i == cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {

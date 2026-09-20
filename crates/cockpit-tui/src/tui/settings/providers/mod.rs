@@ -50,12 +50,12 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::settings::provider_entries_equal;
 use crate::tui::textfield::TextField;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 use cockpit_config::providers::{
     HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy, OnUnlistedModelsFetch,
     ProviderEntry, ProviderModelCatalog, WireApi, format_model_fetch_age,
@@ -3379,7 +3379,7 @@ impl SettingsCx {
         status: Option<&str>,
         delete_pending: bool,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
@@ -3402,7 +3402,7 @@ impl SettingsCx {
             ),
         ));
         lines.push(Line::from(vec![
-            Span::raw(if button_selected { "▸ " } else { "  " }),
+            Span::raw(if button_selected { "› " } else { "  " }),
             Span::styled("[refetch provider models]".to_string(), button_style),
         ]));
         bindings.push((
@@ -3440,7 +3440,7 @@ impl SettingsCx {
             for (i, id) in ids.iter().enumerate() {
                 let row = i + 1;
                 let entry = self.config.providers.get(id.as_str()).unwrap();
-                let marker = if row == cursor { "▸ " } else { "  " };
+                let marker = if row == cursor { "› " } else { "  " };
                 let label = format!("{:<width$}", id, width = id_w);
                 let star = if entry.favorite.unwrap_or(false) {
                     " ★"
@@ -3691,7 +3691,7 @@ impl SettingsCx {
         if let Some(step) = s.run.current_provider_step() {
             super::pointer_acceptance_tests::record_rendered_wizard_step(step);
         }
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -3706,7 +3706,7 @@ impl SettingsCx {
                 lines.push(Line::default());
                 let ordered = onboarding_ordered_templates();
                 for (i, t) in ordered.iter().enumerate() {
-                    let marker = if i == s.template_cursor { "▸ " } else { "  " };
+                    let marker = if i == s.template_cursor { "› " } else { "  " };
                     let style = if t.is_disabled() {
                         muted.add_modifier(Modifier::DIM)
                     } else if i == s.template_cursor {
@@ -3748,7 +3748,7 @@ impl SettingsCx {
                 .enumerate()
                 {
                     let marker = if index == s.wire_api_cursor {
-                        "▸ "
+                        "› "
                     } else {
                         "  "
                     };
@@ -3804,7 +3804,7 @@ impl SettingsCx {
                     }
                     for (index, (label, description)) in options.iter().enumerate() {
                         let marker = if index == s.auth_method_cursor {
-                            "▸ "
+                            "› "
                         } else {
                             "  "
                         };
@@ -3838,6 +3838,12 @@ impl SettingsCx {
                 }
                 if s.is_step("api-key") {
                     lines.push(Line::default());
+                    let (title, subtitle) = crate::tui::onboarding::provider_api_key_copy(t);
+                    lines.push(Line::from(Span::styled(
+                        title.to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(Span::styled(subtitle, muted)));
                     let masked = if s.api_key_field.text().is_empty() {
                         ""
                     } else {
@@ -3947,6 +3953,16 @@ impl SettingsCx {
                 ));
             }
             Some("saving" | "fetching" | "test-key") => {
+                let provider_id = s.id_field.text();
+                let (title, subtitle) = crate::tui::onboarding::provider_verify_copy(
+                    provider_id,
+                    !s.is_step("test-key") || s.fetch.is_some(),
+                );
+                lines.push(Line::from(Span::styled(
+                    title.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(Span::styled(subtitle, muted)));
                 lines.push(Line::from(Span::styled(
                     if s.is_step("saving") {
                         "Saving config…"
@@ -4039,7 +4055,7 @@ impl SettingsCx {
     }
 
     fn render_edit(&self, frame: &mut Frame, area: Rect, s: &EditState) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
@@ -4152,7 +4168,7 @@ impl SettingsCx {
                 continue;
             }
             let (label, value) = row(*action);
-            let marker = if selected { "▸ " } else { "  " };
+            let marker = if selected { "› " } else { "  " };
             let style = if selected {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
@@ -4245,7 +4261,7 @@ impl SettingsCx {
         editor: &HeaderEditor,
         parent: &EditState,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(vec![
                 Span::styled("Provider: ", muted),
@@ -4301,7 +4317,7 @@ impl SettingsCx {
         editor: &ModelEditor,
         parent: &EditState,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(vec![
                 Span::styled("Provider: ", muted),
@@ -4412,7 +4428,7 @@ impl SettingsCx {
         editor: &SettingsEditor,
         parent: &EditState,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let scope_label = match &editor.scope {
             super::settings_editor::SettingsScope::Model { model_id } => {
@@ -4441,7 +4457,7 @@ impl SettingsCx {
 
         for (i, field) in fields.iter().enumerate() {
             let selected = i == editor.cursor;
-            let marker = if selected { "▸ " } else { "  " };
+            let marker = if selected { "› " } else { "  " };
             let label_style = if selected {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
@@ -4706,7 +4722,7 @@ impl SettingsCx {
     }
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let green = Style::default().fg(Color::Green);
         let red = Style::default().fg(Color::Red);
@@ -4767,7 +4783,7 @@ impl SettingsCx {
         ];
         let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
-            let marker = if i == s.cursor { "▸ " } else { "  " };
+            let marker = if i == s.cursor { "› " } else { "  " };
             let style = if i == s.cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
@@ -4788,7 +4804,7 @@ impl SettingsCx {
                 Span::styled(label.to_string(), style),
             ]));
         }
-        let check = if s.dont_ask_again { "[x]" } else { "[ ]" };
+        let check = if s.dont_ask_again { "▣" } else { "▢" };
         let style = if s.cursor == 2 {
             yellow.add_modifier(Modifier::BOLD)
         } else {
@@ -4801,7 +4817,7 @@ impl SettingsCx {
             ),
         ));
         lines.push(Line::from(vec![
-            Span::raw(if s.cursor == 2 { "▸ " } else { "  " }),
+            Span::raw(if s.cursor == 2 { "› " } else { "  " }),
             Span::styled(format!("{check} Do not show again"), style),
         ]));
         let selected_line = selected_line_from_marker(&lines);
@@ -4820,7 +4836,7 @@ impl SettingsCx {
     }
 
     fn render_fetch_one_prompt(&self, frame: &mut Frame, area: Rect, s: &FetchOnePromptState) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -4847,7 +4863,7 @@ impl SettingsCx {
         ];
         let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
-            let marker = if i == s.cursor { "▸ " } else { "  " };
+            let marker = if i == s.cursor { "› " } else { "  " };
             let style = if i == s.cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
@@ -4881,7 +4897,7 @@ impl SettingsCx {
             ),
         ));
         lines.push(Line::from("[Cancel]"));
-        let check = if s.dont_ask_again { "[x]" } else { "[ ]" };
+        let check = if s.dont_ask_again { "▣" } else { "▢" };
         let style = if s.cursor == 2 {
             yellow.add_modifier(Modifier::BOLD)
         } else {
@@ -4894,7 +4910,7 @@ impl SettingsCx {
             ),
         ));
         lines.push(Line::from(vec![
-            Span::raw(if s.cursor == 2 { "▸ " } else { "  " }),
+            Span::raw(if s.cursor == 2 { "› " } else { "  " }),
             Span::styled(format!("{check} Do not show again"), style),
         ]));
         let selected_line = selected_line_from_marker(&lines);
@@ -4918,7 +4934,7 @@ impl SettingsCx {
         area: Rect,
         s: &FetchFallbackPromptState,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -4939,7 +4955,7 @@ impl SettingsCx {
         ];
         let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
-            let marker = if i == s.cursor { "▸ " } else { "  " };
+            let marker = if i == s.cursor { "› " } else { "  " };
             let style = if i == s.cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
@@ -4997,7 +5013,7 @@ fn render_header_editor(
     lines: &mut Vec<Line<'static>>,
     h: &HeaderEditor,
 ) -> Vec<(usize, SettingsControlId)> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let mut bindings = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -5014,7 +5030,7 @@ fn render_header_editor(
 
     for (i, row) in h.rows().iter().enumerate() {
         let cursor_here = h.cursor == i;
-        let marker = if cursor_here { "  ▸ " } else { "    " };
+        let marker = if cursor_here { "  › " } else { "    " };
         let name_style = if cursor_here {
             yellow.add_modifier(Modifier::BOLD)
         } else {
@@ -5031,7 +5047,7 @@ fn render_header_editor(
 
     let add_idx = h.add_row_idx();
     let add_cursor = h.cursor == add_idx;
-    let add_marker = if add_cursor { "  ▸ " } else { "    " };
+    let add_marker = if add_cursor { "  › " } else { "    " };
     let add_style = if add_cursor {
         yellow.add_modifier(Modifier::BOLD)
     } else {
@@ -5045,7 +5061,7 @@ fn render_header_editor(
 
     if let Some(cont_idx) = h.continue_idx() {
         let cont_cursor = h.cursor == cont_idx;
-        let marker = if cont_cursor { "  ▸ " } else { "    " };
+        let marker = if cont_cursor { "  › " } else { "    " };
         let style = if cont_cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {
@@ -5097,7 +5113,7 @@ fn provider_header_pointer_action(
 /// mode. The `Clear` widget wipes the cells underneath so the list
 /// doesn't bleed through.
 fn render_header_edit_popup(cx: &SettingsCx, frame: &mut Frame, area: Rect, h: &HeaderEditor) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
 
     let name_focus = matches!(h.mode, HeaderMode::EditName);
@@ -5190,11 +5206,7 @@ fn render_header_edit_popup(cx: &SettingsCx, frame: &mut Frame, area: Rect, h: &
     let width = area.width.saturating_sub(6).clamp(24, 70);
     let height = (body.len() as u16) + 2; // +2 for the top/bottom border
     let rect = centered_rect(area, width, height);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(yellow)
-        .title(title);
+    let block = crate::tui::chrome::rounded_block(title, true);
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
@@ -5208,7 +5220,7 @@ fn render_model_editor(
     lines: &mut Vec<Line<'static>>,
     m: &ModelEditor,
 ) -> Vec<(usize, SettingsControlId)> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let green = Style::default().fg(Color::Green);
     let mut bindings = Vec::new();
@@ -5231,7 +5243,7 @@ fn render_model_editor(
             .unwrap_or(0);
         for (i, row) in m.rows().iter().enumerate() {
             let cursor_here = m.cursor == i;
-            let marker = if cursor_here { "  ▸ " } else { "    " };
+            let marker = if cursor_here { "  › " } else { "    " };
             let id_style = if cursor_here {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
@@ -5258,7 +5270,7 @@ fn render_model_editor(
 
     let add_idx = m.rows().len();
     let add_cursor = m.cursor == add_idx;
-    let add_marker = if add_cursor { "  ▸ " } else { "    " };
+    let add_marker = if add_cursor { "  › " } else { "    " };
     let add_style = if add_cursor {
         yellow.add_modifier(Modifier::BOLD)
     } else {
@@ -5302,7 +5314,7 @@ fn render_model_fetch_status_block(
     entry: &ProviderEntry,
     now: chrono::DateTime<Utc>,
 ) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let state = provider_model_fetch_display_state(entry);
     let state_style = match state {
         cockpit_config::providers::ProviderModelFetchDisplayState::Live => {
@@ -5345,8 +5357,7 @@ fn render_model_fetch_status_block(
 /// Centered id/name/context popup for adding or editing a manual model.
 /// Drawn on top of the model list while the editor is in `Edit` mode.
 fn render_model_edit_popup(frame: &mut Frame, area: Rect, m: &ModelEditor) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let red = Style::default().fg(Color::Red);
 
     let mut body: Vec<Line<'static>> = Vec::new();
@@ -5385,11 +5396,7 @@ fn render_model_edit_popup(frame: &mut Frame, area: Rect, m: &ModelEditor) {
     let width = area.width.saturating_sub(6).clamp(24, 70);
     let height = (body.len() as u16) + 2; // +2 for the top/bottom border
     let rect = centered_rect(area, width, height);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(yellow)
-        .title(title);
+    let block = crate::tui::chrome::rounded_block(title, true);
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
@@ -5417,13 +5424,13 @@ fn render_field_row(
     active: bool,
 ) -> usize {
     let line = lines.len();
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let value_style = if active {
         Style::default().fg(Color::White)
     } else {
         muted
     };
-    let marker = if active { "▸ " } else { "  " };
+    let marker = if active { "› " } else { "  " };
     let mut spans = vec![
         Span::raw(marker),
         Span::styled(

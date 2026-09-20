@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models ────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
+                              ▌ ││  [refetch provider models]                                                       ││ │
+ SESSIONS                       ││  [+ add provider]                                                                ││ │
+ no active sessions in all pr   ││  on unlisted models (m): ask (default — prompt each fetch)                       ││ │
+                                ││                                                                                  ││ │
+                              no││› fixture    https://api.example.invalid/v1  1 models                             ││ │
+                              ┊ ││  [Delete]                                                                        ││ │
+                              ▌ ││                                                                                  ││ │
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                               ⋯││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit/refetch-all  R: refet│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

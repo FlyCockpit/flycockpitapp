@@ -107,10 +107,118 @@ impl IsolatedHome {
         }
     }
 
+    /// Loopback provider metadata that satisfies bundled frontier catalog slots
+    /// (remote computer-use-capable model with a 32k+ context window).
+    pub fn write_agent_authoring_loopback_provider(&self, base_url: &str) {
+        let config_dir = self.config_dir();
+        let providers_dir = config_dir.join("providers");
+        std::fs::create_dir_all(&providers_dir).expect("create providers config dir");
+        std::fs::write(
+            config_dir.join("config.json"),
+            r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":false}"#,
+        )
+        .expect("write integration config.json");
+        std::fs::write(
+            providers_dir.join("local.json"),
+            format!(
+                r#"{{
+  "url": "{}",
+  "auth": "none",
+  "wire_api": "completions",
+  "allow_insecure_http": true,
+  "models": [
+    {{
+      "id": "scripted",
+      "manual": true,
+      "location": "remote",
+      "can_delegate": false,
+      "subagent_invokable": true,
+      "context_length": 32768,
+      "capabilities": {{
+        "tool_calling": "supported",
+        "context_tokens": 32768,
+        "computer_use": {{
+          "contract": "open_ai_responses"
+        }}
+      }}
+    }},
+    {{
+      "id": "fallback",
+      "manual": true,
+      "location": "remote",
+      "subagent_invokable": true,
+      "context_length": 32768,
+      "capabilities": {{
+        "tool_calling": "supported",
+        "context_tokens": 32768,
+        "computer_use": {{
+          "contract": "open_ai_responses"
+        }}
+      }}
+    }}
+  ]
+}}"#,
+                base_url
+            ),
+        )
+        .expect("write agent-authoring integration provider config");
+        let prices_home = self.home_dir().join(".cockpit");
+        std::fs::create_dir_all(&prices_home).expect("create isolated prices dir");
+        std::fs::write(
+            prices_home.join("prices.json"),
+            r#"{"scripted": {}, "fallback": {}}"#,
+        )
+        .expect("write integration prices.json");
+    }
+
+    /// Set workspace trust through the already-running daemon (bootstrap-locked
+    /// installs reject `cockpit trust set` from a subprocess).
+    pub fn set_workspace_trust_via_daemon(&self) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build workspace-trust fixture runtime");
+        runtime.block_on(async {
+            let client = cockpit_client::DaemonClient::connect(&self.socket_path())
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "agent PTY fixture daemon client failed: {err:?}\nlog tail:\n{}",
+                        log_tail(self)
+                    )
+                });
+            let project_root = self.project.display().to_string();
+            let expected_config_generation = match client
+                .request_ok(cockpit_proto::Request::GetWorkspaceTrust {
+                    project_root: project_root.clone(),
+                })
+                .await
+                .expect("agent PTY fixture trust read transport")
+            {
+                cockpit_proto::Response::WorkspaceTrust {
+                    config_generation, ..
+                } => config_generation,
+                other => panic!("unexpected agent PTY fixture trust read: {other:?}"),
+            };
+            match client
+                .request_ok(cockpit_proto::Request::SetWorkspaceTrust {
+                    project_root,
+                    mode: cockpit_proto::WorkspaceTrustMode::Trust,
+                    expected_config_generation,
+                })
+                .await
+                .expect("agent PTY fixture trust set transport")
+            {
+                cockpit_proto::Response::WorkspaceTrustSet { .. } => {}
+                other => panic!("unexpected agent PTY fixture trust set: {other:?}"),
+            }
+        });
+    }
+
     /// Leave first-run onboarding open at the agent authoring stage with a
     /// machine-bound vault and a loopback provider already configured.
     pub fn seed_onboarding_open_at_agent(&self, provider_url: &str) {
-        self.write_local_provider_config(provider_url);
+        self.write_agent_authoring_loopback_provider(provider_url);
         let cockpit_data_dir = self.data_home.join("cockpit");
         std::fs::create_dir_all(&cockpit_data_dir).expect("create isolated cockpit data dir");
         #[cfg(unix)]
@@ -154,7 +262,7 @@ impl IsolatedHome {
                     cockpit_db::db::onboarding::OnboardingBootstrapState::Ready,
                     false,
                     Some(cockpit_db::db::onboarding::OnboardingSecurePlacement::MachineBoundFile),
-                    1,
+                    0,
                 )
                 .await
                 .expect("open onboarding at the agent authoring stage");
@@ -252,6 +360,14 @@ impl IsolatedHome {
 
     pub fn pid_file(&self) -> PathBuf {
         self.socket_path().with_file_name("daemon.pid")
+    }
+
+    /// Global authored-agent packages staged by the daemon during onboarding apply.
+    pub fn daemon_agents_dir(&self) -> PathBuf {
+        self.pid_file()
+            .parent()
+            .expect("daemon pid file parent")
+            .join("agents")
     }
 
     pub fn log_file(&self) -> PathBuf {

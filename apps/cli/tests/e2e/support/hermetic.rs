@@ -641,6 +641,61 @@ impl HermeticCockpit {
         self.pty.as_ref().map(|pty| pty.pid).or(self.reaped_pty_pid)
     }
 
+    fn wait_for_receipt_daemon(&self, timeout: Duration) -> Result<DaemonGeneration, String> {
+        let deadline = Instant::now() + timeout;
+        let mut delay = Duration::from_millis(20);
+        loop {
+            if let Ok(generation) = self.capture_current_daemon_generation() {
+                return Ok(generation);
+            }
+            if Instant::now() >= deadline {
+                return self.capture_current_daemon_generation();
+            }
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_millis(200));
+        }
+    }
+
+    /// Start the detached daemon against the isolated ledger without trusting
+    /// the project first. Use when bootstrap is still open and trust must be
+    /// seeded through daemon RPC after the socket is live.
+    pub fn start_detached_daemon(&mut self) {
+        let output = self
+            .spec
+            .launch_path(HermeticLaunchKind::DaemonStart)
+            .std_command()
+            .output()
+            .expect("hermetic cockpit daemon start");
+        assert_success("hermetic cockpit daemon start", &output, &self.home);
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        {
+            self.wait_for_receipt_daemon(DEFAULT_DAEMON_TIMEOUT)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "capture receipt-verified daemon generation: {error:?}\nlog tail:\n{}",
+                        log_tail(&self.home)
+                    )
+                });
+            self.install_current_daemon_generation(false)
+                .expect("capture receipt-verified initial daemon generation");
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        )))]
+        {
+            self.wait_for_daemon(DEFAULT_DAEMON_TIMEOUT);
+            self.daemon_pid = self.pid_from_file();
+        }
+    }
+
     pub fn start_trusted_daemon(&mut self) {
         let trust = self
             .spec
@@ -814,6 +869,21 @@ impl HermeticCockpit {
         );
     }
 
+    /// Drop fixture-owned daemon metadata after `stop_child_spawned_daemon` so
+    /// `reap()` can tear down the PTY without a second receipt-bound stop.
+    pub fn forget_fixture_daemon_ownership(&mut self) {
+        self.daemon_pid = None;
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        {
+            self.daemon_generation = None;
+        }
+    }
+
     fn command(&self, args: &[&str]) -> Output {
         let mut command = Command::new(self.spec.executable());
         command
@@ -934,6 +1004,10 @@ impl HermeticCockpit {
         }
         self.daemon_generation = Some(current);
         Ok(())
+    }
+
+    pub fn wait_for_daemon_handshake(&self, timeout: Duration) {
+        self.wait_for_daemon(timeout);
     }
 
     fn wait_for_daemon(&self, timeout: Duration) {

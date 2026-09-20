@@ -127,15 +127,7 @@ impl std::fmt::Debug for AgentAuthoringScreen {
 
 impl AgentAuthoringScreen {
     pub fn new(projection: AgentAuthoringProjection, client_operation_id: String) -> Self {
-        let mut draft = AgentAuthoringDraft::from_projection(&projection);
-        initialize_tool_tiers(&mut draft.tool_tiers);
-        if draft.children.is_empty() {
-            draft.children.push(prepared_child_draft(&projection));
-        } else {
-            for child in &mut draft.children {
-                initialize_child_tool_tiers(child);
-            }
-        }
+        let draft = fresh_authoring_draft(&projection);
         let name = draft.name.clone();
         Self {
             projection,
@@ -220,7 +212,7 @@ impl AgentAuthoringScreen {
             .as_deref()
             .is_some_and(|revision| revision != projection.policy.policy_revision);
         self.projection = projection;
-        self.draft = AgentAuthoringDraft::from_projection(&self.projection);
+        self.draft = fresh_authoring_draft(&self.projection);
         if stale_review {
             self.review = None;
             self.review_policy_revision = None;
@@ -647,35 +639,8 @@ impl AgentAuthoringScreen {
             return false;
         }
         if let Some(button) = self.actions.clicked(pos) {
-            match self.phase {
-                Phase::SubagentsList if button == 0 => self.begin_add_subagent(),
-                Phase::SubagentsList if button == 1 => {
-                    if let Some(action) = self.request_preview() {
-                        self.pending_action = Some(action);
-                    }
-                }
-                Phase::Create if self.status.is_some() && button == 0 => {
-                    self.phase = Phase::Review;
-                }
-                Phase::Pending if button == 0 => {
-                    self.phase = Phase::Review;
-                }
-                Phase::Conflict | Phase::Unknown if button == 0 => {
-                    self.phase = Phase::Review;
-                }
-                Phase::Conflict if button == 1 => {
-                    if let Some(action) = self.request_preview() {
-                        self.pending_action = Some(action);
-                    }
-                }
-                Phase::Unknown if button == 1 => {
-                    self.pending_action = Some(AgentAuthoringAction::RefreshProjection);
-                }
-                _ => {
-                    if let Some(action) = self.handle_advance() {
-                        self.pending_action = Some(action);
-                    }
-                }
+            if let Some(action) = self.action_bar_click(button) {
+                self.pending_action = Some(action);
             }
             return true;
         }
@@ -685,7 +650,7 @@ impl AgentAuthoringScreen {
                 .iter()
                 .position(|rect| rect.contains(pos))
         {
-            self.tool_model_cursor = self.scroll_offset + index;
+            self.tool_model_cursor = index;
             self.choose_tool_model();
             return true;
         }
@@ -926,6 +891,7 @@ impl AgentAuthoringScreen {
                             .insert(item.name.to_string(), ToolTier::Enabled);
                     }
                     self.status = Some("Required tools stay enabled.".into());
+                    return;
                 } else if current == ToolTier::Disabled
                     && tool_requires_model(item.name)
                     && !self.tool_models.contains_key(item.name)
@@ -947,12 +913,11 @@ impl AgentAuthoringScreen {
                     self.begin_edit_nested_subagent(self.cursor - 1);
                 }
             }
+            Phase::SubagentsList if self.cursor < self.draft.children.len() => {
+                self.begin_edit_subagent(self.cursor);
+            }
             Phase::SubagentsList => {
-                if self.cursor < self.draft.children.len() {
-                    self.begin_edit_subagent(self.cursor);
-                } else {
-                    let _ = self.request_preview();
-                }
+                self.pending_action = self.request_preview();
             }
             _ => {}
         }
@@ -1194,14 +1159,7 @@ impl AgentAuthoringScreen {
                 self.commit_subagent_edit();
                 None
             }
-            Phase::SubagentsList => {
-                if self.cursor < self.draft.children.len() {
-                    self.begin_edit_subagent(self.cursor);
-                    None
-                } else {
-                    self.request_preview()
-                }
-            }
+            Phase::SubagentsList => self.request_preview(),
             Phase::SubagentEdit(SubagentPhase::Identity) => {
                 let name = self.name_field.text().trim().to_string();
                 if let Some(child) = self.current_child_mut() {
@@ -1451,49 +1409,70 @@ impl AgentAuthoringScreen {
         self.list_row_rects.clear();
         self.list_row_indices.clear();
         self.model_picker_row_rects.clear();
-        let col = ui::column(area);
-        let rows = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
-        .split(col);
-        let failure =
-            matches!(self.phase, Phase::Conflict | Phase::Unknown) || self.status_is_failure();
-        ui::render_header_colored(
-            frame,
-            rows[0],
-            self.phase_title(),
-            &self.phase_subtitle(),
-            if failure { theme::BAD } else { theme::INK },
-        );
-
-        let body = rows[2];
-        if self.tool_model_picker.is_some() {
-            let split = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(body);
-            let phase_rows = self.phase_rows();
-            self.render_rows_block(frame, split[0], " Tools ", phase_rows);
-            self.render_tool_model_picker(frame, split[1]);
-        } else {
-            let title = self.block_title();
-            let phase_rows = self.phase_rows();
-            self.render_rows_block(frame, body, &title, phase_rows);
+        match self.phase {
+            Phase::SourceIdentity => self.render_source_identity(frame, area),
+            Phase::ThirdPartyLocator => self.render_third_party_locator(frame, area),
+            Phase::SubagentEdit(SubagentPhase::Identity) => {
+                self.render_subagent_identity(frame, area);
+            }
+            _ if self.tool_model_picker.is_some() => {
+                let split =
+                    Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
+                        .split(area);
+                let phase_rows = self.phase_rows();
+                self.render_rows_block(frame, split[0], " Tools ", phase_rows);
+                self.render_tool_model_picker(frame, split[1]);
+            }
+            _ => {
+                let title = self.block_title();
+                let phase_rows = self.phase_rows();
+                self.render_rows_block(frame, area, &title, phase_rows);
+            }
         }
+    }
 
-        let buttons = self.buttons();
-        let bar_width = chrome::action_bar_width(&buttons);
-        let help_width = rows[3].width.saturating_sub(bar_width.saturating_add(1));
-        ui::render_help(
+    fn render_source_identity(&mut self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(area);
+        if let Some(caret) =
+            ui::render_field(frame, rows[0], "Name", &self.name_field, true, "e.g. pilot")
+        {
+            frame.set_cursor_position(caret);
+        }
+        let source_rows = self.source_selection_rows();
+        self.render_rows_block(frame, rows[1], " Agent ", source_rows);
+    }
+
+    fn render_third_party_locator(&mut self, frame: &mut Frame, area: Rect) {
+        if let Some(caret) = ui::render_field(
             frame,
-            Rect {
-                width: help_width,
-                ..rows[3]
-            },
-            self.help_text(),
-        );
-        self.actions.render(frame, rows[3], &buttons);
+            area,
+            "Locator",
+            &self.third_party_field,
+            true,
+            "pinned source locator",
+        ) {
+            frame.set_cursor_position(caret);
+        }
+    }
+
+    fn render_subagent_identity(&mut self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(theme::NIGHT))
+            .title(Span::styled(" Subagent ", Style::new().fg(theme::INK)))
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if let Some(caret) = ui::render_field(
+            frame,
+            inner,
+            "Name",
+            &self.name_field,
+            true,
+            "subagent name",
+        ) {
+            frame.set_cursor_position(caret);
+        }
     }
 
     fn block_title(&self) -> String {
@@ -1539,7 +1518,7 @@ impl AgentAuthoringScreen {
         }
     }
 
-    fn buttons(&self) -> Vec<chrome::Button<'static>> {
+    pub(crate) fn buttons(&self) -> Vec<chrome::Button<'static>> {
         match self.phase {
             Phase::Review => vec![chrome::Button::primary("Create agent")],
             Phase::Create if self.status.is_some() => vec![
@@ -1564,6 +1543,31 @@ impl AgentAuthoringScreen {
         }
     }
 
+    pub(crate) fn action_bar_click(&mut self, button: usize) -> Option<AgentAuthoringAction> {
+        match self.phase {
+            Phase::SubagentsList if button == 0 => {
+                self.begin_add_subagent();
+                None
+            }
+            Phase::SubagentsList => self.request_preview(),
+            Phase::Create if self.status.is_some() && button == 0 => {
+                self.phase = Phase::Review;
+                None
+            }
+            Phase::Pending if button == 0 => {
+                self.phase = Phase::Review;
+                None
+            }
+            Phase::Conflict | Phase::Unknown if button == 0 => {
+                self.phase = Phase::Review;
+                None
+            }
+            Phase::Conflict if button == 1 => self.request_preview(),
+            Phase::Unknown if button == 1 => Some(AgentAuthoringAction::RefreshProjection),
+            _ => self.handle_advance(),
+        }
+    }
+
     fn render_rows_block(
         &mut self,
         frame: &mut Frame,
@@ -1573,8 +1577,19 @@ impl AgentAuthoringScreen {
     ) {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(theme::NIGHT))
-            .title(Span::styled(title.to_string(), Style::new().fg(theme::INK)))
+            .border_style(Style::new().fg(if matches!(self.phase, Phase::Review) {
+                theme::GOOD
+            } else {
+                theme::NIGHT
+            }))
+            .title(Span::styled(
+                title.to_string(),
+                Style::new().fg(if matches!(self.phase, Phase::Review) {
+                    theme::GOOD
+                } else {
+                    theme::INK
+                }),
+            ))
             .padding(Padding::horizontal(1));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1674,79 +1689,76 @@ impl AgentAuthoringScreen {
         }
     }
 
+    fn source_selection_rows(&self) -> Vec<(Option<usize>, Line<'static>)> {
+        let selected = Style::new().fg(theme::BRASS).add_modifier(Modifier::BOLD);
+        let mut lines = Vec::new();
+        lines.push((None, Line::default()));
+        for (index, source) in self.projection.sources.iter().enumerate() {
+            let chosen = self.draft.source_selection == SourceSelection::Catalog
+                && self.draft.source_index == index;
+            lines.push((
+                Some(index),
+                Line::from(vec![
+                    ui::radio_mark(chosen, self.cursor == index),
+                    Span::styled(
+                        source.display_name.clone(),
+                        if self.cursor == index {
+                            selected
+                        } else {
+                            Style::new().fg(theme::INK)
+                        },
+                    ),
+                ]),
+            ));
+        }
+        let authored = self.projection.sources.len();
+        lines.push((
+            Some(authored),
+            Line::from(vec![
+                ui::radio_mark(
+                    self.draft.source_selection == SourceSelection::Authored,
+                    self.cursor == authored,
+                ),
+                Span::styled(
+                    "Custom authored agent",
+                    if self.cursor == authored {
+                        selected
+                    } else {
+                        Style::new().fg(theme::INK)
+                    },
+                ),
+            ]),
+        ));
+        let third_party = authored + 1;
+        lines.push((
+            Some(third_party),
+            Line::from(vec![
+                ui::radio_mark(
+                    self.draft.source_selection == SourceSelection::ThirdParty,
+                    self.cursor == third_party,
+                ),
+                Span::styled(
+                    "Third-party pinned source",
+                    if self.cursor == third_party {
+                        selected
+                    } else {
+                        Style::new().fg(theme::INK)
+                    },
+                ),
+            ]),
+        ));
+        lines
+    }
+
     fn phase_rows(&self) -> Vec<(Option<usize>, Line<'static>)> {
         let muted = Style::new().fg(theme::FOG);
         let selected = Style::new().fg(theme::BRASS).add_modifier(Modifier::BOLD);
         let mut lines = Vec::new();
         match self.phase {
-            Phase::SourceIdentity => {
-                let name = if self.name_field.text().is_empty() {
-                    "pilot"
-                } else {
-                    self.name_field.text()
-                };
-                lines.push((None, Line::from(format!("Name  {name}"))));
-                lines.push((None, Line::default()));
-                for (index, source) in self.projection.sources.iter().enumerate() {
-                    let chosen = self.draft.source_selection == SourceSelection::Catalog
-                        && self.draft.source_index == index;
-                    lines.push((
-                        Some(index),
-                        Line::from(vec![
-                            ui::radio_mark(chosen, self.cursor == index),
-                            Span::styled(
-                                source.display_name.clone(),
-                                if self.cursor == index {
-                                    selected
-                                } else {
-                                    Style::new().fg(theme::INK)
-                                },
-                            ),
-                        ]),
-                    ));
-                }
-                let authored = self.projection.sources.len();
-                lines.push((
-                    Some(authored),
-                    Line::from(vec![
-                        ui::radio_mark(
-                            self.draft.source_selection == SourceSelection::Authored,
-                            self.cursor == authored,
-                        ),
-                        Span::styled(
-                            "Custom authored agent",
-                            if self.cursor == authored {
-                                selected
-                            } else {
-                                Style::new().fg(theme::INK)
-                            },
-                        ),
-                    ]),
-                ));
-                let third_party = authored + 1;
-                lines.push((
-                    Some(third_party),
-                    Line::from(vec![
-                        ui::radio_mark(
-                            self.draft.source_selection == SourceSelection::ThirdParty,
-                            self.cursor == third_party,
-                        ),
-                        Span::styled(
-                            "Third-party pinned source",
-                            if self.cursor == third_party {
-                                selected
-                            } else {
-                                Style::new().fg(theme::INK)
-                            },
-                        ),
-                    ]),
-                ));
-            }
-            Phase::ThirdPartyLocator => {
-                lines.push((
-                    Some(0),
-                    Line::from(format!("Locator  {}", self.third_party_field.text())),
-                ));
+            Phase::SourceIdentity
+            | Phase::ThirdPartyLocator
+            | Phase::SubagentEdit(SubagentPhase::Identity) => {
+                return lines;
             }
             Phase::ThirdPartyTrust => {
                 lines.push((
@@ -1838,10 +1850,17 @@ impl AgentAuthoringScreen {
                     .enumerate()
                 {
                     let route = &self.projection.policy.routes[index];
+                    let confirmed = self
+                        .draft
+                        .trust_confirmations
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false);
+                    let marked = confirmed || self.mouse_selected == Some(row);
                     lines.push((
                         Some(row),
                         Line::from(vec![
-                            ui::radio_mark(false, self.cursor == row),
+                            ui::radio_mark(marked, self.cursor == row),
                             Span::styled(
                                 format!(
                                     "Confirm {}/{} as {}",
@@ -1874,10 +1893,16 @@ impl AgentAuthoringScreen {
                         .enumerate()
                     {
                         let route = &self.projection.policy.routes[index];
+                        let confirmed = child
+                            .trust_confirmations
+                            .get(index)
+                            .copied()
+                            .unwrap_or(false);
+                        let marked = confirmed || self.mouse_selected == Some(row);
                         lines.push((
                             Some(row),
                             Line::from(vec![
-                                ui::radio_mark(false, self.cursor == row),
+                                ui::radio_mark(marked, self.cursor == row),
                                 Span::styled(
                                     format!(
                                         "Confirm {}/{} as {}",
@@ -2026,12 +2051,6 @@ impl AgentAuthoringScreen {
                         ));
                     }
                 }
-            }
-            Phase::SubagentEdit(SubagentPhase::Identity) => {
-                lines.push((
-                    Some(0),
-                    Line::from(format!("Name  {}", self.name_field.text())),
-                ));
             }
             Phase::Review => {
                 if let Some(review) = &self.review {
@@ -2220,6 +2239,19 @@ fn enable_required_tools(tiers: &mut std::collections::BTreeMap<String, ToolTier
     {
         tiers.insert(item.name.to_string(), ToolTier::Enabled);
     }
+}
+
+fn fresh_authoring_draft(projection: &AgentAuthoringProjection) -> AgentAuthoringDraft {
+    let mut draft = AgentAuthoringDraft::from_projection(projection);
+    initialize_tool_tiers(&mut draft.tool_tiers);
+    if draft.children.is_empty() {
+        draft.children.push(prepared_child_draft(projection));
+    } else {
+        for child in &mut draft.children {
+            initialize_child_tool_tiers(child);
+        }
+    }
+    draft
 }
 
 fn initialize_tool_tiers(tiers: &mut std::collections::BTreeMap<String, ToolTier>) {

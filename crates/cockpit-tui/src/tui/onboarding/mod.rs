@@ -1649,6 +1649,17 @@ impl OnboardingShell {
             (OnboardingScreen::Complete { .. }, Some(1)) => {
                 PointerOutcome::acted(OnboardingShellAction::Close)
             }
+            (OnboardingScreen::AgentAuthoring(screen), Some(index)) => {
+                let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen else {
+                    unreachable!()
+                };
+                match screen.action_bar_click(index) {
+                    Some(action) => {
+                        PointerOutcome::acted(OnboardingShellAction::AgentAuthoring(action))
+                    }
+                    None => PointerOutcome::consumed(),
+                }
+            }
             _ => match self.activate_primary(engine) {
                 Some(action) => PointerOutcome::acted(action),
                 None => PointerOutcome::consumed(),
@@ -2046,7 +2057,7 @@ impl OnboardingShell {
             }
             OnboardingScreen::Authenticate(screen) => screen.buttons(),
             OnboardingScreen::Verify(screen) => screen.buttons(),
-            OnboardingScreen::AgentAuthoring(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::AgentAuthoring(screen) => screen.buttons(),
             OnboardingScreen::Lifetime(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Model(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::EmbeddedSettings => vec![chrome::Button::primary("Continue")],

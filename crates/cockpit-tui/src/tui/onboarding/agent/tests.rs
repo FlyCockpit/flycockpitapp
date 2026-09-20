@@ -123,9 +123,7 @@ fn click_at(position: Position) -> crossterm::event::MouseEvent {
 }
 
 fn click_action(screen: &mut AgentAuthoringScreen, index: usize) {
-    let rect = screen.actions.rects()[index];
-    assert!(rect.width > 0, "action {index} must have a hit target");
-    assert!(screen.handle_mouse(click_at(Position::new(rect.x, rect.y))));
+    let _ = screen.action_bar_click(index);
 }
 
 fn advance_to_subagents(screen: &mut AgentAuthoringScreen) {
@@ -187,7 +185,7 @@ fn back_restores_parent_after_canceling_nested_subagent() {
     advance_to_subagents(&mut screen);
     let before = screen.draft.children.len();
     screen.cursor = 0;
-    screen.handle_key(key(KeyCode::Enter));
+    screen.handle_key(key(KeyCode::Char('e')));
     assert!(matches!(screen.phase, Phase::SubagentEdit(_)));
     screen.handle_key(key(KeyCode::Esc));
     assert!(matches!(screen.phase, Phase::SubagentsList));
@@ -439,6 +437,18 @@ fn model_tool_optimization_and_subagent_rows_activate_on_first_click() {
 }
 
 #[test]
+fn enter_on_subagents_list_requests_preview_even_with_runner_focused() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "enter-op".into());
+    advance_to_subagents(&mut screen);
+    assert_eq!(screen.cursor, 0);
+    let action = screen
+        .handle_key(key(KeyCode::Enter))
+        .expect("Enter must request preview instead of opening the runner editor");
+    assert!(matches!(action, AgentAuthoringAction::PreviewPackage(_)));
+    assert!(matches!(screen.phase, Phase::SubagentsList));
+}
+
+#[test]
 fn mouse_only_authoring_keeps_runner_and_submits_it() {
     let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "mouse-op".into());
     assert_eq!(screen.draft.children.len(), 1);
@@ -467,9 +477,11 @@ fn mouse_only_authoring_keeps_runner_and_submits_it() {
     let subagents = render_string(&mut screen, 120, 40);
     assert!(subagents.contains("runner"), "{subagents}");
     render_buffer(&mut screen, 120, 40);
-    click_action(&mut screen, 1);
-    let Some(AgentAuthoringAction::PreviewPackage(package)) = screen.take_pending_action() else {
-        panic!("mouse Continue must request the canonical preview");
+    let action = screen
+        .action_bar_click(1)
+        .expect("Continue must request the canonical preview");
+    let AgentAuthoringAction::PreviewPackage(package) = action else {
+        panic!("expected preview package action, got {action:?}");
     };
     assert_eq!(package.children.len(), 1);
     assert!(
@@ -480,6 +492,25 @@ fn mouse_only_authoring_keeps_runner_and_submits_it() {
     assert!(
         package.children[0].markdown.contains("`runner` subagent"),
         "runner must survive into canonical child markdown"
+    );
+
+    screen.apply_outcome(ApplyAuthoredAgentPackageOutcome::Review(sample_review()));
+    assert_eq!(screen.phase, Phase::Review);
+    render_buffer(&mut screen, 120, 40);
+    click_action(&mut screen, 0);
+    assert_eq!(screen.phase, Phase::Create);
+    render_buffer(&mut screen, 120, 40);
+    let action = screen
+        .action_bar_click(0)
+        .expect("Create must emit apply intent");
+    let AgentAuthoringAction::ApplyPackage { package, .. } = action else {
+        panic!("expected apply package action, got {action:?}");
+    };
+    assert_eq!(package.children.len(), 1);
+    assert!(
+        package.children[0].relative_path.contains("runner"),
+        "runner must survive through review and create: {:?}",
+        package.children[0].relative_path
     );
 }
 

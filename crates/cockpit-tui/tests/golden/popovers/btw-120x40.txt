@@ -1,17 +1,18 @@
                                                                                 ● Working ╭ btw · seeded ──────────────╮
- ◆ Cockpit             [Hide] /tmp/project                                                │                            │
+ ◆ Cockpit             [Hide] ⎇ /tmp/project                                [Setup: Code] │                            │
                               ─────────────────────────────────────────────────────────── │                            │
-  + New session               ▌Continue with every transcript element.                  │ │                            │
-                              ▌ Agent                              [Pin] [Fork]  12:00  │ │                            │
- SESSIONS                       Model  Agent                                            │ │                            │
- no active sessions in all pr   TTFT   0.9s                                             │ │                            │
+  + New session               ▌Continue with every transcript element.           12:00  │ │                            │
+                              ┊ Keep product-only transcript variants.                  │ │                            │
+ SESSIONS                     ▌ Agent                              [Pin] [Fork]  12:00  │ │                            │
+ no active sessions in all pr   Model  Agent                                            │ │                            │
+                                TTFT   0.9s                                             │ │                            │
                                 TPS    40                                               │ │                            │
                                 Cache  —                                                │ │                            │
                                 ▾ Thought                                               │ │                            │
                                 Map each requested row to its owning renderer.          │ │                            │
                                 The open thought is followed by tool work.              │ │                            │
                                                                                         │ │                            │
-                                ▸ read  crates/cockpit-tui/src/tui/history/mod.rs       │ │                            │
+                                ▸ read  crates/cockpit-tui/src/tui/history/mod.rs       █ │                            │
                                                                                         █ │                            │
                                 ─ explore                                               █ │                            │
                               ▌ interactive ✓ explore worked for 3s [u]                 █ │                            │
@@ -35,6 +36,5 @@
                                 Streaming the final response with a stable caret        █ │╰──────────────────────────╯│
                                 while the viewport remains scrolled.▌                   █ ╰────────────────────────────╯
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys                                           113 tokens│
+│Ask anything, ⇧↵ for a newline, or / for commands…                                                          113 tokens│
 ╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯
-Setup: Code                                                                                                             

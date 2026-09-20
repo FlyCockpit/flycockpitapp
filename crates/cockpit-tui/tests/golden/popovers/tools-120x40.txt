@@ -1,15 +1,16 @@
                                                                                                                ● Working
- ◆ Cockpit             [Hide] /tmp/project                                                                              
+ ◆ Cockpit             [Hide] ⎇ /tmp/project                                                               [Setup: Code]
                               ──────────────────────────────────────────────────────────────────────────────────────────
-  + New session               ▌Restyle the complete transcript surface.                                                │
-                                                                                                                       │
- SESSIONS                       ▸ You                                                                                  │
- no active sessions in all pr   Prioritize the transcript chrome.                                                      │
+  + New session               ▌Restyle the complete transcript surface.                           [Pin] [Fork]  12:00  │
+                              ▌ Continue with every transcript element.                                                │
+ SESSIONS                                                                                                              │
+ no active sessions in all pr   ▸ You                                                                                  │
+                                Prioritize the transcript chrome.                                                      │
                               note to self                                                                      12:00  │
                               ┊ Keep product-only transcript variants.                                                 │
                               ▌ Agent╭ tools ───────────────────────────────────────────────────────────────────╮2:00  │
-                                Model│Cockpit  current agent tools                                              │      │
-                                TTFT │                                                                          │      │
+                                Model│Cockpit  current agent tools                                              │      █
+                                TTFT │                                                                          │      █
                                 TPS  │files                                                                     │      █
                                 Cache│› [ ] read  tier: -                                                       │      █
                                 ▾ Tho│                                                                          │      █
@@ -37,4 +38,3 @@
  ● working  ● waiting  ● done   Thinking                                                                               █
                                 Check the final visual hierarchy.                                                      █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
-Setup: Code                                                                                                             

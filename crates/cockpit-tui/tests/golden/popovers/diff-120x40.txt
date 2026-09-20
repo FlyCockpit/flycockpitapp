@@ -1,15 +1,16 @@
                                                                                                                ● Working
- ◆ Cockpit             [Hide] /t╭ /diff source: worktree ────────────────────────────────────────────────────────────╮  
+ ◆ Cockpit             [Hide] ⎇ ╭ /diff source: worktree ────────────────────────────────────────────────────────────╮e]
                               ──│loading git diff…               loading git diff…                                   │──
   + New session               ▌R│                                                                                    │ │
-                                │                                                                                    │ │
+                              ▌ │                                                                                    │ │
  SESSIONS                       │                                                                                    │ │
  no active sessions in all pr   │                                                                                    │ │
+                                │                                                                                    │ │
                               no│                                                                                    │ │
                               ┊ │                                                                                    │ │
                               ▌ │                                                                                    │ │
-                                │                                                                                    │ │
-                                │                                                                                    │ │
+                                │                                                                                    │ █
+                                │                                                                                    │ █
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                                 │                                                                                    │ █
@@ -37,4 +38,3 @@
  ● working  ● waiting  ● done   │q quit  ↑/↓ file  PgUp/PgDn Ctrl+U/D scroll  g/G top/bottom  Tab source  w wrap  s s│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
-Setup: Code                                                                                                             

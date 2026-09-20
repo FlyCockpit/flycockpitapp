@@ -1456,10 +1456,23 @@ impl App {
             chat_body,
             crate::tui::chrome::PopoverSide::Center,
         );
-        if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust)
-            || self.dialog.is_active()
-            || self.overlay.is_open()
-        {
+        let popover_stack_active = self.onboarding_shell.is_none()
+            && self.question_dialog.is_none()
+            && (self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust)
+                || self.overlay.is_open()
+                || self.dialog.is_active());
+        let paint_transcript_under_popover = popover_stack_active
+            && (self.overlay.is_open()
+                || self.dialog.is_active()
+                || self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust));
+        if paint_transcript_under_popover {
+            // excoc paints the main transcript before Clear+overlay; keep the
+            // chat column visible around popovers and dialog surfaces.
+            let history_body = self.render_chat_header(frame, chat_body);
+            self.render_chat_history_pane(frame, history_body);
+            self.paint_transcript_control_buttons(frame);
+        }
+        if popover_stack_active {
             frame.render_widget(ratatui::widgets::Clear, popover_body);
         }
 

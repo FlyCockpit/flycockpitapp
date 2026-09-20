@@ -349,7 +349,7 @@ impl SessionRail {
             scrollbar(
                 frame,
                 body,
-                max_session_scroll + 1,
+                card_count,
                 self.last_session_view,
                 self.current().session_scroll,
             );

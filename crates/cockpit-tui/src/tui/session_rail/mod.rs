@@ -1378,8 +1378,10 @@ impl SessionRail {
                 if let Some(index) = hit_card(&self.card_hits, mouse.column, mouse.row) {
                     self.focus();
                     self.column_focus = ColumnFocus::List;
-                    if let Some(level) = self.levels.last_mut() {
-                        level.select(index);
+                    if let Some((summary, _)) = self.filtered_cards().get(index) {
+                        if let Some(level) = self.levels.last_mut() {
+                            level.selected_session_id = Some(summary.session_id);
+                        }
                     }
                     self.ensure_session_scroll_shows_selected();
                     return self.preview_for_selection();

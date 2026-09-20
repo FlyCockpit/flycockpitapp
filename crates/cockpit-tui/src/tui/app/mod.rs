@@ -4088,12 +4088,18 @@ impl App {
             worktree_root,
             dialog: Dialog::None,
             overlay: Overlay::None,
-            session_rail: crate::tui::session_rail::SessionRail::new(
-                None,
-                &launch_cwd,
-                false,
-                use_emojis,
-            ),
+            session_rail: {
+                let mut session_rail = crate::tui::session_rail::SessionRail::new(
+                    None,
+                    &launch_cwd,
+                    false,
+                    use_emojis,
+                );
+                if let Ok(visible) = cockpit_config::extended::load_global_session_rail_visible() {
+                    session_rail.set_visible(visible);
+                }
+                session_rail
+            },
             session_setup_inline: Some(
                 crate::tui::session_setup::SessionSetupPane::loading_inline(true),
             ),

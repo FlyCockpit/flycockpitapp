@@ -281,11 +281,11 @@ fn select_first_model_in_composer_menu(app: &mut App) {
 
 fn trigger_add_model_from_composer_menu(app: &mut App) {
     if let Some(picker) = app.composer_controls.picker.as_mut() {
-        if picker.level == 0 {
-            if let Some(index) = picker.categories.iter().position(|c| c.id == "p") {
-                picker.level = 1;
-                picker.category = index;
-            }
+        if picker.level == 0
+            && let Some(index) = picker.categories.iter().position(|c| c.id == "p")
+        {
+            picker.level = 1;
+            picker.category = index;
         }
         if let Some(category) = picker.categories.get(picker.category)
             && let Some(index) = category

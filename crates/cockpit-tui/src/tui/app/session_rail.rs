@@ -316,24 +316,19 @@ mod tests {
         assert!(!app.overlay.is_open());
     }
 
-    fn popover_rect_for_test(app: &App, width: u16, height: u16) -> ratatui::layout::Rect {
-        let geom = app.geometry();
-        let rects = geom.layout(ratatui::layout::Rect::new(0, 0, width, height));
+    fn popover_chat_body(app: &App, width: u16, height: u16) -> ratatui::layout::Rect {
+        let rects = app
+            .geometry()
+            .layout(ratatui::layout::Rect::new(0, 0, width, height));
         let (_rail, chat_body) = app.session_rail.split_body(rects.body, width);
-        let popover_max_height = chat_body.height.saturating_sub(2).max(1);
-        let popover_height = if geom.dialog > 0 {
-            geom.dialog
-                .clamp(12.min(popover_max_height), popover_max_height)
-        } else {
-            popover_max_height
-        };
-        crate::tui::chrome::place_popover(
-            chat_body,
-            chat_body.width.saturating_sub(4).clamp(1, 96),
-            popover_height,
-            chat_body,
-            crate::tui::chrome::PopoverSide::Center,
-        )
+        chat_body
+    }
+
+    fn chat_column_text(buf: &ratatui::buffer::Buffer, rail_right: u16, width: u16) -> String {
+        (0..buf.area.height)
+            .map(|y| row_text(buf, y, rail_right, width))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -350,6 +345,7 @@ mod tests {
             assert!(matches!(tools.overlay, Overlay::Tools(_)));
             let tools_buf = render_buffer(&mut tools, 120, 40);
             let rail = tools.session_rail.rail_area().expect("persistent rail");
+            let rail_right = rail.x + rail.width;
             let tools_text = tools_buf
                 .content()
                 .iter()
@@ -357,18 +353,14 @@ mod tests {
                 .collect::<String>();
             assert!(tools_text.contains("◆ Cockpit"));
             assert!(tools_text.contains("SESSIONS"));
-            let rail_right = rail.x + rail.width;
-            let chat_has_tools = (0..40u16)
-                .any(|y| row_text(&tools_buf, y, rail_right, 120).contains("current agent tools"));
+            let chat_has_tools =
+                chat_column_text(&tools_buf, rail_right, 120).contains("current agent tools");
             assert!(
                 chat_has_tools,
                 "tools popover must render in the chat body, not over the rail"
             );
-            let tools_rects = tools
-                .geometry()
-                .layout(ratatui::layout::Rect::new(0, 0, 120, 40));
-            let (_persistent, chat_body) = tools.session_rail.split_body(tools_rects.body, 120);
-            let popover = popover_rect_for_test(&tools, 120, 40);
+            let chat_body = popover_chat_body(&tools, 120, 40);
+            let popover = tools.last_popover_rect_for_tests();
             assert!(
                 popover.height > 12,
                 "zero-dialog overlays must not clamp to the legacy 12-row popover"
@@ -390,11 +382,15 @@ mod tests {
                 quick_geom.dialog > 0,
                 "quick overlay owns a bounded dialog height"
             );
-            let quick_popover = popover_rect_for_test(&quick, 120, 40);
+            render_buffer(&mut quick, 120, 40);
+            let rail = quick.session_rail.rail_area().expect("quick rail");
+            let rail_right = rail.x + rail.width;
+            let quick_popover = quick.last_popover_rect_for_tests();
             assert_eq!(
                 quick_popover.height, quick_geom.dialog,
                 "dialog-height overlays keep their declared height"
             );
+            assert!(quick_popover.x >= rail_right);
         }
 
         {
@@ -402,24 +398,34 @@ mod tests {
             settings.dialog = Dialog::Settings(Box::new(
                 crate::tui::settings::SettingsDialog::open(tmp.path().join("config.json")),
             ));
-            render_width(&mut settings, 120, 40);
+            let settings_buf = render_buffer(&mut settings, 120, 40);
             assert!(settings.session_rail.rail_area().is_some());
-            let settings_popover = popover_rect_for_test(&settings, 120, 40);
             let settings_rail = settings.session_rail.rail_area().expect("settings rail");
-            assert!(settings_popover.x >= settings_rail.x + settings_rail.width);
+            let rail_right = settings_rail.x + settings_rail.width;
+            let settings_popover = settings.last_popover_rect_for_tests();
+            assert!(settings_popover.x >= rail_right);
             assert!(settings_popover.height > 12);
+            assert!(
+                chat_column_text(&settings_buf, rail_right, 120).contains("Settings"),
+                "settings dialog paints in the chat column beside the rail"
+            );
         }
 
         {
             let (mut picker, _env) = configured_app(&tmp);
             picker.open_model_picker();
             assert!(matches!(picker.overlay, Overlay::ModelPicker(_)));
-            render_width(&mut picker, 120, 40);
+            let picker_buf = render_buffer(&mut picker, 120, 40);
             assert!(picker.session_rail.rail_area().is_some());
-            let picker_popover = popover_rect_for_test(&picker, 120, 40);
             let picker_rail = picker.session_rail.rail_area().expect("picker rail");
-            assert!(picker_popover.x >= picker_rail.x + picker_rail.width);
+            let rail_right = picker_rail.x + picker_rail.width;
+            let picker_popover = picker.last_popover_rect_for_tests();
+            assert!(picker_popover.x >= rail_right);
             assert!(picker_popover.height > 12);
+            assert!(
+                chat_column_text(&picker_buf, rail_right, 120).contains("model"),
+                "model picker paints in the chat column beside the rail"
+            );
         }
 
         {
@@ -429,12 +435,17 @@ mod tests {
                 root: tmp.path().to_path_buf(),
                 kind: cockpit_config::trust::TrustRootKind::Directory,
             });
-            render_width(&mut trust, 120, 40);
+            let trust_buf = render_buffer(&mut trust, 120, 40);
             assert!(trust.session_rail.rail_area().is_some());
-            let trust_popover = popover_rect_for_test(&trust, 120, 40);
             let trust_rail = trust.session_rail.rail_area().expect("trust rail");
-            assert!(trust_popover.x >= trust_rail.x + trust_rail.width);
+            let rail_right = trust_rail.x + trust_rail.width;
+            let trust_popover = trust.last_popover_rect_for_tests();
+            assert!(trust_popover.x >= rail_right);
             assert!(trust_popover.height > 12);
+            assert!(
+                chat_column_text(&trust_buf, rail_right, 120).contains("trust"),
+                "workspace trust dialog paints in the chat column beside the rail"
+            );
         }
     }
 
@@ -507,6 +518,10 @@ mod tests {
         assert!(!persisted.tui.session_rail_visible);
         drop(_env);
         let (mut restarted, _env2) = configured_app(&tmp);
+        assert!(
+            !restarted.config_snapshot.extended.tui.session_rail_visible,
+            "held config must match the persisted hide preference before attach or toggle"
+        );
         assert!(
             !restarted.session_rail.is_visible(),
             "App::new reads the persisted global session-rail preference before first paint"

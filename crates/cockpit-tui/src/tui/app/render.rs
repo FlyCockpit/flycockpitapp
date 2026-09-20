@@ -1456,6 +1456,10 @@ impl App {
             chat_body,
             crate::tui::chrome::PopoverSide::Center,
         );
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.last_popover_rect = popover_body;
+        }
         let popover_stack_active = self.onboarding_shell.is_none()
             && self.question_dialog.is_none()
             && (self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust)

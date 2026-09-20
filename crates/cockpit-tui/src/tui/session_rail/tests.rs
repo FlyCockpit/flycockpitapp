@@ -1,6 +1,12 @@
 use super::*;
+use crate::tui::theme::{
+    BRASS, BRASS_INDEX, GOOD, GOOD_INDEX, HOVER_BG, HOVER_BG_INDEX, RED, RED_INDEX, SURFACE,
+    SURFACE_INDEX, YELLOW, YELLOW_INDEX, resolve_color,
+};
 use cockpit_proto::MessageRole;
 use crossterm::event::{KeyEventKind, KeyEventState, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier};
 use ratatui::{Terminal, backend::TestBackend};
 use std::collections::HashMap;
 
@@ -94,7 +100,12 @@ fn message(seq: i64, text: &str) -> SessionMessage {
     }
 }
 
-fn golden_rail(selected: bool, hovered: Option<usize>, visible: bool) -> ratatui::buffer::Buffer {
+fn golden_rail(
+    selected: bool,
+    hovered: Option<usize>,
+    visible: bool,
+    pointer: Option<(u16, u16)>,
+) -> ratatui::buffer::Buffer {
     let mut first = summary(Uuid::from_u128(1), 1_725_582_480_000);
     first.title = Some("Build session rail".into());
     first.favorite = true;
@@ -112,6 +123,7 @@ fn golden_rail(selected: bool, hovered: Option<usize>, visible: bool) -> ratatui
         None
     };
     rail.hovered_card = hovered;
+    rail.pointer_position = pointer;
     rail.set_visible(visible);
     crate::tui::golden::render_frame(120, 40, |frame| {
         let persistent = visible.then_some(Rect::new(0, 0, 30, 40));
@@ -119,70 +131,128 @@ fn golden_rail(selected: bool, hovered: Option<usize>, visible: bool) -> ratatui
     })
 }
 
-#[test]
-fn golden_rail_region_matches_excoc_paint_rules_120x40() {
-    let _pins = crate::tui::golden::GoldenPins::install().allow_hover();
-    let buffer = golden_rail(true, None, true);
-    let rendered = crate::tui::golden::buffer_text(&buffer);
-    let rail_width = 30usize;
-    let crop = crop_buffer_width(&rendered, rail_width);
-    let lines: Vec<_> = crop.lines().collect();
+const EXCOC_RAIL_WIDTH: u16 = 30;
+
+fn rail_row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..EXCOC_RAIL_WIDTH)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+fn assert_cell(
+    buffer: &ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    symbol: &str,
+    fg: Color,
+    bg: Color,
+    modifier: Modifier,
+) {
+    let cell = &buffer[(x, y)];
+    assert_eq!(cell.symbol(), symbol, "cell ({x},{y})");
+    assert_eq!(cell.fg, fg, "fg at ({x},{y})");
+    assert_eq!(cell.bg, bg, "bg at ({x},{y})");
+    assert_eq!(cell.modifier, modifier, "modifier at ({x},{y})");
+}
+
+/// excoc sidebar inner layout at 120×40 with a 30-column persistent rail:
+/// header y=1, new-session y=3, SESSIONS y=5, cards from y=6, legend last two rows.
+fn assert_excoc_open_selected_rail_cells(buffer: &ratatui::buffer::Buffer) {
+    let surface = resolve_color(SURFACE, SURFACE_INDEX);
+    let hover = resolve_color(HOVER_BG, HOVER_BG_INDEX);
+    let brass = resolve_color(BRASS, BRASS_INDEX);
+    let row1 = rail_row_text(buffer, 1);
     assert!(
-        lines
-            .iter()
-            .any(|line| line.contains('◆') && line.contains("Cockpit")),
-        "excoc header uses the Do 6 ◆ Cockpit title"
+        row1.contains('◆') && row1.contains("Cockpit"),
+        "excoc header title"
     );
     assert!(
-        lines.iter().any(|line| line.contains("[Hide]")),
-        "open rail shows the excoc Hide chip"
+        row1.trim_end().ends_with("[Hide]"),
+        "excoc Hide chip flush-right in header"
     );
+    assert_eq!(buffer[(1, 1)].bg, surface, "sidebar SURFACE wash");
     assert!(
-        lines.iter().any(|line| line.contains("+ New session")),
+        rail_row_text(buffer, 3).contains("+ New session"),
         "excoc new-session chip"
     );
     assert!(
-        lines
-            .iter()
-            .any(|line| line.trim_start().starts_with("SESSIONS")),
+        rail_row_text(buffer, 5)
+            .trim_start()
+            .starts_with("SESSIONS"),
         "excoc sessions label row"
     );
+    assert_cell(buffer, 1, 6, "▌", brass, hover, Modifier::BOLD);
+    let datetime = crate::tui::golden::PINNED_DATETIME;
     assert!(
-        lines.iter().any(|line| line.contains('▌')),
-        "selected row uses excoc repeat-highlight"
+        rail_row_text(buffer, 7).contains(datetime),
+        "excoc datetime row uses pinned %b %-d, %H:%M"
     );
+    let legend = format!("{}{}", rail_row_text(buffer, 37), rail_row_text(buffer, 38));
     assert!(
-        lines
-            .iter()
-            .any(|line| line.contains('●') && line.contains("working")),
-        "excoc legend names the working dot tier"
+        legend.contains('●') && legend.contains("working") && legend.contains("waiting"),
+        "excoc activity legend"
+    );
+    let mut dot_colours = Vec::new();
+    for x in 0..EXCOC_RAIL_WIDTH {
+        if buffer[(x, 37)].symbol() == "●" {
+            dot_colours.push(buffer[(x, 37)].fg);
+        }
+    }
+    assert_eq!(
+        dot_colours,
+        vec![
+            resolve_color(YELLOW, YELLOW_INDEX),
+            resolve_color(RED, RED_INDEX),
+            resolve_color(GOOD, GOOD_INDEX),
+        ],
+        "excoc legend dot colours in order"
     );
     // Product-only selected-row metadata (third line) is allowed; excoc has no
     // equivalent, so this is not part of the excoc parity check.
     assert!(
-        lines.iter().any(|line| line.contains("pin 2")),
+        rail_row_text(buffer, 8).contains("pin 2"),
         "selected-row product metadata remains a bounded extension"
     );
 }
 
-fn crop_buffer_width(text: &str, width: usize) -> String {
-    text.lines()
-        .map(|line| {
-            let mut out = String::new();
-            let mut cols = 0usize;
-            for ch in line.chars() {
-                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                if cols + w > width {
-                    break;
-                }
-                out.push(ch);
-                cols += w;
-            }
-            out
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
+fn assert_excoc_hidden_show_chip(buffer: &ratatui::buffer::Buffer) {
+    assert!(
+        rail_row_text(buffer, 0).starts_with("[Show]"),
+        "hidden rail paints excoc Show at terminal origin"
+    );
+}
+
+fn assert_excoc_hovered_action_row(buffer: &ratatui::buffer::Buffer) {
+    let row = rail_row_text(buffer, 9);
+    assert!(row.contains("[Pin]"), "hover replaces datetime with Pin");
+    assert!(row.contains("[Archive]"), "hover Archive chip");
+    assert!(row.contains("[×]"), "hover delete chip");
+    let pin_fg = buffer[(row.find("[Pin]").unwrap() as u16, 9)].fg;
+    let archive_fg = buffer[(row.find("[Archive]").unwrap() as u16, 9)].fg;
+    let delete_fg = buffer[(row.find("[×]").unwrap() as u16, 9)].fg;
+    assert_eq!(
+        pin_fg,
+        Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX),
+        "Pin uses FOG like excoc"
+    );
+    assert_eq!(
+        archive_fg,
+        Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX),
+        "Archive uses FOG like excoc"
+    );
+    assert_eq!(
+        delete_fg,
+        resolve_color(RED, RED_INDEX),
+        "delete chip uses RED"
+    );
+}
+
+#[test]
+fn golden_rail_region_matches_excoc_paint_rules_120x40() {
+    let _pins = crate::tui::golden::GoldenPins::install().allow_hover();
+    assert_excoc_open_selected_rail_cells(&golden_rail(true, None, true, None));
+    assert_excoc_hidden_show_chip(&golden_rail(false, None, false, None));
+    assert_excoc_hovered_action_row(&golden_rail(false, Some(1), true, Some((5, 9))));
 }
 
 #[test]
@@ -266,7 +336,7 @@ fn golden_session_rail_open_hidden_hovered_and_selected_120x40() {
         ("hovered-row", false, Some(1), true),
         ("selected-row", true, None, true),
     ] {
-        let buffer = golden_rail(selected, hovered, visible);
+        let buffer = golden_rail(selected, hovered, visible, None);
         crate::tui::golden::assert_golden("session-rail", name, 120, 40, &buffer);
     }
 }

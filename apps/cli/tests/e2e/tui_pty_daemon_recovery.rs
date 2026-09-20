@@ -6,6 +6,7 @@ use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 const HISTORY_MARKER: &str = "watchdog-history-marker-437";
+const SECOND_HISTORY_MARKER: &str = "watchdog-second-marker-437";
 
 fn session_id_with_durable_marker(db_path: &Path, marker: &str) -> Uuid {
     let session_id: String = Connection::open(db_path)
@@ -21,31 +22,55 @@ fn session_id_with_durable_marker(db_path: &Path, marker: &str) -> Uuid {
     Uuid::parse_str(&session_id).expect("session id in sqlite")
 }
 
-fn durable_user_message_contains(db_path: &Path, session_id: Uuid, marker: &str) -> bool {
+fn session_has_durable_user_message(db_path: &Path, session_id: Uuid, marker: &str) -> bool {
     Connection::open(db_path)
         .expect("open hermetic session db")
         .query_row(
-            "SELECT data_json FROM session_events \
-             WHERE session_id = ?1 AND type = 'user_message' ORDER BY seq LIMIT 1",
-            params![session_id.to_string()],
-            |row| row.get::<_, String>(0),
+            "SELECT 1 FROM session_events \
+             WHERE session_id = ?1 AND type = 'user_message' AND data_json LIKE ?2 LIMIT 1",
+            params![session_id.to_string(), format!("%{marker}%")],
+            |_| Ok(()),
         )
-        .map(|json| json.contains(marker))
-        .unwrap_or(false)
+        .is_ok()
+}
+
+fn assert_session_retains_markers(db_path: &Path, session_id: Uuid, markers: &[&str]) {
+    for marker in markers {
+        assert!(
+            session_has_durable_user_message(db_path, session_id, marker),
+            "session {session_id} must retain durable user message {marker}"
+        );
+    }
+}
+
+fn submit_durable_marker(session: &mut HermeticCockpit, marker: &str) {
+    session.write_str(marker);
+    session
+        .wait_until_screen("marker draft", Duration::from_secs(5), |screen| {
+            screen.contains(marker)
+        })
+        .expect("marker must reach the composer before submit");
+    session.send_enter();
+}
+
+fn wait_until_durable_marker(db_path: &Path, session_id: Uuid, marker: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if session_has_durable_user_message(db_path, session_id, marker) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let actual = session_id_with_durable_marker(db_path, marker);
+    panic!(
+        "session {session_id} must retain durable user message {marker} within {timeout:?}; \
+         marker is stored under {actual}"
+    );
 }
 
 fn attach_with_durable_history() -> HermeticCockpit {
     let mut session = HermeticCockpit::launch_ready(HermeticProfile::Default);
-    // Wait for the PTY paste to reach the composer before sending Enter. The
-    // input source acknowledges paste asynchronously, so back-to-back bytes
-    // can otherwise make the test assert against an unsubmitted draft.
-    session.write_str(HISTORY_MARKER);
-    session
-        .wait_until_screen("history marker draft", Duration::from_secs(5), |screen| {
-            screen.contains(HISTORY_MARKER)
-        })
-        .expect("history marker must reach the composer before submit");
-    session.send_enter();
+    submit_durable_marker(&mut session, HISTORY_MARKER);
     session
         .wait_until_screen(
             "durable history marker",
@@ -53,9 +78,6 @@ fn attach_with_durable_history() -> HermeticCockpit {
             |screen| screen.contains(HISTORY_MARKER) && screen.contains(COMPOSER_PLACEHOLDER),
         )
         .expect("submitted history is visible before daemon replacement");
-    // The user event is persisted before model execution; allow its daemon
-    // response to cross the PTY without requiring the animated screen to be
-    // byte-stable.
     std::thread::sleep(Duration::from_millis(500));
     session
 }
@@ -94,9 +116,24 @@ fn sigkill_prompts_within_one_second_and_restart_replays_same_session() {
             },
         )
         .expect("restart must reattach and replay SQLite history");
-    assert!(
-        durable_user_message_contains(&session.home().db_path(), session_id, HISTORY_MARKER),
-        "reattach must keep the durable transcript for the original session id"
+    session
+        .wait_until_screen(
+            "composer ready after crash restart",
+            Duration::from_secs(30),
+            |screen| screen.contains(COMPOSER_PLACEHOLDER),
+        )
+        .expect("crash restart must return to an idle composer");
+    submit_durable_marker(&mut session, SECOND_HISTORY_MARKER);
+    wait_until_durable_marker(
+        &session.home().db_path(),
+        session_id,
+        SECOND_HISTORY_MARKER,
+        Duration::from_secs(20),
+    );
+    assert_session_retains_markers(
+        &session.home().db_path(),
+        session_id,
+        &[HISTORY_MARKER, SECOND_HISTORY_MARKER],
     );
     session.adopt_current_daemon_generation();
     session.reap();
@@ -125,9 +162,10 @@ fn daemon_restart_reconnects_attached_tui_without_prompt() {
             },
         )
         .expect("trusted restart must reconnect without user input");
-    assert!(
-        durable_user_message_contains(&session.home().db_path(), session_id, HISTORY_MARKER),
-        "trusted restart must preserve the durable session id and transcript"
+    assert_eq!(
+        session_id,
+        session_id_with_durable_marker(&session.home().db_path(), HISTORY_MARKER),
+        "trusted restart must keep the durable session id for the history marker"
     );
     session.reap();
     session.assert_reaped();

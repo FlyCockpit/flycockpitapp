@@ -4900,4 +4900,35 @@ mod tests {
             "{restored_lines:?}"
         );
     }
+
+    #[test]
+    fn provisional_new_session_daemon_restart_prompt_clears_loading_placeholder() {
+        use crate::tui::agent_runner::{GLOBAL_ATTACHMENT_EPOCH, QueuedTurnEvent};
+        use crate::tui::session_setup::SessionSetupPane;
+        use cockpit_client::presentation::TurnEvent;
+
+        let mut app = App::new(Some(std::path::Path::new("/tmp/project")), false);
+        app.provisional_new_session = true;
+        app.overlay = Overlay::SessionSetup(SessionSetupPane::loading(false));
+        app.session_setup_inline = Some(SessionSetupPane::loading_inline(false));
+
+        app.route_queued_turn_event(QueuedTurnEvent {
+            attachment_epoch: GLOBAL_ATTACHMENT_EPOCH,
+            event: TurnEvent::DaemonRestartPrompt,
+        });
+
+        assert!(app.daemon_restart_prompt.is_some());
+        if let Overlay::SessionSetup(pane) = &app.overlay {
+            assert_eq!(
+                pane.error_message(),
+                Some("Daemon stopped; choose Restart or Quit.")
+            );
+        }
+        assert_eq!(
+            app.session_setup_inline
+                .as_ref()
+                .and_then(|pane| pane.error_message()),
+            Some("Daemon stopped; choose Restart or Quit.")
+        );
+    }
 }

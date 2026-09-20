@@ -246,7 +246,9 @@ fn author_placeable_tool_tier_preferences(
     tool_tiers
         .iter()
         .filter(|(tool, tier)| {
-            matches!(*tier, ToolTier::Enabled | ToolTier::Discoverable)
+            crate::agents::known_tool_names().contains(&tool.as_str())
+                && matches!(*tier, ToolTier::Enabled | ToolTier::Discoverable)
+                && legal_tool_tiers(tool).contains(tier)
                 && !crate::engine::builtin::author_tool_tier_preference_is_reserved(tool)
         })
         .map(|(tool, tier)| (tool.clone(), *tier))
@@ -834,6 +836,19 @@ mod tests {
             }],
             review_trust_disclosure: "shared trust".into(),
         }
+    }
+
+    #[test]
+    fn prepared_runner_child_markdown_loads_as_workspace_package() {
+        let projection = sample_projection();
+        let mut child = default_child_draft(&projection);
+        child.trust_confirmations[0] = true;
+        let (_path, markdown) = build_child_markdown(&projection, &child, "").unwrap();
+        let files = BTreeMap::from([(
+            crate::agents::PACKAGE_ROOT_FILE.to_string(),
+            markdown.into_bytes(),
+        )]);
+        crate::agents::load_workspace_package_from_files("runner", files).unwrap();
     }
 
     #[test]

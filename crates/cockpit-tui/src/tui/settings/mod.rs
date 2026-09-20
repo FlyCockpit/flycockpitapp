@@ -10286,17 +10286,22 @@ fn render_workspace_trust(
         Line::default(),
         Line::from(Span::styled("Choose workspace trust:", muted)),
     ];
-    for (index, (label, description, _)) in options.iter().enumerate() {
-        let hovered = index == cursor;
-        let marker = if hovered { "› " } else { "  " };
-        let row = |style| crate::tui::chrome::chip_style(style, hovered);
-        lines.push(Line::from(vec![
-            Span::styled(marker, row(ink)),
-            Span::styled(format!("{}. {label}", index + 1), row(ink)),
-            Span::styled(" - ", row(ink)),
-            Span::styled((*description).to_string(), row(muted)),
-        ]));
-    }
+    lines.extend(
+        options
+            .iter()
+            .enumerate()
+            .map(|(index, (label, description, _))| {
+                let hovered = index == cursor;
+                let marker = if hovered { "› " } else { "  " };
+                let row = |style| crate::tui::chrome::chip_style(style, hovered);
+                Line::from(vec![
+                    Span::styled(marker, row(ink)),
+                    Span::styled(format!("{}. {label}", index + 1), row(ink)),
+                    Span::styled(" - ", row(ink)),
+                    Span::styled((*description).to_string(), row(muted)),
+                ])
+            }),
+    );
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
     frame.render_widget(help_line("↑/↓  enter: choose  esc: untrusted"), layout[1]);
 }
@@ -10333,15 +10338,12 @@ fn render_picker(
             let row = |style| crate::tui::chrome::chip_style(style, hovered);
             let path_str = cockpit_core::welcome::display_path(&entry.path);
             let kind_str = kind_label(&entry.kind);
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            spans.push(Span::styled(marker, row(product_ink())));
-            spans.push(Span::styled(
-                pad_right(&path_str, path_w),
-                row(product_ink()),
-            ));
-            spans.push(Span::styled("   ", row(product_ink())));
-            spans.push(Span::styled(kind_str.to_string(), row(product_muted())));
-            lines.push(Line::from(spans));
+            lines.push(Line::from(vec![
+                Span::styled(marker, row(product_ink())),
+                Span::styled(pad_right(&path_str, path_w), row(product_ink())),
+                Span::styled("   ", row(product_ink())),
+                Span::styled(kind_str.to_string(), row(product_muted())),
+            ]));
         }
     }
     if let Some(msg) = status {

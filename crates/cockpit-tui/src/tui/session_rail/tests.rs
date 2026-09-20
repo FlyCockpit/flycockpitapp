@@ -128,9 +128,7 @@ fn golden_rail_region_matches_excoc_reference_120x40() {
     if reference != excoc_crop {
         panic!(
             "session rail crop drifted from excoc reference; refresh excoc-reference-120x40.txt with COCKPIT_UPDATE_GOLDEN=1 if intentional\n{}",
-            similar::TextDiff::from_lines(&reference, &excoc_crop)
-                .unified_diff()
-                .to_string()
+            similar::TextDiff::from_lines(&reference, &excoc_crop).unified_diff()
         );
     }
 }
@@ -198,7 +196,7 @@ fn sessions_keybindings_include_open_preview_and_switch_actions() {
     let actions: Vec<_> = group.bindings.iter().map(|b| b.action).collect();
     for required in ["open", "preview", "switch", "forks", "windows"] {
         assert!(
-            actions.iter().any(|action| *action == required),
+            actions.contains(&required),
             "missing Sessions which-key action: {required}"
         );
     }

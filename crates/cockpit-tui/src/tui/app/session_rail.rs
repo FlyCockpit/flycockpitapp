@@ -243,7 +243,7 @@ mod tests {
     fn row_text(buf: &ratatui::buffer::Buffer, y: u16, x_start: u16, x_end: u16) -> String {
         let mut out = String::new();
         for x in x_start..x_end {
-            out.push_str(buf.get(x, y).symbol());
+            out.push_str(buf[(x, y)].symbol());
         }
         out
     }

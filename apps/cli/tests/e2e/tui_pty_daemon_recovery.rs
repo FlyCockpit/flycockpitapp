@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -150,22 +151,51 @@ fn daemon_restart_reconnects_attached_tui_without_prompt() {
         stdout.contains("attached clients will reconnect"),
         "restart output must describe attached-client behavior: {stdout}"
     );
+    let saw_reconnect_chrome = Cell::new(false);
+    let _ = session.wait_until_screen(
+        "trusted restart reconnecting",
+        Duration::from_secs(10),
+        |screen| screen.contains("daemon restarting") || screen.contains("daemon connection lost"),
+    );
     session
         .wait_until_screen(
             "trusted restart reattached",
             Duration::from_secs(30),
             |screen| {
+                if screen.contains("daemon reconnected") {
+                    saw_reconnect_chrome.set(true);
+                }
                 screen.contains(COMPOSER_PLACEHOLDER)
                     && screen.contains(HISTORY_MARKER)
                     && !screen.contains("The daemon stopped unexpectedly")
                     && !screen.contains("Loading session setup")
+                    && !screen.contains("daemon restarting")
+                    && !screen.contains("daemon connection lost")
             },
         )
         .expect("trusted restart must reconnect without user input");
-    assert_eq!(
+    assert!(
+        saw_reconnect_chrome.get(),
+        "trusted restart must surface the daemon reconnected toast during reattach"
+    );
+    session
+        .wait_until_screen(
+            "composer ready after trusted restart",
+            Duration::from_secs(30),
+            |screen| screen.contains(COMPOSER_PLACEHOLDER),
+        )
+        .expect("trusted restart must return to an idle composer");
+    submit_durable_marker(&mut session, SECOND_HISTORY_MARKER);
+    wait_until_durable_marker(
+        &session.home().db_path(),
         session_id,
-        session_id_with_durable_marker(&session.home().db_path(), HISTORY_MARKER),
-        "trusted restart must keep the durable session id for the history marker"
+        SECOND_HISTORY_MARKER,
+        Duration::from_secs(30),
+    );
+    assert_session_retains_markers(
+        &session.home().db_path(),
+        session_id,
+        &[HISTORY_MARKER, SECOND_HISTORY_MARKER],
     );
     session.reap();
     session.assert_reaped();

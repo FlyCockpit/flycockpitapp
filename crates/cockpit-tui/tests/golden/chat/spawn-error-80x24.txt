@@ -15,10 +15,10 @@
                               │ Tip: /help gets you oriented                │   
                               ╰─────────────────────────────────────────────╯   
                                                                                 
-                                                                                
-                                                                                
-                                                                                
  ● working  ● waiting  ● do                                                     
                                                                                 
                              daemon socket address already in use: /tmp/cockpit…
+╭──────────────────────────────────────────────────────────────────────────────╮
+│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys     0 tokens│
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────[Send]╯
 Setup: Code                                                                     

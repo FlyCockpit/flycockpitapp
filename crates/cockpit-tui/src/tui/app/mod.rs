@@ -1484,12 +1484,13 @@ impl Overlay {
 
     pub(super) fn dialog_height(&self) -> u16 {
         match self {
+            Self::None => 0,
             Self::Quick(_) => 14,
             Self::Multireview(_)
             | Self::Notes(_)
             | Self::Diff(_)
             | Self::SessionSetup(_)
-            | Self::AgentTree(_) => 0,
+            | Self::AgentTree(_) => 1,
             _ => 20,
         }
     }

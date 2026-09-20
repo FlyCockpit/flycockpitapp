@@ -31,10 +31,10 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
  ● working  ● waiting  ● done                                                                                           
                                                                                                                         
                                                                 daemon socket address already in use: /tmp/cockpit.sock 
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│❯ Message FlyCockpit — Ctrl+P model · Ctrl+E effort · Ctrl+K keys                                             0 tokens│
+╰[Cockpit]─[model]─[effort]─[permissions: manual]─[sandbox: on]──────────────────────────────────────────────────[Send]╯
 Setup: Code                                                                                                             

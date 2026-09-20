@@ -1,16 +1,19 @@
                                                                                                                ● Working
  ◆ Cockpit             [Hide] /t╭ Agent tree ────────────────────────────────────────────────────────────────────────╮  
                               ──│  The agent tree is only available once attached to a session.                      │──
-  + New session               ▌C│                                                                                    │ │
+  + New session               ▌R│                                                                                    │ │
+                                │                                                                                    │ │
+ SESSIONS                       │                                                                                    │ │
+ no active sessions in all pr   │                                                                                    │ │
                               no│                                                                                    │ │
- SESSIONS                     ┊ │                                                                                    │ │
- no active sessions in all pr ▌ │                                                                                    │ │
+                              ┊ │                                                                                    │ │
+                              ▌ │                                                                                    │ │
                                 │                                                                                    │ │
                                 │                                                                                    │ │
-                                │                                                                                    │ │
-                                │                                                                                    │ │
-                                │                                                                                    │ │
-                                │                                                                                    │ │
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                                 │                                                                                    │ █
@@ -34,7 +37,4 @@
  ● working  ● waiting  ● done   │                                                                                    │ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
 Setup: Code                                                                                                             

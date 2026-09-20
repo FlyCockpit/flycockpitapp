@@ -383,7 +383,7 @@ fn popover_fixture(name: &str) -> App {
     app
 }
 
-fn assert_product_popovers() {
+pub fn assert_product_popovers() {
     let _pins = GoldenPins::install();
     for name in [
         "tools",
@@ -836,8 +836,12 @@ mod seed_tests {
     use super::*;
     use cockpit_test_support::TestEnvGuard;
 
+    /// Stable backing dir for isolated HOME/XDG paths in golden dumps (see
+    /// `permissions` popover cache line).
+    const GOLDEN_ISOLATED_ENV_ROOT: &str = "/tmp/flycockpit-tui-golden-env";
+
     fn isolate_render_env() -> TestEnvGuard {
-        let env = TestEnvGuard::isolated_cockpit_home();
+        let env = TestEnvGuard::isolate_cockpit_home_at(Path::new(GOLDEN_ISOLATED_ENV_ROOT));
         env.remove_var("NO_COLOR");
         env.remove_var("COCKPIT_ROOSTER");
         env.remove_var("COCKPIT_REDUCE_MOTION");

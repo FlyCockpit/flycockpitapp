@@ -11,7 +11,7 @@
                                 Model│Project                                                                   │      │
                                 TTFT │  (no project root for the current directory)                             │      │
                                 TPS  │                                                                          │      █
-                                Cache│Global  /dev/shm/.tmpOe0YsI/home/.config/cockpit/approvals.json           │      █
+                                Cache│Global  /tmp/flycockpit-tui-golden-env/home/.config/cockpit/approvals.json│      █
                                 ▾ Tho│  No grants in this scope.                                                │      █
                                 Map e│                                                                          │      █
                                 The o│                                                                          │      █

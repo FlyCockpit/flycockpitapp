@@ -10361,10 +10361,91 @@ mod render_history_spacing_tests {
 }
 
 #[cfg(test)]
+mod shell_composer_caret_tests {
+    use super::App;
+    use crate::tui::banner_box;
+    use ratatui::Terminal;
+    use ratatui::backend::{Backend, TestBackend};
+
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    fn render_app_cursor(app: &mut App, width: u16, height: u16) -> (u16, u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        banner_box::with_test_banner_visible(|| {
+            terminal.draw(|frame| app.render(frame)).unwrap();
+        });
+        let cursor = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("composer caret must be visible while overlays are open");
+        (cursor.x, cursor.y)
+    }
+
+    fn assert_cursor_in_composer(app: &App, cursor: (u16, u16)) {
+        let input = app
+            .input_area
+            .expect("composer input rect must be mapped after render");
+        assert!(
+            cursor.0 >= input.x && cursor.0 < input.x + input.width,
+            "cursor x={} outside composer x={} w={}",
+            cursor.0,
+            input.x,
+            input.width
+        );
+        assert!(
+            cursor.1 >= input.y && cursor.1 < input.y + input.height,
+            "cursor y={} outside composer y={} h={}",
+            cursor.1,
+            input.y,
+            input.height
+        );
+    }
+
+    #[test]
+    fn slash_palette_open_keeps_composer_caret_visible_at_120x40() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.composer.replace_buffer("/");
+        app.reset_slash_window();
+        assert!(app.slash_query().is_some());
+
+        let cursor = render_app_cursor(&mut app, 120, 40);
+        assert_cursor_in_composer(&app, cursor);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn at_popup_open_keeps_composer_caret_visible_at_120x40() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.composer.set("@");
+        app.reset_at_window();
+        await_at_suggestions(&mut app).await;
+        assert!(app.at_popup_active());
+
+        let cursor = render_app_cursor(&mut app, 120, 40);
+        assert_cursor_in_composer(&app, cursor);
+    }
+}
+
+#[cfg(test)]
 mod prediction_ghost_context_indicator_tests {
     use super::{
-        App, IDLE_COMPOSER_PLACEHOLDER, first_line_truncated, input_visual_rows,
-        wrap_ghost_line_chunks,
+        App, IDLE_COMPOSER_PLACEHOLDER, WORKING_COMPOSER_PLACEHOLDER, first_line_truncated,
+        input_visual_rows, wrap_ghost_line_chunks,
     };
     use crate::tui::composer::{PredictionGhost, VimMode, display_width, input_prefix_width};
     use crate::tui::theme::MUTED_TEXT;
@@ -10439,6 +10520,23 @@ mod prediction_ghost_context_indicator_tests {
             delivery_class: Default::default(),
             send_now: false,
         }
+    }
+
+    #[test]
+    fn working_empty_composer_renders_working_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.busy = true;
+        assert!(app.queue.is_empty());
+        let buf = render_input_buffer(&mut app, 100, 5);
+        let painted = (0..5)
+            .map(|y| row_text(&buf, y, 100))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            painted.contains(WORKING_COMPOSER_PLACEHOLDER),
+            "working + empty queue should paint the working placeholder: {painted:?}"
+        );
     }
 
     #[test]

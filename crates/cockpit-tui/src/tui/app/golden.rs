@@ -12,6 +12,7 @@ use crate::tui::golden::{
 };
 use crate::tui::onboarding::OnboardingShell;
 use crate::tui::settings::Dialog;
+use cockpit_client::presentation::TurnEvent;
 use cockpit_config::extended::VimModeSetting;
 use cockpit_config::providers::{
     ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ModelCapabilities, ModelEntry,
@@ -712,9 +713,13 @@ fn shell_chrome_app(scene: &str) -> App {
                 .replace_buffer("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
         }
         "sandbox-unavailable" => {
-            app.sandbox_down_notice = Some(super::SandboxDownNotice {
-                remedy: "sandbox host is unavailable".to_string(),
-                fix_command: None,
+            app.apply_event(TurnEvent::SandboxUnavailable {
+                remedy: "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); \
+                     `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` re-enables confinement"
+                    .to_string(),
+                fix_command: Some(
+                    "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".to_string(),
+                ),
             });
             app.open_composer_picker(ComposerControlKind::Sandbox);
         }
@@ -764,6 +769,18 @@ pub fn assert_shell_chrome() {
                     app.suggestion_row_hits.len(),
                     3,
                     "the golden contains exactly three clickable matches"
+                );
+            }
+            if scene == "sandbox-unavailable" && width == 80 && height == 24 {
+                let text = buffer_text(&buffer);
+                assert!(
+                    text.contains("/sandbox off"),
+                    "painted sandbox status must include the composer action"
+                );
+                assert!(
+                    text.contains("sudo sysctl")
+                        && text.contains("kernel.apparmor_restrict_unprivileged_userns=0"),
+                    "painted sandbox status must include the sysctl remedy tail"
                 );
             }
             buffer

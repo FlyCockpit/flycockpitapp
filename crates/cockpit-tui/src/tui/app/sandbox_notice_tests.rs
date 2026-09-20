@@ -2,8 +2,10 @@ use super::{
     App, MAX_SANDBOX_NOTICE_ROWS, sandbox_down_notice_text, sandbox_notice_render_text,
     sandbox_notice_wrapped_rows,
 };
+use crate::tui::app::golden::render_app;
 use crate::tui::chat_header::HeaderPillKind;
 use crate::tui::composer_controls::ComposerControlKind;
+use crate::tui::golden::buffer_text;
 use cockpit_client::presentation::TurnEvent;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -68,6 +70,17 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
             .status_text
             .as_deref()
             .is_some_and(|status| status.contains("/sandbox off"))
+    );
+
+    let painted = buffer_text(&render_app(&mut app, 80, 24));
+    assert!(
+        painted.contains("sudo sysctl")
+            && painted.contains("kernel.apparmor_restrict_unprivileged_userns=0"),
+        "picker status paint must include the sysctl remedy at 80x24: {painted:?}"
+    );
+    assert!(
+        painted.contains("/sandbox off"),
+        "picker status paint must include the composer action at 80x24"
     );
 
     // A repeated unavailable event just refreshes the same notice (the

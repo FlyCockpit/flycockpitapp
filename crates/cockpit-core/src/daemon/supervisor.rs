@@ -275,7 +275,10 @@ pub(crate) fn take_worker_listeners(paths: &DaemonPaths) -> Result<Option<Worker
         let reveal = tokio::net::UnixListener::from_std(reveal)?;
         Ok(Some((
             control,
-            super::leak_reveal_socket::BoundRevealSocket::new(reveal, paths.leak_reveal_socket()),
+            super::leak_reveal_socket::BoundRevealSocket::inherited(
+                reveal,
+                paths.leak_reveal_socket(),
+            ),
         )))
     }
     #[cfg(windows)]
@@ -1147,6 +1150,13 @@ fn worker_receipt(
 fn watch_worker(
     receipt: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
 ) -> Result<tokio::sync::mpsc::Receiver<std::result::Result<(), String>>> {
+    watch_worker_with_interval(receipt, Duration::from_secs(365 * 24 * 60 * 60))
+}
+
+fn watch_worker_with_interval(
+    receipt: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+    interval: Duration,
+) -> Result<tokio::sync::mpsc::Receiver<std::result::Result<(), String>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     #[cfg(any(
         target_os = "linux",
@@ -1155,7 +1165,7 @@ fn watch_worker(
         windows
     ))]
     {
-        use cockpit_host::daemon_lifecycle::VerifiedProcessOutcome;
+        use cockpit_host::daemon_lifecycle::{PidIdentity, VerifiedProcessOutcome};
         let process = match cockpit_host::daemon_lifecycle::acquire_verified_daemon_process(receipt)
         {
             VerifiedProcessOutcome::Verified(process) => process,
@@ -1163,16 +1173,31 @@ fn watch_worker(
                 bail!("could not acquire stable worker process witness: {identity:?}")
             }
         };
+        let receipt = receipt.clone();
         tokio::spawn(async move {
-            let outcome = process
-                .wait_for_exit(Duration::from_secs(365 * 24 * 60 * 60))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|exited| {
-                    exited.then_some(()).ok_or_else(|| {
-                        "worker process watch reached its one-year bound".to_string()
-                    })
-                });
+            let mut process = process;
+            let outcome = loop {
+                match process.wait_for_exit(interval).await {
+                    Ok(true) => break Ok(()),
+                    Ok(false) => {
+                        process =
+                            match cockpit_host::daemon_lifecycle::acquire_verified_daemon_process(
+                                &receipt,
+                            ) {
+                                VerifiedProcessOutcome::Verified(process) => process,
+                                VerifiedProcessOutcome::Identity(
+                                    PidIdentity::Missing | PidIdentity::NotDaemon,
+                                ) => break Ok(()),
+                                VerifiedProcessOutcome::Identity(identity) => {
+                                    break Err(format!(
+                                        "could not re-arm stable worker process witness: {identity:?}"
+                                    ));
+                                }
+                            };
+                    }
+                    Err(error) => break Err(error.to_string()),
+                }
+            };
             let _ = tx.send(outcome).await;
         });
     }
@@ -1309,14 +1334,20 @@ async fn accept_admin(listener: &mut AdminListener) -> Result<DaemonStream> {
 
 async fn read_admin(stream: DaemonStream) -> Result<(AdminRequest, DaemonStream)> {
     let mut reader = BufReader::new(stream);
+    let request = read_admin_request(&mut reader).await?;
+    Ok((request, reader.into_inner()))
+}
+
+async fn read_admin_request<R>(reader: &mut R) -> Result<AdminRequest>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     let mut line = String::new();
     let read = reader.read_line(&mut line).await?;
     if read == 0 || line.len() > MAX_ADMIN_LINE {
         bail!("invalid supervisor admin frame length");
     }
-    let request =
-        serde_json::from_str(line.trim_end()).context("decoding supervisor admin frame")?;
-    Ok((request, reader.into_inner()))
+    serde_json::from_str(line.trim_end()).context("decoding supervisor admin frame")
 }
 
 async fn write_admin(stream: &mut DaemonStream, response: &AdminResponse) -> Result<()> {
@@ -1529,17 +1560,17 @@ fn reexec_supervisor(request: ReexecRequest<'_>) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn admin_protocol_rejects_public_proto_shape() {
-        let request = AdminRequest {
-            version: ADMIN_PROTOCOL_VERSION,
-            command: AdminCommand::Status,
-        };
-        let json = serde_json::to_value(request).unwrap();
-        assert_eq!(json["version"], ADMIN_PROTOCOL_VERSION);
-        assert_eq!(json["command"], "status");
-        assert!(json.get("v").is_none());
-        assert!(json.get("kind").is_none());
+    #[tokio::test]
+    async fn admin_protocol_rejects_public_proto_shape() {
+        let public_frame = format!(
+            "{{\"v\":{},\"kind\":\"request\",\"id\":1,\"request\":{{\"type\":\"status\"}}}}\n",
+            super::super::proto::PROTOCOL_VERSION
+        );
+        let mut reader = BufReader::new(std::io::Cursor::new(public_frame.into_bytes()));
+
+        let error = read_admin_request(&mut reader).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("decoding supervisor admin frame"));
     }
 
     #[test]
@@ -1564,6 +1595,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
+    #[tokio::test]
+    async fn worker_watch_rearms_until_the_process_exits() {
+        let binary = super::super::discover_daemon_spawn_harness_executable().unwrap();
+        let mut child = std::process::Command::new(&binary)
+            .args(["daemon", "worker"])
+            .env("COCKPIT_WORKER_WATCH_TEST_HOLD", "1")
+            .spawn()
+            .unwrap();
+        let receipt = worker_receipt(child.id(), &binary).unwrap();
+        let mut exited = watch_worker_with_interval(&receipt, Duration::from_millis(10)).unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), exited.recv())
+                .await
+                .is_err(),
+            "a live process must remain watched across repeated interval bounds"
+        );
+        child.kill().unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), exited.recv())
+                .await
+                .unwrap(),
+            Some(Ok(()))
+        );
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]
@@ -1595,25 +1659,42 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_identity_promotion_replaces_only_at_readiness() {
+        const CHILD_ENV: &str = "COCKPIT_WINDOWS_IDENTITY_READINESS_TEST_PATH";
+        if let Some(staged) = std::env::var_os(CHILD_ENV) {
+            std::thread::sleep(Duration::from_millis(100));
+            let successor = super::super::windows_pipe::NamedPipeListener::prepare().unwrap();
+            successor.publish(Path::new(&staged)).unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let staged = directory.path().join("staged.json");
         let canonical = directory.path().join("daemon.json");
         let predecessor = super::super::windows_pipe::NamedPipeListener::prepare().unwrap();
         predecessor.publish(&canonical).unwrap();
         let predecessor_name = predecessor.pipe_name().clone();
-        let successor = super::super::windows_pipe::NamedPipeListener::prepare().unwrap();
-        successor.publish(&staged).unwrap();
-        let successor_name = successor.pipe_name().clone();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "daemon::supervisor::tests::windows_identity_promotion_replaces_only_at_readiness",
+                "--exact",
+            ])
+            .env(CHILD_ENV, &staged)
+            .spawn()
+            .unwrap();
 
         assert_eq!(
             cockpit_host::named_pipe::read_pipe_identity(&canonical).unwrap(),
             predecessor_name
         );
+        assert!(wait_windows_identity(&staged, &mut child, Duration::from_secs(1)).unwrap());
+        let successor_name = cockpit_host::named_pipe::read_pipe_identity(&staged).unwrap();
         promote_windows_identity(&staged, &canonical).unwrap();
         assert_eq!(
             cockpit_host::named_pipe::read_pipe_identity(&canonical).unwrap(),
             successor_name
         );
         assert!(!staged.exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

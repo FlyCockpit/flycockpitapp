@@ -113,11 +113,18 @@ fn wait_for_replacement_rendezvous(
     }
 }
 
+fn daemon_rendezvous(session: &HermeticCockpit) -> serde_json::Value {
+    let path = session.home().pid_file().with_file_name("daemon.json");
+    serde_json::from_slice(&std::fs::read(path).expect("read supervised daemon rendezvous"))
+        .expect("decode supervised daemon rendezvous")
+}
+
 #[test]
 fn sigkill_worker_reconnects_without_prompt_and_replays_same_session() {
     let mut session = attach_with_durable_history();
     let session_id = session_id_with_durable_marker(&session.home().db_path(), HISTORY_MARKER);
     let status_before = session.daemon_status_json();
+    let rendezvous_before = daemon_rendezvous(&session);
     let old_worker_pid = session.sigkill_worker();
     session
         .wait_until_screen(
@@ -146,6 +153,10 @@ fn sigkill_worker_reconnects_without_prompt_and_replays_same_session() {
         rendezvous["worker_pid"].as_u64(),
         Some(u64::from(old_worker_pid)),
         "supervisor must publish a new worker pid"
+    );
+    assert_eq!(
+        rendezvous["opened_at_unix_ms"], rendezvous_before["opened_at_unix_ms"],
+        "worker respawn must preserve the supervisor-owned uptime origin"
     );
     assert!(
         rendezvous["generation"]

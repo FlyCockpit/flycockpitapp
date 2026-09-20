@@ -32,6 +32,10 @@ fn run() -> Result<()> {
             .unwrap_or("cockpit-daemon-spawn-harness");
         bail!("usage: {argv0} daemon <supervise|worker>");
     }
+    if std::env::var_os("COCKPIT_WORKER_WATCH_TEST_HOLD").is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Ok(());
+    }
     let no_sandbox = args.iter().any(|arg| arg == "--no-sandbox");
     let resume_all_sessions = args.iter().any(|arg| arg == "--resume-all-sessions");
     if no_sandbox {

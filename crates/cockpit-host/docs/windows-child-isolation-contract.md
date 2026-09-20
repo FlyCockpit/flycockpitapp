@@ -28,7 +28,8 @@ resource set for the arbitrary approved and `/sandbox off` routes. Granting
 not an implementation of the current product contract.
 
 The research outcome for #398 was therefore **Blocked**; #438 superseded that
-verdict by deciding the OS user account is the boundary. #399 remains deferred.
+verdict by deciding the OS user account is the boundary, and #439 superseded
+#399 with the cross-platform stable supervisor.
 An unavailable Windows fixture is also a blocked result, never supervisor
 activation evidence.
 

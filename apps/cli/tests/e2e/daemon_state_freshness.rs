@@ -235,6 +235,68 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ephemeral_supervisor_exits_after_last_lifetime_client_disconnects() {
+    let home = IsolatedHome::new();
+    let socket = home.socket_path();
+    let pid_file = home.pid_file();
+    let mut daemon_command = home.cockpit();
+    daemon_command
+        .args(["daemon", "start", "--foreground"])
+        .env("COCKPIT_DAEMON_LIFETIME", "ephemeral")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = daemon_command
+        .spawn()
+        .expect("spawn foreground ephemeral supervisor");
+    let supervisor = EphemeralDaemonGuard::new(child, socket.clone(), pid_file.clone());
+    wait_for_daemon_handshake_on_socket(&socket, &pid_file, DAEMON_START_HANDSHAKE_TIMEOUT, || {
+        if let Ok(Some(status)) = supervisor.try_wait() {
+            panic!("ephemeral supervisor exited before handshake: {status}");
+        }
+        None
+    })
+    .await;
+
+    let client = DaemonClient::connect(&socket)
+        .await
+        .expect("connect lifetime client before any transient command disconnects");
+    let rendezvous: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(pid_file.with_file_name("daemon.json"))
+            .expect("read ephemeral supervisor rendezvous"),
+    )
+    .expect("decode ephemeral supervisor rendezvous");
+    assert_eq!(rendezvous["ephemeral"], true);
+    assert!(rendezvous["worker_pid"].as_u64().is_some());
+
+    drop(client);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if supervisor
+            .try_wait()
+            .expect("poll ephemeral supervisor exit")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ephemeral supervisor must exit after its final lifetime client disconnects"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let output = supervisor
+        .wait_with_output()
+        .expect("reap exited ephemeral supervisor");
+    assert_success("ephemeral supervisor natural reap", &output, &home);
+    assert!(
+        !pid_file.exists(),
+        "supervisor must retract its pid metadata"
+    );
+    assert!(!socket.exists(), "supervisor must retract its endpoint");
+}
+
 #[tokio::test]
 async fn daemon_refuses_newer_migration_ledger() {
     // Doctor is read-only and never materializes SQLite. Boot (then stop) a

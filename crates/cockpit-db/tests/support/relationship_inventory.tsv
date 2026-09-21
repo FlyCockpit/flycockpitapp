@@ -2101,6 +2101,7 @@ local	sessions	fork_point_turn_id	foreign
 local	sessions	goal_settings_override_json	non_relationship
 local	sessions	guidance_baseline_hash	non_relationship
 local	sessions	guidance_baseline_path	non_relationship
+local	sessions	handover_boundary	non_relationship
 local	sessions	is_assistant_thread	non_relationship
 local	sessions	is_dream_session	non_relationship
 local	sessions	knowledge_base_prompt_snapshot_captured	non_relationship

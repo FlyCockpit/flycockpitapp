@@ -667,6 +667,17 @@ pub struct SessionEventRow {
     pub data: Value,
 }
 
+/// Latest committed safe handover point for one durable session.
+///
+/// `(session_id, marker)` is the intent key reserved for the replay/fencing
+/// policy in issue #441. This issue only records and resumes at the boundary;
+/// it never decides that post-boundary work is safe to replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBoundaryMarker {
+    pub session_id: Uuid,
+    pub marker: i64,
+}
+
 impl std::fmt::Debug for SessionEventRow {
     /// `data` is the raw trusted per-event JSON payload; never print it
     /// verbatim. Show its structural descriptor plus the (non-body) event
@@ -1374,7 +1385,15 @@ impl Db {
         ts_ms: i64,
         data_json: &str,
     ) -> Result<i64> {
-        conn.execute(
+        let advances_boundary = matches!(
+            kind,
+            SessionEventKind::ToolCallCompleted | SessionEventKind::AssistantMessage
+        );
+        if advances_boundary {
+            conn.execute_batch("SAVEPOINT cockpit_handover_boundary")
+                .context("starting handover-boundary transaction")?;
+        }
+        let inserted = conn.execute(
             "INSERT INTO session_events
              (session_id, ts_ms, type, agent, call_id, task_call_id, label, origin_principal,
               provider_id, model_id, model_trust, data_json)
@@ -1393,9 +1412,56 @@ impl Db {
                 context.model_trust,
                 data_json,
             ],
-        )
-        .context("inserting session_event")?;
-        Ok(conn.last_insert_rowid())
+        );
+        if let Err(error) = inserted {
+            if advances_boundary {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO cockpit_handover_boundary; RELEASE cockpit_handover_boundary",
+                );
+            }
+            return Err(error).context("inserting session_event");
+        }
+        let seq = conn.last_insert_rowid();
+        if advances_boundary {
+            let update = conn.execute(
+                "UPDATE sessions SET handover_boundary=?2
+                 WHERE session_id=?1 AND handover_boundary < ?2",
+                params![session_id.to_string(), seq],
+            );
+            if let Err(error) = update {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO cockpit_handover_boundary; RELEASE cockpit_handover_boundary",
+                );
+                return Err(error).context("advancing durable handover boundary");
+            }
+            conn.execute_batch("RELEASE cockpit_handover_boundary")
+                .context("committing handover boundary with session event")?;
+        }
+        Ok(seq)
+    }
+
+    /// Return the latest safe handover point for every durable session. A
+    /// zero marker is significant: the session exists but has not committed a
+    /// result or turn-end boundary yet.
+    pub async fn session_boundary_markers(&self) -> Result<Vec<SessionBoundaryMarker>> {
+        self.read(Self::session_boundary_markers_conn).await
+    }
+
+    pub fn session_boundary_markers_conn(conn: &Connection) -> Result<Vec<SessionBoundaryMarker>> {
+        let mut stmt =
+            conn.prepare("SELECT session_id, handover_boundary FROM sessions ORDER BY session_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            let (session_id, marker) = row?;
+            Ok(SessionBoundaryMarker {
+                session_id: Uuid::parse_str(&session_id)
+                    .context("parsing handover boundary session id")?,
+                marker,
+            })
+        })
+        .collect()
     }
 
     /// All events for one session, ordered by `seq` (oldest first). Used
@@ -2191,6 +2257,105 @@ fn is_truncated_tail_error(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn handover_boundary_advances_atomically_with_safe_events() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/boundary", "Build").await.unwrap();
+        let session_id = session.session_id;
+        let user_seq = db
+            .insert_session_event(
+                session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "queued work"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.session_boundary_markers().await.unwrap(),
+            vec![SessionBoundaryMarker {
+                session_id,
+                marker: 0,
+            }]
+        );
+
+        let tool_seq = db
+            .insert_session_event(
+                session_id,
+                SessionEventKind::ToolCallCompleted,
+                Some("Build"),
+                Some("call-1"),
+                &json!({"status": "completed", "dispatched": true}),
+            )
+            .await
+            .unwrap();
+        assert!(tool_seq > user_seq);
+        assert_eq!(
+            db.session_boundary_markers().await.unwrap(),
+            vec![SessionBoundaryMarker {
+                session_id,
+                marker: tool_seq,
+            }]
+        );
+
+        let turn_seq = db
+            .insert_session_event(
+                session_id,
+                SessionEventKind::AssistantMessage,
+                Some("Build"),
+                Some("turn-1"),
+                &json!({"text": "done"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.session_boundary_markers().await.unwrap()[0].marker,
+            turn_seq
+        );
+    }
+
+    #[tokio::test]
+    async fn boundary_update_failure_rolls_back_the_result_row() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/boundary-rollback", "Build")
+            .await
+            .unwrap();
+        let session_id = session.session_id;
+        db.write(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_handover_boundary
+                 BEFORE UPDATE OF handover_boundary ON sessions
+                 BEGIN SELECT RAISE(ABORT, 'controlled boundary failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = db
+            .insert_session_event(
+                session_id,
+                SessionEventKind::ToolCallCompleted,
+                Some("Build"),
+                Some("call-rollback"),
+                &json!({"status": "completed", "dispatched": true}),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("handover boundary"));
+        assert!(db.list_session_events(session_id).await.unwrap().is_empty());
+        assert_eq!(
+            db.session_boundary_markers().await.unwrap(),
+            vec![SessionBoundaryMarker {
+                session_id,
+                marker: 0,
+            }]
+        );
+    }
 
     #[tokio::test]
     async fn retract_keeps_global_sequences_monotonic_across_concurrent_sessions() {

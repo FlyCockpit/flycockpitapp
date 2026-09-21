@@ -193,10 +193,10 @@ fn mouse_through_agent_authoring(session: &mut HermeticCockpit) {
 
     click_text(session, "[ Create agent ]");
     session
-        .wait_until_screen("agent authoring success", AGENT_ASYNC_TIMEOUT, |screen| {
-            screen.contains("Your agent is ready") && screen.contains("step 6/8")
+        .wait_until_screen("agent package committed", AGENT_ASYNC_TIMEOUT, |screen| {
+            screen.contains("Background agents") && screen.contains("step 7/8")
         })
-        .expect("create receipt reaches the agent authoring success screen");
+        .expect("committed agent package advances onboarding to the Lifetime stage");
 }
 
 fn find_runner_subagent_package(agents_root: &Path) -> Option<PathBuf> {

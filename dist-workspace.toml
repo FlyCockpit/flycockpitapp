@@ -23,7 +23,10 @@ include = ["target/dist/completions", "target/dist/man", "apps/cli/scripts/insta
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program
-install-updater = false
+# cargo-dist writes its installation receipt only when updater installation is
+# enabled. Cockpit uses that receipt as its authorization proof for the
+# built-in updater; axoupdater itself is not invoked by Cockpit.
+install-updater = true
 # Publish the Homebrew formula as `cockpit` (the binary name) rather than the
 # `cockpit-cli` package name, so the install line is
 # `brew install flycockpit/tap/cockpit`.

@@ -104,6 +104,7 @@ fn runtime_release_contract_tests() {
 #[test]
 fn installer_destination_and_completion() {
     assert!(DIST.contains("install-path = \"CARGO_HOME\""));
+    assert!(DIST.contains("install-updater = true"));
     assert!(!README.contains("FLYCOCKPIT_INSTALL_DIR"));
     for term in [
         "do not edit shell startup files",
@@ -113,6 +114,68 @@ fn installer_destination_and_completion() {
     ] {
         assert!(README.contains(term));
     }
+}
+
+#[test]
+fn cargo_dist_receipt_contract_uses_the_distributable_app_name() {
+    assert!(
+        CARGO_DIST_SHELL_TEMPLATE
+            .contains("RECEIPT_HOME=\"${XDG_CONFIG_HOME:-$INFERRED_HOME/.config}/{{ app_name }}\"")
+    );
+    assert!(CARGO_DIST_SHELL_TEMPLATE.contains("$RECEIPT_HOME/$APP_NAME-receipt.json"));
+    assert!(CARGO_DIST_SHELL_TEMPLATE.contains("if [ \"$INSTALL_UPDATER\" = \"1\" ]; then"));
+    assert_eq!(cockpit_core::updater::CARGO_DIST_APP_NAME, "cockpit-cli");
+}
+
+#[cfg(unix)]
+#[test]
+fn rendered_cargo_dist_receipt_writer_authorizes_the_installed_cli() {
+    use std::process::Command;
+
+    // Keep this rendered tail tied to the pinned template anchors above: it
+    // is the installer path after cargo-dist has substituted `app_name`.
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("cockpit-cli-installer.sh");
+    let install_prefix = temp.path().join("install");
+    let executable = install_prefix.join("bin/cockpit");
+    std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    std::fs::write(&executable, b"cockpit").unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nset -eu\nAPP_NAME=cockpit-cli\nINSTALL_UPDATER=1\nRECEIPT_HOME=\"$XDG_CONFIG_HOME/$APP_NAME\"\nRECEIPT='{{\"install_prefix\":\"{}\"}}'\nif [ \"$INSTALL_UPDATER\" = \"1\" ]; then mkdir -p \"$RECEIPT_HOME\"; echo \"$RECEIPT\" > \"$RECEIPT_HOME/$APP_NAME-receipt.json\"; fi\n",
+            install_prefix.display()
+        ),
+    )
+    .unwrap();
+    let config = temp.path().join("config");
+    let output = Command::new("sh")
+        .arg(&script)
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let expected = config.join("cockpit-cli/cockpit-cli-receipt.json");
+    assert!(expected.is_file());
+    assert_eq!(
+        expected,
+        config
+            .join(cockpit_core::updater::CARGO_DIST_APP_NAME)
+            .join(format!(
+                "{}-receipt.json",
+                cockpit_core::updater::CARGO_DIST_APP_NAME
+            ))
+    );
+    let policy =
+        cockpit_core::updater::InstallationPolicy::new(cockpit_core::updater::InstallationPaths {
+            current_exe: executable,
+            receipt: expected,
+            brew_prefix: None,
+        });
+    assert_eq!(
+        policy.authorize(),
+        Ok(cockpit_core::updater::InstallationAuthorization::SelfUpdate)
+    );
 }
 
 #[test]

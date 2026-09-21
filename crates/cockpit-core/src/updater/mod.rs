@@ -13,7 +13,10 @@ mod traits;
 mod types;
 
 #[cfg(not(feature = "no-self-update"))]
-pub use active::{ActiveUpdater, HOMEBREW_UPGRADE_COMMAND, InstallationPolicy, current_platform};
+pub use active::{
+    ActiveUpdater, CARGO_DIST_APP_NAME, HOMEBREW_UPGRADE_COMMAND, InstallationPolicy,
+    cargo_dist_receipt_path, current_platform,
+};
 pub use background::spawn_background;
 pub use composition::{InstalledUpdaterComposition, installed_composition, installed_updater};
 pub use disabled::PackageManagerUpdater;
@@ -74,7 +77,18 @@ pub fn maybe_spawn_background(ctx: Arc<DaemonContext>) -> Option<tokio::task::Jo
 /// Startup and background check entrypoint. Checks never place a binary or
 /// request supervisor maintenance; they only refresh the process-local notice.
 pub async fn run_startup_check(channel: UpdateChannel) -> UpdateCheckResult {
-    let result = installed_updater().check(channel).await;
+    run_startup_check_with(installed_updater().updater(), channel).await
+}
+
+/// Execute an update check in the process that owns its presentation and
+/// publish its result for that process's TUI. The daemon and interactive TUI
+/// are separate processes, so each performs its own check rather than sharing
+/// a process-local slot.
+pub async fn run_startup_check_with(
+    updater: &dyn Updater,
+    channel: UpdateChannel,
+) -> UpdateCheckResult {
+    let result = updater.check(channel).await;
     let notice = notice_for_result(&result);
     if let Ok(mut slot) = update_notice_slot().write() {
         *slot = notice;

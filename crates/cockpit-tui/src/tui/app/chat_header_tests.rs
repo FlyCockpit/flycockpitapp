@@ -9,6 +9,10 @@ use super::{
 use crate::tui::chat_header::{HEADER_COLLAPSE_PROBE_WIDTHS, HeaderPillKind};
 use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
 use crate::tui::rules_overlay::RulesReview;
+use cockpit_config::config::update_channel::UpdateChannel;
+use cockpit_core::updater::{
+    ManualUpdateOutcome, UpdateCheckResult, UpdateStatusSnapshot, Updater, UpdaterError,
+};
 use cockpit_proto::{
     ConversationRule, ConversationRuleCreatedBy, ConversationRuleSourceTrust, PinnedMessage,
     RepoStatus,
@@ -76,17 +80,75 @@ fn setup_mode_rehomes_to_header_pill() {
     assert_eq!(setup.label, "Setup: Code");
 }
 
+struct AvailableUpdate;
+
+struct CurrentUpdate;
+
+#[async_trait::async_trait]
+impl Updater for AvailableUpdate {
+    async fn check(&self, _channel: UpdateChannel) -> UpdateCheckResult {
+        UpdateCheckResult::Available {
+            version: "9.9.9".to_string(),
+        }
+    }
+
+    async fn apply_manual(
+        &self,
+        _channel: UpdateChannel,
+        _version: Option<&str>,
+    ) -> Result<ManualUpdateOutcome, UpdaterError> {
+        unreachable!("header check never applies an update")
+    }
+
+    fn status(&self, _channel: UpdateChannel) -> UpdateStatusSnapshot {
+        unreachable!("header check never reads update status")
+    }
+}
+
+#[async_trait::async_trait]
+impl Updater for CurrentUpdate {
+    async fn check(&self, _channel: UpdateChannel) -> UpdateCheckResult {
+        UpdateCheckResult::Current
+    }
+
+    async fn apply_manual(
+        &self,
+        _channel: UpdateChannel,
+        _version: Option<&str>,
+    ) -> Result<ManualUpdateOutcome, UpdaterError> {
+        unreachable!("header check never applies an update")
+    }
+
+    fn status(&self, _channel: UpdateChannel) -> UpdateStatusSnapshot {
+        unreachable!("header check never reads update status")
+    }
+}
+
 #[test]
 fn update_available_is_a_header_pill_and_not_a_persistent_row() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app(&tmp);
-    app.update_available_version = Some("9.9.9".to_string());
+    let result = futures::executor::block_on(cockpit_core::updater::run_startup_check_with(
+        &AvailableUpdate,
+        UpdateChannel::Auto,
+    ));
+    assert_eq!(
+        result,
+        UpdateCheckResult::Available {
+            version: "9.9.9".to_string()
+        }
+    );
+    assert!(app.sync_update_notice());
 
     let buffer = render(&mut app, 100, 30);
     let layout = app.chat_header_layout.clone().expect("header rendered");
     let meta = row_text(&buffer, layout.area.y + 1);
     assert!(meta.contains("[update 9.9.9]"), "{meta:?}");
     assert_eq!(app.persistent_notice_text(), None);
+    let _ = futures::executor::block_on(cockpit_core::updater::run_startup_check_with(
+        &CurrentUpdate,
+        UpdateChannel::Auto,
+    ));
 }
 
 fn click(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {

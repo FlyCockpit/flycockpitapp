@@ -69,6 +69,9 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
 fn print_outcome(outcome: ManualUpdateOutcome) {
     match outcome {
         ManualUpdateOutcome::Updated { version } => println!("updated cockpit to {version}"),
+        ManualUpdateOutcome::PlacedSupervisorUnavailable { version, reason } => {
+            println!("updated cockpit to {version}; daemon roll is pending: {reason}")
+        }
         ManualUpdateOutcome::Homebrew { command } => println!("{command}"),
     }
 }

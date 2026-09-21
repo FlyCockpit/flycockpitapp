@@ -115,8 +115,9 @@ pub fn cleanup_previous_binary_after_successful_start() -> Result<(), UpdaterErr
             .map_err(|error| UpdaterError::io("resolving started executable", error))?;
         let previous = previous_binary_path(&installed);
         if previous.exists() {
-            std::fs::remove_file(previous)
-                .map_err(|error| UpdaterError::io("cleaning previous executable", error))?;
+            // A still-running predecessor can retain the rename-aside image.
+            // Cleanup is deliberately best effort and must never block startup.
+            let _ = std::fs::remove_file(previous);
         }
     }
     Ok(())
@@ -202,21 +203,120 @@ impl FileUpdateLockStore {
 impl UpdateLockStore for FileUpdateLockStore {
     async fn acquire_exclusive(&self, record: &UpdateLockRecord) -> Result<(), UpdaterError> {
         use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = options
-            .open(&self.path)
-            .map_err(|error| UpdaterError::Lock(format!("acquiring update lock: {error}")))?;
-        let bytes = serde_json::to_vec(record)
-            .map_err(|error| UpdaterError::Lock(format!("encoding update lock: {error}")))?;
-        file.write_all(&bytes)
-            .map_err(|error| UpdaterError::Lock(format!("writing update lock: {error}")))?;
-        file.sync_all()
-            .map_err(|error| UpdaterError::Lock(format!("syncing update lock: {error}")))
+        loop {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            match options.open(&self.path) {
+                Ok(mut file) => {
+                    let bytes = serde_json::to_vec(record).map_err(|error| {
+                        UpdaterError::Lock(format!("encoding update lock: {error}"))
+                    })?;
+                    file.write_all(&bytes).map_err(|error| {
+                        UpdaterError::Lock(format!("writing update lock: {error}"))
+                    })?;
+                    return file.sync_all().map_err(|error| {
+                        UpdaterError::Lock(format!("syncing update lock: {error}"))
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = read_lock_record(&self.path)?;
+                    if update_lock_owner_is_live(&existing) {
+                        return Err(UpdaterError::Lock(
+                            "another live process is applying an update".into(),
+                        ));
+                    }
+                    std::fs::remove_file(&self.path).map_err(|error| {
+                        UpdaterError::Lock(format!("reclaiming stale update lock: {error}"))
+                    })?;
+                }
+                Err(error) => {
+                    return Err(UpdaterError::Lock(format!(
+                        "acquiring update lock: {error}"
+                    )));
+                }
+            }
+        }
     }
 
-    async fn release(&self, _update_id: uuid::Uuid) -> Result<(), UpdaterError> {
+    async fn release(&self, update_id: uuid::Uuid) -> Result<(), UpdaterError> {
+        let existing = read_lock_record(&self.path)?;
+        if existing.update_id != update_id {
+            return Err(UpdaterError::Lock(
+                "refusing to release an update lock owned by another update".into(),
+            ));
+        }
         std::fs::remove_file(&self.path)
             .map_err(|error| UpdaterError::Lock(format!("releasing update lock: {error}")))
+    }
+}
+
+fn read_lock_record(path: &Path) -> Result<UpdateLockRecord, UpdaterError> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| UpdaterError::Lock(format!("reading update lock: {error}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| UpdaterError::Lock(format!("decoding update lock: {error}")))
+}
+
+fn update_lock_owner_is_live(record: &UpdateLockRecord) -> bool {
+    cockpit_host::daemon_lifecycle::process_start_identity(record.owner_pid).is_ok_and(|identity| {
+        record.owner_start_id == format!("{}:{}", identity.primary, identity.secondary)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lock_record(update_id: uuid::Uuid, owner_start_id: String) -> UpdateLockRecord {
+        UpdateLockRecord {
+            update_id,
+            owner_pid: std::process::id(),
+            owner_start_id,
+            installed_path_digest: "test".into(),
+            state: super::super::types::UpdateLockState::Held,
+            revision: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_lock_is_reclaimed_but_a_live_owner_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".cockpit-update.lock");
+        let store = FileUpdateLockStore::new(path.clone());
+        let live_id = uuid::Uuid::now_v7();
+        let identity =
+            cockpit_host::daemon_lifecycle::process_start_identity(std::process::id()).unwrap();
+        let live = lock_record(
+            live_id,
+            format!("{}:{}", identity.primary, identity.secondary),
+        );
+        std::fs::write(&path, serde_json::to_vec(&live).unwrap()).unwrap();
+        assert!(
+            store
+                .acquire_exclusive(&lock_record(uuid::Uuid::now_v7(), "new".into()))
+                .await
+                .is_err()
+        );
+
+        let stale = lock_record(uuid::Uuid::now_v7(), "recycled-pid".into());
+        std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let replacement = lock_record(uuid::Uuid::now_v7(), "new".into());
+        store.acquire_exclusive(&replacement).await.unwrap();
+        assert_eq!(
+            read_lock_record(&path).unwrap().update_id,
+            replacement.update_id
+        );
+        store.release(replacement.update_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_refuses_a_different_update_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".cockpit-update.lock");
+        let store = FileUpdateLockStore::new(path.clone());
+        let record = lock_record(uuid::Uuid::now_v7(), "owner".into());
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(store.release(uuid::Uuid::now_v7()).await.is_err());
+        assert!(path.exists());
     }
 }

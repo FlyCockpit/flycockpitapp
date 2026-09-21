@@ -86,8 +86,18 @@ pub enum InstallationAuthorization {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManualUpdateOutcome {
-    Updated { version: String },
-    Homebrew { command: &'static str },
+    Updated {
+        version: String,
+    },
+    /// Placement committed, but the daemon supervisor was unavailable to roll
+    /// immediately. The next supervised start uses the placed binary.
+    PlacedSupervisorUnavailable {
+        version: String,
+        reason: String,
+    },
+    Homebrew {
+        command: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

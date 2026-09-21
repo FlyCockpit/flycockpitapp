@@ -39,16 +39,26 @@ fn policy(
     })
 }
 
+fn write_receipt(path: &std::path::Path, install_prefix: &std::path::Path) {
+    std::fs::write(
+        path,
+        serde_json::json!({ "install_prefix": install_prefix }).to_string(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn receipt_precedes_homebrew_and_authorizes_self_update() {
     let temp = tempfile::tempdir().unwrap();
     let prefix = temp.path().join("homebrew");
     let binary = prefix.join("bin/cockpit");
-    let receipt = temp.path().join("config/cockpit/cockpit-receipt.json");
+    let receipt = temp
+        .path()
+        .join("config/cockpit-cli/cockpit-cli-receipt.json");
     std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
     std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
     std::fs::write(&binary, b"old").unwrap();
-    std::fs::write(&receipt, b"{}").unwrap();
+    write_receipt(&receipt, &prefix);
 
     assert_eq!(
         policy(binary, receipt, Some(prefix)).authorize().unwrap(),
@@ -182,7 +192,7 @@ async fn receipt_without_production_root_fails_closed_with_specific_reason() {
     let binary = temp.path().join("cockpit");
     let receipt = temp.path().join("cockpit-receipt.json");
     std::fs::write(&binary, b"old").unwrap();
-    std::fs::write(&receipt, b"{}").unwrap();
+    write_receipt(&receipt, temp.path());
     let updater = updater_with_no_root(policy(binary, receipt, None));
 
     assert_eq!(
@@ -293,7 +303,7 @@ async fn receipt_fixture_tuf_target_updates_then_rolls_once_with_continuous_upti
     let new_bytes = b"verified replacement binary".to_vec();
     std::fs::write(&binary, b"old binary").unwrap();
     std::fs::write(&staged, &new_bytes).unwrap();
-    std::fs::write(&receipt, b"{}").unwrap();
+    write_receipt(&receipt, temp.path());
     let target = UpdateTargetDescriptor {
         version: "9.9.9".into(),
         platform: "test-platform".into(),
@@ -365,7 +375,7 @@ async fn corrupt_target_never_places_or_rolls() {
     let receipt = temp.path().join("cockpit-receipt.json");
     std::fs::write(&binary, b"old binary").unwrap();
     std::fs::write(&staged, b"corrupt").unwrap();
-    std::fs::write(&receipt, b"{}").unwrap();
+    write_receipt(&receipt, temp.path());
     let fixture = FakeFixtureEvidence {
         release_tag: "v9.9.9".into(),
         commit: "fixture-commit".into(),
@@ -472,10 +482,11 @@ fn cli_without_receipt_refuses_generic_package_manager_install() {
 #[test]
 fn installed_cli_with_receipt_reports_missing_production_root() {
     let temp = tempfile::tempdir().unwrap();
-    let receipt = temp.path().join("cockpit/cockpit-receipt.json");
+    let binary = cargo_bin("cockpit");
+    let receipt = temp.path().join("cockpit-cli/cockpit-cli-receipt.json");
     std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
-    std::fs::write(receipt, b"{}").unwrap();
-    let output = std::process::Command::new(cargo_bin("cockpit"))
+    write_receipt(&receipt, binary.parent().unwrap().parent().unwrap());
+    let output = std::process::Command::new(binary)
         .arg("update")
         .env("COCKPIT_UPDATES", "auto")
         .env("XDG_CONFIG_HOME", temp.path())

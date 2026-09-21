@@ -10,12 +10,12 @@
                  │ Verification  Self-verification (1 rules)                                          │                 
                  │ Goal skeptics  2 goal skeptics                                                     │                 
                  │ Interactive subagents  on                                                          │                 
+                 │ Auto-prune  off                                                                    │                 
+                 │ Max subagent recursion  2                                                          │                 
+                 │ Tool steering  terse                                                               │                 
+                 │ Self-verify Writes & edits  vendor/exact-a ×1                                      │                 
                  │ Make default  yes                                                                  │                 
                  │ Trust classification is shared global provider/model policy.                       │                 
-                 │                                                                                    │                 
-                 │                                                                                    │                 
-                 │                                                                                    │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

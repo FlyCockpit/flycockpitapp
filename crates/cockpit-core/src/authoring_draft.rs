@@ -15,11 +15,49 @@ use cockpit_proto::{
 };
 
 use crate::agents::{
-    AgentDefinitionFrontmatter, AgentRole, AllowedChild, DelegationPolicy, DelegationTarget,
-    GoalSkepticsPolicy, ModelCapability, ModelLocality, ModelSlot, SCHEMA_VERSION,
-    SelectorPredicate, SlotModelRef, ToolClass, ToolTier, VerificationAction, VerificationPolicy,
-    VerificationRule, VerificationSelector, known_tool_names, legal_tool_tiers,
+    AgentCapability, AgentDefinitionFrontmatter, AgentRole, AllowedChild, DelegationPolicy,
+    DelegationTarget, GoalSkepticsPolicy, ModelCapability, ModelLocality, ModelSlot,
+    SCHEMA_VERSION, SELF_CHILD_REF, SelectorPredicate, SlotModelRef, ToolClass, ToolSteering,
+    ToolTier, VerificationAction, VerificationAdjudicator, VerificationPolicy, VerificationRule,
+    VerificationSelector, known_tool_names, legal_tool_tiers,
 };
+
+/// Risky action surfaces configured independently by agent authoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationSurface {
+    ArtifactWrite,
+    Command,
+    Monty,
+}
+
+impl VerificationSurface {
+    pub const ALL: [Self; 3] = [Self::ArtifactWrite, Self::Command, Self::Monty];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ArtifactWrite => "Writes & edits",
+            Self::Command => "Commands",
+            Self::Monty => "Monty",
+        }
+    }
+}
+
+/// Copy counts parallel to the projection's model-route catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceVerificationDraft {
+    pub surface: VerificationSurface,
+    pub copies: Vec<u8>,
+}
+
+impl SurfaceVerificationDraft {
+    pub fn is_off(&self) -> bool {
+        self.copies.iter().all(|copies| *copies == 0)
+    }
+
+    pub fn total_copies(&self) -> u32 {
+        self.copies.iter().map(|copies| u32::from(*copies)).sum()
+    }
+}
 
 /// How the user chose the agent identity/source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +86,12 @@ pub struct ChildAuthoringDraft {
     pub tool_tiers: BTreeMap<String, ToolTier>,
     /// UI-only model selections for tools that require a dedicated model.
     pub tool_models: BTreeMap<String, usize>,
+    pub interactive_subagents: bool,
+    pub auto_prune: bool,
+    pub max_subagent_recursion: u8,
+    pub tool_steering: ToolSteering,
+    pub goal_skeptics: GoalSkepticsPolicy,
+    pub self_verification: Vec<SurfaceVerificationDraft>,
     pub children: Vec<ChildAuthoringDraft>,
 }
 
@@ -65,8 +109,11 @@ pub struct AgentAuthoringDraft {
     /// Parallel to enabled grants that require confirmation.
     pub trust_confirmations: Vec<bool>,
     pub interactive_subagents: bool,
+    pub auto_prune: bool,
+    pub max_subagent_recursion: u8,
+    pub tool_steering: ToolSteering,
     pub goal_skeptics: GoalSkepticsPolicy,
-    pub verification_enabled: bool,
+    pub self_verification: Vec<SurfaceVerificationDraft>,
     pub tool_tiers: BTreeMap<String, ToolTier>,
     /// UI-only model selections for tools that require a dedicated model.
     pub tool_models: BTreeMap<String, usize>,
@@ -95,6 +142,7 @@ impl AgentAuthoringDraft {
             .get(source_index)
             .and_then(|source| source.slug.clone())
             .unwrap_or_else(|| "pilot".to_string());
+        let default_route_index = 0;
         Self {
             name: catalog_name,
             source_selection: if projection.sources.is_empty() {
@@ -106,11 +154,24 @@ impl AgentAuthoringDraft {
             third_party_locator: String::new(),
             third_party_trust_confirmed: false,
             route_grants,
-            default_route_index: 0,
+            default_route_index,
             trust_confirmations: vec![false; route_count],
             interactive_subagents: true,
+            auto_prune: false,
+            max_subagent_recursion: 2,
+            tool_steering: ToolSteering::Terse,
             goal_skeptics: GoalSkepticsPolicy::Count { count: 2 },
-            verification_enabled: true,
+            self_verification: VerificationSurface::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(surface_index, surface)| {
+                    let mut copies = vec![0; route_count];
+                    if surface_index == 0 && route_count > 0 {
+                        copies[default_route_index] = 1;
+                    }
+                    SurfaceVerificationDraft { surface, copies }
+                })
+                .collect(),
             tool_tiers: default_tool_tiers(),
             tool_models: BTreeMap::new(),
             children: Vec::new(),
@@ -172,7 +233,9 @@ pub fn toggle_route_grant_draft(
     grants: &mut [RouteGrantDraft],
     cursor: usize,
     default_route_index: &mut usize,
+    self_verification: &mut [SurfaceVerificationDraft],
 ) {
+    let previous_default = *default_route_index;
     let enabled_count = grants.iter().filter(|entry| entry.enabled).count();
     let Some(grant) = grants.get_mut(cursor) else {
         return;
@@ -190,6 +253,27 @@ pub fn toggle_route_grant_draft(
         *default_route_index = cursor;
     }
     reconcile_route_grant_default(grants, default_route_index);
+    migrate_default_route_verification(self_verification, previous_default, *default_route_index);
+}
+
+/// Preserve the distinguished same-model verifier when the agent's default
+/// route changes. The former default's copies become the new default's copies;
+/// existing copies on the newly selected route remain attached to the former
+/// default as an ordinary verifier. This keeps the cache-warm quick dial
+/// semantic without discarding any configured copy counts.
+pub fn migrate_default_route_verification(
+    self_verification: &mut [SurfaceVerificationDraft],
+    previous_default: usize,
+    next_default: usize,
+) {
+    if previous_default == next_default {
+        return;
+    }
+    for surface in self_verification {
+        if previous_default < surface.copies.len() && next_default < surface.copies.len() {
+            surface.copies.swap(previous_default, next_default);
+        }
+    }
 }
 
 impl ChildAuthoringDraft {
@@ -495,10 +579,8 @@ fn build_frontmatter(
     let tool_tier_preferences =
         author_placeable_tool_tier_preferences(&draft.tool_tiers, diagnostics);
 
-    let delegation = if draft.children.is_empty() {
-        None
-    } else {
-        let allowed_children = draft
+    let delegation = {
+        let mut allowed_children = draft
             .children
             .iter()
             .map(|child| {
@@ -506,31 +588,34 @@ fn build_frontmatter(
                 AllowedChild::portable_ref(&slug)
             })
             .collect::<Vec<_>>();
+        if allowed_children.is_empty() {
+            allowed_children.push(AllowedChild::portable_ref(SELF_CHILD_REF));
+        }
         Some(DelegationPolicy {
             allowed_children,
-            max_descendant_depth: Some(2),
+            // Definition depth includes the directly delegated child; the UI
+            // value counts only subagent-on-subagent recursion.
+            max_descendant_depth: Some(u16::from(draft.max_subagent_recursion) + 1),
             max_concurrent_children: Some(3),
             targets: vec![DelegationTarget::SameRoot],
-            default_child: draft.children.first().map(|child| child_slug(child)),
+            default_child: Some(
+                draft
+                    .children
+                    .first()
+                    .map(child_slug)
+                    .unwrap_or_else(|| SELF_CHILD_REF.to_string()),
+            ),
             interactive_subagents: draft.interactive_subagents,
         })
     };
 
-    let verification = if draft.verification_enabled || !draft.goal_skeptics.is_off() {
-        let mut rules = Vec::new();
-        if draft.verification_enabled {
-            rules.push(VerificationRule {
-                selector: VerificationSelector {
-                    all_of: vec![],
-                    any_of: vec![SelectorPredicate::ToolClass {
-                        tool_class: ToolClass::ArtifactWrite,
-                    }],
-                },
-                action: VerificationAction::Verify,
-                adjudicator_slot: Some("primary".into()),
-                ..Default::default()
-            });
-        }
+    let rules = draft
+        .self_verification
+        .iter()
+        .filter(|surface| !surface.is_off())
+        .map(|surface| verification_rule(projection, draft.default_route_index, surface))
+        .collect::<Result<Vec<_>>>()?;
+    let verification = if !rules.is_empty() || !draft.goal_skeptics.is_off() {
         Some(VerificationPolicy {
             rules,
             goal_skeptics: draft.goal_skeptics,
@@ -563,10 +648,63 @@ fn build_frontmatter(
         requested_network_hosts: Default::default(),
         requests_requested: false,
         description: name.to_string(),
-        capabilities: Default::default(),
-        tool_steering: None,
+        capabilities: if draft.auto_prune {
+            [AgentCapability::AutoPrune].into_iter().collect()
+        } else {
+            Default::default()
+        },
+        tool_steering: Some(draft.tool_steering),
         context_policy: None,
         mcp_bindings: Vec::new(),
+    })
+}
+
+fn verification_rule(
+    projection: &AgentAuthoringProjection,
+    default_route_index: usize,
+    surface: &SurfaceVerificationDraft,
+) -> Result<VerificationRule> {
+    ensure!(
+        surface.copies.len() == projection.policy.routes.len(),
+        "verification copy counts are stale for the model catalog"
+    );
+    let mut order = (0..projection.policy.routes.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| usize::from(*index != default_route_index));
+    let adjudicators = order
+        .into_iter()
+        .map(|index| {
+            let copies = surface.copies[index];
+            let route = &projection.policy.routes[index];
+            VerificationAdjudicator {
+                model_ref: SlotModelRef {
+                    provider_id: route.provider_id.clone(),
+                    model_id: route.model_id.clone(),
+                    default: index == default_route_index,
+                },
+                copies,
+            }
+        })
+        .collect();
+    let predicate = match surface.surface {
+        VerificationSurface::ArtifactWrite => SelectorPredicate::ToolClass {
+            tool_class: ToolClass::ArtifactWrite,
+        },
+        VerificationSurface::Command => SelectorPredicate::ToolClass {
+            tool_class: ToolClass::Command,
+        },
+        VerificationSurface::Monty => SelectorPredicate::ToolClass {
+            tool_class: ToolClass::Monty,
+        },
+    };
+    Ok(VerificationRule {
+        selector: VerificationSelector {
+            all_of: Vec::new(),
+            any_of: vec![predicate],
+        },
+        action: VerificationAction::Verify,
+        adjudicators,
+        adjudicator_slot: Some("primary".into()),
+        ..Default::default()
     })
 }
 
@@ -748,6 +886,12 @@ fn build_child_markdown(
     );
     let tool_tier_preferences =
         author_placeable_tool_tier_preferences(&child.tool_tiers, diagnostics);
+    let rules = child
+        .self_verification
+        .iter()
+        .filter(|surface| !surface.is_off())
+        .map(|surface| verification_rule(projection, child.default_route_index, surface))
+        .collect::<Result<Vec<_>>>()?;
     let frontmatter = AgentDefinitionFrontmatter {
         schema_version: SCHEMA_VERSION,
         agent_id: format!("authored/{name}"),
@@ -764,32 +908,50 @@ fn build_child_markdown(
                 models,
             },
         )]),
-        delegation: if child.children.is_empty() {
-            None
-        } else {
-            let allowed_children = child
+        delegation: {
+            let mut allowed_children = child
                 .children
                 .iter()
                 .map(|nested| AllowedChild::portable_ref(&child_slug(nested)))
-                .collect();
+                .collect::<Vec<_>>();
+            if allowed_children.is_empty() {
+                allowed_children.push(AllowedChild::portable_ref(SELF_CHILD_REF));
+            }
             Some(DelegationPolicy {
                 allowed_children,
-                max_descendant_depth: Some(2),
+                max_descendant_depth: Some(u16::from(child.max_subagent_recursion) + 1),
                 max_concurrent_children: Some(3),
                 targets: vec![DelegationTarget::SameRoot],
-                default_child: child.children.first().map(|nested| child_slug(nested)),
-                interactive_subagents: false,
+                default_child: Some(
+                    child
+                        .children
+                        .first()
+                        .map(child_slug)
+                        .unwrap_or_else(|| SELF_CHILD_REF.to_string()),
+                ),
+                interactive_subagents: child.interactive_subagents,
             })
         },
         questions: None,
-        verification: None,
+        verification: if rules.is_empty() && child.goal_skeptics.is_off() {
+            None
+        } else {
+            Some(VerificationPolicy {
+                rules,
+                goal_skeptics: child.goal_skeptics,
+            })
+        },
         allowed_knowledge_bases: None,
         tool_tier_preferences,
         requested_network_hosts: Default::default(),
         requests_requested: false,
         description: name.clone(),
-        capabilities: Default::default(),
-        tool_steering: None,
+        capabilities: if child.auto_prune {
+            [AgentCapability::AutoPrune].into_iter().collect()
+        } else {
+            Default::default()
+        },
+        tool_steering: Some(child.tool_steering),
         context_policy: None,
         mcp_bindings: Vec::new(),
     };
@@ -818,13 +980,30 @@ pub fn default_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthor
     if route_count > 0 {
         route_grants[0].enabled = true;
     }
+    let default_route_index = 0;
     ChildAuthoringDraft {
         name: "runner".to_string(),
         route_grants,
-        default_route_index: 0,
+        default_route_index,
         trust_confirmations: vec![false; route_count],
         tool_tiers: child_default_tool_tiers(),
         tool_models: BTreeMap::new(),
+        interactive_subagents: true,
+        auto_prune: false,
+        max_subagent_recursion: 2,
+        tool_steering: ToolSteering::Terse,
+        goal_skeptics: GoalSkepticsPolicy::Count { count: 2 },
+        self_verification: VerificationSurface::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(surface_index, surface)| {
+                let mut copies = vec![0; route_count];
+                if surface_index == 0 && route_count > 0 {
+                    copies[default_route_index] = 1;
+                }
+                SurfaceVerificationDraft { surface, copies }
+            })
+            .collect(),
         children: Vec::new(),
     }
 }
@@ -989,16 +1168,122 @@ mod tests {
     }
 
     #[test]
+    fn authoring_draft_emits_seven_optimization_values_and_surface_copies() {
+        let projection = sample_projection();
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
+        draft.trust_confirmations[0] = true;
+        draft.route_grants[1].enabled = true;
+        draft.default_route_index = 1;
+        draft.auto_prune = true;
+        draft.interactive_subagents = false;
+        draft.max_subagent_recursion = 4;
+        draft.tool_steering = ToolSteering::Verbose;
+        draft.goal_skeptics = GoalSkepticsPolicy::Count { count: 3 };
+        draft.self_verification[0].copies = vec![2, 1];
+        draft.self_verification[1].copies = vec![0, 3];
+        draft.self_verification[2].copies = vec![1, 0];
+        let mut child = default_child_draft(&projection);
+        child.trust_confirmations[0] = true;
+        draft.children = vec![child];
+        draft.make_default = false;
+
+        let package = build_package_draft(&projection, &draft).unwrap();
+        assert!(!package.make_default);
+        let yaml = package
+            .markdown
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("---\n")
+            .unwrap()
+            .0;
+        let frontmatter: AgentDefinitionFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            frontmatter
+                .capabilities
+                .contains(&AgentCapability::AutoPrune)
+        );
+        assert_eq!(frontmatter.tool_steering, Some(ToolSteering::Verbose));
+        let delegation = frontmatter.delegation.unwrap();
+        assert!(!delegation.interactive_subagents);
+        assert_eq!(delegation.max_descendant_depth, Some(5));
+        let verification = frontmatter.verification.unwrap();
+        assert_eq!(
+            verification.goal_skeptics,
+            GoalSkepticsPolicy::Count { count: 3 }
+        );
+        assert_eq!(verification.rules.len(), 3);
+        assert_eq!(
+            verification.rules[0].adjudicators[0].model_ref.model_id,
+            "exact-b"
+        );
+        assert_eq!(verification.rules[0].adjudicators[0].copies, 1);
+        assert_eq!(verification.rules[0].adjudicators[1].copies, 2);
+        assert_eq!(verification.rules[1].adjudicators[0].copies, 3);
+        assert_eq!(verification.rules[2].adjudicators[0].copies, 0);
+        assert_eq!(verification.rules[2].adjudicators[1].copies, 1);
+    }
+
+    #[test]
+    fn surface_is_off_only_when_every_copy_count_is_zero() {
+        let mut surface = SurfaceVerificationDraft {
+            surface: VerificationSurface::Command,
+            copies: vec![0, 0, 0],
+        };
+        assert!(surface.is_off());
+        surface.copies[2] = 1;
+        assert!(!surface.is_off());
+        surface.copies[2] = 0;
+        assert!(surface.is_off());
+    }
+
+    #[test]
+    fn all_zero_surface_emits_no_verification_rule() {
+        let projection = sample_projection();
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
+        draft.trust_confirmations[0] = true;
+        draft.self_verification[1].copies.fill(0);
+        let package = build_package_draft(&projection, &draft).unwrap();
+        let yaml = package
+            .markdown
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("---\n")
+            .unwrap()
+            .0;
+        let frontmatter: AgentDefinitionFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        let verification = frontmatter
+            .verification
+            .expect("default writes rule remains");
+        assert_eq!(verification.rules.len(), 1);
+        assert_eq!(
+            verification.rules[0].selector.any_of,
+            vec![SelectorPredicate::ToolClass {
+                tool_class: ToolClass::ArtifactWrite
+            }]
+        );
+    }
+
+    #[test]
     fn toggle_route_grant_draft_replaces_disabled_default() {
         let mut grants = vec![
             RouteGrantDraft { enabled: true },
             RouteGrantDraft { enabled: true },
         ];
         let mut default_route_index = 0;
-        toggle_route_grant_draft(&mut grants, 0, &mut default_route_index);
+        let mut self_verification = vec![SurfaceVerificationDraft {
+            surface: VerificationSurface::ArtifactWrite,
+            copies: vec![1, 3],
+        }];
+        toggle_route_grant_draft(
+            &mut grants,
+            0,
+            &mut default_route_index,
+            &mut self_verification,
+        );
         assert!(!grants[0].enabled);
         assert!(grants[1].enabled);
         assert_eq!(default_route_index, 1);
+        assert_eq!(self_verification[0].copies, vec![3, 1]);
     }
 
     #[test]
@@ -1008,7 +1293,13 @@ mod tests {
             RouteGrantDraft { enabled: false },
         ];
         let mut default_route_index = 0;
-        toggle_route_grant_draft(&mut grants, 0, &mut default_route_index);
+        let mut self_verification = Vec::new();
+        toggle_route_grant_draft(
+            &mut grants,
+            0,
+            &mut default_route_index,
+            &mut self_verification,
+        );
         assert!(grants[0].enabled);
         assert_eq!(default_route_index, 0);
     }

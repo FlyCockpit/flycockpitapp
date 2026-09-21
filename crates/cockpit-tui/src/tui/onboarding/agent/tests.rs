@@ -12,7 +12,8 @@ use cockpit_proto::{
     AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
     AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
     AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
-    AuthoredAgentReview, AuthoredAgentReviewGrant,
+    AuthoredAgentReview, AuthoredAgentReviewAdjudicator, AuthoredAgentReviewGrant,
+    AuthoredAgentReviewVerificationSurface,
 };
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -83,7 +84,20 @@ fn sample_review() -> AuthoredAgentReview {
         tool_tier_preferences: vec![("read".into(), "enabled".into())],
         verification_label: Some("Self-verification (1 rules)".into()),
         interactive_subagents: true,
+        auto_prune: false,
+        max_subagent_recursion: 2,
+        tool_steering: "terse".into(),
         goal_skeptics_label: "2 goal skeptics".into(),
+        verification_surfaces: vec![AuthoredAgentReviewVerificationSurface {
+            surface: "Writes & edits".into(),
+            adjudicators: vec![AuthoredAgentReviewAdjudicator {
+                provider_id: "vendor".into(),
+                model_id: "exact-a".into(),
+                copies: 1,
+                is_default_model: true,
+            }],
+            enforcement_note: None,
+        }],
         children: vec![],
         sidecars: vec![],
         source: "catalog/frontier@rev".into(),
@@ -189,6 +203,85 @@ fn default_replacement_toggle_on_create_screen() {
 }
 
 #[test]
+fn hyphen_is_preserved_in_identity_and_locator_text_fields() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "hyphen-root".into());
+    screen.name_field.set("my");
+    screen.handle_key(key(KeyCode::Char('-')));
+    screen.handle_key(key(KeyCode::Char('p')));
+    assert_eq!(screen.name_field.text(), "my-p");
+
+    screen.phase = Phase::ThirdPartyLocator;
+    screen.third_party_field.set("registry");
+    screen.handle_key(key(KeyCode::Char('-')));
+    screen.handle_key(key(KeyCode::Char('p')));
+    assert_eq!(screen.third_party_field.text(), "registry-p");
+
+    screen.begin_edit_subagent(0);
+    screen.name_field.set("child");
+    screen.handle_key(key(KeyCode::Char('-')));
+    assert_eq!(screen.name_field.text(), "child-");
+}
+
+#[test]
+fn child_optimization_back_restores_pending_model_trust() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "child-trust".into());
+    screen.begin_edit_subagent(0);
+    screen
+        .editing_child
+        .as_mut()
+        .expect("child editor")
+        .trust_confirmations[0] = false;
+    screen.phase = Phase::SubagentEdit(SubagentPhase::Optimizations);
+
+    screen.handle_key(key(KeyCode::Esc));
+
+    assert_eq!(screen.phase, Phase::SubagentEdit(SubagentPhase::ModelTrust));
+}
+
+#[test]
+fn self_verify_and_panel_done_restore_the_opening_rows() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "restore-focus".into());
+    screen.phase = Phase::SelfVerify;
+    screen.cursor = 2;
+    screen.handle_key(key(KeyCode::Esc));
+    assert_eq!(screen.phase, Phase::Optimizations);
+    assert_eq!(screen.cursor, 5);
+
+    screen.phase = Phase::SelfVerify;
+    screen.cursor = 1;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert_eq!(screen.phase, Phase::VerifierPanel(1));
+    screen.handle_key(key(KeyCode::Enter));
+    assert_eq!(screen.phase, Phase::SelfVerify);
+    assert_eq!(screen.cursor, 1);
+}
+
+#[test]
+fn child_self_verify_edits_the_child_draft_only() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "child-verify".into());
+    let root = screen.draft.self_verification[1].copies.clone();
+    screen.begin_edit_subagent(0);
+    screen.phase = Phase::SubagentEdit(SubagentPhase::Optimizations);
+    screen.cursor = 5;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    screen.cursor = 1;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert_eq!(screen.phase, Phase::VerifierPanel(1));
+    screen.cursor = 0;
+    screen.handle_key(key(KeyCode::Char('+')));
+
+    assert_eq!(screen.draft.self_verification[1].copies, root);
+    assert_eq!(
+        screen
+            .current_child()
+            .expect("child editor")
+            .self_verification[1]
+            .copies[0],
+        1
+    );
+}
+
+#[test]
 fn back_restores_parent_after_canceling_nested_subagent() {
     let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
     advance_to_subagents(&mut screen);
@@ -247,6 +340,11 @@ fn advance_subagent_to_helpers(screen: &mut AgentAuthoringScreen) {
         screen.handle_key(key(KeyCode::Char(' ')));
         screen.handle_key(key(KeyCode::Enter));
     }
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::Optimizations)
+    ));
+    screen.handle_key(key(KeyCode::Enter));
     assert!(matches!(
         screen.phase,
         Phase::SubagentEdit(SubagentPhase::ToolTiers)
@@ -322,11 +420,12 @@ fn saving_added_nested_subagent_preserves_the_parent_editor() {
 #[test]
 fn tool_model_selection_is_scoped_to_the_draft_being_edited() {
     let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "tool-scope".into());
-    let tool_index = tool_surface_catalog()
+    let tool_index = screen
+        .tool_catalog
         .iter()
         .position(|item| item.name == "transcribe_audio")
         .expect("model-gated tool");
-    let cursor = tool_presentation_order()
+    let cursor = tool_presentation_order(&screen.tool_catalog)
         .iter()
         .position(|index| *index == tool_index)
         .expect("model-gated tool must be visible");
@@ -416,6 +515,11 @@ fn review_render_matches_canonical_projection_without_secrets() {
     assert!(rendered.contains("navigator"));
     assert!(rendered.contains("vendor/exact-a"));
     assert!(rendered.contains("2 goal skeptics"));
+    assert!(rendered.contains("Auto-prune  off"));
+    assert!(
+        !rendered.contains("Auto-prune  off (not yet enforced)"),
+        "the enabled runtime setting must not be labeled unsupported"
+    );
     assert!(rendered.contains("shared global provider/model policy"));
     for secret in [
         "api_key",
@@ -474,26 +578,9 @@ fn invalid_nested_depth_surfaces_canonical_failure() {
     }];
     let mut screen = AgentAuthoringScreen::new(projection, "op-depth".into());
     advance_to_subagents(&mut screen);
-    screen.draft.children = vec![
-        cockpit_core::authoring_draft::ChildAuthoringDraft {
-            name: "child-a".into(),
-            route_grants: vec![cockpit_core::authoring_draft::RouteGrantDraft { enabled: true }],
-            default_route_index: 0,
-            trust_confirmations: vec![false],
-            tool_tiers: Default::default(),
-            tool_models: Default::default(),
-            children: vec![],
-        },
-        cockpit_core::authoring_draft::ChildAuthoringDraft {
-            name: "child-a".into(),
-            route_grants: vec![cockpit_core::authoring_draft::RouteGrantDraft { enabled: true }],
-            default_route_index: 0,
-            trust_confirmations: vec![false],
-            tool_tiers: Default::default(),
-            tool_models: Default::default(),
-            children: vec![],
-        },
-    ];
+    let mut duplicate = cockpit_core::authoring_draft::default_child_draft(&screen.projection);
+    duplicate.name = "child-a".into();
+    screen.draft.children = vec![duplicate.clone(), duplicate];
     let error = build_package_draft(&screen.projection, &screen.draft)
         .expect_err("duplicate child names must fail canonical package construction");
     assert!(
@@ -506,12 +593,12 @@ fn invalid_nested_depth_surfaces_canonical_failure() {
 fn model_gated_tool_stays_off_until_its_inline_model_is_chosen() {
     let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-tools".into());
     screen.phase = Phase::ToolTiers;
-    let catalog = tool_surface_catalog();
+    let catalog = &screen.tool_catalog;
     let tool_index = catalog
         .iter()
         .position(|item| item.name == "transcribe_audio")
         .expect("model-gated transcription tool must be in the catalog");
-    screen.cursor = tool_presentation_order()
+    screen.cursor = tool_presentation_order(catalog)
         .iter()
         .position(|index| *index == tool_index)
         .expect("model-gated tool must be presented");
@@ -546,7 +633,7 @@ fn model_gated_tool_stays_off_until_its_inline_model_is_chosen() {
 #[test]
 fn tools_are_grouped_and_required_tools_cannot_be_disabled() {
     let catalog = tool_surface_catalog();
-    let order = tool_presentation_order();
+    let order = tool_presentation_order(&catalog);
     let sections = order
         .iter()
         .map(|index| tool_section(&catalog[*index]))
@@ -586,11 +673,11 @@ fn model_tool_optimization_and_subagent_rows_activate_on_first_click() {
     assert!(screen.draft.route_grants[1].enabled);
 
     screen.phase = Phase::Optimizations;
-    let interactive_before = screen.draft.interactive_subagents;
+    let auto_prune_before = screen.draft.auto_prune;
     render_buffer(&mut screen, 120, 40);
     let optimization = screen.list_row_rects[0];
     assert!(screen.handle_mouse(click_at(Position::new(optimization.x, optimization.y))));
-    assert_ne!(screen.draft.interactive_subagents, interactive_before);
+    assert_ne!(screen.draft.auto_prune, auto_prune_before);
 
     screen.phase = Phase::ToolTiers;
     render_buffer(&mut screen, 120, 40);
@@ -598,8 +685,8 @@ fn model_tool_optimization_and_subagent_rows_activate_on_first_click() {
         .list_row_indices
         .iter()
         .position(|logical| {
-            let index = tool_presentation_order()[*logical];
-            tool_surface_catalog()[index].name == "context_pack"
+            let index = tool_presentation_order(&screen.tool_catalog)[*logical];
+            screen.tool_catalog[index].name == "context_pack"
         })
         .expect("context_pack must have a visible hit target at 120x40");
     let tool_rect = screen.list_row_rects[tool_row];
@@ -614,6 +701,63 @@ fn model_tool_optimization_and_subagent_rows_activate_on_first_click() {
         screen.phase,
         Phase::SubagentEdit(SubagentPhase::Identity)
     ));
+}
+
+#[test]
+fn verifier_panel_keeps_default_model_first_and_labels_cache_reuse() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-order".into());
+    screen.draft.default_route_index = 1;
+    screen.phase = Phase::VerifierPanel(0);
+    assert_eq!(screen.verifier_route_index(0), Some(1));
+    assert_eq!(screen.verifier_route_index(1), Some(0));
+    screen.draft.self_verification[0].copies[1] = 1;
+    let rows = screen.phase_rows();
+    let first = &rows[0].1;
+    assert_eq!(first.spans[6].content, "Same model");
+    assert_eq!(first.spans[7].content, "  reuses cache");
+}
+
+#[test]
+fn changing_the_default_model_moves_same_model_verification_copies() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-default".into());
+    screen.phase = Phase::ModelGrants;
+    screen.cursor = 1;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    screen.handle_key(key(KeyCode::Char('d')));
+
+    assert_eq!(screen.draft.default_route_index, 1);
+    assert_eq!(screen.draft.self_verification[0].copies, vec![0, 1]);
+    screen.phase = Phase::VerifierPanel(0);
+    let rows = screen.phase_rows();
+    assert_eq!(screen.verifier_route_index(0), Some(1));
+    assert_eq!(rows[0].1.spans[3].content, "×1 ");
+    assert_eq!(rows[0].1.spans[6].content, "Same model");
+    assert_eq!(rows[0].1.spans[7].content, "  reuses cache");
+}
+
+#[test]
+fn verifier_minus_at_zero_is_a_no_op_and_surface_off_requires_all_zero() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-zero".into());
+    screen.draft.self_verification[1].copies.fill(0);
+    assert!(screen.draft.self_verification[1].is_off());
+    screen.phase = Phase::VerifierPanel(1);
+    render_buffer(&mut screen, 120, 40);
+    let first = screen.list_row_rects[0];
+    assert!(screen.handle_mouse(click_at(Position::new(first.x + 2, first.y))));
+    assert_eq!(screen.draft.self_verification[1].copies, vec![0, 0]);
+    screen.adjust_verifier(1, 1, 1);
+    assert!(!screen.draft.self_verification[1].is_off());
+    screen.adjust_verifier(1, 1, -1);
+    assert!(screen.draft.self_verification[1].is_off());
+}
+
+#[test]
+fn verifier_space_wraps_from_the_copy_cap_to_zero() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-wrap".into());
+    screen.phase = Phase::VerifierPanel(0);
+    screen.draft.self_verification[0].copies[0] = 9;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert_eq!(screen.draft.self_verification[0].copies[0], 0);
 }
 
 #[test]
@@ -660,12 +804,12 @@ fn nested_subagent_required_tool_lock_does_not_cycle_tier() {
         }
         screen.handle_key(key(KeyCode::Enter));
     }
-    let catalog = tool_surface_catalog();
+    let catalog = &screen.tool_catalog;
     let read_index = catalog
         .iter()
         .position(|item| item.name == "read")
         .expect("read tool");
-    screen.cursor = tool_presentation_order()
+    screen.cursor = tool_presentation_order(catalog)
         .iter()
         .position(|index| *index == read_index)
         .expect("read row");
@@ -698,12 +842,12 @@ fn nested_subagent_required_tool_lock_does_not_cycle_tier() {
 fn tool_model_picker_click_uses_picker_row_index_after_tools_scroll() {
     let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "picker-scroll".into());
     screen.phase = Phase::ToolTiers;
-    let catalog = tool_surface_catalog();
+    let catalog = &screen.tool_catalog;
     let tool_index = catalog
         .iter()
         .position(|item| item.name == "transcribe_audio")
         .expect("model-gated tool");
-    screen.cursor = tool_presentation_order()
+    screen.cursor = tool_presentation_order(catalog)
         .iter()
         .position(|index| *index == tool_index)
         .expect("tool row");
@@ -868,6 +1012,7 @@ fn mouse_only_authoring_keeps_runner_and_submits_it() {
 
 fn golden_screen(phase: Phase) -> AgentAuthoringScreen {
     let mut screen = AgentAuthoringScreen::new(sample_projection("golden-rev"), "golden-op".into());
+    screen.tool_catalog = golden_tool_catalog();
     if let Phase::SubagentEdit(subphase) = phase {
         screen.begin_edit_subagent(0);
         let child = screen
@@ -901,9 +1046,81 @@ fn golden_screen(phase: Phase) -> AgentAuthoringScreen {
     screen
 }
 
+/// The onboarding goldens exercise a fixed authoring catalog, not the
+/// feature-selected runtime inventory. Keep this list explicit so a new tool
+/// (including one behind a feature) cannot change their scroll geometry.
+fn golden_tool_catalog() -> Vec<ToolSurfaceItem> {
+    const NAMES: &[&str] = &[
+        "read",
+        "bash",
+        "escalate",
+        "context_pack",
+        "code",
+        "graph",
+        "search",
+        "change_impact",
+        "task",
+        "skill",
+        "skill_manage",
+        "question",
+        "raise",
+        "schedule",
+        "spawn",
+        "worktree_orchestrate",
+        "mcp",
+        "webfetch",
+        "websearch",
+        "lsp",
+        "start_build",
+        "defer_to_orchestrator",
+        "return",
+        "harness_list",
+        "harness_invoke",
+        "history_search",
+        "thread_start",
+        "semantic_search",
+        "structured_search",
+        "todo",
+        "set_conversation_rule",
+        "list_conversation_rules",
+        "remove_conversation_rule",
+        "write",
+        "edit",
+        "delete",
+        "unlock",
+        "grep",
+        "glob",
+        "list_sealed_value_descriptions",
+        "use_sealed_value",
+        "acquire_sealed_value",
+        "run_acquisition_command",
+        "capture_sealed_value",
+        "acquisition_requires_user",
+        "acquisition_fail",
+        "inspect_audio",
+        "inspect_video",
+        "extract_video_clip",
+        "extract_audio",
+        "transcribe_audio",
+        "read_image",
+        "ask_image",
+    ];
+    let live = tool_surface_catalog();
+    NAMES
+        .iter()
+        .map(|name| {
+            live.iter()
+                .find(|item| item.name == *name)
+                .cloned()
+                .expect("every pinned golden tool must remain in the live catalog")
+        })
+        .collect()
+}
+
 #[test]
-fn golden_agent_authoring_all_twenty_states() {
+fn golden_agent_authoring_screens() {
     let _pins = crate::tui::golden::GoldenPins::install();
+    assert_eq!(golden_tool_catalog().len(), 53);
     let states = [
         ("name", Phase::SourceIdentity),
         ("third-party-locator", Phase::ThirdPartyLocator),
@@ -912,6 +1129,8 @@ fn golden_agent_authoring_all_twenty_states() {
         ("trust", Phase::ModelTrust),
         ("sidecar-egress", Phase::SidecarEgress),
         ("optimizations", Phase::Optimizations),
+        ("self-verify", Phase::SelfVerify),
+        ("verifier-panel", Phase::VerifierPanel(0)),
         ("tools", Phase::ToolTiers),
         ("subagents", Phase::SubagentsList),
         (
@@ -941,7 +1160,7 @@ fn golden_agent_authoring_all_twenty_states() {
         ("unknown", Phase::Unknown),
         ("success", Phase::Success),
     ];
-    assert_eq!(states.len(), 20);
+    assert_eq!(states.len(), 22);
     for (name, phase) in states {
         let mut screen = golden_screen(phase);
         if phase == Phase::SubagentEdit(SubagentPhase::ModelTrust) {

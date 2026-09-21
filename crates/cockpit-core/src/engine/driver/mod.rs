@@ -10753,15 +10753,28 @@ impl Driver {
         providers.resolve_shrink(&provider, &model)
     }
 
-    /// Resolve the auto-prune master switch for the session's active
-    /// (provider, model): model override → provider override → on. Defaults
-    /// to on when the config can't be loaded, matching the historical
-    /// behavior. Takes a pre-loaded providers config (from one
+    /// Resolve the auto-prune master switch. An authored active frame's
+    /// `AutoPrune` capability is authoritative; frames without an authored
+    /// definition retain provider/model resolution (model override → provider
+    /// override → on). Defaults to on when the config can't be loaded,
+    /// matching the historical behavior. Takes a pre-loaded providers config (from one
     /// [`Self::active_providers_config`] call shared across several
     /// resolves).
     fn auto_prune_enabled_from(
+        &self,
         cfg: Option<&(crate::config::providers::ProvidersConfig, String, String)>,
     ) -> bool {
+        if let Some(definition) = self
+            .stack
+            .last()
+            .and_then(|frame| frame.agent.definition.as_ref())
+            .and_then(|definition| definition.vnext.as_ref())
+            .filter(|definition| definition.agent_id.starts_with("authored/"))
+        {
+            return definition
+                .capabilities
+                .contains(&crate::agents::AgentCapability::AutoPrune);
+        }
         let Some((providers, provider, model)) = cfg else {
             return true;
         };

@@ -206,6 +206,7 @@ fn rule_from_snapshot(
             any_of: Vec::new(),
         },
         action: VerificationAction::Verify,
+        adjudicators: Vec::new(),
         max_candidates: Some(budget.max_candidates),
         max_total_tokens: Some(budget.max_total_tokens),
         max_estimated_cost_microusd: Some(budget.max_estimated_cost_microusd),

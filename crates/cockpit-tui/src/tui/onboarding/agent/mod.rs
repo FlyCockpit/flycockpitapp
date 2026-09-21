@@ -16,10 +16,12 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 
 use super::{chrome, theme, ui};
 use crate::tui::textfield::TextField;
-use cockpit_core::agents::{GoalSkepticsPolicy, ToolTier, tool_surface_catalog};
+use cockpit_core::agents::{
+    GoalSkepticsPolicy, ToolSteering, ToolSurfaceItem, ToolTier, tool_surface_catalog,
+};
 use cockpit_core::authoring_draft::{
     AgentAuthoringDraft, ChildAuthoringDraft, RouteGrantDraft, SourceSelection,
-    build_package_draft_with_diagnostics, default_child_draft,
+    SurfaceVerificationDraft, build_package_draft_with_diagnostics, default_child_draft,
 };
 use cockpit_proto::{
     AgentAuthoringProjection, ApplyAuthoredAgentPackageOutcome, ApplyAuthoredAgentPackageReceipt,
@@ -51,6 +53,8 @@ pub(crate) enum Phase {
     ModelTrust,
     SidecarEgress,
     Optimizations,
+    SelfVerify,
+    VerifierPanel(usize),
     ToolTiers,
     SubagentsList,
     SubagentEdit(SubagentPhase),
@@ -67,6 +71,7 @@ enum SubagentPhase {
     Identity,
     ModelGrants,
     ModelTrust,
+    Optimizations,
     ToolTiers,
     SubagentsList,
 }
@@ -112,6 +117,10 @@ pub struct AgentAuthoringScreen {
     mouse_selected: Option<usize>,
     tool_model_picker: Option<usize>,
     tool_model_cursor: usize,
+    /// The catalog is captured for the editor's lifetime. Production receives
+    /// the complete live catalog; golden tests replace it with their pinned
+    /// fixture so a feature-gated tool cannot alter their bytes.
+    tool_catalog: Vec<ToolSurfaceItem>,
     draft_diagnostics: Vec<String>,
 }
 
@@ -154,6 +163,7 @@ impl AgentAuthoringScreen {
             mouse_selected: None,
             tool_model_picker: None,
             tool_model_cursor: 0,
+            tool_catalog: tool_surface_catalog(),
             draft_diagnostics: Vec::new(),
         }
     }
@@ -262,6 +272,9 @@ impl AgentAuthoringScreen {
             .route_grants
             .resize(count, RouteGrantDraft { enabled: false });
         self.draft.trust_confirmations.resize(count, false);
+        for surface in &mut self.draft.self_verification {
+            surface.copies.resize(count, 0);
+        }
         if self.draft.default_route_index >= count && count > 0 {
             self.draft.default_route_index = 0;
         }
@@ -279,6 +292,9 @@ impl AgentAuthoringScreen {
             .route_grants
             .resize(count, RouteGrantDraft { enabled: false });
         child.trust_confirmations.resize(count, false);
+        for surface in &mut child.self_verification {
+            surface.copies.resize(count, 0);
+        }
         if child.default_route_index >= count && count > 0 {
             child.default_route_index = 0;
         }
@@ -311,6 +327,27 @@ impl AgentAuthoringScreen {
             .copied()
     }
 
+    fn current_self_verification(&self) -> &[SurfaceVerificationDraft] {
+        self.current_child()
+            .map(|child| child.self_verification.as_slice())
+            .unwrap_or(&self.draft.self_verification)
+    }
+
+    fn current_self_verification_mut(&mut self) -> &mut [SurfaceVerificationDraft] {
+        if self.editing_root() {
+            &mut self.draft.self_verification
+        } else {
+            self.editing_child
+                .as_mut()
+                .map(|child| child.self_verification.as_mut_slice())
+                .unwrap_or(&mut self.draft.self_verification)
+        }
+    }
+
+    fn optimization_row_count(&self) -> usize {
+        if self.editing_root() { 7 } else { 6 }
+    }
+
     pub(super) fn phase_title(&self) -> &'static str {
         match self.phase {
             Phase::SourceIdentity => "Create your first agent",
@@ -320,11 +357,16 @@ impl AgentAuthoringScreen {
             Phase::ModelTrust => "How much does this agent see?",
             Phase::SidecarEgress => "Let the sidecar reach the network?",
             Phase::Optimizations => "Tune the agent",
+            Phase::SelfVerify => "Self-verify risky actions",
+            Phase::VerifierPanel(0) => "Verifier panel — Writes & edits",
+            Phase::VerifierPanel(1) => "Verifier panel — Commands",
+            Phase::VerifierPanel(_) => "Verifier panel — Monty",
             Phase::ToolTiers => "Grant tools",
             Phase::SubagentsList => "Define subagents",
             Phase::SubagentEdit(SubagentPhase::Identity) => "Subagent",
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => "Subagent models",
             Phase::SubagentEdit(SubagentPhase::ModelTrust) => "How much does this subagent see?",
+            Phase::SubagentEdit(SubagentPhase::Optimizations) => "Tune the subagent",
             Phase::SubagentEdit(SubagentPhase::ToolTiers) => "Subagent tools",
             Phase::SubagentEdit(SubagentPhase::SubagentsList) => "Subagent helpers",
             Phase::Review => "Ready to create",
@@ -359,6 +401,14 @@ impl AgentAuthoringScreen {
             Phase::Optimizations => {
                 "These settings are independent; the defaults are a sane starting point.".into()
             }
+            Phase::SelfVerify => "Re-check writes, commands, and Monty before they land.".into(),
+            Phase::VerifierPanel(surface) => format!(
+                "{} verifier models and copy counts.",
+                self.current_self_verification()
+                    .get(surface)
+                    .map(|entry| entry.surface.label())
+                    .unwrap_or("Risky action")
+            ),
             Phase::ToolTiers => "Required tools are always on. Toggle the rest.".into(),
             Phase::SubagentsList => {
                 "Helpers this agent can delegate to. The runner is ready to keep or edit.".into()
@@ -371,6 +421,9 @@ impl AgentAuthoringScreen {
             }
             Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
                 "Confirm the shared trust classification for every unset model.".into()
+            }
+            Phase::SubagentEdit(SubagentPhase::Optimizations) => {
+                "These settings are independent; the defaults are a sane starting point.".into()
             }
             Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
                 "Required tools are always on. Toggle the rest.".into()
@@ -464,7 +517,16 @@ impl AgentAuthoringScreen {
             Phase::ToolTiers | Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
                 "↑↓ move   space cycle grant   m set model   enter continue   esc back"
             }
-            Phase::Optimizations => "↑↓ move   space toggle   enter continue   esc back",
+            Phase::Optimizations => {
+                "↑↓ move   space toggle/open   ←→ adjust   enter continue   esc back"
+            }
+            Phase::SubagentEdit(SubagentPhase::Optimizations) => {
+                "↑↓ move   space toggle/open   ←→ adjust   enter continue   esc back"
+            }
+            Phase::SelfVerify => "↑↓ surface   ←→ same model   space configure   x off   esc back",
+            Phase::VerifierPanel(_) => {
+                "↑↓ move   -/+ or [−][+] copies   space bump   enter done   esc back"
+            }
             Phase::SubagentsList => {
                 "a add   e edit   d delete   ↑↓ move   enter continue   esc back"
             }
@@ -496,15 +558,16 @@ impl AgentAuthoringScreen {
     }
 
     fn focused_tool_index(&self) -> Option<usize> {
-        tool_presentation_order().get(self.cursor).copied()
+        tool_presentation_order(&self.tool_catalog)
+            .get(self.cursor)
+            .copied()
     }
 
     fn open_tool_model_picker(&mut self) {
         let Some(index) = self.focused_tool_index() else {
             return;
         };
-        let catalog = tool_surface_catalog();
-        if !tool_requires_model(catalog[index].name) {
+        if !tool_requires_model(self.tool_catalog[index].name) {
             self.status = Some("This tool does not need a separate model.".into());
             return;
         }
@@ -514,7 +577,7 @@ impl AgentAuthoringScreen {
         }
         self.tool_model_picker = Some(index);
         self.tool_model_cursor = self
-            .tool_model_for(catalog[index].name)
+            .tool_model_for(self.tool_catalog[index].name)
             .unwrap_or(0)
             .min(self.projection.policy.routes.len() - 1);
         self.status = None;
@@ -524,8 +587,11 @@ impl AgentAuthoringScreen {
         let Some(index) = self.tool_model_picker.take() else {
             return;
         };
-        let catalog = tool_surface_catalog();
-        let Some(item) = catalog.get(index) else {
+        let Some(tool_name) = self
+            .tool_catalog
+            .get(index)
+            .map(|item| item.name.to_string())
+        else {
             return;
         };
         if self
@@ -540,19 +606,13 @@ impl AgentAuthoringScreen {
         }
         let selected_model = self.tool_model_cursor;
         if let Some(child) = self.current_child_mut() {
-            child
-                .tool_models
-                .insert(item.name.to_string(), selected_model);
-            child
-                .tool_tiers
-                .insert(item.name.to_string(), ToolTier::Enabled);
+            child.tool_models.insert(tool_name.clone(), selected_model);
+            child.tool_tiers.insert(tool_name, ToolTier::Enabled);
         } else {
             self.draft
                 .tool_models
-                .insert(item.name.to_string(), selected_model);
-            self.draft
-                .tool_tiers
-                .insert(item.name.to_string(), ToolTier::Enabled);
+                .insert(tool_name.clone(), selected_model);
+            self.draft.tool_tiers.insert(tool_name, ToolTier::Enabled);
         }
         self.status = None;
     }
@@ -573,6 +633,26 @@ impl AgentAuthoringScreen {
             }
             KeyCode::Down => {
                 self.move_cursor(1);
+                None
+            }
+            KeyCode::Left => {
+                self.adjust_current_control(-1);
+                None
+            }
+            KeyCode::Char('-') if self.has_adjustable_control() => {
+                self.adjust_current_control(-1);
+                None
+            }
+            KeyCode::Right => {
+                self.adjust_current_control(1);
+                None
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') if self.has_adjustable_control() => {
+                self.adjust_current_control(1);
+                None
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') if self.phase == Phase::SelfVerify => {
+                self.clear_surface(self.cursor);
                 None
             }
             KeyCode::Char(' ') => {
@@ -692,6 +772,17 @@ impl AgentAuthoringScreen {
             .position(|rect| rect.contains(pos));
         if let Some(index) = index {
             let logical = self.list_row_indices.get(index).copied().unwrap_or(index);
+            if let Phase::VerifierPanel(surface) = self.phase {
+                self.cursor = logical;
+                let rect = self.list_row_rects[index];
+                let column = pos.x.saturating_sub(rect.x);
+                if (2..=4).contains(&column) {
+                    self.adjust_verifier(surface, logical, -1);
+                } else if (9..=11).contains(&column) {
+                    self.adjust_verifier(surface, logical, 1);
+                }
+                return true;
+            }
             if matches!(
                 self.phase,
                 Phase::ModelTrust
@@ -733,10 +824,20 @@ impl AgentAuthoringScreen {
         if let Some(child) = self.current_child_mut() {
             if let Some(grant) = child.route_grants.get_mut(index) {
                 grant.enabled = true;
+                cockpit_core::authoring_draft::migrate_default_route_verification(
+                    &mut child.self_verification,
+                    child.default_route_index,
+                    index,
+                );
                 child.default_route_index = index;
             }
         } else if let Some(grant) = self.draft.route_grants.get_mut(index) {
             grant.enabled = true;
+            cockpit_core::authoring_draft::migrate_default_route_verification(
+                &mut self.draft.self_verification,
+                self.draft.default_route_index,
+                index,
+            );
             self.draft.default_route_index = index;
         }
     }
@@ -790,9 +891,13 @@ impl AgentAuthoringScreen {
                 .current_child()
                 .map(|child| child.pending_trust_route_indices(&self.projection).len())
                 .unwrap_or(0),
-            Phase::Optimizations => 4,
+            Phase::Optimizations | Phase::SubagentEdit(SubagentPhase::Optimizations) => {
+                self.optimization_row_count()
+            }
+            Phase::SelfVerify => 3,
+            Phase::VerifierPanel(_) => self.projection.policy.routes.len(),
             Phase::ToolTiers | Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
-                tool_surface_catalog().len()
+                self.tool_catalog.len()
             }
             Phase::SubagentsList => self.draft.children.len() + 1,
             Phase::Review => self.phase_rows().len(),
@@ -832,6 +937,7 @@ impl AgentAuthoringScreen {
                     &mut self.draft.route_grants,
                     cursor,
                     &mut self.draft.default_route_index,
+                    &mut self.draft.self_verification,
                 );
             }
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
@@ -841,6 +947,7 @@ impl AgentAuthoringScreen {
                         &mut child.route_grants,
                         cursor,
                         &mut child.default_route_index,
+                        &mut child.self_verification,
                     );
                 }
             }
@@ -869,41 +976,48 @@ impl AgentAuthoringScreen {
                 self.review = None;
                 self.review_policy_revision = None;
             }
-            Phase::Optimizations => match self.cursor {
-                0 => {
-                    self.draft.interactive_subagents = !self.draft.interactive_subagents;
-                }
-                1 => {
-                    self.draft.verification_enabled = !self.draft.verification_enabled;
-                }
-                2 => self.cycle_goal_skeptics(),
-                3 => self.draft.make_default = !self.draft.make_default,
-                _ => {}
-            },
+            Phase::Optimizations | Phase::SubagentEdit(SubagentPhase::Optimizations) => {
+                self.activate_optimization()
+            }
+            Phase::SelfVerify => {
+                self.phase = Phase::VerifierPanel(self.cursor.min(2));
+                self.cursor = 0;
+            }
+            Phase::VerifierPanel(surface) => {
+                let current = self
+                    .verifier_route_index(self.cursor)
+                    .and_then(|route| {
+                        self.current_self_verification()
+                            .get(surface)
+                            .and_then(|entry| entry.copies.get(route))
+                    })
+                    .copied()
+                    .unwrap_or(0);
+                self.adjust_verifier(surface, self.cursor, if current >= 9 { -9 } else { 1 });
+            }
             Phase::ToolTiers => {
                 let Some(index) = self.focused_tool_index() else {
                     return;
                 };
-                let catalog = tool_surface_catalog();
-                let item = &catalog[index];
+                let tool_name = self.tool_catalog[index].name;
                 let current = self
                     .draft
                     .tool_tiers
-                    .get(item.name)
+                    .get(tool_name)
                     .copied()
                     .unwrap_or(ToolTier::Disabled);
-                if tool_section(item) == REQUIRED_TOOL_SECTION {
+                if tool_section(&self.tool_catalog[index]) == REQUIRED_TOOL_SECTION {
                     self.draft
                         .tool_tiers
-                        .insert(item.name.to_string(), ToolTier::Enabled);
+                        .insert(tool_name.to_string(), ToolTier::Enabled);
                     self.status = Some("Required tools stay enabled.".into());
                 } else if current == ToolTier::Disabled
-                    && tool_requires_model(item.name)
-                    && self.tool_model_for(item.name).is_none()
+                    && tool_requires_model(tool_name)
+                    && self.tool_model_for(tool_name).is_none()
                 {
                     self.open_tool_model_picker();
                 } else {
-                    cycle_tool_tier_at(&mut self.draft.tool_tiers, index);
+                    cycle_tool_tier_at(&mut self.draft.tool_tiers, &self.tool_catalog, index);
                     self.status = None;
                 }
             }
@@ -911,30 +1025,30 @@ impl AgentAuthoringScreen {
                 let Some(index) = self.focused_tool_index() else {
                     return;
                 };
-                let catalog = tool_surface_catalog();
-                let item = &catalog[index];
+                let tool_name = self.tool_catalog[index].name;
                 let current = self
                     .current_child()
-                    .and_then(|child| child.tool_tiers.get(item.name))
+                    .and_then(|child| child.tool_tiers.get(tool_name))
                     .copied()
                     .unwrap_or(ToolTier::Disabled);
-                if tool_section(item) == REQUIRED_TOOL_SECTION {
+                if tool_section(&self.tool_catalog[index]) == REQUIRED_TOOL_SECTION {
                     if let Some(child) = self.current_child_mut() {
                         child
                             .tool_tiers
-                            .insert(item.name.to_string(), ToolTier::Enabled);
+                            .insert(tool_name.to_string(), ToolTier::Enabled);
                     }
                     self.status = Some("Required tools stay enabled.".into());
                     return;
                 } else if current == ToolTier::Disabled
-                    && tool_requires_model(item.name)
-                    && self.tool_model_for(item.name).is_none()
+                    && tool_requires_model(tool_name)
+                    && self.tool_model_for(tool_name).is_none()
                 {
                     self.open_tool_model_picker();
                     return;
                 }
+                let catalog = self.tool_catalog.clone();
                 if let Some(child) = self.current_child_mut() {
-                    cycle_tool_tier_at(&mut child.tool_tiers, index);
+                    cycle_tool_tier_at(&mut child.tool_tiers, &catalog, index);
                     self.status = None;
                 }
             }
@@ -958,13 +1072,163 @@ impl AgentAuthoringScreen {
     }
 
     fn cycle_goal_skeptics(&mut self) {
-        self.draft.goal_skeptics = match self.draft.goal_skeptics {
+        let policy = if let Some(child) = self.current_child_mut() {
+            &mut child.goal_skeptics
+        } else {
+            &mut self.draft.goal_skeptics
+        };
+        *policy = match *policy {
             GoalSkepticsPolicy::Off => GoalSkepticsPolicy::Count { count: 1 },
             GoalSkepticsPolicy::Count { count } if count < GoalSkepticsPolicy::MAX_COUNT => {
                 GoalSkepticsPolicy::Count { count: count + 1 }
             }
             GoalSkepticsPolicy::Count { .. } => GoalSkepticsPolicy::Off,
         };
+    }
+
+    fn has_adjustable_control(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Optimizations
+                | Phase::SubagentEdit(SubagentPhase::Optimizations)
+                | Phase::SelfVerify
+                | Phase::VerifierPanel(_)
+        )
+    }
+
+    fn adjust_current_control(&mut self, delta: i8) {
+        match self.phase {
+            Phase::Optimizations | Phase::SubagentEdit(SubagentPhase::Optimizations) => {
+                self.adjust_optimization(delta)
+            }
+            Phase::SelfVerify => self.adjust_same_model(self.cursor, delta),
+            Phase::VerifierPanel(surface) => self.adjust_verifier(surface, self.cursor, delta),
+            _ => {}
+        }
+    }
+
+    fn activate_optimization(&mut self) {
+        match self.cursor {
+            0 => {
+                if let Some(child) = self.current_child_mut() {
+                    child.auto_prune = !child.auto_prune;
+                } else {
+                    self.draft.auto_prune = !self.draft.auto_prune;
+                }
+            }
+            1 => {
+                if let Some(child) = self.current_child_mut() {
+                    child.interactive_subagents = !child.interactive_subagents;
+                } else {
+                    self.draft.interactive_subagents = !self.draft.interactive_subagents;
+                }
+            }
+            2 => self.adjust_optimization(1),
+            3 => {
+                if let Some(child) = self.current_child_mut() {
+                    child.tool_steering = match child.tool_steering {
+                        ToolSteering::Terse => ToolSteering::Verbose,
+                        ToolSteering::Verbose => ToolSteering::Terse,
+                    };
+                } else {
+                    self.draft.tool_steering = match self.draft.tool_steering {
+                        ToolSteering::Terse => ToolSteering::Verbose,
+                        ToolSteering::Verbose => ToolSteering::Terse,
+                    };
+                }
+            }
+            4 => self.cycle_goal_skeptics(),
+            5 => {
+                self.phase = Phase::SelfVerify;
+                self.cursor = 0;
+            }
+            6 if self.editing_root() => self.draft.make_default = !self.draft.make_default,
+            _ => {}
+        }
+    }
+
+    fn adjust_optimization(&mut self, delta: i8) {
+        match self.cursor {
+            2 => {
+                let value = if let Some(child) = self.current_child_mut() {
+                    &mut child.max_subagent_recursion
+                } else {
+                    &mut self.draft.max_subagent_recursion
+                };
+                *value = (i16::from(*value) + i16::from(delta)).clamp(0, 6) as u8;
+            }
+            4 => {
+                if delta < 0 {
+                    let count = self
+                        .current_child()
+                        .map(|child| child.goal_skeptics.count())
+                        .unwrap_or_else(|| self.draft.goal_skeptics.count());
+                    let policy = if count <= 1 {
+                        GoalSkepticsPolicy::Off
+                    } else {
+                        GoalSkepticsPolicy::Count { count: count - 1 }
+                    };
+                    if let Some(child) = self.current_child_mut() {
+                        child.goal_skeptics = policy;
+                    } else {
+                        self.draft.goal_skeptics = policy;
+                    }
+                } else {
+                    self.cycle_goal_skeptics();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn verifier_route_index(&self, row: usize) -> Option<usize> {
+        let count = self.projection.policy.routes.len();
+        if count == 0 || row >= count {
+            return None;
+        }
+        let default = self
+            .current_child()
+            .map(|child| child.default_route_index)
+            .unwrap_or(self.draft.default_route_index)
+            .min(count - 1);
+        if row == 0 {
+            Some(default)
+        } else {
+            (0..count).filter(|index| *index != default).nth(row - 1)
+        }
+    }
+
+    fn adjust_same_model(&mut self, surface: usize, delta: i8) {
+        let default = self
+            .current_child()
+            .map(|child| child.default_route_index)
+            .unwrap_or(self.draft.default_route_index);
+        if let Some(copies) = self
+            .current_self_verification_mut()
+            .get_mut(surface)
+            .and_then(|entry| entry.copies.get_mut(default))
+        {
+            *copies = (i16::from(*copies) + i16::from(delta)).clamp(0, 9) as u8;
+        }
+    }
+
+    fn adjust_verifier(&mut self, surface: usize, row: usize, delta: i8) {
+        let Some(route) = self.verifier_route_index(row) else {
+            return;
+        };
+        if let Some(copies) = self
+            .current_self_verification_mut()
+            .get_mut(surface)
+            .and_then(|entry| entry.copies.get_mut(route))
+        {
+            *copies = (i16::from(*copies) + i16::from(delta)).clamp(0, 9) as u8;
+        }
+    }
+
+    fn clear_surface(&mut self, surface: usize) {
+        if let Some(entry) = self.current_self_verification_mut().get_mut(surface) {
+            entry.copies.fill(0);
+        }
     }
 
     fn handle_back(&mut self) -> Option<AgentAuthoringAction> {
@@ -1016,6 +1280,32 @@ impl AgentAuthoringScreen {
                 };
                 None
             }
+            Phase::SubagentEdit(SubagentPhase::Optimizations) => {
+                self.phase = if self.current_child().is_some_and(|child| {
+                    !child
+                        .pending_trust_route_indices(&self.projection)
+                        .is_empty()
+                }) {
+                    Phase::SubagentEdit(SubagentPhase::ModelTrust)
+                } else {
+                    Phase::SubagentEdit(SubagentPhase::ModelGrants)
+                };
+                None
+            }
+            Phase::SelfVerify => {
+                self.phase = if self.editing_root() {
+                    Phase::Optimizations
+                } else {
+                    Phase::SubagentEdit(SubagentPhase::Optimizations)
+                };
+                self.cursor = 5;
+                None
+            }
+            Phase::VerifierPanel(surface) => {
+                self.phase = Phase::SelfVerify;
+                self.cursor = surface;
+                None
+            }
             Phase::ToolTiers if self.editing_root() => {
                 self.phase = Phase::Optimizations;
                 None
@@ -1041,15 +1331,7 @@ impl AgentAuthoringScreen {
                 None
             }
             Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
-                if let Some(child) = self.current_child()
-                    && !child
-                        .pending_trust_route_indices(&self.projection)
-                        .is_empty()
-                {
-                    self.phase = Phase::SubagentEdit(SubagentPhase::ModelTrust);
-                } else {
-                    self.phase = Phase::SubagentEdit(SubagentPhase::ModelGrants);
-                }
+                self.phase = Phase::SubagentEdit(SubagentPhase::Optimizations);
                 None
             }
             Phase::SubagentEdit(SubagentPhase::SubagentsList) => {
@@ -1132,12 +1414,12 @@ impl AgentAuthoringScreen {
                         .pending_trust_route_indices(&self.projection)
                         .is_empty()
                     {
-                        Phase::SubagentEdit(SubagentPhase::ToolTiers)
+                        Phase::SubagentEdit(SubagentPhase::Optimizations)
                     } else {
                         Phase::SubagentEdit(SubagentPhase::ModelTrust)
                     };
                 } else {
-                    self.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
+                    self.phase = Phase::SubagentEdit(SubagentPhase::Optimizations);
                 }
                 None
             }
@@ -1150,7 +1432,7 @@ impl AgentAuthoringScreen {
                     self.status = Some("Confirm trust for every enabled unset model.".into());
                     return None;
                 }
-                self.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
+                self.phase = Phase::SubagentEdit(SubagentPhase::Optimizations);
                 None
             }
             Phase::ModelTrust => {
@@ -1185,6 +1467,24 @@ impl AgentAuthoringScreen {
                 };
                 None
             }
+            Phase::SubagentEdit(SubagentPhase::Optimizations) => {
+                self.phase = Phase::SubagentEdit(SubagentPhase::ToolTiers);
+                None
+            }
+            Phase::SelfVerify => {
+                self.phase = if self.editing_root() {
+                    Phase::Optimizations
+                } else {
+                    Phase::SubagentEdit(SubagentPhase::Optimizations)
+                };
+                self.cursor = 5;
+                None
+            }
+            Phase::VerifierPanel(surface) => {
+                self.phase = Phase::SelfVerify;
+                self.cursor = surface;
+                None
+            }
             Phase::ToolTiers if self.editing_root() => {
                 self.phase = Phase::SubagentsList;
                 None
@@ -1213,12 +1513,12 @@ impl AgentAuthoringScreen {
                         .pending_trust_route_indices(&self.projection)
                         .is_empty()
                     {
-                        Phase::SubagentEdit(SubagentPhase::ToolTiers)
+                        Phase::SubagentEdit(SubagentPhase::Optimizations)
                     } else {
                         Phase::SubagentEdit(SubagentPhase::ModelTrust)
                     }
                 } else {
-                    Phase::SubagentEdit(SubagentPhase::ToolTiers)
+                    Phase::SubagentEdit(SubagentPhase::Optimizations)
                 };
                 self.phase = next_phase;
                 None
@@ -1590,21 +1890,34 @@ impl AgentAuthoringScreen {
             | Phase::ThirdPartyTrust
             | Phase::SidecarEgress
             | Phase::SubagentEdit(SubagentPhase::ModelTrust) => " Trust ".into(),
-            Phase::Optimizations => " Optimizations ".into(),
+            Phase::Optimizations | Phase::SubagentEdit(SubagentPhase::Optimizations) => {
+                " Optimizations ".into()
+            }
+            Phase::SelfVerify => " Self-verify ".into(),
+            Phase::VerifierPanel(surface) => format!(
+                " Verifier panel — {} ",
+                self.current_self_verification()
+                    .get(surface)
+                    .map(|entry| entry.surface.label())
+                    .unwrap_or("Risky action")
+            ),
             Phase::ToolTiers | Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
                 let tiers = self
                     .current_child()
                     .map(|child| &child.tool_tiers)
                     .unwrap_or(&self.draft.tool_tiers);
-                let catalog = tool_surface_catalog();
-                let enabled = catalog
+                let enabled = self
+                    .tool_catalog
                     .iter()
                     .filter(|item| {
                         tool_section(item) == REQUIRED_TOOL_SECTION
                             || tiers.get(item.name) == Some(&ToolTier::Enabled)
                     })
                     .count();
-                format!(" Tools  ·  {enabled} of {} enabled ", catalog.len())
+                format!(
+                    " Tools  ·  {enabled} of {} enabled ",
+                    self.tool_catalog.len()
+                )
             }
             Phase::SubagentsList | Phase::SubagentEdit(SubagentPhase::SubagentsList) => {
                 format!(" Subagents  ·  {} ", self.draft.children.len())
@@ -1638,6 +1951,9 @@ impl AgentAuthoringScreen {
             ],
             Phase::SubagentEdit(SubagentPhase::SubagentsList) => {
                 vec![chrome::Button::primary("Save")]
+            }
+            Phase::SelfVerify | Phase::VerifierPanel(_) => {
+                vec![chrome::Button::primary("Done")]
             }
             _ => vec![chrome::Button::primary("Continue")],
         }
@@ -2024,16 +2340,33 @@ impl AgentAuthoringScreen {
                     }
                 }
             }
-            Phase::Optimizations => {
+            Phase::Optimizations | Phase::SubagentEdit(SubagentPhase::Optimizations) => {
+                let (auto_prune, interactive, recursion, steering, skeptics, self_verify) =
+                    if let Some(child) = self.current_child() {
+                        (
+                            child.auto_prune,
+                            child.interactive_subagents,
+                            child.max_subagent_recursion,
+                            child.tool_steering,
+                            child.goal_skeptics,
+                            child.self_verification.as_slice(),
+                        )
+                    } else {
+                        (
+                            self.draft.auto_prune,
+                            self.draft.interactive_subagents,
+                            self.draft.max_subagent_recursion,
+                            self.draft.tool_steering,
+                            self.draft.goal_skeptics,
+                            self.draft.self_verification.as_slice(),
+                        )
+                    };
                 lines.push((
                     Some(0),
                     opt_line(
                         0,
                         self.cursor,
-                        &format!(
-                            "Interactive subagents: {}",
-                            on_off(self.draft.interactive_subagents)
-                        ),
+                        &format!("Auto-prune: [ {} ]", on_off(auto_prune)),
                     ),
                 ));
                 lines.push((
@@ -2041,10 +2374,7 @@ impl AgentAuthoringScreen {
                     opt_line(
                         1,
                         self.cursor,
-                        &format!(
-                            "Self-verification: {}",
-                            on_off(self.draft.verification_enabled)
-                        ),
+                        &format!("Interactive subagents: [ {} ]", on_off(interactive)),
                     ),
                 ));
                 lines.push((
@@ -2052,7 +2382,14 @@ impl AgentAuthoringScreen {
                     opt_line(
                         2,
                         self.cursor,
-                        &format!("Goal skeptics: {}", self.draft.goal_skeptics.review_label()),
+                        &format!(
+                            "Max subagent recursion: {}",
+                            if self.cursor == 2 {
+                                format!("◂ {recursion} ▸")
+                            } else {
+                                recursion.to_string()
+                            }
+                        ),
                     ),
                 ));
                 lines.push((
@@ -2060,9 +2397,121 @@ impl AgentAuthoringScreen {
                     opt_line(
                         3,
                         self.cursor,
-                        &format!("Make default agent: {}", on_off(self.draft.make_default)),
+                        &format!(
+                            "Tool steering: {}",
+                            match steering {
+                                ToolSteering::Terse => {
+                                    if self.cursor == 3 {
+                                        "◂ terse ▸"
+                                    } else {
+                                        "terse"
+                                    }
+                                }
+                                ToolSteering::Verbose => {
+                                    if self.cursor == 3 {
+                                        "◂ verbose ▸"
+                                    } else {
+                                        "verbose"
+                                    }
+                                }
+                            }
+                        ),
                     ),
                 ));
+                lines.push((
+                    Some(4),
+                    opt_line(
+                        4,
+                        self.cursor,
+                        &format!(
+                            "Goal-completion skeptics: {}",
+                            match skeptics {
+                                GoalSkepticsPolicy::Off => "off".to_string(),
+                                GoalSkepticsPolicy::Count { count } if self.cursor == 4 => {
+                                    format!("◂ {count} ▸")
+                                }
+                                GoalSkepticsPolicy::Count { count } => count.to_string(),
+                            }
+                        ),
+                    ),
+                ));
+                let enabled = self_verify
+                    .iter()
+                    .filter(|surface| !surface.is_off())
+                    .count();
+                lines.push((
+                    Some(5),
+                    opt_line(
+                        5,
+                        self.cursor,
+                        &format!("Self-verify: {enabled} of 3 surfaces ›"),
+                    ),
+                ));
+                if self.editing_root() {
+                    lines.push((
+                        Some(6),
+                        opt_line(
+                            6,
+                            self.cursor,
+                            &format!(
+                                "Make default agent: [ {} ]",
+                                on_off(self.draft.make_default)
+                            ),
+                        ),
+                    ));
+                }
+                lines.push((None, Line::default()));
+                for detail in optimization_detail_lines(self.cursor) {
+                    lines.push((None, Line::from(Span::styled(*detail, muted))));
+                }
+            }
+            Phase::SelfVerify => {
+                let default_route_index = self
+                    .current_child()
+                    .map(|child| child.default_route_index)
+                    .unwrap_or(self.draft.default_route_index);
+                for (index, surface) in self.current_self_verification().iter().enumerate() {
+                    let value = surface_verification_summary(surface, default_route_index);
+                    lines.push((
+                        Some(index),
+                        self_verify_line(index, self.cursor, surface.surface.label(), &value),
+                    ));
+                }
+                let surface = &self.current_self_verification()[self.cursor.min(2)];
+                let detail = if surface.is_off() {
+                    "This surface is off. Use ←/→ to add the same model cheaply, or space to choose other verifiers."
+                } else {
+                    "←/→ changes the same-model copies; space opens the verifier panel for other models and copy steppers."
+                };
+                lines.push((None, Line::default()));
+                lines.push((None, Line::from(Span::styled(detail, muted))));
+            }
+            Phase::VerifierPanel(surface_index) => {
+                let surface = self.current_self_verification().get(surface_index);
+                for row in 0..self.projection.policy.routes.len() {
+                    let Some(route_index) = self.verifier_route_index(row) else {
+                        continue;
+                    };
+                    let route = &self.projection.policy.routes[route_index];
+                    let copies = surface
+                        .and_then(|entry| entry.copies.get(route_index))
+                        .copied()
+                        .unwrap_or(0);
+                    lines.push((
+                        Some(row),
+                        verifier_panel_line(
+                            row,
+                            self.cursor,
+                            if row == 0 {
+                                "Same model".into()
+                            } else {
+                                format!("{}/{}", route.provider_id, route.model_id)
+                            },
+                            copies,
+                            row == 0,
+                        ),
+                    ));
+                }
             }
             Phase::ToolTiers | Phase::SubagentEdit(SubagentPhase::ToolTiers) => {
                 let tiers = if let Some(child) = self.current_child() {
@@ -2070,10 +2519,12 @@ impl AgentAuthoringScreen {
                 } else {
                     &self.draft.tool_tiers
                 };
-                let catalog = tool_surface_catalog();
                 let mut previous = None;
-                for (logical, index) in tool_presentation_order().into_iter().enumerate() {
-                    let item = &catalog[index];
+                for (logical, index) in tool_presentation_order(&self.tool_catalog)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let item = &self.tool_catalog[index];
                     let group = tool_section(item);
                     if previous != Some(group) {
                         lines.push((
@@ -2205,6 +2656,47 @@ impl AgentAuthoringScreen {
                             on_off(review.interactive_subagents)
                         )),
                     ));
+                    lines.push((
+                        None,
+                        Line::from(format!("Auto-prune  {}", on_off(review.auto_prune))),
+                    ));
+                    lines.push((
+                        None,
+                        Line::from(format!(
+                            "Max subagent recursion  {}",
+                            review.max_subagent_recursion
+                        )),
+                    ));
+                    lines.push((
+                        None,
+                        Line::from(format!("Tool steering  {}", review.tool_steering)),
+                    ));
+                    for surface in &review.verification_surfaces {
+                        let copies = surface
+                            .adjudicators
+                            .iter()
+                            .map(|adjudicator| {
+                                format!(
+                                    "{}/{} ×{}",
+                                    adjudicator.provider_id,
+                                    adjudicator.model_id,
+                                    adjudicator.copies
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let mut value = if copies.is_empty() {
+                            "off".to_string()
+                        } else {
+                            copies.join(", ")
+                        };
+                        if let Some(note) = &surface.enforcement_note {
+                            value.push_str(&format!(" ({note})"));
+                        }
+                        lines.push((
+                            None,
+                            Line::from(format!("Self-verify {}  {value}", surface.surface)),
+                        ));
+                    }
                     for child in &review.children {
                         for line in review_child_lines(child, 1) {
                             lines.push((None, line));
@@ -2298,8 +2790,154 @@ fn opt_line(index: usize, cursor: usize, label: &str) -> Line<'static> {
     ))
 }
 
+fn self_verify_line(index: usize, cursor: usize, label: &str, value: &str) -> Line<'static> {
+    let focused = index == cursor;
+    let value = if focused {
+        format!("◂ {value} ▸")
+    } else {
+        value.to_string()
+    };
+    let value_style = if value.contains("off") {
+        Style::default().fg(theme::FOG)
+    } else {
+        Style::default().fg(theme::GOOD)
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{} {}", if focused { "▸" } else { " " }, label),
+            if focused {
+                Style::default()
+                    .fg(theme::BRASS)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::INK)
+            },
+        ),
+        Span::raw(": "),
+        Span::styled(value, value_style),
+        Span::styled("  ›", Style::default().fg(theme::FOG)),
+    ])
+}
+
+fn verifier_panel_line(
+    index: usize,
+    cursor: usize,
+    label: String,
+    copies: u8,
+    same_model: bool,
+) -> Line<'static> {
+    let focused = index == cursor;
+    let button_style = if focused {
+        Style::default().fg(theme::BRASS)
+    } else {
+        Style::default().fg(theme::FOG)
+    };
+    let count = if copies == 0 {
+        Span::styled(" · ", Style::default().fg(theme::DISABLED))
+    } else {
+        Span::styled(format!("×{copies} "), Style::default().fg(theme::GOOD))
+    };
+    let label_style = if focused {
+        Style::default()
+            .fg(theme::BRASS)
+            .add_modifier(Modifier::BOLD)
+    } else if copies == 0 {
+        Style::default().fg(theme::FOG)
+    } else {
+        Style::default().fg(theme::INK)
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!("{} ", if focused { "▸" } else { " " }),
+            Style::default().fg(theme::BRASS),
+        ),
+        Span::styled("[−]", button_style),
+        Span::raw(" "),
+        count,
+        Span::styled("[+]", button_style),
+        Span::raw("  "),
+        Span::styled(label, label_style),
+    ];
+    if same_model {
+        spans.push(Span::styled(
+            "  reuses cache",
+            Style::default().fg(theme::GOOD),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn optimization_detail_lines(index: usize) -> &'static [&'static str] {
+    match index {
+        0 => &[
+            "Auto-prune losslessly drops duplicate context before it forces a summary.",
+            "It starts off because some frontier-model caches are more valuable than the",
+            "reclaimed context.",
+        ],
+        1 => &[
+            "Interactive subagents take the foreground, then hand control back.",
+            "They do not consume the recursion depth below.",
+        ],
+        2 => &[
+            "How many levels of non-interactive subagents may delegate again.",
+            "Zero lets only this agent delegate.",
+        ],
+        3 => &[
+            "Terse tool and MCP descriptions save tokens and keep caches stable;",
+            "verbose descriptions can help smaller models.",
+        ],
+        4 => &[
+            "Before completion, skeptics independently try to refute the goal.",
+            "Zero turns that gate off.",
+        ],
+        5 => &[
+            "Re-check risky actions before they land.",
+            "Configure writes, commands, and Monty independently.",
+        ],
+        6 => &["Use this agent for new sessions by default."],
+        _ => &[],
+    }
+}
+
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
+}
+
+fn surface_verification_summary(
+    surface: &SurfaceVerificationDraft,
+    default_route_index: usize,
+) -> String {
+    if surface.is_off() {
+        return "off".to_string();
+    }
+    let mut parts = Vec::new();
+    let same_copies = surface
+        .copies
+        .get(default_route_index)
+        .copied()
+        .unwrap_or(0);
+    if same_copies > 0 {
+        parts.push(format!("same model ×{same_copies}"));
+    }
+    let other_copies = surface
+        .copies
+        .iter()
+        .enumerate()
+        .filter(|(index, copies)| *index != default_route_index && **copies > 0)
+        .collect::<Vec<_>>();
+    if !other_copies.is_empty() {
+        let copies = other_copies
+            .iter()
+            .map(|(_, copies)| u32::from(**copies))
+            .sum::<u32>();
+        let models = other_copies.len();
+        parts.push(format!(
+            "{models} other {}, {copies} {}",
+            if models == 1 { "model" } else { "models" },
+            if copies == 1 { "copy" } else { "copies" }
+        ));
+    }
+    parts.join(" + ")
 }
 
 const REQUIRED_TOOL_SECTION: u8 = 0;
@@ -2335,8 +2973,7 @@ fn tool_display_name(name: &str) -> &str {
     if name == "bash" { "shell" } else { name }
 }
 
-fn tool_presentation_order() -> Vec<usize> {
-    let catalog = tool_surface_catalog();
+fn tool_presentation_order(catalog: &[ToolSurfaceItem]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..catalog.len()).collect();
     order.sort_by_key(|index| (tool_section(&catalog[*index]), *index));
     order
@@ -2423,7 +3060,20 @@ pub(crate) fn golden_sample_review() -> AuthoredAgentReview {
         tool_tier_preferences: vec![("read".into(), "enabled".into())],
         verification_label: Some("Self-verification (1 rules)".into()),
         interactive_subagents: true,
+        auto_prune: false,
+        max_subagent_recursion: 2,
+        tool_steering: "terse".into(),
         goal_skeptics_label: "2 goal skeptics".into(),
+        verification_surfaces: vec![cockpit_proto::AuthoredAgentReviewVerificationSurface {
+            surface: "Writes & edits".into(),
+            adjudicators: vec![cockpit_proto::AuthoredAgentReviewAdjudicator {
+                provider_id: "vendor".into(),
+                model_id: "exact-a".into(),
+                copies: 1,
+                is_default_model: true,
+            }],
+            enforcement_note: None,
+        }],
         children: vec![],
         sidecars: vec![],
         source: "catalog/frontier@rev".into(),
@@ -2507,8 +3157,11 @@ fn initialize_child_tool_tiers(child: &mut ChildAuthoringDraft) {
     }
 }
 
-fn cycle_tool_tier_at(tiers: &mut std::collections::BTreeMap<String, ToolTier>, index: usize) {
-    let catalog = tool_surface_catalog();
+fn cycle_tool_tier_at(
+    tiers: &mut std::collections::BTreeMap<String, ToolTier>,
+    catalog: &[ToolSurfaceItem],
+    index: usize,
+) {
     if let Some(item) = catalog.get(index) {
         let current = tiers.get(item.name).copied().unwrap_or(ToolTier::Disabled);
         let legal = item.tiers;
@@ -2547,9 +3200,37 @@ fn review_child_lines(child: &AuthoredAgentReviewChild, indent: usize) -> Vec<Li
         }
     )));
     lines.push(Line::from(format!(
+        "{prefix}  auto-prune: {}",
+        on_off(child.auto_prune)
+    )));
+    lines.push(Line::from(format!(
+        "{prefix}  max subagent recursion: {}",
+        child.max_subagent_recursion
+    )));
+    lines.push(Line::from(format!(
+        "{prefix}  tool steering: {}",
+        child.tool_steering
+    )));
+    lines.push(Line::from(format!(
         "{prefix}  goal skeptics: {}",
         child.goal_skeptics_label
     )));
+    for surface in &child.verification_surfaces {
+        let copies = surface
+            .adjudicators
+            .iter()
+            .map(|adjudicator| u32::from(adjudicator.copies))
+            .sum::<u32>();
+        lines.push(Line::from(format!(
+            "{prefix}  self-verify {}: {}",
+            surface.surface,
+            if copies == 0 {
+                "off".to_string()
+            } else {
+                format!("{copies} copies")
+            }
+        )));
+    }
     if !child.children.is_empty() {
         lines.push(Line::from(format!("{prefix}  delegation children:")));
         for nested in &child.children {

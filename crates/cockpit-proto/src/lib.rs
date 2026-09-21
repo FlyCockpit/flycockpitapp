@@ -56,7 +56,8 @@ pub use agent_authoring::{
     ApplyAuthoredAgentPackageReceipt, ApplyAuthoredAgentPackageRequest, AuthoredAgentChild,
     AuthoredAgentOnboardingCorrelation, AuthoredAgentPackageDraft,
     AuthoredAgentPackageReceiptQuery, AuthoredAgentReceiptStatus, AuthoredAgentRejectReason,
-    AuthoredAgentReview, AuthoredAgentReviewChild, AuthoredAgentReviewGrant, AuthoredAgentSource,
+    AuthoredAgentReview, AuthoredAgentReviewAdjudicator, AuthoredAgentReviewChild,
+    AuthoredAgentReviewGrant, AuthoredAgentReviewVerificationSurface, AuthoredAgentSource,
     AuthoredSidecarDeclaration, ModelTrustConfirmation,
 };
 pub use agent_installation::{

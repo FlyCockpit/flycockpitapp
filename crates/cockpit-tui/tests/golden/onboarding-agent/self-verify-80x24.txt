@@ -1,15 +1,15 @@
-╭ Optimizations ───────────────────────────────────────────────────────────────╮
-│ ▸ Auto-prune: [ off ]                                                        │
-│   Interactive subagents: [ on ]                                              │
-│   Max subagent recursion: 2                                                  │
-│   Tool steering: terse                                                       │
-│   Goal-completion skeptics: 2                                                │
-│   Self-verify: 1 of 3 surfaces ›                                             │
-│   Make default agent: [ on ]                                                 │
+╭ Self-verify ─────────────────────────────────────────────────────────────────╮
+│ ▸ Writes & edits: ◂ same model ×1 ▸  ›                                       │
+│   Commands: off  ›                                                           │
+│   Monty: off  ›                                                              │
 │                                                                              │
-│ Auto-prune losslessly drops duplicate context before it forces a summary.    │
-│ It starts off because some frontier-model caches are more valuable than the  │
-│ reclaimed context.                                                           │
+│ ←/→ changes the same-model copies; space opens the verifier panel for other  │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
 │                                                                              │
 │                                                                              │
 │                                                                              │

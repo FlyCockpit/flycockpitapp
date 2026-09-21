@@ -1,12 +1,11 @@
-//! ArtifactWrite verification: policy resolution, candidate generation, and
-//! gate/revise application for `write`/`edit` (and granted plan variants).
+//! Risky-action verification: policy resolution, candidate generation, and
+//! gate/revise application for writes, commands, and Monty dispatch.
 //!
 //! ToolClass is not yet a declared field on standard tool definitions. The
-//! classifier in [`classify`] is therefore hardcoded: `write`/`edit` (and
-//! plan variants when those tools are granted) map to
-//! [`crate::agents::ToolClass::ArtifactWrite`]. Everything else is
-//! unclassified and cannot match a verification rule. A future change should
-//! make `ToolClass` a declared field on standard tool definitions.
+//! classifier in [`classify`] is therefore hardcoded for these three surfaces.
+//! Everything else is unclassified and cannot match a verification rule. A
+//! future change should make `ToolClass` a declared field on standard tool
+//! definitions.
 
 pub(crate) mod adjudicate;
 pub(crate) mod budget;

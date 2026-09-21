@@ -72,11 +72,12 @@ pub use vnext::{
     ModelTrustSuggestion, OnAdjudicationFailure, OnBudgetExceeded, PROFILE_CLEAN_ROOM,
     PROFILE_PANEL, PROFILE_SELF_CHECK, PreparedPrimarySlotRoute, ProhibitedQuestionClass,
     ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder, SCHEMA_VERSION, SELF_CHILD_REF,
-    SelectorPredicate, SlotModelRef, ToolClass, VerificationAction, VerificationBudget,
-    VerificationCandidateDispatch, VerificationDispatch, VerificationEstimate, VerificationMode,
-    VerificationPolicy, VerificationRecipe, VerificationRule, VerificationSelector,
-    VerificationSessionReduction, VerificationSubject, VerificationToolCategory, VnextAgentDef,
-    VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
+    SelectorPredicate, SlotModelRef, ToolClass, VerificationAction, VerificationAdjudicator,
+    VerificationBudget, VerificationCandidateDispatch, VerificationDispatch, VerificationEstimate,
+    VerificationMode, VerificationPolicy, VerificationRecipe, VerificationRule,
+    VerificationSelector, VerificationSessionReduction, VerificationSubject,
+    VerificationToolCategory, VnextAgentDef, VnextHostPolicy, delegation_kind_permitted,
+    resolve_question_policy,
 };
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
@@ -107,13 +108,15 @@ pub(crate) fn package_child_grant_scope(parent_scope: &str, child_name: &str) ->
     }
 }
 
-/// Unified per-agent capabilities. The four issue-#75 tool-posture grants and
-/// the computer-use declaration share one closed set; host policy still
+/// Unified per-agent capabilities. Tool-posture grants, context auto-pruning,
+/// and the computer-use declaration share one closed set; host policy still
 /// decides whether a declared capability is executable. Wire names are the
 /// camelCase spellings below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentCapability {
+    /// Permit lossless duplicate-context pruning before compaction.
+    AutoPrune,
     ComputerUse,
     FollowupSeed,
     SandboxEscalate,
@@ -128,6 +131,7 @@ pub enum AgentCapability {
 impl AgentCapability {
     pub fn from_wire(name: &str) -> Option<Self> {
         match name {
+            "autoPrune" => Some(Self::AutoPrune),
             "computerUse" => Some(Self::ComputerUse),
             "followupSeed" => Some(Self::FollowupSeed),
             "sandboxEscalate" => Some(Self::SandboxEscalate),
@@ -140,6 +144,7 @@ impl AgentCapability {
 
     pub fn wire_name(self) -> &'static str {
         match self {
+            Self::AutoPrune => "autoPrune",
             Self::ComputerUse => "computerUse",
             Self::FollowupSeed => "followupSeed",
             Self::SandboxEscalate => "sandboxEscalate",
@@ -264,7 +269,8 @@ impl PostureResolution {
                         .filter(|capability| {
                             !matches!(
                                 capability,
-                                AgentCapability::ComputerUse
+                                AgentCapability::AutoPrune
+                                    | AgentCapability::ComputerUse
                                     | AgentCapability::SealedAcquisitionCapture
                             )
                         })

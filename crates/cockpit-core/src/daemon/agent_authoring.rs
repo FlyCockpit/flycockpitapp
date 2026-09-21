@@ -396,9 +396,13 @@ fn empty_review(agent_name: &str) -> AuthoredAgentReview {
         tool_tier_preferences: Vec::new(),
         verification_label: None,
         interactive_subagents: false,
+        auto_prune: false,
+        max_subagent_recursion: 0,
+        tool_steering: "terse".into(),
         goal_skeptics_label: crate::agents::GoalSkepticsPolicy::Off
             .review_label()
             .to_string(),
+        verification_surfaces: Vec::new(),
         children: Vec::new(),
         sidecars: Vec::new(),
         source: String::new(),
@@ -717,9 +721,13 @@ fn unknown_receipt(
             tool_tier_preferences: Vec::new(),
             verification_label: None,
             interactive_subagents: false,
+            auto_prune: false,
+            max_subagent_recursion: 0,
+            tool_steering: "terse".into(),
             goal_skeptics_label: crate::agents::GoalSkepticsPolicy::Off
                 .review_label()
                 .to_string(),
+            verification_surfaces: Vec::new(),
             children: Vec::new(),
             sidecars: Vec::new(),
             source: String::new(),

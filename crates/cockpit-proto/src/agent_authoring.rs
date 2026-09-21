@@ -218,8 +218,32 @@ pub struct AuthoredAgentReviewChild {
     pub grants: Vec<AuthoredAgentReviewGrant>,
     pub tool_tier_preferences: Vec<(String, String)>,
     pub interactive_subagents: bool,
+    #[serde(default)]
+    pub auto_prune: bool,
+    #[serde(default)]
+    pub max_subagent_recursion: u8,
+    #[serde(default = "default_review_tool_steering")]
+    pub tool_steering: String,
     pub goal_skeptics_label: String,
+    #[serde(default)]
+    pub verification_surfaces: Vec<AuthoredAgentReviewVerificationSurface>,
     pub children: Vec<AuthoredAgentReviewChild>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoredAgentReviewAdjudicator {
+    pub provider_id: String,
+    pub model_id: String,
+    pub copies: u8,
+    pub is_default_model: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoredAgentReviewVerificationSurface {
+    pub surface: String,
+    pub adjudicators: Vec<AuthoredAgentReviewAdjudicator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforcement_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,7 +254,15 @@ pub struct AuthoredAgentReview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_label: Option<String>,
     pub interactive_subagents: bool,
+    #[serde(default)]
+    pub auto_prune: bool,
+    #[serde(default)]
+    pub max_subagent_recursion: u8,
+    #[serde(default = "default_review_tool_steering")]
+    pub tool_steering: String,
     pub goal_skeptics_label: String,
+    #[serde(default)]
+    pub verification_surfaces: Vec<AuthoredAgentReviewVerificationSurface>,
     pub children: Vec<AuthoredAgentReviewChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<String>,
@@ -238,6 +270,10 @@ pub struct AuthoredAgentReview {
     pub make_default: bool,
     pub trust_is_shared: bool,
     pub trust_disclosure: String,
+}
+
+fn default_review_tool_steering() -> String {
+    "terse".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

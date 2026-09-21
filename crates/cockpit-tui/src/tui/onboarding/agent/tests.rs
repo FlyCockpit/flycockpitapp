@@ -745,6 +745,50 @@ fn trust_first_mouse_click_renders_selected_radio() {
 }
 
 #[test]
+fn settlement_trust_first_mouse_click_renders_selected_radio() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("settlement-radio"), "op".into());
+
+    screen.phase = Phase::ThirdPartyTrust;
+    render_buffer(&mut screen, 120, 40);
+    let publisher_trust = screen.list_row_rects[0];
+    assert!(screen.handle_mouse(click_at(Position::new(
+        publisher_trust.x,
+        publisher_trust.y,
+    ))));
+    assert!(!screen.draft.third_party_trust_confirmed);
+    assert!(render_string(&mut screen, 120, 40).contains('◉'));
+    assert!(screen.handle_mouse(click_at(Position::new(
+        publisher_trust.x,
+        publisher_trust.y,
+    ))));
+    assert!(screen.draft.third_party_trust_confirmed);
+
+    screen.phase = Phase::SidecarEgress;
+    screen.draft.sidecar_route_index = Some(0);
+    screen.mouse_selected = None;
+    render_buffer(&mut screen, 120, 40);
+    let sidecar_egress = screen.list_row_rects[0];
+    assert!(screen.handle_mouse(click_at(Position::new(sidecar_egress.x, sidecar_egress.y,))));
+    assert!(!screen.draft.sidecar_egress_confirmed);
+    assert!(render_string(&mut screen, 120, 40).contains('◉'));
+    assert!(screen.handle_mouse(click_at(Position::new(sidecar_egress.x, sidecar_egress.y,))));
+    assert!(screen.draft.sidecar_egress_confirmed);
+}
+
+#[test]
+fn runner_keeps_the_safe_default_route_and_lists_its_actual_trust() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("runner-route"), "op".into());
+    let runner = &screen.draft.children[0];
+    assert!(runner.route_grants[0].enabled);
+    assert!(!runner.route_grants[1].enabled);
+    assert_eq!(runner.default_route_index, 0);
+
+    screen.phase = Phase::SubagentsList;
+    let rendered = render_string(&mut screen, 120, 40);
+    assert!(rendered.contains("runner  ·  unset"), "{rendered}");
+}
+
+#[test]
 fn enter_on_subagents_list_requests_preview_even_with_runner_focused() {
     let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "enter-op".into());
     advance_to_subagents(&mut screen);
@@ -826,6 +870,17 @@ fn golden_screen(phase: Phase) -> AgentAuthoringScreen {
     let mut screen = AgentAuthoringScreen::new(sample_projection("golden-rev"), "golden-op".into());
     if let Phase::SubagentEdit(subphase) = phase {
         screen.begin_edit_subagent(0);
+        let child = screen
+            .editing_child
+            .as_mut()
+            .expect("golden subagent phase must edit the seeded runner");
+        child.trust_confirmations[0] = false;
+        let child = screen
+            .editing_child
+            .as_ref()
+            .expect("golden subagent phase must edit the seeded runner");
+        assert!(child.route_grants[0].enabled);
+        assert!(!child.trust_confirmations[0]);
         screen.phase = Phase::SubagentEdit(subphase);
     } else {
         screen.phase = phase;
@@ -889,6 +944,13 @@ fn golden_agent_authoring_all_twenty_states() {
     assert_eq!(states.len(), 20);
     for (name, phase) in states {
         let mut screen = golden_screen(phase);
+        if phase == Phase::SubagentEdit(SubagentPhase::ModelTrust) {
+            let rendered = render_string(&mut screen, 120, 40);
+            assert!(
+                rendered.contains("Confirm vendor/exact-a as unset") && rendered.contains('○'),
+                "nested trust golden must include a confirmable runner route: {rendered}"
+            );
+        }
         crate::tui::golden::assert_golden_sizes("onboarding-agent", name, |width, height| {
             render_buffer(&mut screen, width, height)
         });

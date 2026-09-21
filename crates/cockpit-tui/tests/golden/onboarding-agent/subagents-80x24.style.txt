@@ -1,7 +1,7 @@
 # style runs: count:fg/bg/mod  (mod is - or BOLD+DIM+…)
 80x24
 0	1:Rgb(74,90,106)/Reset/- 17:Rgb(244,239,230)/Reset/- 62:Rgb(74,90,106)/Reset/-
-1	1:Rgb(74,90,106)/Reset/- 1:Reset/Reset/- 22:Rgb(224,177,86)/Reset/BOLD 55:Reset/Reset/- 1:Rgb(74,90,106)/Reset/-
+1	1:Rgb(74,90,106)/Reset/- 1:Reset/Reset/- 18:Rgb(224,177,86)/Reset/BOLD 59:Reset/Reset/- 1:Rgb(74,90,106)/Reset/-
 2	1:Rgb(74,90,106)/Reset/- 78:Reset/Reset/- 1:Rgb(74,90,106)/Reset/-
 3	1:Rgb(74,90,106)/Reset/- 78:Reset/Reset/- 1:Rgb(74,90,106)/Reset/-
 4	1:Rgb(74,90,106)/Reset/- 78:Reset/Reset/- 1:Rgb(74,90,106)/Reset/-

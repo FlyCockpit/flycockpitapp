@@ -1861,10 +1861,12 @@ impl AgentAuthoringScreen {
                 return lines;
             }
             Phase::ThirdPartyTrust => {
+                let marked =
+                    self.draft.third_party_trust_confirmed || self.mouse_selected == Some(0);
                 lines.push((
                     Some(0),
                     Line::from(vec![
-                        ui::radio_mark(self.draft.third_party_trust_confirmed, true),
+                        ui::radio_mark(marked, true),
                         Span::styled("I trust this publisher and pinned source", selected),
                     ]),
                 ));
@@ -1887,10 +1889,11 @@ impl AgentAuthoringScreen {
                         )),
                     ));
                 }
+                let marked = self.draft.sidecar_egress_confirmed || self.mouse_selected == Some(0);
                 lines.push((
                     Some(0),
                     Line::from(vec![
-                        ui::radio_mark(self.draft.sidecar_egress_confirmed, true),
+                        ui::radio_mark(marked, true),
                         Span::styled("Allow remote sidecar egress", selected),
                     ]),
                 ));
@@ -2128,7 +2131,15 @@ impl AgentAuthoringScreen {
                 for (index, child) in self.draft.children.iter().enumerate() {
                     lines.push((
                         Some(index),
-                        opt_line(index, self.cursor, &format!("{}  ·  untrusted", child.name)),
+                        opt_line(
+                            index,
+                            self.cursor,
+                            &format!(
+                                "{}  ·  {}",
+                                child.name,
+                                child_trust_label(child, &self.projection)
+                            ),
+                        ),
                     ));
                 }
                 lines.push((
@@ -2448,19 +2459,45 @@ fn initialize_tool_tiers(tiers: &mut std::collections::BTreeMap<String, ToolTier
 fn prepared_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthoringDraft {
     let mut child = default_child_draft(projection);
     initialize_tool_tiers(&mut child.tool_tiers);
-    if let Some(index) = projection
-        .policy
-        .routes
-        .iter()
-        .position(|route| !route.confirmation_required)
+    let default_route_is_safe = child
+        .route_grants
+        .get(child.default_route_index)
+        .is_some_and(|grant| grant.enabled)
+        && projection
+            .policy
+            .routes
+            .get(child.default_route_index)
+            .is_some_and(|route| {
+                route.trust != cockpit_proto::AgentPolicyTrustClassification::Trusted
+            });
+    if default_route_is_safe
+        && let Some(confirmation) = child.trust_confirmations.get_mut(child.default_route_index)
     {
-        for grant in &mut child.route_grants {
-            grant.enabled = false;
-        }
-        child.route_grants[index].enabled = true;
-        child.default_route_index = index;
+        // The suggested runner is intentionally safe-by-default. A trusted
+        // default route still requires an explicit nested trust confirmation.
+        *confirmation = true;
     }
     child
+}
+
+fn child_trust_label(
+    child: &ChildAuthoringDraft,
+    projection: &AgentAuthoringProjection,
+) -> &'static str {
+    let default_grant = child
+        .route_grants
+        .get(child.default_route_index)
+        .zip(projection.policy.routes.get(child.default_route_index))
+        .filter(|(grant, _)| grant.enabled);
+    let enabled_grant = child
+        .route_grants
+        .iter()
+        .zip(&projection.policy.routes)
+        .find(|(grant, _)| grant.enabled);
+    default_grant
+        .or(enabled_grant)
+        .map(|(_, route)| trust_label(route.trust))
+        .unwrap_or("no model")
 }
 
 fn initialize_child_tool_tiers(child: &mut ChildAuthoringDraft) {

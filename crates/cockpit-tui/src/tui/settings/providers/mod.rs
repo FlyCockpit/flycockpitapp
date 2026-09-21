@@ -3711,6 +3711,19 @@ impl SettingsCx {
                 ) {
                     frame.set_cursor_position(caret);
                 }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Providers(
+                                super::pointer_actions::ProvidersAction::EditOAuthCallback(
+                                    s.flow_id,
+                                ),
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
             }
         }
         if let Some(links) = links {
@@ -4094,6 +4107,19 @@ impl SettingsCx {
             ) {
                 frame.set_cursor_position(caret);
             }
+            self.pointer_surface
+                .register(super::shell::SettingsPointerTarget {
+                    rect,
+                    action: super::shell::SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Providers(
+                            super::pointer_actions::ProvidersAction::EditOAuthCallback(
+                                state.flow_id,
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
         }
         for (line, title, field, focused, placeholder) in fields {
             let y = area.y.saturating_add(line.saturating_sub(offset) as u16);
@@ -4103,7 +4129,7 @@ impl SettingsCx {
             let rect = Rect::new(
                 area.x,
                 y,
-                area.width,
+                crate::tui::chrome::scrollbar_content(area).width,
                 3.min(area.bottom().saturating_sub(y)),
             );
             if let Some(caret) =
@@ -4386,7 +4412,7 @@ impl SettingsCx {
                 let rect = Rect::new(
                     area.x,
                     y,
-                    area.width,
+                    crate::tui::chrome::scrollbar_content(area).width,
                     3.min(area.bottom().saturating_sub(y)),
                 );
                 if let Some(caret) = crate::tui::chrome::render_field(
@@ -4399,6 +4425,20 @@ impl SettingsCx {
                 ) {
                     frame.set_cursor_position(caret);
                 }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Providers(
+                                super::pointer_actions::ProvidersAction::EditField(
+                                    super::pointer_actions::ProviderId(s.provider_id.clone()),
+                                    EditField::Url,
+                                ),
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
             }
         }
     }
@@ -6496,6 +6536,79 @@ impl SettingsPage for ProvidersPage {
             return Nav::Stay;
         };
         if let (
+            ProvidersPage::Edit(state),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::EditField(provider_id, field),
+            ),
+        ) = (&mut *self, &action)
+            && state.provider_id == provider_id.0
+            && state.editing_field == Some(*field)
+        {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            state
+                .field_buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::OAuthSetup { state, .. },
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::EditOAuthCallback(flow_id),
+            ),
+        ) = (&mut *self, &action)
+            && state.paste_focused
+            && state.flow_id == *flow_id
+        {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            state
+                .manual_input
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::Add(state),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::EditOAuthCallback(flow_id),
+            ),
+        ) = (&mut *self, &action)
+            && let Some(oauth) = state.oauth_auth.as_mut()
+            && oauth.paste_focused
+            && oauth.flow_id == *flow_id
+        {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            oauth
+                .manual_input
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        if let (
             ProvidersPage::ModelSettings { editor, .. }
             | ProvidersPage::ProviderSettings { editor, .. },
             super::pointer_actions::SettingsPointerAction::Providers(
@@ -6506,18 +6619,16 @@ impl SettingsPage for ProvidersPage {
         ) = (&mut *self, &action)
             && editor.editing.is_some_and(|field| field == *id)
         {
-            let label_width = editor
-                .fields()
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
                 .iter()
-                .map(|field| field.label().chars().count())
-                .max()
-                .unwrap_or(0) as u16;
-            let value_x = cx.pointer_surface.area.get().map_or(0, |area| {
-                area.x
-                    .saturating_add(2)
-                    .saturating_add(label_width)
-                    .saturating_add(2)
-            });
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
             editor
                 .buf
                 .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));

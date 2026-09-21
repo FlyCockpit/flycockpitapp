@@ -15,9 +15,9 @@
 12	30:Reset/Indexed(235)/- 2:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 2:Reset/Reset/- 15:Indexed(255)/Reset/- 67:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
 13	30:Reset/Indexed(235)/- 2:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 2:Reset/Reset/- 15:Indexed(255)/Reset/- 67:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
 14	30:Reset/Indexed(235)/- 2:Rgb(138,155,176)/Reset/- 1:Indexed(179)/Reset/- 84:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
-15	30:Reset/Indexed(235)/- 2:Reset/Reset/- 86:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
-16	30:Reset/Indexed(235)/- 2:Reset/Reset/- 2:Indexed(179)/Reset/- 1:Reset/Reset/- 32:Indexed(255)/Reset/- 49:Reset/Reset/- 2:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
-17	30:Reset/Indexed(235)/- 2:Rgb(244,239,230)/Reset/- 86:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
+15	30:Reset/Indexed(235)/- 2:Reset/Reset/- 84:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
+16	30:Reset/Indexed(235)/- 2:Reset/Reset/- 2:Indexed(179)/Reset/- 1:Reset/Reset/- 32:Indexed(255)/Reset/- 48:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
+17	30:Reset/Indexed(235)/- 2:Rgb(244,239,230)/Reset/- 84:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
 18	30:Reset/Indexed(235)/- 2:Reset/Reset/- 1:Indexed(179)/Reset/- 84:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
 19	30:Reset/Indexed(235)/- 2:Reset/Reset/- 1:Indexed(179)/Reset/- 83:Indexed(109)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-
 20	30:Reset/Indexed(235)/- 2:Reset/Reset/- 1:Indexed(179)/Reset/- 84:Reset/Reset/- 1:Indexed(179)/Reset/- 1:Reset/Reset/- 1:Indexed(179)/Reset/-

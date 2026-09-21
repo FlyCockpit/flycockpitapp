@@ -5069,9 +5069,32 @@ fn provider_settings_numeric_edit_render_places_caret_at_textfield_cursor() {
         parent: Box::new(providers::EditState::new("p".to_string(), entry)),
     }));
 
-    let rows = render_settings_rows(&d, 100, 30).join("\n");
-
-    assert!(rows.contains("12 34"), "{rows}");
+    let width = 100;
+    let height = 30;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut links = crate::tui::links::LinkRegistry::default();
+    terminal
+        .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
+        .expect("draw");
+    let rendered_rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+    let rendered = rendered_rows.join("\n");
+    assert!(
+        rendered.contains("1234"),
+        "field value should be painted: {rendered}"
+    );
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert!(
+        rendered_rows[usize::from(cursor.y)].contains("1234"),
+        "field value should be painted on the caret row"
+    );
+    assert_eq!(cursor, Position::new(5, cursor.y));
 }
 
 #[test]
@@ -7419,13 +7442,32 @@ fn lsp_edit_row_places_caret_at_textfield_cursor() {
     p.buf.handle_key(press(KeyCode::Home));
     p.buf.handle_key(press(KeyCode::Right));
     p.buf.handle_key(press(KeyCode::Right));
-    let TestPageRef::Lsp(p) = d.test_page() else {
-        panic!("expected LSP page")
-    };
-    let (rows, selected_line) = lsp_rows(&d, p);
-
-    assert_eq!(selected_line, row_index(LspRow::DebounceMs) + 1);
-    assert!(line_text(&rows[selected_line]).contains("12\u{E000}34"));
+    let width = 100;
+    let height = 30;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut links = crate::tui::links::LinkRegistry::default();
+    terminal
+        .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
+        .expect("draw");
+    let rendered_rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+    let rendered = rendered_rows.join("\n");
+    assert!(
+        rendered.contains("1234"),
+        "field value should be painted: {rendered}"
+    );
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert!(
+        rendered_rows[usize::from(cursor.y)].contains("1234"),
+        "field value should be painted on the caret row"
+    );
+    assert_eq!(cursor, Position::new(5, cursor.y));
 }
 
 #[test]
@@ -7636,6 +7678,65 @@ fn harnesses_page_opens_and_seeds_presets() {
             "missing seeded preset `{name}`"
         );
     }
+}
+
+#[test]
+fn harness_add_name_field_click_repositions_caret_without_saving() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    enter_harnesses_from_root(&mut dialog);
+    dialog.handle_key(press(KeyCode::Char('a')));
+    dialog.paste("abcd");
+    let _ = render_settings_rows(&dialog, 100, 40);
+    let field = dialog
+        .cx
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.rect.height == 3
+                && matches!(
+                    target.action,
+                    shell::SettingsPointerAction::Page(
+                        pointer_actions::SettingsPointerAction::Harnesses(
+                            pointer_actions::HarnessesAction::Add
+                        )
+                    )
+                )
+        })
+        .cloned()
+        .expect("add-name rounded field target");
+    let click_column = field.rect.x.saturating_add(4);
+    let click_row = field.rect.y.saturating_add(1);
+    let _ = dialog.handle_pointer(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: click_column,
+        row: click_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    let _ = dialog.handle_pointer(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: click_column,
+        row: click_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    dialog.handle_key(press(KeyCode::Char('X')));
+
+    assert!(
+        dialog.extended.harnesses.is_empty(),
+        "field click must not save"
+    );
+    let TestPageRef::Harnesses(HarnessesPage::List(state)) = dialog.test_page() else {
+        panic!("add-name field click must keep the Harnesses list open");
+    };
+    assert_eq!(
+        state.adding.as_ref().map(TextField::text),
+        Some("abXcd"),
+        "field click must place the next character at its text coordinate"
+    );
 }
 
 #[test]
@@ -9376,9 +9477,31 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
     d.handle_key(press(KeyCode::Enter)); // key field
     d.paste("fc-secret-value");
 
-    let rendered = tools_page_rendered(&d);
-    assert!(rendered.contains(secret_display::MASKED_VALUE));
-    assert!(!rendered.contains("fc-secret-value"));
+    let width = 100;
+    // The tools inventory is intentionally long; retain every painted row so
+    // this asserts the focused masked field, rather than an unrelated viewport.
+    let height = 200;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut links = crate::tui::links::LinkRegistry::default();
+    terminal
+        .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
+        .expect("draw");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        rendered.contains("•••••••••••••••"),
+        "masked field was not painted: {rendered}"
+    );
+    assert!(
+        !rendered.contains("fc-secret-value"),
+        "plaintext key leaked into frame: {rendered}"
+    );
 
     // Invoke the page reducer directly for the final Enter so the settings
     // test wrapper cannot auto-settle and consume the newly queued effect.

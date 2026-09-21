@@ -1038,6 +1038,14 @@ impl SettingsCx {
             ) {
                 frame.set_cursor_position(caret);
             }
+            if let Some(action) = self.tools_pointer_action(p, p.cursor) {
+                self.pointer_surface.register(shell::SettingsPointerTarget {
+                    rect,
+                    action: shell::SettingsPointerAction::Page(action),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
         }
         for (line, action) in read_only {
             let Some(screen_row) = line.checked_sub(offset) else {
@@ -1262,6 +1270,31 @@ impl SettingsPage for ToolsPage {
         };
         self.cursor = index;
         cx.handle_tools_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        if self.editing.is_some() {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            self.buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, action)
     }
 
     fn handle_pointer_scroll(

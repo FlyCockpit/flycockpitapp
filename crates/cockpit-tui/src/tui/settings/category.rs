@@ -4532,7 +4532,8 @@ impl SettingsPage for CategoryPage {
                 .find(|target| {
                     target.action == super::shell::SettingsPointerAction::Page(action.clone())
                 })
-                .map_or(column, |target| target.rect.x);
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
             editor
                 .buf
                 .set_cursor_display_col(usize::from(column.saturating_sub(field_x)));

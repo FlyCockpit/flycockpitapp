@@ -1269,7 +1269,7 @@ impl SettingsCx {
             let rect = Rect::new(
                 area.x,
                 y,
-                area.width,
+                crate::tui::chrome::scrollbar_content(area).width,
                 3.min(area.bottom().saturating_sub(y)),
             );
             if let Some(caret) =

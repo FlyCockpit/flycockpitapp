@@ -584,6 +584,7 @@ pub(super) enum ProvidersAction {
     RowEditor(ProviderRowEditorAction),
     ModelLifecycle(ModelLifecycleAction),
     CopyOAuth(OAuthFlowId, OAuthCopyKind),
+    EditOAuthCallback(OAuthFlowId),
     CopilotConfirm(ProviderId, ConfirmationChoice),
 }
 
@@ -786,6 +787,7 @@ impl SettingsPointerAction {
                 ProvidersAction::Open(_)
                     | ProvidersAction::EditField(_, _)
                     | ProvidersAction::OAuthOption(_, _)
+                    | ProvidersAction::EditOAuthCallback(_)
                     | ProvidersAction::WizardControl(
                         _,
                         WizardControlId::Template(_)

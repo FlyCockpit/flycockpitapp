@@ -352,6 +352,32 @@ impl SettingsPage for LspPage {
         Nav::Stay
     }
 
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        if let (Some(edit), SettingsPointerAction::Lsp(PointerLspAction::Edit(edit_action))) =
+            (self.editing, &action)
+            && pointer_edit(edit) == *edit_action
+        {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| target.action == shell::SettingsPointerAction::Page(action.clone()))
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            self.buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, action)
+    }
+
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › LSP",
@@ -757,6 +783,14 @@ impl SettingsCx {
                 ) {
                     frame.set_cursor_position(caret);
                 }
+                self.pointer_surface.register(shell::SettingsPointerTarget {
+                    rect,
+                    action: shell::SettingsPointerAction::Page(SettingsPointerAction::Lsp(
+                        PointerLspAction::Edit(pointer_edit(edit)),
+                    )),
+                    enabled: true,
+                    disabled_reason: None,
+                });
             }
         }
         let server_count = row_count.saturating_sub(LSP_SERVER_ROW_START);

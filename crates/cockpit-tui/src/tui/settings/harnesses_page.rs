@@ -948,11 +948,33 @@ impl SettingsPage for HarnessesPage {
                 .borrow()
                 .iter()
                 .find(|target| {
-                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                    target.rect.height == 3
+                        && target.action
+                            == super::shell::SettingsPointerAction::Page(action.clone())
                 })
                 // `render_field`'s text starts after its border and padding.
                 .map_or(column, |target| target.rect.x.saturating_add(2));
             buf.set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
+            return Nav::Stay;
+        }
+        if matches!(harness_action, super::pointer_actions::HarnessesAction::Add)
+            && let HarnessesPage::List(state) = self
+            && let Some(buf) = state.adding.as_mut()
+        {
+            let field_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.rect.height == 3
+                        && target.action
+                            == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field`'s text starts after its border and padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            buf.set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
+            return Nav::Stay;
         }
         self.handle_pointer_control(cx, action)
     }

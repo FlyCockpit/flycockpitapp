@@ -13,9 +13,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
 
 use super::{Nav, PageBox, SettingsCx, SettingsPage, SettingsPointerSurfaceKind};
+use crate::tui::textfield::TextField;
 
 /// The subset of the daemon-owned image spend policy this page renders and
 /// re-opens. The owner-remoted `GetImageSpendPolicy` / `SaveImageSpendPolicy`
@@ -224,9 +224,9 @@ pub(super) fn page(project_key: String, cx: &mut SettingsCx) -> PageBox {
         project_key,
         cursor: 0,
         editing_time_zone: false,
-        time_zone_before_edit: None,
         editing_micros: None,
-        micros_buffer: String::new(),
+        micros_buffer: TextField::default(),
+        time_zone_buffer: TextField::default(),
         draft: ImageSpendSettings::default(),
         saved: ImageSpendSettings::default(),
         version: None,
@@ -267,9 +267,9 @@ fn page_with_persistence(
         project_key,
         cursor: 0,
         editing_time_zone: false,
-        time_zone_before_edit: None,
         editing_micros: None,
-        micros_buffer: String::new(),
+        micros_buffer: TextField::default(),
+        time_zone_buffer: TextField::default(),
         draft: ImageSpendSettings::default(),
         saved: ImageSpendSettings::default(),
         version: None,
@@ -288,9 +288,9 @@ pub(super) struct ImageSpendPage {
     project_key: String,
     cursor: usize,
     editing_time_zone: bool,
-    time_zone_before_edit: Option<String>,
     editing_micros: Option<usize>,
-    micros_buffer: String,
+    micros_buffer: TextField,
+    time_zone_buffer: TextField,
     draft: ImageSpendSettings,
     saved: ImageSpendSettings,
     version: Option<u64>,
@@ -355,15 +355,9 @@ impl ImageSpendPage {
         match code {
             KeyCode::Esc => {
                 self.editing_micros = None;
-                self.micros_buffer.clear();
+                self.micros_buffer = TextField::default();
             }
-            KeyCode::Backspace => {
-                self.micros_buffer.pop();
-            }
-            KeyCode::Char(character) if character.is_ascii_digit() => {
-                self.micros_buffer.push(character);
-            }
-            KeyCode::Enter => match self.micros_buffer.parse::<u64>() {
+            KeyCode::Enter => match self.micros_buffer.text().parse::<u64>() {
                 Ok(value) if value > 0 => {
                     let policy = match scope {
                         0 => &mut self.draft.request,
@@ -372,40 +366,55 @@ impl ImageSpendPage {
                     };
                     *policy = BudgetPolicy::Finite { usd_micros: value };
                     self.editing_micros = None;
-                    self.micros_buffer.clear();
+                    self.micros_buffer = TextField::default();
                     self.status = "Finite micros updated; save to authorize.".into();
                 }
                 _ => self.status = "Enter a positive whole u64 micros value.".into(),
             },
+            KeyCode::Backspace | KeyCode::Char('0'..='9') => {
+                self.micros_buffer
+                    .handle_key(KeyEvent::new(code, crossterm::event::KeyModifiers::NONE));
+            }
             _ => {}
         }
     }
 
     fn edit_time_zone(&mut self, code: KeyCode) {
-        let Some(ProjectEpochPolicy::CalendarMonth { time_zone }) = &mut self.draft.project_epoch
-        else {
+        if !matches!(
+            self.draft.project_epoch,
+            Some(ProjectEpochPolicy::CalendarMonth { .. })
+        ) {
             self.editing_time_zone = false;
             return;
-        };
+        }
         match code {
             KeyCode::Enter => {
-                self.time_zone_before_edit = None;
-                self.editing_time_zone = false;
-            }
-            KeyCode::Esc => {
-                if let Some(previous) = self.time_zone_before_edit.take() {
-                    *time_zone = previous;
+                if let Some(ProjectEpochPolicy::CalendarMonth { time_zone }) =
+                    &mut self.draft.project_epoch
+                {
+                    *time_zone = self.time_zone_buffer.text().to_string();
                 }
                 self.editing_time_zone = false;
+                self.time_zone_buffer = TextField::default();
             }
-            KeyCode::Backspace => {
-                time_zone.pop();
+            KeyCode::Esc => {
+                self.editing_time_zone = false;
+                self.time_zone_buffer = TextField::default();
             }
             KeyCode::Char(character)
                 if character.is_ascii_alphanumeric()
                     || matches!(character, '/' | '_' | '-' | '+') =>
             {
-                time_zone.push(character);
+                self.time_zone_buffer.handle_key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            }
+            KeyCode::Backspace => {
+                self.time_zone_buffer.handle_key(KeyEvent::new(
+                    KeyCode::Backspace,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
             }
             _ => {}
         }
@@ -598,7 +607,7 @@ impl SettingsPage for ImageSpendPage {
         SettingsPointerSurfaceKind::Category
     }
 
-    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+    fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         self.poll();
         if self.editing_micros.is_some() {
             self.edit_micros(key.code);
@@ -615,7 +624,7 @@ impl SettingsPage for ImageSpendPage {
                 Nav::Stay
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.cursor = (self.cursor + 1).min(4);
+                self.cursor = (self.cursor + 1).min(3);
                 Nav::Stay
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -640,7 +649,6 @@ impl SettingsPage for ImageSpendPage {
                             Some(ProjectEpochPolicy::Rolling { .. }) => None,
                         }
                     }
-                    4 => self.save(cx),
                     _ => {}
                 }
                 Nav::Stay
@@ -660,10 +668,10 @@ impl SettingsPage for ImageSpendPage {
                     1 => self.draft.session,
                     _ => self.draft.project,
                 };
-                self.micros_buffer = match policy {
+                self.micros_buffer = TextField::new(match policy {
                     BudgetPolicy::Finite { usd_micros } => usd_micros.to_string(),
                     _ => String::new(),
-                };
+                });
                 Nav::Stay
             }
             KeyCode::Char('e')
@@ -673,12 +681,10 @@ impl SettingsPage for ImageSpendPage {
                         Some(ProjectEpochPolicy::CalendarMonth { .. })
                     ) =>
             {
-                self.time_zone_before_edit = match &self.draft.project_epoch {
-                    Some(ProjectEpochPolicy::CalendarMonth { time_zone }) => {
-                        Some(time_zone.clone())
-                    }
-                    _ => None,
-                };
+                self.time_zone_buffer = TextField::new(match &self.draft.project_epoch {
+                    Some(ProjectEpochPolicy::CalendarMonth { time_zone }) => time_zone.clone(),
+                    _ => String::new(),
+                });
                 self.editing_time_zone = true;
                 Nav::Stay
             }
@@ -686,7 +692,7 @@ impl SettingsPage for ImageSpendPage {
         }
     }
 
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         let marker = |row| super::shell::marker(self.cursor == row);
         let suggestions = ImageSpendSuggestions::DISPLAY_ONLY;
         let epoch = match &self.draft.project_epoch {
@@ -698,8 +704,7 @@ impl SettingsPage for ImageSpendPage {
                 duration_seconds, ..
             }) => format!("rolling ({duration_seconds}s, saved anchor)"),
         };
-        let lines = vec![
-            Line::from("Image generation spend policy"),
+        let mut lines = vec![
             Line::from("Suggestions are display-only until you select and save them."),
             Line::from(format!(
                 "{} Request: {}  [suggestion $1]",
@@ -717,30 +722,146 @@ impl SettingsPage for ImageSpendPage {
                 policy_label(self.draft.project)
             )),
             Line::from(format!("{} Project window: {epoch}", marker(3))),
-            Line::from(format!("{} Save reviewed choices", marker(4))),
-            Line::from(format!("Status: {}", self.status)),
-            Line::from(if self.editing_micros.is_some() {
-                format!("Exact micros input: {}", self.micros_buffer)
-            } else if self.editing_time_zone {
-                "IANA timezone input active (Enter accepts, Esc restores).".into()
-            } else {
-                String::new()
-            }),
-            Line::from(format!(
-                "Display suggestions: {}/{}/{} micros",
-                suggestions.request_usd_micros,
-                suggestions.session_usd_micros,
-                suggestions.project_usd_micros
-            )),
         ];
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let active_field = if self.editing_micros.is_some() {
+            Some((lines.len() + 1, "Exact micros", &self.micros_buffer))
+        } else if self.editing_time_zone {
+            Some((lines.len() + 1, "IANA timezone", &self.time_zone_buffer))
+        } else {
+            None
+        };
+        if active_field.is_some() {
+            lines.push(Line::default());
+            lines.extend([Line::default(), Line::default(), Line::default()]);
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(format!("Status: {}", self.status)));
+        lines.push(Line::from(format!(
+            "Display suggestions: {}/{}/{} micros",
+            suggestions.request_usd_micros,
+            suggestions.session_usd_micros,
+            suggestions.project_usd_micros
+        )));
+        let block = crate::tui::chrome::rounded_block(" Spend policy ", false);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let selected_line = self.cursor + 1;
+        cx.scroll_states.render_bound_lines(
+            frame,
+            inner,
+            "image-spend",
+            (lines, Some(selected_line)),
+            Vec::<(usize, super::pointer_actions::SettingsPointerAction)>::new(),
+            (
+                &cx.pointer_surface,
+                super::shell::SettingsScrollRegionId("image-spend"),
+            )
+                .into(),
+        );
+        if let Some((line, title, field)) = active_field {
+            let offset = cx.scroll_states.offset_for("image-spend");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(inner.height)
+            {
+                let rect = Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(inner).width,
+                    3,
+                );
+                if let Some(caret) =
+                    crate::tui::chrome::render_field(frame, rect, title, field, true, "")
+                {
+                    frame.set_cursor_position(caret);
+                }
+                cx.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::List(
+                                super::pointer_actions::ListAction::Save,
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 
     fn title(&self, _cx: &SettingsCx) -> String {
         "Image spend budgets".into()
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
-        "↑/↓: select  enter: choose/save  e: exact u64 micros/IANA zone  +/-: adjust  esc: back"
+        "↑/↓: select  enter: choose  e: exact u64 micros/IANA zone  +/-: adjust  esc: back"
+    }
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        match action {
+            super::pointer_actions::SettingsPointerAction::List(
+                super::pointer_actions::ListAction::Save,
+            ) => {
+                self.save(cx);
+                Nav::Stay
+            }
+            super::pointer_actions::SettingsPointerAction::List(
+                super::pointer_actions::ListAction::Cancel,
+            ) => Nav::Back,
+            _ => Nav::Stay,
+        }
+    }
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        if self.editing_micros.is_some() || self.editing_time_zone {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            let cursor = usize::from(column.saturating_sub(value_x));
+            if self.editing_micros.is_some() {
+                self.micros_buffer.set_cursor_display_col(cursor);
+            } else {
+                self.time_zone_buffer.set_cursor_display_col(cursor);
+            }
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, action)
+    }
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        super::shell::finish_help_row(
+            cx,
+            vec![
+                super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: super::pointer_actions::SettingsPointerAction::List(
+                        super::pointer_actions::ListAction::Cancel,
+                    ),
+                },
+                super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: true,
+                    primary: true,
+                    action: super::pointer_actions::SettingsPointerAction::List(
+                        super::pointer_actions::ListAction::Save,
+                    ),
+                },
+            ],
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -829,9 +950,9 @@ mod tests {
             project_key: "project".into(),
             cursor: 0,
             editing_time_zone: false,
-            time_zone_before_edit: None,
             editing_micros: None,
-            micros_buffer: String::new(),
+            micros_buffer: TextField::default(),
+            time_zone_buffer: TextField::default(),
             draft: ImageSpendSettings::default(),
             saved: ImageSpendSettings::default(),
             version: None,
@@ -900,6 +1021,7 @@ mod tests {
         for character in "Pacific/Auckland".chars() {
             page.edit_time_zone(KeyCode::Char(character));
         }
+        page.edit_time_zone(KeyCode::Enter);
         assert!(matches!(
             page.draft.project_epoch,
             Some(ProjectEpochPolicy::CalendarMonth { ref time_zone }) if time_zone == "Pacific/Auckland"
@@ -912,7 +1034,7 @@ mod tests {
         page.draft.project_epoch = Some(ProjectEpochPolicy::CalendarMonth {
             time_zone: "America/Chicago".into(),
         });
-        page.time_zone_before_edit = Some("America/Chicago".into());
+        page.time_zone_buffer = TextField::new("America/Chicago");
         page.editing_time_zone = true;
         page.edit_time_zone(KeyCode::Backspace);
         page.edit_time_zone(KeyCode::Esc);
@@ -957,7 +1079,7 @@ mod tests {
         }
         page.edit_time_zone(KeyCode::Enter);
         page.editing_micros = Some(2);
-        page.micros_buffer.clear();
+        page.micros_buffer.set("");
         for character in u64::MAX.to_string().chars() {
             page.edit_micros(KeyCode::Char(character));
         }

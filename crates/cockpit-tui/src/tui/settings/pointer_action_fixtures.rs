@@ -1180,6 +1180,7 @@ fn provider_key(action: &ProvidersAction) -> ProvidersFixture {
         ProvidersAction::OAuthOption(_, OAuthOption::ManualPaste) => {
             ProvidersFixture::OAuthManualPaste
         }
+        ProvidersAction::EditOAuthCallback(_) => ProvidersFixture::OAuthManualPaste,
         ProvidersAction::OAuthOption(_, OAuthOption::Poll) => ProvidersFixture::OAuthPoll,
         ProvidersAction::OAuthOption(_, OAuthOption::SkipContinue) => {
             ProvidersFixture::OAuthSkipContinue

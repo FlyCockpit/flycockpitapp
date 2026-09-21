@@ -361,10 +361,7 @@ impl App {
                 ComposerControlKind::Sandbox if self.sandbox_down_notice.is_some() => {
                     crate::tui::theme::RED
                 }
-                ComposerControlKind::Sandbox
-                    if self.command_capability_notice.is_some()
-                        || self.update_disabled_notice_text().is_some() =>
-                {
+                ComposerControlKind::Sandbox if self.command_capability_notice.is_some() => {
                     crate::tui::theme::YELLOW
                 }
                 ComposerControlKind::Model if self.auth_failure_notice.is_some() => {
@@ -746,8 +743,7 @@ impl App {
             ComposerControlKind::Sandbox => {
                 let notice = self
                     .sandbox_down_notice_text()
-                    .or_else(|| self.command_capability_notice_text())
-                    .or_else(|| self.update_disabled_notice_text().map(str::to_string));
+                    .or_else(|| self.command_capability_notice_text());
                 if let Some(notice) = notice {
                     picker.status = ComposerPickerStatus::Unavailable;
                     picker.status_text = Some(super::sandbox_notice_render_text(&notice));

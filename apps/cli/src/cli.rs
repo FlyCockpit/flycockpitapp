@@ -153,7 +153,8 @@ pub enum PublicCommand {
     #[command(subcommand)]
     Daemon(DaemonCommand),
     Doctor(DoctorArgs),
-    /// Check or apply installed-binary updates (disabled until activation).
+    /// Check or apply installed-binary updates.
+    #[command(alias = "self-update")]
     Update(UpdateArgs),
     #[command(subcommand)]
     Session(SessionCommand),
@@ -367,7 +368,8 @@ pub enum Command {
     /// Print read-only diagnostics, including trust/model policy and delegation status.
     Doctor(DoctorArgs),
 
-    /// Check or apply installed-binary updates (disabled until activation).
+    /// Check or apply installed-binary updates.
+    #[command(alias = "self-update")]
     Update(UpdateArgs),
 
     /// Manage sessions.

@@ -2951,7 +2951,7 @@ pub struct App {
     /// enters history or any inference request — purely client-side chrome.
     pub(super) sandbox_down_notice: Option<SandboxDownNotice>,
     pub(super) command_capability_notice: Option<CommandCapabilityNotice>,
-    pub(super) update_disabled_notice: Option<String>,
+    pub(super) update_available_version: Option<String>,
     /// Process-local, event-earned per-model auth failures. These deliberately
     /// have no persistence path and start empty for every TUI process.
     pub(super) auth_failure_annotations: crate::tui::auth_failure::AuthFailureAnnotations,
@@ -4375,7 +4375,7 @@ impl App {
             waiting_for_lock: None,
             sandbox_down_notice: None,
             command_capability_notice: None,
-            update_disabled_notice: None,
+            update_available_version: None,
             auth_failure_annotations: Default::default(),
             auth_failure_notice: None,
             auth_failure_fingerprints: Default::default(),

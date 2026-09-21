@@ -45,6 +45,7 @@ pub const HEADER_COLLAPSE_PROBE_WIDTHS: [u16; 3] = [80, 56, 40];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum HeaderPillKind {
     Attention,
+    Update,
     Tool,
     Agent,
     Task,
@@ -66,8 +67,9 @@ impl HeaderPillKind {
     /// Every kind, in priority order. The button inventory derives its
     /// header coverage from this list.
     #[cfg(not(feature = "remote"))]
-    pub(crate) const ALL: [HeaderPillKind; 12] = [
+    pub(crate) const ALL: [HeaderPillKind; 13] = [
         HeaderPillKind::Attention,
+        HeaderPillKind::Update,
         HeaderPillKind::Tool,
         HeaderPillKind::Agent,
         HeaderPillKind::Task,
@@ -81,8 +83,9 @@ impl HeaderPillKind {
         HeaderPillKind::Caffeinate,
     ];
     #[cfg(feature = "remote")]
-    pub(crate) const ALL: [HeaderPillKind; 14] = [
+    pub(crate) const ALL: [HeaderPillKind; 15] = [
         HeaderPillKind::Attention,
+        HeaderPillKind::Update,
         HeaderPillKind::Tool,
         HeaderPillKind::Agent,
         HeaderPillKind::Task,
@@ -345,6 +348,7 @@ pub(crate) fn plan_chat_header(state: &ChatHeaderState, area: Rect) -> ChatHeade
 fn compact_pill_label(pill: &HeaderPill) -> String {
     match pill.kind {
         HeaderPillKind::Attention => pill.label.replace("attention", "attn"),
+        HeaderPillKind::Update => "update".to_string(),
         HeaderPillKind::Tool => pill.label.clone(),
         HeaderPillKind::Agent => pill
             .label
@@ -734,6 +738,11 @@ pub fn capability_parity_table() -> &'static [HeaderParityRow] {
             control: "session title/status",
             surface: "chat header title row",
             proof: "header_session_status_tracks_real_state",
+        },
+        HeaderParityRow {
+            control: "update available notice",
+            surface: "chat header update pill",
+            proof: "update_available_is_a_header_pill_and_not_a_persistent_row",
         },
     ]
 }

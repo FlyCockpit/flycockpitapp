@@ -1,108 +1,89 @@
 //! Test-only fake fixture adapters. Never linked into the installed binary.
 #![cfg(any(test, feature = "test-support"))]
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 
-use super::traits::{
-    BinaryReplacer, MetadataRepository, SupervisorMaintenanceClient, TargetFetcher, UpdateLockStore,
-};
+use super::traits::{MetadataRepository, TargetFetcher, TrustRoot};
 use super::types::{
-    DisabledNoProductionRoot, SupervisorMaintenanceRequest, TrustedMetadataVersions,
-    UpdateApplyReceipt, UpdateLockRecord, UpdateTargetDescriptor,
+    FakeFixtureEvidence, TrustedMetadataVersions, UntrustedRepositoryMetadata,
+    UpdateTargetDescriptor, UpdaterError, VerifiedRepositoryMetadata,
+    validate_fake_fixture_evidence,
 };
 
-pub use super::types::FakeFixtureEvidence;
+#[derive(Debug, Clone)]
+pub struct FakeFixtureTrustRoot {
+    evidence: FakeFixtureEvidence,
+    exact_metadata: Vec<u8>,
+}
 
-/// Injectable metadata repository for error-path tests only.
-#[derive(Debug, Default, Clone)]
+impl FakeFixtureTrustRoot {
+    pub fn new(evidence: FakeFixtureEvidence) -> Self {
+        let exact_metadata = serde_json::to_vec(&evidence).expect("fixture evidence serializes");
+        Self {
+            evidence,
+            exact_metadata,
+        }
+    }
+
+    pub fn metadata(&self) -> UntrustedRepositoryMetadata {
+        UntrustedRepositoryMetadata {
+            bytes: self.exact_metadata.clone(),
+        }
+    }
+}
+
+impl TrustRoot for FakeFixtureTrustRoot {
+    fn verify_metadata(
+        &self,
+        metadata: &UntrustedRepositoryMetadata,
+    ) -> Result<VerifiedRepositoryMetadata, UpdaterError> {
+        if metadata.bytes != self.exact_metadata {
+            return Err(UpdaterError::Metadata(
+                "fixture metadata was not authorized by the injected trust root".into(),
+            ));
+        }
+        validate_fake_fixture_evidence(&self.evidence).map_err(UpdaterError::Metadata)?;
+        Ok(VerifiedRepositoryMetadata {
+            versions: TrustedMetadataVersions {
+                root: 1,
+                timestamp: 1,
+                snapshot: 1,
+                targets: 1,
+                checked_at_unix_ms: 1,
+            },
+            targets: self.evidence.targets.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FakeFixtureMetadataRepository {
-    pub fail_with: Option<DisabledNoProductionRoot>,
+    pub metadata: UntrustedRepositoryMetadata,
 }
 
 #[async_trait]
 impl MetadataRepository for FakeFixtureMetadataRepository {
-    async fn refresh_trusted_metadata(
+    async fn fetch_metadata(
         &self,
-    ) -> Result<TrustedMetadataVersions, DisabledNoProductionRoot> {
-        if let Some(error) = self.fail_with {
-            return Err(error);
-        }
-        Ok(TrustedMetadataVersions {
-            root: 1,
-            timestamp: 1,
-            snapshot: 1,
-            targets: 1,
-            checked_at_unix_ms: 1,
-        })
-    }
-
-    async fn cached_versions(
-        &self,
-    ) -> Result<Option<TrustedMetadataVersions>, DisabledNoProductionRoot> {
-        if let Some(error) = self.fail_with {
-            return Err(error);
-        }
-        Ok(None)
+        _channel: cockpit_config::config::update_channel::UpdateChannel,
+    ) -> Result<UntrustedRepositoryMetadata, UpdaterError> {
+        Ok(self.metadata.clone())
     }
 }
 
-/// Injectable target fetcher for serialization tests only.
-#[derive(Debug, Default, Clone)]
-pub struct FakeFixtureTargetFetcher;
+#[derive(Debug, Clone)]
+pub struct FakeFixtureTargetFetcher {
+    pub path: PathBuf,
+}
 
 #[async_trait]
 impl TargetFetcher for FakeFixtureTargetFetcher {
-    async fn download_verified_target(
+    async fn download_target(
         &self,
         _target: &UpdateTargetDescriptor,
-    ) -> Result<std::path::PathBuf, DisabledNoProductionRoot> {
-        Err(DisabledNoProductionRoot)
-    }
-}
-
-/// Injectable binary replacer for serialization tests only.
-#[derive(Debug, Default, Clone)]
-pub struct FakeFixtureBinaryReplacer;
-
-#[async_trait]
-impl BinaryReplacer for FakeFixtureBinaryReplacer {
-    async fn stage_and_swap(
-        &self,
-        _staged: &std::path::PathBuf,
-        _receipt: &mut UpdateApplyReceipt,
-    ) -> Result<(), DisabledNoProductionRoot> {
-        Err(DisabledNoProductionRoot)
-    }
-}
-
-/// Injectable maintenance client for serialization tests only.
-#[derive(Debug, Default, Clone)]
-pub struct FakeFixtureMaintenanceClient;
-
-#[async_trait]
-impl SupervisorMaintenanceClient for FakeFixtureMaintenanceClient {
-    async fn request_maintenance(
-        &self,
-        _request: SupervisorMaintenanceRequest,
-    ) -> Result<(), DisabledNoProductionRoot> {
-        Err(DisabledNoProductionRoot)
-    }
-}
-
-/// Injectable lock store for serialization tests only.
-#[derive(Debug, Default, Clone)]
-pub struct FakeFixtureUpdateLockStore;
-
-#[async_trait]
-impl UpdateLockStore for FakeFixtureUpdateLockStore {
-    async fn acquire_exclusive(
-        &self,
-        _record: &UpdateLockRecord,
-    ) -> Result<(), DisabledNoProductionRoot> {
-        Err(DisabledNoProductionRoot)
-    }
-
-    async fn release(&self, _update_id: uuid::Uuid) -> Result<(), DisabledNoProductionRoot> {
-        Err(DisabledNoProductionRoot)
+    ) -> Result<PathBuf, UpdaterError> {
+        Ok(self.path.clone())
     }
 }

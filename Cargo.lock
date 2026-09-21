@@ -1346,6 +1346,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "firecrawl",
+ "flate2",
  "flycockpit-relay-protocol",
  "futures",
  "globset",

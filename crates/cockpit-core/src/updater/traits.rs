@@ -1,15 +1,15 @@
-//! Injected updater seams. Installed production composition wires only
-//! [`super::disabled::DisabledUpdater`]; future activation supplies real adapters.
+//! Injected updater seams. Production composition deliberately has no trust
+//! root until owner ceremony evidence is embedded.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use cockpit_config::config::update_channel::UpdateChannel;
 
 use super::types::{
-    DisabledNoProductionRoot, SupervisorMaintenanceRequest, TrustedMetadataVersions,
+    ManualUpdateOutcome, SupervisorMaintenanceRequest, UntrustedRepositoryMetadata,
     UpdateApplyReceipt, UpdateCheckResult, UpdateLockRecord, UpdateStatusSnapshot,
-    UpdateTargetDescriptor, UpdaterApplyError,
+    UpdateTargetDescriptor, UpdaterError, VerifiedRepositoryMetadata,
 };
 
 #[async_trait]
@@ -19,35 +19,40 @@ pub trait Updater: Send + Sync {
         &self,
         channel: UpdateChannel,
         version: Option<&str>,
-    ) -> Result<(), UpdaterApplyError>;
+    ) -> Result<ManualUpdateOutcome, UpdaterError>;
     fn status(&self, channel: UpdateChannel) -> UpdateStatusSnapshot;
+}
+
+pub trait TrustRoot: Send + Sync {
+    fn verify_metadata(
+        &self,
+        metadata: &UntrustedRepositoryMetadata,
+    ) -> Result<VerifiedRepositoryMetadata, UpdaterError>;
 }
 
 #[async_trait]
 pub trait MetadataRepository: Send + Sync {
-    async fn refresh_trusted_metadata(
+    async fn fetch_metadata(
         &self,
-    ) -> Result<TrustedMetadataVersions, DisabledNoProductionRoot>;
-    async fn cached_versions(
-        &self,
-    ) -> Result<Option<TrustedMetadataVersions>, DisabledNoProductionRoot>;
+        channel: UpdateChannel,
+    ) -> Result<UntrustedRepositoryMetadata, UpdaterError>;
 }
 
 #[async_trait]
 pub trait TargetFetcher: Send + Sync {
-    async fn download_verified_target(
+    async fn download_target(
         &self,
         target: &UpdateTargetDescriptor,
-    ) -> Result<PathBuf, DisabledNoProductionRoot>;
+    ) -> Result<PathBuf, UpdaterError>;
 }
 
 #[async_trait]
 pub trait BinaryReplacer: Send + Sync {
     async fn stage_and_swap(
         &self,
-        staged: &PathBuf,
+        staged: &Path,
         receipt: &mut UpdateApplyReceipt,
-    ) -> Result<(), DisabledNoProductionRoot>;
+    ) -> Result<(), UpdaterError>;
 }
 
 #[async_trait]
@@ -55,14 +60,11 @@ pub trait SupervisorMaintenanceClient: Send + Sync {
     async fn request_maintenance(
         &self,
         request: SupervisorMaintenanceRequest,
-    ) -> Result<(), DisabledNoProductionRoot>;
+    ) -> Result<(), UpdaterError>;
 }
 
 #[async_trait]
 pub trait UpdateLockStore: Send + Sync {
-    async fn acquire_exclusive(
-        &self,
-        record: &UpdateLockRecord,
-    ) -> Result<(), DisabledNoProductionRoot>;
-    async fn release(&self, update_id: uuid::Uuid) -> Result<(), DisabledNoProductionRoot>;
+    async fn acquire_exclusive(&self, record: &UpdateLockRecord) -> Result<(), UpdaterError>;
+    async fn release(&self, update_id: uuid::Uuid) -> Result<(), UpdaterError>;
 }

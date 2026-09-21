@@ -1,688 +1,495 @@
-//! Disabled updater boundary tests for issue #402.
+//! Behavioural updater evidence for issue #442.
 
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use assert_cmd::cargo::cargo_bin;
-use cockpit_core::updater::{
-    UpdateCheckResult, Updater, effective_update_channel, installed_composition, installed_updater,
-    run_startup_check, update_notice, update_status,
+use async_trait::async_trait;
+use cockpit_config::config::update_channel::UpdateChannel;
+use cockpit_core::updater::fake::{
+    FakeFixtureMetadataRepository, FakeFixtureTargetFetcher, FakeFixtureTrustRoot,
 };
+use cockpit_core::updater::{
+    ActiveUpdater, BinaryReplacer, FakeFixtureEvidence, InstallationAuthorization,
+    InstallationPaths, InstallationPolicy, ManualUpdateOutcome, MetadataRepository,
+    PlatformBinaryReplacer, SupervisorMaintenanceClient, SupervisorMaintenanceRequest,
+    TargetFetcher, TrustRoot, UntrustedRepositoryMetadata, UpdateApplyReceipt,
+    UpdateApplyReceiptState, UpdateCheckResult, UpdateLockRecord, UpdateLockStore,
+    UpdateStatusSnapshot, UpdateTargetDescriptor, Updater, UpdaterError,
+    VerifiedRepositoryMetadata,
+};
+use sha2::{Digest, Sha256};
 
-static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-const WORKSPACE_SCAN_ROOTS: &[&str] = &["apps", "crates"];
-
-const EXPECTED_UPDATER_CONSUMERS: &[&str] = &[
-    "apps/cli/src/commands/update.rs",
-    "apps/cli/tests/updater_disabled.rs",
-    "crates/cockpit-core/src/daemon/mod.rs",
-    "crates/cockpit-core/src/daemon/server/mod.rs",
-    "crates/cockpit-tui/src/tui/app/update_notice.rs",
-];
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn production_updater_implementation_sources() -> Vec<PathBuf> {
-    let root = workspace_root().join("crates/cockpit-core/src/updater");
-    fs::read_dir(&root)
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to read updater sources at {}: {error}",
-                root.display()
-            )
-        })
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension().is_some_and(|ext| ext == "rs")
-                && path.file_name().is_some_and(|name| name != "fake.rs")
-        })
-        .collect()
-}
-
-fn is_updater_implementation_source(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str() == "updater")
-        && path
-            .components()
-            .any(|component| component.as_os_str() == "cockpit-core")
-}
-
-fn strip_rust_comments(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let bytes = source.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'/' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'/' {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            if bytes[i + 1] == b'*' {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-                continue;
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    out
-}
-
-fn is_updater_module_path(path: &str) -> bool {
-    path == "updater"
-        || path == "cockpit_core::updater"
-        || path == "crate::updater"
-        || path.ends_with("::updater")
-}
-
-fn references_installed_updater_module(source: &str) -> bool {
-    let production = strip_rust_comments(source);
-    if production.contains("cockpit_core::updater")
-        || production.contains("crate::updater")
-        || production.contains("::updater::")
-    {
-        return true;
-    }
-
-    let mut module_aliases = Vec::new();
-    for line in production.lines() {
-        let trimmed = line.trim().trim_end_matches(';').trim();
-        if !trimmed.starts_with("use ") {
-            continue;
-        }
-        let rest = trimmed.strip_prefix("use ").unwrap_or("").trim();
-        if let Some((path, alias)) = rest.split_once(" as ") {
-            if is_updater_module_path(path.trim()) {
-                module_aliases.push(alias.trim().to_string());
-            }
-            continue;
-        }
-        let path = rest.split_once('{').map_or(rest, |(path, _)| path).trim();
-        if is_updater_module_path(path.trim_end_matches("::")) {
-            return true;
-        }
-    }
-
-    module_aliases
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
-        .any(|alias| production.contains(&format!("{alias}::")))
-}
-
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    if !dir.is_dir() {
-        return;
-    }
-    let entries = fs::read_dir(dir).unwrap_or_else(|error| {
-        panic!(
-            "failed to read updater consumer scan root {}: {error}",
-            dir.display()
-        )
-    });
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rs_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-fn discover_updater_consumer_sources() -> Vec<PathBuf> {
-    let root = workspace_root();
-    let mut sources = Vec::new();
-    for relative in WORKSPACE_SCAN_ROOTS {
-        collect_rs_files(&root.join(relative), &mut sources);
-    }
-
-    let mut consumers = sources
-        .into_iter()
-        .filter(|path| !is_updater_implementation_source(path))
-        .filter(|path| {
-            let source = fs::read_to_string(path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to read updater consumer candidate {}: {error}",
-                    path.display()
-                )
-            });
-            let production_source = strip_test_modules(&source);
-            references_installed_updater_module(&production_source)
-        })
-        .collect::<Vec<_>>();
-    consumers.sort();
-    consumers.dedup();
-    consumers
-}
-
-fn expected_updater_consumer_sources() -> Vec<PathBuf> {
-    EXPECTED_UPDATER_CONSUMERS
-        .iter()
-        .map(|relative| workspace_root().join(relative))
+        .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
-fn production_updater_consumer_sources() -> Vec<PathBuf> {
-    let discovered = discover_updater_consumer_sources();
-    let expected = expected_updater_consumer_sources();
-    assert_eq!(
-        discovered, expected,
-        "updater consumer surface changed; update EXPECTED_UPDATER_CONSUMERS and review boundary scans"
-    );
-    expected
+fn policy(
+    current_exe: PathBuf,
+    receipt: PathBuf,
+    brew_prefix: Option<PathBuf>,
+) -> InstallationPolicy {
+    InstallationPolicy::new(InstallationPaths {
+        current_exe,
+        receipt,
+        brew_prefix,
+    })
 }
 
-fn production_updater_boundary_sources() -> Vec<PathBuf> {
-    let mut sources = production_updater_implementation_sources();
-    sources.extend(production_updater_consumer_sources());
-    sources
-}
-
-fn implementation_updater_sources() -> Vec<PathBuf> {
-    production_updater_implementation_sources()
-        .into_iter()
-        .filter(|path| {
-            path.file_name().is_some_and(|name| {
-                name == "disabled.rs" || name == "composition.rs" || name == "background.rs"
-            })
-        })
-        .collect()
-}
-
-fn boundary_side_effect_sources() -> Vec<PathBuf> {
-    let mut sources = implementation_updater_sources();
-    sources.extend(production_updater_consumer_sources());
-    sources
-}
-
-fn is_updater_boundary_scan_source(path: &Path) -> bool {
-    !path
-        .components()
-        .any(|component| component.as_os_str() == "tests")
-}
-
-fn side_effect_scan_segments(_path: &Path, source: &str) -> Vec<String> {
-    vec![strip_test_modules(source)]
-}
-
-fn scan_segments_for_forbidden(segments: &[String], needles: &[&str], path: &Path, label: &str) {
-    for segment in segments {
-        for needle in needles {
-            assert!(
-                !segment.contains(needle),
-                "{} must not {label} `{needle}` in production updater code",
-                path.display()
-            );
-        }
-    }
-}
-
-fn is_run_startup_check_call_site(line: &str) -> bool {
-    if !line.contains("run_startup_check(") {
-        return false;
-    }
-    let trimmed = line.trim_start();
-    !(trimmed.starts_with("use ")
-        || line.contains("pub async fn run_startup_check")
-        || line.contains("pub fn run_startup_check"))
-}
-
-fn byte_offset_for_line(source: &str, line_idx: usize) -> usize {
-    source
-        .lines()
-        .take(line_idx)
-        .map(|line| line.len() + 1)
-        .sum()
-}
-
-fn find_enclosing_block_opener(source: &str, call_offset: usize) -> Option<usize> {
-    let bytes = source.as_bytes();
-    let mut depth = 0usize;
-    let mut index = call_offset;
-    while index > 0 {
-        index -= 1;
-        match bytes[index] {
-            b'}' => depth += 1,
-            b'{' => {
-                if depth == 0 {
-                    return Some(index);
-                }
-                depth -= 1;
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn line_before_block(source: &str, block_opener: usize) -> (usize, &str) {
-    let prefix = source[..block_opener].trim_end();
-    let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-    (line_start, prefix[line_start..].trim())
-}
-
-fn controlling_statement_for_block(source: &str, block_opener: usize) -> String {
-    let (last_line_start, last_line) = line_before_block(source, block_opener);
-    if let Some(arm_start) = last_line.find("=>") {
-        return last_line[..arm_start].trim().to_string();
-    }
-    if last_line.is_empty() {
-        let prev_end = last_line_start.saturating_sub(1);
-        let (prev_line_start, prev_line) = line_before_block(source, prev_end);
-        if let Some(arm_start) = prev_line.find("=>") {
-            return prev_line[..arm_start].trim().to_string();
-        }
-        if prev_line.starts_with("if ") {
-            return prev_line.to_string();
-        }
-        if let Some(if_start) = prev_line.rfind(" if ") {
-            return prev_line[if_start + 1..].trim().to_string();
-        }
-    }
-    if last_line.starts_with("if ") {
-        return last_line.to_string();
-    }
-    if let Some(if_start) = last_line.rfind(" if ") {
-        return last_line[if_start + 1..].trim().to_string();
-    }
-    String::new()
-}
-
-fn call_is_update_check_gated(source: &str, line_idx: usize) -> bool {
-    let call_offset = byte_offset_for_line(source, line_idx);
-    let mut search_from = call_offset;
-    while let Some(block_opener) = find_enclosing_block_opener(source, search_from) {
-        let controller = controlling_statement_for_block(source, block_opener);
-        if controller.contains("update_checks_enabled") {
-            return true;
-        }
-        if block_opener == 0 {
-            break;
-        }
-        search_from = block_opener;
-    }
-    false
-}
-
-fn assert_run_startup_check_gated(source: &str, path_label: &str) {
-    let production = strip_rust_comments(&strip_test_modules(source));
-    for (line_idx, line) in production.lines().enumerate() {
-        if !is_run_startup_check_call_site(line) {
-            continue;
-        }
-        assert!(
-            call_is_update_check_gated(&production, line_idx),
-            "{}: run_startup_check must be enclosed by an update_checks_enabled guard",
-            path_label
-        );
-    }
-}
-
-fn assert_update_checks_suppressed_when_off() {
-    let server_path = workspace_root().join("crates/cockpit-core/src/daemon/server/mod.rs");
-    let server = fs::read_to_string(&server_path).expect("read daemon server source");
-    assert!(
-        server.contains("update_checks_enabled(update_channel)"),
-        "daemon boot must gate startup update checks behind update_checks_enabled"
-    );
-    assert_run_startup_check_gated(&server, &server_path.display().to_string());
-
-    let daemon = fs::read_to_string(workspace_root().join("crates/cockpit-core/src/daemon/mod.rs"))
-        .expect("read daemon source");
-    assert!(
-        daemon.contains("maybe_spawn_background"),
-        "daemon must spawn background update checks only through maybe_spawn_background"
-    );
-    assert!(
-        !strip_rust_comments(&strip_test_modules(&daemon))
-            .contains("crate::updater::spawn_background"),
-        "daemon must not invoke updater::spawn_background directly"
-    );
-
-    let background_path = workspace_root().join("crates/cockpit-core/src/updater/background.rs");
-    let background = fs::read_to_string(&background_path).expect("read updater background source");
-    assert!(
-        background.contains("update_checks_enabled(channel)"),
-        "background update loop must skip checks when the effective channel is off"
-    );
-    assert_run_startup_check_gated(&background, &background_path.display().to_string());
+fn write_receipt(path: &std::path::Path, install_prefix: &std::path::Path) {
+    std::fs::write(
+        path,
+        serde_json::json!({ "install_prefix": install_prefix }).to_string(),
+    )
+    .unwrap();
 }
 
 #[test]
-fn installed_composition_has_no_trust_or_transport() {
-    assert_update_checks_suppressed_when_off();
+fn receipt_precedes_homebrew_and_authorizes_self_update() {
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("homebrew");
+    let binary = prefix.join("bin/cockpit");
+    let receipt = temp
+        .path()
+        .join("config/cockpit-cli/cockpit-cli-receipt.json");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+    std::fs::write(&binary, b"old").unwrap();
+    write_receipt(&receipt, &prefix);
 
-    let transport_forbidden = [
-        "reqwest",
-        "tough",
-        "self_replace",
-        "ureq",
-        "minisign",
-        "https://",
-        "http://",
-        "fake::",
-    ];
-    let capability_forbidden = [
-        "download_verified_target",
-        "stage_and_swap",
-        "request_maintenance",
-        "refresh_trusted_metadata",
-        "acquire_exclusive",
-        "std::process::Command",
-        "Command::new",
-        "tokio::process",
-    ];
-    for path in production_updater_boundary_sources() {
-        assert!(
-            path.is_file(),
-            "updater boundary source must exist: {}",
-            path.display()
-        );
-        let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!(
-                "failed to read production updater source {}: {error}",
-                path.display()
-            )
-        });
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        let scan_transport = is_updater_implementation_source(&path)
-            && file_name != "traits.rs"
-            && file_name != "types.rs";
-        let segments = side_effect_scan_segments(&path, &source);
-        if is_updater_boundary_scan_source(&path) {
-            if scan_transport {
-                scan_segments_for_forbidden(&segments, &transport_forbidden, &path, "reference");
-            }
-            if implementation_updater_sources()
-                .iter()
-                .any(|candidate| candidate == &path)
-            {
-                scan_segments_for_forbidden(&segments, &capability_forbidden, &path, "invoke");
-            }
-        }
-    }
-
-    let composition_source = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/cockpit-core/src/updater/composition.rs"),
-    )
-    .expect("read composition source");
-    assert!(
-        composition_source.contains("DisabledUpdater"),
-        "installed composition must wire only DisabledUpdater"
+    assert_eq!(
+        policy(binary, receipt, Some(prefix)).authorize().unwrap(),
+        InstallationAuthorization::SelfUpdate
     );
-    assert!(
-        !composition_source.contains("FakeFixture"),
-        "installed composition must not reference fake adapters"
-    );
-    let _composition = installed_composition();
 }
 
 #[tokio::test]
-async fn all_check_entrypoints_return_disabled_without_side_effect() {
-    let _guard = cockpit_test_support::TestEnvGuard::lock().await;
-    let state_dir = isolated_state_dir();
-    fs::create_dir_all(&state_dir).expect("create isolated state dir");
-    _guard.set_var(
-        "COCKPIT_STATE_DIR",
-        state_dir.to_str().expect("utf8 state dir"),
+async fn homebrew_branch_returns_command_and_leaves_binary_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("homebrew");
+    let binary = prefix.join("bin/cockpit");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(&binary, b"original-homebrew-binary").unwrap();
+    let updater = updater_with_no_root(policy(
+        binary.clone(),
+        temp.path().join("missing-receipt.json"),
+        Some(prefix),
+    ));
+
+    let outcome = updater
+        .apply_manual(UpdateChannel::Auto, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        ManualUpdateOutcome::Homebrew {
+            command: "brew upgrade cockpit"
+        }
     );
-    let channel = effective_update_channel().expect("effective update channel");
-    let before = snapshot_state_tree(&state_dir);
+    assert_eq!(std::fs::read(binary).unwrap(), b"original-homebrew-binary");
+}
 
-    let startup = run_startup_check(channel).await;
-    let manual = installed_updater().check(channel).await;
-    let status = update_status(channel);
-    let notice = update_notice(channel);
+#[test]
+fn missing_receipt_outside_homebrew_refuses_package_manager_install() {
+    let temp = tempfile::tempdir().unwrap();
+    let error = policy(
+        temp.path().join("usr/bin/cockpit"),
+        temp.path().join("missing-receipt.json"),
+        Some(temp.path().join("homebrew")),
+    )
+    .authorize()
+    .unwrap_err();
+    assert_eq!(error, UpdaterError::PackageManager);
+    assert!(error.to_string().contains("installed by a package manager"));
+}
 
-    match channel {
-        cockpit_config::config::update_channel::UpdateChannel::Off => {
-            assert_eq!(startup, UpdateCheckResult::Off);
-            assert_eq!(manual, UpdateCheckResult::Off);
-            assert!(matches!(
-                status,
-                cockpit_core::updater::UpdateStatusSnapshot::Off
-            ));
-            assert!(notice.is_none());
-        }
-        _ => {
-            assert!(matches!(startup, UpdateCheckResult::Disabled(_)));
-            assert!(matches!(manual, UpdateCheckResult::Disabled(_)));
-            assert!(matches!(
-                status,
-                cockpit_core::updater::UpdateStatusSnapshot::Disabled { .. }
-            ));
-            assert!(notice.is_some());
-        }
+#[derive(Debug)]
+struct NeverRepository;
+
+#[async_trait]
+impl MetadataRepository for NeverRepository {
+    async fn fetch_metadata(
+        &self,
+        _channel: UpdateChannel,
+    ) -> Result<UntrustedRepositoryMetadata, UpdaterError> {
+        panic!("repository must not run without a trust root")
+    }
+}
+
+#[derive(Debug)]
+struct NeverFetcher;
+
+#[async_trait]
+impl TargetFetcher for NeverFetcher {
+    async fn download_target(
+        &self,
+        _target: &UpdateTargetDescriptor,
+    ) -> Result<PathBuf, UpdaterError> {
+        panic!("fetcher must not run without a trust root")
+    }
+}
+
+#[derive(Debug)]
+struct NeverReplacer;
+
+#[async_trait]
+impl BinaryReplacer for NeverReplacer {
+    async fn stage_and_swap(
+        &self,
+        _staged: &Path,
+        _receipt: &mut UpdateApplyReceipt,
+    ) -> Result<(), UpdaterError> {
+        panic!("replacer must not run without a trust root")
+    }
+}
+
+#[derive(Debug)]
+struct NeverSupervisor;
+
+#[async_trait]
+impl SupervisorMaintenanceClient for NeverSupervisor {
+    async fn request_maintenance(
+        &self,
+        _request: SupervisorMaintenanceRequest,
+    ) -> Result<(), UpdaterError> {
+        panic!("supervisor must not run without a trust root")
+    }
+}
+
+#[derive(Debug, Default)]
+struct MemoryLock;
+
+#[async_trait]
+impl UpdateLockStore for MemoryLock {
+    async fn acquire_exclusive(&self, _record: &UpdateLockRecord) -> Result<(), UpdaterError> {
+        Ok(())
     }
 
-    let after = snapshot_state_tree(&state_dir);
-    assert_eq!(before, after, "update checks must not touch the state tree");
+    async fn release(&self, _update_id: uuid::Uuid) -> Result<(), UpdaterError> {
+        Ok(())
+    }
+}
 
-    let bin = cargo_bin("cockpit");
-    let output = Command::new(&bin)
-        .args(["update", "--check"])
-        .output()
-        .expect("run cockpit update --check");
-    if channel == cockpit_config::config::update_channel::UpdateChannel::Off {
+fn updater_with_no_root(policy: InstallationPolicy) -> ActiveUpdater {
+    ActiveUpdater::new(
+        policy,
+        "test-platform",
+        None,
+        Arc::new(NeverRepository),
+        Arc::new(NeverFetcher),
+        Arc::new(NeverReplacer),
+        Arc::new(NeverSupervisor),
+        Arc::new(MemoryLock),
+    )
+}
+
+#[tokio::test]
+async fn receipt_without_production_root_fails_closed_with_specific_reason() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = temp.path().join("cockpit");
+    let receipt = temp.path().join("cockpit-receipt.json");
+    std::fs::write(&binary, b"old").unwrap();
+    write_receipt(&receipt, temp.path());
+    let updater = updater_with_no_root(policy(binary, receipt, None));
+
+    assert_eq!(
+        updater.check(UpdateChannel::Auto).await,
+        UpdateCheckResult::Failed(UpdaterError::NoProductionTrustRoot)
+    );
+    assert_eq!(
+        updater.status(UpdateChannel::Auto),
+        UpdateStatusSnapshot::Unavailable {
+            channel: UpdateChannel::Auto,
+            reason: UpdaterError::NoProductionTrustRoot,
+        }
+    );
+    let error = updater
+        .apply_manual(UpdateChannel::Auto, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "no production trust root");
+}
+
+#[derive(Clone)]
+struct RecordingRoot {
+    inner: FakeFixtureTrustRoot,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl TrustRoot for RecordingRoot {
+    fn verify_metadata(
+        &self,
+        metadata: &UntrustedRepositoryMetadata,
+    ) -> Result<VerifiedRepositoryMetadata, UpdaterError> {
+        let verified = self.inner.verify_metadata(metadata)?;
+        self.events.lock().unwrap().push("metadata_verified");
+        Ok(verified)
+    }
+}
+
+struct RecordingReplacer {
+    inner: PlatformBinaryReplacer,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl BinaryReplacer for RecordingReplacer {
+    async fn stage_and_swap(
+        &self,
+        staged: &Path,
+        receipt: &mut UpdateApplyReceipt,
+    ) -> Result<(), UpdaterError> {
+        self.inner.stage_and_swap(staged, receipt).await?;
+        self.events.lock().unwrap().push("placed");
+        Ok(())
+    }
+}
+
+struct RecordingSupervisor {
+    installed: PathBuf,
+    expected: Vec<u8>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    maintenance_requests: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl SupervisorMaintenanceClient for RecordingSupervisor {
+    async fn request_maintenance(
+        &self,
+        _request: SupervisorMaintenanceRequest,
+    ) -> Result<(), UpdaterError> {
+        assert_eq!(std::fs::read(&self.installed).unwrap(), self.expected);
+        assert_eq!(
+            self.events.lock().unwrap().as_slice(),
+            ["metadata_verified", "placed"]
+        );
+        *self.maintenance_requests.lock().unwrap() += 1;
+        self.events.lock().unwrap().push("maintenance_requested");
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingLock {
+    acquired: Arc<Mutex<usize>>,
+    released: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl UpdateLockStore for RecordingLock {
+    async fn acquire_exclusive(&self, _record: &UpdateLockRecord) -> Result<(), UpdaterError> {
+        *self.acquired.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    async fn release(&self, _update_id: uuid::Uuid) -> Result<(), UpdaterError> {
+        *self.released.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn receipt_fixture_tuf_target_places_binary_then_requests_maintenance_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = temp.path().join("cockpit");
+    let staged = temp.path().join("downloaded-cockpit");
+    let receipt = temp.path().join("cockpit-receipt.json");
+    let new_bytes = b"verified replacement binary".to_vec();
+    std::fs::write(&binary, b"old binary").unwrap();
+    std::fs::write(&staged, &new_bytes).unwrap();
+    write_receipt(&receipt, temp.path());
+    let target = UpdateTargetDescriptor {
+        version: "9.9.9".into(),
+        platform: "test-platform".into(),
+        path: "cockpit-test.bin".into(),
+        length: new_bytes.len() as u64,
+        sha256: sha256(&new_bytes),
+    };
+    let fixture = FakeFixtureEvidence {
+        release_tag: "v9.9.9".into(),
+        commit: "fixture-commit".into(),
+        targets: vec![target],
+    };
+    let fixture_root = FakeFixtureTrustRoot::new(fixture);
+    let repository = FakeFixtureMetadataRepository {
+        metadata: fixture_root.metadata(),
+    };
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let maintenance_requests = Arc::new(Mutex::new(0));
+    let lock = Arc::new(RecordingLock::default());
+    let updater = ActiveUpdater::new(
+        policy(binary.clone(), receipt, None),
+        "test-platform",
+        Some(Arc::new(RecordingRoot {
+            inner: fixture_root,
+            events: events.clone(),
+        })),
+        Arc::new(repository),
+        Arc::new(FakeFixtureTargetFetcher { path: staged }),
+        Arc::new(RecordingReplacer {
+            inner: PlatformBinaryReplacer::new(binary.clone()),
+            events: events.clone(),
+        }),
+        Arc::new(RecordingSupervisor {
+            installed: binary.clone(),
+            expected: new_bytes.clone(),
+            events: events.clone(),
+            maintenance_requests: maintenance_requests.clone(),
+        }),
+        lock.clone(),
+    );
+
+    let outcome = updater
+        .apply_manual(UpdateChannel::Auto, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        ManualUpdateOutcome::Updated {
+            version: "9.9.9".into()
+        }
+    );
+    assert_eq!(std::fs::read(binary).unwrap(), new_bytes);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["metadata_verified", "placed", "maintenance_requested"]
+    );
+    assert_eq!(*maintenance_requests.lock().unwrap(), 1);
+    assert_eq!(*lock.acquired.lock().unwrap(), 1);
+    assert_eq!(*lock.released.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn corrupt_target_never_places_or_rolls() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = temp.path().join("cockpit");
+    let staged = temp.path().join("downloaded-cockpit");
+    let receipt = temp.path().join("cockpit-receipt.json");
+    std::fs::write(&binary, b"old binary").unwrap();
+    std::fs::write(&staged, b"corrupt").unwrap();
+    write_receipt(&receipt, temp.path());
+    let fixture = FakeFixtureEvidence {
+        release_tag: "v9.9.9".into(),
+        commit: "fixture-commit".into(),
+        targets: vec![UpdateTargetDescriptor {
+            version: "9.9.9".into(),
+            platform: "test-platform".into(),
+            path: "cockpit-test.bin".into(),
+            length: 7,
+            sha256: "0".repeat(64),
+        }],
+    };
+    let root = FakeFixtureTrustRoot::new(fixture);
+    let updater = ActiveUpdater::new(
+        policy(binary.clone(), receipt, None),
+        "test-platform",
+        Some(Arc::new(root.clone())),
+        Arc::new(FakeFixtureMetadataRepository {
+            metadata: root.metadata(),
+        }),
+        Arc::new(FakeFixtureTargetFetcher { path: staged }),
+        Arc::new(NeverReplacer),
+        Arc::new(NeverSupervisor),
+        Arc::new(MemoryLock),
+    );
+
+    assert_eq!(
+        updater
+            .apply_manual(UpdateChannel::Auto, None)
+            .await
+            .unwrap_err(),
+        UpdaterError::TargetHash
+    );
+    assert_eq!(std::fs::read(binary).unwrap(), b"old binary");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_replacement_renames_a_sibling_temp_and_changes_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let installed = temp.path().join("cockpit");
+    let staged = temp.path().join("staged");
+    std::fs::write(&installed, b"old").unwrap();
+    std::fs::write(&staged, b"new").unwrap();
+    let before = std::fs::metadata(&installed).unwrap().ino();
+    let mut receipt = UpdateApplyReceipt {
+        update_id: uuid::Uuid::now_v7(),
+        state: UpdateApplyReceiptState::VerifiedStaged,
+        target: None,
+        updated_at_unix_ms: 1,
+    };
+
+    PlatformBinaryReplacer::new(installed.clone())
+        .stage_and_swap(&staged, &mut receipt)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&installed).unwrap(), b"new");
+    assert_ne!(before, std::fs::metadata(installed).unwrap().ino());
+}
+
+#[test]
+fn cli_brew_refusal_is_successful_and_update_aliases_self_update() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = cargo_bin("cockpit");
+    let before = std::fs::read(&binary).unwrap();
+    let prefix = binary.parent().unwrap().parent().unwrap();
+    for command in ["update", "self-update"] {
+        let output = std::process::Command::new(&binary)
+            .arg(command)
+            .env("COCKPIT_UPDATES", "auto")
+            .env("XDG_CONFIG_HOME", temp.path())
+            .env("HOMEBREW_PREFIX", prefix)
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-    } else {
-        assert!(!output.status.success(), "disabled apply must fail closed");
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            combined.contains("disabled") || combined.contains("production TUF updater"),
-            "expected disabled updater output, got: {combined}"
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "brew upgrade cockpit"
         );
     }
-
-    for path in boundary_side_effect_sources() {
-        if !is_updater_boundary_scan_source(&path) {
-            continue;
-        }
-        let source = fs::read_to_string(&path).expect("read updater boundary source");
-        for segment in side_effect_scan_segments(&path, &source) {
-            assert!(
-                !segment.contains("reqwest::")
-                    && !segment.contains("tough::")
-                    && !segment.contains("self_replace::")
-                    && !segment.contains("MetadataRepository")
-                    && !segment.contains("TargetFetcher")
-                    && !segment.contains("BinaryReplacer")
-                    && !segment.contains("SupervisorMaintenanceClient")
-                    && !segment.contains("UpdateLockStore"),
-                "{} must not delegate to transport/trust/maintenance seams",
-                path.display()
-            );
-        }
-    }
+    assert_eq!(std::fs::read(binary).unwrap(), before);
 }
 
 #[test]
-fn tuf_release_uses_canonical_fake_fixture_schema() {
-    let main_rs = fs::read_to_string(workspace_root().join("tools/tuf-release/src/main.rs"))
-        .expect("read tuf-release main source");
-    assert!(
-        main_rs.contains("cockpit_updater_evidence::FakeFixtureEvidence")
-            || main_rs.contains("cockpit_updater_evidence::{FakeFixtureEvidence"),
-        "tuf-release must deserialize canonical FakeFixtureEvidence from cockpit-updater-evidence"
-    );
-    let tuf_manifest = fs::read_to_string(workspace_root().join("tools/tuf-release/Cargo.toml"))
-        .expect("read tuf-release manifest");
-    assert!(
-        !tuf_manifest.contains("cockpit-core"),
-        "tuf-release must not depend on the request-capable cockpit-core crate"
-    );
-    assert!(
-        tuf_manifest.contains("cockpit-updater-evidence"),
-        "tuf-release must depend only on the evidence schema crate"
-    );
-    assert!(
-        main_rs.contains("validate_fake_fixture_evidence"),
-        "tuf-release must validate evidence through the shared cockpit-core validator"
-    );
-    assert!(
-        !main_rs.contains("struct FakeFixtureTarget"),
-        "tuf-release must not declare a parallel fake-fixture schema"
-    );
+fn cli_without_receipt_refuses_generic_package_manager_install() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(cargo_bin("cockpit"))
+        .arg("update")
+        .env("COCKPIT_UPDATES", "auto")
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("HOMEBREW_PREFIX", temp.path().join("not-the-prefix"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("installed by a package manager"));
 }
 
 #[test]
-fn fixture_adapter_cannot_link_to_installed_binary() {
-    let mod_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/cockpit-core/src/updater/mod.rs");
-    let source = fs::read_to_string(mod_path).expect("read updater mod source");
-    assert!(
-        source.contains("#[cfg(any(test, feature = \"test-support\"))]"),
-        "fake fixture adapters must be cfg-gated in updater/mod.rs"
-    );
-
-    let cli_manifest =
-        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .expect("read cli manifest");
-    let production_dep = cli_manifest
-        .split("[dependencies]")
-        .nth(1)
-        .and_then(|section| section.split("[dev-dependencies]").next())
-        .unwrap_or("");
-    assert!(
-        !production_dep.contains("test-support"),
-        "installed CLI production dependency must not enable cockpit-core test-support"
-    );
-
-    let core_manifest = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/cockpit-core/Cargo.toml"),
-    )
-    .expect("read cockpit-core manifest");
-    assert!(
-        core_manifest.contains("[features]"),
-        "cockpit-core manifest must declare explicit features"
-    );
-    assert!(
-        !core_manifest.contains("default = [\"test-support\"]"),
-        "cockpit-core default features must not expose fake updater adapters"
-    );
-
-    let composition_source = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/cockpit-core/src/updater/composition.rs"),
-    )
-    .expect("read composition source");
-    assert!(
-        !composition_source.contains("fake::"),
-        "installed composition must not reference fake adapters"
-    );
-}
-
-#[test]
-fn cargo_dist_and_docs_remain_disabled() {
-    let dist = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist-workspace.toml"),
-    )
-    .expect("read dist-workspace.toml");
-    assert!(dist.contains("install-updater = false"));
-
-    let readme = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"))
-        .expect("read cli README");
-    assert!(
-        readme.contains("cargo-dist"),
-        "README must document cargo-dist installer ownership"
-    );
-    assert!(
-        readme.contains("self-update"),
-        "README must document that generic self-update remains disabled"
-    );
-}
-
-fn isolated_state_dir() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "cockpit-updater-disabled-{}",
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-fn snapshot_state_tree(root: &Path) -> Vec<String> {
-    walk_tree(root)
-}
-
-fn walk_tree(root: &Path) -> Vec<String> {
-    if !root.exists() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
-    };
-    for entry in entries {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let meta = entry.metadata().unwrap();
-        if meta.is_dir() {
-            out.extend(walk_tree(&path));
-        } else {
-            out.push(format!("{}:{}", path.display(), meta.len()));
-        }
-    }
-    out.sort();
-    out
-}
-
-fn strip_test_modules(src: &str) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    let bytes = src.as_bytes();
-    while i < src.len() {
-        if let Some(rel) = src[i..].find("#[cfg(test)]") {
-            out.push_str(&src[i..i + rel]);
-            let after = i + rel + "#[cfg(test)]".len();
-            if let Some(mod_rel) = src[after..].find('{') {
-                let mut depth = 0;
-                let mut j = after + mod_rel;
-                while j < src.len() {
-                    match bytes[j] {
-                        b'{' => depth += 1,
-                        b'}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                j += 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                i = j;
-            } else {
-                i = after;
-            }
-            continue;
-        }
-        out.push_str(&src[i..]);
-        break;
-    }
-    out
+fn installed_cli_with_receipt_reports_missing_production_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = cargo_bin("cockpit");
+    let receipt = temp.path().join("cockpit-cli/cockpit-cli-receipt.json");
+    std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+    write_receipt(&receipt, binary.parent().unwrap().parent().unwrap());
+    let output = std::process::Command::new(binary)
+        .arg("update")
+        .env("COCKPIT_UPDATES", "auto")
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("HOMEBREW_PREFIX", temp.path().join("not-the-prefix"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no production trust root"), "{stderr}");
+    assert!(!stderr.contains("disabled"), "{stderr}");
 }

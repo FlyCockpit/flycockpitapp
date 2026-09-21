@@ -150,6 +150,13 @@ impl App {
             });
         }
 
+        if let Some(version) = self.update_available_version.as_ref() {
+            pills.push(HeaderPill {
+                kind: HeaderPillKind::Update,
+                label: format!("update {version}"),
+            });
+        }
+
         if let Some(tool) = self.header_active_tool() {
             pills.push(HeaderPill {
                 kind: HeaderPillKind::Tool,
@@ -504,6 +511,7 @@ impl App {
         self.chat_header_more_open = false;
         match kind {
             HeaderPillKind::Attention | HeaderPillKind::Agent => self.open_agent_tree(),
+            HeaderPillKind::Update => self.header_pill_selection = None,
             HeaderPillKind::Tool => self.open_tools_pane(),
             HeaderPillKind::Task | HeaderPillKind::Timer => self.handle_schedule_command(""),
             HeaderPillKind::Skill => self.open_skills_pane(),

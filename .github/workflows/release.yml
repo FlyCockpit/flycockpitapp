@@ -620,31 +620,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "::error::Set HOMEBREW_TAP_TOKEN to a token with contents:write access to FlyCockpit/homebrew-tap."
+            echo "::error::Set HOMEBREW_TAP_TOKEN to a token with contents:read access to FlyCockpit/homebrew-tap."
             exit 1
           fi
-
-      - name: Download generated formula
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
-        with:
-          pattern: artifacts-*
-          path: artifacts
-          merge-multiple: true
-
-      - id: formula
-        name: Find generated formula
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          formula_path="$(find artifacts -type f -name cockpit.rb -print -quit)"
-          if [ -z "$formula_path" ]; then
-            echo "::error::Generated cockpit.rb formula was not found in downloaded artifacts."
-            find artifacts -maxdepth 3 -print | sort
-            exit 1
-          fi
-
-          echo "path=$formula_path" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Homebrew tap
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -654,26 +632,19 @@ jobs:
           path: homebrew-tap
           fetch-depth: 0
 
-      - name: Commit formula to tap
+      # The tap is owner-maintained because its source-build formula is the
+      # compilation boundary that removes self-update. This workflow verifies
+      # the exact release/tag and feature contract; it never synthesizes or
+      # commits an owner formula from cargo-dist's prebuilt-binary formula.
+      - name: Verify owner Homebrew formula disables self-update
         shell: bash
         run: |
           set -euo pipefail
-
-          mkdir -p homebrew-tap/Formula
-          cp "${{ steps.formula.outputs.path }}" homebrew-tap/Formula/cockpit.rb
-
-          cd homebrew-tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add Formula/cockpit.rb
-          if git diff --cached --quiet -- Formula/cockpit.rb; then
-            echo "Formula/cockpit.rb already matches ${{ needs.validate.outputs.tag }}."
-            exit 0
-          fi
-
-          git commit -m "cockpit ${{ needs.validate.outputs.tag }}"
-          git push origin HEAD:main
+          formula=homebrew-tap/Formula/cockpit.rb
+          test -f "$formula"
+          grep -F -- '"--features", "no-self-update"' "$formula"
+          grep -F -- '${{ needs.validate.outputs.tag }}' "$formula"
+          git -C homebrew-tap diff --exit-code -- Formula/cockpit.rb
 
   release-summary:
     name: Release summary
@@ -696,5 +667,5 @@ jobs:
             echo '- Homebrew: `brew install flycockpit/tap/cockpit`'
             echo '- Every artifact is signed (keyless Sigstore, GitHub OIDC) with a detached `.sig.bundle` uploaded alongside it and carries a build-provenance attestation on the release commit. Verify a download with:'
             echo '  `cosign verify-blob --bundle <artifact>.sig.bundle --certificate-identity-regexp=https://github.com/FlyCockpit/flycockpitapp/.github/ --certificate-oidc-issuer=https://token.actions.githubusercontent.com <artifact>`'
-            echo '- The installers cannot drift from the signed bytes: the shell installer verifies the SHA-256 digest embedded by cargo-dist before extracting, and the Homebrew formula pins the same digest, so both consume exactly the artifacts that were signed and attested. Sigstore bundle verification above is the provenance check for anyone who needs it.'
+            echo '- The shell installer verifies the SHA-256 digest embedded by cargo-dist before extracting. The owner-maintained Homebrew formula builds from the tagged source with the `no-self-update` feature; this workflow fails closed unless that exact tag and feature are present.'
           } >> "$GITHUB_STEP_SUMMARY"

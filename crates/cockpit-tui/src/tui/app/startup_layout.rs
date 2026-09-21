@@ -2391,6 +2391,15 @@ impl App {
         }
         self.startup_background.started = true;
         let generation = self.startup_background.generation;
+        if let Ok(channel) = cockpit_core::updater::effective_update_channel()
+            && cockpit_core::updater::update_checks_enabled(channel)
+        {
+            // The daemon's update notice lives in its process. Run the check
+            // here as well so this interactive process can render the result.
+            tokio::spawn(async move {
+                let _ = cockpit_core::updater::run_startup_check(channel).await;
+            });
+        }
         // The first authority operation is isolated in the action runner so
         // an exit before the worker begins has no configuration I/O.  It
         // reads only `daemon.background_agents`; project configuration is not
@@ -2584,7 +2593,6 @@ impl App {
         // auth notice remains queued until higher-priority remedies clear.
         self.sandbox_down_notice_text()
             .or_else(|| self.command_capability_notice_text())
-            .or_else(|| self.update_disabled_notice_text().map(str::to_string))
             .or_else(|| {
                 self.auth_failure_notice
                     .as_ref()

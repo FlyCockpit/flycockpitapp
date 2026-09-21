@@ -180,6 +180,12 @@ jobs:
           --no-default-features
           --features cockpit-tui/test-support,cockpit-noise/test-entropy,cockpit-db/host-capability-refresh-composition
 
+      - name: Test package-manager build boundary
+        run: >
+          cargo nextest run --locked -p cockpit-cli
+          --features no-self-update
+          --test updater_no_self_update
+
       - name: Check feature-gated test coverage
         run: bash scripts/check-feature-gated-test-coverage.sh
 

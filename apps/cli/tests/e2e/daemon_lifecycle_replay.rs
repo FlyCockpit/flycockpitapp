@@ -35,7 +35,7 @@ async fn lifecycle_provider_for_command(command: &str) -> ScriptedProvider {
 }
 
 #[cfg(unix)]
-async fn wait_for_handover_side_effect(path: &Path) -> String {
+async fn wait_for_handover_file(path: &Path, label: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         if let Ok(contents) = std::fs::read_to_string(path) {
@@ -43,9 +43,82 @@ async fn wait_for_handover_side_effect(path: &Path) -> String {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "handover-spanning tool did not commit its side effect within 20s"
+            "handover-spanning tool did not {label} within 20s"
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_handover_process_start(
+    client: &cockpit_cli::integration::DaemonClient,
+    daemon: &SpawnedDaemon,
+    session_id: Uuid,
+    path: &Path,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            return contents;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handover-spanning tool did not start its host process within 20s"
+        );
+        if let Ok(event) = tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            client.next_event_unbounded(),
+        )
+        .await
+        {
+            match event.expect("event while waiting for handover tool process") {
+                DaemonEvent::InterruptRaised {
+                    session_id: got,
+                    interrupt_id,
+                    ..
+                } if got == session_id => {
+                    let approve = offered_approval_option(&daemon.db_path(), interrupt_id);
+                    client
+                        .answer_interrupt_option(interrupt_id, approve)
+                        .await
+                        .expect("approve handover-spanning tool execution");
+                }
+                DaemonEvent::ToolEnd {
+                    session_id: got,
+                    call_id,
+                    ..
+                }
+                | DaemonEvent::ToolError {
+                    session_id: got,
+                    call_id,
+                    ..
+                } if got == session_id && call_id == TOOL_CALL_ID => {
+                    let terminal = open_db(&daemon.db_path())
+                        .query_row(
+                            "SELECT output, hard_fail, exit_code, sandbox_unavailable_reason \
+                               FROM tool_call_events \
+                              WHERE session_id = ?1 AND call_id = ?2 \
+                              ORDER BY timestamp DESC LIMIT 1",
+                            params![session_id.to_string(), TOOL_CALL_ID],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, Option<i64>>(2)?,
+                                    row.get::<_, Option<String>>(3)?,
+                                ))
+                            },
+                        )
+                        .ok();
+                    panic!(
+                        "handover-spanning tool reached a terminal event before its start marker; \
+                         terminal row: {terminal:?}; log tail:\n{}",
+                        log_tail(daemon.home())
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -519,16 +592,18 @@ async fn restart_daemon_gracefully(daemon: &SpawnedDaemon) {
 #[tokio::test(flavor = "multi_thread")]
 async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
     let home = IsolatedHome::new();
+    let started = home.project_path().join("handover-tool-started.txt");
     let side_effect = home.project_path().join("handover-side-effect.txt");
     let command = format!(
-        "sleep 1; printf 'committed\\n' >> {}",
-        side_effect.display()
+        "printf 'started\\n' > {}; sleep 3; printf 'committed\\n' >> {}",
+        started.display(),
+        side_effect.display(),
     );
     let provider = lifecycle_provider_for_command(&command).await;
     home.write_local_provider_config(&provider.base_url());
     std::fs::write(
         home.config_dir().join("config.json"),
-        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto"}"#,
+        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox":{"defaultMode":"off"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto"}"#,
     )
     .expect("write handover auto-approval config");
     let daemon = SpawnedDaemon::start_with_home(home).await;
@@ -569,13 +644,18 @@ async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
         }
     }
 
+    assert_eq!(
+        wait_for_handover_process_start(&client, &daemon, attached.session_id, &started).await,
+        "started\n",
+        "the roll must begin only after the real tool process is running"
+    );
     let before = supervisor_status_json(&daemon);
     let roll = daemon.restart_via_command(2).await;
     assert!(roll.status.success(), "{}", output_text(&roll));
     drop(client);
 
     assert_eq!(
-        wait_for_handover_side_effect(&side_effect).await,
+        wait_for_handover_file(&side_effect, "commit its side effect").await,
         "committed\n",
         "the host side effect must execute exactly once across the roll"
     );

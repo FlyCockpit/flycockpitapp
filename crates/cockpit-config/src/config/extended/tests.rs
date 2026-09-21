@@ -3725,6 +3725,27 @@ fn image_sidecar_selection_is_a_typed_local_config_field() {
 }
 
 #[test]
+fn installation_handover_timer_overrides_load_from_the_supervisor_layer() {
+    let isolated = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());
+    let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+    std::fs::write(
+        config_dir.join(crate::config::dirs::CONFIG_FILE),
+        r#"{"daemon":{"handover":{"drain_ms":17,"hard_ms":23,"grace_ms":31}}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        load_installation_handover_timers().unwrap(),
+        HandoverTimersConfig {
+            drain_ms: 17,
+            hard_ms: 23,
+            grace_ms: 31,
+        }
+    );
+}
+
+#[test]
 fn extended_config_ignores_secret_store_key() {
     let isolated = TempDir::new().unwrap();
     let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());

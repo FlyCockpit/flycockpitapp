@@ -3198,7 +3198,7 @@ impl SessionRegistry {
     /// Interrupt every still-running foreground turn through the same
     /// cancellation path used by daemon control requests. Durable accepted
     /// queue rows are intentionally retained for the successor.
-    pub async fn interrupt_for_handover(&self) -> Result<usize> {
+    pub async fn interrupt_for_handover(&self, hard_timeout: Duration) -> Result<usize> {
         let handles: Vec<SessionWorkerHandle> = {
             let workers = crate::sync::lock_or_recover(&self.inner.workers);
             workers
@@ -3208,20 +3208,57 @@ impl SessionRegistry {
                 .filter(|handle| handle.live_status().1)
                 .collect()
         };
-        let mut interrupted = 0;
+        let mut candidates = Vec::with_capacity(handles.len());
         for handle in handles {
             let session_id = handle.session_id();
-            let already_recorded = self
-                .inner
-                .db
-                .list_session_events(session_id)
-                .await?
-                .into_iter()
-                .any(|event| {
-                    event.kind == "interrupt_decision"
-                        && event.data["reason"] == "worker_handover_hard_deadline"
-                });
+            let events = self.inner.db.list_session_events(session_id).await?;
+            let turn_start_seq = events
+                .iter()
+                .rev()
+                .find(|event| event.kind == "user_message")
+                .map_or(0, |event| event.seq);
+            let already_recorded = events.iter().any(|event| {
+                event.seq > turn_start_seq
+                    && event.kind == "interrupt_decision"
+                    && event.data["reason"] == "worker_handover_hard_deadline"
+            });
             if already_recorded {
+                continue;
+            }
+            handle
+                .send_work(crate::daemon::session_worker::SessionWork::Cancel {
+                    origin: crate::daemon::session_worker::CancelOrigin::Handover,
+                })
+                .await?;
+            candidates.push((handle, turn_start_seq));
+        }
+
+        let deadline = tokio::time::Instant::now() + hard_timeout;
+        while candidates.iter().any(|(handle, _)| handle.live_status().1)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::ensure!(
+            candidates.iter().all(|(handle, _)| !handle.live_status().1),
+            "worker handover interrupt path did not reach an idle boundary before T_hard"
+        );
+
+        let mut interrupted = 0;
+        for (handle, turn_start_seq) in candidates {
+            let session_id = handle.session_id();
+            let events = self.inner.db.list_session_events(session_id).await?;
+            if events
+                .iter()
+                .any(|event| event.seq > turn_start_seq && event.kind == "assistant_message")
+            {
+                continue;
+            }
+            if events.iter().any(|event| {
+                event.seq > turn_start_seq
+                    && event.kind == "interrupt_decision"
+                    && event.data["reason"] == "worker_handover_hard_deadline"
+            }) {
                 continue;
             }
             let decision = crate::daemon::proto::InterruptDecision {
@@ -3245,11 +3282,6 @@ impl SessionRegistry {
                     None,
                     &data,
                 )
-                .await?;
-            handle
-                .send_work(crate::daemon::session_worker::SessionWork::Cancel {
-                    origin: crate::daemon::session_worker::CancelOrigin::Handover,
-                })
                 .await?;
             interrupted += 1;
         }
@@ -5016,7 +5048,7 @@ mod tests {
         let session = test_session(&reg);
         let session_id = session.id;
         let (handle, closed_rx) = test_handle_with_rx(&reg, session);
-        let generation = reg.insert_test_worker_without_join(handle);
+        reg.insert_test_worker_without_join(handle);
         {
             let workers = crate::sync::lock_or_recover(&reg.inner.workers);
             let entry = workers.live.get(&session_id).expect("test generation");
@@ -5867,32 +5899,72 @@ mod tests {
         let completed_id = completed.id;
         completed
             .record_event(
-                crate::db::session_log::SessionEventKind::AssistantMessage,
+                crate::db::session_log::SessionEventKind::UserMessage,
                 Some("Build"),
-                Some("completed-turn"),
-                &json!({"text": "completed on predecessor"}),
+                None,
+                &json!({"text": "complete during cancellation race"}),
             )
             .await
             .unwrap();
-        let completed_handle = test_handle(&reg, completed);
-        completed_handle.set_test_live_status(false, false, false);
-        reg.insert_test_worker_without_join(completed_handle);
+        let (completed_handle, mut completed_rx) = test_handle_with_rx(&reg, completed.clone());
+        completed_handle.set_test_live_status(false, true, true);
+        reg.insert_test_worker_without_join(completed_handle.clone());
+        let completion_ack = tokio::spawn(async move {
+            assert!(matches!(
+                completed_rx.recv().await,
+                Some(session_worker::SessionWork::Cancel {
+                    origin: session_worker::CancelOrigin::Handover
+                })
+            ));
+            completed
+                .record_event(
+                    crate::db::session_log::SessionEventKind::AssistantMessage,
+                    Some("Build"),
+                    Some("completed-turn"),
+                    &json!({"text": "completed on predecessor"}),
+                )
+                .await
+                .unwrap();
+            completed_handle.set_test_live_status(false, false, false);
+        });
 
         let interrupted = persisted_test_session(&reg);
         let interrupted_id = interrupted.id;
+        interrupted
+            .record_event(
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "interrupt at hard deadline"}),
+            )
+            .await
+            .unwrap();
         let (interrupted_handle, mut work_rx) = test_handle_with_rx(&reg, interrupted);
         interrupted_handle.set_test_live_status(false, true, true);
-        reg.insert_test_worker_without_join(interrupted_handle);
+        reg.insert_test_worker_without_join(interrupted_handle.clone());
 
-        assert_eq!(reg.interrupt_for_handover().await.unwrap(), 1);
-        assert!(matches!(
-            work_rx.recv().await,
-            Some(session_worker::SessionWork::Cancel {
-                origin: session_worker::CancelOrigin::Handover
-            })
-        ));
+        let cancel_ack = tokio::spawn(async move {
+            assert!(matches!(
+                work_rx.recv().await,
+                Some(session_worker::SessionWork::Cancel {
+                    origin: session_worker::CancelOrigin::Handover
+                })
+            ));
+            interrupted_handle.set_test_live_status(false, false, false);
+        });
+
         assert_eq!(
-            reg.interrupt_for_handover().await.unwrap(),
+            reg.interrupt_for_handover(Duration::from_secs(1))
+                .await
+                .unwrap(),
+            1
+        );
+        completion_ack.await.unwrap();
+        cancel_ack.await.unwrap();
+        assert_eq!(
+            reg.interrupt_for_handover(Duration::from_secs(1))
+                .await
+                .unwrap(),
             0,
             "a repeated hard-deadline observation must not record or deliver a second decision"
         );
@@ -5939,6 +6011,19 @@ mod tests {
             0,
             "an interrupted turn is never also recorded as predecessor-completed"
         );
+        for (session_id, events) in [
+            (completed_id, &completed_events),
+            (interrupted_id, &interrupted_events),
+        ] {
+            let completed = events.iter().any(|event| event.kind == "assistant_message");
+            let interrupted = events
+                .iter()
+                .any(|event| event.kind == "interrupt_decision");
+            assert_ne!(
+                completed, interrupted,
+                "handover turn {session_id} must be completed XOR interrupted"
+            );
+        }
     }
 
     #[tokio::test]

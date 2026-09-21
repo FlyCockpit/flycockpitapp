@@ -1955,9 +1955,10 @@ fn apply_handover_resume_boundary(
     else {
         return false;
     };
-    *last_applied_seq
+    let mut cursor = last_applied_seq
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(boundary.marker);
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cursor = Some(cursor.map_or(boundary.marker, |current| current.min(boundary.marker)));
     true
 }
 
@@ -7652,12 +7653,29 @@ mod tests {
             ],
         ));
         assert_eq!(current_last_applied_seq(&cursor), Some(17));
+
+        *cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(9);
+        assert!(apply_handover_resume_boundary(
+            &cursor,
+            session_id,
+            &[proto::SessionBoundaryMarker {
+                session_id,
+                marker: 17,
+            }],
+        ));
+        assert_eq!(
+            current_last_applied_seq(&cursor),
+            Some(9),
+            "a boundary must not skip committed history the client has not applied"
+        );
         assert!(!apply_handover_resume_boundary(
             &cursor,
             uuid::Uuid::new_v4(),
             &[],
         ));
-        assert_eq!(current_last_applied_seq(&cursor), Some(17));
+        assert_eq!(current_last_applied_seq(&cursor), Some(9));
     }
 
     #[test]

@@ -3246,15 +3246,14 @@ async fn prepare_worker_handover(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     if ctx.registry.has_handover_inflight() {
-        let interrupted = ctx.registry.interrupt_for_handover().await?;
+        let interrupted = ctx
+            .registry
+            .interrupt_for_handover(handover.timers.hard())
+            .await?;
         tracing::warn!(
             interrupted,
             "worker handover hard deadline interrupted live turns"
         );
-        let hard_deadline = tokio::time::Instant::now() + handover.timers.hard();
-        while ctx.registry.has_handover_inflight() && tokio::time::Instant::now() < hard_deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         anyhow::ensure!(
             !ctx.registry.has_handover_inflight(),
             "worker handover interrupt path did not reach a durable boundary before T_hard"

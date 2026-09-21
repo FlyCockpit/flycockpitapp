@@ -274,7 +274,7 @@ fn author_placeable_tool_tier_preferences(
 
 fn child_default_tool_tiers() -> BTreeMap<String, ToolTier> {
     let mut tiers = default_tool_tiers();
-    for tool in ["search", "timer", "task"] {
+    for tool in ["search", "schedule", "task"] {
         if legal_tool_tiers(tool).contains(&ToolTier::Enabled) {
             tiers.insert(tool.to_string(), ToolTier::Enabled);
         }

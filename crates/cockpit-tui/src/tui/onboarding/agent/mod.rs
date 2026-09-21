@@ -1314,6 +1314,37 @@ impl AgentAuthoringScreen {
         Some(current)
     }
 
+    /// Restore an edited child into a parent snapshot. Adds start from a
+    /// snapshot that deliberately predates the new child, while edits already
+    /// have a slot at `path` in that snapshot.
+    fn replace_or_append_child_at_path(
+        draft: &mut AgentAuthoringDraft,
+        path: &[usize],
+        child: ChildAuthoringDraft,
+    ) -> bool {
+        if let Some(slot) = Self::child_slot_at_path(draft, path) {
+            *slot = child;
+            return true;
+        }
+
+        let Some((index, parent_path)) = path.split_last() else {
+            return false;
+        };
+        let siblings = if parent_path.is_empty() {
+            Some(&mut draft.children)
+        } else {
+            Self::child_slot_at_path(draft, parent_path).map(|parent| &mut parent.children)
+        };
+        let Some(siblings) = siblings else {
+            return false;
+        };
+        if *index != siblings.len() {
+            return false;
+        }
+        siblings.push(child);
+        true
+    }
+
     fn begin_add_nested_subagent(&mut self) {
         let Some(parent_path) = self
             .subagent_stack
@@ -1322,7 +1353,7 @@ impl AgentAuthoringScreen {
         else {
             return;
         };
-        let Some(parent) = Self::child_at_path(&self.draft, &parent_path) else {
+        let Some(parent) = self.editing_child.as_ref() else {
             return;
         };
         let child_path = parent_path
@@ -1330,11 +1361,17 @@ impl AgentAuthoringScreen {
             .chain([&parent.children.len()])
             .copied()
             .collect::<Vec<usize>>();
+        let mut parent_snapshot = self.draft.clone();
+        let Some(slot) = Self::child_slot_at_path(&mut parent_snapshot, &parent_path) else {
+            return;
+        };
+        *slot = parent.clone();
         self.subagent_stack.push(SubagentStackFrame {
-            parent: self.draft.clone(),
+            parent: parent_snapshot.clone(),
             child_path: child_path.clone(),
             phase: SubagentPhase::Identity,
         });
+        self.draft = parent_snapshot;
         if let Some(parent) = Self::child_slot_at_path(&mut self.draft, &parent_path) {
             parent.children.push(prepared_child_draft(&self.projection));
         }
@@ -1420,9 +1457,11 @@ impl AgentAuthoringScreen {
             child.name = self.name_field.text().trim().to_string();
             if let Some(frame) = self.subagent_stack.pop() {
                 self.draft = frame.parent;
-                if let Some(slot) = Self::child_slot_at_path(&mut self.draft, &frame.child_path) {
-                    *slot = child;
-                }
+                debug_assert!(Self::replace_or_append_child_at_path(
+                    &mut self.draft,
+                    &frame.child_path,
+                    child,
+                ));
                 if frame.child_path.len() == 1 {
                     self.phase = Phase::SubagentsList;
                     self.subagents_focus = SubagentsFocus::List;
@@ -1433,6 +1472,9 @@ impl AgentAuthoringScreen {
                         .map(|(last, prefix)| (prefix.to_vec(), *last))
                         .unwrap_or((Vec::new(), 0));
                     self.editing_child = Self::child_at_path(&self.draft, &parent_path.0).cloned();
+                    if let Some(parent) = &self.editing_child {
+                        self.name_field.set(&parent.name);
+                    }
                     self.phase = Phase::SubagentEdit(SubagentPhase::SubagentsList);
                 }
             }

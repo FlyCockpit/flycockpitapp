@@ -236,6 +236,89 @@ fn canceling_nested_subagent_restores_its_parent_editor_without_the_new_child() 
     );
 }
 
+fn advance_subagent_to_helpers(screen: &mut AgentAuthoringScreen) {
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::ModelGrants)
+    ));
+    screen.handle_key(key(KeyCode::Enter));
+    if matches!(screen.phase, Phase::SubagentEdit(SubagentPhase::ModelTrust)) {
+        screen.handle_key(key(KeyCode::Char(' ')));
+        screen.handle_key(key(KeyCode::Enter));
+    }
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::ToolTiers)
+    ));
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::SubagentsList)
+    ));
+}
+
+#[test]
+fn saving_added_subagent_appends_it_to_the_root_draft() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "root-add".into());
+    advance_to_subagents(&mut screen);
+    let initial_children = screen.draft.children.len();
+
+    screen.handle_key(key(KeyCode::Char('a')));
+    for _ in "runner".chars() {
+        screen.handle_key(key(KeyCode::Backspace));
+    }
+    screen.paste("reviewer");
+    advance_subagent_to_helpers(&mut screen);
+    screen.handle_key(key(KeyCode::Enter));
+
+    assert!(matches!(screen.phase, Phase::SubagentsList));
+    assert_eq!(screen.draft.children.len(), initial_children + 1);
+    assert_eq!(
+        screen
+            .draft
+            .children
+            .last()
+            .map(|child| child.name.as_str()),
+        Some("reviewer")
+    );
+}
+
+#[test]
+fn saving_added_nested_subagent_preserves_the_parent_editor() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "nested-add".into());
+    advance_to_subagents(&mut screen);
+    screen.begin_edit_subagent(0);
+    for _ in "runner".chars() {
+        screen.handle_key(key(KeyCode::Backspace));
+    }
+    screen.paste("coordinator");
+    advance_subagent_to_helpers(&mut screen);
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::SubagentsList)
+    ));
+
+    screen.cursor = 0;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    for _ in "helper".chars() {
+        screen.handle_key(key(KeyCode::Backspace));
+    }
+    screen.paste("reviewer");
+    advance_subagent_to_helpers(&mut screen);
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::SubagentsList)
+    ));
+    screen.handle_key(key(KeyCode::Enter));
+
+    assert!(matches!(screen.phase, Phase::SubagentsList));
+    assert_eq!(screen.draft.children[0].name, "coordinator");
+    assert_eq!(screen.draft.children[0].children.len(), 1);
+    assert_eq!(screen.draft.children[0].children[0].name, "reviewer");
+}
+
 #[test]
 fn tool_model_selection_is_scoped_to_the_draft_being_edited() {
     let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "tool-scope".into());

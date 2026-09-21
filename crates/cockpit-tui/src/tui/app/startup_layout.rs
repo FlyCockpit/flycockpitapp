@@ -1264,7 +1264,7 @@ impl App {
     fn request_onboarding_transition(
         &mut self,
         transition: cockpit_proto::OnboardingTransitionKind,
-        mut settlement: Option<cockpit_proto::OnboardingStageSettlement>,
+        settlement: Option<cockpit_proto::OnboardingStageSettlement>,
     ) {
         let Some(snapshot) = self.onboarding_snapshot.clone() else {
             self.show_toast(

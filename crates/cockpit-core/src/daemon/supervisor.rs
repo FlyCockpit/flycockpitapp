@@ -451,7 +451,7 @@ pub(crate) fn wait_for_worker_promotion() -> Result<()> {
         promotion
             .read_exact(&mut byte)
             .context("waiting for supervisor handover promotion")?;
-        anyhow::ensure!(byte == [b'P'], "invalid supervisor handover promotion");
+        anyhow::ensure!(byte == *b"P", "invalid supervisor handover promotion");
     }
     Ok(())
 }

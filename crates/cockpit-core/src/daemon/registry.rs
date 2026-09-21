@@ -3210,7 +3210,7 @@ impl SessionRegistry {
                 .live
                 .values()
                 .map(|entry| entry.handle.clone())
-                .filter(|handle| handover_activity(handle))
+                .filter(handover_activity)
                 .collect()
         };
         let mut candidates = Vec::with_capacity(handles.len());

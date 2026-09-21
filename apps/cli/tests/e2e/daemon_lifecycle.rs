@@ -178,18 +178,18 @@ async fn spawned_daemons_are_parallel_safe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_running_daemon_replaces_pid_and_keeps_socket_usable() {
+async fn restart_running_daemon_rolls_worker_and_keeps_socket_usable() {
     let daemon = SpawnedDaemon::start().await;
-    let old_pid = daemon.pid();
+    let old_supervisor_pid = daemon.pid();
 
     let output = daemon.restart_via_command(0).await;
     assert!(output.status.success(), "{}", output_text(&output));
-    assert!(output_text(&output).contains("daemon: restarted"));
+    assert!(output_text(&output).contains("daemon: rolled worker"));
 
-    assert_ne!(
+    assert_eq!(
         daemon.pid(),
-        old_pid,
-        "restart must publish a new generation"
+        old_supervisor_pid,
+        "restart must retain the stable supervisor"
     );
     daemon.status().await;
 }
@@ -221,11 +221,7 @@ async fn stop_with_unreachable_socket_waits_for_exact_daemon_retirement() {
     let output = daemon.stop_via_unreachable_socket();
 
     assert!(output.status.success(), "{}", output_text(&output));
-    assert!(
-        output_text(&output).contains("socket unreachable; used SIGTERM"),
-        "{}",
-        output_text(&output)
-    );
+    assert_eq!(output_text(&output).trim(), "daemon: stopped");
     assert!(
         daemon.try_pid().is_none(),
         "stop success must retire pid metadata"

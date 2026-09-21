@@ -72,7 +72,7 @@ impl App {
         if self.header_attention_count() > 0 {
             return HeaderSessionStatus::Attention;
         }
-        if self.reconnect.is_some() {
+        if self.reconnect.is_some() || self.daemon_link.is_some() {
             return HeaderSessionStatus::Reconnecting;
         }
         if self.busy || self.pending.is_some() {

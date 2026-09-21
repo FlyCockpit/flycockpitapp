@@ -1141,6 +1141,14 @@
     "kind": "evt",
     "v": 1
   },
+  "reconnect": {
+    "data": {
+      "generation": 7
+    },
+    "event": "reconnect",
+    "kind": "evt",
+    "v": 1
+  },
   "reconnecting": {
     "data": {
       "agent": "agent-fixture",

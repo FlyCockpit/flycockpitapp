@@ -829,6 +829,14 @@ pub enum Event {
         url: String,
     },
 
+    /// Supervisor control frame: the stable wrapper has made worker
+    /// `generation` ready and this connection must reattach to the same
+    /// durable session. This is daemon-global and intentionally distinct from
+    /// [`Self::Reconnecting`], which reports a model-provider network retry.
+    Reconnect {
+        generation: u64,
+    },
+
     /// A configured stream wait threshold elapsed. Without a backup model the
     /// daemon keeps waiting; with a backup model this warning precedes the
     /// timeout failure that engages fallback.
@@ -1789,6 +1797,7 @@ macro_rules! event_variants {
             (Event::ImageControlConfigChanged { .. }, "image_control_config_changed");
             (Event::ThinkingStarted { .. }, "thinking_started");
             (Event::Reconnecting { .. }, "reconnecting");
+            (Event::Reconnect { .. }, "reconnect");
             (Event::InferenceWarning { .. }, "inference_warning");
             (Event::AssistantTextDelta { .. }, "assistant_text_delta");
             (Event::ReasoningDelta { .. }, "reasoning_delta");

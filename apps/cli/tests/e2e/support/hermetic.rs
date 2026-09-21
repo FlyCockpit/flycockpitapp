@@ -678,17 +678,31 @@ impl HermeticCockpit {
     /// Run the product restart command and refresh the receipt-bound ownership
     /// witness before any later cleanup can observe the replacement as current.
     pub fn restart_daemon(&mut self) -> Output {
+        let before = self.daemon_status_json();
         let output = self.command(&["daemon", "restart"]);
         assert_success("hermetic cockpit daemon restart", &output, &self.home);
         self.wait_for_daemon(DEFAULT_DAEMON_TIMEOUT);
+        let after = self.daemon_status_json();
+        assert_eq!(
+            after["supervisor_pid"], before["supervisor_pid"],
+            "restart must retain supervisor"
+        );
+        assert_ne!(
+            after["worker_pid"], before["worker_pid"],
+            "restart must replace worker"
+        );
+        assert!(
+            after["generation"].as_u64().unwrap() > before["generation"].as_u64().unwrap(),
+            "restart must advance worker generation"
+        );
         #[cfg(any(
             target_os = "linux",
             target_os = "macos",
             target_os = "freebsd",
             windows
         ))]
-        self.install_current_daemon_generation(true)
-            .expect("refresh receipt-verified daemon generation after restart");
+        self.verify_current_supervisor_after_roll()
+            .expect("verify receipt-bound supervisor after worker roll");
         #[cfg(not(any(
             target_os = "linux",
             target_os = "macos",
@@ -699,6 +713,18 @@ impl HermeticCockpit {
             self.daemon_pid = self.pid_from_file();
         }
         output
+    }
+
+    pub fn reexec_daemon_supervisor(&self) -> Output {
+        let output = self.command(&["daemon", "reexec"]);
+        assert_success("hermetic cockpit daemon reexec", &output, &self.home);
+        output
+    }
+
+    pub fn daemon_status_json(&self) -> serde_json::Value {
+        let output = self.command(&["daemon", "status", "--json"]);
+        assert_success("hermetic cockpit daemon status", &output, &self.home);
+        serde_json::from_slice(&output.stdout).expect("decode daemon status JSON")
     }
 
     /// Kill the exact receipt-verified daemon generation retained by this
@@ -729,6 +755,26 @@ impl HermeticCockpit {
             assert!(Instant::now() < deadline, "SIGKILLed daemon did not exit");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Kill only the current supervised worker. The stable wrapper remains
+    /// live and must publish a higher generation without client action.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    pub fn sigkill_worker(&self) -> u32 {
+        let rendezvous = self.home.pid_file().with_file_name("daemon.json");
+        let value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&rendezvous).expect("read supervised daemon rendezvous"),
+        )
+        .expect("decode supervised daemon rendezvous");
+        let worker_pid = value["worker_pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .expect("rendezvous worker_pid");
+        let pid = libc::pid_t::try_from(worker_pid).expect("worker pid fits pid_t");
+        // SAFETY: the PID was read from the receipt-bound supervisor's current
+        // generation record immediately before signaling in this hermetic home.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        worker_pid
     }
 
     /// Adopt the replacement generation spawned by the attached TUI after a
@@ -861,6 +907,32 @@ impl HermeticCockpit {
         // bound to the last verified generation instead of silently losing it.
         self.daemon_generation = Some(current);
         self.daemon_pid = Some(current_pid);
+        Ok(())
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
+    fn verify_current_supervisor_after_roll(&mut self) -> Result<(), String> {
+        let current = self.capture_current_daemon_generation()?;
+        let previous = self
+            .daemon_generation
+            .as_ref()
+            .ok_or_else(|| "daemon worker roll had no supervisor ownership witness".to_string())?;
+        if previous.receipt != current.receipt {
+            return Err("daemon worker roll replaced the stable supervisor receipt".into());
+        }
+        if previous
+            .process
+            .has_exited()
+            .map_err(|error| format!("checking stable supervisor after roll: {error}"))?
+        {
+            return Err("daemon worker roll exited the stable supervisor".into());
+        }
+        self.daemon_generation = Some(current);
         Ok(())
     }
 

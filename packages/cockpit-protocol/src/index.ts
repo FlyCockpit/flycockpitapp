@@ -2892,6 +2892,7 @@ export const knownEventKindSchema = z.enum([
   "queue_updated",
   "queued_user_messages_folded",
   "reasoning_delta",
+  "reconnect",
   "reconnecting",
   "redaction_state",
   "resource_clear",

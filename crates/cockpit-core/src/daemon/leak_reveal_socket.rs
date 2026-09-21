@@ -33,12 +33,13 @@ use crate::daemon::server::{DaemonContext, socket_peer_identity, validate_peer_o
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::leaks::LEAK_REVEAL_MAX_PLAINTEXT_BYTES;
 
-/// Owns both the bound reveal listener and its discovery path. Dropping this
-/// value closes the listener first and retracts the path on every early return,
-/// including a later control-publication failure.
+/// Wraps a bound reveal listener and records whether this instance owns its
+/// discovery path. Dropping an owner closes the listener before retracting the
+/// path; inherited worker copies close only their listener descriptor.
 pub struct BoundRevealSocket {
     pub(crate) listener: Option<DaemonListener>,
     path: std::path::PathBuf,
+    owns_path: bool,
 }
 
 impl BoundRevealSocket {
@@ -46,14 +47,38 @@ impl BoundRevealSocket {
         Self {
             listener: Some(listener),
             path,
+            owns_path: true,
         }
+    }
+
+    /// Wrap an inherited listener without taking ownership of the supervisor's
+    /// published path. Worker generations close only their descriptor copy;
+    /// the stable endpoint owner remains solely responsible for unlinking.
+    #[cfg(unix)]
+    pub(crate) fn inherited(listener: DaemonListener, path: std::path::PathBuf) -> Self {
+        Self {
+            listener: Some(listener),
+            path,
+            owns_path: false,
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.listener
+            .as_ref()
+            .expect("bound reveal listener")
+            .as_raw_fd()
     }
 }
 
 impl Drop for BoundRevealSocket {
     fn drop(&mut self) {
         drop(self.listener.take());
-        let _ = std::fs::remove_file(&self.path);
+        if self.owns_path {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -440,7 +465,11 @@ pub fn bind_reveal_socket(
     paths: &crate::daemon::DaemonPaths,
     #[cfg(windows)] control: &cockpit_host::named_pipe::PipeName,
 ) -> Result<BoundRevealSocket> {
-    let path = paths.leak_reveal_socket();
+    let canonical_path = paths.leak_reveal_socket();
+    #[cfg(unix)]
+    let path = canonical_path;
+    #[cfg(windows)]
+    let path = crate::daemon::supervisor::worker_reveal_identity(&canonical_path);
     let _ = std::fs::remove_file(&path);
     #[cfg(unix)]
     {
@@ -456,5 +485,29 @@ pub fn bind_reveal_socket(
         let listener = crate::daemon::windows_pipe::NamedPipeListener::bind_named(&path, reveal)
             .with_context(|| format!("binding leak-reveal pipe {}", path.display()))?;
         Ok(BoundRevealSocket::new(listener, path))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn inherited_listener_drop_preserves_owner_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reveal.sock");
+        let owner = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let inherited = owner.try_clone().unwrap();
+        inherited.set_nonblocking(true).unwrap();
+        let inherited = tokio::net::UnixListener::from_std(inherited).unwrap();
+
+        drop(BoundRevealSocket::inherited(inherited, path.clone()));
+
+        assert!(
+            path.exists(),
+            "an inherited worker must not unlink the owner path"
+        );
+        drop(owner);
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -1308,6 +1308,24 @@ pub enum SyncCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
+    /// Internal stable endpoint owner. Spawned by `daemon start`.
+    #[command(hide = true)]
+    Supervise {
+        #[arg(long)]
+        no_sandbox: bool,
+        #[arg(long)]
+        resume_all_sessions: bool,
+        #[arg(long, hide = true)]
+        reexec_child: bool,
+    },
+    /// Internal rolling daemon body. Launched only by the supervisor.
+    #[command(hide = true)]
+    Worker {
+        #[arg(long)]
+        no_sandbox: bool,
+        #[arg(long)]
+        resume_all_sessions: bool,
+    },
     /// Start the daemon (foreground by default; `--detach` spawns a child).
     Start {
         /// Run in the foreground. Used by the wrapper that spawns the
@@ -1349,6 +1367,13 @@ pub enum DaemonCommand {
         #[arg(long)]
         no_sandbox: bool,
     },
+    /// Roll the worker to a specific Cockpit binary.
+    Upgrade {
+        #[arg(value_name = "BINARY")]
+        binary: std::path::PathBuf,
+    },
+    /// Re-execute the stable supervisor from its current binary.
+    Reexec,
     /// Print whether the daemon is running.
     Status {
         /// Emit one JSON document with daemon, DB-path, and schema diagnostics.

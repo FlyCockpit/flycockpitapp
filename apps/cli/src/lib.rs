@@ -26,6 +26,7 @@ pub mod test_env {
     }
 }
 pub(crate) mod daemon {
+    pub(crate) use cockpit_core::daemon::supervisor;
     pub(crate) use cockpit_core::daemon::{
         DaemonPaths, DaemonProbe, DaemonStatus, EventSender, SharedRedactionTable, caffeinate,
         capture_restart_release, daemon_pid, derive_restart_no_sandbox, discover, proto,
@@ -744,6 +745,10 @@ pub fn main_entry() -> ExitCode {
     if invoked_as_jq() {
         return commands::jq::run_from_argv0();
     }
+    if let Err(error) = cockpit_core::daemon::supervisor::prepare_process_entry_environment() {
+        eprintln!("Error: preparing supervised worker activation: {error:#}");
+        return ExitCode::FAILURE;
+    }
 
     let launch_start = Instant::now();
 
@@ -895,9 +900,13 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
             | Some(Command::Invocation(_))
             | Some(Command::Daemon(
                 crate::cli::DaemonCommand::Status { .. }
+                    | crate::cli::DaemonCommand::Supervise { .. }
+                    | crate::cli::DaemonCommand::Worker { .. }
                     | crate::cli::DaemonCommand::Start { .. }
                     | crate::cli::DaemonCommand::Stop { .. }
                     | crate::cli::DaemonCommand::Restart { .. }
+                    | crate::cli::DaemonCommand::Upgrade { .. }
+                    | crate::cli::DaemonCommand::Reexec
                     | crate::cli::DaemonCommand::CleanWorktree { .. }
                     | crate::cli::DaemonCommand::DiagnosticSnapshot { .. }
                     | crate::cli::DaemonCommand::DiagnosticFailedCalls { .. }
@@ -2034,6 +2043,25 @@ mod tests {
                 permission_mode: None,
             }
         ))));
+    }
+
+    #[test]
+    fn supervisor_process_roles_do_not_bootstrap_through_their_own_endpoint() {
+        for command in [
+            crate::cli::DaemonCommand::Supervise {
+                no_sandbox: false,
+                resume_all_sessions: false,
+                reexec_child: false,
+            },
+            crate::cli::DaemonCommand::Worker {
+                no_sandbox: false,
+                resume_all_sessions: false,
+            },
+        ] {
+            assert!(!command_requires_workspace_trust(Some(&Command::Daemon(
+                command
+            ))));
+        }
     }
 
     #[test]

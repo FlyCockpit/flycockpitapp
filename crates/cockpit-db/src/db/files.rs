@@ -38,7 +38,7 @@ fn sidecar_parent_sync_forced_failure(path: &Path) -> bool {
 /// open file description. A crashed process therefore cannot leave stale
 /// ownership behind (unlike a create-new or PID-file protocol).
 pub(crate) struct DatabaseOwnerLock {
-    _file: std::fs::File,
+    file: std::fs::File,
 }
 
 impl DatabaseOwnerLock {
@@ -58,7 +58,24 @@ impl DatabaseOwnerLock {
                 lock_path.display()
             )
         })?;
-        Ok(Self { _file: file })
+        Ok(Self { file })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.file.as_raw_fd()
+    }
+
+    #[cfg(unix)]
+    // SAFETY: callers transfer the uniquely owned database-lock descriptor.
+    pub(crate) unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
+        use std::os::fd::FromRawFd as _;
+        Self {
+            // SAFETY: the caller transfers one descriptor that already owns
+            // this process's database lock across exec.
+            file: unsafe { std::fs::File::from_raw_fd(fd) },
+        }
     }
 }
 

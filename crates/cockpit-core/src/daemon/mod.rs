@@ -90,6 +90,7 @@ pub mod scheduler;
 pub mod server;
 #[cfg(any(unix, windows))]
 pub(crate) mod spawn_notify;
+pub mod supervisor;
 
 /// Current daemon-published configuration generation for client settlement
 /// correlation. Clients must read this from the daemon inventory, not infer it
@@ -439,6 +440,9 @@ fn write_endpoint_record_with_receipt_and_canonical(
             socket_path: paths.socket.clone(),
             protocol_version: proto::PROTOCOL_VERSION,
             daemon_version: proto::DAEMON_VERSION.to_string(),
+            worker_pid: None,
+            generation: 0,
+            opened_at_unix_ms: 0,
             receipt: receipt.clone(),
             ephemeral: paths.ephemeral,
         };
@@ -816,8 +820,12 @@ fn prepare_and_publish_socket_pair(
     let reveal = leak_reveal_socket::bind_reveal_socket(paths, control.pipe_name())?;
     // The control identity is the final observable readiness boundary. If it
     // fails, `reveal` drops here and retracts its own identity.
-    control.publish(&paths.socket)?;
-    spawn_notify::report_ready(&paths.socket);
+    if supervisor::is_worker_process() {
+        control.publish(&supervisor::worker_control_identity(&paths.socket))?;
+    } else {
+        control.publish(&paths.socket)?;
+        spawn_notify::report_ready(&paths.socket);
+    }
     Ok((control, reveal))
 }
 
@@ -1649,8 +1657,7 @@ fn spawn_detached_child(
     let mut command = Command::new(exe);
     command
         .arg("daemon")
-        .arg("start")
-        .arg("--foreground")
+        .arg("supervise")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr));
@@ -2760,23 +2767,28 @@ async fn run_foreground_inner_with_boot_db_impl(
             .context("creating writable global Cockpit config directory")?;
     }
     timer.phase("global_config_dir");
-    match probe(&paths).await {
-        DaemonStatus::Running => {
-            return Err(DaemonBindInUse {
-                path: paths.socket.clone(),
+    let supervised_worker = supervisor::is_worker_process();
+    let mut inherited_listeners = supervisor::take_worker_listeners(&paths)?;
+    if !supervised_worker {
+        match probe(&paths).await {
+            DaemonStatus::Running => {
+                return Err(DaemonBindInUse {
+                    path: paths.socket.clone(),
+                }
+                .into());
             }
-            .into());
+            DaemonStatus::IncompatibleProtocol => {
+                anyhow::bail!(
+                    "another daemon is already running (socket: {})",
+                    paths.socket.display()
+                );
+            }
+            _ => {}
         }
-        DaemonStatus::IncompatibleProtocol => {
-            anyhow::bail!(
-                "another daemon is already running (socket: {})",
-                paths.socket.display()
-            );
-        }
-        _ => {}
     }
     timer.phase("probe");
-    if boot_db.is_none()
+    if !supervised_worker
+        && boot_db.is_none()
         && DaemonPaths::resolve_canonical()
             .as_ref()
             .is_ok_and(|canonical| {
@@ -2822,36 +2834,49 @@ async fn run_foreground_inner_with_boot_db_impl(
     // Lifetime is acquired before the short metadata transaction. Cleanup
     // follows the same lifetime -> lifecycle order, preventing inversion, and
     // no PID receipt is ever observable without its kernel witness held.
-    let daemon_lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+    let (pid_receipt, mut metadata_guard) = if supervised_worker {
+        (None, None)
+    } else {
+        let daemon_lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(
+            &paths.pid_file,
+        )
         .with_context(|| format!("acquiring daemon lifetime for {}", paths.pid_file.display()))?;
-    let pid_receipt = reclaim_stale_and_reserve(
-        &paths.pid_file,
-        &paths.socket,
-        endpoint_record.as_deref(),
-        std::process::id(),
-        &executable,
-    )
-    .with_context(|| format!("reserving pid file {}", paths.pid_file.display()))?;
+        let pid_receipt = reclaim_stale_and_reserve(
+            &paths.pid_file,
+            &paths.socket,
+            endpoint_record.as_deref(),
+            std::process::id(),
+            &executable,
+        )
+        .with_context(|| format!("reserving pid file {}", paths.pid_file.display()))?;
+        let guard = ForegroundMetadataGuard::new_with_lifetime(
+            paths.pid_file.clone(),
+            paths.socket.clone(),
+            None,
+            pid_receipt.clone(),
+            daemon_lifetime,
+        )?;
+        (Some(pid_receipt), Some(guard))
+    };
     timer.phase("pid_reserve");
     boot_dbg!("after_reserve");
-    let mut metadata_guard = ForegroundMetadataGuard::new_with_lifetime(
-        paths.pid_file.clone(),
-        paths.socket.clone(),
-        None,
-        pid_receipt.clone(),
-        daemon_lifetime,
-    )?;
     // The product daemon is a process owner: its lifetime witness is released
     // by kernel process teardown, including every early-return and panic path.
     // Injected in-process daemons keep RAII ownership so their test process can
     // host later generations after the supervisor has fully joined.
-    if boot_db.is_none() {
+    if boot_db.is_none()
+        && let Some(metadata_guard) = metadata_guard.as_mut()
+    {
         metadata_guard.hold_lifetime_until_process_exit();
     }
-    match std::fs::remove_file(&paths.socket) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("removing stale daemon socket after reservation"),
+    if !supervised_worker {
+        match std::fs::remove_file(&paths.socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("removing stale daemon socket after reservation");
+            }
+        }
     }
 
     let uses_supplied_boot_db = boot_db.is_some();
@@ -2866,6 +2891,9 @@ async fn run_foreground_inner_with_boot_db_impl(
             )
             .await?
         }
+        None if supervised_worker => {
+            server::boot_supervised_worker(paths.clone(), terminal_factory).await?
+        }
         None => server::boot(paths.clone(), terminal_factory).await?,
     };
     let mut published_listeners = None;
@@ -2876,17 +2904,27 @@ async fn run_foreground_inner_with_boot_db_impl(
             // service. Publish only after DB/non-secret construction, then
             // keep ordinary recovery and dispatch unreachable until the
             // selected vault opens and ReadyServices finishes construction.
-            if uses_supplied_boot_db {
-                write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
-            } else {
-                write_endpoint_record(&paths)?;
+            if let Some(pid_receipt) = pid_receipt.as_ref() {
+                if uses_supplied_boot_db {
+                    write_endpoint_record_with_receipt_and_canonical(&paths, &paths, pid_receipt)?;
+                } else {
+                    write_endpoint_record(&paths)?;
+                }
+                if let Some(metadata_guard) = metadata_guard.as_mut() {
+                    metadata_guard.track_endpoint_record(endpoint_record.clone());
+                }
             }
-            metadata_guard.track_endpoint_record(endpoint_record.clone());
             #[cfg(unix)]
-            let (listener, reveal_listener) =
-                publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?;
+            let (listener, reveal_listener) = match inherited_listeners.take() {
+                Some(listeners) => listeners,
+                None => publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?,
+            };
             #[cfg(windows)]
-            let (listener, reveal_listener) = prepare_and_publish_socket_pair(&paths)?;
+            let (listener, reveal_listener) = match inherited_listeners.take() {
+                Some(listeners) => listeners,
+                None => prepare_and_publish_socket_pair(&paths)?,
+            };
+            supervisor::report_worker_ready()?;
             let locked_outcome = tokio::select! {
                 result = server::run_locked_until_ready(
                     std::sync::Arc::new(locked),
@@ -2902,9 +2940,11 @@ async fn run_foreground_inner_with_boot_db_impl(
                     (ready, listener, reveal_listener)
                 }
                 server::LockedRunOutcome::Shutdown => {
-                    metadata_guard
-                        .cleanup()
-                        .context("retiring locked ephemeral daemon metadata")?;
+                    if let Some(metadata_guard) = metadata_guard.as_mut() {
+                        metadata_guard
+                            .cleanup()
+                            .context("retiring locked ephemeral daemon metadata")?;
+                    }
                     return Ok(());
                 }
             };
@@ -2929,22 +2969,32 @@ async fn run_foreground_inner_with_boot_db_impl(
     let (listener, reveal_listener) = match published_listeners {
         Some(listeners) => listeners,
         None => {
-            if uses_supplied_boot_db {
-                write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &pid_receipt)?;
-            } else {
-                write_endpoint_record(&paths)?;
+            if let Some(pid_receipt) = pid_receipt.as_ref() {
+                if uses_supplied_boot_db {
+                    write_endpoint_record_with_receipt_and_canonical(&paths, &paths, pid_receipt)?;
+                } else {
+                    write_endpoint_record(&paths)?;
+                }
+                if let Some(metadata_guard) = metadata_guard.as_mut() {
+                    metadata_guard.track_endpoint_record(endpoint_record);
+                }
             }
-            metadata_guard.track_endpoint_record(endpoint_record);
             // Prepare both required endpoints before publishing control readiness.
             // Unix reveal binding is observable but harmless until control appears;
             // Windows binds an undiscoverable random control pipe first, derives the
             // reveal sibling from that immutable name, and writes control identity
             // only after the sibling is ready.
             #[cfg(unix)]
-            let listeners =
-                publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?;
+            let listeners = match inherited_listeners.take() {
+                Some(listeners) => listeners,
+                None => publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?,
+            };
             #[cfg(windows)]
-            let listeners = prepare_and_publish_socket_pair(&paths)?;
+            let listeners = match inherited_listeners.take() {
+                Some(listeners) => listeners,
+                None => prepare_and_publish_socket_pair(&paths)?,
+            };
+            supervisor::report_worker_ready()?;
             listeners
         }
     };
@@ -2962,10 +3012,17 @@ async fn run_foreground_inner_with_boot_db_impl(
                 use tokio::signal::unix::{SignalKind, signal};
                 let mut int = signal(SignalKind::interrupt()).ok();
                 let mut term = signal(SignalKind::terminate()).ok();
+                let mut roll = signal(SignalKind::user_defined1()).ok();
                 loop {
-                    tokio::select! {
-                        _ = async { if let Some(s) = int.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
-                        _ = async { if let Some(s) = term.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+                    let reconnect = tokio::select! {
+                        _ = async { if let Some(s) = int.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => false,
+                        _ = async { if let Some(s) = term.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => false,
+                        _ = async { if let Some(s) = roll.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => true,
+                    };
+                    if reconnect {
+                        ctx.broadcast_global(proto::Event::Reconnect {
+                            generation: supervisor::worker_generation().saturating_add(1),
+                        });
                     }
                     server::request_shutdown(&ctx);
                     if ctx.shutdown_signal().is_forced() {
@@ -3144,7 +3201,10 @@ async fn run_foreground_inner_with_boot_db_impl(
     // Retire metadata only after every foreground-owned task has acknowledged
     // cancellation. This never releases the lifetime witness: production
     // ownership ends at process teardown, and injected ownership ends at Drop.
-    let metadata_result = metadata_guard.cleanup();
+    let metadata_result = match metadata_guard.as_mut() {
+        Some(metadata_guard) => metadata_guard.cleanup(),
+        None => Ok(()),
+    };
     let mut failures = Vec::new();
     if let Err(error) = result {
         failures.push(format!("daemon accept loop: {error}"));
@@ -3284,7 +3344,11 @@ async fn ephemeral_last_client_reaper(
 
 /// Kill the running daemon (if any) and clean up its pid + socket files.
 pub fn stop(paths: &DaemonPaths) -> Result<bool> {
-    stop_with_timeout(paths, restart_release_timeout(None))
+    // A supervised stop has two process boundaries: the wrapper first drains
+    // its worker, then releases its own receipt. Keep the legacy synchronous
+    // API bounded, but give it the same lifecycle budget as an attached
+    // client instead of racing the worker's 30-second drain grace.
+    stop_with_timeout(paths, cockpit_client::LIFECYCLE_REQUEST_TIMEOUT)
 }
 
 /// Stop using only the caller's remaining command-level budget.
@@ -3292,6 +3356,12 @@ pub fn stop_with_timeout(paths: &DaemonPaths, timeout: Duration) -> Result<bool>
     let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
         return Ok(false);
     };
+    if matches!(
+        supervisor::request_blocking(paths, supervisor::AdminCommand::Stop),
+        Ok(supervisor::AdminResponse::Stopping { .. })
+    ) {
+        return wait_for_supervisor_admin_stop(paths, &record, timeout);
+    }
     #[cfg(target_os = "linux")]
     return stop_linux(paths, record, timeout);
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -3309,6 +3379,37 @@ pub fn stop_with_timeout(paths: &DaemonPaths, timeout: Duration) -> Result<bool>
         anyhow::bail!(
             "daemon lifecycle metadata exists but this platform has no stable process handle; preserving metadata and refusing numeric signaling"
         )
+    }
+}
+
+fn wait_for_supervisor_admin_stop(
+    paths: &DaemonPaths,
+    record: &DaemonPidRecord,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let receipt_released =
+            cockpit_host::daemon_lifecycle::capture_daemon_lifetime_release(&paths.pid_file)
+                .and_then(cockpit_host::daemon_lifecycle::DaemonLifetimeReleaseWitness::released)
+                .unwrap_or(false);
+        if receipt_released
+            && read_daemon_pid_record(&paths.pid_file).as_ref() != Some(record)
+            && !paths.pid_file.exists()
+            && !paths.socket.exists()
+        {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            let pid = match record {
+                DaemonPidRecord::LegacyNumeric(pid) => *pid,
+                DaemonPidRecord::Receipt(receipt) => receipt.pid,
+            };
+            anyhow::bail!(
+                "timed out waiting for supervisor PID {pid} to drain its worker and release metadata"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -4644,6 +4745,9 @@ mod tests {
             socket_path,
             protocol_version: proto::PROTOCOL_VERSION,
             daemon_version: proto::DAEMON_VERSION.to_string(),
+            worker_pid: None,
+            generation: 0,
+            opened_at_unix_ms: 0,
             receipt,
             ephemeral,
         }

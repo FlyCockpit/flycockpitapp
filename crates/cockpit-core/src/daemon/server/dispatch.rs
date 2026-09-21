@@ -18784,8 +18784,8 @@ async fn handle_serialized_request_impl(
         }
 
         Request::DaemonStatus => Ok(Response::DaemonStatus {
-            pid: std::process::id(),
-            uptime_secs: ctx.started_at.elapsed().as_secs(),
+            pid: super::super::supervisor::published_owner_pid(&ctx.paths),
+            uptime_secs: super::super::supervisor::published_uptime_secs(ctx.started_at.elapsed()),
             active_sessions: ctx.registry.active_session_ids().len() as u32,
             socket_path: ctx.paths.socket.display().to_string(),
             daemon_version: proto::DAEMON_VERSION.to_string(),
@@ -20900,8 +20900,8 @@ async fn handle_concurrent_request_impl(
             Ok(Response::ScheduledJobs { jobs })
         }
         Request::DaemonStatus => Ok(Response::DaemonStatus {
-            pid: std::process::id(),
-            uptime_secs: ctx.started_at.elapsed().as_secs(),
+            pid: super::super::supervisor::published_owner_pid(&ctx.paths),
+            uptime_secs: super::super::supervisor::published_uptime_secs(ctx.started_at.elapsed()),
             active_sessions: ctx.registry.active_session_ids().len() as u32,
             socket_path: ctx.paths.socket.display().to_string(),
             daemon_version: proto::DAEMON_VERSION.to_string(),

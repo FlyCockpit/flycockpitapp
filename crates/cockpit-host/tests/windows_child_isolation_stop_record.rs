@@ -2243,7 +2243,7 @@ fn platform_contract_retains_the_real_runner_and_route_inventory() {
     let contract = include_str!("../docs/windows-child-isolation-contract.md");
 
     for required_text in [
-        "**Status:** **Blocked — no production activation**",
+        "**Status:** **Superseded by #438 — no production activation**",
         "CreateRestrictedToken",
         "PROC_THREAD_ATTRIBUTE_HANDLE_LIST",
         "bInheritHandles = FALSE",
@@ -2261,7 +2261,7 @@ fn platform_contract_retains_the_real_runner_and_route_inventory() {
         "typed `Unavailable`",
         "ERROR_NOT_SUPPORTED` or `ERROR_CALL_NOT_IMPLEMENTED`",
         "NoDocumentedAllowRule",
-        "#399 remains deferred",
+        "#399 with the cross-platform stable supervisor",
         "test-only temporary-object fixture runner",
         "spawns\na second test-runner process",
         "FILE_READ_DATA | FILE_WRITE_DATA |\nSYNCHRONIZE",

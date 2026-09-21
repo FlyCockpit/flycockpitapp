@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::support::{COMPOSER_PLACEHOLDER, HermeticCockpit, HermeticProfile, sgr_left_click};
+use crate::support::{COMPOSER_PLACEHOLDER, HermeticCockpit, HermeticProfile};
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
@@ -10,17 +10,26 @@ const HISTORY_MARKER: &str = "watchdog-history-marker-437";
 const SECOND_HISTORY_MARKER: &str = "watchdog-second-marker-437";
 
 fn session_id_with_durable_marker(db_path: &Path, marker: &str) -> Uuid {
-    let session_id: String = Connection::open(db_path)
-        .expect("open hermetic session db")
-        .query_row(
-            "SELECT session_id FROM session_events \
-             WHERE type = 'user_message' AND data_json LIKE ?1 \
-             ORDER BY seq DESC LIMIT 1",
-            params![format!("%{marker}%")],
-            |row| row.get(0),
-        )
-        .expect("durable user message with history marker");
-    Uuid::parse_str(&session_id).expect("session id in sqlite")
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let session_id = Connection::open(db_path)
+            .expect("open hermetic session db")
+            .query_row(
+                "SELECT session_id FROM session_events \
+                 WHERE type = 'user_message' AND data_json LIKE ?1 \
+                 ORDER BY seq DESC LIMIT 1",
+                params![format!("%{marker}%")],
+                |row| row.get::<_, String>(0),
+            );
+        if let Ok(session_id) = session_id {
+            return Uuid::parse_str(&session_id).expect("session id in sqlite");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "durable user message with history marker {marker} did not commit within 20s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn session_has_durable_user_message(db_path: &Path, session_id: Uuid, marker: &str) -> bool {
@@ -83,28 +92,50 @@ fn attach_with_durable_history() -> HermeticCockpit {
     session
 }
 
+fn wait_for_replacement_rendezvous(
+    session: &HermeticCockpit,
+    old_worker_pid: u32,
+) -> serde_json::Value {
+    let path = session.home().pid_file().with_file_name("daemon.json");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && value["worker_pid"].as_u64() != Some(u64::from(old_worker_pid))
+        {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "supervisor must publish a replacement worker within 10s"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn daemon_rendezvous(session: &HermeticCockpit) -> serde_json::Value {
+    let path = session.home().pid_file().with_file_name("daemon.json");
+    serde_json::from_slice(&std::fs::read(path).expect("read supervised daemon rendezvous"))
+        .expect("decode supervised daemon rendezvous")
+}
+
 #[test]
-fn sigkill_prompts_within_one_second_and_restart_replays_same_session() {
+fn sigkill_worker_reconnects_without_prompt_and_replays_same_session() {
     let mut session = attach_with_durable_history();
     let session_id = session_id_with_durable_marker(&session.home().db_path(), HISTORY_MARKER);
-    let killed_at = Instant::now();
-    session.sigkill_daemon();
+    let status_before = session.daemon_status_json();
+    let rendezvous_before = daemon_rendezvous(&session);
+    let old_worker_pid = session.sigkill_worker();
     session
-        .wait_until_screen("daemon restart prompt", Duration::from_secs(1), |screen| {
-            screen.contains("The daemon stopped unexpectedly. Restart it?")
-                && screen.contains("[ Restart ]")
-                && screen.contains("[ Quit ]")
-        })
-        .expect("receipt watch or socket EOF must raise the prompt within one second");
-    assert!(killed_at.elapsed() <= Duration::from_secs(1));
-
-    // Exercise the actual modal action. The lifecycle host reclaims the stale
-    // endpoint, spawns, and the runner attaches the same durable session id.
-    let restart = session
-        .snapshot()
-        .find_text("[ Restart ]")
-        .expect("restart action geometry");
-    session.write_bytes(&sgr_left_click(restart.sgr_x(), restart.sgr_y()));
+        .wait_until_screen(
+            "supervised reconnect blip",
+            Duration::from_secs(10),
+            |screen| {
+                screen.contains("Reconnecting")
+                    && !screen.contains("The daemon stopped unexpectedly. Restart it?")
+            },
+        )
+        .expect("worker replacement must show a reconnecting blip without a modal");
     session
         .wait_until_screen(
             "same session reattached with history",
@@ -116,7 +147,32 @@ fn sigkill_prompts_within_one_second_and_restart_replays_same_session() {
                     && !screen.contains("Loading session setup")
             },
         )
-        .expect("restart must reattach and replay SQLite history");
+        .expect("supervisor respawn must reattach and replay SQLite history");
+    let rendezvous = wait_for_replacement_rendezvous(&session, old_worker_pid);
+    assert_ne!(
+        rendezvous["worker_pid"].as_u64(),
+        Some(u64::from(old_worker_pid)),
+        "supervisor must publish a new worker pid"
+    );
+    assert_eq!(
+        rendezvous["opened_at_unix_ms"], rendezvous_before["opened_at_unix_ms"],
+        "worker respawn must preserve the supervisor-owned uptime origin"
+    );
+    assert!(
+        rendezvous["generation"]
+            .as_u64()
+            .is_some_and(|value| value > 1),
+        "supervisor must advance generation"
+    );
+    let status_after = session.daemon_status_json();
+    assert_eq!(status_after["worker_pid"], rendezvous["worker_pid"]);
+    assert!(
+        status_after["generation"].as_u64().unwrap()
+            > status_before["generation"].as_u64().unwrap()
+    );
+    assert!(
+        status_after["uptime_ms"].as_u64().unwrap() >= status_before["uptime_ms"].as_u64().unwrap()
+    );
     session
         .wait_until_screen(
             "composer ready after crash restart",
@@ -136,7 +192,30 @@ fn sigkill_prompts_within_one_second_and_restart_replays_same_session() {
         session_id,
         &[HISTORY_MARKER, SECOND_HISTORY_MARKER],
     );
-    session.adopt_current_daemon_generation();
+    session.reap();
+    session.assert_reaped();
+}
+
+#[test]
+fn supervisor_reexec_keeps_attached_session_and_listener() {
+    let mut session = attach_with_durable_history();
+    let before = session.daemon_status_json();
+    session.reexec_daemon_supervisor();
+    session
+        .wait_until_screen(
+            "session remains attached after reexec",
+            Duration::from_secs(10),
+            |screen| {
+                screen.contains(HISTORY_MARKER)
+                    && screen.contains(COMPOSER_PLACEHOLDER)
+                    && !screen.contains("The daemon stopped unexpectedly. Restart it?")
+            },
+        )
+        .expect("supervisor reexec must preserve the attached worker connection");
+    let after = session.daemon_status_json();
+    assert_eq!(after["worker_pid"], before["worker_pid"]);
+    assert_eq!(after["generation"], before["generation"]);
+    assert!(after["uptime_ms"].as_u64().unwrap() >= before["uptime_ms"].as_u64().unwrap());
     session.reap();
     session.assert_reaped();
 }

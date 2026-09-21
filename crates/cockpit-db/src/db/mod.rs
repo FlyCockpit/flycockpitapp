@@ -634,6 +634,43 @@ pub struct Db {
     monty_network_egress_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
+/// Opaque database-lifetime witness retained by the stable daemon supervisor.
+///
+/// Supervised workers may overlap only for the bounded ready/drain handover;
+/// they rely on this process-independent guard instead of each claiming the
+/// singleton lock themselves. It exposes no connection or storage operation.
+pub struct SupervisorDatabaseOwner {
+    lock: files::DatabaseOwnerLock,
+}
+
+impl SupervisorDatabaseOwner {
+    pub fn acquire_default() -> Result<Self> {
+        let path = Db::default_path()?;
+        Ok(Self {
+            lock: files::DatabaseOwnerLock::acquire(&path)?,
+        })
+    }
+
+    #[cfg(unix)]
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.lock.raw_fd()
+    }
+
+    /// Resume the same kernel lock after an in-place supervisor exec.
+    ///
+    /// # Safety
+    /// `fd` must be the uniquely transferred descriptor returned by
+    /// [`Self::raw_fd`] before the exec.
+    #[cfg(unix)]
+    // SAFETY: callers transfer the uniquely owned database-lock descriptor.
+    pub unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
+        Self {
+            // SAFETY: upheld by this function's caller contract.
+            lock: unsafe { files::DatabaseOwnerLock::from_raw_fd(fd) },
+        }
+    }
+}
+
 /// Shared side of the history-scope revocation fence.
 ///
 /// This is deliberately opaque: callers may hold it only while producing one
@@ -782,6 +819,20 @@ impl Db {
             .context("canonical cockpit DB path has no parent")?;
         files::ensure_private_dir(dir).with_context(|| format!("securing {}", dir.display()))?;
         Self::open_daemon_owned(&path)
+    }
+
+    /// Open the canonical database beneath a live stable-supervisor owner.
+    ///
+    /// This is intentionally separate from the general unowned API: callers
+    /// must first establish the supervisor's opaque lifetime witness.
+    pub fn open_default_supervised_worker() -> Result<Self> {
+        OPEN_DEFAULT_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let path = Self::default_path()?;
+        let dir = path
+            .parent()
+            .context("canonical cockpit DB path has no parent")?;
+        files::ensure_private_dir(dir).with_context(|| format!("securing {}", dir.display()))?;
+        Self::open_impl(&path, false)
     }
 
     /// Open a database at an arbitrary path without claiming daemon ownership.
@@ -2662,6 +2713,22 @@ mod tests {
         let db_path = data_dir.join("cockpit.db");
         assert_eq!(mode(&data_dir), 0o700);
         assert_eq!(mode(&db_path), 0o600);
+    }
+
+    #[test]
+    fn supervisor_owner_allows_worker_open_but_excludes_a_second_daemon_owner() {
+        let tmp = TempDir::new().unwrap();
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var("XDG_DATA_HOME", tmp.path());
+
+        let owner = SupervisorDatabaseOwner::acquire_default().unwrap();
+        let worker = Db::open_default_supervised_worker().unwrap();
+        let error = Db::open_default().expect_err("second daemon owner must remain excluded");
+        assert!(error.to_string().contains("live exclusive owner"));
+
+        drop(worker);
+        drop(owner);
+        Db::open_default().expect("ordinary daemon ownership resumes after supervisor exit");
     }
 
     #[tokio::test]

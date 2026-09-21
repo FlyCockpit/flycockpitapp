@@ -1557,6 +1557,7 @@ impl AgentAuthoringScreen {
 
     fn render_subagent_identity(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(theme::NIGHT))
             .title(Span::styled(" Subagent ", Style::new().fg(theme::INK)))
             .padding(Padding::horizontal(1));
@@ -1675,6 +1676,7 @@ impl AgentAuthoringScreen {
         rows: Vec<(Option<usize>, Line<'static>)>,
     ) {
         let block = Block::bordered()
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(if matches!(self.phase, Phase::Review) {
                 theme::GOOD
             } else {
@@ -1741,6 +1743,7 @@ impl AgentAuthoringScreen {
 
     fn render_tool_model_picker(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(theme::BRASS))
             .title(Span::styled(" Models ", Style::new().fg(theme::BRASS)));
         let inner = block.inner(area);

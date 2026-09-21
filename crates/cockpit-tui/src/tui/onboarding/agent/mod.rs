@@ -1457,11 +1457,12 @@ impl AgentAuthoringScreen {
             child.name = self.name_field.text().trim().to_string();
             if let Some(frame) = self.subagent_stack.pop() {
                 self.draft = frame.parent;
-                debug_assert!(Self::replace_or_append_child_at_path(
+                let placed = Self::replace_or_append_child_at_path(
                     &mut self.draft,
                     &frame.child_path,
                     child,
-                ));
+                );
+                debug_assert!(placed, "subagent edit must restore its saved child path");
                 if frame.child_path.len() == 1 {
                     self.phase = Phase::SubagentsList;
                     self.subagents_focus = SubagentsFocus::List;

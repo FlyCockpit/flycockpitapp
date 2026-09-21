@@ -1393,7 +1393,7 @@ impl App {
                         attempt_id: snapshot.attempt_id,
                         expected_revision: snapshot.revision,
                         client_operation_id: request_id.clone(),
-                        transition: transition.clone(),
+                        transition,
                         settlement: settlement.clone(),
                     };
                     match client

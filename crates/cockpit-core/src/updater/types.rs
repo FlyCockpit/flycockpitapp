@@ -130,6 +130,9 @@ pub enum UpdaterError {
     Off,
     NoProductionTrustRoot,
     PackageManager,
+    UnsupportedPlatform,
+    UnsupportedArtifact(String),
+    InvalidArchive(String),
     Io(String),
     Metadata(String),
     TargetNotFound(String),
@@ -154,6 +157,13 @@ impl fmt::Display for UpdaterError {
             Self::PackageManager => f.write_str(
                 "self-update refused: this cockpit binary was installed by a package manager; use that package manager to upgrade",
             ),
+            Self::UnsupportedPlatform => {
+                f.write_str("self-update is unsupported on this platform")
+            }
+            Self::UnsupportedArtifact(path) => {
+                write!(f, "trusted update target has an unsupported artifact name `{path}`")
+            }
+            Self::InvalidArchive(message) => write!(f, "invalid update archive: {message}"),
             Self::Io(message)
             | Self::Metadata(message)
             | Self::Replacement(message)

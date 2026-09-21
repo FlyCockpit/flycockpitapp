@@ -205,6 +205,7 @@ rayon = { workspace = true }
 # contained in deny.toml ([advisories]/[bans]). Do not widen this pin without
 # re-auditing that stack and updating deny.toml in the same change.
 firecrawl = "=2.12.1"
+flate2 = { workspace = true }
 jsonc-parser = { workspace = true }
 # Generated SVG trust boundary. Exact direct pins; both run without optional
 # default features so parser/sanitizer behavior cannot drift through features.

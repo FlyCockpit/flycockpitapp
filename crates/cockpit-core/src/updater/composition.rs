@@ -105,7 +105,7 @@ pub fn installed_composition() -> InstalledUpdaterComposition {
         let _ceremony_evidence = super::types::production_trust_root_evidence();
         let trust_root: Option<Arc<dyn TrustRoot>> = None;
         InstalledUpdaterComposition {
-            updater: Box::new(ActiveUpdater::new(
+            updater: Box::new(ActiveUpdater::new_for_platform_result(
                 policy,
                 current_platform(),
                 trust_root,

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cockpit_config::config::update_channel::UpdateChannel;
+use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -142,7 +143,7 @@ fn resolve_brew_prefix() -> Option<PathBuf> {
 
 pub struct ActiveUpdater {
     policy: InstallationPolicy,
-    platform: String,
+    platform: Result<String, UpdaterError>,
     trust_root: Option<Arc<dyn TrustRoot>>,
     repository: Arc<dyn MetadataRepository>,
     fetcher: Arc<dyn TargetFetcher>,
@@ -165,7 +166,30 @@ impl ActiveUpdater {
     ) -> Self {
         Self {
             policy,
-            platform: platform.into(),
+            platform: Ok(platform.into()),
+            trust_root,
+            repository,
+            fetcher,
+            replacer,
+            supervisor,
+            lock_store,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_platform_result(
+        policy: InstallationPolicy,
+        platform: Result<String, UpdaterError>,
+        trust_root: Option<Arc<dyn TrustRoot>>,
+        repository: Arc<dyn MetadataRepository>,
+        fetcher: Arc<dyn TargetFetcher>,
+        replacer: Arc<dyn BinaryReplacer>,
+        supervisor: Arc<dyn SupervisorMaintenanceClient>,
+        lock_store: Arc<dyn UpdateLockStore>,
+    ) -> Self {
+        Self {
+            policy,
+            platform,
             trust_root,
             repository,
             fetcher,
@@ -179,6 +203,10 @@ impl ActiveUpdater {
         self.trust_root
             .as_deref()
             .ok_or(UpdaterError::NoProductionTrustRoot)
+    }
+
+    fn platform(&self) -> Result<&str, UpdaterError> {
+        self.platform.as_deref().map_err(Clone::clone)
     }
 
     async fn verified_metadata(
@@ -195,10 +223,11 @@ impl ActiveUpdater {
         metadata: &'a VerifiedRepositoryMetadata,
         requested: Option<&str>,
     ) -> Result<&'a UpdateTargetDescriptor, UpdaterError> {
+        let platform = self.platform()?;
         metadata
             .targets
             .iter()
-            .filter(|target| target.platform == self.platform)
+            .filter(|target| target.platform == platform)
             .filter(|target| requested.is_none_or(|version| target.version == version))
             .max_by(|left, right| compare_versions(&left.version, &right.version))
             .ok_or_else(|| UpdaterError::TargetNotFound(requested.unwrap_or("latest").to_string()))
@@ -209,6 +238,7 @@ impl ActiveUpdater {
         channel: UpdateChannel,
         version: Option<&str>,
     ) -> Result<ManualUpdateOutcome, UpdaterError> {
+        self.platform()?;
         let update_id = Uuid::now_v7();
         let installed_path_digest =
             hex_sha256(self.policy.current_exe().as_os_str().as_encoded_bytes());
@@ -254,9 +284,12 @@ impl ActiveUpdater {
         };
         let staged = self.fetcher.download_target(&target).await?;
         verify_target(&staged, &target)?;
+        let staged_binary = extract_executable(&staged, &target)?;
         receipt.state = UpdateApplyReceiptState::VerifiedStaged;
         receipt.updated_at_unix_ms = now_unix_ms();
-        self.replacer.stage_and_swap(&staged, &mut receipt).await?;
+        self.replacer
+            .stage_and_swap(staged_binary.path(), &mut receipt)
+            .await?;
         receipt.state = UpdateApplyReceiptState::Swapped;
         receipt.updated_at_unix_ms = now_unix_ms();
         if let Err(error) = self
@@ -294,6 +327,7 @@ impl Updater for ActiveUpdater {
             Ok(InstallationAuthorization::SelfUpdate) => {}
         }
         let result = async {
+            self.platform()?;
             let metadata = self.verified_metadata(channel).await?;
             let target = self.select_target(&metadata, None)?;
             Ok::<_, UpdaterError>(target.version.clone())
@@ -330,7 +364,10 @@ impl Updater for ActiveUpdater {
             .policy
             .authorize()
             .and_then(|authorization| match authorization {
-                InstallationAuthorization::SelfUpdate => self.root().map(|_| ()),
+                InstallationAuthorization::SelfUpdate => self
+                    .platform()
+                    .map(|_| ())
+                    .and_then(|()| self.root().map(|_| ())),
                 InstallationAuthorization::Homebrew { .. } => Err(UpdaterError::PackageManager),
             });
         match result {
@@ -338,6 +375,176 @@ impl Updater for ActiveUpdater {
             Err(reason) => UpdateStatusSnapshot::Unavailable { channel, reason },
         }
     }
+}
+
+enum StagedExecutable {
+    Raw(PathBuf),
+    Temporary(tempfile::NamedTempFile),
+}
+
+impl StagedExecutable {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Raw(path) => path,
+            Self::Temporary(file) => file.path(),
+        }
+    }
+}
+
+fn extract_executable(
+    staged: &Path,
+    target: &UpdateTargetDescriptor,
+) -> Result<StagedExecutable, UpdaterError> {
+    if target.path.ends_with(".bin") {
+        return Ok(StagedExecutable::Raw(staged.to_path_buf()));
+    }
+    if target.path.ends_with(".tar.gz") {
+        return extract_tar_gz_executable(staged).map(StagedExecutable::Temporary);
+    }
+    if target.path.ends_with(".zip") {
+        return extract_zip_executable(staged).map(StagedExecutable::Temporary);
+    }
+    Err(UpdaterError::UnsupportedArtifact(target.path.clone()))
+}
+
+fn extract_tar_gz_executable(staged: &Path) -> Result<tempfile::NamedTempFile, UpdaterError> {
+    use std::io::Read;
+
+    let source = std::fs::File::open(staged)
+        .map_err(|error| UpdaterError::io("opening downloaded tarball", error))?;
+    let mut archive = Vec::new();
+    GzDecoder::new(source)
+        .read_to_end(&mut archive)
+        .map_err(|error| UpdaterError::InvalidArchive(format!("reading gzip stream: {error}")))?;
+    extract_tar_member(&archive)
+}
+
+fn extract_tar_member(archive: &[u8]) -> Result<tempfile::NamedTempFile, UpdaterError> {
+    const HEADER_SIZE: usize = 512;
+    let mut offset = 0;
+    let mut executable = None;
+    while offset < archive.len() {
+        let header_end = offset
+            .checked_add(HEADER_SIZE)
+            .ok_or_else(|| UpdaterError::InvalidArchive("tar header offset overflow".into()))?;
+        let header = archive
+            .get(offset..header_end)
+            .ok_or_else(|| UpdaterError::InvalidArchive("truncated tar header".into()))?;
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let size = tar_octal(&header[124..136], "member size")?;
+        let mode = tar_octal(&header[100..108], "member mode")?;
+        let name = tar_name(header)?;
+        let data_start = header_end;
+        let data_end = data_start
+            .checked_add(size)
+            .ok_or_else(|| UpdaterError::InvalidArchive("tar member size overflow".into()))?;
+        let data = archive.get(data_start..data_end).ok_or_else(|| {
+            UpdaterError::InvalidArchive(format!("truncated tar member `{name}`"))
+        })?;
+        let is_executable = matches!(name.as_str(), "cockpit" | "cockpit-cli")
+            && matches!(header[156], 0 | b'0')
+            && mode & 0o111 != 0;
+        if is_executable && executable.replace((data.to_vec(), mode)).is_some() {
+            return Err(UpdaterError::InvalidArchive(
+                "tarball contains more than one cockpit executable".into(),
+            ));
+        }
+        let padded = size
+            .checked_add(HEADER_SIZE - 1)
+            .ok_or_else(|| UpdaterError::InvalidArchive("tar member padding overflow".into()))?
+            / HEADER_SIZE
+            * HEADER_SIZE;
+        offset = data_start
+            .checked_add(padded)
+            .ok_or_else(|| UpdaterError::InvalidArchive("tar member offset overflow".into()))?;
+    }
+    let Some((bytes, mode)) = executable else {
+        return Err(UpdaterError::InvalidArchive(
+            "tarball contains no executable cockpit member".into(),
+        ));
+    };
+    let mut output = tempfile::NamedTempFile::new()
+        .map_err(|error| UpdaterError::io("creating extracted update staging file", error))?;
+    use std::io::Write;
+    output
+        .write_all(&bytes)
+        .map_err(|error| UpdaterError::io("writing extracted update staging file", error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(mode as u32))
+            .map_err(|error| UpdaterError::io("setting extracted executable permissions", error))?;
+    }
+    Ok(output)
+}
+
+fn tar_octal(field: &[u8], label: &str) -> Result<usize, UpdaterError> {
+    let value = std::str::from_utf8(field)
+        .map_err(|_| UpdaterError::InvalidArchive(format!("tar {label} is not UTF-8")))?
+        .trim_matches(['\0', ' ']);
+    if value.is_empty() {
+        return Ok(0);
+    }
+    usize::from_str_radix(value, 8)
+        .map_err(|_| UpdaterError::InvalidArchive(format!("tar {label} is not octal")))
+}
+
+fn tar_name(header: &[u8]) -> Result<String, UpdaterError> {
+    let name = std::str::from_utf8(&header[..100])
+        .map_err(|_| UpdaterError::InvalidArchive("tar member name is not UTF-8".into()))?
+        .trim_end_matches('\0');
+    if name.is_empty() {
+        return Err(UpdaterError::InvalidArchive(
+            "tar member name is empty".into(),
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+#[cfg(windows)]
+fn extract_zip_executable(staged: &Path) -> Result<tempfile::NamedTempFile, UpdaterError> {
+    use std::io::{Read, Write};
+
+    let source = std::fs::File::open(staged)
+        .map_err(|error| UpdaterError::io("opening downloaded zip archive", error))?;
+    let mut archive = zip::ZipArchive::new(source)
+        .map_err(|error| UpdaterError::InvalidArchive(format!("reading zip archive: {error}")))?;
+    let mut executable = None;
+    for index in 0..archive.len() {
+        let mut member = archive.by_index(index).map_err(|error| {
+            UpdaterError::InvalidArchive(format!("reading zip member: {error}"))
+        })?;
+        if member.name() == "cockpit.exe" && member.is_file() {
+            if executable.is_some() {
+                return Err(UpdaterError::InvalidArchive(
+                    "zip archive contains more than one cockpit.exe member".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            member.read_to_end(&mut bytes).map_err(|error| {
+                UpdaterError::InvalidArchive(format!("reading cockpit.exe member: {error}"))
+            })?;
+            executable = Some(bytes);
+        }
+    }
+    let bytes = executable.ok_or_else(|| {
+        UpdaterError::InvalidArchive("zip archive contains no cockpit.exe member".into())
+    })?;
+    let mut output = tempfile::NamedTempFile::new()
+        .map_err(|error| UpdaterError::io("creating extracted update staging file", error))?;
+    output
+        .write_all(&bytes)
+        .map_err(|error| UpdaterError::io("writing extracted update staging file", error))?;
+    Ok(output)
+}
+
+#[cfg(not(windows))]
+fn extract_zip_executable(_staged: &Path) -> Result<tempfile::NamedTempFile, UpdaterError> {
+    Err(UpdaterError::UnsupportedArtifact(
+        "zip artifacts are only supported on Windows".into(),
+    ))
 }
 
 fn verify_target(path: &Path, target: &UpdateTargetDescriptor) -> Result<(), UpdaterError> {
@@ -379,10 +586,10 @@ fn process_start_id(pid: u32) -> Result<String, UpdaterError> {
     Ok(format!("{}:{}", identity.primary, identity.secondary))
 }
 
-pub fn current_platform() -> String {
+pub fn current_platform() -> Result<String, UpdaterError> {
     cargo_dist_target_for(std::env::consts::ARCH, std::env::consts::OS)
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS))
+        .ok_or(UpdaterError::UnsupportedPlatform)
 }
 
 fn cargo_dist_target_for(arch: &str, os: &str) -> Option<&'static str> {
@@ -412,7 +619,96 @@ fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::UntrustedRepositoryMetadata;
     use super::*;
+
+    struct NeverRepository;
+
+    #[async_trait]
+    impl MetadataRepository for NeverRepository {
+        async fn fetch_metadata(
+            &self,
+            _channel: UpdateChannel,
+        ) -> Result<UntrustedRepositoryMetadata, UpdaterError> {
+            panic!("unsupported platforms must not fetch metadata")
+        }
+    }
+
+    struct NeverFetcher;
+
+    #[async_trait]
+    impl TargetFetcher for NeverFetcher {
+        async fn download_target(
+            &self,
+            _target: &UpdateTargetDescriptor,
+        ) -> Result<PathBuf, UpdaterError> {
+            panic!("unsupported platforms must not download targets")
+        }
+    }
+
+    struct NeverReplacer;
+
+    #[async_trait]
+    impl BinaryReplacer for NeverReplacer {
+        async fn stage_and_swap(
+            &self,
+            _staged: &PathBuf,
+            _receipt: &mut UpdateApplyReceipt,
+        ) -> Result<(), UpdaterError> {
+            panic!("unsupported platforms must not replace binaries")
+        }
+    }
+
+    struct NeverSupervisor;
+
+    #[async_trait]
+    impl SupervisorMaintenanceClient for NeverSupervisor {
+        async fn request_maintenance(
+            &self,
+            _request: SupervisorMaintenanceRequest,
+        ) -> Result<(), UpdaterError> {
+            panic!("unsupported platforms must not request maintenance")
+        }
+    }
+
+    struct MemoryLock;
+
+    #[async_trait]
+    impl UpdateLockStore for MemoryLock {
+        async fn acquire_exclusive(&self, _record: &UpdateLockRecord) -> Result<(), UpdaterError> {
+            Ok(())
+        }
+
+        async fn release(&self, _update_id: Uuid) -> Result<(), UpdaterError> {
+            Ok(())
+        }
+    }
+
+    fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut tar = Vec::new();
+        for (name, bytes, mode) in entries {
+            let mut header = [0_u8; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            write_tar_octal(&mut header[100..108], *mode as usize);
+            write_tar_octal(&mut header[124..136], bytes.len());
+            header[156] = b'0';
+            tar.extend_from_slice(&header);
+            tar.extend_from_slice(bytes);
+            tar.resize((tar.len() + 511) & !511, 0);
+        }
+        tar.resize(tar.len() + 1024, 0);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn write_tar_octal(field: &mut [u8], value: usize) {
+        let encoded = format!("{value:0width$o}", width = field.len() - 1);
+        field[..encoded.len()].copy_from_slice(encoded.as_bytes());
+        field[field.len() - 1] = 0;
+    }
 
     fn write_receipt(path: &Path, prefix: &Path) {
         std::fs::write(
@@ -537,7 +833,7 @@ mod tests {
         let mut target = UpdateTargetDescriptor {
             version: "9.9.9".into(),
             platform: "test".into(),
-            path: "target".into(),
+            path: "target.bin".into(),
             length: 8,
             sha256: hex_sha256(b"verified"),
         };
@@ -553,5 +849,105 @@ mod tests {
         target.length = 8;
         target.sha256 = "0".repeat(64);
         assert_eq!(verify_target(&path, &target), Err(UpdaterError::TargetHash));
+    }
+
+    #[tokio::test]
+    async fn verified_tarball_places_its_executable_member_not_archive_bytes() {
+        use super::super::platform::PlatformBinaryReplacer;
+
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("cockpit.tar.gz");
+        let installed = temp.path().join("cockpit");
+        let executable = b"new executable member";
+        let archive_bytes = tar_gz(&[("cockpit", executable, 0o755)]);
+        std::fs::write(&archive, &archive_bytes).unwrap();
+        std::fs::write(&installed, b"old executable").unwrap();
+        let target = UpdateTargetDescriptor {
+            version: "9.9.9".into(),
+            platform: "test".into(),
+            path: "cockpit.tar.gz".into(),
+            length: archive_bytes.len() as u64,
+            sha256: hex_sha256(&archive_bytes),
+        };
+        verify_target(&archive, &target).unwrap();
+        let extracted = extract_executable(&archive, &target).unwrap();
+        let mut receipt = UpdateApplyReceipt {
+            update_id: Uuid::now_v7(),
+            state: UpdateApplyReceiptState::VerifiedStaged,
+            target: Some(target),
+            updated_at_unix_ms: 1,
+        };
+        PlatformBinaryReplacer::new(installed.clone())
+            .stage_and_swap(&extracted.path().to_path_buf(), &mut receipt)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(installed).unwrap(), executable);
+    }
+
+    #[test]
+    fn tarball_without_exactly_one_executable_member_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, entries) in [
+            ("zero", vec![("README", &b"text"[..], 0o644)]),
+            (
+                "two",
+                vec![
+                    ("cockpit", &b"first"[..], 0o755),
+                    ("cockpit-cli", &b"second"[..], 0o755),
+                ],
+            ),
+        ] {
+            let archive = temp.path().join(format!("{name}.tar.gz"));
+            std::fs::write(&archive, tar_gz(&entries)).unwrap();
+            let target = UpdateTargetDescriptor {
+                version: "9.9.9".into(),
+                platform: "test".into(),
+                path: format!("{name}.tar.gz"),
+                length: std::fs::metadata(&archive).unwrap().len(),
+                sha256: hex_sha256(&std::fs::read(&archive).unwrap()),
+            };
+            assert!(matches!(
+                extract_executable(&archive, &target),
+                Err(UpdaterError::InvalidArchive(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_platform_is_reported_without_target_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("cockpit");
+        let receipt = temp.path().join("receipt.json");
+        std::fs::write(&binary, b"binary").unwrap();
+        write_receipt(&receipt, temp.path());
+        let updater = ActiveUpdater::new_for_platform_result(
+            InstallationPolicy::new(InstallationPaths {
+                current_exe: binary,
+                receipt,
+                brew_prefix: None,
+            }),
+            Err(UpdaterError::UnsupportedPlatform),
+            None,
+            Arc::new(NeverRepository),
+            Arc::new(NeverFetcher),
+            Arc::new(NeverReplacer),
+            Arc::new(NeverSupervisor),
+            Arc::new(MemoryLock),
+        );
+        assert_eq!(
+            updater.check(UpdateChannel::Auto).await,
+            UpdateCheckResult::Failed(UpdaterError::UnsupportedPlatform)
+        );
+        assert_eq!(
+            updater.status(UpdateChannel::Auto),
+            UpdateStatusSnapshot::Unavailable {
+                channel: UpdateChannel::Auto,
+                reason: UpdaterError::UnsupportedPlatform,
+            }
+        );
+        assert_eq!(
+            updater.apply_manual(UpdateChannel::Auto, None).await,
+            Err(UpdaterError::UnsupportedPlatform)
+        );
     }
 }

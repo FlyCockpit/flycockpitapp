@@ -252,9 +252,7 @@ struct RecordingSupervisor {
     installed: PathBuf,
     expected: Vec<u8>,
     events: Arc<Mutex<Vec<&'static str>>>,
-    rolls: Arc<Mutex<usize>>,
-    uptime_before: u64,
-    uptime_after: u64,
+    maintenance_requests: Arc<Mutex<usize>>,
 }
 
 #[async_trait]
@@ -268,9 +266,8 @@ impl SupervisorMaintenanceClient for RecordingSupervisor {
             self.events.lock().unwrap().as_slice(),
             ["metadata_verified", "placed"]
         );
-        assert_eq!(self.uptime_after, self.uptime_before);
-        *self.rolls.lock().unwrap() += 1;
-        self.events.lock().unwrap().push("rolled");
+        *self.maintenance_requests.lock().unwrap() += 1;
+        self.events.lock().unwrap().push("maintenance_requested");
         Ok(())
     }
 }
@@ -295,7 +292,7 @@ impl UpdateLockStore for RecordingLock {
 }
 
 #[tokio::test]
-async fn receipt_fixture_tuf_target_updates_then_rolls_once_with_continuous_uptime() {
+async fn receipt_fixture_tuf_target_places_binary_then_requests_maintenance_once() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("cockpit");
     let staged = temp.path().join("downloaded-cockpit");
@@ -307,7 +304,7 @@ async fn receipt_fixture_tuf_target_updates_then_rolls_once_with_continuous_upti
     let target = UpdateTargetDescriptor {
         version: "9.9.9".into(),
         platform: "test-platform".into(),
-        path: "cockpit-test.tar.gz".into(),
+        path: "cockpit-test.bin".into(),
         length: new_bytes.len() as u64,
         sha256: sha256(&new_bytes),
     };
@@ -321,7 +318,7 @@ async fn receipt_fixture_tuf_target_updates_then_rolls_once_with_continuous_upti
         metadata: fixture_root.metadata(),
     };
     let events = Arc::new(Mutex::new(Vec::new()));
-    let rolls = Arc::new(Mutex::new(0));
+    let maintenance_requests = Arc::new(Mutex::new(0));
     let lock = Arc::new(RecordingLock::default());
     let updater = ActiveUpdater::new(
         policy(binary.clone(), receipt, None),
@@ -340,9 +337,7 @@ async fn receipt_fixture_tuf_target_updates_then_rolls_once_with_continuous_upti
             installed: binary.clone(),
             expected: new_bytes.clone(),
             events: events.clone(),
-            rolls: rolls.clone(),
-            uptime_before: 41_000,
-            uptime_after: 41_000,
+            maintenance_requests: maintenance_requests.clone(),
         }),
         lock.clone(),
     );
@@ -360,9 +355,9 @@ async fn receipt_fixture_tuf_target_updates_then_rolls_once_with_continuous_upti
     assert_eq!(std::fs::read(binary).unwrap(), new_bytes);
     assert_eq!(
         events.lock().unwrap().as_slice(),
-        ["metadata_verified", "placed", "rolled"]
+        ["metadata_verified", "placed", "maintenance_requested"]
     );
-    assert_eq!(*rolls.lock().unwrap(), 1);
+    assert_eq!(*maintenance_requests.lock().unwrap(), 1);
     assert_eq!(*lock.acquired.lock().unwrap(), 1);
     assert_eq!(*lock.released.lock().unwrap(), 1);
 }
@@ -382,7 +377,7 @@ async fn corrupt_target_never_places_or_rolls() {
         targets: vec![UpdateTargetDescriptor {
             version: "9.9.9".into(),
             platform: "test-platform".into(),
-            path: "cockpit-test.tar.gz".into(),
+            path: "cockpit-test.bin".into(),
             length: 7,
             sha256: "0".repeat(64),
         }],

@@ -28,8 +28,8 @@ use cockpit_config::extended::{
 
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
-    SettingsScrollRegionId, focused_field_style, marker, muted_style, push_text_field_at_cursor,
-    selected_line_from_marker, selected_style, warning_style,
+    SettingsScrollRegionId, focused_field_style, marker, muted_style, selected_line_from_marker,
+    selected_style, warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -352,8 +352,7 @@ impl SettingsCx {
         // Rows: 0..n harnesses, then [+ add], [seed presets], [reset].
         let add_row = n;
         let seed_row = n + 1;
-        let reset_row = n + 2;
-        let total = n + 3;
+        let total = n + 2;
 
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
@@ -400,13 +399,6 @@ impl SettingsCx {
                     s.adding = Some(TextField::default());
                 } else if s.cursor == seed_row {
                     s.status = self.seed_presets_status();
-                } else if s.cursor == reset_row {
-                    if s.reset.activate() == ResetOutcome::Apply {
-                        self.extended.harnesses.clear();
-                        s.status = self.seed_presets_status();
-                    } else {
-                        s.status = None;
-                    }
                 }
             }
             _ => {}
@@ -533,6 +525,7 @@ impl SettingsCx {
         let yellow = warning_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
+        let mut add_field_line = None;
         lines.push(Line::from(Span::styled(
             "External harnesses (harness_invoke)".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -583,7 +576,6 @@ impl SettingsCx {
 
         let add_row = names.len();
         let seed_row = names.len() + 1;
-        let reset_row = names.len() + 2;
         lines.push(Line::default());
         bindings.push((lines.len(), super::pointer_actions::HarnessesAction::Add));
         lines.push(synthetic_row("[+ add harness]", s.cursor == add_row));
@@ -595,14 +587,6 @@ impl SettingsCx {
             "[seed installed presets]",
             s.cursor == seed_row,
         ));
-        bindings.push((
-            lines.len(),
-            super::pointer_actions::HarnessesAction::ResetAndSeedPresets,
-        ));
-        lines.push(
-            s.reset
-                .render_line(s.cursor == reset_row, "reset to verified presets"),
-        );
         if let Some(name) = names.get(s.cursor) {
             lines.push(Line::default());
             if s.delete_pending {
@@ -629,15 +613,9 @@ impl SettingsCx {
 
         if let Some(buf) = &s.adding {
             lines.push(Line::default());
-            push_text_field_at_cursor(
-                &mut lines,
-                area.width,
-                "new harness name",
-                buf.text(),
-                buf.cursor(),
-                true,
-                None,
-            );
+            let line = lines.len();
+            lines.extend([Line::default(), Line::default(), Line::default()]);
+            add_field_line = Some((line, buf));
         }
         if let Some(status) = &s.status {
             lines.push(Line::default());
@@ -656,6 +634,35 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, buf)) = add_field_line {
+            let offset = self.scroll_states.offset_for("harnesses:list");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) =
+                    crate::tui::chrome::render_field(frame, rect, "New harness name", buf, true, "")
+                {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Harnesses(
+                                super::pointer_actions::HarnessesAction::Add,
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 
     fn render_harness_edit(&self, frame: &mut Frame, area: Rect, s: &EditState) {
@@ -663,6 +670,7 @@ impl SettingsCx {
         let yellow = warning_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
+        let mut edit_field_line = None;
         lines.push(Line::from(Span::styled(
             format!("Harness: {}", s.name),
             Style::default()
@@ -705,58 +713,9 @@ impl SettingsCx {
         if let Some(buf) = &s.editing {
             let field = FIELDS[s.cursor.min(FIELDS.len() - 1)];
             lines.push(Line::default());
-            let edit_line = lines.len();
-            push_text_field_at_cursor(
-                &mut lines,
-                area.width,
-                field.label(),
-                buf.text(),
-                buf.cursor(),
-                true,
-                None,
-            );
-            let field_x = field.label().chars().count().saturating_add(2) as u16;
-            self.pointer_surface
-                .register(super::shell::SettingsPointerTarget {
-                    rect: Rect::new(
-                        area.x.saturating_add(field_x),
-                        area.y.saturating_add(edit_line as u16),
-                        area.width.saturating_sub(field_x),
-                        1,
-                    ),
-                    action: super::shell::SettingsPointerAction::Page(
-                        super::pointer_actions::SettingsPointerAction::Harnesses(
-                            super::pointer_actions::HarnessesAction::EditField(field.pointer_id()),
-                        ),
-                    ),
-                    enabled: true,
-                    disabled_reason: None,
-                });
-            let action_line = lines.len();
-            lines.push(Line::from(vec![
-                Span::styled("[Save]", selected_style()),
-                Span::raw("  "),
-                Span::styled("[Cancel]", selected_style()),
-            ]));
-            for (action, x, width) in [
-                (super::pointer_actions::HarnessesAction::Save, 0, 6),
-                (super::pointer_actions::HarnessesAction::Cancel, 8, 8),
-            ] {
-                self.pointer_surface
-                    .register(super::shell::SettingsPointerTarget {
-                        rect: Rect::new(
-                            area.x + x,
-                            area.y.saturating_add(action_line as u16),
-                            width,
-                            1,
-                        ),
-                        action: super::shell::SettingsPointerAction::Page(
-                            super::pointer_actions::SettingsPointerAction::Harnesses(action),
-                        ),
-                        enabled: true,
-                        disabled_reason: None,
-                    });
-            }
+            let line = lines.len();
+            lines.extend([Line::default(), Line::default(), Line::default()]);
+            edit_field_line = Some((line, field, buf));
         }
         if let Some(status) = &s.status {
             lines.push(Line::default());
@@ -775,6 +734,37 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, field, buf)) = edit_field_line {
+            let offset = self.scroll_states.offset_for("harnesses:edit");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) =
+                    crate::tui::chrome::render_field(frame, rect, field.label(), buf, true, "")
+                {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Harnesses(
+                                super::pointer_actions::HarnessesAction::EditField(
+                                    field.pointer_id(),
+                                ),
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 }
 
@@ -909,7 +899,18 @@ impl SettingsPage for HarnessesPage {
             (
                 HarnessesPage::List(state),
                 super::pointer_actions::HarnessesAction::ResetAndSeedPresets,
-            ) => state.cursor = cx.harness_names().len() + 2,
+            ) => {
+                match state.reset.activate() {
+                    ResetOutcome::Apply => {
+                        cx.extended.harnesses.clear();
+                        state.status = cx.seed_presets_status();
+                    }
+                    ResetOutcome::Armed => {
+                        state.status = None;
+                    }
+                }
+                return Nav::Stay;
+            }
             (
                 HarnessesPage::Edit(state),
                 super::pointer_actions::HarnessesAction::EditField(id),
@@ -947,10 +948,33 @@ impl SettingsPage for HarnessesPage {
                 .borrow()
                 .iter()
                 .find(|target| {
-                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                    target.rect.height == 3
+                        && target.action
+                            == super::shell::SettingsPointerAction::Page(action.clone())
                 })
-                .map_or(column, |target| target.rect.x);
+                // `render_field`'s text starts after its border and padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
             buf.set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
+            return Nav::Stay;
+        }
+        if matches!(harness_action, super::pointer_actions::HarnessesAction::Add)
+            && let HarnessesPage::List(state) = self
+            && let Some(buf) = state.adding.as_mut()
+        {
+            let field_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.rect.height == 3
+                        && target.action
+                            == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field`'s text starts after its border and padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            buf.set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
+            return Nav::Stay;
         }
         self.handle_pointer_control(cx, action)
     }
@@ -1022,6 +1046,48 @@ impl SettingsPage for HarnessesPage {
                 }
             }
         }
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{HarnessesAction, SettingsPointerAction};
+        let HarnessesPage::List(state) = self else {
+            if let HarnessesPage::Edit(s) = self
+                && s.editing.is_some()
+            {
+                return super::shell::finish_help_row(
+                    cx,
+                    vec![
+                        super::shell::SettingsHelpAction {
+                            label: "Save",
+                            enabled: true,
+                            primary: true,
+                            action: SettingsPointerAction::Harnesses(HarnessesAction::Save),
+                        },
+                        super::shell::SettingsHelpAction {
+                            label: "Cancel",
+                            enabled: true,
+                            primary: false,
+                            action: SettingsPointerAction::Harnesses(HarnessesAction::Cancel),
+                        },
+                    ],
+                );
+            }
+            return super::shell::finish_help_row(cx, Vec::new());
+        };
+        let label = if state.reset.is_pending() {
+            "confirm reset"
+        } else {
+            "reset to verified presets"
+        };
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
+                label,
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Harnesses(HarnessesAction::ResetAndSeedPresets),
+            }],
+        )
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

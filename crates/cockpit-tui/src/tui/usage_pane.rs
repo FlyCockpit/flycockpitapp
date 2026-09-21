@@ -112,7 +112,7 @@ impl UsagePane {
             );
         }
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "q quit  ↑/↓ scroll  g/G top/bottom",

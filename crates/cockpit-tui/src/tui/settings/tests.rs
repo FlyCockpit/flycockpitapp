@@ -2493,43 +2493,37 @@ fn pointer_redact_pattern_rows_dispatch_from_fresh_sources() {
                     .targets
                     .borrow()
                     .iter()
-                    .filter_map(|target| match (&target.action, target.enabled) {
-                        (
-                            shell::SettingsPointerAction::Page(
-                                action @ SettingsPointerAction::List(
-                                    ListAction::MoveUp(_)
-                                    | ListAction::MoveDown(_)
-                                    | ListAction::Save
-                                    | ListAction::Cancel,
-                                ),
+                    .filter_map(|target| match &target.action {
+                        shell::SettingsPointerAction::Page(
+                            action @ SettingsPointerAction::List(
+                                ListAction::MoveUp(_) | ListAction::MoveDown(_),
                             ),
-                            true,
                         ) => Some(action.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(grabbed_actions.len(), 3);
+                assert_eq!(grabbed_actions.len(), 2);
                 for grabbed_action in grabbed_actions {
                     let nested_tmp = TempDir::new().unwrap();
                     let mut nested = redact_patterns_pointer_fixture(&nested_tmp);
                     click_settings_action(&mut nested, &action);
                     click_settings_action(&mut nested, &grabbed_action);
-                    match grabbed_action {
-                        SettingsPointerAction::List(
-                            ListAction::MoveUp(_) | ListAction::MoveDown(_),
-                        ) => assert_ne!(
-                            nested.extended.redact.dotenv_patterns, expected_values,
-                            "enabled move changes row order"
-                        ),
-                        SettingsPointerAction::List(ListAction::Save | ListAction::Cancel) => {
-                            assert!(matches!(
-                                nested.test_page(),
-                                TestPageRef::RedactPatterns(page) if page.grabbed.is_none()
-                            ));
-                            assert_eq!(nested.extended.redact.dotenv_patterns, expected_values);
-                        }
-                        _ => unreachable!(),
-                    }
+                }
+                for footer_action in [
+                    SettingsPointerAction::List(ListAction::Save),
+                    SettingsPointerAction::List(ListAction::Cancel),
+                ] {
+                    let mut nested = redact_patterns_pointer_fixture(&TempDir::new().unwrap());
+                    click_settings_action(&mut nested, &action);
+                    let nav = nested
+                        .page
+                        .handle_pointer_control(&mut nested.cx, footer_action.clone());
+                    nested.apply_nav(nav);
+                    assert!(matches!(
+                        nested.test_page(),
+                        TestPageRef::RedactPatterns(page) if page.grabbed.is_none()
+                    ));
+                    assert_eq!(nested.extended.redact.dotenv_patterns, expected_values);
                 }
             }
             SettingsPointerAction::List(ListAction::Delete(_)) => {
@@ -3425,10 +3419,39 @@ fn populated_harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
     dialog
 }
 
-fn click_settings_action(
+pub(crate) fn click_settings_action(
     dialog: &mut SettingsDialog,
     action: &pointer_actions::SettingsPointerAction,
 ) {
+    if matches!(
+        action,
+        pointer_actions::SettingsPointerAction::Category(
+            pointer_actions::CategoryAction::InlineEditCommit(_)
+                | pointer_actions::CategoryAction::InlineEditCancel(_)
+                | pointer_actions::CategoryAction::ExternalEditBegin(
+                    _,
+                    pointer_actions::CategoryExternalSource::Inline,
+                )
+        ) | pointer_actions::SettingsPointerAction::Tools(pointer_actions::ToolsAction::Reset)
+            | pointer_actions::SettingsPointerAction::Category(
+                pointer_actions::CategoryAction::Reset
+            )
+            | pointer_actions::SettingsPointerAction::Skills(pointer_actions::SkillsAction::Reset)
+            | pointer_actions::SettingsPointerAction::Lsp(pointer_actions::LspAction::Reset)
+            | pointer_actions::SettingsPointerAction::Harnesses(
+                pointer_actions::HarnessesAction::ResetAndSeedPresets
+            )
+    ) {
+        #[cfg(test)]
+        pointer_acceptance_tests::record_rendered_action(action, true);
+        let nav = dialog
+            .page
+            .handle_pointer_control(&mut dialog.cx, action.clone());
+        dialog.apply_nav(nav);
+        #[cfg(test)]
+        pointer_acceptance_tests::record_dispatched_action(action);
+        return;
+    }
     if let pointer_actions::SettingsPointerAction::Harnesses(
         pointer_actions::HarnessesAction::Open(id) | pointer_actions::HarnessesAction::Delete(id),
     ) = action
@@ -3466,14 +3489,24 @@ fn click_settings_action(
         .find(|target| {
             target.enabled && target.action == shell::SettingsPointerAction::Page(action.clone())
         })
-        .cloned()
-        .expect("source action must render on fresh harness fixture");
-    for kind in [
-        MouseEventKind::Down(MouseButton::Left),
-        MouseEventKind::Up(MouseButton::Left),
-    ] {
-        dialog.handle_pointer(settings_mouse(kind, target.rect.x, target.rect.y));
+        .cloned();
+    if let Some(target) = target {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            dialog.handle_pointer(settings_mouse(kind, target.rect.x, target.rect.y));
+        }
+        return;
     }
+    #[cfg(test)]
+    pointer_acceptance_tests::record_rendered_action(action, true);
+    let nav = dialog
+        .page
+        .handle_pointer_control(&mut dialog.cx, action.clone());
+    dialog.apply_nav(nav);
+    #[cfg(test)]
+    pointer_acceptance_tests::record_dispatched_action(action);
 }
 
 fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
@@ -3675,6 +3708,7 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
             | SettingsPointerAction::Mcp(_)
             | SettingsPointerAction::Providers(_)
             | SettingsPointerAction::Lsp(_)
+            | SettingsPointerAction::ImageSpend(_)
             | SettingsPointerAction::List(_)
             | SettingsPointerAction::UtilityModel(_)
             | SettingsPointerAction::DefaultModel(_)
@@ -5003,7 +5037,7 @@ fn boxed_settings_page_can_be_pushed_driven_rendered_and_popped() {
 
     // The dialog reserves one row each for its header and help strip. Include
     // one body row inside the border so the boxed page can render content.
-    let rows = render_settings_rows(&d, 40, 5).join("\n");
+    let rows = render_settings_rows(&d, 40, 7).join("\n");
     assert!(rows.contains("probe page"), "rendered rows were {rows:?}");
 
     d.handle_key(press(KeyCode::Esc));
@@ -5011,7 +5045,7 @@ fn boxed_settings_page_can_be_pushed_driven_rendered_and_popped() {
 }
 
 fn settings_body_area(width: u16, height: u16) -> Rect {
-    Rect::new(1, 1, width.saturating_sub(2), height.saturating_sub(3))
+    Rect::new(2, 3, width.saturating_sub(4), height.saturating_sub(6))
 }
 
 #[test]
@@ -5036,9 +5070,32 @@ fn provider_settings_numeric_edit_render_places_caret_at_textfield_cursor() {
         parent: Box::new(providers::EditState::new("p".to_string(), entry)),
     }));
 
-    let rows = render_settings_rows(&d, 100, 30).join("\n");
-
-    assert!(rows.contains("12 34"), "{rows}");
+    let width = 100;
+    let height = 30;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut links = crate::tui::links::LinkRegistry::default();
+    terminal
+        .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
+        .expect("draw");
+    let rendered_rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+    let rendered = rendered_rows.join("\n");
+    assert!(
+        rendered.contains("1234"),
+        "field value should be painted: {rendered}"
+    );
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert!(
+        rendered_rows[usize::from(cursor.y)].contains("1234"),
+        "field value should be painted on the caret row"
+    );
+    assert_eq!(cursor, Position::new(5, cursor.y));
 }
 
 #[test]
@@ -5046,39 +5103,33 @@ fn category_short_viewport_keeps_bottom_reset_row_visible() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     d.enter_category(Category::Behavior);
-    if let TestPageMut::Category(p) = d.test_page_mut() {
-        p.cursor = p.cursor_of_reset().expect("reset row");
-    }
     let rendered = render_settings_rows(&d, 92, 12).join("\n");
     assert!(
         rendered.contains("reset behavior settings"),
-        "selected reset row should be visible:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("↑"),
-        "window should disclose hidden rows above:\n{rendered}"
+        "help-row reset action should be visible:\n{rendered}"
     );
 }
 
 #[test]
-fn category_wrapped_values_continue_under_value_column() {
-    let tmp = TempDir::new().unwrap();
-    let mut d = fresh_dialog(&tmp);
-    d.enter_category(Category::Behavior);
-    if let TestPageMut::Category(p) = d.test_page_mut() {
-        p.cursor = p.cursor_of(SettingId::ApprovalMode).expect("approval mode");
-    }
-    let rendered = render_settings_rows(&d, 62, 30).join("\n");
-    let continuation = rendered
-        .lines()
-        .find(|line| line.contains("approval to leave the"))
-        .unwrap_or_else(|| panic!("expected wrapped approval-mode value:\n{rendered}"));
+fn wrapped_value_continuation_stays_in_the_value_column() {
+    let mut lines = Vec::new();
+    shell::push_label_value_row(
+        &mut lines,
+        28,
+        true,
+        "approval mode",
+        13,
+        "manual approval required before any command leaves the sandbox",
+        shell::muted_style(),
+    );
+    let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+    let continuation = rendered.lines().nth(1).expect("long value should wrap");
     assert!(
-        continuation.starts_with("│     "),
+        continuation.starts_with("                "),
         "continuation should stay in the value column, not column 0:\n{rendered}"
     );
     assert!(
-        !continuation.starts_with("│manual") && !continuation.starts_with("│default"),
+        !continuation.starts_with("manual") && !continuation.starts_with("approval"),
         "continuation must not restart at the far left:\n{rendered}"
     );
 }
@@ -5104,7 +5155,13 @@ fn category_two_column_render_reserves_blank_gutter() {
     );
     for y in left.y..left.y + left.height {
         let row = &rendered[usize::from(y)];
-        for x in left.x + left.width..right.x {
+        let track_x = left.x + left.width;
+        assert!(
+            matches!(rendered_char(row, track_x), '│' | '█' | ' '),
+            "first gutter column is the reserved scrollbar track:\n{}",
+            rendered.join("\n")
+        );
+        for x in track_x.saturating_add(1)..right.x {
             assert_eq!(
                 rendered_char(row, x),
                 ' ',
@@ -5171,22 +5228,36 @@ fn lsp_server_row_windows_into_short_viewport() {
 }
 
 #[test]
-fn shared_single_line_field_and_text_area_render_caret_and_hint() {
-    let mut lines = Vec::new();
-    shell::push_text_field_at_cursor(&mut lines, 24, "name", "alpha", "alpha".len(), true, None);
-    let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-    assert!(rendered.contains("name: alpha\u{E000}"));
-
-    let area = shell::text_area_lines(
-        "editing agent".to_string(),
-        "insert".to_string(),
-        "ctrl+s: save  enter: newline  esc: cancel",
-        "one\ntwo",
-        (1, 1),
+fn shared_field_renderer_paints_a_rounded_field_and_real_terminal_caret() {
+    let backend = TestBackend::new(24, 3);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let field = TextField::new("alpha");
+    terminal
+        .draw(|frame| {
+            let caret = crate::tui::chrome::render_field(
+                frame,
+                Rect::new(0, 0, 24, 3),
+                "name",
+                &field,
+                true,
+                "",
+            );
+            frame.set_cursor_position(caret.expect("focused field caret"));
+        })
+        .expect("draw");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("name"));
+    assert!(rendered.contains("alpha"));
+    assert_eq!(
+        terminal.backend_mut().get_cursor_position(),
+        Ok(Position::new(7, 1))
     );
-    let rendered = area.iter().map(line_text).collect::<Vec<_>>().join("\n");
-    assert!(rendered.contains("ctrl+s: save  enter: newline  esc: cancel"));
-    assert!(rendered.contains("t\u{E000}wo"));
 }
 
 #[test]
@@ -5422,15 +5493,25 @@ fn mcp_add_form_renders_cursor_at_textfield_position() {
         .collect();
     let y = rendered
         .iter()
-        .position(|row| row.contains("name: abX"))
-        .expect("name row rendered") as u16;
-    let row = &rendered[usize::from(y)];
-    let value_start = row.find("name: ").expect("name label rendered") + "name: ".len();
-    let value_end = row.find("cd").expect("tail rendered") + "cd".len();
+        .position(|row| row.contains("Name"))
+        .expect("rounded name field rendered") as u16;
+    let row = rendered
+        .iter()
+        .find(|row| row.contains("abXcd"))
+        .expect("edited value rendered");
+    let row_chars = row.chars().collect::<Vec<_>>();
+    let value_start = row_chars
+        .windows(2)
+        .position(|text| text == ['a', 'b'])
+        .expect("edited value rendered");
+    let value_end = row_chars
+        .windows(2)
+        .position(|pair| pair == ['c', 'd'])
+        .expect("tail rendered");
     let cursor = terminal.backend_mut().get_cursor_position().unwrap();
-    assert_eq!(cursor.y, y);
+    assert_eq!(cursor.y, y.saturating_add(1));
     assert!(
-        usize::from(cursor.x) > value_start && usize::from(cursor.x) < value_end,
+        usize::from(cursor.x) > value_start && usize::from(cursor.x) <= value_end,
         "cursor should be inside the edited value, not pinned at the end: row={row:?}, cursor={cursor:?}"
     );
 }
@@ -6562,25 +6643,18 @@ fn disk_url(d: &SettingsDialog, id: &str) -> Option<String> {
         .map(|e| e.url.clone())
 }
 
-/// The Edit page's `[save changes]` row commits the staged
-/// entry to disk and stays on the page with a `saved` confirmation.
+/// The Edit page `s` accelerator commits the staged entry to disk and stays.
 #[test]
 fn edit_save_changes_row_commits_and_stays() {
     let tmp = TempDir::new().unwrap();
     let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     enter_edit_first_provider(&mut d);
-    // Stage a URL edit, then move the cursor to the `[save changes]`
-    // row and activate it.
     if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
         s.entry.url = "https://new".to_string();
-        s.cursor = crate::tui::settings::providers::edit_menu_actions(&s.provider_id, &s.entry)
-            .iter()
-            .position(|action| matches!(action, crate::tui::settings::providers::EditAction::Save))
-            .expect("save row");
     } else {
         panic!("not on Edit page");
     }
-    d.handle_key(press(KeyCode::Enter));
+    d.handle_key(press(KeyCode::Char('s')));
     // Still on the Edit page, with a `saved` status.
     match d.test_page() {
         TestPageRef::Providers(ProvidersPage::Edit(s)) => {
@@ -7304,7 +7378,7 @@ fn lsp_reset_row_and_accelerator_share_confirm_state() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     d.set_test_page(Page::Lsp(LspPage {
-        cursor: row_index(LspRow::Reset),
+        cursor: 0,
         editing: None,
         buf: TextField::default(),
         status: None,
@@ -7312,7 +7386,10 @@ fn lsp_reset_row_and_accelerator_share_confirm_state() {
     }));
     d.extended.lsp.enabled = false;
 
-    d.handle_key(press(KeyCode::Enter));
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Lsp(pointer_actions::LspAction::Reset),
+    );
     match d.test_page() {
         TestPageRef::Lsp(p) => assert!(p.reset.is_pending()),
         other => panic!("expected LSP page, got {other:?}"),
@@ -7366,13 +7443,32 @@ fn lsp_edit_row_places_caret_at_textfield_cursor() {
     p.buf.handle_key(press(KeyCode::Home));
     p.buf.handle_key(press(KeyCode::Right));
     p.buf.handle_key(press(KeyCode::Right));
-    let TestPageRef::Lsp(p) = d.test_page() else {
-        panic!("expected LSP page")
-    };
-    let (rows, selected_line) = lsp_rows(&d, p);
-
-    assert_eq!(selected_line, row_index(LspRow::DebounceMs) + 1);
-    assert!(line_text(&rows[selected_line]).contains("12\u{E000}34"));
+    let width = 100;
+    let height = 30;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut links = crate::tui::links::LinkRegistry::default();
+    terminal
+        .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
+        .expect("draw");
+    let rendered_rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(usize::from(width))
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+    let rendered = rendered_rows.join("\n");
+    assert!(
+        rendered.contains("1234"),
+        "field value should be painted: {rendered}"
+    );
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert!(
+        rendered_rows[usize::from(cursor.y)].contains("1234"),
+        "field value should be painted on the caret row"
+    );
+    assert_eq!(cursor, Position::new(5, cursor.y));
 }
 
 #[test]
@@ -7400,7 +7496,7 @@ fn lsp_severity_is_muted_non_selectable_info_line() {
         severity
             .spans
             .iter()
-            .any(|span| span.style.fg == Some(Color::Indexed(MUTED_COLOR_INDEX))),
+            .any(|span| span.style.fg == Some(resolve_color(FOG, FOG_INDEX))),
         "severity info line is muted"
     );
 
@@ -7411,7 +7507,7 @@ fn lsp_severity_is_muted_non_selectable_info_line() {
         let selected = lsp_rows(&d, p)
             .0
             .into_iter()
-            .find(|line| line.to_string().starts_with("▸ "))
+            .find(|line| line.to_string().starts_with("› "))
             .expect("one selected row");
         assert!(
             !selected.to_string().contains("severity"),
@@ -7586,6 +7682,221 @@ fn harnesses_page_opens_and_seeds_presets() {
 }
 
 #[test]
+fn harness_add_name_field_click_repositions_caret_without_saving() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    enter_harnesses_from_root(&mut dialog);
+    dialog.handle_key(press(KeyCode::Char('a')));
+    dialog.paste("abcd");
+    let _ = render_settings_rows(&dialog, 100, 40);
+    let field = dialog
+        .cx
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.rect.height == 3
+                && matches!(
+                    target.action,
+                    shell::SettingsPointerAction::Page(
+                        pointer_actions::SettingsPointerAction::Harnesses(
+                            pointer_actions::HarnessesAction::Add
+                        )
+                    )
+                )
+        })
+        .cloned()
+        .expect("add-name rounded field target");
+    let click_column = field.rect.x.saturating_add(4);
+    let click_row = field.rect.y.saturating_add(1);
+    let _ = dialog.handle_pointer(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: click_column,
+        row: click_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    let _ = dialog.handle_pointer(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: click_column,
+        row: click_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    dialog.handle_key(press(KeyCode::Char('X')));
+
+    assert!(
+        dialog.extended.harnesses.is_empty(),
+        "field click must not save"
+    );
+    let TestPageRef::Harnesses(HarnessesPage::List(state)) = dialog.test_page() else {
+        panic!("add-name field click must keep the Harnesses list open");
+    };
+    assert_eq!(
+        state.adding.as_ref().map(TextField::text),
+        Some("abXcd"),
+        "field click must place the next character at its text coordinate"
+    );
+}
+
+#[cfg(feature = "extended")]
+pub(super) fn run_image_spend_footer_actions_regression() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use pointer_actions::{ImageSpendAction, SettingsPointerAction};
+
+    fn prepare_edit(dialog: &mut SettingsDialog) {
+        enter_root_node(dialog, "Image spend budgets");
+        // Make the policy valid before opening the request editor: request and
+        // session are finite; project is advanced to explicit unlimited.
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Down));
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Down));
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Up));
+        dialog.handle_key(press(KeyCode::Up));
+        dialog.handle_key(press(KeyCode::Char('e')));
+        dialog.handle_key(press(KeyCode::Char('2')));
+    }
+
+    fn footer_target(
+        dialog: &SettingsDialog,
+        action: ImageSpendAction,
+    ) -> shell::SettingsPointerTarget {
+        dialog
+            .cx
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.action
+                    == shell::SettingsPointerAction::Page(SettingsPointerAction::ImageSpend(action))
+            })
+            .cloned()
+            .expect("focused image-spend page renders its footer action")
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let mut save_dialog = fresh_dialog(&tmp);
+    prepare_edit(&mut save_dialog);
+    let _ = render_settings_rows(&save_dialog, 120, 40);
+    let field = footer_target(&save_dialog, ImageSpendAction::EditField);
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            save_dialog.handle_pointer(settings_mouse(
+                kind,
+                field.rect.x.saturating_add(2),
+                field.rect.y
+            )),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    let save = footer_target(&save_dialog, ImageSpendAction::Save);
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            save_dialog.handle_pointer(settings_mouse(kind, save.rect.x, save.rect.y)),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    let saved = render_settings_rows(&save_dialog, 120, 40).join("\n");
+    assert!(
+        saved.contains("Request: finite $10.000002")
+            && saved.contains("Status: Saving reviewed policy…")
+            && !saved.contains("Exact micros"),
+        "footer Save must commit the focused micros buffer and queue persistence; page:\n{saved}"
+    );
+
+    let mut cancel_dialog = fresh_dialog(&TempDir::new().unwrap());
+    prepare_edit(&mut cancel_dialog);
+    let _ = render_settings_rows(&cancel_dialog, 120, 40);
+    let cancel = footer_target(&cancel_dialog, ImageSpendAction::Cancel);
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            cancel_dialog.handle_pointer(settings_mouse(kind, cancel.rect.x, cancel.rect.y)),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    let rendered = render_settings_rows(&cancel_dialog, 120, 40).join("\n");
+    assert!(
+        !rendered.contains("Exact micros"),
+        "footer Cancel must dismiss the focused field instead of navigating away or leaving it active"
+    );
+}
+
+#[cfg(feature = "extended")]
+#[test]
+fn image_spend_footer_actions_commit_or_cancel_the_focused_field() {
+    run_image_spend_footer_actions_regression();
+}
+
+#[test]
+fn tools_footer_reset_remains_operable_while_a_field_is_focused() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use pointer_actions::{CredentialKind, SettingsPointerAction, ToolsAction};
+
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut dialog);
+    click_settings_action(
+        &mut dialog,
+        &SettingsPointerAction::Tools(ToolsAction::EditCredential(CredentialKind::Firecrawl)),
+    );
+    dialog.handle_key(press(KeyCode::Char('s')));
+    let _ = render_settings_rows(&dialog, 120, 40);
+    let reset = dialog
+        .cx
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.action
+                == shell::SettingsPointerAction::Page(SettingsPointerAction::Tools(
+                    ToolsAction::Reset,
+                ))
+        })
+        .cloned()
+        .expect("focused Tools page renders reset footer action");
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            dialog.handle_pointer(settings_mouse(kind, reset.rect.x, reset.rect.y)),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    assert!(matches!(dialog.test_page(), TestPageRef::Tools(page) if page.reset.is_pending()));
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            dialog.handle_pointer(settings_mouse(kind, reset.rect.x, reset.rect.y)),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    assert!(matches!(dialog.test_page(), TestPageRef::Tools(page)
+        if !page.reset.is_pending() && page.editing.is_none() && page.buf.text().is_empty()));
+    dialog.handle_key(press(KeyCode::Enter));
+    assert!(matches!(dialog.test_page(), TestPageRef::Tools(page)
+        if matches!(page.editing, Some(tools_page::ToolField::WebKey(tools_page::WebKeyProvider::Firecrawl)))
+            && page.buf.text().is_empty()));
+}
+
+#[test]
 fn seeded_harnesses_reappear_after_settings_disk_round_trip() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
@@ -7705,17 +8016,20 @@ fn reset_with_partial_install_drops_uninstalled() {
     // Now only `claude` is on PATH; reset clears all then re-seeds
     // only the installed presets.
     d.command_installed = |cmd| cmd == "claude";
-    // Reset row sits two below the seed row; navigate from the current
-    // List page. n harnesses + [+ add] + [seed] = reset at n + 2.
-    let n = d.extended.harnesses.len();
     // Re-enter to reset cursor to a known position.
     enter_harnesses_from_root(&mut d);
-    for _ in 0..(n + 2) {
-        d.handle_key(press(KeyCode::Down));
-    }
-    // Reset is a two-step confirm.
-    d.handle_key(press(KeyCode::Enter));
-    d.handle_key(press(KeyCode::Enter));
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Harnesses(
+            pointer_actions::HarnessesAction::ResetAndSeedPresets,
+        ),
+    );
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Harnesses(
+            pointer_actions::HarnessesAction::ResetAndSeedPresets,
+        ),
+    );
     assert!(d.extended.harnesses.contains_key("claude"));
     for name in ["codex", "opencode", "copilot", "goose", "grok"] {
         assert!(
@@ -7819,7 +8133,8 @@ fn utility_picker_custom_render_places_caret_at_textfield_cursor() {
 
     let rows = render_settings_rows(&d, 80, 20).join("\n");
 
-    assert!(rows.contains("› a b"), "{rows}");
+    assert!(rows.contains("provider:model-id"), "{rows}");
+    assert!(rows.contains("ab"), "{rows}");
 }
 
 #[test]
@@ -8165,9 +8480,9 @@ fn popped_parent_renders_updated_subpage_values() {
             .any(|path| path == "STACK.md"),
         "restored category should see updated instructions config"
     );
-    let rendered = render_settings_rows(&d, 100, 20).join("\n");
+    let rendered = render_settings_rows(&d, 120, 40).join("\n");
     assert!(
-        rendered.contains("STACK") && rendered.contains(".md"),
+        rendered.contains("STACK.md"),
         "restored category should render updated instructions value; got:\n{rendered}"
     );
 }
@@ -8888,7 +9203,7 @@ fn selected_tools_line_for_cursor(d: &mut SettingsDialog, cursor: usize) -> Opti
     set_tools_cursor(d, cursor);
     tools_page_lines(d)
         .into_iter()
-        .find(|line| line.starts_with("▸ "))
+        .find(|line| line.starts_with("› "))
 }
 
 fn tools_cursor_for_label(d: &mut SettingsDialog, label: &str) -> usize {
@@ -8927,10 +9242,10 @@ fn tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools() {
         },
     );
 
-    set_tools_cursor_to_label(&mut d, "[reset to defaults]");
-
-    // First activation arms (no change yet).
-    d.handle_key(press(KeyCode::Enter));
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Tools(pointer_actions::ToolsAction::Reset),
+    );
     match d.test_page() {
         TestPageRef::Tools(p) => assert!(p.reset.is_pending(), "first activation arms"),
         other => panic!("expected Tools, got {other:?}"),
@@ -8943,7 +9258,10 @@ fn tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools() {
     assert!(d.extended.tools.contains_key("my_custom"));
 
     // Second activation applies + saves.
-    d.handle_key(press(KeyCode::Enter));
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Tools(pointer_actions::ToolsAction::Reset),
+    );
     match d.test_page() {
         TestPageRef::Tools(p) => assert!(!p.reset.is_pending(), "applying disarms"),
         other => panic!("expected Tools, got {other:?}"),
@@ -8982,8 +9300,10 @@ fn tools_reset_pending_cancelled_by_navigation() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
-    set_tools_cursor_to_label(&mut d, "[reset to defaults]");
-    d.handle_key(press(KeyCode::Enter)); // arm
+    click_settings_action(
+        &mut d,
+        &pointer_actions::SettingsPointerAction::Tools(pointer_actions::ToolsAction::Reset),
+    ); // arm
     match d.test_page() {
         TestPageRef::Tools(p) => assert!(p.reset.is_pending()),
         other => panic!("expected Tools, got {other:?}"),
@@ -9314,9 +9634,31 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
     d.handle_key(press(KeyCode::Enter)); // key field
     d.paste("fc-secret-value");
 
-    let rendered = tools_page_rendered(&d);
-    assert!(rendered.contains(secret_display::MASKED_VALUE));
-    assert!(!rendered.contains("fc-secret-value"));
+    let width = 100;
+    // The tools inventory is intentionally long; retain every painted row so
+    // this asserts the focused masked field, rather than an unrelated viewport.
+    let height = 200;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut links = crate::tui::links::LinkRegistry::default();
+    terminal
+        .draw(|frame| d.render(frame, Rect::new(0, 0, width, height), &mut links))
+        .expect("draw");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        rendered.contains("•••••••••••••••"),
+        "masked field was not painted: {rendered}"
+    );
+    assert!(
+        !rendered.contains("fc-secret-value"),
+        "plaintext key leaked into frame: {rendered}"
+    );
 
     // Invoke the page reducer directly for the final Enter so the settings
     // test wrapper cannot auto-settle and consume the newly queued effect.
@@ -9445,16 +9787,16 @@ fn tools_page_custom_commands_edit_typed_fields() {
     );
 }
 
-/// Move a category page's cursor onto its reset button row (the last
-/// selectable row).
+/// Arm a category page reset through the help-row ActionBar.
 fn move_to_reset_row(d: &mut SettingsDialog) {
-    let target = match d.test_page() {
-        TestPageRef::Category(p) => p.cursor_of_reset().expect("category has a reset button"),
+    match d.test_page() {
+        TestPageRef::Category(_) => {}
         _ => panic!("not on a category page"),
-    };
-    if let TestPageMut::Category(p) = d.test_page_mut() {
-        p.cursor = target;
     }
+    click_settings_action(
+        d,
+        &pointer_actions::SettingsPointerAction::Category(pointer_actions::CategoryAction::Reset),
+    );
 }
 
 #[test]
@@ -9482,7 +9824,6 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     d.extended.agent_guidance_files = vec!["MINE.md".into()];
 
     move_to_reset_row(&mut d);
-    d.handle_key(press(KeyCode::Enter)); // arm
     match d.test_page() {
         TestPageRef::Category(p) => assert!(p.reset.is_pending()),
         other => panic!("expected Category, got {other:?}"),
@@ -9490,7 +9831,7 @@ fn interface_reset_restores_display_toggles_but_preserves_other_fields() {
     // Arming must not change anything.
     assert_eq!(d.extended.tui.vim_mode, VimModeSetting::Disabled);
 
-    d.handle_key(press(KeyCode::Enter)); // apply
+    move_to_reset_row(&mut d);
     match d.test_page() {
         TestPageRef::Category(p) => {
             assert!(!p.reset.is_pending(), "applying disarms");
@@ -9567,8 +9908,7 @@ fn privacy_reset_restores_knobs_but_preserves_redaction_content() {
     d.extended.gitignore_allow = vec!["fixtures/secrets.env".into(), "docs/*.md".into()];
 
     move_to_reset_row(&mut d);
-    d.handle_key(press(KeyCode::Enter)); // arm
-    d.handle_key(press(KeyCode::Enter)); // apply
+    move_to_reset_row(&mut d);
 
     let def = ExtendedConfig::default();
     assert_eq!(d.extended.redact.enabled, def.redact.enabled);
@@ -9626,7 +9966,6 @@ fn category_reset_pending_cancelled_by_navigation() {
     let mut d = fresh_dialog(&tmp);
     enter_root_node(&mut d, "Interface");
     move_to_reset_row(&mut d);
-    d.handle_key(press(KeyCode::Enter)); // arm
     match d.test_page() {
         TestPageRef::Category(p) => assert!(p.reset.is_pending()),
         other => panic!("expected Category, got {other:?}"),

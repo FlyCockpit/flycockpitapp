@@ -11,7 +11,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use ratatui::widgets::{Block, Padding, Paragraph};
 
 use super::theme::{BAD, BRASS, DISABLED, FOG, INK, NIGHT, PLACEHOLDER};
 
@@ -436,7 +436,7 @@ impl SecureStoreScreen {
     ) -> Option<Position> {
         let border = if focused { BRASS } else { NIGHT };
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(border))
             .title(Span::styled(format!(" {title} "), Style::new().fg(border)))
             .padding(Padding::horizontal(1));

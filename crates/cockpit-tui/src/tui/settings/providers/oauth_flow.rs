@@ -6,7 +6,7 @@ use cockpit_core::auth::codex_oauth;
 use cockpit_core::auth::xai_oauth;
 
 pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let red = Style::default().fg(Color::Red);
     let green = Style::default().fg(Color::Green);
 
@@ -20,28 +20,27 @@ pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSet
             "Press Enter to continue.".to_string(),
             muted,
         )));
-        return;
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Copilot authentication is managed by the Cockpit daemon.".to_string(),
+            muted,
+        )));
+        lines.push(Line::from(Span::styled(
+            "The TUI does not inspect or copy credentials and never edits shell startup files."
+                .to_string(),
+            muted,
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Ensure the daemon's environment already contains the approved Copilot credential, then retry the provider request.".to_string(),
+            muted,
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Press Enter or Esc to return.".to_string(),
+            muted,
+        )));
     }
-
-    lines.push(Line::from(Span::styled(
-        "Copilot authentication is managed by the Cockpit daemon.".to_string(),
-        muted,
-    )));
-    lines.push(Line::from(Span::styled(
-        "The TUI does not inspect or copy credentials and never edits shell startup files."
-            .to_string(),
-        muted,
-    )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "Ensure the daemon's environment already contains the approved Copilot credential, then retry the provider request.".to_string(),
-        muted,
-    )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "Press Enter or Esc to return.".to_string(),
-        muted,
-    )));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1385,10 +1384,6 @@ fn codex_oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<CodexOAuthOpt
     options
 }
 
-fn rendered_cursor(s: &OAuthFlowState, host: OAuthHost) -> usize {
-    s.cursor.min(s.option_count(host).saturating_sub(1))
-}
-
 pub(super) fn oauth_help_legend(host: OAuthHost, s: &OAuthFlowState) -> &'static str {
     if s.acknowledgement_required {
         return "enter: acknowledge  esc: back";
@@ -1471,11 +1466,14 @@ pub(super) fn oauth_help_legend(host: OAuthHost, s: &OAuthFlowState) -> &'static
 fn render_provider_oauth(
     lines: &mut Vec<Line<'static>>,
     s: &OAuthFlowState,
-    host: OAuthHost,
-    mut controls: Option<&mut Vec<(usize, usize)>>,
+    _host: OAuthHost,
+    _controls: Option<&mut Vec<(usize, usize)>>,
 ) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+    let yellow = Style::default().fg(resolve_color(
+        crate::tui::theme::BRASS,
+        crate::tui::theme::BRASS_INDEX,
+    ));
     let green = Style::default().fg(Color::Green);
     let red = Style::default().fg(Color::Red);
     let cyan = Style::default().fg(Color::Cyan);
@@ -1532,60 +1530,25 @@ fn render_provider_oauth(
         lines.push(Line::default());
     }
 
-    if s.acknowledgement_required {
-        let cursor = rendered_cursor(s, host);
-        for (i, option) in oauth_options(s, host).iter().enumerate() {
-            let marker = if i == cursor { "▸ " } else { "  " };
-            let style = if i == cursor {
-                yellow.add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            if let Some(controls) = controls.as_deref_mut() {
-                controls.push((lines.len(), i));
-            }
-            lines.push(Line::from(vec![
-                Span::raw(marker),
-                Span::styled(format!("[{}]", option.label()), style),
-            ]));
+    if !s.acknowledgement_required {
+        match s.provider {
+            OAuthProvider::Grok => render_browser_callback_session(lines, s, muted, yellow, cyan),
+            OAuthProvider::Codex => render_device_code_session(lines, s, muted, yellow, cyan),
         }
-        return;
-    }
 
-    match s.provider {
-        OAuthProvider::Grok => render_browser_callback_session(lines, s, muted, yellow, cyan),
-        OAuthProvider::Codex => render_device_code_session(lines, s, muted, yellow, cyan),
-    }
-
-    if s.paste_focused {
-        lines.push(Line::from(Span::styled(
-            "Paste callback URL, ?code=...&state=..., or bare code:".to_string(),
-            muted,
-        )));
-        lines.push(Line::from(vec![
-            Span::styled(s.manual_input.text().to_string(), cyan),
-            crate::tui::settings::shell::cursor_marker_span(),
-        ]));
-        return;
-    }
-
-    let cursor = rendered_cursor(s, host);
-    for (i, option) in oauth_options(s, host).iter().enumerate() {
-        let label = option.label();
-        let marker = if i == cursor { "▸ " } else { "  " };
-        let style = if i == cursor {
-            yellow.add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        if let Some(controls) = controls.as_deref_mut() {
-            controls.push((lines.len(), i));
+        if s.paste_focused {
+            lines.push(Line::from(Span::styled(
+                "Paste callback URL, ?code=...&state=..., or bare code:".to_string(),
+                muted,
+            )));
+            // The caller overlays these reserved rows with the shared rounded
+            // field after it has applied its scroll layout.
+            lines.extend([Line::default(), Line::default(), Line::default()]);
         }
-        lines.push(Line::from(vec![
-            Span::raw(marker),
-            Span::styled(format!("[{label}]"), style),
-        ]));
     }
+
+    // OAuth options are primary controls.  Their identities are rendered by
+    // the settings help-row ActionBar, not as cursor-navigable body rows.
 }
 
 fn render_browser_callback_session(

@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
@@ -92,7 +92,7 @@ impl SessionRail {
             frame,
             area,
             "[Show]",
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
             self.pointer_position
                 .is_some_and(|(x, y)| point_in_rect(area, x, y)),
         );
@@ -103,9 +103,9 @@ impl SessionRail {
         self.rail_area = Some(area);
         let focused = self.focused;
         let style = if focused {
-            Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX))
+            Style::default().fg(crate::tui::theme::indexed_color(ACCENT_BLUE_INDEX))
         } else {
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
+            Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX))
         };
         let label = if self.search.is_empty() { "S" } else { "/" };
         let block = Block::default()
@@ -167,7 +167,7 @@ impl SessionRail {
             frame,
             toggle,
             "[Hide]",
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
             self.pointer_position
                 .is_some_and(|(x, y)| point_in_rect(toggle, x, y)),
         );
@@ -192,7 +192,7 @@ impl SessionRail {
             Paragraph::new(Span::styled(
                 label_text,
                 Style::default()
-                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX))
                     .add_modifier(Modifier::BOLD),
             )),
             label,
@@ -206,17 +206,17 @@ impl SessionRail {
                 ),
                 Span::styled(
                     "working  ",
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
                 ),
                 Span::styled("● ", Style::default().fg(resolve_color(RED, RED_INDEX))),
                 Span::styled(
                     "waiting  ",
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
                 ),
                 Span::styled("● ", Style::default().fg(resolve_color(GOOD, GOOD_INDEX))),
                 Span::styled(
                     "done",
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
                 ),
             ])),
             legend,
@@ -242,7 +242,7 @@ impl SessionRail {
                 Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))),
                 Line::from(Span::styled(
                     "press r to retry",
-                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                    Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
                 )),
             ];
             frame.render_widget(Paragraph::new(lines), body);
@@ -281,7 +281,7 @@ impl SessionRail {
             lines.extend(card);
         }
         if let Some(preview) = &self.preview {
-            let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+            let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
             let preview_line = if let Some(error) = &preview.error {
                 Line::from(Span::styled(
                     format!("preview unavailable: {error}"),
@@ -440,7 +440,7 @@ impl SessionRail {
                     Style::default().fg(resolve_color(YELLOW, YELLOW_INDEX))
                 }
                 CardAction::Delete => Style::default().fg(resolve_color(RED, RED_INDEX)),
-                _ => Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                _ => Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
             };
             let hovered = self
                 .pointer_position
@@ -459,7 +459,7 @@ impl SessionRail {
     }
 
     fn render_skeleton(&self, frame: &mut Frame, body: Rect) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
         let mut lines = Vec::new();
         for _ in 0..SKELETON_CARDS {
             lines.push(Line::from(Span::styled("  ••• loading".to_string(), muted)));
@@ -469,7 +469,7 @@ impl SessionRail {
     }
 
     fn empty_line(&self) -> Line<'static> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
         let scope = match self.scope {
             Scope::Project => "this project",
             Scope::All => "all projects",
@@ -515,14 +515,14 @@ impl SessionRail {
         );
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX)))
+            .border_type(crate::tui::chrome::rounded_border_type())
+            .border_style(Style::default().fg(crate::tui::theme::indexed_color(ACCENT_BLUE_INDEX)))
             .title(" archive / delete ");
         let inner = block.inner(rect);
         frame.render_widget(Clear, rect);
         frame.render_widget(block, rect);
 
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(label.clone()));
         let cascade = if *descendants > 0 {
@@ -601,7 +601,7 @@ pub fn card_lines(
     width: usize,
     use_emojis: bool,
 ) -> Vec<Line<'static>> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
     let row_style = if selected {
         Style::default()
             .bg(resolve_color(HOVER_BG, HOVER_BG_INDEX))

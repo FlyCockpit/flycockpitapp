@@ -19,11 +19,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 
 use super::grab;
 use super::pointer_actions::{ListAction, ListKind, ListRowId, SettingsPointerAction};
@@ -443,8 +443,11 @@ impl SettingsCx {
         area: Rect,
         p: &StringListPage,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(Span::styled(
                 p.kind.title().to_string(),
@@ -454,7 +457,12 @@ impl SettingsCx {
         ];
         let mut controls = vec![None; lines.len()];
         let mut confirmation_lines = Vec::new();
-        push_wrapped_text(&mut lines, area.width, p.kind.intro(), muted);
+        push_wrapped_text(
+            &mut lines,
+            crate::tui::chrome::scrollbar_content(area).width,
+            p.kind.intro(),
+            muted,
+        );
         controls.resize(lines.len(), None);
         lines.push(Line::default());
         controls.push(None);
@@ -484,7 +492,10 @@ impl SettingsCx {
             let style = if on_cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(
+                    crate::tui::theme::INK,
+                    crate::tui::theme::INK_INDEX,
+                ))
             };
             lines.push(Line::from(vec![
                 Span::raw(marker),
@@ -568,18 +579,6 @@ impl SettingsCx {
                 ))),
                 can_down,
                 (!can_down).then_some("already last"),
-            )));
-            lines.push(Line::from("[Save]"));
-            controls.push(Some((
-                SettingsPointerAction::List(ListAction::Save),
-                true,
-                None,
-            )));
-            lines.push(Line::from("[Cancel]"));
-            controls.push(Some((
-                SettingsPointerAction::List(ListAction::Cancel),
-                true,
-                None,
             )));
             lines.push(grab::grab_hint_line(grab::GRAB_HINT));
             controls.push(None);
@@ -737,6 +736,29 @@ impl SettingsPage for StringListPage {
             cockpit_core::welcome::display_path(&cx.config_path),
             self.crumb()
         )
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{ListAction, SettingsPointerAction};
+        let actions = if self.grabbed.is_some() {
+            vec![
+                super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::List(ListAction::Save),
+                },
+                super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::List(ListAction::Cancel),
+                },
+            ]
+        } else {
+            Vec::new()
+        };
+        super::shell::finish_help_row(cx, actions)
     }
 
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {

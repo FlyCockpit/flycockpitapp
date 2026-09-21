@@ -184,6 +184,30 @@ fn settings_hover_is_not_stolen_by_session_rail() {
 }
 
 #[test]
+fn settings_field_pointer_targets_cover_the_full_rounded_field() {
+    let dialog = crate::tui::settings::SettingsDialog::golden_fixture("mcp-add");
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut links = crate::tui::links::LinkRegistry::default();
+    terminal
+        .draw(|frame| dialog.render(frame, Rect::new(0, 0, 120, 40), &mut links))
+        .expect("draw");
+    let field_targets = dialog
+        .pointer_test_target_rects()
+        .into_iter()
+        .filter(|rect| rect.height == 3)
+        .collect::<Vec<_>>();
+    assert!(
+        !field_targets.is_empty(),
+        "MCP text fields must expose their rounded three-row hit regions"
+    );
+    assert!(
+        field_targets.iter().all(|rect| rect.width > 4),
+        "field hit regions must include the padded text interior"
+    );
+}
+
+#[test]
 fn settings_mouse_default_model_menu_matches_keyboard() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut app = App::new(Some(tmp.path()), false);

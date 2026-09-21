@@ -233,12 +233,12 @@ fn assert_excoc_hovered_action_row(buffer: &ratatui::buffer::Buffer) {
     let delete_fg = buffer[(row.find("[×]").unwrap() as u16, 9)].fg;
     assert_eq!(
         pin_fg,
-        Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX),
+        crate::tui::theme::indexed_color(crate::tui::theme::MUTED_COLOR_INDEX),
         "Pin uses FOG like excoc"
     );
     assert_eq!(
         archive_fg,
-        Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX),
+        crate::tui::theme::indexed_color(crate::tui::theme::MUTED_COLOR_INDEX),
         "Archive uses FOG like excoc"
     );
     assert_eq!(

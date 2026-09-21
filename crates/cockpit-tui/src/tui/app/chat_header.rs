@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::widgets::{Block, BorderType, Borders, Clear};
+use ratatui::widgets::{Block, Borders, Clear};
 
 use crate::tui::chat_header::{
     CHAT_HEADER_HEIGHT, ChatHeaderLayout, ChatHeaderState, HeaderPill, HeaderPillKind,
@@ -404,7 +404,7 @@ impl App {
         frame.render_widget(Clear, popover);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(ACCENT_BLUE))
             .title(" more ");
         let inner = block.inner(popover);

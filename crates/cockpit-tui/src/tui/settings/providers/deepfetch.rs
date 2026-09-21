@@ -440,8 +440,11 @@ impl SettingsCx {
         area: Rect,
         state: &DeepFetchState,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let red = Style::default().fg(Color::Red);
         let mut lines = vec![
             Line::from(vec![
@@ -479,7 +482,7 @@ impl SettingsCx {
                         ),
                     ));
                     lines.push(Line::from(Span::styled(
-                        format!("{}{}", if selected { "▸ " } else { "  " }, label),
+                        format!("{}{}", if selected { "› " } else { "  " }, label),
                         if selected {
                             yellow.add_modifier(Modifier::BOLD)
                         } else {

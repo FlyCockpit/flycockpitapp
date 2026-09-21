@@ -188,7 +188,6 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Color;
     use std::path::PathBuf;
 
     fn sample(enabled: bool, name: Option<&str>) -> LaunchInfo {
@@ -326,12 +325,18 @@ mod tests {
             .iter()
             .find(|span| span.style.fg.is_some())
             .expect("accent border span");
-        assert_eq!(border.style.fg, Some(Color::Indexed(BRASS_INDEX)));
+        assert_eq!(
+            border.style.fg,
+            Some(crate::tui::theme::indexed_color(BRASS_INDEX))
+        );
         let version = lines
             .iter()
             .flat_map(|line| line.spans.iter())
             .find(|span| span.content.starts_with("v9.9.9"))
             .expect("version span");
-        assert_eq!(version.style.fg, Some(Color::Indexed(FOG_INDEX)));
+        assert_eq!(
+            version.style.fg,
+            Some(crate::tui::theme::indexed_color(FOG_INDEX))
+        );
     }
 }

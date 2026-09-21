@@ -21,7 +21,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 
 /// Shared arm/confirm state for a page-level reset button. A page embeds
 /// one of these and drives it through [`Self::activate`] /
@@ -77,8 +77,8 @@ impl ResetButton {
     /// (e.g. `"reset to defaults"`). While armed the row turns red and
     /// shows a confirm hint; otherwise it shows the key hint.
     pub(super) fn render_line(&self, selected: bool, label: &str) -> Line<'static> {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let marker = if selected { "▸ " } else { "  " };
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let marker = super::shell::marker(selected);
         if self.pending {
             let red = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
             Line::from(vec![
@@ -89,7 +89,10 @@ impl ResetButton {
         } else {
             let style = if selected {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(resolve_color(
+                        crate::tui::theme::BRASS,
+                        crate::tui::theme::BRASS_INDEX,
+                    ))
                     .add_modifier(Modifier::BOLD)
             } else {
                 muted

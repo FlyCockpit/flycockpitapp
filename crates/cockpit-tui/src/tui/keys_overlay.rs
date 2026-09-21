@@ -25,7 +25,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::tui::pane::Pane;
 use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, resolve_color};
@@ -797,7 +797,7 @@ impl KeysOverlay {
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(resolve_color(BRASS, BRASS_INDEX)))
             .title(Line::from(Span::styled(
                 format!(" keybindings — {} ", self.title()),

@@ -170,6 +170,8 @@ fixture_enum!(ProvidersFixture {
     DeleteCancel,
     SaveProvider,
     LocalBack,
+    RetryVerification,
+    ContinueVerificationOffline,
     AddModel,
     RenameModel,
     DeleteModel,
@@ -257,6 +259,11 @@ fixture_enum!(LspFixture {
     Uninstall,
     Restart
 });
+fixture_enum!(ImageSpendFixture {
+    EditField,
+    Save,
+    Cancel
+});
 fixture_enum!(ListFixture {
     Add,
     Edit,
@@ -339,6 +346,7 @@ pub(super) enum ActionFixtureKey {
     Mcp(McpFixture),
     Providers(ProvidersFixture),
     Lsp(LspFixture),
+    ImageSpend(ImageSpendFixture),
     List(ListFixture),
     Utility(UtilityFixture),
     DefaultModel(DefaultModelFixture),
@@ -399,6 +407,7 @@ fixture_enum!(WizardPayloadControlKey {
     ContinueHeaders,
     CopilotContinue,
     DoneContinue,
+    Continue,
     EditText
 });
 
@@ -435,6 +444,7 @@ fn wizard_payload_key(control: &WizardControlId) -> WizardPayloadControlKey {
         WizardControlId::ContinueHeaders => WizardPayloadControlKey::ContinueHeaders,
         WizardControlId::CopilotContinue => WizardPayloadControlKey::CopilotContinue,
         WizardControlId::DoneContinue => WizardPayloadControlKey::DoneContinue,
+        WizardControlId::Continue => WizardPayloadControlKey::Continue,
         WizardControlId::EditText => WizardPayloadControlKey::EditText,
     }
 }
@@ -524,6 +534,8 @@ pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWiza
             | ProviderWizardStep::Fetching => false,
             #[cfg(not(feature = "grok-subscription"))]
             ProviderWizardStep::GrokOAuth => false,
+            #[cfg(feature = "grok-subscription")]
+            ProviderWizardStep::GrokOAuth => true,
             ProviderWizardStep::Template
             | ProviderWizardStep::WireApi
             | ProviderWizardStep::ProviderId
@@ -533,7 +545,6 @@ pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWiza
             | ProviderWizardStep::ApiKey
             | ProviderWizardStep::EnvVar
             | ProviderWizardStep::CopilotAuth
-            | ProviderWizardStep::GrokOAuth
             | ProviderWizardStep::CodexOAuth
             | ProviderWizardStep::Done => true,
         })
@@ -582,6 +593,7 @@ pub(super) fn payload_keys_for(action: &SettingsPointerAction) -> Vec<PayloadFix
             | ListAction::MoveDown(id) => vec![PayloadFixtureKey::List(id.kind)],
             ListAction::Add | ListAction::Save | ListAction::Cancel => Vec::new(),
         },
+        SettingsPointerAction::ImageSpend(_) => Vec::new(),
         SettingsPointerAction::Agents(_)
         | SettingsPointerAction::Tools(_)
         | SettingsPointerAction::Harnesses(_)
@@ -628,6 +640,7 @@ impl ActionFixtureKey {
             | Self::Mcp(_)
             | Self::Providers(_)
             | Self::Lsp(_)
+            | Self::ImageSpend(_)
             | Self::List(_)
             | Self::Utility(_)
             | Self::DefaultModel(DefaultModelFixture::Choose)
@@ -707,6 +720,12 @@ pub(super) fn all_keys() -> Vec<ActionFixtureKey> {
     );
     #[cfg(feature = "extended")]
     {
+        all.extend(
+            ImageSpendFixture::ALL
+                .iter()
+                .copied()
+                .map(ActionFixtureKey::ImageSpend),
+        );
         all.extend(
             GenerationFixture::ALL
                 .iter()
@@ -905,6 +924,11 @@ pub(super) fn key_for(action: &SettingsPointerAction) -> ActionFixtureKey {
         }),
         SettingsPointerAction::Providers(action) => K::Providers(provider_key(action)),
         SettingsPointerAction::Lsp(action) => K::Lsp(lsp_key(action)),
+        SettingsPointerAction::ImageSpend(action) => K::ImageSpend(match action {
+            ImageSpendAction::EditField => ImageSpendFixture::EditField,
+            ImageSpendAction::Save => ImageSpendFixture::Save,
+            ImageSpendAction::Cancel => ImageSpendFixture::Cancel,
+        }),
         SettingsPointerAction::List(action) => K::List(match action {
             ListAction::Add => ListFixture::Add,
             ListAction::Edit(_) => ListFixture::Edit,
@@ -1040,6 +1064,7 @@ enum WizardControlKind {
     ContinueHeaders,
     CopilotContinue,
     DoneContinue,
+    Continue,
     EditText,
 }
 
@@ -1061,6 +1086,7 @@ fn wizard_control_kind(control: &WizardControlId) -> WizardControlKind {
         WizardControlId::ContinueHeaders => WizardControlKind::ContinueHeaders,
         WizardControlId::CopilotContinue => WizardControlKind::CopilotContinue,
         WizardControlId::DoneContinue => WizardControlKind::DoneContinue,
+        WizardControlId::Continue => WizardControlKind::Continue,
         WizardControlId::EditText => WizardControlKind::EditText,
     }
 }
@@ -1105,7 +1131,12 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         {
             ProvidersFixture::WizardAuthCopyDetectedEnv
         }
-        ProviderWizardStep::ApiKey if matches!(control, WizardControlKind::EditText) => {
+        ProviderWizardStep::ApiKey
+            if matches!(
+                control,
+                WizardControlKind::Continue | WizardControlKind::EditText
+            ) =>
+        {
             ProvidersFixture::WizardApiKeyEdit
         }
         ProviderWizardStep::EnvVar if matches!(control, WizardControlKind::EditText) => {
@@ -1168,6 +1199,7 @@ fn provider_key(action: &ProvidersAction) -> ProvidersFixture {
         ProvidersAction::OAuthOption(_, OAuthOption::ManualPaste) => {
             ProvidersFixture::OAuthManualPaste
         }
+        ProvidersAction::EditOAuthCallback(_) => ProvidersFixture::OAuthManualPaste,
         ProvidersAction::OAuthOption(_, OAuthOption::Poll) => ProvidersFixture::OAuthPoll,
         ProvidersAction::OAuthOption(_, OAuthOption::SkipContinue) => {
             ProvidersFixture::OAuthSkipContinue
@@ -1193,6 +1225,10 @@ fn provider_key(action: &ProvidersAction) -> ProvidersFixture {
         ProvidersAction::Delete(_, ProviderDeleteChoice::Cancel) => ProvidersFixture::DeleteCancel,
         ProvidersAction::SaveProvider(_) => ProvidersFixture::SaveProvider,
         ProvidersAction::LocalBack => ProvidersFixture::LocalBack,
+        ProvidersAction::RetryVerification => ProvidersFixture::RetryVerification,
+        ProvidersAction::ContinueVerificationOffline => {
+            ProvidersFixture::ContinueVerificationOffline
+        }
         ProvidersAction::AddModel(_) => ProvidersFixture::AddModel,
         ProvidersAction::RenameModel(_, _) => ProvidersFixture::RenameModel,
         ProvidersAction::DeleteModel(_, _) => ProvidersFixture::DeleteModel,

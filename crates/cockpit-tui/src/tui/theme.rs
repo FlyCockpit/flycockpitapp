@@ -196,6 +196,21 @@ pub fn resolve_color(truecolor: Color, index: u8) -> Color {
     }
 }
 
+/// Construct an indexed fallback without letting paint sites depend on the
+/// palette representation directly. New UI should prefer [`resolve_color`].
+pub const fn indexed_color(index: u8) -> Color {
+    Color::Indexed(index)
+}
+
+/// Inspect an indexed colour for deterministic style dumps.
+#[cfg(any(test, feature = "test-support"))]
+pub const fn indexed_value(color: Color) -> Option<u8> {
+    match color {
+        Color::Indexed(index) => Some(index),
+        _ => None,
+    }
+}
+
 // Per-thread capability override behind [`pin_truecolor`]. Tests and the
 // golden harness install it so both capability branches are exercised
 // deterministically and golden dumps never depend on the ambient

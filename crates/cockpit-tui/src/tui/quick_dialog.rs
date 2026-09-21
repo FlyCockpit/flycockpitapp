@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -215,7 +215,7 @@ impl QuickDialog {
             Paragraph::new(
                 "tab/→/l: next  shift+tab/←/h: previous  ↑/↓/j/k: move  space: stage  enter: commit  esc: discard",
             )
-            .style(Style::default().fg(Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX))),
+            .style(Style::default().fg(crate::tui::theme::indexed_color(crate::tui::theme::MUTED_COLOR_INDEX))),
             layout[2],
         );
     }
@@ -418,10 +418,14 @@ impl QuickDialog {
             }
             let style = if i == self.tab {
                 Style::default()
-                    .fg(Color::Indexed(crate::tui::theme::ACCENT_BLUE_INDEX))
+                    .fg(crate::tui::theme::indexed_color(
+                        crate::tui::theme::ACCENT_BLUE_INDEX,
+                    ))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Indexed(crate::tui::theme::MUTED_COLOR_INDEX))
+                Style::default().fg(crate::tui::theme::indexed_color(
+                    crate::tui::theme::MUTED_COLOR_INDEX,
+                ))
             };
             spans.push(Span::styled(tab.label(), style));
         }

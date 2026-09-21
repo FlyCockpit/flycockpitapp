@@ -50,6 +50,12 @@ pub(super) fn record_rendered_surface(surface: SettingsPointerSurfaceKind) {
 /// token: a rendered agent row's occurrence binds to the workspace's live
 /// source identity and revision, which no fixture dispatch can reproduce.
 fn coverage_identity(action: &SettingsPointerAction) -> SettingsPointerAction {
+    if let SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(_, kind)) = action {
+        // Each OAuth presentation owns a freshly generated flow token. The
+        // copy reducer is keyed by its kind; a separate fixture necessarily
+        // has a different token while exercising the same live source.
+        return SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(OAuthFlowId(0), *kind));
+    }
     let SettingsPointerAction::Agents(action) = action else {
         return action.clone();
     };
@@ -136,6 +142,9 @@ pub(super) fn record_dispatched_action(action: &SettingsPointerAction) {
 }
 
 fn click_target(dialog: &mut super::SettingsDialog, target: &SettingsPointerTarget) {
+    if let RenderAction::Page(action) = &target.action {
+        record_rendered_action(action, target.enabled);
+    }
     for kind in [
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
@@ -609,6 +618,8 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     PAYLOAD_COVERAGE.with(|coverage| *coverage.borrow_mut() = Default::default());
     WIZARD_SOURCE_COVERAGE.with(|coverage| coverage.borrow_mut().clear());
     super::tests::run_pointer_dialog_regression_matrix();
+    #[cfg(feature = "extended")]
+    super::tests::run_image_spend_footer_actions_regression();
     super::tests::run_pointer_picker_suggestion_matrix();
     super::tests::run_pointer_category_confirmation_and_effect_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();

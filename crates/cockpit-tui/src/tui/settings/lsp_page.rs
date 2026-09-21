@@ -43,11 +43,10 @@ pub(super) enum LspRow {
     DebounceMs,
     DocumentTimeoutMs,
     WorkspaceTimeoutMs,
-    Reset,
     Server(usize),
 }
 
-pub(super) const LSP_NAV_ROWS: [LspRow; 9] = [
+pub(super) const LSP_NAV_ROWS: [LspRow; 8] = [
     LspRow::Enabled,
     LspRow::AutoInstall,
     LspRow::Diagnostics,
@@ -56,7 +55,6 @@ pub(super) const LSP_NAV_ROWS: [LspRow; 9] = [
     LspRow::DebounceMs,
     LspRow::DocumentTimeoutMs,
     LspRow::WorkspaceTimeoutMs,
-    LspRow::Reset,
 ];
 
 pub(super) const LSP_SERVER_ROW_START: usize = LSP_NAV_ROWS.len();
@@ -242,7 +240,6 @@ impl SettingsPage for LspPage {
                             cx.extended.lsp.diagnostics.workspace_timeout_ms,
                         );
                     }
-                    LspRow::Reset => cx.activate_lsp_reset(self),
                     LspRow::Server(idx) => {
                         self.reset.disarm();
                         cx.queue_lsp_action(idx, LspControlAction::Check, self);
@@ -318,7 +315,10 @@ impl SettingsPage for LspPage {
                 }
                 return Nav::Stay;
             }
-            PointerLspAction::Reset => row_index(LspRow::Reset),
+            PointerLspAction::Reset => {
+                cx.activate_lsp_reset(self);
+                return Nav::Stay;
+            }
             PointerLspAction::Check(_)
             | PointerLspAction::Install(_)
             | PointerLspAction::Uninstall(_)
@@ -352,6 +352,32 @@ impl SettingsPage for LspPage {
         Nav::Stay
     }
 
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        if let (Some(edit), SettingsPointerAction::Lsp(PointerLspAction::Edit(edit_action))) =
+            (self.editing, &action)
+            && pointer_edit(edit) == *edit_action
+        {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| target.action == shell::SettingsPointerAction::Page(action.clone()))
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            self.buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, action)
+    }
+
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › LSP",
@@ -365,6 +391,44 @@ impl SettingsPage for LspPage {
         } else {
             "↑/↓/Tab/Shift+Tab  enter: toggle / edit  r: reset  esc/h: back  q: close"
         }
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{LspAction, SettingsPointerAction};
+        if let Some(edit) = self.editing {
+            let edit = pointer_edit(edit);
+            return super::shell::finish_help_row(
+                cx,
+                vec![
+                    super::shell::SettingsHelpAction {
+                        label: "Cancel",
+                        enabled: true,
+                        primary: false,
+                        action: SettingsPointerAction::Lsp(LspAction::CancelEdit(edit)),
+                    },
+                    super::shell::SettingsHelpAction {
+                        label: "Save",
+                        enabled: true,
+                        primary: true,
+                        action: SettingsPointerAction::Lsp(LspAction::SaveEdit(edit)),
+                    },
+                ],
+            );
+        }
+        let label = if self.reset.is_pending() {
+            "confirm reset"
+        } else {
+            "restore LSP defaults"
+        };
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
+                label,
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Lsp(LspAction::Reset),
+            }],
+        )
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -390,11 +454,11 @@ pub(super) fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>,
     let d = &dialog.extended.lsp.diagnostics;
     let project_context = dialog.project_context();
     let mut rows = vec![
-        lsp_row(
+        lsp_toggle_row(
             row_index(LspRow::Enabled),
             p.cursor,
             "enabled",
-            on_off(dialog.extended.lsp.enabled),
+            dialog.extended.lsp.enabled,
         ),
         lsp_row(
             row_index(LspRow::AutoInstall),
@@ -402,11 +466,11 @@ pub(super) fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>,
             "auto install",
             dialog.extended.lsp.auto_install.as_str(),
         ),
-        lsp_row(
+        lsp_toggle_row(
             row_index(LspRow::Diagnostics),
             p.cursor,
             "diagnostics",
-            on_off(d.enabled),
+            d.enabled,
         ),
         lsp_edit_row(
             row_index(LspRow::OtherFilesLimit),
@@ -444,8 +508,6 @@ pub(super) fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>,
             "workspace timeout ms",
             d.workspace_timeout_ms,
         ),
-        p.reset
-            .render_line(p.cursor == row_index(LspRow::Reset), "restore LSP defaults"),
     ];
     if let Some(cwd) = project_context.project_root() {
         for (idx, server) in cockpit_core::daemon::lsp::builtin_server_views(cwd, &dialog.extended)
@@ -520,6 +582,21 @@ fn lsp_row(
     ])
 }
 
+fn lsp_toggle_row(
+    idx: usize,
+    cursor: usize,
+    label: impl Into<String>,
+    enabled: bool,
+) -> Line<'static> {
+    let selected = idx == cursor;
+    Line::from(vec![
+        Span::raw(marker(selected)),
+        crate::tui::chrome::check_mark(enabled, selected),
+        Span::styled(format!("{:<22}", label.into()), selected_or_field(selected)),
+        Span::styled(if enabled { "on" } else { "off" }, muted_style()),
+    ])
+}
+
 fn lsp_info_row(label: impl Into<String>, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
@@ -531,31 +608,37 @@ fn lsp_info_row(label: impl Into<String>, value: impl Into<String>) -> Line<'sta
 fn lsp_edit_row<T: ToString>(
     idx: usize,
     p: &LspPage,
-    edit: LspEdit,
+    _edit: LspEdit,
     label: &str,
     value: T,
 ) -> Line<'static> {
-    if p.editing == Some(edit) {
-        let selected = idx == p.cursor;
-        let text = p.buf.text();
-        let cursor = cockpit_host::text::floor_char_boundary(text, p.buf.cursor());
-        let (before, after) = text.split_at(cursor);
-        Line::from(vec![
-            Span::raw(marker(selected)),
-            Span::styled(format!("{label:<24}"), selected_or_field(selected)),
-            Span::styled(before.to_string(), muted_style()),
-            shell::cursor_marker_span(),
-            Span::styled(after.to_string(), muted_style()),
-            Span::styled("  [cancel]", muted_style()),
-        ])
-    } else {
-        lsp_row(idx, p.cursor, label, value.to_string())
-    }
+    lsp_row(idx, p.cursor, label, value.to_string())
 }
 
 pub(super) fn lsp_selected_line_for_cursor(cursor: usize) -> usize {
     let severity_insert_at = row_index(LspRow::DebounceMs);
     cursor + usize::from(cursor >= severity_insert_at)
+}
+
+fn lsp_render_line_for_cursor(cursor: usize, editing: Option<LspEdit>) -> usize {
+    let line = lsp_selected_line_for_cursor(cursor);
+    editing
+        .map(lsp_row_for_edit)
+        .map(row_index)
+        .map(|edited_cursor| {
+            line + 2 * usize::from(lsp_selected_line_for_cursor(edited_cursor) < line)
+        })
+        .unwrap_or(line)
+}
+
+fn lsp_edit_label(edit: LspEdit) -> &'static str {
+    match edit {
+        LspEdit::OtherFilesLimit => "other files limit",
+        LspEdit::PerFileLimit => "per-file limit",
+        LspEdit::DebounceMs => "debounce ms",
+        LspEdit::DocumentTimeoutMs => "document timeout ms",
+        LspEdit::WorkspaceTimeoutMs => "workspace timeout ms",
+    }
 }
 
 fn on_off(v: bool) -> &'static str {
@@ -620,7 +703,15 @@ impl SettingsCx {
     }
 
     fn render_lsp_page(&self, frame: &mut Frame, area: Rect, p: &LspPage) {
-        let (rows, selected_line) = lsp_rows(self, p);
+        let (mut rows, _) = lsp_rows(self, p);
+        if let Some(edit) = p.editing {
+            let line = lsp_selected_line_for_cursor(row_index(lsp_row_for_edit(edit)));
+            rows.splice(
+                line..=line,
+                [Line::default(), Line::default(), Line::default()],
+            );
+        }
+        let selected_line = lsp_render_line_for_cursor(p.cursor, p.editing);
         let row_count = LSP_SERVER_ROW_START
             + self
                 .project_context()
@@ -639,21 +730,16 @@ impl SettingsCx {
                 LspRow::AutoInstall => Some(PointerLspAction::CycleAutoInstall),
                 LspRow::Diagnostics => Some(PointerLspAction::ToggleDiagnostics),
                 LspRow::OtherFilesLimit => {
-                    Some(lsp_edit_pointer_action(p, PointerLspEdit::OtherFilesLimit))
+                    lsp_edit_pointer_action(p, PointerLspEdit::OtherFilesLimit)
                 }
-                LspRow::PerFileLimit => {
-                    Some(lsp_edit_pointer_action(p, PointerLspEdit::PerFileLimit))
+                LspRow::PerFileLimit => lsp_edit_pointer_action(p, PointerLspEdit::PerFileLimit),
+                LspRow::DebounceMs => lsp_edit_pointer_action(p, PointerLspEdit::DebounceMs),
+                LspRow::DocumentTimeoutMs => {
+                    lsp_edit_pointer_action(p, PointerLspEdit::DocumentTimeoutMs)
                 }
-                LspRow::DebounceMs => Some(lsp_edit_pointer_action(p, PointerLspEdit::DebounceMs)),
-                LspRow::DocumentTimeoutMs => Some(lsp_edit_pointer_action(
-                    p,
-                    PointerLspEdit::DocumentTimeoutMs,
-                )),
-                LspRow::WorkspaceTimeoutMs => Some(lsp_edit_pointer_action(
-                    p,
-                    PointerLspEdit::WorkspaceTimeoutMs,
-                )),
-                LspRow::Reset => Some(PointerLspAction::Reset),
+                LspRow::WorkspaceTimeoutMs => {
+                    lsp_edit_pointer_action(p, PointerLspEdit::WorkspaceTimeoutMs)
+                }
                 // The unavailable sentinel is explanatory text, not an
                 // enabled Check control. A real project source below supplies
                 // stable server identities and actionable controls.
@@ -663,7 +749,7 @@ impl SettingsCx {
                     .map(|server| PointerLspAction::Check(LspServerId(server.id.clone()))),
             }?;
             Some((
-                lsp_selected_line_for_cursor(cursor),
+                lsp_render_line_for_cursor(cursor, p.editing),
                 SettingsPointerAction::Lsp(action),
             ))
         });
@@ -677,28 +763,34 @@ impl SettingsCx {
         );
         let offset = self.scroll_states.offset_for("lsp");
         if let Some(edit) = p.editing {
-            let line = lsp_selected_line_for_cursor(row_index(lsp_row_for_edit(edit)));
+            let line = lsp_render_line_for_cursor(row_index(lsp_row_for_edit(edit)), p.editing);
             if let Some(screen_row) = line.checked_sub(offset)
-                && screen_row < usize::from(area.height)
+                && screen_row + 3 <= usize::from(area.height)
             {
-                // The overlay owns the complete rendered `  [cancel]` span,
-                // beginning immediately after marker + label + draft + caret.
-                let cancel_x = 27usize.saturating_add(p.buf.text().chars().count());
-                if cancel_x < usize::from(area.width) {
-                    self.pointer_surface.register(shell::SettingsPointerTarget {
-                        rect: Rect::new(
-                            area.x.saturating_add(cancel_x as u16),
-                            area.y.saturating_add(screen_row as u16),
-                            10.min(area.width.saturating_sub(cancel_x as u16)),
-                            1,
-                        ),
-                        action: shell::SettingsPointerAction::Page(SettingsPointerAction::Lsp(
-                            PointerLspAction::CancelEdit(pointer_edit(edit)),
-                        )),
-                        enabled: true,
-                        disabled_reason: None,
-                    });
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    lsp_edit_label(edit),
+                    &p.buf,
+                    true,
+                    "",
+                ) {
+                    frame.set_cursor_position(caret);
                 }
+                self.pointer_surface.register(shell::SettingsPointerTarget {
+                    rect,
+                    action: shell::SettingsPointerAction::Page(SettingsPointerAction::Lsp(
+                        PointerLspAction::Edit(pointer_edit(edit)),
+                    )),
+                    enabled: true,
+                    disabled_reason: None,
+                });
             }
         }
         let server_count = row_count.saturating_sub(LSP_SERVER_ROW_START);
@@ -706,7 +798,7 @@ impl SettingsCx {
             let Some(server) = servers.as_ref().and_then(|items| items.get(server_idx)) else {
                 continue;
             };
-            let line = lsp_selected_line_for_cursor(LSP_SERVER_ROW_START + server_idx);
+            let line = lsp_render_line_for_cursor(LSP_SERVER_ROW_START + server_idx, p.editing);
             let Some(screen_row) = line.checked_sub(offset) else {
                 continue;
             };
@@ -751,11 +843,11 @@ impl SettingsCx {
     }
 }
 
-fn lsp_edit_pointer_action(p: &LspPage, edit: PointerLspEdit) -> PointerLspAction {
-    if p.editing.map(pointer_edit) == Some(edit) {
-        PointerLspAction::SaveEdit(edit)
+fn lsp_edit_pointer_action(p: &LspPage, edit: PointerLspEdit) -> Option<PointerLspAction> {
+    if p.editing.is_some() {
+        None
     } else {
-        PointerLspAction::Edit(edit)
+        Some(PointerLspAction::Edit(edit))
     }
 }
 

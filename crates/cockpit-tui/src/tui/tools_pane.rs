@@ -12,7 +12,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::tui::theme::{BRASS, BRASS_INDEX, YELLOW, YELLOW_INDEX, resolve_color};
 
@@ -880,7 +880,7 @@ impl ToolsPane {
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(resolve_color(BRASS, BRASS_INDEX)))
             .title(Span::styled(
                 " tools ",

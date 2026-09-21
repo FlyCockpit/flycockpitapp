@@ -230,7 +230,7 @@ impl ResourcesPane {
         }
         frame.render_widget(
             Paragraph::new(self.help_line())
-                .style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))),
+                .style(Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX))),
             help_area,
         );
     }
@@ -286,7 +286,7 @@ impl ResourcesPane {
         if self.loading {
             lines.push(Line::from(Span::styled(
                 "Loading resources...",
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
             )));
             return (lines, None, queued_rows);
         }
@@ -415,7 +415,7 @@ fn section(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
         Style::default()
-            .fg(Color::Indexed(ACCENT_BLUE_INDEX))
+            .fg(crate::tui::theme::indexed_color(ACCENT_BLUE_INDEX))
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -435,7 +435,7 @@ impl Pane for ResourcesPane {
 fn muted(text: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(
         text.into(),
-        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+        Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
     ))
 }
 

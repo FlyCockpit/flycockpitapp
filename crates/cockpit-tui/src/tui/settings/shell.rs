@@ -5,18 +5,21 @@ use std::collections::BTreeMap;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 use crate::tui::button::{
     ButtonDispatch, ButtonId, ButtonKind, ButtonRegistry, ButtonSpec, RowControlId,
     RowControlRegistry, RowDispatch, RowTarget, first_bracketed_label,
 };
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{
+    BRASS, BRASS_INDEX, FOG, FOG_INDEX, GOOD, GOOD_INDEX, INK, INK_INDEX, RED, RED_INDEX, YELLOW,
+    YELLOW_INDEX, resolve_color,
+};
 
-pub(super) const SELECTED_MARKER: &str = "▸ ";
+pub(super) const SELECTED_MARKER: &str = "› ";
 pub(super) const ROW_MARKER_WIDTH: usize = 2;
 const CURSOR_MARKER: &str = "\u{E000}";
 pub(super) const TEXT_COLUMN_GUTTER_WIDTH: u16 = 2;
@@ -57,17 +60,15 @@ pub(super) fn settings_text_columns(area: Rect) -> TextColumnLayout {
 }
 
 pub(super) fn normal_style() -> Style {
-    Style::default()
+    Style::default().fg(resolve_color(INK, INK_INDEX))
 }
 
 pub(super) fn muted_style() -> Style {
-    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
+    Style::default().fg(resolve_color(FOG, FOG_INDEX))
 }
 
 pub(super) fn selected_style() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD)
+    crate::tui::chrome::selection_style()
 }
 
 pub(super) fn heading_style() -> Style {
@@ -75,15 +76,11 @@ pub(super) fn heading_style() -> Style {
 }
 
 pub(super) fn focused_field_style() -> Style {
-    Style::default().fg(Color::White)
-}
-
-pub(super) fn inactive_field_style() -> Style {
-    muted_style()
+    Style::default().fg(resolve_color(INK, INK_INDEX))
 }
 
 pub(super) fn caret_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    Style::default().fg(resolve_color(BRASS, BRASS_INDEX))
 }
 
 pub(super) fn cursor_marker_span() -> Span<'static> {
@@ -107,19 +104,115 @@ pub(super) fn park_cursor_from_markers(frame: &mut Frame, area: Rect) -> Option<
 }
 
 pub(super) fn success_style() -> Style {
-    Style::default().fg(Color::Green)
+    Style::default().fg(resolve_color(GOOD, GOOD_INDEX))
 }
 
 pub(super) fn warning_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    Style::default().fg(resolve_color(YELLOW, YELLOW_INDEX))
 }
 
 pub(super) fn error_style() -> Style {
-    Style::default().fg(Color::Red)
+    Style::default().fg(resolve_color(RED, RED_INDEX))
 }
 
 pub(super) fn marker(selected: bool) -> &'static str {
     if selected { SELECTED_MARKER } else { "  " }
+}
+
+/// One footer action on the settings help row (excoc ActionBar idiom).
+pub(super) struct SettingsHelpAction<'a> {
+    pub label: &'a str,
+    pub enabled: bool,
+    pub primary: bool,
+    pub action: super::pointer_actions::SettingsPointerAction,
+}
+
+pub(super) struct SettingsHelpRow<'a> {
+    pub actions: Vec<SettingsHelpAction<'a>>,
+    pub hover: Option<usize>,
+    disabled_reasons: Vec<Option<&'static str>>,
+}
+
+pub(super) fn finish_help_row<'a>(
+    cx: &super::SettingsCx,
+    actions: Vec<SettingsHelpAction<'a>>,
+) -> SettingsHelpRow<'a> {
+    SettingsHelpRow {
+        disabled_reasons: vec![None; actions.len()],
+        actions,
+        hover: cx.pointer_surface.help_row_hover.get(),
+    }
+}
+
+impl<'a> SettingsHelpRow<'a> {
+    /// Attach the domain reason for a disabled action without forcing every
+    /// always-enabled ActionBar call site to carry redundant metadata.
+    pub(super) fn with_disabled_reason(
+        mut self,
+        index: usize,
+        disabled_reason: Option<&'static str>,
+    ) -> Self {
+        if let Some(reason) = self.disabled_reasons.get_mut(index) {
+            *reason = disabled_reason;
+        }
+        self
+    }
+
+    pub(super) fn disabled_reason(&self, index: usize) -> Option<&'static str> {
+        if self
+            .actions
+            .get(index)
+            .is_some_and(|action| !action.enabled)
+        {
+            self.disabled_reasons
+                .get(index)
+                .copied()
+                .flatten()
+                .or(Some("action unavailable"))
+        } else {
+            None
+        }
+    }
+}
+
+pub(super) fn render_settings_help_row(
+    frame: &mut Frame,
+    area: Rect,
+    help: &str,
+    row: &SettingsHelpRow<'_>,
+) -> Vec<Rect> {
+    let buttons: Vec<crate::tui::chrome::ActionButton<'_>> = row
+        .actions
+        .iter()
+        .map(|action| crate::tui::chrome::ActionButton {
+            label: action.label,
+            enabled: action.enabled,
+            primary: action.primary,
+        })
+        .collect();
+    let bar_width = if buttons.is_empty() {
+        0
+    } else {
+        crate::tui::chrome::action_bar_width(&buttons)
+    };
+    let help_width = area.width.saturating_sub(bar_width.saturating_add(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            help.to_string(),
+            Style::default().fg(resolve_color(FOG, FOG_INDEX)),
+        ))),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: help_width,
+            height: 1,
+        },
+    );
+    if buttons.is_empty() {
+        Vec::new()
+    } else {
+        crate::tui::chrome::render_action_bar(frame, area, &buttons, row.hover)
+    }
 }
 
 pub(super) fn selected_line_from_marker(lines: &[Line<'static>]) -> Option<usize> {
@@ -241,6 +334,8 @@ pub(super) struct SettingsPointerSurface {
     pub buttons: RefCell<ButtonRegistry>,
     pub rows: RefCell<RowControlRegistry>,
     pub surface_generation: std::cell::Cell<u64>,
+    pub help_row_hover: std::cell::Cell<Option<usize>>,
+    help_row_action_rects: RefCell<Vec<Rect>>,
 }
 
 impl Default for SettingsPointerSurface {
@@ -257,7 +352,19 @@ impl Default for SettingsPointerSurface {
             buttons: RefCell::new(ButtonRegistry::default()),
             rows: RefCell::new(RowControlRegistry::default()),
             surface_generation: std::cell::Cell::new(0),
+            help_row_hover: std::cell::Cell::new(None),
+            help_row_action_rects: RefCell::new(Vec::new()),
         }
+    }
+}
+
+impl SettingsPointerSurface {
+    pub(super) fn set_help_row_action_rects(&self, rects: Vec<Rect>) {
+        *self.help_row_action_rects.borrow_mut() = rects;
+    }
+
+    pub(super) fn help_row_action_at(&self, pos: ratatui::layout::Position) -> Option<usize> {
+        crate::tui::chrome::action_button_at(&self.help_row_action_rects.borrow(), pos)
     }
 }
 
@@ -417,7 +524,16 @@ impl SettingsScrollStates {
         let mut states = self.states.borrow_mut();
         let state = states.entry(key.into()).or_default();
         state.select(selected);
-        frame.render_stateful_widget(List::new(items).scroll_padding(1), area, state);
+        let view_h = usize::from(area.height);
+        let content = crate::tui::chrome::scrollbar_content(area);
+        frame.render_stateful_widget(
+            List::new(items)
+                .scroll_padding(1)
+                .highlight_style(crate::tui::chrome::selection_style()),
+            content,
+            state,
+        );
+        crate::tui::chrome::scrollbar(frame, area, item_count, view_h, state.offset());
     }
 
     /// Render a list and publish its page-declared semantic controls from the
@@ -633,98 +749,6 @@ pub(super) fn push_label_value_row(
     );
 }
 
-pub(super) fn push_label_text_field_row(
-    lines: &mut Vec<Line<'static>>,
-    width: u16,
-    selected: bool,
-    label: &str,
-    label_width: usize,
-    value: &str,
-    cursor: usize,
-) {
-    let indent = ROW_MARKER_WIDTH + label_width + 2;
-    let value_width = usize::from(width).saturating_sub(indent).max(1);
-    let visible = cursor_visible_slice(value, cursor, value_width);
-    let cursor = cockpit_host::text::floor_char_boundary(value, cursor);
-    let rel_cursor = cursor.saturating_sub(visible.start).min(visible.text.len());
-    let rel_cursor = cockpit_host::text::floor_char_boundary(&visible.text, rel_cursor);
-    let (before, after) = visible.text.split_at(rel_cursor);
-    let mut spans = vec![
-        Span::raw(marker(selected).to_string()),
-        Span::styled(
-            format!("{label:<width$}", width = label_width),
-            selected_or_field(selected),
-        ),
-        Span::raw("  "),
-    ];
-    if visible.text.is_empty() {
-        spans.push(cursor_marker_span());
-    } else {
-        spans.push(Span::styled(before.to_string(), focused_field_style()));
-        spans.push(cursor_marker_span());
-        spans.push(Span::styled(after.to_string(), focused_field_style()));
-    }
-    lines.push(Line::from(spans));
-}
-
-pub(super) fn push_text_field_at_cursor(
-    lines: &mut Vec<Line<'static>>,
-    width: u16,
-    label: &str,
-    value: &str,
-    cursor: usize,
-    focused: bool,
-    placeholder: Option<&str>,
-) -> std::ops::Range<usize> {
-    let start = lines.len();
-    let prompt = format!("{label}: ");
-    if focused {
-        let mut spans = vec![Span::styled(prompt, muted_style())];
-        if value.is_empty() {
-            spans.push(cursor_marker_span());
-            if let Some(placeholder) = placeholder {
-                spans.push(Span::styled(
-                    placeholder.to_string(),
-                    inactive_field_style(),
-                ));
-            }
-            lines.push(Line::from(spans));
-            return start..lines.len();
-        }
-        let cursor = cockpit_host::text::floor_char_boundary(value, cursor);
-        let (before, after) = value.split_at(cursor);
-        spans.push(Span::styled(before.to_string(), focused_field_style()));
-        spans.push(cursor_marker_span());
-        spans.push(Span::styled(after.to_string(), focused_field_style()));
-        lines.push(Line::from(spans));
-        return start..lines.len();
-    }
-
-    let shown = if value.is_empty() {
-        placeholder.unwrap_or("")
-    } else {
-        value
-    };
-    let value_style = if value.is_empty() {
-        inactive_field_style()
-    } else {
-        focused_field_style()
-    };
-    push_wrapped_prefixed_value(
-        lines,
-        width,
-        WrappedValueLayout {
-            first_prefix: vec![Span::styled(prompt.clone(), muted_style())],
-            prefix_width: prompt.width(),
-            continuation_prefix: vec![Span::raw(" ".repeat(prompt.width()))],
-            suffix: None,
-        },
-        shown,
-        value_style,
-    );
-    start..lines.len()
-}
-
 pub(super) fn push_wrapped_text(
     lines: &mut Vec<Line<'static>>,
     width: u16,
@@ -734,78 +758,6 @@ pub(super) fn push_wrapped_text(
     for chunk in wrap_chunks(text, usize::from(width).max(1)) {
         lines.push(Line::from(Span::styled(chunk, style)));
     }
-}
-
-struct VisibleSlice {
-    start: usize,
-    text: String,
-}
-
-fn cursor_visible_slice(value: &str, cursor: usize, max_width: usize) -> VisibleSlice {
-    let cursor = cockpit_host::text::floor_char_boundary(value, cursor);
-    let before = &value[..cursor];
-    let mut start = 0;
-    while before[start..].width() >= max_width && start < cursor {
-        let Some((idx, ch)) = before[start..].char_indices().next() else {
-            break;
-        };
-        start += idx + ch.len_utf8();
-    }
-    let start = cockpit_host::text::floor_char_boundary(value, start);
-    let mut end = cursor;
-    while end < value.len() && value[start..end].width() < max_width.saturating_sub(1) {
-        let Some(ch) = value[end..].chars().next() else {
-            break;
-        };
-        let next = end + ch.len_utf8();
-        if value[start..next].width() > max_width {
-            break;
-        }
-        end = next;
-    }
-    VisibleSlice {
-        start,
-        text: value[start..end].to_string(),
-    }
-}
-
-pub(super) fn text_area_lines(
-    title: String,
-    mode_label: String,
-    hint: &'static str,
-    text: &str,
-    cursor: (usize, usize),
-) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(title, heading_style()),
-            Span::raw(" "),
-            Span::styled(format!("[{mode_label}]"), warning_style()),
-        ]),
-        Line::from(Span::styled(hint.to_string(), muted_style())),
-        Line::default(),
-    ];
-
-    let (cur_line, cur_col) = cursor;
-    for (li, line_text) in text.split('\n').enumerate() {
-        if li == cur_line {
-            let chars: Vec<char> = line_text.chars().collect();
-            let split = cur_col.min(chars.len());
-            let before: String = chars[..split].iter().collect();
-            let after: String = chars[split..].iter().collect();
-            lines.push(Line::from(vec![
-                Span::styled(before, focused_field_style()),
-                cursor_marker_span(),
-                Span::styled(after, focused_field_style()),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled(
-                line_text.to_string(),
-                focused_field_style(),
-            )));
-        }
-    }
-    lines
 }
 
 fn wrap_chunks(value: &str, width: usize) -> Vec<String> {

@@ -329,21 +329,32 @@ fn sidecar_save_preserves_existing_discovered_selection_without_offering_it_agai
 }
 
 #[test]
-fn sidecar_editors_expose_a_named_dirty_save_control() {
+fn sidecar_editors_expose_a_help_row_dirty_save_control() {
     let mut page = page_with(SidecarPageKind::ModeEditor);
-    let save = page
-        .named_actions()
-        .into_iter()
-        .find(|(action, _, _)| matches!(action, SidecarAction::SaveSelection))
+    let dialog = test_dialog();
+    let help = page.help_row_actions(&dialog);
+    let save = help
+        .actions
+        .iter()
+        .position(|action| {
+            matches!(
+                action.action,
+                SettingsPointerAction::Sidecar(SidecarAction::SaveSelection)
+            )
+        })
         .expect("mode editor must expose Save changes");
-    assert!(!save.1);
-    assert_eq!(save.2, Some(REASON_NO_PENDING_CHANGES));
+    assert!(!help.actions[save].enabled);
+    assert_eq!(help.disabled_reason(save), Some(REASON_NO_PENDING_CHANGES));
     page.session.form.local_edits_preserved = true;
     assert!(
-        page.named_actions()
+        page.help_row_actions(&dialog)
+            .actions
             .into_iter()
-            .any(|(action, enabled, reason)| {
-                matches!(action, SidecarAction::SaveSelection) && enabled && reason.is_none()
+            .any(|action| {
+                matches!(
+                    action.action,
+                    SettingsPointerAction::Sidecar(SidecarAction::SaveSelection)
+                ) && action.enabled
             })
     );
 }
@@ -377,13 +388,20 @@ fn sidecar_releases_only_the_matching_rejected_config_save() {
     let mut page = page_with(SidecarPageKind::ModeEditor);
     page.session.form.local_edits_preserved = true;
     page.session.reload_required_before_reapply = true;
-    let save = page
-        .named_actions()
-        .into_iter()
-        .find(|(action, _, _)| matches!(action, SidecarAction::SaveSelection))
+    let dialog = test_dialog();
+    let help = page.help_row_actions(&dialog);
+    let save = help
+        .actions
+        .iter()
+        .position(|action| {
+            matches!(
+                action.action,
+                SettingsPointerAction::Sidecar(SidecarAction::SaveSelection)
+            )
+        })
         .expect("mode editor exposes Save changes");
-    assert!(!save.1);
-    assert_eq!(save.2, Some(REASON_RELOAD_REQUIRED));
+    assert!(!help.actions[save].enabled);
+    assert_eq!(help.disabled_reason(save), Some(REASON_RELOAD_REQUIRED));
 }
 
 #[test]
@@ -1804,11 +1822,25 @@ fn image_sidecar_settings_state_action_registry() {
     let dialog = test_dialog();
     let mut seen_surfaces = std::collections::HashSet::new();
     let mut seen_actions = std::collections::HashSet::new();
+    let mut seen_selection_save_enabled = false;
+    let mut seen_selection_save_disabled = false;
+    let mut seen_central_policy_save_enabled = false;
+    let mut seen_central_policy_save_disabled = false;
     for kind in SidecarPageKind::ALL {
         for (w, h) in [(100, 30), (80, 24), (60, 16)] {
             let mut page = page_with(kind);
-            if kind == SidecarPageKind::ModeEditor {
+            if kind == SidecarPageKind::ModeEditor && h == 30 {
                 page.session.conflict = Some("reload before reapplying".into());
+            }
+            if matches!(
+                kind,
+                SidecarPageKind::ModeEditor
+                    | SidecarPageKind::DefaultEditor
+                    | SidecarPageKind::OverrideEditor
+                    | SidecarPageKind::CentralPolicyEditor
+            ) && h == 24
+            {
+                page.session.form.local_edits_preserved = true;
             }
             page.session.reducer.grants = vec![sample_grant(GrantScope::Project)];
             page.session.reducer.invocations = vec![sample_invocation()];
@@ -1842,6 +1874,31 @@ fn image_sidecar_settings_state_action_registry() {
                         "disabled action {:?} needs a stable reason",
                         action
                     );
+                }
+            }
+            let help = page.help_row_actions(&dialog);
+            for (index, help_action) in help.actions.iter().enumerate() {
+                let SettingsPointerAction::Sidecar(sidecar_action) = &help_action.action else {
+                    continue;
+                };
+                seen_actions.insert(std::mem::discriminant(sidecar_action));
+                if !help_action.enabled {
+                    assert!(
+                        help.disabled_reason(index).is_some(),
+                        "disabled help-row action {:?} needs a stable reason",
+                        sidecar_action
+                    );
+                }
+                match sidecar_action {
+                    SidecarAction::SaveSelection => {
+                        seen_selection_save_enabled |= help_action.enabled;
+                        seen_selection_save_disabled |= !help_action.enabled;
+                    }
+                    SidecarAction::SaveCentralPolicy => {
+                        seen_central_policy_save_enabled |= help_action.enabled;
+                        seen_central_policy_save_disabled |= !help_action.enabled;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1890,5 +1947,13 @@ fn image_sidecar_settings_state_action_registry() {
         seen_actions.len(),
         20,
         "every SidecarAction variant must be emitted by the state registry"
+    );
+    assert!(
+        seen_selection_save_enabled && seen_selection_save_disabled,
+        "SaveSelection must be observed both enabled and disabled"
+    );
+    assert!(
+        seen_central_policy_save_enabled && seen_central_policy_save_disabled,
+        "SaveCentralPolicy must be observed both enabled and disabled"
     );
 }

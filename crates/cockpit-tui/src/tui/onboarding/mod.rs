@@ -45,12 +45,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 
 use crate::tui::settings::Dialog;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use auth::AuthPhase;
-use auth::AuthScreen;
+pub(crate) use auth::AuthScreen;
 pub(crate) use auth::AuthSubmission;
 use chrome::ActionBar;
 use cockpit_core::providers::ProviderTemplate;
@@ -67,7 +67,8 @@ use search::{ProviderSearchScreen, onboarding_catalog};
 use secure_store::SecureStoreScreen;
 use theme::{BAD, BRASS, FOG, GOOD, HOVER_BG, INK, NIGHT};
 pub(crate) use verify::VerifyOutcome;
-use verify::VerifyScreen;
+pub(crate) use verify::VerifyPhase;
+pub(crate) use verify::VerifyScreen;
 
 #[derive(Debug, Clone)]
 pub struct ProviderSettlementEvidence {
@@ -2252,7 +2253,7 @@ impl OnboardingShell {
             format!(" Providers  ·  {filtered} of {total} ")
         };
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(NIGHT))
             .title(Span::styled(title, Style::new().fg(INK)))
             .padding(Padding::horizontal(1));
@@ -2355,7 +2356,7 @@ impl OnboardingShell {
             Line::from("Use /help any time to see available commands."),
         ];
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(GOOD))
             .title(Span::styled(
                 " Summary ",
@@ -2382,7 +2383,7 @@ impl OnboardingShell {
         };
         frame.render_widget(Clear, rect);
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(BRASS))
             .title(Span::styled(" Leave setup? ", Style::new().fg(BRASS)));
         let inner = block.inner(rect);

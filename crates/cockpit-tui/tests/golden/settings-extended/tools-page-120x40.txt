@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Tools ──────────────────────────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│Web tools                                                                          █│ │
+                              ▌ │                                                                                   █│ │
+ SESSIONS                       │› provider            Firecrawl (enter cycles Firecrawl, TinyFish, Custom)         █│ │
+ no active sessions in all pr   │  api key             none; env wins over stored credentials                       █│ │
+                                │  base url            default (empty uses https://api.firecrawl.dev)               █│ │
+                              no│                                                                                   █│ │
+                              ┊ │Built-in tools                                                                     █│ │
+                              ▌ │                                                                                   █│ │
+                                │  Filesystem                                                                       █│ █
+                                │  read                Read project files through the sandbox boundary.             ││ █
+                                │  grep                Search file contents with scoped regular expressions.        ││ █
+                                │  glob                Find files by glob pattern.                                  ││ █
+                                │  Shell                                                                            ││ █
+                                │  bash                Run shell commands with approval and sandbox checks.         ││ █
+                                │  escalate            Request elevated command or path access from the user.       ││ █
+                                │  Locks                                                                            ││ █
+                                │  write               Write files with automatic daemon-arbitrated locking.        ││ █
+                                │  edit                Edit files with automatic daemon-arbitrated locking.         ││ █
+                                │  delete              Delete files with automatic daemon-arbitrated locking.       ││ █
+                              ▌ │  unlock              Recover by releasing a stuck held file lock.                 ││ █
+                              ▌ │  Intel                                                                            ││ █
+                                │  context_pack        Assemble a focused code context bundle.                      ││ █
+                              ▌ │  code                Inspect code structure, symbols, and identifier uses.        ││ █
+                                │  graph               Inspect imports, importers, cycles, callers, calls, and most-││ █
+                                │                      recently-modified files by mtime.                            ││ █
+                                │  search              Search project text with budgeted regular expressions.       ││ █
+                                │  change_impact       Estimate impact for local changes.                           ││ █
+                                │  Skills                                                                           ││ █
+                                │  skill               Load named skill instructions and package support files.     ││ █
+                               ⋯│  skill_manage        Create and manage local skills.                              ││ █
+                                │  Planning                                                                         ││ █
+                                │  start_build         Start a build from the current plan.                         ││ █
+                                │  todo                Manage session todos and notes. (interactive sessions)       ││ █
+                              ▌ │  Session                                                                          ││ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: edit/cycle  t: toggle  d: remove  r: [ reset to defaults ]│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

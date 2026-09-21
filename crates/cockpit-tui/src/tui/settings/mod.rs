@@ -82,19 +82,13 @@ use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-#[cfg(test)]
-use ratatui::style::Color;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::tui::textfield::TextField;
-#[cfg(test)]
-use crate::tui::theme::MUTED_COLOR_INDEX;
-use crate::tui::theme::{
-    BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, YELLOW, YELLOW_INDEX, resolve_color,
-};
+use crate::tui::theme::{FOG, FOG_INDEX, INK, INK_INDEX, YELLOW, YELLOW_INDEX, resolve_color};
 use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
     cwd_scoped_creatable_dirs, discover_config_dirs, ensure_config_layer_dir, global_config_dir,
@@ -2844,6 +2838,16 @@ fn setup_wizard_dialog(
     Ok(Dialog::SetupWizard(wizard))
 }
 
+#[cfg(test)]
+pub(crate) fn golden_setup_wizard_text() -> Dialog {
+    setup_wizard_dialog(
+        std::path::Path::new("/fixture/project"),
+        cockpit_core::wizard::onboarding_profile_descriptor(),
+        None,
+    )
+    .expect("profile text wizard fixture")
+}
+
 impl Deref for SettingsDialog {
     type Target = SettingsCx;
 
@@ -2902,6 +2906,11 @@ pub(super) trait SettingsPage: Any {
     }
     fn title(&self, cx: &SettingsCx) -> String;
     fn help_text(&self, cx: &SettingsCx) -> &'static str;
+    /// Optional help-row ActionBar actions (Save/Cancel/Reset). When empty,
+    /// the dialog footer shows help text only.
+    fn help_row_actions(&self, cx: &SettingsCx) -> shell::SettingsHelpRow<'_> {
+        shell::finish_help_row(cx, Vec::new())
+    }
     /// Resolve a semantic control registered by this page. Implementations
     /// must validate the stable identity against current state before
     /// mutating; stale targets therefore become inert after reloads.
@@ -7587,6 +7596,111 @@ impl SettingsDialog {
 }
 
 impl SettingsDialog {
+    /// Scripted, machine-independent configuration used by settings goldens.
+    /// It deliberately avoids disk discovery, daemon data, `$USER`, and time.
+    #[cfg(test)]
+    pub(crate) fn golden_fixture(scene: &str) -> Self {
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "fixture".into(),
+            ProviderEntry {
+                url: "https://api.example.invalid/v1".into(),
+                models: vec![cockpit_config::providers::ModelEntry {
+                    id: "fixture-model".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let mut settings = Self::open_with_config(
+            PathBuf::from("/fixture/project/.cockpit/config.json"),
+            config,
+        );
+        settings.cx.guidance_trace_lines = vec![
+            "Guidance fixture: project instructions enabled.".into(),
+            "Redaction fixture: secrets remain protected.".into(),
+        ];
+        settings.cx.extended_warnings.clear();
+        settings.cx.provider_warnings.clear();
+        settings.cx.picker_cwd = None;
+        let fixture_entry = settings
+            .config
+            .providers
+            .get("fixture")
+            .expect("fixture provider")
+            .clone();
+        settings.page = match scene {
+            "ui-page" => instructions_page(ui_page::InstructionsPage::new()),
+            "string-list" => string_list_page(string_list::StringListPage::agent_dirs()),
+            "reset" => category_page(CategoryPage::new(Category::Behavior)),
+            "settings-editor" => providers_page(ProvidersPage::ProviderSettings {
+                editor: settings_editor::SettingsEditor::for_provider("fixture", &fixture_entry),
+                parent: Box::new(providers::EditState::new(
+                    "fixture".into(),
+                    fixture_entry.clone(),
+                )),
+            }),
+            "agent-editor" => {
+                let mut page = AgentsPage::new(PathBuf::from("/fixture/project").as_path());
+                page.editing = Some(agent_editor::AgentEditor::new(
+                    "fixture-agent".into(),
+                    "# Fixture agent\n\nKeep settings deterministic.\n",
+                    false,
+                    Some("fixture-revision".into()),
+                ));
+                agents_page(page)
+            }
+            "providers-mod" => providers_page(ProvidersPage::Add(providers::AddState::new())),
+            "auth" => {
+                let template = cockpit_core::providers::template_by_id("anthropic")
+                    .expect("anthropic template");
+                let mut add = providers::AddState::new();
+                add.template = Some(template);
+                add.id_field.set(template.id);
+                add.url_field.set(template.url);
+                add.run.return_to("api-key").expect("api-key step");
+                add.api_key_field.set("fixture-api-key");
+                add.auth_method_cursor = 0;
+                providers_page(ProvidersPage::Add(add))
+            }
+            "provider-verify" => {
+                let template = cockpit_core::providers::template_by_id("anthropic")
+                    .expect("anthropic template");
+                let mut add = providers::AddState::new();
+                add.template = Some(template);
+                add.id_field.set(template.id);
+                add.url_field.set(template.url);
+                add.saved_provider_id = Some(template.id.to_string());
+                add.run.return_to("test-key").expect("test-key step");
+                let mut verify = crate::tui::onboarding::VerifyScreen::new(template.id.to_string());
+                verify.apply(
+                    crate::tui::onboarding::VerifyOutcome::Network(
+                        "fixture network unavailable".into(),
+                    ),
+                    None,
+                );
+                add.verify = Some(Box::new(verify));
+                add.validation_failure = Some("fixture network unavailable".into());
+                providers_page(ProvidersPage::Add(add))
+            }
+            "provider-edit" => {
+                let mut edit = providers::EditState::new("fixture".into(), fixture_entry);
+                edit.editing_field = Some(providers::EditField::Url);
+                edit.field_buf.set("https://typed.example.invalid/v1");
+                providers_page(ProvidersPage::Edit(edit))
+            }
+            "mcp-add" => mcp_page(McpPage::Add(Box::new(mcp_page::AddState::golden_fixture()))),
+            "oauth-flow" => providers_page(ProvidersPage::OAuthSetup {
+                state: Box::new(providers::OAuthFlowState::new(
+                    providers::OAuthProvider::Codex,
+                )),
+                parent: Box::new(providers::EditState::new("fixture".into(), fixture_entry)),
+            }),
+            _ => root_page(0),
+        };
+        settings
+    }
+
     pub fn open(config_path: PathBuf) -> Self {
         let mut settings = Self::open_with_config(config_path, ProvidersConfig::default());
         settings.cx.queue_provider_catalog(None);
@@ -7798,6 +7912,11 @@ impl SettingsDialog {
             .downcast_mut::<dependencies_page::DependenciesPage>()
         {
             page.tick();
+        }
+        if let Some(ProvidersPage::Add(state)) = self.page.downcast_mut::<ProvidersPage>()
+            && let Some(screen) = state.verify.as_mut()
+        {
+            screen.tick();
         }
         let pending = self
             .page
@@ -8259,6 +8378,11 @@ impl SettingsDialog {
                     .buttons
                     .borrow_mut()
                     .handle_mouse(mouse);
+                let help_hover = self.cx.pointer_surface.help_row_action_at(Position {
+                    x: mouse.column,
+                    y: mouse.row,
+                });
+                self.cx.pointer_surface.help_row_hover.set(help_hover);
                 let action = match button_outcome {
                     Some(_) => self
                         .pointer_surface
@@ -8527,9 +8651,7 @@ impl SettingsDialog {
         }
         self.pointer_surface.clear_for_page(area, surface_token);
         let title = self.title();
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Settings — {title} "));
+        let block = crate::tui::chrome::rounded_block(format!(" Settings — {title} "), true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -8575,8 +8697,12 @@ impl SettingsDialog {
                 "Back to config picker",
             );
         }
+        // The dialog itself already owns the settings border.  Pages that
+        // need a subsection render their own rounded block; wrapping every
+        // page in a second generic “Options” frame produced nested chrome.
+        let section_inner = layout[1];
         self.page
-            .render_with_links(&self.cx, frame, layout[1], links);
+            .render_with_links(&self.cx, frame, section_inner, links);
         #[cfg(test)]
         for target in self.pointer_surface.targets.borrow().iter() {
             if let SettingsPointerAction::Page(action) = &target.action {
@@ -8584,17 +8710,45 @@ impl SettingsDialog {
             }
         }
         self.pointer_surface.buttons.borrow_mut().end_frame();
-        if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[1]) {
+        if let Some(cursor) = shell::park_cursor_from_markers(frame, section_inner) {
             frame.set_cursor_position(cursor);
         }
-        let help = if self.pointer_surface.enabled.get() {
+        let mut help_row = self.page.help_row_actions(&self.cx);
+        let help = if self.pointer_surface.enabled.get() && help_row.actions.is_empty() {
             // Pointer hints stay leftmost so an 80-column pane still shows
             // both phrases when the page help string is the longer picker form.
-            format!("click: activate  wheel: scroll  {}", self.help_text())
+            format!(
+                "click: activate  wheel: scroll  {}",
+                self.page.help_text(&self.cx)
+            )
         } else {
-            self.help_text().to_string()
+            self.page.help_text(&self.cx).to_string()
         };
-        frame.render_widget(help_line(&help), layout[2]);
+        help_row.hover = self.cx.pointer_surface.help_row_hover.get();
+        let help_action_rects = shell::render_settings_help_row(frame, layout[2], &help, &help_row);
+        self.cx
+            .pointer_surface
+            .set_help_row_action_rects(help_action_rects.clone());
+        if self.pointer_surface.enabled.get() {
+            for (index, (rect, action)) in help_action_rects
+                .into_iter()
+                .zip(help_row.actions.iter())
+                .enumerate()
+            {
+                if rect.width == 0 || rect.height == 0 {
+                    continue;
+                }
+                self.pointer_surface.register(shell::SettingsPointerTarget {
+                    rect,
+                    action: shell::SettingsPointerAction::Page(action.action.clone()),
+                    enabled: action.enabled,
+                    disabled_reason: help_row.disabled_reason(index),
+                });
+                #[cfg(test)]
+                pointer_acceptance_tests::record_rendered_action(&action.action, action.enabled);
+                let _ = index;
+            }
+        }
     }
 
     fn title(&self) -> String {
@@ -8982,27 +9136,6 @@ pub(super) fn save_status<T: SaveStatusValue>(r: Result<T, String>) -> Option<St
         Ok(value) => Some(value.status()),
         Err(e) => Some(format!("save failed: {e}")),
     }
-}
-
-/// A bottom-of-list `[label]` save-button row. The glyphs are a placeholder;
-/// `render_control_lines` paints the exact `[label]` cells through
-/// `ButtonRegistry` so the hit rect is the painted label, not the list row.
-pub(super) fn save_button_line(label: &str, selected: bool) -> Line<'static> {
-    let text = label.trim_start_matches('[').trim_end_matches(']');
-    let spec = crate::tui::button::ButtonSpec::new(
-        crate::tui::button::ButtonId::Settings(pointer_actions::SettingsPointerAction::Mcp(
-            pointer_actions::McpAction::Save,
-        )),
-        text,
-        crate::tui::button::ButtonDispatch::Settings(pointer_actions::SettingsPointerAction::Mcp(
-            pointer_actions::McpAction::Save,
-        )),
-    )
-    .focused(selected);
-    Line::from(Span::styled(
-        crate::tui::button::bracketed_label(text),
-        crate::tui::button::button_style(&spec, false, false),
-    ))
 }
 
 fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
@@ -10128,13 +10261,7 @@ fn list_key_action(key: KeyEvent, cursor: &mut usize, len: usize) -> ListAction 
 }
 
 fn product_dialog_block(title: impl Into<Line<'static>>) -> Block<'static> {
-    let style = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(style)
-        .title(title)
-        .title_style(style)
+    crate::tui::chrome::rounded_block(title, true)
 }
 
 fn product_ink() -> Style {
@@ -10260,7 +10387,7 @@ fn render_wizard_menu(
     wizards: &[cockpit_core::wizard::WizardDescriptor],
     cursor: usize,
 ) {
-    let block = product_dialog_block(" Setup — choose a wizard ");
+    let block = product_dialog_block(" Choose a setup wizard ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
@@ -10293,7 +10420,7 @@ fn render_model_setup_choice(
     pending: Option<&(String, String)>,
     cursor: usize,
 ) {
-    let block = product_dialog_block(" Setup — model ");
+    let block = product_dialog_block(" Configure model ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
@@ -10368,13 +10495,14 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
         status,
         ..
     } = wizard;
-    let block = product_dialog_block(format!(" Setup — {} ", run.descriptor().title));
+    let block = product_dialog_block(format!(" {} ", run.descriptor().title));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
     let muted = product_muted();
     let ink = product_ink();
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut field_line = None;
     lines.push(Line::from(Span::styled(
         run.descriptor().description.to_string(),
         muted,
@@ -10414,14 +10542,20 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                 }
             }
             cockpit_core::wizard::StepKind::Confirm => {
-                let current = match run.prefill() {
-                    Some(cockpit_core::wizard::WizardAnswer::Confirm(true)) => "yes",
-                    _ => "no",
-                };
-                lines.push(Line::from(format!("Current/default: {current}")));
+                let yes = matches!(
+                    run.prefill(),
+                    Some(cockpit_core::wizard::WizardAnswer::Confirm(true))
+                );
+                lines.push(Line::from(vec![
+                    crate::tui::chrome::radio_mark(yes, *cursor == 0),
+                    Span::raw("yes    "),
+                    crate::tui::chrome::radio_mark(!yes, *cursor == 1),
+                    Span::raw("no"),
+                ]));
             }
             cockpit_core::wizard::StepKind::Text => {
-                lines.push(Line::from(format!("Value: {}", text.text())));
+                field_line = Some(lines.len());
+                lines.extend([Line::default(), Line::default(), Line::default()]);
             }
             cockpit_core::wizard::StepKind::Info => {
                 lines.push(Line::from("Press Enter to continue."));
@@ -10447,12 +10581,10 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                         .as_ref()
                         .map(|values| values.iter().any(|value| value == option.id.as_ref()))
                         .unwrap_or_else(|| multi.contains(option.id.as_ref()));
-                    let check = if checked { "[x]" } else { "[ ]" };
                     let row = |style| crate::tui::chrome::chip_style(style, hovered);
                     lines.push(Line::from(vec![
                         Span::styled(marker, row(ink)),
-                        Span::styled(check.to_string(), row(ink)),
-                        Span::styled(" ", row(ink)),
+                        crate::tui::chrome::check_mark(checked, hovered),
                         Span::styled(option.label.to_string(), row(ink)),
                         Span::styled("  ", row(ink)),
                         Span::styled(option.description.to_string(), row(muted)),
@@ -10496,8 +10628,7 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
                     let row = |style| crate::tui::chrome::chip_style(style, hovered);
                     lines.push(Line::from(vec![
                         Span::styled(marker, row(ink)),
-                        Span::styled(if checked { "[x]" } else { "[ ]" }.to_string(), row(ink)),
-                        Span::styled(" ", row(ink)),
+                        crate::tui::chrome::check_mark(checked, hovered),
                         Span::styled(item.name.to_string(), row(ink)),
                         Span::styled("  ", row(ink)),
                         Span::styled(format!("tier: {tier}"), row(muted)),
@@ -10514,10 +10645,41 @@ fn render_setup_wizard(frame: &mut Frame, area: Rect, wizard: &SetupWizardDialog
         lines.push(Line::from(Span::styled(status.to_string(), muted)));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
-    frame.render_widget(
-        help_line("↑/↓  space: toggle  t: tier  enter: select/continue  y/n: confirm  esc: close"),
-        layout[1],
+    if let Some(line) = field_line {
+        let field_area = Rect::new(
+            layout[0].x,
+            layout[0].y.saturating_add(line as u16),
+            layout[0].width,
+            3.min(layout[0].height.saturating_sub(line as u16)),
+        );
+        if let Some(cursor) =
+            crate::tui::chrome::render_field(frame, field_area, "Value", text, true, "type a value")
+        {
+            frame.set_cursor_position(cursor);
+        }
+    }
+    let actions = if run.is_complete() {
+        vec![crate::tui::chrome::ActionButton::primary("Done")]
+    } else {
+        vec![
+            crate::tui::chrome::ActionButton::secondary("Cancel"),
+            crate::tui::chrome::ActionButton::primary("Continue"),
+        ]
+    };
+    let action_width = crate::tui::chrome::action_bar_width(&actions).min(layout[1].width);
+    let help_area = Rect::new(
+        layout[1].x,
+        layout[1].y,
+        layout[1]
+            .width
+            .saturating_sub(action_width.saturating_add(1)),
+        1,
     );
+    frame.render_widget(
+        help_line("↑/↓  space: toggle  enter: continue  esc: close"),
+        help_area,
+    );
+    crate::tui::chrome::render_action_bar(frame, layout[1], &actions, None);
 }
 
 fn help_line(text: &str) -> Paragraph<'static> {

@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ /tmp/project                                                               [Setup: Code]
+                              ──────────────────────────────────────────────────────────────────────────────────────────
+  + New session               ▌Restyle the complete transcript surface.                           [Pin] [Fork]  12:00  │
+                              ▌ Continue with every transcript element.                                                │
+ SESSIONS                                                                                                              │
+ no active sessions in all pr   ▸ You                                                                                  │
+                                Prioritize the transcript chrome.                                                      │
+                              note to self                                                                      12:00  │
+                              ┊ Keep product-only transcript variants.                                                 │
+                              ▌ Agent╭ Security posture ────────────────────────────────────────────────────────╮2:00  │
+                                Model│Review sandboxing, approvals, redaction, and workspace trust              │      █
+                                TTFT │                                                                          │      █
+                                TPS  │How should Cockpit confine shell commands by default?                     │      █
+                                Cache│Keep the host shell sandbox unless you specifically need container        │      █
+                                ▾ Tho│isolation or unconfined commands. `off` means commands the model runs are │      █
+                                Map e│unconfined. Container rows are omitted when docker/podman is not          │      █
+                                The o│available. Host sandbox is omitted when the host capability is down.      │      █
+                                     │                                                                          │      █
+                                ▸ rea│› off  Unconfined: commands the model runs are not sandboxed.             │      █
+                                     │                                                                          │      █
+                                ─ exp│                                                                          │      █
+                              ▌ inter│                                                                          │      █
+                              ▌ Inter│                                                                          │      █
+                                     │                                                                          │      █
+                              ▌ backg│                                                                          │      █
+                                Backg│                                                                          │      █
+                                     │                                                                          │      █
+                                ◇ Edi│↑/↓  space: toggle  enter: continue  esc: close    [ Cancel ] [ Continue ]│      █
+                                │ - o╰──────────────────────────────────────────────────────────────────────────╯      █
+                                │ + new line                                                                           █
+                                │   shared line                                                                        █
+                               ⋯ Compacted from abc123 · auto · ctx 82.0% · 9000→2400 tokens · 6 turns · tail 2/1 ·  ⋯ █
+                                                               ⋯ 2 seed tools (~42) ⋯                                  █
+                                [show summary]                                                                         █
+                                                                                                                       █
+                              ▌ Agent                                                                           12:00  █
+ ● working  ● waiting  ● done   Thinking                                                                               █
+                                Check the final visual hierarchy.                                                      █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

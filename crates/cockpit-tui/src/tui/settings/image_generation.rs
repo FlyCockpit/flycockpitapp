@@ -924,7 +924,7 @@ fn generation_layout(frame: &mut Frame, area: Rect, mode: GenerationViewportMode
                 Line::from("No secret, provider URL,"),
                 Line::from("or host path is rendered."),
             ])
-            .block(Block::default().borders(Borders::ALL).title(" Context "))
+            .block(crate::tui::chrome::rounded_block(" Context ", false))
             .wrap(Wrap { trim: false });
             frame.render_widget(info, cols[1]);
             cols[0]
@@ -964,9 +964,7 @@ fn render_generation_page(
         return;
     }
     let content = generation_layout(frame, area, mode);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "));
+    let block = crate::tui::chrome::rounded_block(format!(" {title} "), false);
     let inner = block.inner(content);
     frame.render_widget(block, content);
     let mut lines = Vec::with_capacity(rows.len());
@@ -1097,7 +1095,7 @@ impl SettingsPage for GenerationListPage {
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         for (i, title) in GENERATION_NODE_TITLES.iter().enumerate() {
-            let marker = if i == self.cursor { "▸ " } else { "  " };
+            let marker = if i == self.cursor { "› " } else { "  " };
             let node = match i {
                 0 => super::pointer_actions::GenerationNodeId::Endpoints,
                 1 => super::pointer_actions::GenerationNodeId::Targets,
@@ -1196,10 +1194,6 @@ impl SettingsPage for EndpointEditorPage {
                     )),
                 ));
             }
-            rows.push((
-                "[Cancel]".into(),
-                Some((GenerationAction::Cancel, true, None)),
-            ));
         }
         render_generation_page(
             cx,
@@ -1216,6 +1210,17 @@ impl SettingsPage for EndpointEditorPage {
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
         "↑/↓: navigate  ctrl+s: save  h/esc: back"
+    }
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Generation(GenerationAction::Cancel),
+            }],
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1300,10 +1305,6 @@ impl SettingsPage for TargetEditorPage {
                 "[refresh health]".into(),
                 Some((GenerationAction::RefreshHealth, true, None)),
             ));
-            rows.push((
-                "[Cancel]".into(),
-                Some((GenerationAction::Cancel, true, None)),
-            ));
         }
         render_generation_page(
             cx,
@@ -1320,6 +1321,17 @@ impl SettingsPage for TargetEditorPage {
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
         "↑/↓: navigate  ctrl+s: save  h/esc: back"
+    }
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Generation(GenerationAction::Cancel),
+            }],
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1390,10 +1402,6 @@ impl SettingsPage for WorkflowEditorPage {
                     )),
                 ));
             }
-            rows.push((
-                "[Cancel]".into(),
-                Some((GenerationAction::Cancel, true, None)),
-            ));
         }
         render_generation_page(
             cx,
@@ -1410,6 +1418,17 @@ impl SettingsPage for WorkflowEditorPage {
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
         "↑/↓: navigate  ctrl+s: save  h/esc: back"
+    }
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
+                label: "Cancel",
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Generation(GenerationAction::Cancel),
+            }],
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1631,22 +1650,6 @@ impl SettingsPage for BudgetEditorPage {
                 "  USD 1/request, USD 10/session, USD 100/project-month".into(),
                 None,
             ));
-            rows.push((
-                "[Save]".into(),
-                Some((
-                    GenerationAction::SaveBudget,
-                    self.authority_loaded && !self.save_pending,
-                    if self.authority_loaded {
-                        self.save_pending.then_some("save_pending")
-                    } else {
-                        Some("authoritative_policy_unavailable")
-                    },
-                )),
-            ));
-            rows.push((
-                "[Cancel]".into(),
-                Some((GenerationAction::Cancel, true, None)),
-            ));
             if let Some(status) = &self.status {
                 rows.push((String::new(), None));
                 rows.push((status.clone(), None));
@@ -1664,6 +1667,26 @@ impl SettingsPage for BudgetEditorPage {
     }
     fn title(&self, _cx: &SettingsCx) -> String {
         "Budget".to_owned()
+    }
+
+    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        super::shell::finish_help_row(
+            _cx,
+            vec![
+                super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Generation(GenerationAction::Cancel),
+                },
+                super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: self.authority_loaded && !self.save_pending,
+                    primary: true,
+                    action: SettingsPointerAction::Generation(GenerationAction::SaveBudget),
+                },
+            ],
+        )
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
         "↑/↓: navigate  ctrl+s: save  h/esc: back"
@@ -1844,7 +1867,7 @@ impl SettingsPage for JobListPage {
             rows.push(("No jobs.".into(), None));
         } else {
             for (i, job) in self.reducer.jobs.iter().enumerate() {
-                let marker = if i == self.cursor { "▸ " } else { "  " };
+                let marker = if i == self.cursor { "› " } else { "  " };
                 let stale = if job.stale { " (stale)" } else { "" };
                 rows.push((
                     format!(
@@ -2162,7 +2185,7 @@ fn render_resize_blocker(frame: &mut Frame, area: Rect) {
     ];
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" Resize "))
+            .block(crate::tui::chrome::rounded_block(" Resize ", false))
             .wrap(Wrap { trim: false }),
         area,
     );

@@ -11,7 +11,7 @@
 //!   - the corresponding handlers + renderers on [`SettingsDialog`]
 //!     (multiple `impl` blocks across this file and `mod.rs`)
 //!   - provider-only free helpers (`render_header_editor`,
-//!     `render_field_row`, `valid_url`, `valid_id`,
+//!     `valid_url`, `valid_id`,
 //!     `render_copilot_body`).
 
 mod deepfetch;
@@ -50,12 +50,12 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::settings::provider_entries_equal;
 use crate::tui::textfield::TextField;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, resolve_color};
 use cockpit_config::providers::{
     HeaderSpec, ModelEntry, ModelFetchStatusKind, ModelMergePolicy, OnUnlistedModelsFetch,
     ProviderEntry, ProviderModelCatalog, WireApi, format_model_fetch_age,
@@ -76,7 +76,7 @@ use super::settings_editor::{SettingsEditor, SettingsResult};
 use super::shell::{
     SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
 };
-use super::{Nav, SettingsCx, SettingsDialog, SettingsPage, save_button_line};
+use super::{Nav, SettingsCx, SettingsDialog, SettingsPage};
 #[cfg(test)]
 use super::{Page, TestPageRef};
 
@@ -126,7 +126,6 @@ pub(super) fn edit_menu_actions(provider_id: &str, entry: &ProviderEntry) -> Vec
         EditAction::Refetch,
         EditAction::DeepFetch,
         EditAction::Delete,
-        EditAction::Save,
         EditAction::Back,
     ]);
     actions
@@ -194,6 +193,20 @@ fn provider_catalog_suffix(catalog: ProviderModelCatalog) -> &'static str {
         ProviderModelCatalog::Live => "",
         ProviderModelCatalog::CodexFallback => " · fallback catalog active",
     }
+}
+
+fn reserve_provider_field<'a>(
+    lines: &mut Vec<Line<'static>>,
+    fields: &mut Vec<(usize, &'static str, &'a TextField, bool, &'static str)>,
+    title: &'static str,
+    field: &'a TextField,
+    focused: bool,
+    placeholder: &'static str,
+) -> usize {
+    let line = lines.len();
+    lines.extend([Line::default(), Line::default(), Line::default()]);
+    fields.push((line, title, field, focused, placeholder));
+    line
 }
 
 fn provider_catalog_suffix_for_entry(entry: &ProviderEntry) -> String {
@@ -974,7 +987,8 @@ pub(super) struct AddState {
     /// matches a catalog already persisted for this provider.
     fallback_offer: Option<FallbackOffer>,
     fallback_commit_pending: bool,
-    validation_failure: Option<String>,
+    pub(super) validation_failure: Option<String>,
+    pub(super) verify: Option<Box<crate::tui::onboarding::VerifyScreen>>,
 }
 
 struct FallbackOffer;
@@ -1025,6 +1039,7 @@ impl AddState {
             fallback_offer: None,
             fallback_commit_pending: false,
             validation_failure: None,
+            verify: None,
         };
         state.restore_non_secret_inputs();
         state
@@ -1162,6 +1177,7 @@ impl SettingsDialog {
         provider_id: &str,
         result: Result<FetchOutcome, String>,
     ) {
+        let unsupported = matches!(&result, Ok(FetchOutcome::Unsupported));
         let referenced_environment = self
             .config
             .providers
@@ -1363,8 +1379,24 @@ impl SettingsDialog {
                     s.fetch = None;
                     s.fallback_commit_pending = false;
                     s.fallback_offer = fallback_offer;
-                    if validation_failure.is_some() {
-                        s.validation_failure = validation_failure;
+                    if let Some(reason) = validation_failure.as_ref() {
+                        s.validation_failure = Some(reason.clone());
+                    }
+                    if let (Some(reason), Some(screen)) = (validation_failure, s.verify.as_mut()) {
+                        screen.apply(crate::tui::onboarding::VerifyOutcome::Network(reason), None);
+                    } else if live_validation_succeeded && let Some(screen) = s.verify.as_mut() {
+                        if unsupported {
+                            screen.apply(crate::tui::onboarding::VerifyOutcome::NoEndpoint, None);
+                        } else {
+                            let models = refreshed
+                                .as_ref()
+                                .map(|(models, _, _)| {
+                                    models.iter().map(|model| model.id.clone()).collect()
+                                })
+                                .unwrap_or_default();
+                            screen
+                                .apply(crate::tui::onboarding::VerifyOutcome::Models(models), None);
+                        }
                     }
                     if s.is_step("fetching") {
                         let _ = s.run.submit(WizardAnswer::Acknowledged);
@@ -1704,6 +1736,9 @@ impl SettingsCx {
             }
         };
         s.saved_provider_id = Some(id.clone());
+        s.verify = Some(Box::new(crate::tui::onboarding::VerifyScreen::new(
+            id.clone(),
+        )));
         let notice = self.last_secret_notice.take();
         if s.is_step("test-key") && entry.last_model_fetch.is_some() {
             let _ = s.run.submit(WizardAnswer::Acknowledged);
@@ -2128,6 +2163,9 @@ impl SettingsCx {
                     };
                     s.fallback_offer = None;
                     s.validation_failure = None;
+                    if let Some(screen) = s.verify.as_mut() {
+                        screen.retry();
+                    }
                     s.error = Some("Retrying live provider validation…".into());
                     s.fetch = Some(FetchHandle::spawn(
                         self.lifecycle.clone(),
@@ -3379,7 +3417,7 @@ impl SettingsCx {
         status: Option<&str>,
         delete_pending: bool,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
@@ -3390,7 +3428,7 @@ impl SettingsCx {
         let button_selected = cursor == 0;
         let button_style = if button_selected {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(resolve_color(BRASS, BRASS_INDEX))
                 .add_modifier(Modifier::BOLD)
         } else {
             muted
@@ -3402,7 +3440,7 @@ impl SettingsCx {
             ),
         ));
         lines.push(Line::from(vec![
-            Span::raw(if button_selected { "▸ " } else { "  " }),
+            Span::raw(if button_selected { "› " } else { "  " }),
             Span::styled("[refetch provider models]".to_string(), button_style),
         ]));
         bindings.push((
@@ -3440,7 +3478,7 @@ impl SettingsCx {
             for (i, id) in ids.iter().enumerate() {
                 let row = i + 1;
                 let entry = self.config.providers.get(id.as_str()).unwrap();
-                let marker = if row == cursor { "▸ " } else { "  " };
+                let marker = if row == cursor { "› " } else { "  " };
                 let label = format!("{:<width$}", id, width = id_w);
                 let star = if entry.favorite.unwrap_or(false) {
                     " ★"
@@ -3451,10 +3489,10 @@ impl SettingsCx {
                     red.add_modifier(Modifier::BOLD)
                 } else if row == cursor {
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(resolve_color(BRASS, BRASS_INDEX))
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(resolve_color(INK, INK_INDEX))
                 };
                 let model_count = format!("{} models", entry.models.len());
                 bindings.push((
@@ -3522,7 +3560,7 @@ impl SettingsCx {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 msg.to_string(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
@@ -3545,47 +3583,15 @@ impl SettingsCx {
         frame: &mut Frame,
         area: Rect,
         s: &CopilotSetupState,
-        provider_id: &str,
+        _provider_id: &str,
     ) {
         let mut lines = oauth_setup_lines(OAuthFlowView::Copilot(s), OAuthHost::Standalone);
-        let mut controls = Vec::new();
-        let copilot_id = || super::pointer_actions::ProviderId(provider_id.into());
-        let provider_action =
-            |action| super::pointer_actions::SettingsPointerAction::Providers(action);
+        let controls: Vec<(usize, super::pointer_actions::SettingsPointerAction)> = Vec::new();
         lines.push(Line::default());
-        if s.outcome.is_some() {
-            controls.push((
-                lines.len(),
-                provider_action(super::pointer_actions::ProvidersAction::CopilotConfirm(
-                    copilot_id(),
-                    super::pointer_actions::ConfirmationChoice::Confirm,
-                )),
-            ));
-            lines.push(Line::from("[Continue]"));
-        } else if s.shell.is_some() && s.rc_path.is_some() && !s.already_configured {
-            controls.push((
-                lines.len(),
-                provider_action(super::pointer_actions::ProvidersAction::CopilotConfirm(
-                    copilot_id(),
-                    super::pointer_actions::ConfirmationChoice::Confirm,
-                )),
-            ));
-            lines.push(Line::from("[Set up Copilot auth]"));
-            controls.push((
-                lines.len(),
-                provider_action(super::pointer_actions::ProvidersAction::CopilotConfirm(
-                    copilot_id(),
-                    super::pointer_actions::ConfirmationChoice::Cancel,
-                )),
-            ));
-            lines.push(Line::from("[Cancel]"));
-        } else {
-            controls.push((
-                lines.len(),
-                provider_action(super::pointer_actions::ProvidersAction::LocalBack),
-            ));
-            lines.push(Line::from("[Back]"));
-        }
+        lines.push(Line::from(Span::styled(
+            "Use the action bar to continue, apply Copilot authentication, or go back.",
+            Style::default().fg(resolve_color(FOG, FOG_INDEX)),
+        )));
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,
@@ -3657,6 +3663,20 @@ impl SettingsCx {
             ));
             lines.push(Line::from("[copy device code]"));
         }
+        let paste_field_line = s
+            .paste_focused
+            .then(|| {
+                lines
+                    .iter()
+                    .position(|line| {
+                        line.spans.iter().any(|span| {
+                            span.content.as_ref()
+                                == "Paste callback URL, ?code=...&state=..., or bare code:"
+                        })
+                    })
+                    .map(|line| line + 1)
+            })
+            .flatten();
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,
@@ -3670,6 +3690,42 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some(line) = paste_field_line {
+            let offset = self.scroll_states.offset_for("providers:oauth-setup");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    "Callback URL or code",
+                    &s.manual_input,
+                    true,
+                    "",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Providers(
+                                super::pointer_actions::ProvidersAction::EditOAuthCallback(
+                                    s.flow_id,
+                                ),
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
         if let Some(links) = links {
             register_visible_link_regions(
                 links,
@@ -3691,11 +3747,20 @@ impl SettingsCx {
         if let Some(step) = s.run.current_provider_step() {
             super::pointer_acceptance_tests::record_rendered_wizard_step(step);
         }
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut controls = Vec::new();
+        let mut fields = Vec::new();
+
+        if s.is_step("api-key") {
+            self.render_add_api_key_step(frame, area, s);
+            return;
+        }
 
         match s.run.current_step_id() {
             Some("template") => {
@@ -3706,13 +3771,16 @@ impl SettingsCx {
                 lines.push(Line::default());
                 let ordered = onboarding_ordered_templates();
                 for (i, t) in ordered.iter().enumerate() {
-                    let marker = if i == s.template_cursor { "▸ " } else { "  " };
+                    let marker = if i == s.template_cursor { "› " } else { "  " };
                     let style = if t.is_disabled() {
-                        muted.add_modifier(Modifier::DIM)
+                        Style::default().fg(resolve_color(
+                            crate::tui::theme::DISABLED,
+                            crate::tui::theme::DISABLED_INDEX,
+                        ))
                     } else if i == s.template_cursor {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(resolve_color(INK, INK_INDEX))
                     };
                     controls.push((lines.len(), i));
                     lines.push(Line::from(vec![
@@ -3748,14 +3816,14 @@ impl SettingsCx {
                 .enumerate()
                 {
                     let marker = if index == s.wire_api_cursor {
-                        "▸ "
+                        "› "
                     } else {
                         "  "
                     };
                     let style = if index == s.wire_api_cursor {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(resolve_color(INK, INK_INDEX))
                     };
                     controls.push((lines.len(), index));
                     lines.push(Line::from(vec![
@@ -3770,11 +3838,28 @@ impl SettingsCx {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
-                    Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        t.display.to_string(),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
+                    ),
                 ]));
                 lines.push(Line::default());
-                let id_line = render_field_row(&mut lines, "id", &s.id_field, s.is_step("id"));
-                let url_line = render_field_row(&mut lines, "url", &s.url_field, s.is_step("url"));
+                let id_line = reserve_provider_field(
+                    &mut lines,
+                    &mut fields,
+                    "Provider ID",
+                    &s.id_field,
+                    s.is_step("id"),
+                    "provider-id",
+                );
+                let url_line = reserve_provider_field(
+                    &mut lines,
+                    &mut fields,
+                    "Base URL",
+                    &s.url_field,
+                    s.is_step("url"),
+                    "https://api.example.com",
+                );
                 if s.is_step("id") {
                     controls.push((id_line, 0));
                 } else if s.is_step("url") {
@@ -3804,14 +3889,14 @@ impl SettingsCx {
                     }
                     for (index, (label, description)) in options.iter().enumerate() {
                         let marker = if index == s.auth_method_cursor {
-                            "▸ "
+                            "› "
                         } else {
                             "  "
                         };
                         let style = if index == s.auth_method_cursor {
                             yellow.add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(Color::White)
+                            Style::default().fg(resolve_color(INK, INK_INDEX))
                         };
                         controls.push((lines.len(), index));
                         lines.push(Line::from(vec![
@@ -3836,28 +3921,16 @@ impl SettingsCx {
                         muted,
                     )));
                 }
-                if s.is_step("api-key") {
-                    lines.push(Line::default());
-                    let masked = if s.api_key_field.text().is_empty() {
-                        ""
-                    } else {
-                        "••••••••"
-                    };
-                    controls.push((lines.len(), 0));
-                    lines.push(Line::from(vec![
-                        Span::styled("api key: ", muted),
-                        Span::styled(masked.to_string(), Style::default().fg(Color::White)),
-                    ]));
-                    if let Some(meta) = t.api_key {
-                        lines.push(Line::from(Span::styled(
-                            format!("Hint: {} · {}", meta.format_hint, meta.console_url),
-                            muted,
-                        )));
-                    }
-                }
                 if s.is_step("env-var") {
                     lines.push(Line::default());
-                    let line = render_field_row(&mut lines, "env var", &s.env_var_field, true);
+                    let line = reserve_provider_field(
+                        &mut lines,
+                        &mut fields,
+                        "Environment variable",
+                        &s.env_var_field,
+                        true,
+                        "API_KEY",
+                    );
                     controls.push((line, 0));
                 }
                 if s.is_step("headers") {
@@ -3886,21 +3959,24 @@ impl SettingsCx {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
-                    Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        t.display.to_string(),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
+                    ),
                 ]));
                 lines.push(Line::default());
                 lines.push(Line::from(vec![
                     Span::styled("id:  ", muted),
                     Span::styled(
                         s.id_field.text().to_string(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
                     ),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("API url: ", muted),
                     Span::styled(
                         s.url_field.text().to_string(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
                     ),
                 ]));
                 lines.push(Line::default());
@@ -3909,17 +3985,6 @@ impl SettingsCx {
                     OAuthFlowView::Copilot(state),
                     OAuthHost::AddWizard,
                 );
-                controls.push((lines.len(), 0));
-                let primary_label = if state.outcome.is_none()
-                    && state.shell.is_some()
-                    && state.rc_path.is_some()
-                    && !state.already_configured
-                {
-                    "[Set up Copilot auth]"
-                } else {
-                    "[Continue]"
-                };
-                lines.push(Line::from(primary_label));
                 lines.push(Line::default());
                 lines.push(Line::from(Span::styled(
                     "After this step we'll fetch the model list automatically. \
@@ -3937,7 +4002,10 @@ impl SettingsCx {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
-                    Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        t.display.to_string(),
+                        Style::default().fg(resolve_color(INK, INK_INDEX)),
+                    ),
                 ]));
                 lines.push(Line::default());
                 controls.extend(render_oauth_body_with_controls(
@@ -3946,37 +4014,17 @@ impl SettingsCx {
                     OAuthHost::AddWizard,
                 ));
             }
-            Some("saving" | "fetching" | "test-key") => {
-                lines.push(Line::from(Span::styled(
-                    if s.is_step("saving") {
-                        "Saving config…"
-                    } else if s.is_step("test-key") {
-                        "Testing key…"
-                    } else {
-                        "Fetching /models…"
-                    }
-                    .to_string(),
-                    yellow,
-                )));
-                if s.is_step("test-key") && s.fetch.is_none() {
-                    lines.push(Line::from(Span::styled(
-                        if s.fallback_offer.is_some() {
-                            "Validation failed. o: persist fallback catalog offline  r: retry  m: manual model  esc: options"
-                        } else {
-                            "Validation failed. r: retry  m: manual model  esc: back/defer/cancel (offline needs an existing fallback catalog)"
-                        },
-                        muted,
-                    )));
-                }
+            Some("saving" | "fetching" | "test-key" | "done") => {
+                self.render_add_verify_step(frame, area, s);
+                return;
             }
-            Some("done") | None => {
+            None => {
                 lines.push(Line::from(Span::styled(
                     "Done.".to_string(),
                     Style::default().add_modifier(Modifier::BOLD),
                 )));
                 if s.is_step("done") {
                     controls.push((lines.len(), 0));
-                    lines.push(Line::from("[Continue]"));
                 }
             }
             Some(other) => {
@@ -4010,6 +4058,19 @@ impl SettingsCx {
         let link_regions = oauth_flow
             .and_then(|flow| prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref()))
             .unwrap_or_default();
+        let paste_field_line = oauth_flow
+            .filter(|flow| matches!(flow, OAuthFlowView::OAuth(state) if state.paste_focused))
+            .and_then(|_| {
+                lines
+                    .iter()
+                    .position(|line| {
+                        line.spans.iter().any(|span| {
+                            span.content.as_ref()
+                                == "Paste callback URL, ?code=...&state=..., or bare code:"
+                        })
+                    })
+                    .map(|line| line + 1)
+            });
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,
@@ -4025,6 +4086,67 @@ impl SettingsCx {
             )
                 .into(),
         );
+        let offset = self.scroll_states.offset_for("providers:add");
+        if let (Some(line), Some(OAuthFlowView::OAuth(state))) = (paste_field_line, oauth_flow)
+            && let Some(screen_row) = line.checked_sub(offset)
+            && screen_row + 3 <= usize::from(area.height)
+        {
+            let rect = Rect::new(
+                area.x,
+                area.y.saturating_add(screen_row as u16),
+                crate::tui::chrome::scrollbar_content(area).width,
+                3,
+            );
+            if let Some(caret) = crate::tui::chrome::render_field(
+                frame,
+                rect,
+                "Callback URL or code",
+                &state.manual_input,
+                true,
+                "",
+            ) {
+                frame.set_cursor_position(caret);
+            }
+            self.pointer_surface
+                .register(super::shell::SettingsPointerTarget {
+                    rect,
+                    action: super::shell::SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Providers(
+                            super::pointer_actions::ProvidersAction::EditOAuthCallback(
+                                state.flow_id,
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+        }
+        for (line, title, field, focused, placeholder) in fields {
+            let y = area.y.saturating_add(line.saturating_sub(offset) as u16);
+            if line < offset || y >= area.bottom() {
+                continue;
+            }
+            let rect = Rect::new(
+                area.x,
+                y,
+                crate::tui::chrome::scrollbar_content(area).width,
+                3.min(area.bottom().saturating_sub(y)),
+            );
+            if let Some(caret) =
+                crate::tui::chrome::render_field(frame, rect, title, field, focused, placeholder)
+            {
+                frame.set_cursor_position(caret);
+            }
+            if let Some(action) = provider_add_field_pointer_action(s) {
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(action),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
         if let Some(links) = links {
             register_visible_link_regions(
                 links,
@@ -4038,9 +4160,63 @@ impl SettingsCx {
         }
     }
 
+    fn render_add_verify_step(&self, frame: &mut Frame, area: Rect, s: &AddState) {
+        use crate::tui::onboarding::VerifyPhase;
+        use ratatui::layout::{Constraint, Layout};
+
+        let Some(screen) = s.verify.as_deref() else {
+            return;
+        };
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let title_color = match screen.phase() {
+            VerifyPhase::Success(_) | VerifyPhase::NoEndpoint => {
+                resolve_color(crate::tui::theme::GOOD, crate::tui::theme::GOOD_INDEX)
+            }
+            VerifyPhase::Error(_) => {
+                resolve_color(crate::tui::theme::BAD, crate::tui::theme::RED_INDEX)
+            }
+            VerifyPhase::Fetching => resolve_color(INK, INK_INDEX),
+        };
+        let layout = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(area);
+        frame.render_widget(
+            Line::from(Span::styled(
+                screen.title().to_string(),
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            layout[0],
+        );
+        frame.render_widget(
+            Line::from(Span::styled(screen.subtitle(), muted)),
+            layout[1],
+        );
+        screen.render(frame, layout[2]);
+    }
+
+    fn render_add_api_key_step(&self, frame: &mut Frame, area: Rect, s: &AddState) {
+        let t = s.template.expect("template chosen");
+        let mut screen = crate::tui::onboarding::AuthScreen::new(t);
+        let field_rect = screen.render_api_key_external(frame, area, s.api_key_field.as_ref());
+        if let Some(action) = provider_add_field_pointer_action(s) {
+            self.pointer_surface
+                .register(super::shell::SettingsPointerTarget {
+                    rect: field_rect,
+                    action: super::shell::SettingsPointerAction::Page(action),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+        }
+    }
+
     fn render_edit(&self, frame: &mut Frame, area: Rect, s: &EditState) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
 
@@ -4148,15 +4324,14 @@ impl SettingsCx {
             let selected = idx == s.cursor;
             bindings.push((lines.len(), provider_edit_pointer_action(s, *action)));
             if *action == EditAction::Save {
-                lines.push(save_button_line("[save changes]", selected));
                 continue;
             }
             let (label, value) = row(*action);
-            let marker = if selected { "▸ " } else { "  " };
+            let marker = if selected { "› " } else { "  " };
             let style = if selected {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             lines.push(Line::from(vec![
                 Span::raw(marker),
@@ -4196,18 +4371,14 @@ impl SettingsCx {
             }
         }
 
+        let mut edit_field_line = None;
         if let Some(field) = s.editing_field {
-            let prompt = match field {
-                EditField::Url => "URL: ",
+            let title = match field {
+                EditField::Url => "URL",
             };
             lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::styled(prompt.to_string(), muted),
-                Span::styled(
-                    s.field_buf.text().to_string(),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
+            edit_field_line = Some((lines.len(), title));
+            lines.extend([Line::default(), Line::default(), Line::default()]);
         }
 
         if let Some(status) = &s.status {
@@ -4234,6 +4405,42 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, title)) = edit_field_line {
+            let offset = self.scroll_states.offset_for("providers:edit");
+            let y = area.y.saturating_add(line.saturating_sub(offset) as u16);
+            if line >= offset && y < area.bottom() {
+                let rect = Rect::new(
+                    area.x,
+                    y,
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3.min(area.bottom().saturating_sub(y)),
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    title,
+                    &s.field_buf,
+                    true,
+                    "https://api.example.com/v1",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Providers(
+                                super::pointer_actions::ProvidersAction::EditField(
+                                    super::pointer_actions::ProviderId(s.provider_id.clone()),
+                                    EditField::Url,
+                                ),
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 
     /// Full-pane render for the Headers sub-page. The header rows are
@@ -4245,7 +4452,7 @@ impl SettingsCx {
         editor: &HeaderEditor,
         parent: &EditState,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(vec![
                 Span::styled("Provider: ", muted),
@@ -4270,7 +4477,7 @@ impl SettingsCx {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 status.clone(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
@@ -4301,7 +4508,7 @@ impl SettingsCx {
         editor: &ModelEditor,
         parent: &EditState,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(vec![
                 Span::styled("Provider: ", muted),
@@ -4379,7 +4586,7 @@ impl SettingsCx {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 status.clone(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(resolve_color(BRASS, BRASS_INDEX)),
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
@@ -4412,8 +4619,8 @@ impl SettingsCx {
         editor: &SettingsEditor,
         parent: &EditState,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let scope_label = match &editor.scope {
             super::settings_editor::SettingsScope::Model { model_id } => {
                 format!("{} › {}", parent.provider_id, model_id)
@@ -4428,6 +4635,7 @@ impl SettingsCx {
             Line::default(),
         ];
         let mut bindings = Vec::new();
+        let mut inline_edit_field = None;
 
         // Scope-aware field list: provider scope includes provider-only
         // transport security, while model scope omits provider-only rows and
@@ -4440,18 +4648,32 @@ impl SettingsCx {
             .unwrap_or(0);
 
         for (i, field) in fields.iter().enumerate() {
+            if editor.editing == Some(*field) {
+                let line = lines.len();
+                bindings.push((
+                    line,
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::RowEditor(
+                            super::pointer_actions::ProviderRowEditorAction::SettingEdit(*field),
+                        ),
+                    ),
+                ));
+                lines.extend([Line::default(), Line::default(), Line::default()]);
+                inline_edit_field = Some((line, *field));
+                continue;
+            }
             let selected = i == editor.cursor;
-            let marker = if selected { "▸ " } else { "  " };
+            let marker = if selected { "› " } else { "  " };
             let label_style = if selected {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             let overridden = editor.is_overridden(*field);
             let value_style = if !overridden {
                 muted
             } else if selected {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             } else {
                 muted
             };
@@ -4463,16 +4685,7 @@ impl SettingsCx {
                 ),
                 Span::raw("  "),
             ];
-            // While editing a numeric field, show the live buffer with a
-            // caret at the text-field cursor; otherwise the formatted value.
-            if editor.editing == Some(*field) {
-                let (before, after) = editor.buf.split_at_cursor();
-                spans.push(Span::styled(before.to_string(), value_style));
-                spans.push(super::shell::cursor_marker_span());
-                spans.push(Span::styled(after.to_string(), value_style));
-            } else {
-                spans.push(Span::styled(editor.value_str(*field), value_style));
-            }
+            spans.push(Span::styled(editor.value_str(*field), value_style));
             if !overridden {
                 spans.push(Span::styled("  (inherited)".to_string(), muted));
             }
@@ -4486,17 +4699,6 @@ impl SettingsCx {
             ));
             lines.push(Line::from(spans));
         }
-
-        // `[save changes]` row, styled like MCP Add's button.
-        bindings.push((
-            lines.len(),
-            super::pointer_actions::SettingsPointerAction::Providers(
-                super::pointer_actions::ProvidersAction::RowEditor(
-                    super::pointer_actions::ProviderRowEditorAction::SettingSave,
-                ),
-            ),
-        ));
-        lines.push(save_button_line("[save changes]", editor.on_save_row()));
 
         if let (Some(_), super::settings_editor::SettingsScope::Model { model_id }) =
             (editor.multimodal(), &editor.scope)
@@ -4703,11 +4905,49 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, field)) = inline_edit_field {
+            let offset = self.scroll_states.offset_for("providers:settings");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    field.label(),
+                    &editor.buf,
+                    true,
+                    "",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Providers(
+                                super::pointer_actions::ProvidersAction::RowEditor(
+                                    super::pointer_actions::ProviderRowEditorAction::SettingEdit(
+                                        field,
+                                    ),
+                                ),
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let green = Style::default().fg(Color::Green);
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -4767,11 +5007,11 @@ impl SettingsCx {
         ];
         let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
-            let marker = if i == s.cursor { "▸ " } else { "  " };
+            let marker = if i == s.cursor { "› " } else { "  " };
             let style = if i == s.cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             bindings.push((
                 lines.len(),
@@ -4788,11 +5028,11 @@ impl SettingsCx {
                 Span::styled(label.to_string(), style),
             ]));
         }
-        let check = if s.dont_ask_again { "[x]" } else { "[ ]" };
+        let check = if s.dont_ask_again { "▣" } else { "▢" };
         let style = if s.cursor == 2 {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(INK, INK_INDEX))
         };
         bindings.push((
             lines.len(),
@@ -4801,7 +5041,7 @@ impl SettingsCx {
             ),
         ));
         lines.push(Line::from(vec![
-            Span::raw(if s.cursor == 2 { "▸ " } else { "  " }),
+            Span::raw(if s.cursor == 2 { "› " } else { "  " }),
             Span::styled(format!("{check} Do not show again"), style),
         ]));
         let selected_line = selected_line_from_marker(&lines);
@@ -4820,8 +5060,8 @@ impl SettingsCx {
     }
 
     fn render_fetch_one_prompt(&self, frame: &mut Frame, area: Rect, s: &FetchOnePromptState) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         lines.push(Line::from(Span::styled(
@@ -4847,11 +5087,11 @@ impl SettingsCx {
         ];
         let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
-            let marker = if i == s.cursor { "▸ " } else { "  " };
+            let marker = if i == s.cursor { "› " } else { "  " };
             let style = if i == s.cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             bindings.push((
                 lines.len(),
@@ -4881,11 +5121,11 @@ impl SettingsCx {
             ),
         ));
         lines.push(Line::from("[Cancel]"));
-        let check = if s.dont_ask_again { "[x]" } else { "[ ]" };
+        let check = if s.dont_ask_again { "▣" } else { "▢" };
         let style = if s.cursor == 2 {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(INK, INK_INDEX))
         };
         bindings.push((
             lines.len(),
@@ -4894,7 +5134,7 @@ impl SettingsCx {
             ),
         ));
         lines.push(Line::from(vec![
-            Span::raw(if s.cursor == 2 { "▸ " } else { "  " }),
+            Span::raw(if s.cursor == 2 { "› " } else { "  " }),
             Span::styled(format!("{check} Do not show again"), style),
         ]));
         let selected_line = selected_line_from_marker(&lines);
@@ -4918,8 +5158,8 @@ impl SettingsCx {
         area: Rect,
         s: &FetchFallbackPromptState,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         lines.push(Line::from(Span::styled(
@@ -4939,11 +5179,11 @@ impl SettingsCx {
         ];
         let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
-            let marker = if i == s.cursor { "▸ " } else { "  " };
+            let marker = if i == s.cursor { "› " } else { "  " };
             let style = if i == s.cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             let choice = match i {
                 0 => super::pointer_actions::FetchFallbackChoice::Retry,
@@ -4997,8 +5237,8 @@ fn render_header_editor(
     lines: &mut Vec<Line<'static>>,
     h: &HeaderEditor,
 ) -> Vec<(usize, SettingsControlId)> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+    let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
     let mut bindings = Vec::new();
     lines.push(Line::from(Span::styled(
         "Headers:".to_string(),
@@ -5014,11 +5254,11 @@ fn render_header_editor(
 
     for (i, row) in h.rows().iter().enumerate() {
         let cursor_here = h.cursor == i;
-        let marker = if cursor_here { "  ▸ " } else { "    " };
+        let marker = if cursor_here { "  › " } else { "    " };
         let name_style = if cursor_here {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(INK, INK_INDEX))
         };
         bindings.push((lines.len(), SettingsControlId(i as u64)));
         lines.push(Line::from(vec![
@@ -5031,7 +5271,7 @@ fn render_header_editor(
 
     let add_idx = h.add_row_idx();
     let add_cursor = h.cursor == add_idx;
-    let add_marker = if add_cursor { "  ▸ " } else { "    " };
+    let add_marker = if add_cursor { "  › " } else { "    " };
     let add_style = if add_cursor {
         yellow.add_modifier(Modifier::BOLD)
     } else {
@@ -5043,27 +5283,6 @@ fn render_header_editor(
         Span::styled("[+ add header]".to_string(), add_style),
     ]));
 
-    if let Some(cont_idx) = h.continue_idx() {
-        let cont_cursor = h.cursor == cont_idx;
-        let marker = if cont_cursor { "  ▸ " } else { "    " };
-        let style = if cont_cursor {
-            yellow.add_modifier(Modifier::BOLD)
-        } else {
-            muted
-        };
-        bindings.push((lines.len(), SettingsControlId(cont_idx as u64)));
-        lines.push(Line::from(vec![
-            Span::raw(marker.to_string()),
-            Span::styled("[continue → save & fetch /models]".to_string(), style),
-        ]));
-    }
-
-    // `[save changes]` row on the Edit-page sub-page (mutually exclusive
-    // with `[continue →]`). Styled like MCP Add's button.
-    if let Some(save_idx) = h.save_idx() {
-        bindings.push((lines.len(), SettingsControlId(save_idx as u64)));
-        lines.push(save_button_line("[save changes]", h.cursor == save_idx));
-    }
     if let Some(status) = &h.status {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(status.clone(), yellow)));
@@ -5082,8 +5301,6 @@ fn provider_header_pointer_action(
         ProviderRowEditorAction::HeaderOpen(HeaderName(row.name.clone()))
     } else if index == editor.add_row_idx() {
         ProviderRowEditorAction::HeaderAdd
-    } else if editor.save_idx() == Some(index) {
-        ProviderRowEditorAction::HeaderSave
     } else {
         return None;
     };
@@ -5097,14 +5314,15 @@ fn provider_header_pointer_action(
 /// mode. The `Clear` widget wipes the cells underneath so the list
 /// doesn't bleed through.
 fn render_header_edit_popup(cx: &SettingsCx, frame: &mut Frame, area: Rect, h: &HeaderEditor) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+    let yellow = Style::default().fg(resolve_color(
+        crate::tui::theme::BRASS,
+        crate::tui::theme::BRASS_INDEX,
+    ));
 
     let name_focus = matches!(h.mode, HeaderMode::EditName);
 
     let mut body: Vec<Line<'static>> = Vec::new();
-    render_field_row(&mut body, "Name ", &h.name_buf, name_focus);
-    render_field_row(&mut body, "Value", &h.value_buf, !name_focus);
 
     // Dynamic-reference status for the value (headers commonly reference
     // `$VAR` or `$secret:<name>`).  This is deliberately syntax-only: the
@@ -5188,17 +5406,43 @@ fn render_header_edit_popup(cx: &SettingsCx, frame: &mut Frame, area: Rect, h: &
         " Add header "
     };
     let width = area.width.saturating_sub(6).clamp(24, 70);
-    let height = (body.len() as u16) + 2; // +2 for the top/bottom border
+    let height = (body.len() as u16) + 8; // two three-row fields + borders
     let rect = centered_rect(area, width, height);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(yellow)
-        .title(title);
+    let block = crate::tui::chrome::rounded_block(title, true);
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+    let name_rect = Rect::new(inner.x, inner.y, inner.width, 3);
+    let value_rect = Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 3);
+    if let Some(caret) = crate::tui::chrome::render_field(
+        frame,
+        name_rect,
+        "Name",
+        &h.name_buf,
+        name_focus,
+        "Header name",
+    ) {
+        frame.set_cursor_position(caret);
+    }
+    if let Some(caret) = crate::tui::chrome::render_field(
+        frame,
+        value_rect,
+        "Value",
+        &h.value_buf,
+        !name_focus,
+        "Header value",
+    ) {
+        frame.set_cursor_position(caret);
+    }
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(6),
+            inner.width,
+            inner.height.saturating_sub(6),
+        ),
+    );
 }
 
 /// Render a [`ModelEditor`] as rows + `[+ add model]`. Each row shows the
@@ -5208,8 +5452,8 @@ fn render_model_editor(
     lines: &mut Vec<Line<'static>>,
     m: &ModelEditor,
 ) -> Vec<(usize, SettingsControlId)> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+    let yellow = Style::default().fg(resolve_color(BRASS, BRASS_INDEX));
     let green = Style::default().fg(Color::Green);
     let mut bindings = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -5231,11 +5475,11 @@ fn render_model_editor(
             .unwrap_or(0);
         for (i, row) in m.rows().iter().enumerate() {
             let cursor_here = m.cursor == i;
-            let marker = if cursor_here { "  ▸ " } else { "    " };
+            let marker = if cursor_here { "  › " } else { "    " };
             let id_style = if cursor_here {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(resolve_color(INK, INK_INDEX))
             };
             let tag = if row.manual { "M" } else { " " };
             let mut detail = row.name.clone().unwrap_or_default();
@@ -5258,7 +5502,7 @@ fn render_model_editor(
 
     let add_idx = m.rows().len();
     let add_cursor = m.cursor == add_idx;
-    let add_marker = if add_cursor { "  ▸ " } else { "    " };
+    let add_marker = if add_cursor { "  › " } else { "    " };
     let add_style = if add_cursor {
         yellow.add_modifier(Modifier::BOLD)
     } else {
@@ -5270,9 +5514,6 @@ fn render_model_editor(
         Span::styled("[+ add model]".to_string(), add_style),
     ]));
 
-    // `[save changes]` row, styled like MCP Add's button.
-    bindings.push((lines.len(), SettingsControlId(m.save_idx() as u64)));
-    lines.push(save_button_line("[save changes]", m.cursor == m.save_idx()));
     bindings
 }
 
@@ -5287,8 +5528,6 @@ fn provider_model_pointer_action(
         ProviderRowEditorAction::ModelOpen(ModelId(row.id.clone()))
     } else if index == editor.add_row_idx() {
         ProviderRowEditorAction::ModelAdd
-    } else if index == editor.save_idx() {
-        ProviderRowEditorAction::ModelSave
     } else {
         return None;
     };
@@ -5302,7 +5541,7 @@ fn render_model_fetch_status_block(
     entry: &ProviderEntry,
     now: chrono::DateTime<Utc>,
 ) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let state = provider_model_fetch_display_state(entry);
     let state_style = match state {
         cockpit_config::providers::ProviderModelFetchDisplayState::Live => {
@@ -5311,7 +5550,7 @@ fn render_model_fetch_status_block(
         cockpit_config::providers::ProviderModelFetchDisplayState::Fallback
         | cockpit_config::providers::ProviderModelFetchDisplayState::Preserved
         | cockpit_config::providers::ProviderModelFetchDisplayState::Unsupported => {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(resolve_color(BRASS, BRASS_INDEX))
         }
         cockpit_config::providers::ProviderModelFetchDisplayState::Failed
         | cockpit_config::providers::ProviderModelFetchDisplayState::AuthFailed => {
@@ -5345,24 +5584,10 @@ fn render_model_fetch_status_block(
 /// Centered id/name/context popup for adding or editing a manual model.
 /// Drawn on top of the model list while the editor is in `Edit` mode.
 fn render_model_edit_popup(frame: &mut Frame, area: Rect, m: &ModelEditor) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let red = Style::default().fg(Color::Red);
 
     let mut body: Vec<Line<'static>> = Vec::new();
-    render_field_row(&mut body, "Id     ", &m.id_buf, m.focus == ModelField::Id);
-    render_field_row(
-        &mut body,
-        "Name   ",
-        &m.name_buf,
-        m.focus == ModelField::Name,
-    );
-    render_field_row(
-        &mut body,
-        "Context",
-        &m.context_buf,
-        m.focus == ModelField::Context,
-    );
     body.push(Line::default());
     if let Some(status) = &m.status {
         body.push(Line::from(Span::styled(format!("  {status}"), red)));
@@ -5383,17 +5608,55 @@ fn render_model_edit_popup(frame: &mut Frame, area: Rect, m: &ModelEditor) {
         " Add model "
     };
     let width = area.width.saturating_sub(6).clamp(24, 70);
-    let height = (body.len() as u16) + 2; // +2 for the top/bottom border
+    let height = (body.len() as u16) + 11; // three three-row fields + borders
     let rect = centered_rect(area, width, height);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(yellow)
-        .title(title);
+    let block = crate::tui::chrome::rounded_block(title, true);
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+    let id_rect = Rect::new(inner.x, inner.y, inner.width, 3);
+    let name_rect = Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 3);
+    let context_rect = Rect::new(inner.x, inner.y.saturating_add(6), inner.width, 3);
+    let mut caret = None;
+    caret = crate::tui::chrome::render_field(
+        frame,
+        id_rect,
+        "ID",
+        &m.id_buf,
+        m.focus == ModelField::Id,
+        "model-id",
+    )
+    .or(caret);
+    caret = crate::tui::chrome::render_field(
+        frame,
+        name_rect,
+        "Name",
+        &m.name_buf,
+        m.focus == ModelField::Name,
+        "Display name",
+    )
+    .or(caret);
+    caret = crate::tui::chrome::render_field(
+        frame,
+        context_rect,
+        "Context",
+        &m.context_buf,
+        m.focus == ModelField::Context,
+        "Tokens",
+    )
+    .or(caret);
+    if let Some(caret) = caret {
+        frame.set_cursor_position(caret);
+    }
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(9),
+            inner.width,
+            inner.height.saturating_sub(9),
+        ),
+    );
 }
 
 /// A `width`×`height` rect centered within `area`, clamped to fit.
@@ -5408,47 +5671,6 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
-}
-
-fn render_field_row(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    field: &TextField,
-    active: bool,
-) -> usize {
-    let line = lines.len();
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let value_style = if active {
-        Style::default().fg(Color::White)
-    } else {
-        muted
-    };
-    let marker = if active { "▸ " } else { "  " };
-    let mut spans = vec![
-        Span::raw(marker),
-        Span::styled(
-            format!("{label}: "),
-            if active {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                muted
-            },
-        ),
-    ];
-    if active {
-        let text = field.text();
-        let cursor = cockpit_host::text::floor_char_boundary(text, field.cursor());
-        let (before, after) = text.split_at(cursor);
-        spans.push(Span::styled(before.to_string(), value_style));
-        spans.push(super::shell::cursor_marker_span());
-        spans.push(Span::styled(after.to_string(), value_style));
-    } else {
-        spans.push(Span::styled(field.text().to_string(), value_style));
-    }
-    lines.push(Line::from(spans));
-    line
 }
 
 /// Build the `ProvidersPage` for `/model-settings`: the active model's
@@ -5592,10 +5814,16 @@ fn provider_add_pointer_action(
                 return None;
             }
         }
-        WizardStepId::ProviderId
-        | WizardStepId::Url
-        | WizardStepId::ApiKey
-        | WizardStepId::EnvVar => WizardControlId::EditText,
+        WizardStepId::ProviderId | WizardStepId::Url | WizardStepId::EnvVar => {
+            WizardControlId::EditText
+        }
+        WizardStepId::ApiKey => {
+            if index == 0 {
+                WizardControlId::Continue
+            } else {
+                return None;
+            }
+        }
         WizardStepId::CopyDetectedEnv => return None,
         WizardStepId::CopilotAuth => (index == 0).then_some(WizardControlId::CopilotContinue)?,
         WizardStepId::Done => (index == 0).then_some(WizardControlId::DoneContinue)?,
@@ -5603,6 +5831,23 @@ fn provider_add_pointer_action(
     };
     Some(SettingsPointerAction::Providers(
         ProvidersAction::WizardControl(step, control),
+    ))
+}
+
+fn provider_add_field_pointer_action(
+    state: &AddState,
+) -> Option<super::pointer_actions::SettingsPointerAction> {
+    use super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+    let step = state.run.current_provider_step()?;
+    matches!(
+        step,
+        super::pointer_actions::WizardStepId::ProviderId
+            | super::pointer_actions::WizardStepId::Url
+            | super::pointer_actions::WizardStepId::ApiKey
+            | super::pointer_actions::WizardStepId::EnvVar
+    )
+    .then_some(SettingsPointerAction::Providers(
+        ProvidersAction::WizardControl(step, WizardControlId::EditText),
     ))
 }
 
@@ -5667,6 +5912,38 @@ impl SettingsPage for ProvidersPage {
         else {
             return Nav::Stay;
         };
+        if matches!(self, ProvidersPage::Add(_)) {
+            match &provider_action {
+                super::pointer_actions::ProvidersAction::LocalBack => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::WizardControl(
+                    super::pointer_actions::WizardStepId::ApiKey,
+                    super::pointer_actions::WizardControlId::Continue,
+                ) => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::RetryVerification => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::ContinueVerificationOffline => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                _ => {}
+            }
+        }
         if let super::pointer_actions::ProvidersAction::Delete(id, choice) = provider_action {
             let pending_matches = match self {
                 ProvidersPage::List {
@@ -5988,6 +6265,12 @@ impl SettingsPage for ProvidersPage {
             }
         }
         let index = match (&*self, &provider_action) {
+            (ProvidersPage::Edit(_), super::pointer_actions::ProvidersAction::SaveProvider(_)) => {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                    self,
+                );
+            }
             (ProvidersPage::List { .. }, super::pointer_actions::ProvidersAction::RefetchAll) => 0,
             (ProvidersPage::List { .. }, super::pointer_actions::ProvidersAction::Open(id)) => {
                 let Some(index) = cx
@@ -6026,10 +6309,10 @@ impl SettingsPage for ProvidersPage {
                 }
                 super::pointer_actions::ProviderRowEditorAction::HeaderAdd => editor.add_row_idx(),
                 super::pointer_actions::ProviderRowEditorAction::HeaderSave => {
-                    let Some(index) = editor.save_idx() else {
-                        return Nav::Stay;
-                    };
-                    index
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                        self,
+                    );
                 }
                 _ => return Nav::Stay,
             },
@@ -6044,7 +6327,12 @@ impl SettingsPage for ProvidersPage {
                     index
                 }
                 super::pointer_actions::ProviderRowEditorAction::ModelAdd => editor.add_row_idx(),
-                super::pointer_actions::ProviderRowEditorAction::ModelSave => editor.save_idx(),
+                super::pointer_actions::ProviderRowEditorAction::ModelSave => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
                 _ => return Nav::Stay,
             },
             (
@@ -6059,7 +6347,10 @@ impl SettingsPage for ProvidersPage {
                     index
                 }
                 super::pointer_actions::ProviderRowEditorAction::SettingSave => {
-                    editor.fields().len()
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                        self,
+                    );
                 }
                 _ => return Nav::Stay,
             },
@@ -6149,17 +6440,12 @@ impl SettingsPage for ProvidersPage {
                 editor.cursor = index;
             }
             ProvidersPage::Headers { editor, .. }
-                if !editor.is_editing()
-                    && index
-                        <= editor
-                            .save_idx()
-                            .or_else(|| editor.continue_idx())
-                            .unwrap_or_else(|| editor.add_row_idx()) =>
+                if !editor.is_editing() && index <= editor.add_row_idx() =>
             {
                 editor.cursor = index;
             }
             ProvidersPage::Models { editor, .. }
-                if !editor.is_editing() && index <= editor.save_idx() =>
+                if !editor.is_editing() && index <= editor.add_row_idx() =>
             {
                 editor.cursor = index;
             }
@@ -6250,6 +6536,79 @@ impl SettingsPage for ProvidersPage {
             return Nav::Stay;
         };
         if let (
+            ProvidersPage::Edit(state),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::EditField(provider_id, field),
+            ),
+        ) = (&mut *self, &action)
+            && state.provider_id == provider_id.0
+            && state.editing_field == Some(*field)
+        {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            state
+                .field_buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::OAuthSetup { state, .. },
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::EditOAuthCallback(flow_id),
+            ),
+        ) = (&mut *self, &action)
+            && state.paste_focused
+            && state.flow_id == *flow_id
+        {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            state
+                .manual_input
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::Add(state),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::EditOAuthCallback(flow_id),
+            ),
+        ) = (&mut *self, &action)
+            && let Some(oauth) = state.oauth_auth.as_mut()
+            && oauth.paste_focused
+            && oauth.flow_id == *flow_id
+        {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            oauth
+                .manual_input
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        if let (
             ProvidersPage::ModelSettings { editor, .. }
             | ProvidersPage::ProviderSettings { editor, .. },
             super::pointer_actions::SettingsPointerAction::Providers(
@@ -6260,40 +6619,55 @@ impl SettingsPage for ProvidersPage {
         ) = (&mut *self, &action)
             && editor.editing.is_some_and(|field| field == *id)
         {
-            let label_width = editor
-                .fields()
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
                 .iter()
-                .map(|field| field.label().chars().count())
-                .max()
-                .unwrap_or(0) as u16;
-            let value_x = cx.pointer_surface.area.get().map_or(0, |area| {
-                area.x
-                    .saturating_add(2)
-                    .saturating_add(label_width)
-                    .saturating_add(2)
-            });
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
             editor
                 .buf
                 .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
             return Nav::Stay;
         }
         if let ProvidersPage::Add(state) = self {
-            let (label, field): (&str, &mut TextField) = match state.run.current_step_id() {
-                Some("id") => ("id", &mut state.id_field),
-                Some("url") => ("url", &mut state.url_field),
-                Some("api-key") => ("api key", state.api_key_field.as_mut()),
-                Some("env-var") => ("env var", state.env_var_field.as_mut()),
+            if matches!(
+                &action,
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::LocalBack
+                        | super::pointer_actions::ProvidersAction::WizardControl(
+                            super::pointer_actions::WizardStepId::ApiKey,
+                            super::pointer_actions::WizardControlId::Continue,
+                        )
+                        | super::pointer_actions::ProvidersAction::RetryVerification
+                        | super::pointer_actions::ProvidersAction::ContinueVerificationOffline
+                )
+            ) {
+                return self.handle_pointer_control(cx, action);
+            }
+            let field: &mut TextField = match state.run.current_step_id() {
+                Some("id") => &mut state.id_field,
+                Some("url") => &mut state.url_field,
+                Some("api-key") => state.api_key_field.as_mut(),
+                Some("env-var") => state.env_var_field.as_mut(),
                 _ => {
                     return self.handle_pointer_control(cx, action);
                 }
             };
             let value_x = cx
                 .pointer_surface
-                .area
-                .get()
-                .map_or(label.len() as u16 + 2, |area| {
-                    area.x.saturating_add(label.len() as u16 + 2)
-                });
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
             field.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
             return Nav::Stay;
         }
@@ -6343,10 +6717,7 @@ impl SettingsPage for ProvidersPage {
             && let ProvidersPage::Headers { editor, .. } = self
             && !editor.is_editing()
         {
-            let last = editor
-                .save_idx()
-                .or_else(|| editor.continue_idx())
-                .unwrap_or_else(|| editor.add_row_idx());
+            let last = editor.add_row_idx();
             editor.cursor = editor.cursor.saturating_add_signed(delta).min(last);
         } else if region == SettingsScrollRegionId("providers:models")
             && let ProvidersPage::Models { editor, .. } = self
@@ -6355,7 +6726,7 @@ impl SettingsPage for ProvidersPage {
             editor.cursor = editor
                 .cursor
                 .saturating_add_signed(delta)
-                .min(editor.save_idx());
+                .min(editor.add_row_idx());
         } else {
             match self {
                 ProvidersPage::FetchAll(state)
@@ -6548,7 +6919,9 @@ impl SettingsPage for ProvidersPage {
                         oauth_help_legend(OAuthHost::AddWizard, state)
                     }
                 },
-                Some("test-key") if s.fetch.is_none() => "o: continue offline  esc: cancel",
+                Some("test-key") if s.fetch.is_none() => {
+                    "r: retry  o: continue offline  esc: cancel"
+                }
                 Some("saving" | "fetching" | "test-key") => "(in progress)  esc: cancel",
                 Some("done") | None => "enter: back to list",
                 Some(_) => "esc: cancel",
@@ -6609,6 +6982,262 @@ impl SettingsPage for ProvidersPage {
                 oauth_help_legend(OAuthHost::Standalone, state)
             }
         }
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{
+            ProviderId, ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
+            WizardControlId, WizardStepId,
+        };
+        let mut actions = Vec::new();
+        match self {
+            ProvidersPage::Add(s) if s.is_step("api-key") => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Continue",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::ApiKey,
+                        WizardControlId::Continue,
+                    )),
+                });
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+                });
+            }
+            ProvidersPage::Add(s) if s.is_step("done") && s.verify.is_none() => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Continue",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::Done,
+                        WizardControlId::DoneContinue,
+                    )),
+                });
+            }
+            ProvidersPage::Add(s)
+                if matches!(s.run.current_step_id(), Some("test-key" | "done")) =>
+            {
+                if let Some(screen) = s.verify.as_deref() {
+                    for button in screen.buttons() {
+                        let action = match button.label {
+                            "Retry" => {
+                                SettingsPointerAction::Providers(ProvidersAction::RetryVerification)
+                            }
+                            "Done" => {
+                                SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                                    WizardStepId::Done,
+                                    WizardControlId::DoneContinue,
+                                ))
+                            }
+                            "Add another" => {
+                                SettingsPointerAction::Providers(ProvidersAction::LocalBack)
+                            }
+                            _ => continue,
+                        };
+                        actions.push(super::shell::SettingsHelpAction {
+                            label: button.label,
+                            enabled: button.enabled,
+                            primary: button.primary,
+                            action,
+                        });
+                    }
+                    if s.fallback_offer.is_some() {
+                        actions.push(super::shell::SettingsHelpAction {
+                            label: "Continue offline",
+                            enabled: true,
+                            primary: false,
+                            action: SettingsPointerAction::Providers(
+                                ProvidersAction::ContinueVerificationOffline,
+                            ),
+                        });
+                    }
+                }
+            }
+            ProvidersPage::Add(s)
+                if s.is_step("headers") && s.headers.show_continue && !s.headers.is_editing() =>
+            {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Continue",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::Headers,
+                        WizardControlId::ContinueHeaders,
+                    )),
+                });
+            }
+            ProvidersPage::Add(s) if s.is_step("copilot-auth") => {
+                let state = s.copilot_auth.as_ref().expect("Copilot auth state");
+                actions.push(super::shell::SettingsHelpAction {
+                    label: if state.outcome.is_none()
+                        && state.shell.is_some()
+                        && state.rc_path.is_some()
+                        && !state.already_configured
+                    {
+                        "Set up Copilot auth"
+                    } else {
+                        "Continue"
+                    },
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::CopilotAuth,
+                        WizardControlId::CopilotContinue,
+                    )),
+                });
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+                });
+            }
+            ProvidersPage::Add(s)
+                if matches!(s.run.current_step_id(), Some("grok-oauth" | "codex-oauth")) =>
+            {
+                let state = s.oauth_auth.as_ref().expect("OAuth state");
+                let step = s.run.current_provider_step().expect("OAuth wizard step");
+                for option in oauth_options(state, OAuthHost::AddWizard) {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: option.label(),
+                        enabled: true,
+                        primary: matches!(
+                            option,
+                            OAuthOption::Acknowledge
+                                | OAuthOption::Continue
+                                | OAuthOption::SkipContinue
+                        ),
+                        action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                            step,
+                            WizardControlId::OAuth(option),
+                        )),
+                    });
+                }
+            }
+            ProvidersPage::Edit(s) if s.editing_field.is_some() => {
+                let id = ProviderId(s.provider_id.clone());
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::SaveProvider(id)),
+                });
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+                });
+            }
+            ProvidersPage::ProviderSettings { .. } => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "save changes",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                        ProviderRowEditorAction::SettingSave,
+                    )),
+                });
+            }
+            ProvidersPage::ModelSettings { .. } => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "save changes",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                        ProviderRowEditorAction::SettingSave,
+                    )),
+                });
+            }
+            ProvidersPage::Headers { editor: h, .. } => {
+                if h.show_continue {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: "Continue",
+                        enabled: true,
+                        primary: true,
+                        action: SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                            WizardStepId::Headers,
+                            WizardControlId::ContinueHeaders,
+                        )),
+                    });
+                } else {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: "save changes",
+                        enabled: true,
+                        primary: true,
+                        action: SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                            ProviderRowEditorAction::HeaderSave,
+                        )),
+                    });
+                }
+            }
+            ProvidersPage::Models { .. } => {
+                actions.push(super::shell::SettingsHelpAction {
+                    label: "save changes",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                        ProviderRowEditorAction::ModelSave,
+                    )),
+                });
+            }
+            ProvidersPage::CopilotSetup { state, parent } => {
+                if state.outcome.is_some()
+                    || (state.shell.is_some()
+                        && state.rc_path.is_some()
+                        && !state.already_configured)
+                {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: if state.outcome.is_some() {
+                            "Continue"
+                        } else {
+                            "Set up Copilot auth"
+                        },
+                        enabled: true,
+                        primary: true,
+                        action: SettingsPointerAction::Providers(ProvidersAction::CopilotConfirm(
+                            ProviderId(parent.provider_id.clone()),
+                            super::pointer_actions::ConfirmationChoice::Confirm,
+                        )),
+                    });
+                }
+                actions.push(super::shell::SettingsHelpAction {
+                    label: if state.outcome.is_some() {
+                        "Back"
+                    } else {
+                        "Cancel"
+                    },
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+                });
+            }
+            ProvidersPage::OAuthSetup { state, parent } => {
+                for option in oauth_options(state, OAuthHost::Standalone) {
+                    actions.push(super::shell::SettingsHelpAction {
+                        label: option.label(),
+                        enabled: true,
+                        primary: matches!(
+                            option,
+                            OAuthOption::Acknowledge
+                                | OAuthOption::Continue
+                                | OAuthOption::SkipContinue
+                        ),
+                        action: SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
+                            ProviderId(parent.provider_id.clone()),
+                            option,
+                        )),
+                    });
+                }
+            }
+            _ => {}
+        }
+        super::shell::finish_help_row(cx, actions)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — Image spend budgets ────────────────────────────────────────────────────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│╭ Spend policy ────────────────────────────────────────────────────────────────────╮│ │
+                              ▌ ││Suggestions are display-only until you select and save them.                      ││ │
+ SESSIONS                       ││›  Request: unconfigured (blocked)  [suggestion $1]                               ││ │
+ no active sessions in all pr   ││   Session: unconfigured (blocked)  [suggestion $10]                              ││ │
+                                ││   Project: unconfigured (blocked)  [suggestion $100]                             ││ │
+                              no││   Project window: unconfigured (blocked when project is finite)                  ││ │
+                              ┊ ││                                                                                  ││ │
+                              ▌ ││Status: Policy operation failed: the disk-backed test daemon fake does not handle ││ │
+                                ││Display suggestions: 1000000/10000000/100000000 micros                            ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                               ⋯││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                                ││                                                                                  ││ █
+                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+ ● working  ● waiting  ● done   │↑/↓: select  enter: choose  e: exact u64 micros/IANA zone  +/-:  [ Cancel ] [ Save ]│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

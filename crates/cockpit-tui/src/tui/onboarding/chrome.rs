@@ -5,12 +5,15 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::theme::{BRASS, DISABLED, FOG, INK};
+use super::theme::{BRASS, DISABLED};
 use crate::tui::chrome::chip_style;
+pub(super) use crate::tui::chrome::{ActionBar, ActionButton as Button, action_bar_width};
+#[cfg(test)]
+use crate::tui::chrome::{action_button_at as button_at, render_action_bar};
 
 const BACK_LABEL: &str = " ‹ Back ";
 
@@ -56,156 +59,6 @@ pub(super) fn render_back_button(
 /// button and every action-bar button.
 pub(super) fn hit(rect: Rect, pos: Position) -> bool {
     rect.width > 0 && rect.height > 0 && rect.contains(pos)
-}
-
-/// One clickable button in an [`render_action_bar`].
-pub(super) struct Button<'a> {
-    pub label: &'a str,
-    /// Disabled buttons render dimmed and never match a click.
-    pub enabled: bool,
-    /// The primary (default) action is brass and bold; others are muted.
-    pub primary: bool,
-}
-
-impl<'a> Button<'a> {
-    pub(super) fn primary(label: &'a str) -> Self {
-        Self {
-            label,
-            enabled: true,
-            primary: true,
-        }
-    }
-
-    pub(super) fn secondary(label: &'a str) -> Self {
-        Self {
-            label,
-            enabled: true,
-            primary: false,
-        }
-    }
-
-    #[allow(dead_code)] // variable button sets in #428–#433.
-    pub(super) fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-}
-
-/// Cells the action bar occupies, including 1-cell gaps. Used to clip the
-/// left-aligned help string so the two never paint over each other.
-pub(super) fn action_bar_width(buttons: &[Button<'_>]) -> u16 {
-    if buttons.is_empty() {
-        return 0;
-    }
-    let labels: u16 = buttons
-        .iter()
-        .map(|button| button.label.chars().count() as u16 + 4)
-        .sum();
-    labels + (buttons.len() as u16).saturating_sub(1)
-}
-
-/// Render `buttons` right-aligned on the single-line `area` (typically the help
-/// row, sharing it with the left-aligned key hints). Returns each button's rect
-/// in order for hit-testing; disabled buttons get an empty rect so their clicks
-/// are ignored. `hover` highlights the button currently under the pointer.
-pub(super) fn render_action_bar(
-    frame: &mut Frame,
-    area: Rect,
-    buttons: &[Button<'_>],
-    hover: Option<usize>,
-) -> Vec<Rect> {
-    let mut rects = vec![Rect::default(); buttons.len()];
-    if area.width == 0 || area.height == 0 || buttons.is_empty() {
-        return rects;
-    }
-    let gap: u16 = 1;
-    // "[ " + label + " ]" = label + 4 cells.
-    let widths: Vec<u16> = buttons
-        .iter()
-        .map(|b| b.label.chars().count() as u16 + 4)
-        .collect();
-    let total: u16 = widths.iter().sum::<u16>() + gap * (buttons.len().saturating_sub(1) as u16);
-    let mut x = if total >= area.width {
-        area.x
-    } else {
-        area.right() - total
-    };
-    for (index, button) in buttons.iter().enumerate() {
-        if x >= area.right() {
-            break;
-        }
-        let width = widths[index].min(area.right() - x);
-        let rect = Rect {
-            x,
-            y: area.y,
-            width,
-            height: 1,
-        };
-        let hovered = hover == Some(index) && button.enabled;
-        let style = if !button.enabled {
-            Style::new().fg(DISABLED)
-        } else if hovered {
-            chip_style(
-                Style::new().fg(if button.primary { BRASS } else { INK }),
-                true,
-            )
-        } else if button.primary {
-            Style::new().fg(BRASS).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(FOG)
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("[ {} ]", button.label),
-                style,
-            ))),
-            rect,
-        );
-        if button.enabled {
-            rects[index] = rect;
-        }
-        x += widths[index] + gap;
-    }
-    rects
-}
-
-/// Index of the button whose rect contains `pos`, if any.
-pub(super) fn button_at(rects: &[Rect], pos: Position) -> Option<usize> {
-    rects.iter().position(|rect| hit(*rect, pos))
-}
-
-/// A stateful wrapper around [`render_action_bar`] that remembers the button
-/// rects and the hovered button between frames, so a screen only needs a
-/// single field. Render it each frame, feed pointer moves to [`Self::track`],
-/// and map left-clicks with [`Self::clicked`].
-#[derive(Default)]
-pub(super) struct ActionBar {
-    rects: Vec<Rect>,
-    hover: Option<usize>,
-}
-
-impl ActionBar {
-    /// Draw the buttons right-aligned on `area` (usually the help row).
-    pub(super) fn render(&mut self, frame: &mut Frame, area: Rect, buttons: &[Button<'_>]) {
-        self.rects = render_action_bar(frame, area, buttons, self.hover);
-    }
-
-    /// Update the hovered button from a pointer position (call on move/drag).
-    pub(super) fn track(&mut self, pos: Position) {
-        self.hover = button_at(&self.rects, pos);
-    }
-
-    /// The button index under `pos`, if any (call on a left-click).
-    pub(super) fn clicked(&self, pos: Position) -> Option<usize> {
-        button_at(&self.rects, pos)
-    }
-
-    /// Hit rects recorded at the last render, in button order. Empty rects
-    /// belong to disabled buttons and never match a click.
-    #[cfg(test)]
-    pub(super) fn rects(&self) -> &[Rect] {
-        &self.rects
-    }
 }
 
 #[cfg(test)]
@@ -256,11 +109,23 @@ mod tests {
     }
 
     #[test]
-    fn disabled_buttons_are_unclickable() {
+    fn disabled_buttons_paint_but_action_bar_rejects_clicks() {
         let buttons = [Button::primary("Next").enabled(false)];
-        let (rects, _) = render(&buttons, None);
-        assert_eq!(rects[0], Rect::default());
-        assert_eq!(button_at(&rects, Position::ORIGIN), None);
+        let (rects, text) = render(&buttons, None);
+        let rect = rects[0];
+        assert!(text.contains("[ Next ]"), "{text}");
+        assert!(rect.width > 0 && rect.height > 0);
+        // Raw geometry remains visible to settings' pointer registry; the
+        // stateful ActionBar is the interaction boundary and rejects it.
+        assert_eq!(button_at(&rects, Position::new(rect.x, rect.y)), Some(0));
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut action_bar = ActionBar::default();
+        terminal
+            .draw(|frame| action_bar.render(frame, frame.area(), &buttons))
+            .unwrap();
+        assert_eq!(action_bar.clicked(Position::new(rect.x, rect.y)), None);
     }
 
     #[test]

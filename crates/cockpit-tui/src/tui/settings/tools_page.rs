@@ -13,15 +13,15 @@ use cockpit_config::extended::{ToolCommandTemplate, WebConfig, WebProvider as Co
 use cockpit_core::engine::builtin::{builtin_tool_inventory, is_reserved_custom_tool_name};
 use cockpit_core::mcp::cache;
 use cockpit_core::mcp::protocol::{ToolDescriptor, sanitize_tool_descriptor};
-use cockpit_proto::{Request, SecretInventoryKind};
+use cockpit_proto::SecretInventoryKind;
 
 use super::mcp_page::{ListState as McpListState, McpPage};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell;
 use super::shell::{
     SettingsControlId, SettingsScrollRegionId, WrappedValueLayout, focused_field_style,
-    muted_style, push_text_field_at_cursor, push_wrapped_prefixed_value, selected_line_from_marker,
-    selected_style, warning_style,
+    muted_style, push_wrapped_prefixed_value, selected_line_from_marker, selected_style,
+    warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -506,7 +506,6 @@ impl SettingsCx {
             rows.push(ToolRow::McpTool { server, tool });
         }
         rows.push(ToolRow::McpJump);
-        rows.push(ToolRow::Reset);
         rows
     }
 
@@ -551,6 +550,7 @@ impl SettingsCx {
         let mut lines = Vec::new();
         let mut bindings = Vec::new();
         let mut row_idx = 0usize;
+        let mut edit_field_line = None;
 
         push_section(&mut lines, "Web tools");
         self.push_web_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
@@ -563,14 +563,6 @@ impl SettingsCx {
 
         push_section(&mut lines, "MCP tools");
         self.push_mcp_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
-
-        lines.push(Line::default());
-        let reset_row = row_idx;
-        bindings.push((lines.len(), SettingsControlId(reset_row as u64)));
-        lines.push(
-            p.reset
-                .render_line(p.cursor == reset_row, "reset to defaults"),
-        );
 
         if let Some(row) = self.tools_page_rows().get(p.cursor) {
             match row {
@@ -610,16 +602,10 @@ impl SettingsCx {
                 ToolField::NewToolName => "tool name",
                 ToolField::UserToolCommand(_) => "command",
             };
-            let visible = match field {
-                ToolField::WebKey(_) => masked_edit_value(p.buf.text()),
-                _ => p.buf.text().to_string(),
-            };
-            let cursor = match field {
-                ToolField::WebKey(_) if !p.buf.text().is_empty() => visible.chars().count(),
-                _ => p.buf.cursor(),
-            };
             lines.push(Line::default());
-            push_text_field_at_cursor(&mut lines, width, label, &visible, cursor, true, None);
+            let line = lines.len();
+            lines.extend([Line::default(), Line::default(), Line::default()]);
+            edit_field_line = Some((line, label, matches!(field, ToolField::WebKey(_))));
         }
 
         if let Some(status) = &p.status {
@@ -663,7 +649,7 @@ impl SettingsCx {
                     .map(|action| (line, action))
             })
             .collect();
-        (lines, semantic, read_only)
+        (lines, semantic, read_only, edit_field_line)
     }
 
     fn tools_pointer_action(
@@ -1022,7 +1008,11 @@ impl SettingsCx {
     }
 
     pub(super) fn render_tools_page(&self, frame: &mut Frame, area: Rect, p: &ToolsPage) {
-        let (lines, bindings, read_only) = self.build_tools_page_lines_with_bindings(area.width, p);
+        let (lines, bindings, read_only, edit_field_line) = self
+            .build_tools_page_lines_with_bindings(
+                crate::tui::chrome::scrollbar_content(area).width,
+                p,
+            );
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,
@@ -1033,6 +1023,30 @@ impl SettingsCx {
             (&self.pointer_surface, SettingsScrollRegionId("tools")).into(),
         );
         let offset = self.scroll_states.offset_for("tools");
+        if let Some((line, title, masked)) = edit_field_line
+            && let Some(screen_row) = line.checked_sub(offset)
+            && screen_row + 3 <= usize::from(area.height)
+        {
+            let rect = Rect::new(
+                area.x,
+                area.y.saturating_add(screen_row as u16),
+                crate::tui::chrome::scrollbar_content(area).width,
+                3,
+            );
+            if let Some(caret) = crate::tui::chrome::render_field_masked(
+                frame, rect, title, &p.buf, true, "", masked,
+            ) {
+                frame.set_cursor_position(caret);
+            }
+            if let Some(action) = self.tools_pointer_action(p, p.cursor) {
+                self.pointer_surface.register(shell::SettingsPointerTarget {
+                    rect,
+                    action: shell::SettingsPointerAction::Page(action),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+        }
         for (line, action) in read_only {
             let Some(screen_row) = line.checked_sub(offset) else {
                 continue;
@@ -1056,7 +1070,12 @@ impl SettingsCx {
 }
 
 type ActionBinding = (usize, super::pointer_actions::SettingsPointerAction);
-type ToolsPageLines = (Vec<Line<'static>>, Vec<ActionBinding>, Vec<ActionBinding>);
+type ToolsPageLines = (
+    Vec<Line<'static>>,
+    Vec<ActionBinding>,
+    Vec<ActionBinding>,
+    Option<(usize, &'static str, bool)>,
+);
 
 fn web_command_status(command: Option<&str>, placeholder: &str) -> String {
     match command.map(str::trim).filter(|value| !value.is_empty()) {
@@ -1095,7 +1114,7 @@ fn push_selectable_row(
 ) {
     let first_line = lines.len();
     let selected = p.cursor == *row_idx;
-    let marker = if selected { "▸ " } else { "  " };
+    let marker = if selected { "› " } else { "  " };
     let label_style = if selected {
         selected_style()
     } else {
@@ -1171,6 +1190,21 @@ impl SettingsPage for ToolsPage {
             return Nav::Stay;
         };
         use super::pointer_actions::{ToolFieldId, ToolsAction};
+        if matches!(action, ToolsAction::Reset) {
+            match self.reset.activate() {
+                ResetOutcome::Apply => {
+                    self.editing = None;
+                    self.buf = TextField::default();
+                    cx.reset_tools_to_defaults();
+                    self.status = save_status(cx.save_extended());
+                }
+                ResetOutcome::Armed => {
+                    self.editing = None;
+                    self.buf = TextField::default();
+                }
+            }
+            return Nav::Stay;
+        }
         let key = match &action {
             ToolsAction::DeleteUserTool(_) if self.delete_pending.is_some() => {
                 Some(KeyCode::Char('d'))
@@ -1243,6 +1277,42 @@ impl SettingsPage for ToolsPage {
         cx.handle_tools_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
     }
 
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        if self.editing.is_some()
+            && matches!(
+                action,
+                super::pointer_actions::SettingsPointerAction::Tools(
+                    super::pointer_actions::ToolsAction::EditFirecrawlBaseUrl
+                        | super::pointer_actions::ToolsAction::EditCredential(_)
+                        | super::pointer_actions::ToolsAction::EditWebFetchCommand
+                        | super::pointer_actions::ToolsAction::EditWebSearchCommand
+                        | super::pointer_actions::ToolsAction::EditUserToolCommand(_)
+                )
+            )
+        {
+            let value_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
+            self.buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, action)
+    }
+
     fn handle_pointer_scroll(
         &mut self,
         cx: &mut SettingsCx,
@@ -1278,6 +1348,24 @@ impl SettingsPage for ToolsPage {
         } else {
             "↑/↓/Tab/Shift+Tab  enter: edit/cycle  t: toggle  d: remove  r: reset row  esc/h: back  q: close"
         }
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{SettingsPointerAction, ToolsAction};
+        let label = if self.reset.is_pending() {
+            "confirm reset"
+        } else {
+            "reset to defaults"
+        };
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
+                label,
+                enabled: true,
+                primary: false,
+                action: SettingsPointerAction::Tools(ToolsAction::Reset),
+            }],
+        )
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models › Ad╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│Which provider would you like to add?                                               │ │
+                              ▌ │                                                                                    │ │
+ SESSIONS                       │› Codex (ChatGPT Plus/Pro)  (codex-oauth)                                           │ │
+ no active sessions in all pr   │  Grok (SuperGrok) — disabled pending xAI authorization  (grok-oauth)               │ │
+                                │  GitHub Copilot  (copilot)                                                         │ │
+                              no│  OpenAI-compatible  (openai-compatible)                                            │ │
+                              ┊ │  OpenAI Platform API  (openai)                                                     │ │
+                              ▌ │  Grok (xAI API)  (grok)                                                            │ │
+                                │  CrofAI  (crofai)                                                                  │ █
+                                │  z.ai (GLM)  (z-ai)                                                                │ █
+                                │  Nous Research  (nous-research)                                                    │ █
+                                │  Baseten Model APIs  (baseten)                                                     │ █
+                                │  MiniMax  (minimax)                                                                │ █
+                                │  OpenCode Zen  (opencode-zen)                                                      │ █
+                                │  OpenRouter  (openrouter)                                                          │ █
+                                │  DeepSeek  (deepseek)                                                              │ █
+                                │  Anthropic (Claude API)  (anthropic)                                               │ █
+                                │  Xiaomi MiMo  (xiaomi-mimo)                                                        │ █
+                                │                                                                                    │ █
+                              ▌ │Subscription login via device code at auth.openai.com/codex/device; no OPENAI_API_K │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                               ⋯│                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓  enter: choose  esc: cancel                     │ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

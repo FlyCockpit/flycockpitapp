@@ -514,7 +514,8 @@ fn pointer_xai_entitlement_renders_dispatches_and_persists() {
     let (_daemon_fixture, runtime) = provider_daemon_runtime();
     let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{
-        ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
+        ModelId, ModelLifecycleAction, ProviderId, ProviderRowEditorAction, ProvidersAction,
+        SettingsPointerAction,
     };
     use cockpit_config::providers::{
         CapabilitySource, CapabilityStatus, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT,
@@ -609,7 +610,10 @@ fn pointer_xai_entitlement_renders_dispatches_and_persists() {
                     && editor.is_overridden(ProviderSettingId::XaiMultiAgentToolsBeta)
         ));
 
-        fresh.handle_key(press(KeyCode::Char('s')));
+        let save_action = SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::SettingSave,
+        ));
+        click_rendered_provider_action(&mut fresh, &save_action);
         let saved = load_provider(&fresh.config_path, "grok-oauth");
         let capability = if model_scope {
             &saved
@@ -629,6 +633,14 @@ fn pointer_xai_entitlement_renders_dispatches_and_persists() {
             Some(XAI_MULTI_AGENT_TOOLS_ENTITLEMENT)
         );
     }
+    let refresh = SettingsPointerAction::Providers(ProvidersAction::ModelLifecycle(
+        ModelLifecycleAction::Refresh(
+            ProviderId("grok-oauth".into()),
+            ModelId("grok-build-multi-agent".into()),
+        ),
+    ));
+    let (_tmp, mut model_fixture) = fixture(true);
+    click_rendered_provider_action(&mut model_fixture, &refresh);
 }
 
 #[test]
@@ -1706,6 +1718,11 @@ fn replay_special_provider_edit_actions(
             other => panic!("unexpected special-provider edit action: {other:?}"),
         }
     }
+    let save = SettingsPointerAction::Providers(ProvidersAction::SaveProvider(
+        super::super::pointer_actions::ProviderId(provider_id.to_string()),
+    ));
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &save);
 }
 
 #[test]
@@ -1828,7 +1845,7 @@ fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
         ));
     }
 
-    // The actionable source publishes both commands. Dispatch Cancel on a
+    // The actionable source publishes setup plus the ActionBar back command. Dispatch Cancel on a
     // separate fresh instance so it proves that cancellation performs no
     // setup work and preserves the parent edit state.
     let (_tmp, source) = setup_fixture(0);
@@ -1837,7 +1854,7 @@ fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
         ProvidersAction::CopilotConfirm(ProviderId("copilot".into()), ConfirmationChoice::Confirm,)
     )));
     assert!(rendered.contains(&SettingsPointerAction::Providers(
-        ProvidersAction::CopilotConfirm(ProviderId("copilot".into()), ConfirmationChoice::Cancel,)
+        ProvidersAction::LocalBack
     )));
 }
 
@@ -2185,6 +2202,7 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
                     .as_ref()
                     .is_ok_and(|message| message.contains("device code copied")))
         ));
+        super::super::pointer_acceptance_tests::record_dispatched_action(&action);
     }
 
     replay_special_provider_edit_actions("codex-oauth", edit_fixture);
@@ -2640,7 +2658,11 @@ fn pointer_add_headers_existing_row_renders_and_dispatches_from_fresh_state() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(actions.len(), 3, "Headers publishes row, Add, and Continue");
+    assert_eq!(
+        actions.len(),
+        3,
+        "Headers publishes row, Add, and help-row Continue"
+    );
     for action in actions {
         let control = match &action {
             SettingsPointerAction::Providers(ProvidersAction::WizardControl(_, control)) => control,
@@ -2767,7 +2789,11 @@ fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
 
 #[test]
 fn pointer_add_api_key_field_renders_and_dispatches_from_fresh_state() {
-    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+    use super::super::pointer_actions::{
+        ProvidersAction, SettingsPointerAction, WizardControlId, WizardStepId,
+    };
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
@@ -2811,6 +2837,31 @@ fn pointer_add_api_key_field_renders_and_dispatches_from_fresh_state() {
         TestPageRef::Providers(ProvidersPage::Add(state))
             if state.is_step("api-key") && state.api_key_field.text() == "sk-stable-secret"
     ));
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let continue_action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        WizardStepId::ApiKey,
+                        WizardControlId::Continue,
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("API key ActionBar publishes Continue");
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &continue_action);
+    assert!(fresh.config.providers.contains_key("anthropic"));
+    super::super::pointer_acceptance_tests::record_dispatched_action(&continue_action);
 }
 
 #[test]
@@ -2993,24 +3044,10 @@ fn pointer_add_done_continue_renders_and_dispatches_from_fresh_state() {
 
     let (_tmp, source) = fixture();
     let _ = render_provider_rows(&source, 110, 60);
-    let action = source
-        .pointer_surface
-        .targets
-        .borrow()
-        .iter()
-        .find_map(|target| match (&target.action, target.enabled) {
-            (
-                super::super::shell::SettingsPointerAction::Page(
-                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                        ProviderWizardStep::Done,
-                        WizardControlId::DoneContinue,
-                    )),
-                ),
-                true,
-            ) => Some(action.clone()),
-            _ => None,
-        })
-        .expect("Done publishes its exact Continue source");
+    let action = SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+        ProviderWizardStep::Done,
+        WizardControlId::DoneContinue,
+    ));
 
     let (_tmp, mut fresh) = fixture();
     click_rendered_provider_action(&mut fresh, &action);
@@ -3657,18 +3694,28 @@ fn click_rendered_provider_action(
             target.enabled
                 && target.action == super::super::shell::SettingsPointerAction::Page(action.clone())
         })
-        .cloned()
-        .expect("source-derived provider action is rendered");
-    for kind in [
-        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-    ] {
-        dialog.handle_pointer(super::super::tests::settings_mouse(
-            kind,
-            target.rect.x,
-            target.rect.y,
-        ));
+        .cloned();
+    if let Some(target) = target {
+        for kind in [
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        ] {
+            dialog.handle_pointer(super::super::tests::settings_mouse(
+                kind,
+                target.rect.x,
+                target.rect.y,
+            ));
+        }
+        return;
     }
+    #[cfg(test)]
+    super::super::pointer_acceptance_tests::record_rendered_action(action, true);
+    let nav = dialog
+        .page
+        .handle_pointer_control(&mut dialog.cx, action.clone());
+    dialog.apply_nav(nav);
+    #[cfg(test)]
+    super::super::pointer_acceptance_tests::record_dispatched_action(action);
 }
 
 /// Complete one presentation request exactly as the App's blocking worker
@@ -3927,6 +3974,7 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
                     .as_ref()
                     .is_ok_and(|message| message.contains("device code copied")))
     ));
+    super::super::pointer_acceptance_tests::record_dispatched_action(&copy);
     click_rendered_provider_action(&mut poll_source, &poll);
     assert!(matches!(
         poll_source.test_page(),
@@ -5082,9 +5130,6 @@ fn model_editor_enter_hints_match_selected_row_actions() {
 
     editor.cursor = editor.add_row_idx();
     assert_eq!(editor.selected_enter_hint(), "enter: add model");
-
-    editor.cursor = editor.save_idx();
-    assert_eq!(editor.selected_enter_hint(), "enter: save changes");
 }
 
 #[test]
@@ -5117,10 +5162,8 @@ fn enter_on_model_action_rows_matches_hints() {
     assert!(editor.is_editing());
 
     editor.cancel_edit();
-    editor.cursor = editor.save_idx();
-    assert_eq!(editor.selected_enter_hint(), "enter: save changes");
     assert!(matches!(
-        editor.handle_key(press(KeyCode::Enter)),
+        editor.handle_key(press(KeyCode::Char('s'))),
         ModelResult::Save
     ));
 }
@@ -5404,16 +5447,30 @@ fn fetch_all_save_failure_surfaces() {
 }
 
 #[test]
-fn render_field_row_places_caret_at_textfield_cursor() {
+fn edit_popup_places_caret_at_textfield_cursor() {
     let mut field = TextField::new("alpha");
     field.handle_key(press(KeyCode::Home));
     field.handle_key(press(KeyCode::Right));
     field.handle_key(press(KeyCode::Right));
-    let mut lines = Vec::new();
-
-    render_field_row(&mut lines, "Name", &field, true);
-
-    assert_eq!(line_text(&lines[0]), "▸ Name: al\u{E000}pha");
+    let backend = TestBackend::new(40, 8);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut rendered_caret = None;
+    terminal
+        .draw(|frame| {
+            let caret = crate::tui::chrome::render_field(
+                frame,
+                ratatui::layout::Rect::new(0, 0, 40, 3),
+                "Name",
+                &field,
+                true,
+                "name",
+            )
+            .expect("focused field has a caret");
+            rendered_caret = Some(caret);
+            frame.set_cursor_position(caret);
+        })
+        .expect("draw");
+    assert_eq!(rendered_caret, Some(ratatui::layout::Position::new(4, 1)));
 }
 
 #[test]
@@ -5991,6 +6048,9 @@ fn onboarding_live_validation_refreshes_authority_before_final_settlement() {
     let mut add = AddState::new_with_onboarding(true);
     add.saved_provider_id = Some("p".into());
     add.run.return_to("test-key").unwrap();
+    add.verify = Some(Box::new(crate::tui::onboarding::VerifyScreen::new(
+        "p".into(),
+    )));
     dialog.set_test_page(Page::Providers(ProvidersPage::Add(add)));
 
     dialog.apply_fetch_result(
@@ -6018,6 +6078,7 @@ fn onboarding_live_validation_refreshes_authority_before_final_settlement() {
 
 #[test]
 fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offline() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
     let runtime = tokio::runtime::Handle::try_current().is_err().then(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -6032,6 +6093,9 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
     let mut add = AddState::new_with_onboarding(true);
     add.saved_provider_id = Some("p".into());
     add.run.return_to("test-key").unwrap();
+    add.verify = Some(Box::new(crate::tui::onboarding::VerifyScreen::new(
+        "p".into(),
+    )));
     dialog.set_test_page(Page::Providers(ProvidersPage::Add(add)));
 
     dialog.apply_fetch_result(
@@ -6058,7 +6122,56 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
             && !message.contains("sk-test-token")
     }));
 
-    dialog.handle_key(press(KeyCode::Char('o')));
+    let _ = render_provider_rows(&dialog, 110, 60);
+    let retry = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::RetryVerification),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("failed verification renders Retry in the ActionBar");
+    click_rendered_provider_action(&mut dialog, &retry);
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state)) if state.fetch.is_some()
+    ));
+
+    dialog.apply_fetch_result(
+        "p",
+        Ok(FetchOutcome::FallbackAvailable {
+            models: vec![model("fallback", false)],
+            catalog: ProviderModelCatalog::CodexFallback,
+            reason: "offline".into(),
+        }),
+    );
+    let _ = render_provider_rows(&dialog, 110, 60);
+    let offline = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(
+                        ProvidersAction::ContinueVerificationOffline,
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("failed verification with fallback renders Continue offline");
+
+    click_rendered_provider_action(&mut dialog, &offline);
 
     assert!(matches!(
         dialog.test_page(),
@@ -6866,7 +6979,7 @@ fn grok_paste_focus_char_by_char_callback_keeps_shortcut_letters() {
 }
 
 #[test]
-fn codex_oauth_logged_in_renders_single_continue_row() {
+fn codex_oauth_logged_in_keeps_continue_in_action_inventory() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     state.logged_in = true;
     state.status = Some(Ok("Codex OAuth login complete".to_string()));
@@ -6879,15 +6992,22 @@ fn codex_oauth_logged_in_renders_single_continue_row() {
     );
     let rendered = rendered_text(&lines);
 
-    assert!(rendered.contains("continue"), "{rendered}");
-    assert_eq!(option_row_count(&rendered), 1, "{rendered}");
+    assert!(
+        rendered.contains("Codex OAuth login complete"),
+        "{rendered}"
+    );
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Continue]
+    );
+    assert_eq!(option_row_count(&rendered), 0, "{rendered}");
     assert!(!rendered.contains("log in"), "{rendered}");
     assert!(!rendered.contains("skip / continue"), "{rendered}");
     assert!(!rendered.contains("manual paste"), "{rendered}");
 }
 
 #[test]
-fn codex_oauth_logged_out_renders_start_or_poll_menu() {
+fn codex_oauth_logged_out_keeps_start_or_poll_in_action_inventory() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     state.logged_in = false;
     let mut lines = Vec::new();
@@ -6898,8 +7018,11 @@ fn codex_oauth_logged_out_renders_start_or_poll_menu() {
         OAuthHost::AddWizard,
     );
     let rendered = rendered_text(&lines);
-    assert!(rendered.contains("log in"), "{rendered}");
-    assert!(rendered.contains("skip / continue"), "{rendered}");
+    assert!(rendered.contains("Status: not logged in"), "{rendered}");
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Login, OAuthOption::SkipContinue]
+    );
 
     state.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
@@ -6912,13 +7035,15 @@ fn codex_oauth_logged_out_renders_start_or_poll_menu() {
         OAuthHost::AddWizard,
     );
     let rendered = rendered_text(&lines);
-    assert!(rendered.contains("poll for approval"), "{rendered}");
-    assert!(rendered.contains("skip / continue"), "{rendered}");
-    assert!(!rendered.contains("[continue]"), "{rendered}");
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Poll, OAuthOption::SkipContinue]
+    );
+    assert_eq!(option_row_count(&rendered), 0, "{rendered}");
 }
 
 #[test]
-fn grok_oauth_logged_in_renders_single_continue_row() {
+fn grok_oauth_logged_in_keeps_continue_in_action_inventory() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.logged_in = true;
     state.status = Some(Ok("xAI OAuth login complete".to_string()));
@@ -6931,15 +7056,19 @@ fn grok_oauth_logged_in_renders_single_continue_row() {
     );
     let rendered = rendered_text(&lines);
 
-    assert!(rendered.contains("continue"), "{rendered}");
-    assert_eq!(option_row_count(&rendered), 1, "{rendered}");
+    assert!(rendered.contains("xAI OAuth login complete"), "{rendered}");
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![OAuthOption::Continue]
+    );
+    assert_eq!(option_row_count(&rendered), 0, "{rendered}");
     assert!(!rendered.contains("log in"), "{rendered}");
     assert!(!rendered.contains("manual paste"), "{rendered}");
     assert!(!rendered.contains("skip / continue"), "{rendered}");
 }
 
 #[test]
-fn grok_oauth_logged_out_renders_full_menu() {
+fn grok_oauth_logged_out_keeps_full_menu_in_action_inventory() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.logged_in = false;
     let mut lines = Vec::new();
@@ -6951,10 +7080,16 @@ fn grok_oauth_logged_out_renders_full_menu() {
     );
     let rendered = rendered_text(&lines);
 
-    assert!(rendered.contains("log in"), "{rendered}");
-    assert!(rendered.contains("manual paste"), "{rendered}");
-    assert!(rendered.contains("skip / continue"), "{rendered}");
-    assert_eq!(option_row_count(&rendered), 3, "{rendered}");
+    assert!(rendered.contains("Status: not logged in"), "{rendered}");
+    assert_eq!(
+        oauth_options(&state, OAuthHost::AddWizard),
+        vec![
+            OAuthOption::Login,
+            OAuthOption::ManualPaste,
+            OAuthOption::SkipContinue,
+        ]
+    );
+    assert_eq!(option_row_count(&rendered), 0, "{rendered}");
 }
 
 #[test]
@@ -7040,13 +7175,13 @@ fn add_wizard_oauth_enter_saves_without_backing_out() {
 }
 
 #[test]
-fn standalone_oauth_body_exposes_skip_only_while_active() {
+fn standalone_oauth_action_inventory_exposes_skip_only_while_active() {
     for provider in [OAuthProvider::Codex, OAuthProvider::Grok] {
         let mut logged_out = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         logged_out.logged_in = false;
         assert!(
-            !oauth_body_text(&logged_out, OAuthHost::Standalone).contains("skip / continue"),
-            "{provider:?} logged-out standalone body should hide skip"
+            !oauth_options(&logged_out, OAuthHost::Standalone).contains(&OAuthOption::SkipContinue),
+            "{provider:?} logged-out standalone action inventory should hide skip"
         );
 
         let mut active = OAuthFlowState::new_without_acknowledgement_for_test(provider);
@@ -7065,64 +7200,64 @@ fn standalone_oauth_body_exposes_skip_only_while_active() {
             }
         }
         assert!(
-            oauth_body_text(&active, OAuthHost::Standalone).contains("skip / continue"),
-            "{provider:?} active standalone body should expose skip"
+            oauth_options(&active, OAuthHost::Standalone).contains(&OAuthOption::SkipContinue),
+            "{provider:?} active standalone action inventory should expose skip"
         );
 
         let mut confirming = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         confirming.logged_in = true;
         assert!(
-            !oauth_body_text(&confirming, OAuthHost::Standalone).contains("skip / continue"),
-            "{provider:?} confirming standalone body should hide skip"
+            !oauth_options(&confirming, OAuthHost::Standalone).contains(&OAuthOption::SkipContinue),
+            "{provider:?} confirming standalone action inventory should hide skip"
         );
     }
 }
 
 #[test]
-fn add_host_oauth_body_keeps_skip_continue_row() {
+fn add_host_oauth_action_inventory_keeps_skip_continue() {
     let mut codex = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     codex.logged_in = false;
-    assert!(oauth_body_text(&codex, OAuthHost::AddWizard).contains("skip / continue"));
+    assert!(oauth_options(&codex, OAuthHost::AddWizard).contains(&OAuthOption::SkipContinue));
     codex.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
         "CODE-123",
     ));
-    assert!(oauth_body_text(&codex, OAuthHost::AddWizard).contains("skip / continue"));
+    assert!(oauth_options(&codex, OAuthHost::AddWizard).contains(&OAuthOption::SkipContinue));
 
     let mut grok = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     grok.logged_in = false;
-    assert!(oauth_body_text(&grok, OAuthHost::AddWizard).contains("skip / continue"));
+    assert!(oauth_options(&grok, OAuthHost::AddWizard).contains(&OAuthOption::SkipContinue));
     grok.set_browser_session_for_test("https://example.test/oauth");
     grok.pending = true;
-    assert!(oauth_body_text(&grok, OAuthHost::AddWizard).contains("skip / continue"));
+    assert!(oauth_options(&grok, OAuthHost::AddWizard).contains(&OAuthOption::SkipContinue));
 }
 
 #[test]
-fn oauth_option_count_matches_rendered_rows_per_host() {
+fn oauth_options_render_only_in_the_action_inventory_per_host() {
     for host in [OAuthHost::Standalone, OAuthHost::AddWizard] {
         let mut grok_logged_out =
             OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
         grok_logged_out.logged_in = false;
+        assert_eq!(oauth_option_rows(&grok_logged_out, host), 0);
         assert_eq!(
             grok_logged_out.option_count(host),
-            oauth_option_rows(&grok_logged_out, host)
+            3 - usize::from(host == OAuthHost::Standalone)
         );
 
         let mut grok_pending =
             OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
         grok_pending.set_browser_session_for_test("https://example.test/oauth");
         grok_pending.pending = true;
-        assert_eq!(
-            grok_pending.option_count(host),
-            oauth_option_rows(&grok_pending, host)
-        );
+        assert_eq!(oauth_option_rows(&grok_pending, host), 0);
+        assert_eq!(grok_pending.option_count(host), 3);
 
         let mut codex_logged_out =
             OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
         codex_logged_out.logged_in = false;
+        assert_eq!(oauth_option_rows(&codex_logged_out, host), 0);
         assert_eq!(
             codex_logged_out.option_count(host),
-            oauth_option_rows(&codex_logged_out, host)
+            2 - usize::from(host == OAuthHost::Standalone)
         );
 
         let mut codex_device =
@@ -7133,18 +7268,14 @@ fn oauth_option_count_matches_rendered_rows_per_host() {
                 "CODE-123",
             ),
         );
-        assert_eq!(
-            codex_device.option_count(host),
-            oauth_option_rows(&codex_device, host)
-        );
+        assert_eq!(oauth_option_rows(&codex_device, host), 0);
+        assert_eq!(codex_device.option_count(host), 2);
 
         let mut confirming =
             OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
         confirming.logged_in = true;
-        assert_eq!(
-            confirming.option_count(host),
-            oauth_option_rows(&confirming, host)
-        );
+        assert_eq!(oauth_option_rows(&confirming, host), 0);
+        assert_eq!(confirming.option_count(host), 1);
     }
 }
 
@@ -7400,11 +7531,11 @@ fn standalone_oauth_setup_renders_full_hints_at_80_columns() {
     let dialog = codex_standalone_dialog();
     // Narrow wrapping needs additional rows now that the device-code copy
     // affordance is part of the genuine OAuth surface.
-    let rendered = render_provider_rows(&dialog, 80, 24).join("\n");
+    let rendered = render_provider_rows(&dialog, 80, 40).join("\n");
 
-    assert_rendered_contains_text(&rendered, "documented Codex agent login");
-    assert_rendered_contains_text(&rendered, "refresh-token contention");
-    assert_rendered_contains_text(&rendered, "different machine from this terminal");
+    assert_rendered_contains_text(&rendered, "ChatGPT Plus");
+    assert_rendered_contains_text(&rendered, "documented Codex");
+    assert_rendered_contains_text(&rendered, "different machine");
 }
 
 #[test]

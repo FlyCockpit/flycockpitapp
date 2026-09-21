@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Behavior ───────────────────────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│Behavior                                         █  How sessions and agents behave: │ │
+                              ▌ │                                                 █  which agent you start on, how   │ │
+ SESSIONS                       │› default agent                            build █  strongly tools are steered, when│ │
+ no active sessions in all pr   │                                           (start│  commands need approval, and how │ │
+                                │                                            on th│  plans run. The Advanced block   │ │
+                              no│                                           e codi│  holds tuning knobs most users   │ │
+                              ┊ │                                           ng age│  never need to touch.            │ │
+                              ▌ │                                           nt — m│                                  │ │
+                                │                                           ake th│  default agent                   │ █
+                                │                                           e chan│  Which agent a brand-new session │ █
+                                │                                           ge now│  starts on. `build` starts on the│ █
+                                │                                           )     │  coding agent; `plan` starts on  │ █
+                                │  background agents                        ▣ on (│  the planning agent. You can     │ █
+                                │                                           defaul│  still switch any time with      │ █
+                                │                                           t — ke│  /build or /plan.                │ █
+                                │                                           ep age│                                  │ █
+                                │                                           nts ru│                                  │ █
+                                │                                           nning │                                  │ █
+                                │                                           after │                                  │ █
+                              ▌ │                                           all wi│                                  │ █
+                              ▌ │                                           ndows │                                  │ █
+                                │                                           close)│                                  │ █
+                              ▌ │  approval mode                            manual│                                  │ █
+                                │                                            (defa│                                  │ █
+                                │                                           ult — │                                  │ █
+                                │                                           sandbo│                                  │ █
+                                │                                           xed by│                                  │ █
+                                │                                            defau│                                  │ █
+                                │                                           lt; yo│                                  │ █
+                               ⋯│                                           u appr│                                  │ █
+                                │                                           ove an│                                  │ █
+                                │                                           ything│                                  │ █
+                                │                                            that │                                  │ █
+                              ▌ │                                           needs │                                  │ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: edit / cycle / dri [ reset behavior settings to defaults ]│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

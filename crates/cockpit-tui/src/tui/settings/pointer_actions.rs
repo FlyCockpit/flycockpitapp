@@ -316,6 +316,7 @@ pub(super) enum WizardControlId {
     ContinueHeaders,
     CopilotContinue,
     DoneContinue,
+    Continue,
     EditText,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -407,6 +408,7 @@ pub(crate) enum SettingsPointerAction {
     Mcp(McpAction),
     Providers(ProvidersAction),
     Lsp(LspAction),
+    ImageSpend(ImageSpendAction),
     List(ListAction),
     UtilityModel(UtilityModelAction),
     DefaultModel(DefaultModelAction),
@@ -566,6 +568,8 @@ pub(super) enum ProvidersAction {
     Delete(ProviderId, ProviderDeleteChoice),
     SaveProvider(ProviderId),
     LocalBack,
+    RetryVerification,
+    ContinueVerificationOffline,
     AddModel(ProviderId),
     RenameModel(ProviderId, ModelId),
     DeleteModel(ProviderId, ModelId),
@@ -581,6 +585,7 @@ pub(super) enum ProvidersAction {
     RowEditor(ProviderRowEditorAction),
     ModelLifecycle(ModelLifecycleAction),
     CopyOAuth(OAuthFlowId, OAuthCopyKind),
+    EditOAuthCallback(OAuthFlowId),
     CopilotConfirm(ProviderId, ConfirmationChoice),
 }
 
@@ -609,6 +614,16 @@ pub(super) enum LspAction {
     Install(LspServerId),
     Uninstall(LspServerId),
     Restart(LspServerId),
+}
+
+/// Image-spend's field target is deliberately distinct from its footer
+/// controls: a click in the field parks its caret, while Save and Cancel must
+/// still reach the page while that field is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ImageSpendAction {
+    EditField,
+    Save,
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -783,11 +798,22 @@ impl SettingsPointerAction {
                 ProvidersAction::Open(_)
                     | ProvidersAction::EditField(_, _)
                     | ProvidersAction::OAuthOption(_, _)
-                    | ProvidersAction::WizardControl(_, _)
+                    | ProvidersAction::EditOAuthCallback(_)
+                    | ProvidersAction::WizardControl(
+                        _,
+                        WizardControlId::Template(_)
+                            | WizardControlId::WireApi(_)
+                            | WizardControlId::AuthMethod(_)
+                            | WizardControlId::OAuth(_)
+                            | WizardControlId::Header(_)
+                            | WizardControlId::AddHeader
+                            | WizardControlId::EditText,
+                    )
                     | ProvidersAction::FetchAllConfirm(_)
                     | ProvidersAction::FetchOneConfirm(_, _)
                     | ProvidersAction::FetchFallbackConfirm(_, _)
                     | ProvidersAction::DeepFetchChoice(_, _)
+                    | ProvidersAction::ModelLifecycle(_)
                     | ProvidersAction::RowEditor(
                         ProviderRowEditorAction::HeaderOpen(_)
                             | ProviderRowEditorAction::ModelOpen(_)
@@ -801,6 +827,7 @@ impl SettingsPointerAction {
                     | LspAction::ToggleDiagnostics
                     | LspAction::Edit(_)
             ),
+            Self::ImageSpend(action) => matches!(action, ImageSpendAction::EditField),
             Self::List(action) => matches!(action, ListAction::Edit(_)),
             Self::UtilityModel(action) => matches!(action, UtilityModelAction::Select(_)),
             Self::DefaultModel(_) => false,
@@ -857,6 +884,8 @@ impl SettingsPointerAction {
             Self::Lsp(LspAction::SaveEdit(_)) => "Save",
             Self::Lsp(LspAction::CancelEdit(_)) => "Cancel",
             Self::Lsp(LspAction::Reset) => "reset to defaults",
+            Self::ImageSpend(ImageSpendAction::Save) => "Save",
+            Self::ImageSpend(ImageSpendAction::Cancel) => "Cancel",
             Self::List(ListAction::Add) => "Add",
             Self::List(ListAction::Save) => "Save",
             Self::List(ListAction::Cancel) => "Cancel",

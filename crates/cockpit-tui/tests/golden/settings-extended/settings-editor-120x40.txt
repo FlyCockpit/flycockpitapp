@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Providers & Provider Models › fi╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│Settings: fixture                                                                   │ │
+                              ▌ │                                                                                    │ │
+ SESSIONS                       │› Allow insecure HTTP            off                                                │ │
+ no active sessions in all pr   │  Trust policy                   untrusted (default)                                │ │
+                                │  Locality                       unset                                              │ │
+                              no│  Quality rank                   0 (default)                                        │ │
+                              ┊ │  Cost rank                      0 (default)                                        │ │
+                              ▌ │  Subagent available             off (default)                                      │ │
+                                │  Auto-compact ctx %             auto                                               │ █
+                                │  Compact-nudge ctx %            60%                                                │ █
+                                │  Compaction shadow brief        on                                                 │ █
+                                │  Shadow margin %                10%                                                │ █
+                                │  Auto-prune                     on (default)                                       │ █
+                                │  Auto-prune ctx %               50%                                                │ █
+                                │  Auto-prune prunable %          30%                                                │ █
+                                │  Cache time (seconds)           300s                                               │ █
+                                │  Cache mode                     none                                               │ █
+                                │  Shrink strategy                prune                                              │ █
+                                │  First-token threshold (s)      120s                                               │ █
+                              ▌ │  Idle threshold (s)             90s                                                │ █
+                              ▌ │  Wire API                       auto                                               │ █
+                                │  Backup model (provider:model)  none                                               │ █
+                              ▌ │  Default thinking mode          inherit                                            │ █
+                                │  Extract inline <think> tags    inherit default                                    │ █
+                                │  Hint tool-call corrections     inherit                                            │ █
+                                │                                                                                    │ █
+                                │auto uses provider defaults and learned endpoint; completions POSTs /chat/completio │ █
+                                │Without a backup model, exceeding thresholds shows a slow-stream warning and keeps  │ █
+                                │enter: edit/cycle   h: back                                                         │ █
+                               ⋯│                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                                │                                                                                    │ █
+                              ▌ │                                                                                    │ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: edit/cycle  h: back  q: close             [ save changes ]│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

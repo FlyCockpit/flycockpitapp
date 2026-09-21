@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Agents ─────────────────────────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│Agents                                                                             █│ │
+                              ▌ │                                                                                   █│ │
+ SESSIONS                       │Enter opens a structured tool editor; e edits a daemon snapshot. Workspace agents c█│ │
+ no active sessions in all pr   │an use $EDITOR through a private, securely seeded leased staging file; its edited b█│ │
+                                │ytes are committed by the daemon. Assistants use the in-TUI editor. Editing a built█│ │
+                              no│-in ejects its default first. The model is the `model:` frontmatter field (provider█│ │
+                              ┊ │/model). Delete uses the source-specific daemon authority; reset reverts an overrid█│ │
+                              ▌ │den built-in.                                                                      █│ │
+                                │                                                                                   █│ █
+                                │› Assistant (built-in)  model: session default                                     █│ █
+                                │    General-purpose personal assistant; file-capable and knowledge-aware, delegates█│ █
+                                │[Open]                                                                             █│ █
+                                │[Edit raw file]                                                                    █│ █
+                                │  Build (built-in)  model: session default                                         █│ █
+                                │    Primary coding agent; write-capable but delegate-eager, hands feature work to `█│ █
+                                │  Careful (built-in)  model: session default                                       █│ █
+                                │    Conservative coding primary; small direct tool surface, uses `mcp` for broader █│ █
+                                │  builder (built-in)  model: session default                                       █│ █
+                                │    Write-capable worker; holds locks and applies edits, does its scope itself.    █│ █
+                              ▌ │  explore (built-in)  model: session default                                       █│ █
+                              ▌ │    Read-only investigator; finds where things live and reports back.              █│ █
+                                │  history (built-in)  model: session default                                       █│ █
+                              ▌ │    Read-only recall worker; searches prior sessions and compaction lineage, then r█│ █
+                                │  knowledge (built-in)  model: session default                                     █│ █
+                                │    Read-only knowledge retrieval specialist; composes cited KB search primitives a█│ █
+                                │  deepthink (built-in)  model: session default                                     █│ █
+                                │    Optional tool-free reasoning worker; analyzes a brief and returns structured fi█│ █
+                                │  scout (built-in)  model: session default                                         █│ █
+                                │    Read-only recursive review worker; reviews a scoped surface and may spawn deepe█│ █
+                               ⋯│  Plan (built-in)  model: session default                                          █│ █
+                                │    Planning agent; maintains a virtual plan document and hands it to Build.       █│ █
+                                │  bee (built-in)  model: session default                                           █│ █
+                                │    Noninteractive parallel worker; write-capable, does its briefed slice and may f█│ █
+                              ▌ │  Multireview (built-in)  model: session default                                   ││ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓  enter: tools  e: raw edit  R: reset all  esc/h │ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

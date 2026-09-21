@@ -12,7 +12,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use ratatui::widgets::{Block, Padding, Paragraph};
 
 use super::{chrome, theme, ui};
 use crate::tui::textfield::TextField;
@@ -1557,7 +1557,7 @@ impl AgentAuthoringScreen {
 
     fn render_subagent_identity(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(theme::NIGHT))
             .title(Span::styled(" Subagent ", Style::new().fg(theme::INK)))
             .padding(Padding::horizontal(1));
@@ -1676,7 +1676,7 @@ impl AgentAuthoringScreen {
         rows: Vec<(Option<usize>, Line<'static>)>,
     ) {
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(if matches!(self.phase, Phase::Review) {
                 theme::GOOD
             } else {
@@ -1743,7 +1743,7 @@ impl AgentAuthoringScreen {
 
     fn render_tool_model_picker(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(theme::BRASS))
             .title(Span::styled(" Models ", Style::new().fg(theme::BRASS)));
         let inner = block.inner(area);

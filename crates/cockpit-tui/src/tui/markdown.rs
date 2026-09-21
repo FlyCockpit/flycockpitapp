@@ -194,12 +194,12 @@ pub(crate) fn render_call_count() -> usize {
     RENDER_CALLS.with(std::cell::Cell::get)
 }
 
-const CODE_FG: Color = Color::Indexed(229); // soft yellow
-const CODE_BG: Color = Color::Indexed(236); // near-black grey
-const HEADING_FG: Color = Color::Indexed(81); // light cyan
-const QUOTE_FG: Color = Color::Indexed(244); // mid grey
-const LINK_FG: Color = Color::Indexed(75); // sky blue
-const MATH_FG: Color = Color::Indexed(151); // soft green
+const CODE_FG: Color = crate::tui::theme::indexed_color(229); // soft yellow
+const CODE_BG: Color = crate::tui::theme::indexed_color(236); // near-black grey
+const HEADING_FG: Color = crate::tui::theme::indexed_color(81); // light cyan
+const QUOTE_FG: Color = crate::tui::theme::indexed_color(244); // mid grey
+const LINK_FG: Color = crate::tui::theme::indexed_color(75); // sky blue
+const MATH_FG: Color = crate::tui::theme::indexed_color(151); // soft green
 pub(crate) const TAB_STOP: usize = 4;
 
 fn expand_tabs(text: &str, start_col: usize) -> String {

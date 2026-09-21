@@ -15,12 +15,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::textfield::TextField;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 use cockpit_config::providers::ProvidersConfig;
 
 use super::grab;
@@ -579,11 +579,15 @@ impl SettingsCx {
         picker: &UtilityModelSelector,
         target: super::category::SettingId,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+        let yellow = Style::default().fg(resolve_color(
+            crate::tui::theme::BRASS,
+            crate::tui::theme::BRASS_INDEX,
+        ));
         let pointer_enabled = self.pointer_surface.enabled.get();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
+        let mut custom_field_line = None;
 
         lines.push(Line::from(Span::styled(
             "Utility model — picks the cheap background model".to_string(),
@@ -597,17 +601,9 @@ impl SettingsCx {
                     "custom provider:model-id".to_string(),
                     muted,
                 )));
-                let (before, after) = buf.split_at_cursor();
-                bindings.push((
-                    lines.len(),
-                    SettingsPointerAction::UtilityModel(UtilityModelAction::EditCustom),
-                ));
-                lines.push(Line::from(vec![
-                    Span::styled("› ".to_string(), muted),
-                    Span::styled(before.to_string(), Style::default().fg(Color::White)),
-                    super::shell::cursor_marker_span(),
-                    Span::styled(after.to_string(), Style::default().fg(Color::White)),
-                ]));
+                let line = lines.len();
+                lines.extend([Line::default(), Line::default(), Line::default()]);
+                custom_field_line = Some((line, buf));
                 lines.push(Line::default());
                 if picker.entries.is_empty() {
                     lines.push(Line::from(Span::styled(
@@ -617,30 +613,6 @@ impl SettingsCx {
                         muted,
                     )));
                 }
-                bindings.push((
-                    lines.len(),
-                    SettingsPointerAction::UtilityModel(UtilityModelAction::CommitCustom),
-                ));
-                lines.push(Line::from(Span::styled(
-                    if pointer_enabled {
-                        "[Save custom]"
-                    } else {
-                        "Save custom"
-                    },
-                    muted,
-                )));
-                bindings.push((
-                    lines.len(),
-                    SettingsPointerAction::UtilityModel(UtilityModelAction::CancelCustom),
-                ));
-                lines.push(Line::from(Span::styled(
-                    if pointer_enabled {
-                        "[Cancel]"
-                    } else {
-                        "Cancel"
-                    },
-                    muted,
-                )));
             }
             PickerMode::List { cursor, scroll } => {
                 let cur_label = |value: &str| -> &'static str {
@@ -669,7 +641,7 @@ impl SettingsCx {
                     SettingsPointerAction::UtilityModel(UtilityModelAction::Clear),
                 ));
                 lines.push(Line::from(vec![
-                    Span::raw(if clear_active { "▸ " } else { "  " }),
+                    Span::raw(if clear_active { "› " } else { "  " }),
                     Span::styled(
                         if pointer_enabled {
                             format!("[clear — unset]{clear_suffix}")
@@ -684,7 +656,7 @@ impl SettingsCx {
                     SettingsPointerAction::UtilityModel(UtilityModelAction::OpenCustom),
                 ));
                 lines.push(Line::from(vec![
-                    Span::raw(if custom_active { "▸ " } else { "  " }),
+                    Span::raw(if custom_active { "› " } else { "  " }),
                     Span::styled(
                         if pointer_enabled {
                             "[custom provider:model-id…]"
@@ -712,11 +684,14 @@ impl SettingsCx {
                         last_provider = Some(e.provider_id.as_str());
                     }
                     let active = *cursor == i + PICKER_ACTION_ROWS;
-                    let marker = if active { "▸ " } else { "  " };
+                    let marker = if active { "› " } else { "  " };
                     let label_style = if active {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(resolve_color(
+                            crate::tui::theme::INK,
+                            crate::tui::theme::INK_INDEX,
+                        ))
                     };
                     let value = e.value();
                     let mut spans = vec![
@@ -784,6 +759,38 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, buf)) = custom_field_line {
+            let offset = self.scroll_states.offset_for("category:utility-picker");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    "provider:model-id",
+                    buf,
+                    true,
+                    "",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            SettingsPointerAction::UtilityModel(UtilityModelAction::EditCustom),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 }
 
@@ -805,8 +812,11 @@ fn render_grab_list(
     status: Option<&str>,
     delete: &RowDeleteConfirm,
 ) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
+    let yellow = Style::default().fg(resolve_color(
+        crate::tui::theme::BRASS,
+        crate::tui::theme::BRASS_INDEX,
+    ));
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled(
             title.to_string(),
@@ -816,7 +826,12 @@ fn render_grab_list(
     ];
     let mut controls = vec![None; lines.len()];
     let mut confirmation_lines = Vec::new();
-    push_wrapped_text(&mut lines, area.width, intro, muted);
+    push_wrapped_text(
+        &mut lines,
+        crate::tui::chrome::scrollbar_content(area).width,
+        intro,
+        muted,
+    );
     controls.resize(lines.len(), None);
     lines.push(Line::default());
     controls.push(None);
@@ -846,7 +861,10 @@ fn render_grab_list(
         let style = if on_cursor {
             yellow.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(resolve_color(
+                crate::tui::theme::INK,
+                crate::tui::theme::INK_INDEX,
+            ))
         };
         lines.push(Line::from(vec![
             Span::raw(marker),
@@ -919,8 +937,6 @@ fn render_grab_list(
                 can_down,
                 "already last",
             ),
-            (ListAction::Save, "[Save]", true, ""),
-            (ListAction::Cancel, "[Cancel]", true, ""),
         ] {
             lines.push(Line::from(label));
             controls.push(Some((
@@ -1093,6 +1109,29 @@ impl SettingsPage for InstructionsPage {
                 .min(cx.extended.agent_guidance_files.len());
         }
         Nav::Stay
+    }
+
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+        use super::pointer_actions::{ListAction, SettingsPointerAction};
+        let actions = if self.grabbed.is_some() {
+            vec![
+                super::shell::SettingsHelpAction {
+                    label: "Save",
+                    enabled: true,
+                    primary: true,
+                    action: SettingsPointerAction::List(ListAction::Save),
+                },
+                super::shell::SettingsHelpAction {
+                    label: "Cancel",
+                    enabled: true,
+                    primary: false,
+                    action: SettingsPointerAction::List(ListAction::Cancel),
+                },
+            ]
+        } else {
+            Vec::new()
+        };
+        super::shell::finish_help_row(cx, actions)
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

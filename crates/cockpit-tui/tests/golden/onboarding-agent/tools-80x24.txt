@@ -1,0 +1,24 @@
+╭ Tools  ·  15 of 53 enabled ──────────────────────────────────────────────────╮
+│ Required                                                                   █ │
+│ ▣ read  —  required                                                        █ │
+│ ▣ shell  —  required                                                       █ │
+│ ▣ write  —  required                                                       █ │
+│ Suggested                                                                  █ │
+│ ▢ context_pack  —  disabled                                                █ │
+│ ▢ code  —  disabled                                                        █ │
+│ ▢ graph  —  disabled                                                       █ │
+│ ▢ search  —  disabled                                                      █ │
+│ ▢ change_impact  —  disabled                                               │ │
+│ ▣ task  —  enabled                                                         │ │
+│ ▢ skill  —  disabled                                                       │ │
+│ ▢ skill_manage  —  disabled                                                │ │
+│ ▣ question  —  enabled                                                     │ │
+│ ▣ raise  —  enabled                                                        │ │
+│ ▣ schedule  —  enabled                                                     │ │
+│ ▣ spawn  —  enabled                                                        │ │
+│ ▢ worktree_orchestrate  —  disabled                                        │ │
+│ ▣ mcp  —  enabled                                                          │ │
+│ ▢ webfetch  —  disabled                                                    │ │
+│ ▢ websearch  —  disabled                                                   │ │
+│ ▢ lsp  —  disabled                                                         │ │
+╰──────────────────────────────────────────────────────────────────────────────╯

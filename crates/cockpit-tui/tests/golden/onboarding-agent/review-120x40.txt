@@ -1,0 +1,40 @@
+╭ Summary ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Agent  navigator                                                                                                     │
+│ ★ vendor/exact-a · untrusted                                                                                         │
+│ Tools  1                                                                                                             │
+│ Verification  Self-verification (1 rules)                                                                            │
+│ Goal skeptics  2 goal skeptics                                                                                       │
+│ Interactive subagents  on                                                                                            │
+│ Make default  yes                                                                                                    │
+│ Trust classification is shared global provider/model policy.                                                         │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

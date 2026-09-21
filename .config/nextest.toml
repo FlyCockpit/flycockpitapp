@@ -37,6 +37,11 @@ slow-timeout = { period = "90s", terminate-after = 4 }
 filter = "test(=daemon::server::tests::dispatch_matrix_readonly_cases_traverse_socket_path)"
 slow-timeout = { period = "90s", terminate-after = 4 }
 
+# Mouse-only agent authoring PTY walk includes several 120s async RPC waits.
+[[profile.default.overrides]]
+filter = "test(=tui_pty_agent_authoring_mouse::tui_pty_mouse_agent_authoring_keeps_runner_subagent)"
+slow-timeout = { period = "120s", terminate-after = 6 }
+
 # Detached IsolatedHome boot applies 0001 + vault before accept; the
 # handshake wait is driven by the daemon's pid liveness and socket hello, not
 # a wall-clock budget, so a slow (fsync-bound) boot on a loaded machine is

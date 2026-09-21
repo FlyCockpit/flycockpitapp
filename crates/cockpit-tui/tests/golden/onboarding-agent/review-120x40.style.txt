@@ -1,0 +1,42 @@
+# style runs: count:fg/bg/mod  (mod is - or BOLD+DIM+…)
+120x40
+0	120:Rgb(127,201,138)/Reset/-
+1	1:Rgb(127,201,138)/Reset/- 1:Reset/Reset/- 16:Rgb(127,201,138)/Reset/BOLD 101:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+2	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+3	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+4	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+5	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+6	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+7	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+8	1:Rgb(127,201,138)/Reset/- 1:Reset/Reset/- 60:Rgb(138,155,176)/Reset/- 57:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+9	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+10	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+11	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+12	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+13	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+14	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+15	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+16	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+17	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+18	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+19	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+20	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+21	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+22	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+23	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+24	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+25	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+26	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+27	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+28	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+29	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+30	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+31	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+32	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+33	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+34	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+35	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+36	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+37	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+38	1:Rgb(127,201,138)/Reset/- 118:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+39	120:Rgb(127,201,138)/Reset/-

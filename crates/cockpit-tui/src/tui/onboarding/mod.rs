@@ -702,6 +702,18 @@ impl OnboardingShell {
         self.escape = None;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn configure_agent_authoring_for_golden(
+        &mut self,
+        phase: agent::Phase,
+        review: Option<cockpit_proto::AuthoredAgentReview>,
+        status: Option<String>,
+    ) {
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            screen.configure_for_golden(phase, review, status);
+        }
+    }
+
     pub(crate) fn present_model(
         &mut self,
         config: &cockpit_config::config::providers::ProvidersConfig,
@@ -1223,6 +1235,11 @@ impl OnboardingShell {
         {
             return None;
         }
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen
+            && screen.back()
+        {
+            return None;
+        }
         if matches!(
             self.screen,
             OnboardingScreen::Authenticate(_) | OnboardingScreen::Verify(_)
@@ -1403,7 +1420,9 @@ impl OnboardingShell {
             }
             OnboardingScreen::AgentAuthoring(screen) => {
                 if matches!(key.code, KeyCode::Esc) {
-                    self.open_escape_menu(engine);
+                    if !screen.back() {
+                        self.open_escape_menu(engine);
+                    }
                     return None;
                 }
                 screen
@@ -1648,6 +1667,17 @@ impl OnboardingShell {
             }
             (OnboardingScreen::Complete { .. }, Some(1)) => {
                 PointerOutcome::acted(OnboardingShellAction::Close)
+            }
+            (OnboardingScreen::AgentAuthoring(_), Some(index)) => {
+                let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen else {
+                    unreachable!()
+                };
+                match screen.action_bar_click(index) {
+                    Some(action) => {
+                        PointerOutcome::acted(OnboardingShellAction::AgentAuthoring(action))
+                    }
+                    None => PointerOutcome::consumed(),
+                }
             }
             _ => match self.activate_primary(engine) {
                 Some(action) => PointerOutcome::acted(action),
@@ -1900,6 +1930,7 @@ impl OnboardingShell {
                 verify::VerifyPhase::Error(_) => BAD,
                 verify::VerifyPhase::Fetching => INK,
             },
+            OnboardingScreen::AgentAuthoring(screen) if screen.header_is_failure() => BAD,
             _ => INK,
         };
         ui::render_header_colored(frame, rows[0], &title, &subtitle, title_color);
@@ -1964,7 +1995,7 @@ impl OnboardingShell {
             OnboardingScreen::Authenticate(screen) => screen.title(),
             OnboardingScreen::Verify(screen) => screen.title(),
             OnboardingScreen::Complete { .. } => "You're ready to fly",
-            OnboardingScreen::AgentAuthoring(_) => "Create your agent",
+            OnboardingScreen::AgentAuthoring(screen) => screen.phase_title(),
             OnboardingScreen::Lifetime(_) => "Background agents",
             OnboardingScreen::Model(screen) => screen.title(),
             OnboardingScreen::EmbeddedSettings => "Cockpit setup",
@@ -1985,6 +2016,7 @@ impl OnboardingShell {
                 "Choose what happens after the last Cockpit window closes.".to_string()
             }
             OnboardingScreen::Model(screen) => screen.subtitle().to_string(),
+            OnboardingScreen::AgentAuthoring(screen) => screen.phase_subtitle(),
             OnboardingScreen::Complete { .. } => "Your setup is complete.".to_string(),
             _ => String::new(),
         };
@@ -2046,7 +2078,7 @@ impl OnboardingShell {
             }
             OnboardingScreen::Authenticate(screen) => screen.buttons(),
             OnboardingScreen::Verify(screen) => screen.buttons(),
-            OnboardingScreen::AgentAuthoring(_) => vec![chrome::Button::primary("Continue")],
+            OnboardingScreen::AgentAuthoring(screen) => screen.buttons(),
             OnboardingScreen::Lifetime(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::Model(_) => vec![chrome::Button::primary("Continue")],
             OnboardingScreen::EmbeddedSettings => vec![chrome::Button::primary("Continue")],

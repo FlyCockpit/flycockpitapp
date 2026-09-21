@@ -6456,6 +6456,21 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup provider-config journal recovery failed")?;
+    // The onboarding stage fence is durable while the config-generation
+    // counter is process-local. A replacement worker must begin beyond the
+    // recorded checkpoint before it publishes its socket; otherwise the next
+    // durable configuration mutation can reuse the stage's authority.
+    if let Some((_, stage_generation)) = ctx
+        .db
+        .onboarding_stage_fence()
+        .await
+        .context("loading onboarding config-generation fence during recovery")?
+    {
+        let post_fence_generation = stage_generation
+            .checked_add(1)
+            .context("onboarding config-generation fence overflow")?;
+        inventory::publish_committed_config_generation_at_least(post_fence_generation);
+    }
     dispatch::recover_all_mcp_config_journals(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))

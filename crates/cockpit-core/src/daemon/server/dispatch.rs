@@ -263,15 +263,6 @@ async fn validate_onboarding_stage_settlement(
     let (stage_entered_at_unix_ms, stage_entry_config_generation) =
         onboarding_stage_fence(ctx).await?;
     let operation_id = settlement.settlement_operation_id.clone();
-    validate_settlement_operation_fence(
-        ctx,
-        owner,
-        &operation_id,
-        stage_entered_at_unix_ms,
-        stage_entry_config_generation,
-        settlement.config_generation,
-    )
-    .await?;
     match stage {
         proto::OnboardingStage::Provider => {
             let provider_id = settlement
@@ -389,7 +380,8 @@ async fn validate_onboarding_stage_settlement(
                 ) if receipt.client_operation_id == operation_id
                     && receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Committed
                     && receipt.default_selected
-                    && receipt.installation_id.is_some() =>
+                    && receipt.installation_id.is_some()
+                    && receipt.result_config_generation == settlement.config_generation =>
                 {
                     Ok(())
                 }
@@ -401,7 +393,22 @@ async fn validate_onboarding_stage_settlement(
         _ => Err(bad_request(
             "onboarding settlement correlation is only valid for provider, model, or agent advance",
         )),
-    }
+    }?;
+    // The terminal receipt is durable, but config generation is process-local.
+    // A worker can restart after the mutation commits and before this separate
+    // transition reaches the authority. Only after the stage-specific receipt
+    // has proved the exact generation may recovery restore that authority;
+    // a later, different config publication still fails the equality fence.
+    inventory::publish_committed_config_generation_at_least(settlement.config_generation);
+    validate_settlement_operation_fence(
+        ctx,
+        owner,
+        &operation_id,
+        stage_entered_at_unix_ms,
+        stage_entry_config_generation,
+        settlement.config_generation,
+    )
+    .await
 }
 
 /// Recover the catalog `(provider_id, model_id)` whose identity digests match

@@ -1455,6 +1455,7 @@ impl App {
                         }
                     }
                     Err(error) if !self.exit_requested && pending_request_id.is_some() => {
+                        tracing::warn!(label, %error, "onboarding transition request failed");
                         self.startup_background.retry = Some(StartupRetry::Onboarding);
                         if self.mark_startup_trace_milestone("onboarding-error") {
                             tracing::warn!(target: cockpit_core::startup::TARGET, event = "onboarding-error", "startup");

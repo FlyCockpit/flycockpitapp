@@ -196,10 +196,16 @@ fn configure_custom_provider(
     wait_for_daemon_roll_to_stability(session, generation);
     activate(session, input, "[ Done ]");
     session
-        .wait_until_screen("native model screen", Duration::from_secs(15), |screen| {
+        .wait_until_screen("native model screen", ASYNC_STAGE_TIMEOUT, |screen| {
             screen.contains("Choose your default model")
+                || screen.contains("Onboarding transition unavailable:")
         })
         .unwrap_or_else(|error| panic!("{error}"));
+    let screen = session.snapshot().contents();
+    assert!(
+        screen.contains("Choose your default model"),
+        "Provider Done must settle into native Model without a transition error:\n{screen}"
+    );
 }
 
 fn complete_model(session: &mut HermeticCockpit, input: WalkthroughInput) {

@@ -59,6 +59,10 @@ pub(crate) struct WorkerHandoverRequest {
 
 static WORKER_HANDOVER: OnceLock<std::sync::Mutex<Option<WorkerHandoverRequest>>> = OnceLock::new();
 static WORKER_HANDOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
+// The predecessor closes admission before it redirects clients.  Its accept
+// loop waits for this edge before closing the established streams, so every
+// attached client gets one bounded opportunity to receive `Reconnect`.
+static WORKER_HANDOVER_RECONNECT_DISPATCHED: AtomicBool = AtomicBool::new(false);
 // The predecessor must not redirect clients until the supervisor has a
 // health-checked successor.  A signal is used here because this is strictly
 // worker-local control; the public/admin protocol remains supervisor-owned.
@@ -72,17 +76,44 @@ pub(crate) fn begin_worker_handover(generation: u64) -> Result<()> {
         bail!("worker handover is already in progress");
     }
     WORKER_HANDOVER_DECISION.store(0, Ordering::Release);
+    WORKER_HANDOVER_RECONNECT_DISPATCHED.store(false, Ordering::Release);
     let slot = WORKER_HANDOVER.get_or_init(|| std::sync::Mutex::new(None));
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
         Some(WorkerHandoverRequest { generation, timers });
     Ok(())
 }
 
-/// The accept loop keeps established streams alive during a handover so the
-/// predecessor can send its final `Reconnect` frame.  New admission is still
-/// closed by the ordinary shutdown gate.
+/// Whether this worker is draining a committed-or-pending handover.
 pub(crate) fn worker_handover_active() -> bool {
     WORKER_HANDOVER_ACTIVE.load(Ordering::Acquire)
+}
+
+pub(crate) fn worker_handover_aborted() -> bool {
+    WORKER_HANDOVER_DECISION.load(Ordering::Acquire) == 2
+}
+
+pub(crate) fn worker_handover_reconnect_dispatched() {
+    WORKER_HANDOVER_RECONNECT_DISPATCHED.store(true, Ordering::Release);
+    WORKER_HANDOVER_DECISION_NOTIFY
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_waiters();
+}
+
+/// Wait until a draining predecessor has either dispatched `Reconnect` or
+/// been aborted.  The accept loop uses this to close established streams only
+/// after the redirect has had its bounded flush interval.
+pub(crate) async fn wait_for_worker_handover_reconnect_dispatch() -> bool {
+    let notify = WORKER_HANDOVER_DECISION_NOTIFY.get_or_init(tokio::sync::Notify::new);
+    loop {
+        let notified = notify.notified();
+        if WORKER_HANDOVER_RECONNECT_DISPATCHED.load(Ordering::Acquire) {
+            return true;
+        }
+        if !worker_handover_active() {
+            return false;
+        }
+        notified.await;
+    }
 }
 
 pub(crate) fn abort_worker_handover() {
@@ -108,11 +139,26 @@ pub(crate) fn commit_worker_handover() {
 pub(crate) async fn wait_for_worker_handover_decision() -> Result<()> {
     let notify = WORKER_HANDOVER_DECISION_NOTIFY.get_or_init(tokio::sync::Notify::new);
     loop {
+        let notified = notify.notified();
         match WORKER_HANDOVER_DECISION.load(Ordering::Acquire) {
             1 => return Ok(()),
             2 => bail!("worker handover was aborted before commit"),
-            _ => notify.notified().await,
+            _ => notified.await,
         }
+    }
+}
+
+/// Cooperatively cancel preparation when the supervisor aborts a staged roll.
+/// A pending or committed decision is not an abort: preparation still owns the
+/// boundary until it has announced it.
+pub(crate) async fn wait_for_worker_handover_abort() -> Result<()> {
+    let notify = WORKER_HANDOVER_DECISION_NOTIFY.get_or_init(tokio::sync::Notify::new);
+    loop {
+        let notified = notify.notified();
+        if worker_handover_aborted() {
+            bail!("worker handover was aborted before boundary completion");
+        }
+        notified.await;
     }
 }
 
@@ -402,8 +448,7 @@ pub(crate) fn take_worker_listeners(paths: &DaemonPaths) -> Result<Option<Worker
     }
 }
 
-/// Signal the supervisor only after boot/recovery and listener construction
-/// have reached the same publication barrier as an ordinary daemon.
+/// Report the successor's boot barrier to the supervisor.
 pub(crate) fn report_worker_ready() -> Result<()> {
     if !is_worker_process() {
         return Ok(());
@@ -433,14 +478,22 @@ pub(crate) fn report_worker_ready() -> Result<()> {
     Ok(())
 }
 
-/// A rolling successor reports readiness after recovery but before it starts
-/// accepting from the inherited listener.  The supervisor releases it only
-/// after the predecessor has exited, so one durable session never has workers
-/// in two processes at once.
+pub(crate) fn worker_handover_standby() -> bool {
+    #[cfg(unix)]
+    {
+        return std::env::var_os(HANDOVER_STANDBY_ENV).is_some();
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+/// A rolling successor reports its non-recovery boot barrier and then waits
+/// before it touches durable recovery or starts accepting from the inherited
+/// listener. The supervisor releases it only after the predecessor has exited.
 pub(crate) fn wait_for_worker_promotion() -> Result<()> {
     #[cfg(unix)]
     {
-        if std::env::var_os(HANDOVER_STANDBY_ENV).is_none() {
+        if !worker_handover_standby() {
             return Ok(());
         }
         use std::io::Read as _;
@@ -871,9 +924,56 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                         }
                         if let Err(error) = promote_ready_worker(&mut successor) {
                             let reason = format!("releasing ready successor: {error:#}");
+                            let recovery_binary = successor.binary.clone();
                             let _ = terminate_worker(&mut successor, false);
                             reap_worker_after_exit(successor);
-                            return Err(anyhow::anyhow!(reason));
+                            // The predecessor has already exited, so failing
+                            // the one-byte release must not take the stable
+                            // supervisor (and its listener) down with it.
+                            // Recover through the ordinary readiness/restart
+                            // budget, now that the successor is the sole
+                            // durable owner.
+                            generation = next_generation;
+                            let Some(replacement) = retry_worker_spawn(
+                                &mut storm,
+                                &mut generation,
+                                |attempt_generation| spawn_ready_worker(WorkerSpawnRequest {
+                                    endpoints: &endpoint_owner,
+                                    binary: &recovery_binary,
+                                    paths: &paths,
+                                    log: &log,
+                                    log_path: &log_path,
+                                    generation: attempt_generation,
+                                    opened_at_unix_ms,
+                                    no_sandbox,
+                                    resume_all_sessions,
+                                    hold_for_promotion: false,
+                                }),
+                            )
+                            .await
+                            else {
+                                bail!("{reason}; recovery worker readiness budget exhausted");
+                            };
+                            worker = replacement;
+                            publish_generation(
+                                &paths,
+                                &receipt,
+                                worker.pid,
+                                generation,
+                                opened_at_unix_ms,
+                            )?;
+                            last_handover = Some(format!(
+                                "completed after successor release recovery: generation {generation}; {} session boundaries",
+                                boundary.len()
+                            ));
+                            write_admin(&mut stream, &AdminResponse::Rolled {
+                                version: ADMIN_PROTOCOL_VERSION,
+                                old_worker_pid: old_pid,
+                                worker_pid: worker.pid,
+                                generation,
+                                uptime_ms: now_unix_ms().saturating_sub(opened_at_unix_ms),
+                            }).await?;
+                            continue;
                         }
                         publish_generation(
                             &paths, &receipt, successor.pid, next_generation, opened_at_unix_ms,
@@ -1727,11 +1827,7 @@ fn terminate_worker(worker: &mut Worker, reconnect: bool) -> Result<()> {
 
 #[cfg(unix)]
 fn signal_worker_handover_decision(worker: &Worker, commit: bool) -> Result<()> {
-    let signal = if commit {
-        libc::SIGUSR2
-    } else {
-        libc::SIGWINCH
-    };
+    let signal = if commit { libc::SIGUSR2 } else { libc::SIGURG };
     let pid = libc::pid_t::try_from(worker.pid).context("worker pid does not fit pid_t")?;
     // SAFETY: the supervisor retains the exact Child and watcher for this worker.
     if unsafe { libc::kill(pid, signal) } != 0 {

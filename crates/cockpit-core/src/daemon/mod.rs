@@ -2880,6 +2880,7 @@ async fn run_foreground_inner_with_boot_db_impl(
     }
 
     let uses_supplied_boot_db = boot_db.is_some();
+    let mut standby_promoted_before_recovery = false;
     let services = match boot_db {
         Some(db) => {
             server::boot_with_db(
@@ -2926,6 +2927,7 @@ async fn run_foreground_inner_with_boot_db_impl(
             };
             supervisor::report_worker_ready()?;
             supervisor::wait_for_worker_promotion()?;
+            standby_promoted_before_recovery = supervisor::worker_handover_standby();
             let locked_outcome = tokio::select! {
                 result = server::run_locked_until_ready(
                     std::sync::Arc::new(locked),
@@ -2954,6 +2956,16 @@ async fn run_foreground_inner_with_boot_db_impl(
         }
     };
     boot_dbg!("after_ctx_boot");
+    // A staged successor must not replay journals, settle leases, expire
+    // guidance, or otherwise reconcile the shared durable authority while the
+    // predecessor still owns its sessions.  Its boot barrier deliberately
+    // excludes recovery; the supervisor can validate the inherited endpoint
+    // and identity without allowing a second recovery owner.
+    if supervisor::worker_handover_standby() {
+        supervisor::report_worker_ready()?;
+        supervisor::wait_for_worker_promotion()?;
+        standby_promoted_before_recovery = true;
+    }
     // Recovery is part of the socket-publication barrier. Neither the control
     // socket nor its reveal sibling may be observable while durable authority
     // is still being reconciled.
@@ -2993,8 +3005,10 @@ async fn run_foreground_inner_with_boot_db_impl(
                 Some(listeners) => listeners,
                 None => prepare_and_publish_socket_pair(&paths)?,
             };
-            supervisor::report_worker_ready()?;
-            supervisor::wait_for_worker_promotion()?;
+            if !standby_promoted_before_recovery {
+                supervisor::report_worker_ready()?;
+                supervisor::wait_for_worker_promotion()?;
+            }
             listeners
         }
     };
@@ -3024,7 +3038,10 @@ async fn run_foreground_inner_with_boot_db_impl(
                 let mut term = signal(SignalKind::terminate()).ok();
                 let mut roll = signal(SignalKind::user_defined1()).ok();
                 let mut commit = signal(SignalKind::user_defined2()).ok();
-                let mut abort = signal(SignalKind::window_change()).ok();
+                // SIGWINCH belongs to the foreground terminal and is emitted
+                // on resize. Use the otherwise-unclaimed SIGURG control lane
+                // for the supervisor-only abort decision.
+                let mut abort = signal(SignalKind::from_raw(libc::SIGURG)).ok();
                 loop {
                     let signal = tokio::select! {
                         _ = async { if let Some(s) = int.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => 0,
@@ -3061,7 +3078,7 @@ async fn run_foreground_inner_with_boot_db_impl(
                                             }
                                             Err(error) => Err(error),
                                         };
-                                        if result.is_ok() && ctx.shutdown_signal().begin_drain() {
+                                        if result.is_ok() {
                                             tracing::info!(
                                                 generation,
                                                 "worker handover drain completed"
@@ -3295,13 +3312,20 @@ async fn prepare_worker_handover(
 ) -> Result<()> {
     let drain_deadline = tokio::time::Instant::now() + handover.timers.drain();
     while ctx.registry.has_handover_inflight() && tokio::time::Instant::now() < drain_deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            result = supervisor::wait_for_worker_handover_abort() => result?,
+        }
     }
+    anyhow::ensure!(
+        !supervisor::worker_handover_aborted(),
+        "worker handover was aborted before hard deadline"
+    );
     if ctx.registry.has_handover_inflight() {
-        let interrupted = ctx
-            .registry
-            .interrupt_for_handover(handover.timers.hard())
-            .await?;
+        let interrupted = tokio::select! {
+            result = ctx.registry.interrupt_for_handover(handover.timers.hard()) => result?,
+            result = supervisor::wait_for_worker_handover_abort() => result?,
+        };
         tracing::warn!(
             interrupted,
             "worker handover hard deadline interrupted live turns"
@@ -3338,27 +3362,24 @@ async fn prepare_worker_handover(
     // the roll.  Keep serving established clients until it has health-checked
     // the staged successor; an abort leaves this generation untouched.
     supervisor::wait_for_worker_handover_decision().await?;
+    // Close admission before redirecting.  The inherited listener remains
+    // supervisor-owned, so reconnect attempts made after this point queue in
+    // its backlog until the successor is promoted; they can never attach to
+    // the retiring predecessor.
+    anyhow::ensure!(
+        ctx.shutdown_signal().begin_drain(),
+        "worker handover lost its shutdown admission gate"
+    );
     ctx.broadcast_global(proto::Event::Reconnect {
         generation: handover.generation,
         resume_from,
     });
-
-    let grace_deadline = tokio::time::Instant::now() + handover.timers.grace();
-    let mut clients = ctx.client_presence();
-    while clients.borrow().count > 0 && tokio::time::Instant::now() < grace_deadline {
-        if tokio::time::timeout_at(grace_deadline, clients.changed())
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-    if clients.borrow().count != 0 {
-        tracing::warn!(
-            remaining = clients.borrow().count,
-            "worker handover T_grace expired; draining committed predecessor"
-        );
-    }
+    // `Reconnect` is event-queue based. Give existing writers a bounded flush
+    // window, then let the accept loop close their streams. Waiting for a
+    // client detach here is incorrect: the client intentionally keeps its old
+    // clone until the replacement attachment succeeds.
+    tokio::time::sleep(handover.timers.grace().min(Duration::from_millis(200))).await;
+    supervisor::worker_handover_reconnect_dispatched();
     Ok(())
 }
 

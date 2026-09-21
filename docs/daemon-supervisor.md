@@ -76,21 +76,22 @@ unrelated to `Reconnecting`, which describes a model-provider network retry.
 
 Roll and upgrade share three installation-scoped deadlines under
 `daemon.handover`: `drain_ms` defaults to 30000, `hard_ms` to 5000, and
-`grace_ms` to 10000. `T_drain` closes new-turn admission and waits for live
-turns to settle; this admission gate is reversible until successor readiness
-has passed, so a failed successor leaves the predecessor serving. At `T_hard`, remaining turns go through the existing
+`grace_ms` to 10000. `T_drain` waits for live turns to settle while the
+handover gate rejects new turns; the gate is reversible until successor
+readiness has passed, so a failed successor leaves the predecessor serving. At `T_hard`, remaining turns go through the existing
 noninteractive cancellation path and receive one durable `InterruptDecision`;
-accepted queue rows remain in `message_queue_items`. `T_grace` retains the
-predecessor until its attached clients have consumed the reconnect instruction
-and detached.
+accepted queue rows remain in `message_queue_items`. `T_grace` bounds the
+predecessor's `Reconnect` frame-flush interval (capped at 200ms); it then
+closes predecessor streams so clients reconnect through the supervisor-owned
+listener backlog rather than reattaching to the retiring worker.
 
 The supervisor first starts a successor in standby and validates its fd-4
 readiness payload (protocol version, PID, generation, and inherited open time).
-Only then does it ask the predecessor to close admission and report its durable
-boundary. It commits that predecessor to send `Reconnect`, waits for it to exit,
-and finally releases the ready successor through fd 6; reconnect attempts queue
-on the supervisor-owned listener in between. A missing payload,
-protocol/open-time mismatch, or process-identity mismatch aborts before the
-predecessor is committed. A committed `T_grace` expiry logs and continues the
-drain rather than reopening admission. `daemon status` remains available while
+Only then does it ask the predecessor to report its durable boundary. It commits
+the predecessor, closes admission before sending `Reconnect`, waits for its
+bounded frame flush and exit, and finally releases the ready successor through
+fd 6; reconnect attempts queue on the supervisor-owned listener in between. A
+standby successor does no durable recovery before fd-6 promotion. A missing
+payload, protocol/open-time mismatch, or process-identity mismatch aborts
+before the predecessor is committed. `daemon status` remains available while
 the boundary is pending and exposes the most recent result as `last_handover`.

@@ -221,21 +221,19 @@ fn supervisor_reexec_keeps_attached_session_and_listener() {
 }
 
 #[test]
-fn daemon_restart_reconnects_attached_tui_without_prompt() {
+fn daemon_upgrade_reconnects_attached_tui_without_prompt() {
     let mut session = attach_with_durable_history();
     let session_id = session_id_with_durable_marker(&session.home().db_path(), HISTORY_MARKER);
-    let output = session.restart_daemon();
+    let output = session.upgrade_daemon();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("attached clients will reconnect"),
-        "restart output must describe attached-client behavior: {stdout}"
+        "upgrade output must describe attached-client behavior: {stdout}"
     );
     let reconnect_blips = Cell::new(0_u32);
     let reconnect_visible = Cell::new(false);
     let observe_reconnect_blip = |screen: &crate::support::ScreenSnapshot| {
-        let visible = screen.contains("daemon restarting")
-            || screen.contains("daemon connection lost")
-            || screen.contains("daemon reconnected");
+        let visible = screen.contains("reconnecting");
         if visible && !reconnect_visible.replace(visible) {
             reconnect_blips.set(reconnect_blips.get() + 1);
         }
@@ -246,14 +244,14 @@ fn daemon_restart_reconnects_attached_tui_without_prompt() {
     };
     session
         .wait_until_screen(
-            "trusted restart reconnecting",
+            "trusted upgrade reconnecting",
             Duration::from_secs(10),
             &observe_reconnect_blip,
         )
         .expect("trusted restart must show one reconnecting blip");
     session
         .wait_until_screen(
-            "trusted restart reattached",
+            "trusted upgrade reattached",
             Duration::from_secs(30),
             |screen| {
                 observe_reconnect_blip(screen);
@@ -261,19 +259,18 @@ fn daemon_restart_reconnects_attached_tui_without_prompt() {
                     && screen.contains(HISTORY_MARKER)
                     && !screen.contains("The daemon stopped unexpectedly")
                     && !screen.contains("Loading session setup")
-                    && !screen.contains("daemon restarting")
-                    && !screen.contains("daemon connection lost")
+                    && !screen.contains("reconnecting")
             },
         )
         .expect("trusted restart must reconnect without user input");
     assert_eq!(
         reconnect_blips.get(),
         1,
-        "trusted restart must surface exactly one reconnecting blip"
+        "trusted upgrade must surface exactly one reconnecting blip"
     );
     session
         .wait_until_screen(
-            "composer ready after trusted restart",
+            "composer ready after trusted upgrade",
             Duration::from_secs(30),
             |screen| screen.contains(COMPOSER_PLACEHOLDER),
         )

@@ -25,7 +25,8 @@ pub struct DaemonConfig {
 pub const DEFAULT_HANDOVER_DRAIN_MS: u64 = 30_000;
 /// Default post-interrupt window for tools to settle at a durable boundary.
 pub const DEFAULT_HANDOVER_HARD_MS: u64 = 5_000;
-/// Default window for attached clients to reconnect before predecessor exit.
+/// Default bounded predecessor-frame flush before attached clients reconnect
+/// through the supervisor-owned listener backlog.
 pub const DEFAULT_HANDOVER_GRACE_MS: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

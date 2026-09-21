@@ -242,7 +242,7 @@ fn session_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
             "SELECT seq, type
                FROM session_events
               WHERE session_id = ?1
-                AND type IN ('user_message', 'assistant_message', 'tool_call', 'interrupt_decision')
+                AND type IN ('user_message', 'assistant_message', 'tool_call_completed', 'interrupt_decision')
               ORDER BY seq",
         )
         .expect("prepare session event rows");
@@ -603,7 +603,7 @@ async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
     home.write_local_provider_config(&provider.base_url());
     std::fs::write(
         home.config_dir().join("config.json"),
-        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox":{"defaultMode":"off"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto"}"#,
+        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox":{"defaultMode":"off"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto","daemon":{"handover":{"drain_ms":5000,"hard_ms":1000,"grace_ms":50}}}"#,
     )
     .expect("write handover auto-approval config");
     let daemon = SpawnedDaemon::start_with_home(home).await;
@@ -656,7 +656,6 @@ async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
         .output()
         .expect("run daemon upgrade during handover-spanning tool");
     assert!(roll.status.success(), "{}", output_text(&roll));
-    drop(client);
 
     assert_eq!(
         wait_for_handover_file(&side_effect, "commit its side effect").await,
@@ -680,9 +679,112 @@ async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
         "the successor must not replay the predecessor's committed side effect"
     );
     assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 1);
+    let terminal_rows = session_event_rows(&daemon.db_path(), attached.session_id);
+    assert_ne!(
+        terminal_rows
+            .iter()
+            .any(|(_, kind)| kind == "tool_call_completed" || kind == "assistant_message"),
+        terminal_rows
+            .iter()
+            .any(|(_, kind)| kind == "interrupt_decision"),
+        "the live predecessor turn must be completed XOR interrupted"
+    );
     let after = supervisor_status_json(&daemon);
     assert!(after["generation"].as_u64().unwrap() > before["generation"].as_u64().unwrap());
     assert!(after["uptime_ms"].as_u64().unwrap() >= before["uptime_ms"].as_u64().unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn handover_hard_deadline_records_interrupt_not_tool_completion() {
+    let home = IsolatedHome::new();
+    let started = home.project_path().join("handover-hard-started.txt");
+    let side_effect = home.project_path().join("handover-hard-side-effect.txt");
+    let command = format!(
+        "printf 'started\\n' > {}; sleep 10; printf 'committed\\n' >> {}",
+        started.display(),
+        side_effect.display(),
+    );
+    let provider = lifecycle_provider_for_command(&command).await;
+    home.write_local_provider_config(&provider.base_url());
+    std::fs::write(
+        home.config_dir().join("config.json"),
+        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox":{"defaultMode":"off"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto","daemon":{"handover":{"drain_ms":25,"hard_ms":5000,"grace_ms":50}}}"#,
+    )
+    .expect("write hard-deadline handover config");
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
+    let client = daemon.client().await;
+    let attached = client
+        .attach(daemon.project_path(), None, None, true)
+        .await
+        .expect("attach hard-deadline handover session");
+    client
+        .send_user_message("run the handover hard-deadline tool")
+        .await
+        .expect("send hard-deadline turn");
+
+    loop {
+        match client
+            .next_event_unbounded()
+            .await
+            .expect("event before hard-deadline tool start")
+        {
+            DaemonEvent::InterruptRaised {
+                session_id,
+                interrupt_id,
+                ..
+            } if session_id == attached.session_id => {
+                client
+                    .answer_interrupt_option(
+                        interrupt_id,
+                        offered_approval_option(&daemon.db_path(), interrupt_id),
+                    )
+                    .await
+                    .expect("approve hard-deadline handover tool");
+            }
+            DaemonEvent::ToolStart {
+                session_id,
+                call_id,
+                ..
+            } if session_id == attached.session_id && call_id == TOOL_CALL_ID => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        wait_for_handover_process_start(&client, &daemon, attached.session_id, &started).await,
+        "started\n"
+    );
+
+    let roll = daemon
+        .command()
+        .args(["daemon", "upgrade"])
+        .output()
+        .expect("run daemon upgrade through hard deadline");
+    assert!(roll.status.success(), "{}", output_text(&roll));
+    assert!(
+        !side_effect.exists(),
+        "the interrupted tool must not reach its side effect"
+    );
+    let terminal_rows = session_event_rows(&daemon.db_path(), attached.session_id);
+    let completed = terminal_rows
+        .iter()
+        .any(|(_, kind)| kind == "tool_call_completed" || kind == "assistant_message");
+    let interrupted = terminal_rows
+        .iter()
+        .any(|(_, kind)| kind == "interrupt_decision");
+    assert_ne!(
+        completed, interrupted,
+        "the live hard-deadline turn must record completion XOR interruption"
+    );
+    assert!(
+        interrupted,
+        "hard deadline must durably record InterruptDecision"
+    );
+    assert!(
+        !completed,
+        "interrupted tool must not later commit a result"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

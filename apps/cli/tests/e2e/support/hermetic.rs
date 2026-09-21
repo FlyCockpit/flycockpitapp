@@ -770,6 +770,28 @@ impl HermeticCockpit {
         output
     }
 
+    /// Exercise the explicit rolling-upgrade command while retaining the
+    /// receipt-bound supervisor witness used by PTY recovery assertions.
+    pub fn upgrade_daemon(&mut self) -> Output {
+        let before = self.daemon_status_json();
+        let output = self.command(&["daemon", "upgrade"]);
+        assert_success("hermetic cockpit daemon upgrade", &output, &self.home);
+        self.wait_for_daemon(DEFAULT_DAEMON_TIMEOUT);
+        let after = self.daemon_status_json();
+        assert_eq!(after["supervisor_pid"], before["supervisor_pid"]);
+        assert_ne!(after["worker_pid"], before["worker_pid"]);
+        assert!(after["generation"].as_u64().unwrap() > before["generation"].as_u64().unwrap());
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        self.verify_current_supervisor_after_roll()
+            .expect("verify receipt-bound supervisor after worker upgrade");
+        output
+    }
+
     pub fn reexec_daemon_supervisor(&self) -> Output {
         let output = self.command(&["daemon", "reexec"]);
         assert_success("hermetic cockpit daemon reexec", &output, &self.home);

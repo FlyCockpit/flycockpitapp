@@ -6676,14 +6676,17 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
         }
     }
 
-    // A handover must deliver `Reconnect` on the predecessor stream before
-    // that stream is closed.  Keep established handlers alive in that one
-    // case; new admission is already closed by the shutdown gate and the
-    // handlers leave after clients reattach to the successor.  Ordinary
-    // shutdown retains the explicit cancellation completion boundary.
-    if !super::supervisor::worker_handover_active() {
-        clients.abort_all();
+    // Handover closes admission before it emits `Reconnect`. Once that frame
+    // has had its bounded flush interval, close every predecessor stream.
+    // Reconnect attempts then remain in the supervisor-owned listener backlog
+    // until promotion; keeping these streams alive would let them attach back
+    // to the only current acceptor and deadlock the roll.
+    if super::supervisor::worker_handover_active()
+        && !super::supervisor::wait_for_worker_handover_reconnect_dispatch().await
+    {
+        tracing::info!("worker handover aborted before reconnect dispatch");
     }
+    clients.abort_all();
     while clients.join_next().await.is_some() {}
 
     Ok(())

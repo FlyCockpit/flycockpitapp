@@ -194,8 +194,9 @@ async fn restart_running_daemon_rolls_worker_and_keeps_socket_usable() {
     daemon.status().await;
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_upgrade_readiness_keeps_predecessor_serving_and_reports_abort() {
+async fn ready_pipe_failure_after_canonicalized_upgrade_keeps_predecessor_serving() {
     let daemon = SpawnedDaemon::start().await;
     let status_before = daemon
         .command()
@@ -209,18 +210,19 @@ async fn failed_upgrade_readiness_keeps_predecessor_serving_and_reports_abort() 
     );
     let before: serde_json::Value =
         serde_json::from_slice(&status_before.stdout).expect("decode status before upgrade");
-    let missing = daemon.home().home_dir().join("missing-upgrade-binary");
+    let non_worker_binary = std::fs::canonicalize("/bin/sleep")
+        .expect("canonicalize a real non-worker binary before upgrade spawn");
 
     let upgrade = daemon
         .command()
         .args(["daemon", "upgrade", "--binary"])
-        .arg(&missing)
+        .arg(&non_worker_binary)
         .output()
-        .expect("failed upgrade command");
+        .expect("upgrade with ready-pipe-failing binary");
 
     assert!(
         !upgrade.status.success(),
-        "missing binary must abort upgrade"
+        "a successor that never writes fd 4 must abort upgrade"
     );
     let status_after = daemon
         .command()
@@ -235,8 +237,8 @@ async fn failed_upgrade_readiness_keeps_predecessor_serving_and_reports_abort() 
     assert!(
         after["last_handover"]
             .as_str()
-            .is_some_and(|outcome| outcome.starts_with("aborted: resolving upgrade binary")),
-        "status must retain the concrete abort reason: {after}"
+            .is_some_and(|outcome| outcome.starts_with("aborted: staging successor readiness")),
+        "status must retain the post-canonicalization readiness abort reason: {after}"
     );
     let text_status = daemon
         .command()
@@ -249,7 +251,7 @@ async fn failed_upgrade_readiness_keeps_predecessor_serving_and_reports_abort() 
         daemon.home(),
     );
     assert!(
-        output_text(&text_status).contains("last handover: aborted: resolving upgrade binary"),
+        output_text(&text_status).contains("last handover: aborted: staging successor readiness"),
         "text status must retain the abort outcome: {}",
         output_text(&text_status)
     );

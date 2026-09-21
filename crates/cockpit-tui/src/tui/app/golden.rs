@@ -735,6 +735,9 @@ fn shell_chrome_app(scene: &str) -> App {
             app.reset_slash_window();
             assert_eq!(app.slash_suggestions().len(), 3);
         }
+        "update-available" => {
+            app.update_available_version = Some("9.9.9".to_string());
+        }
         other => panic!("unknown shell chrome scene {other}"),
     }
     app
@@ -749,6 +752,7 @@ pub fn assert_shell_chrome() {
         "sandbox-unavailable",
         "picker-open",
         "slash-three",
+        "update-available",
     ] {
         assert_golden_sizes("shell-chrome", scene, |width, height| {
             let mut app = shell_chrome_app(scene);

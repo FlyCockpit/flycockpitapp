@@ -44,6 +44,7 @@ remote = [
     "dep:flycockpit-relay-protocol",
 ]
 grok-subscription = ["cockpit-core/grok-subscription", "cockpit-tui/grok-subscription"]
+no-self-update = ["cockpit-core/no-self-update"]
 
 [[bin]]
 name = "cockpit"

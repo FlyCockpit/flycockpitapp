@@ -1,32 +1,45 @@
-//! Disabled updater boundaries and future TUF activation seams.
-//!
-//! Installed production code uses only [`composition::installed_composition`].
-//! Fixture adapters live behind `cfg(test)` / `test-support` and must never
-//! link into the shipped binary.
+//! Receipt-gated updater with an owner-supplied TUF trust-root seam.
 
+#[cfg(not(feature = "no-self-update"))]
+mod active;
 mod background;
 mod composition;
 mod disabled;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
+#[cfg(not(feature = "no-self-update"))]
+mod platform;
 mod traits;
 mod types;
 
+#[cfg(not(feature = "no-self-update"))]
+pub use active::{ActiveUpdater, HOMEBREW_UPGRADE_COMMAND, InstallationPolicy, current_platform};
 pub use background::spawn_background;
 pub use composition::{InstalledUpdaterComposition, installed_composition, installed_updater};
-pub use disabled::DisabledUpdater;
+pub use disabled::PackageManagerUpdater;
+#[cfg(not(feature = "no-self-update"))]
+pub use platform::{
+    FileUpdateLockStore, LiveSupervisorMaintenanceClient, PlatformBinaryReplacer,
+    cleanup_previous_binary_after_successful_start,
+};
+#[cfg(feature = "no-self-update")]
+pub fn cleanup_previous_binary_after_successful_start() -> Result<(), UpdaterError> {
+    Ok(())
+}
 pub use traits::{
-    BinaryReplacer, MetadataRepository, SupervisorMaintenanceClient, TargetFetcher,
+    BinaryReplacer, MetadataRepository, SupervisorMaintenanceClient, TargetFetcher, TrustRoot,
     UpdateLockStore, Updater,
 };
 pub use types::{
-    DisabledNoProductionRoot, FakeFixtureEvidence, InstallChannel, SupervisorMaintenanceRequest,
-    TrustedMetadataVersions, UpdateApplyReceipt, UpdateApplyReceiptState, UpdateCheckResult,
+    FakeFixtureEvidence, InstallationAuthorization, InstallationPaths, ManualUpdateOutcome,
+    ProductionTrustRootEvidence, SupervisorMaintenanceRequest, TrustedMetadataVersions,
+    UntrustedRepositoryMetadata, UpdateApplyReceipt, UpdateApplyReceiptState, UpdateCheckResult,
     UpdateLockRecord, UpdateLockState, UpdateNotice, UpdateStatusSnapshot, UpdateTargetDescriptor,
-    UpdaterApplyError, validate_fake_fixture_evidence,
+    UpdaterError, VerifiedRepositoryMetadata, production_trust_root_evidence,
+    validate_fake_fixture_evidence,
 };
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use cockpit_config::config::update_channel::UpdateChannel;
 
@@ -58,10 +71,24 @@ pub fn maybe_spawn_background(ctx: Arc<DaemonContext>) -> Option<tokio::task::Jo
     }
 }
 
-/// Startup and background check entrypoint. Never performs network, filesystem
-/// update, replacement, or supervisor maintenance work in disabled preparation.
+/// Startup and background check entrypoint. Checks never place a binary or
+/// request supervisor maintenance; they only refresh the process-local notice.
 pub async fn run_startup_check(channel: UpdateChannel) -> UpdateCheckResult {
-    installed_updater().check(channel).await
+    let result = installed_updater().check(channel).await;
+    let notice = notice_for_result(&result);
+    if let Ok(mut slot) = update_notice_slot().write() {
+        *slot = notice;
+    }
+    result
+}
+
+fn notice_for_result(result: &UpdateCheckResult) -> Option<UpdateNotice> {
+    match result {
+        UpdateCheckResult::Available { version } => Some(UpdateNotice::Available {
+            version: version.clone(),
+        }),
+        UpdateCheckResult::Off | UpdateCheckResult::Current | UpdateCheckResult::Failed(_) => None,
+    }
 }
 
 /// Manual/background status projection for CLI and TUI surfaces.
@@ -69,10 +96,37 @@ pub fn update_status(channel: UpdateChannel) -> UpdateStatusSnapshot {
     installed_updater().status(channel)
 }
 
-/// TUI notice entrypoint. Disabled preparation never emits a notify banner.
+/// Process-local TUI projection of the latest completed updater check.
 pub fn update_notice(channel: UpdateChannel) -> Option<UpdateNotice> {
-    match installed_updater().status(channel) {
-        UpdateStatusSnapshot::Off => None,
-        UpdateStatusSnapshot::Disabled { reason, .. } => Some(UpdateNotice::Disabled(reason)),
+    if channel == UpdateChannel::Off {
+        return None;
+    }
+    update_notice_slot()
+        .read()
+        .ok()
+        .and_then(|notice| notice.clone())
+}
+
+fn update_notice_slot() -> &'static RwLock<Option<UpdateNotice>> {
+    static NOTICE: OnceLock<RwLock<Option<UpdateNotice>>> = OnceLock::new();
+    NOTICE.get_or_init(|| RwLock::new(None))
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    #[test]
+    fn available_check_projects_to_a_tui_notice_and_non_available_results_clear_it() {
+        assert_eq!(
+            notice_for_result(&UpdateCheckResult::Available {
+                version: "9.9.9".into(),
+            }),
+            Some(UpdateNotice::Available {
+                version: "9.9.9".into(),
+            })
+        );
+        assert_eq!(notice_for_result(&UpdateCheckResult::Current), None);
+        assert_eq!(notice_for_result(&UpdateCheckResult::Off), None);
     }
 }

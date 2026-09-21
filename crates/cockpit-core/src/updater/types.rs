@@ -1,30 +1,17 @@
-//! Closed updater domain types for disabled preparation and future activation.
+//! Closed updater domain types shared by production composition and fakes.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use cockpit_config::config::update_channel::UpdateChannel;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use cockpit_updater_evidence::{
-    FakeFixtureEvidence, UpdateTargetDescriptor, validate_fake_fixture_evidence,
+    FakeFixtureEvidence, ProductionTrustRootEvidence, UpdateTargetDescriptor,
+    production_trust_root_evidence, validate_fake_fixture_evidence,
 };
 
-/// Production updater activation is blocked until verified root ceremony evidence exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DisabledNoProductionRoot;
-
-impl fmt::Display for DisabledNoProductionRoot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(
-            "production TUF updater is disabled until verified root ceremony evidence is accepted",
-        )
-    }
-}
-
-impl std::error::Error for DisabledNoProductionRoot {}
-
-/// Cached trusted metadata role versions persisted after verification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedMetadataVersions {
     pub root: u64,
@@ -34,7 +21,19 @@ pub struct TrustedMetadataVersions {
     pub checked_at_unix_ms: i64,
 }
 
-/// Durable apply receipt for manual and daemon-owned updates.
+/// Untrusted bytes returned by a metadata repository. Only [`super::TrustRoot`]
+/// may turn these bytes into authorized targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrustedRepositoryMetadata {
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRepositoryMetadata {
+    pub versions: TrustedMetadataVersions,
+    pub targets: Vec<UpdateTargetDescriptor>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateApplyReceipt {
     pub update_id: Uuid,
@@ -54,7 +53,6 @@ pub enum UpdateApplyReceiptState {
     TerminalFailure,
 }
 
-/// Private OS-exclusive update lock record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateLockRecord {
     pub update_id: Uuid,
@@ -73,7 +71,6 @@ pub enum UpdateLockState {
     Conflicted,
 }
 
-/// Supervisor-owned maintenance request issued after a durable swap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorMaintenanceRequest {
     pub update_id: Uuid,
@@ -81,49 +78,94 @@ pub struct SupervisorMaintenanceRequest {
     pub installed_path_digest: String,
 }
 
-/// Installation channel classification derived from the cargo-dist receipt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InstallChannel {
-    ShellInstaller,
-    Homebrew,
-    Cargo,
-    Unknown,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallationAuthorization {
+    SelfUpdate,
+    Homebrew { command: &'static str },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualUpdateOutcome {
+    Updated { version: String },
+    Homebrew { command: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateCheckResult {
     Off,
-    Disabled(DisabledNoProductionRoot),
+    Available { version: String },
+    Current,
+    Failed(UpdaterError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateStatusSnapshot {
     Off,
-    Disabled {
+    Ready {
         channel: UpdateChannel,
-        reason: DisabledNoProductionRoot,
+    },
+    Unavailable {
+        channel: UpdateChannel,
+        reason: UpdaterError,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateNotice {
-    Disabled(DisabledNoProductionRoot),
+    Available { version: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdaterApplyError {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdaterError {
     Off,
-    Disabled(DisabledNoProductionRoot),
+    NoProductionTrustRoot,
+    PackageManager,
+    Io(String),
+    Metadata(String),
+    TargetNotFound(String),
+    TargetLength { expected: u64, actual: u64 },
+    TargetHash,
+    Replacement(String),
+    Supervisor(String),
+    Lock(String),
 }
 
-impl fmt::Display for UpdaterApplyError {
+impl UpdaterError {
+    pub fn io(context: &str, error: impl fmt::Display) -> Self {
+        Self::Io(format!("{context}: {error}"))
+    }
+}
+
+impl fmt::Display for UpdaterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Off => f.write_str("updates are disabled"),
-            Self::Disabled(reason) => fmt::Display::fmt(reason, f),
+            Self::NoProductionTrustRoot => f.write_str("no production trust root"),
+            Self::PackageManager => f.write_str(
+                "self-update refused: this cockpit binary was installed by a package manager; use that package manager to upgrade",
+            ),
+            Self::Io(message)
+            | Self::Metadata(message)
+            | Self::Replacement(message)
+            | Self::Supervisor(message)
+            | Self::Lock(message) => f.write_str(message),
+            Self::TargetNotFound(version) => {
+                write!(f, "no trusted update target matched version `{version}`")
+            }
+            Self::TargetLength { expected, actual } => write!(
+                f,
+                "downloaded update target length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::TargetHash => f.write_str("downloaded update target hash verification failed"),
         }
     }
 }
 
-impl std::error::Error for UpdaterApplyError {}
+impl std::error::Error for UpdaterError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallationPaths {
+    pub current_exe: PathBuf,
+    pub receipt: PathBuf,
+    pub brew_prefix: Option<PathBuf>,
+}

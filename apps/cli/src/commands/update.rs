@@ -1,9 +1,10 @@
-//! `cockpit update` — sole manual update authority (disabled until activation).
+//! `cockpit update` / `cockpit self-update` — one manual update authority.
 
 use anyhow::{Context, Result, bail};
 use cockpit_config::config::update_channel::UpdateChannel;
 use cockpit_core::updater::{
-    UpdateCheckResult, UpdateStatusSnapshot, Updater, effective_update_channel, installed_updater,
+    ManualUpdateOutcome, UpdateCheckResult, UpdateStatusSnapshot, Updater,
+    effective_update_channel, installed_updater,
 };
 
 use crate::cli::UpdateArgs;
@@ -24,10 +25,11 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     }
 
     if args.version.is_some() {
-        installed_updater()
+        let outcome = installed_updater()
             .apply_manual(channel, args.version.as_deref())
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        print_outcome(outcome);
         return Ok(());
     }
 
@@ -39,10 +41,11 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     }
 
     if !args.check {
-        installed_updater()
+        let outcome = installed_updater()
             .apply_manual(channel, None)
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        print_outcome(outcome);
         return Ok(());
     }
 
@@ -51,17 +54,34 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
             println!("updates: off");
             Ok(())
         }
-        UpdateCheckResult::Disabled(reason) => bail!("{reason}"),
+        UpdateCheckResult::Available { version } => {
+            println!("update available: {version}");
+            Ok(())
+        }
+        UpdateCheckResult::Current => {
+            println!("cockpit is up to date");
+            Ok(())
+        }
+        UpdateCheckResult::Failed(reason) => bail!("{reason}"),
+    }
+}
+
+fn print_outcome(outcome: ManualUpdateOutcome) {
+    match outcome {
+        ManualUpdateOutcome::Updated { version } => println!("updated cockpit to {version}"),
+        ManualUpdateOutcome::Homebrew { command } => println!("{command}"),
     }
 }
 
 fn print_status(snapshot: UpdateStatusSnapshot) {
     match snapshot {
         UpdateStatusSnapshot::Off => println!("updates: off"),
-        UpdateStatusSnapshot::Disabled { channel, reason } => {
-            println!("updates: disabled ({})", channel.label());
+        UpdateStatusSnapshot::Ready { channel } => {
+            println!("updates: ready ({})", channel.label());
+        }
+        UpdateStatusSnapshot::Unavailable { channel, reason } => {
+            println!("updates: unavailable ({})", channel.label());
             println!("reason: {reason}");
-            println!("hint: run `cockpit doctor` after production updater activation");
         }
     }
 }

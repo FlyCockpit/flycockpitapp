@@ -24,6 +24,22 @@ pub struct FakeFixtureEvidence {
     pub targets: Vec<UpdateTargetDescriptor>,
 }
 
+/// Owner-produced evidence that binds a shipped build to the root metadata
+/// accepted at the production TUF ceremony. The ceremony output is intentionally
+/// absent until the owner completes and audits that ceremony.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionTrustRootEvidence {
+    pub ceremony_record: &'static str,
+    pub root_json: &'static str,
+    pub root_sha256: &'static str,
+}
+
+/// Build-time production root seam. Replacing `None` is an owner-only release
+/// step and must include the audited ceremony record and exact root bytes.
+pub const fn production_trust_root_evidence() -> Option<&'static ProductionTrustRootEvidence> {
+    None
+}
+
 /// Validate canonical fake-fixture evidence before offline signing or publication.
 pub fn validate_fake_fixture_evidence(evidence: &FakeFixtureEvidence) -> Result<(), String> {
     use std::collections::HashSet;
@@ -88,7 +104,15 @@ pub fn validate_fake_fixture_evidence(evidence: &FakeFixtureEvidence) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{FakeFixtureEvidence, UpdateTargetDescriptor, validate_fake_fixture_evidence};
+    use super::{
+        FakeFixtureEvidence, UpdateTargetDescriptor, production_trust_root_evidence,
+        validate_fake_fixture_evidence,
+    };
+
+    #[test]
+    fn production_root_remains_absent_until_owner_ceremony_evidence_is_embedded() {
+        assert_eq!(production_trust_root_evidence(), None);
+    }
 
     #[test]
     fn fake_fixture_evidence_roundtrips_through_json() {

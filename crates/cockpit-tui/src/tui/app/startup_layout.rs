@@ -2584,7 +2584,6 @@ impl App {
         // auth notice remains queued until higher-priority remedies clear.
         self.sandbox_down_notice_text()
             .or_else(|| self.command_capability_notice_text())
-            .or_else(|| self.update_disabled_notice_text().map(str::to_string))
             .or_else(|| {
                 self.auth_failure_notice
                     .as_ref()

@@ -4,24 +4,17 @@ use super::App;
 
 impl App {
     pub(super) fn sync_update_notice(&mut self) -> bool {
-        let next = match effective_update_channel() {
-            Ok(channel) => update_notice(channel).map(update_notice_text),
-            Err(error) => Some(format!("updates misconfigured: {error}")),
-        };
-        if self.update_disabled_notice != next {
-            self.update_disabled_notice = next;
+        let next =
+            effective_update_channel()
+                .ok()
+                .and_then(update_notice)
+                .map(|notice| match notice {
+                    UpdateNotice::Available { version } => version,
+                });
+        if self.update_available_version != next {
+            self.update_available_version = next;
             return true;
         }
         false
-    }
-
-    pub(super) fn update_disabled_notice_text(&self) -> Option<&str> {
-        self.update_disabled_notice.as_deref()
-    }
-}
-
-fn update_notice_text(notice: UpdateNotice) -> String {
-    match notice {
-        UpdateNotice::Disabled(reason) => format!("updates disabled: {reason}"),
     }
 }

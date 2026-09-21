@@ -54,6 +54,7 @@ excluded-direct = ["zbus", "zbus-secret-service-keyring-store", "cryptoki", "lib
 [features]
 default = []
 test-support = ["dep:cockpit-test-support"]
+no-self-update = []
 # Enables the xAI-authorized SuperGrok browser OAuth implementation. This is
 # intentionally off in the official release; user-authored `auth_command`
 # providers remain available without it.

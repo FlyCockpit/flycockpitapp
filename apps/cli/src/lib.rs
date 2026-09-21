@@ -749,6 +749,10 @@ pub fn main_entry() -> ExitCode {
         eprintln!("Error: preparing supervised worker activation: {error:#}");
         return ExitCode::FAILURE;
     }
+    if let Err(error) = cockpit_core::updater::cleanup_previous_binary_after_successful_start() {
+        eprintln!("Error: cleaning previous cockpit executable: {error}");
+        return ExitCode::FAILURE;
+    }
 
     let launch_start = Instant::now();
 

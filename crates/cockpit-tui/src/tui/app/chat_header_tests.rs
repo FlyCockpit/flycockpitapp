@@ -76,6 +76,19 @@ fn setup_mode_rehomes_to_header_pill() {
     assert_eq!(setup.label, "Setup: Code");
 }
 
+#[test]
+fn update_available_is_a_header_pill_and_not_a_persistent_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app(&tmp);
+    app.update_available_version = Some("9.9.9".to_string());
+
+    let buffer = render(&mut app, 100, 30);
+    let layout = app.chat_header_layout.clone().expect("header rendered");
+    let meta = row_text(&buffer, layout.area.y + 1);
+    assert!(meta.contains("[update 9.9.9]"), "{meta:?}");
+    assert_eq!(app.persistent_notice_text(), None);
+}
+
 fn click(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind,

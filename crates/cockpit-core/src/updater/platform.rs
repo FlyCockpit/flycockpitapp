@@ -24,7 +24,7 @@ impl PlatformBinaryReplacer {
 impl BinaryReplacer for PlatformBinaryReplacer {
     async fn stage_and_swap(
         &self,
-        staged: &PathBuf,
+        staged: &Path,
         _receipt: &mut UpdateApplyReceipt,
     ) -> Result<(), UpdaterError> {
         replace_binary(staged, &self.installed)

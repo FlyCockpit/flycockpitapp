@@ -652,7 +652,7 @@ mod tests {
     impl BinaryReplacer for NeverReplacer {
         async fn stage_and_swap(
             &self,
-            _staged: &PathBuf,
+            _staged: &Path,
             _receipt: &mut UpdateApplyReceipt,
         ) -> Result<(), UpdaterError> {
             panic!("unsupported platforms must not replace binaries")
@@ -878,7 +878,7 @@ mod tests {
             updated_at_unix_ms: 1,
         };
         PlatformBinaryReplacer::new(installed.clone())
-            .stage_and_swap(&extracted.path().to_path_buf(), &mut receipt)
+            .stage_and_swap(extracted.path(), &mut receipt)
             .await
             .unwrap();
         assert_eq!(std::fs::read(installed).unwrap(), executable);

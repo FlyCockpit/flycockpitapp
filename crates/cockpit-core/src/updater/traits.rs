@@ -1,7 +1,7 @@
 //! Injected updater seams. Production composition deliberately has no trust
 //! root until owner ceremony evidence is embedded.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use cockpit_config::config::update_channel::UpdateChannel;
@@ -50,7 +50,7 @@ pub trait TargetFetcher: Send + Sync {
 pub trait BinaryReplacer: Send + Sync {
     async fn stage_and_swap(
         &self,
-        staged: &PathBuf,
+        staged: &Path,
         receipt: &mut UpdateApplyReceipt,
     ) -> Result<(), UpdaterError>;
 }

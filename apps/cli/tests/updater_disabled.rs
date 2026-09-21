@@ -1,6 +1,6 @@
 //! Behavioural updater evidence for issue #442.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use assert_cmd::cargo::cargo_bin;
@@ -139,7 +139,7 @@ struct NeverReplacer;
 impl BinaryReplacer for NeverReplacer {
     async fn stage_and_swap(
         &self,
-        _staged: &PathBuf,
+        _staged: &Path,
         _receipt: &mut UpdateApplyReceipt,
     ) -> Result<(), UpdaterError> {
         panic!("replacer must not run without a trust root")
@@ -239,7 +239,7 @@ struct RecordingReplacer {
 impl BinaryReplacer for RecordingReplacer {
     async fn stage_and_swap(
         &self,
-        staged: &PathBuf,
+        staged: &Path,
         receipt: &mut UpdateApplyReceipt,
     ) -> Result<(), UpdaterError> {
         self.inner.stage_and_swap(staged, receipt).await?;

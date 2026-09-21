@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use super::{DaemonListener, DaemonPaths, DaemonStream};
 
@@ -1403,7 +1403,10 @@ async fn accept_admin(listener: &mut AdminListener) -> Result<DaemonStream> {
     return listener.accept().await;
 }
 
-async fn read_admin(stream: DaemonStream) -> Result<(AdminRequest, DaemonStream)> {
+async fn read_admin<S>(stream: S) -> Result<(AdminRequest, S)>
+where
+    S: AsyncRead + Unpin,
+{
     let mut reader = BufReader::new(stream);
     let request = read_admin_request(&mut reader).await?;
     Ok((request, reader.into_inner()))
@@ -1421,7 +1424,10 @@ where
     serde_json::from_str(line.trim_end()).context("decoding supervisor admin frame")
 }
 
-async fn write_admin(stream: &mut DaemonStream, response: &AdminResponse) -> Result<()> {
+async fn write_admin<W>(stream: &mut W, response: &AdminResponse) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut line = serde_json::to_vec(response)?;
     line.push(b'\n');
     stream.write_all(&line).await?;
@@ -1440,7 +1446,7 @@ pub async fn request(paths: &DaemonPaths, command: AdminCommand) -> Result<Admin
         let pipe = cockpit_host::named_pipe::read_pipe_identity(&path)?;
         cockpit_host::named_pipe::connect_client_pipe(&pipe).await?
     };
-    let mut stream: DaemonStream = stream;
+    let mut stream = stream;
     let request = AdminRequest {
         version: ADMIN_PROTOCOL_VERSION,
         command,

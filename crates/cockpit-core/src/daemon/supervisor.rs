@@ -499,7 +499,7 @@ pub(crate) fn report_worker_ready() -> Result<()> {
 pub(crate) fn worker_handover_standby() -> bool {
     #[cfg(unix)]
     {
-        return std::env::var_os(HANDOVER_STANDBY_ENV).is_some();
+        std::env::var_os(HANDOVER_STANDBY_ENV).is_some()
     }
     #[cfg(not(unix))]
     false

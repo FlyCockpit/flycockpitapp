@@ -582,30 +582,37 @@ fn lsp_info_row(label: impl Into<String>, value: impl Into<String>) -> Line<'sta
 fn lsp_edit_row<T: ToString>(
     idx: usize,
     p: &LspPage,
-    edit: LspEdit,
+    _edit: LspEdit,
     label: &str,
     value: T,
 ) -> Line<'static> {
-    if p.editing == Some(edit) {
-        let selected = idx == p.cursor;
-        let text = p.buf.text();
-        let cursor = cockpit_host::text::floor_char_boundary(text, p.buf.cursor());
-        let (before, after) = text.split_at(cursor);
-        Line::from(vec![
-            Span::raw(marker(selected)),
-            Span::styled(format!("{label:<24}"), selected_or_field(selected)),
-            Span::styled(before.to_string(), muted_style()),
-            shell::cursor_marker_span(),
-            Span::styled(after.to_string(), muted_style()),
-        ])
-    } else {
-        lsp_row(idx, p.cursor, label, value.to_string())
-    }
+    lsp_row(idx, p.cursor, label, value.to_string())
 }
 
 pub(super) fn lsp_selected_line_for_cursor(cursor: usize) -> usize {
     let severity_insert_at = row_index(LspRow::DebounceMs);
     cursor + usize::from(cursor >= severity_insert_at)
+}
+
+fn lsp_render_line_for_cursor(cursor: usize, editing: Option<LspEdit>) -> usize {
+    let line = lsp_selected_line_for_cursor(cursor);
+    editing
+        .map(lsp_row_for_edit)
+        .map(row_index)
+        .map(|edited_cursor| {
+            line + 2 * usize::from(lsp_selected_line_for_cursor(edited_cursor) < line)
+        })
+        .unwrap_or(line)
+}
+
+fn lsp_edit_label(edit: LspEdit) -> &'static str {
+    match edit {
+        LspEdit::OtherFilesLimit => "other files limit",
+        LspEdit::PerFileLimit => "per-file limit",
+        LspEdit::DebounceMs => "debounce ms",
+        LspEdit::DocumentTimeoutMs => "document timeout ms",
+        LspEdit::WorkspaceTimeoutMs => "workspace timeout ms",
+    }
 }
 
 fn on_off(v: bool) -> &'static str {
@@ -670,7 +677,15 @@ impl SettingsCx {
     }
 
     fn render_lsp_page(&self, frame: &mut Frame, area: Rect, p: &LspPage) {
-        let (rows, selected_line) = lsp_rows(self, p);
+        let (mut rows, _) = lsp_rows(self, p);
+        if let Some(edit) = p.editing {
+            let line = lsp_selected_line_for_cursor(row_index(lsp_row_for_edit(edit)));
+            rows.splice(
+                line..=line,
+                [Line::default(), Line::default(), Line::default()],
+            );
+        }
+        let selected_line = lsp_render_line_for_cursor(p.cursor, p.editing);
         let row_count = LSP_SERVER_ROW_START
             + self
                 .project_context()
@@ -708,7 +723,7 @@ impl SettingsCx {
                     .map(|server| PointerLspAction::Check(LspServerId(server.id.clone()))),
             }?;
             Some((
-                lsp_selected_line_for_cursor(cursor),
+                lsp_render_line_for_cursor(cursor, p.editing),
                 SettingsPointerAction::Lsp(action),
             ))
         });
@@ -721,12 +736,35 @@ impl SettingsCx {
             (&self.pointer_surface, shell::SettingsScrollRegionId("lsp")).into(),
         );
         let offset = self.scroll_states.offset_for("lsp");
+        if let Some(edit) = p.editing {
+            let line = lsp_render_line_for_cursor(row_index(lsp_row_for_edit(edit)), p.editing);
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    lsp_edit_label(edit),
+                    &p.buf,
+                    true,
+                    "",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+            }
+        }
         let server_count = row_count.saturating_sub(LSP_SERVER_ROW_START);
         for server_idx in 0..server_count {
             let Some(server) = servers.as_ref().and_then(|items| items.get(server_idx)) else {
                 continue;
             };
-            let line = lsp_selected_line_for_cursor(LSP_SERVER_ROW_START + server_idx);
+            let line = lsp_render_line_for_cursor(LSP_SERVER_ROW_START + server_idx, p.editing);
             let Some(screen_row) = line.checked_sub(offset) else {
                 continue;
             };

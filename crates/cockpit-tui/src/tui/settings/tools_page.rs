@@ -13,15 +13,15 @@ use cockpit_config::extended::{ToolCommandTemplate, WebConfig, WebProvider as Co
 use cockpit_core::engine::builtin::{builtin_tool_inventory, is_reserved_custom_tool_name};
 use cockpit_core::mcp::cache;
 use cockpit_core::mcp::protocol::{ToolDescriptor, sanitize_tool_descriptor};
-use cockpit_proto::{Request, SecretInventoryKind};
+use cockpit_proto::SecretInventoryKind;
 
 use super::mcp_page::{ListState as McpListState, McpPage};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell;
 use super::shell::{
     SettingsControlId, SettingsScrollRegionId, WrappedValueLayout, focused_field_style,
-    muted_style, push_text_field_at_cursor, push_wrapped_prefixed_value, selected_line_from_marker,
-    selected_style, warning_style,
+    muted_style, push_wrapped_prefixed_value, selected_line_from_marker, selected_style,
+    warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -550,6 +550,7 @@ impl SettingsCx {
         let mut lines = Vec::new();
         let mut bindings = Vec::new();
         let mut row_idx = 0usize;
+        let mut edit_field_line = None;
 
         push_section(&mut lines, "Web tools");
         self.push_web_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
@@ -601,16 +602,10 @@ impl SettingsCx {
                 ToolField::NewToolName => "tool name",
                 ToolField::UserToolCommand(_) => "command",
             };
-            let visible = match field {
-                ToolField::WebKey(_) => masked_edit_value(p.buf.text()),
-                _ => p.buf.text().to_string(),
-            };
-            let cursor = match field {
-                ToolField::WebKey(_) if !p.buf.text().is_empty() => visible.chars().count(),
-                _ => p.buf.cursor(),
-            };
             lines.push(Line::default());
-            push_text_field_at_cursor(&mut lines, width, label, &visible, cursor, true, None);
+            let line = lines.len();
+            lines.extend([Line::default(), Line::default(), Line::default()]);
+            edit_field_line = Some((line, label, matches!(field, ToolField::WebKey(_))));
         }
 
         if let Some(status) = &p.status {
@@ -654,7 +649,7 @@ impl SettingsCx {
                     .map(|action| (line, action))
             })
             .collect();
-        (lines, semantic, read_only)
+        (lines, semantic, read_only, edit_field_line)
     }
 
     fn tools_pointer_action(
@@ -1013,7 +1008,11 @@ impl SettingsCx {
     }
 
     pub(super) fn render_tools_page(&self, frame: &mut Frame, area: Rect, p: &ToolsPage) {
-        let (lines, bindings, read_only) = self.build_tools_page_lines_with_bindings(area.width, p);
+        let (lines, bindings, read_only, edit_field_line) = self
+            .build_tools_page_lines_with_bindings(
+                crate::tui::chrome::scrollbar_content(area).width,
+                p,
+            );
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,
@@ -1024,6 +1023,22 @@ impl SettingsCx {
             (&self.pointer_surface, SettingsScrollRegionId("tools")).into(),
         );
         let offset = self.scroll_states.offset_for("tools");
+        if let Some((line, title, masked)) = edit_field_line
+            && let Some(screen_row) = line.checked_sub(offset)
+            && screen_row + 3 <= usize::from(area.height)
+        {
+            let rect = Rect::new(
+                area.x,
+                area.y.saturating_add(screen_row as u16),
+                crate::tui::chrome::scrollbar_content(area).width,
+                3,
+            );
+            if let Some(caret) = crate::tui::chrome::render_field_masked(
+                frame, rect, title, &p.buf, true, "", masked,
+            ) {
+                frame.set_cursor_position(caret);
+            }
+        }
         for (line, action) in read_only {
             let Some(screen_row) = line.checked_sub(offset) else {
                 continue;
@@ -1047,7 +1062,12 @@ impl SettingsCx {
 }
 
 type ActionBinding = (usize, super::pointer_actions::SettingsPointerAction);
-type ToolsPageLines = (Vec<Line<'static>>, Vec<ActionBinding>, Vec<ActionBinding>);
+type ToolsPageLines = (
+    Vec<Line<'static>>,
+    Vec<ActionBinding>,
+    Vec<ActionBinding>,
+    Option<(usize, &'static str, bool)>,
+);
 
 fn web_command_status(command: Option<&str>, placeholder: &str) -> String {
     match command.map(str::trim).filter(|value| !value.is_empty()) {

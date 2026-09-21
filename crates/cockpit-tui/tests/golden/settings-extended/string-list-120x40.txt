@@ -4,7 +4,7 @@
   + New session               ▌R│Agent Directories                                                                   │ │
                               ▌ │                                                                                    │ │
  SESSIONS                       │Extra directories searched for agent-definition files, on top of the built-in locat │ │
- no active sessions in all pr   │ons. Paths are tilde-expanded.                                                      │ │
+ no active sessions in all pr   │ions. Paths are tilde-expanded.                                                     │ │
                                 │                                                                                    │ │
                               no│› [+ add]                                                                           │ │
                               ┊ │                                                                                    │ │

@@ -3663,6 +3663,20 @@ impl SettingsCx {
             ));
             lines.push(Line::from("[copy device code]"));
         }
+        let paste_field_line = s
+            .paste_focused
+            .then(|| {
+                lines
+                    .iter()
+                    .position(|line| {
+                        line.spans.iter().any(|span| {
+                            span.content.as_ref()
+                                == "Paste callback URL, ?code=...&state=..., or bare code:"
+                        })
+                    })
+                    .map(|line| line + 1)
+            })
+            .flatten();
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,
@@ -3676,6 +3690,29 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some(line) = paste_field_line {
+            let offset = self.scroll_states.offset_for("providers:oauth-setup");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    "Callback URL or code",
+                    &s.manual_input,
+                    true,
+                    "",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+            }
+        }
         if let Some(links) = links {
             register_visible_link_regions(
                 links,
@@ -4008,6 +4045,19 @@ impl SettingsCx {
         let link_regions = oauth_flow
             .and_then(|flow| prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref()))
             .unwrap_or_default();
+        let paste_field_line = oauth_flow
+            .filter(|flow| matches!(flow, OAuthFlowView::OAuth(state) if state.paste_focused))
+            .and_then(|_| {
+                lines
+                    .iter()
+                    .position(|line| {
+                        line.spans.iter().any(|span| {
+                            span.content.as_ref()
+                                == "Paste callback URL, ?code=...&state=..., or bare code:"
+                        })
+                    })
+                    .map(|line| line + 1)
+            });
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,
@@ -4024,6 +4074,27 @@ impl SettingsCx {
                 .into(),
         );
         let offset = self.scroll_states.offset_for("providers:add");
+        if let (Some(line), Some(OAuthFlowView::OAuth(state))) = (paste_field_line, oauth_flow)
+            && let Some(screen_row) = line.checked_sub(offset)
+            && screen_row + 3 <= usize::from(area.height)
+        {
+            let rect = Rect::new(
+                area.x,
+                area.y.saturating_add(screen_row as u16),
+                crate::tui::chrome::scrollbar_content(area).width,
+                3,
+            );
+            if let Some(caret) = crate::tui::chrome::render_field(
+                frame,
+                rect,
+                "Callback URL or code",
+                &state.manual_input,
+                true,
+                "",
+            ) {
+                frame.set_cursor_position(caret);
+            }
+        }
         for (line, title, field, focused, placeholder) in fields {
             let y = area.y.saturating_add(line.saturating_sub(offset) as u16);
             if line < offset || y >= area.bottom() {
@@ -4524,6 +4595,7 @@ impl SettingsCx {
             Line::default(),
         ];
         let mut bindings = Vec::new();
+        let mut inline_edit_field = None;
 
         // Scope-aware field list: provider scope includes provider-only
         // transport security, while model scope omits provider-only rows and
@@ -4536,6 +4608,20 @@ impl SettingsCx {
             .unwrap_or(0);
 
         for (i, field) in fields.iter().enumerate() {
+            if editor.editing == Some(*field) {
+                let line = lines.len();
+                bindings.push((
+                    line,
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::RowEditor(
+                            super::pointer_actions::ProviderRowEditorAction::SettingEdit(*field),
+                        ),
+                    ),
+                ));
+                lines.extend([Line::default(), Line::default(), Line::default()]);
+                inline_edit_field = Some((line, *field));
+                continue;
+            }
             let selected = i == editor.cursor;
             let marker = if selected { "› " } else { "  " };
             let label_style = if selected {
@@ -4559,16 +4645,7 @@ impl SettingsCx {
                 ),
                 Span::raw("  "),
             ];
-            // While editing a numeric field, show the live buffer with a
-            // caret at the text-field cursor; otherwise the formatted value.
-            if editor.editing == Some(*field) {
-                let (before, after) = editor.buf.split_at_cursor();
-                spans.push(Span::styled(before.to_string(), value_style));
-                spans.push(super::shell::cursor_marker_span());
-                spans.push(Span::styled(after.to_string(), value_style));
-            } else {
-                spans.push(Span::styled(editor.value_str(*field), value_style));
-            }
+            spans.push(Span::styled(editor.value_str(*field), value_style));
             if !overridden {
                 spans.push(Span::styled("  (inherited)".to_string(), muted));
             }
@@ -4788,6 +4865,44 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, field)) = inline_edit_field {
+            let offset = self.scroll_states.offset_for("providers:settings");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    field.label(),
+                    &editor.buf,
+                    true,
+                    "",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Providers(
+                                super::pointer_actions::ProvidersAction::RowEditor(
+                                    super::pointer_actions::ProviderRowEditorAction::SettingEdit(
+                                        field,
+                                    ),
+                                ),
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
@@ -6423,22 +6538,25 @@ impl SettingsPage for ProvidersPage {
             ) {
                 return self.handle_pointer_control(cx, action);
             }
-            let (label, field): (&str, &mut TextField) = match state.run.current_step_id() {
-                Some("id") => ("id", &mut state.id_field),
-                Some("url") => ("url", &mut state.url_field),
-                Some("api-key") => ("api key", state.api_key_field.as_mut()),
-                Some("env-var") => ("env var", state.env_var_field.as_mut()),
+            let field: &mut TextField = match state.run.current_step_id() {
+                Some("id") => &mut state.id_field,
+                Some("url") => &mut state.url_field,
+                Some("api-key") => state.api_key_field.as_mut(),
+                Some("env-var") => state.env_var_field.as_mut(),
                 _ => {
                     return self.handle_pointer_control(cx, action);
                 }
             };
             let value_x = cx
                 .pointer_surface
-                .area
-                .get()
-                .map_or(label.len() as u16 + 2, |area| {
-                    area.x.saturating_add(label.len() as u16 + 2)
-                });
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                // `render_field` has a one-cell border and one-cell horizontal padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
             field.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
             return Nav::Stay;
         }

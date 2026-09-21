@@ -8,7 +8,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::tui::button::{
     ButtonDispatch, ButtonId, ButtonKind, ButtonRegistry, ButtonSpec, RowControlId,
@@ -77,10 +77,6 @@ pub(super) fn heading_style() -> Style {
 
 pub(super) fn focused_field_style() -> Style {
     Style::default().fg(resolve_color(INK, INK_INDEX))
-}
-
-pub(super) fn inactive_field_style() -> Style {
-    muted_style()
 }
 
 pub(super) fn caret_style() -> Style {
@@ -720,98 +716,6 @@ pub(super) fn push_label_value_row(
     );
 }
 
-pub(super) fn push_label_text_field_row(
-    lines: &mut Vec<Line<'static>>,
-    width: u16,
-    selected: bool,
-    label: &str,
-    label_width: usize,
-    value: &str,
-    cursor: usize,
-) {
-    let indent = ROW_MARKER_WIDTH + label_width + 2;
-    let value_width = usize::from(width).saturating_sub(indent).max(1);
-    let visible = cursor_visible_slice(value, cursor, value_width);
-    let cursor = cockpit_host::text::floor_char_boundary(value, cursor);
-    let rel_cursor = cursor.saturating_sub(visible.start).min(visible.text.len());
-    let rel_cursor = cockpit_host::text::floor_char_boundary(&visible.text, rel_cursor);
-    let (before, after) = visible.text.split_at(rel_cursor);
-    let mut spans = vec![
-        Span::raw(marker(selected).to_string()),
-        Span::styled(
-            format!("{label:<width$}", width = label_width),
-            selected_or_field(selected),
-        ),
-        Span::raw("  "),
-    ];
-    if visible.text.is_empty() {
-        spans.push(cursor_marker_span());
-    } else {
-        spans.push(Span::styled(before.to_string(), focused_field_style()));
-        spans.push(cursor_marker_span());
-        spans.push(Span::styled(after.to_string(), focused_field_style()));
-    }
-    lines.push(Line::from(spans));
-}
-
-pub(super) fn push_text_field_at_cursor(
-    lines: &mut Vec<Line<'static>>,
-    width: u16,
-    label: &str,
-    value: &str,
-    cursor: usize,
-    focused: bool,
-    placeholder: Option<&str>,
-) -> std::ops::Range<usize> {
-    let start = lines.len();
-    let prompt = format!("{label}: ");
-    if focused {
-        let mut spans = vec![Span::styled(prompt, muted_style())];
-        if value.is_empty() {
-            spans.push(cursor_marker_span());
-            if let Some(placeholder) = placeholder {
-                spans.push(Span::styled(
-                    placeholder.to_string(),
-                    inactive_field_style(),
-                ));
-            }
-            lines.push(Line::from(spans));
-            return start..lines.len();
-        }
-        let cursor = cockpit_host::text::floor_char_boundary(value, cursor);
-        let (before, after) = value.split_at(cursor);
-        spans.push(Span::styled(before.to_string(), focused_field_style()));
-        spans.push(cursor_marker_span());
-        spans.push(Span::styled(after.to_string(), focused_field_style()));
-        lines.push(Line::from(spans));
-        return start..lines.len();
-    }
-
-    let shown = if value.is_empty() {
-        placeholder.unwrap_or("")
-    } else {
-        value
-    };
-    let value_style = if value.is_empty() {
-        inactive_field_style()
-    } else {
-        focused_field_style()
-    };
-    push_wrapped_prefixed_value(
-        lines,
-        width,
-        WrappedValueLayout {
-            first_prefix: vec![Span::styled(prompt.clone(), muted_style())],
-            prefix_width: prompt.width(),
-            continuation_prefix: vec![Span::raw(" ".repeat(prompt.width()))],
-            suffix: None,
-        },
-        shown,
-        value_style,
-    );
-    start..lines.len()
-}
-
 pub(super) fn push_wrapped_text(
     lines: &mut Vec<Line<'static>>,
     width: u16,
@@ -821,78 +725,6 @@ pub(super) fn push_wrapped_text(
     for chunk in wrap_chunks(text, usize::from(width).max(1)) {
         lines.push(Line::from(Span::styled(chunk, style)));
     }
-}
-
-struct VisibleSlice {
-    start: usize,
-    text: String,
-}
-
-fn cursor_visible_slice(value: &str, cursor: usize, max_width: usize) -> VisibleSlice {
-    let cursor = cockpit_host::text::floor_char_boundary(value, cursor);
-    let before = &value[..cursor];
-    let mut start = 0;
-    while before[start..].width() >= max_width && start < cursor {
-        let Some((idx, ch)) = before[start..].char_indices().next() else {
-            break;
-        };
-        start += idx + ch.len_utf8();
-    }
-    let start = cockpit_host::text::floor_char_boundary(value, start);
-    let mut end = cursor;
-    while end < value.len() && value[start..end].width() < max_width.saturating_sub(1) {
-        let Some(ch) = value[end..].chars().next() else {
-            break;
-        };
-        let next = end + ch.len_utf8();
-        if value[start..next].width() > max_width {
-            break;
-        }
-        end = next;
-    }
-    VisibleSlice {
-        start,
-        text: value[start..end].to_string(),
-    }
-}
-
-pub(super) fn text_area_lines(
-    title: String,
-    mode_label: String,
-    hint: &'static str,
-    text: &str,
-    cursor: (usize, usize),
-) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(title, heading_style()),
-            Span::raw(" "),
-            Span::styled(format!("[{mode_label}]"), warning_style()),
-        ]),
-        Line::from(Span::styled(hint.to_string(), muted_style())),
-        Line::default(),
-    ];
-
-    let (cur_line, cur_col) = cursor;
-    for (li, line_text) in text.split('\n').enumerate() {
-        if li == cur_line {
-            let chars: Vec<char> = line_text.chars().collect();
-            let split = cur_col.min(chars.len());
-            let before: String = chars[..split].iter().collect();
-            let after: String = chars[split..].iter().collect();
-            lines.push(Line::from(vec![
-                Span::styled(before, focused_field_style()),
-                cursor_marker_span(),
-                Span::styled(after, focused_field_style()),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled(
-                line_text.to_string(),
-                focused_field_style(),
-            )));
-        }
-    }
-    lines
 }
 
 fn wrap_chunks(value: &str, width: usize) -> Vec<String> {

@@ -457,7 +457,12 @@ impl SettingsCx {
         ];
         let mut controls = vec![None; lines.len()];
         let mut confirmation_lines = Vec::new();
-        push_wrapped_text(&mut lines, area.width, p.kind.intro(), muted);
+        push_wrapped_text(
+            &mut lines,
+            crate::tui::chrome::scrollbar_content(area).width,
+            p.kind.intro(),
+            muted,
+        );
         controls.resize(lines.len(), None);
         lines.push(Line::default());
         controls.push(None);

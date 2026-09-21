@@ -587,6 +587,7 @@ impl SettingsCx {
         let pointer_enabled = self.pointer_surface.enabled.get();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
+        let mut custom_field_line = None;
 
         lines.push(Line::from(Span::styled(
             "Utility model — picks the cheap background model".to_string(),
@@ -600,29 +601,9 @@ impl SettingsCx {
                     "custom provider:model-id".to_string(),
                     muted,
                 )));
-                let (before, after) = buf.split_at_cursor();
-                bindings.push((
-                    lines.len(),
-                    SettingsPointerAction::UtilityModel(UtilityModelAction::EditCustom),
-                ));
-                lines.push(Line::from(vec![
-                    Span::styled("› ".to_string(), muted),
-                    Span::styled(
-                        before.to_string(),
-                        Style::default().fg(resolve_color(
-                            crate::tui::theme::INK,
-                            crate::tui::theme::INK_INDEX,
-                        )),
-                    ),
-                    super::shell::cursor_marker_span(),
-                    Span::styled(
-                        after.to_string(),
-                        Style::default().fg(resolve_color(
-                            crate::tui::theme::INK,
-                            crate::tui::theme::INK_INDEX,
-                        )),
-                    ),
-                ]));
+                let line = lines.len();
+                lines.extend([Line::default(), Line::default(), Line::default()]);
+                custom_field_line = Some((line, buf));
                 lines.push(Line::default());
                 if picker.entries.is_empty() {
                     lines.push(Line::from(Span::styled(
@@ -778,6 +759,38 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, buf)) = custom_field_line {
+            let offset = self.scroll_states.offset_for("category:utility-picker");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) = crate::tui::chrome::render_field(
+                    frame,
+                    rect,
+                    "provider:model-id",
+                    buf,
+                    true,
+                    "",
+                ) {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            SettingsPointerAction::UtilityModel(UtilityModelAction::EditCustom),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 }
 
@@ -813,7 +826,12 @@ fn render_grab_list(
     ];
     let mut controls = vec![None; lines.len()];
     let mut confirmation_lines = Vec::new();
-    push_wrapped_text(&mut lines, area.width, intro, muted);
+    push_wrapped_text(
+        &mut lines,
+        crate::tui::chrome::scrollbar_content(area).width,
+        intro,
+        muted,
+    );
     controls.resize(lines.len(), None);
     lines.push(Line::default());
     controls.push(None);

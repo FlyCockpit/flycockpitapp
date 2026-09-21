@@ -4,7 +4,7 @@
   + New session               ▌R│Instructions Files                                                                  │ │
                               ▌ │                                                                                    │ │
  SESSIONS                       │Only the first matching file (in this order) is injected into prompts. Walks up fro │ │
- no active sessions in all pr   │ cwd to the git root.                                                               │ │
+ no active sessions in all pr   │m cwd to the git root.                                                              │ │
                                 │                                                                                    │ │
                               no│› AGENTS.md                                                                         │ │
                               ┊ │    [Delete AGENTS.md]                                                              │ │

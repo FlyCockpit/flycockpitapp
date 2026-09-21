@@ -1790,27 +1790,17 @@ impl SettingsPage for McpPage {
                 return Nav::Stay;
             }
             state.cursor = index;
-            let label = match index {
-                FIELD_NAME => Some("name"),
-                FIELD_ENDPOINT => Some("endpoint"),
-                FIELD_COMMAND => Some("command"),
-                FIELD_ARGS => Some("args"),
-                FIELD_BASE_ENV => Some("base env"),
-                FIELD_HEADER_NAME => Some("header name"),
-                FIELD_HEADER_VALUE => Some("header value"),
-                FIELD_AUTH_ENV => Some("auth env"),
-                FIELD_OAUTH_AUTHORIZE => Some("oauth authorize"),
-                FIELD_OAUTH_TOKEN => Some("oauth token"),
-                FIELD_OAUTH_CLIENT => Some("oauth client id"),
-                FIELD_OAUTH_SCOPES => Some("oauth scopes"),
-                FIELD_CACHE_TTL => Some("cache ttl"),
-                FIELD_CONNECT_TIMEOUT => Some("connect timeout"),
-                FIELD_REQUEST_TIMEOUT => Some("request timeout"),
-                _ => None,
-            };
-            if let Some(label) = label {
-                let area_x = cx.pointer_surface.area.get().map_or(0, |area| area.x);
-                let value_x = area_x.saturating_add(label.len() as u16 + 2);
+            if index != FIELD_ENABLED && index != FIELD_TRANSPORT && index != FIELD_AUTH {
+                let value_x = cx
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                    })
+                    // `render_field` has a one-cell border and one-cell horizontal padding.
+                    .map_or(column, |target| target.rect.x.saturating_add(2));
                 if let Some(field) = active_text_field_mut(state) {
                     field.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
                 }

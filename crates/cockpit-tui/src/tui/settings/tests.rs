@@ -5204,22 +5204,36 @@ fn lsp_server_row_windows_into_short_viewport() {
 }
 
 #[test]
-fn shared_single_line_field_and_text_area_render_caret_and_hint() {
-    let mut lines = Vec::new();
-    shell::push_text_field_at_cursor(&mut lines, 24, "name", "alpha", "alpha".len(), true, None);
-    let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-    assert!(rendered.contains("name: alpha\u{E000}"));
-
-    let area = shell::text_area_lines(
-        "editing agent".to_string(),
-        "insert".to_string(),
-        "ctrl+s: save  enter: newline  esc: cancel",
-        "one\ntwo",
-        (1, 1),
+fn shared_field_renderer_paints_a_rounded_field_and_real_terminal_caret() {
+    let backend = TestBackend::new(24, 3);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let field = TextField::new("alpha");
+    terminal
+        .draw(|frame| {
+            let caret = crate::tui::chrome::render_field(
+                frame,
+                Rect::new(0, 0, 24, 3),
+                "name",
+                &field,
+                true,
+                "",
+            );
+            frame.set_cursor_position(caret.expect("focused field caret"));
+        })
+        .expect("draw");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("name"));
+    assert!(rendered.contains("alpha"));
+    assert_eq!(
+        terminal.backend_mut().get_cursor_position(),
+        Ok(Position::new(7, 1))
     );
-    let rendered = area.iter().map(line_text).collect::<Vec<_>>().join("\n");
-    assert!(rendered.contains("ctrl+s: save  enter: newline  esc: cancel"));
-    assert!(rendered.contains("t\u{E000}wo"));
 }
 
 #[test]
@@ -7861,7 +7875,8 @@ fn utility_picker_custom_render_places_caret_at_textfield_cursor() {
 
     let rows = render_settings_rows(&d, 80, 20).join("\n");
 
-    assert!(rows.contains("› a b"), "{rows}");
+    assert!(rows.contains("provider:model-id"), "{rows}");
+    assert!(rows.contains("ab"), "{rows}");
 }
 
 #[test]

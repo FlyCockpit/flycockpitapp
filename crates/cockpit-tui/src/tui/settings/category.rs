@@ -4621,7 +4621,11 @@ impl SettingsPage for CategoryPage {
     fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
         use super::pointer_actions::{CategoryAction, SettingsPointerAction, UtilityModelAction};
         let mut actions = Vec::new();
-        if self.utility_picker.is_some() {
+        if self
+            .utility_picker
+            .as_ref()
+            .is_some_and(|picker| matches!(picker.mode, PickerMode::Custom { .. }))
+        {
             actions.push(super::shell::SettingsHelpAction {
                 label: "Cancel",
                 enabled: true,

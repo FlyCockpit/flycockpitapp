@@ -1541,10 +1541,9 @@ fn render_provider_oauth(
                 "Paste callback URL, ?code=...&state=..., or bare code:".to_string(),
                 muted,
             )));
-            lines.push(Line::from(vec![
-                Span::styled(s.manual_input.text().to_string(), cyan),
-                crate::tui::settings::shell::cursor_marker_span(),
-            ]));
+            // The caller overlays these reserved rows with the shared rounded
+            // field after it has applied its scroll layout.
+            lines.extend([Line::default(), Line::default(), Line::default()]);
         }
     }
 

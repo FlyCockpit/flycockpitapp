@@ -28,8 +28,8 @@ use cockpit_config::extended::{
 
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
-    SettingsScrollRegionId, focused_field_style, marker, muted_style, push_text_field_at_cursor,
-    selected_line_from_marker, selected_style, warning_style,
+    SettingsScrollRegionId, focused_field_style, marker, muted_style, selected_line_from_marker,
+    selected_style, warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -525,6 +525,7 @@ impl SettingsCx {
         let yellow = warning_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
+        let mut add_field_line = None;
         lines.push(Line::from(Span::styled(
             "External harnesses (harness_invoke)".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -612,15 +613,9 @@ impl SettingsCx {
 
         if let Some(buf) = &s.adding {
             lines.push(Line::default());
-            push_text_field_at_cursor(
-                &mut lines,
-                area.width,
-                "new harness name",
-                buf.text(),
-                buf.cursor(),
-                true,
-                None,
-            );
+            let line = lines.len();
+            lines.extend([Line::default(), Line::default(), Line::default()]);
+            add_field_line = Some((line, buf));
         }
         if let Some(status) = &s.status {
             lines.push(Line::default());
@@ -639,6 +634,35 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, buf)) = add_field_line {
+            let offset = self.scroll_states.offset_for("harnesses:list");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) =
+                    crate::tui::chrome::render_field(frame, rect, "New harness name", buf, true, "")
+                {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Harnesses(
+                                super::pointer_actions::HarnessesAction::Add,
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 
     fn render_harness_edit(&self, frame: &mut Frame, area: Rect, s: &EditState) {
@@ -646,6 +670,7 @@ impl SettingsCx {
         let yellow = warning_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
+        let mut edit_field_line = None;
         lines.push(Line::from(Span::styled(
             format!("Harness: {}", s.name),
             Style::default()
@@ -688,33 +713,9 @@ impl SettingsCx {
         if let Some(buf) = &s.editing {
             let field = FIELDS[s.cursor.min(FIELDS.len() - 1)];
             lines.push(Line::default());
-            let edit_line = lines.len();
-            push_text_field_at_cursor(
-                &mut lines,
-                area.width,
-                field.label(),
-                buf.text(),
-                buf.cursor(),
-                true,
-                None,
-            );
-            let field_x = field.label().chars().count().saturating_add(2) as u16;
-            self.pointer_surface
-                .register(super::shell::SettingsPointerTarget {
-                    rect: Rect::new(
-                        area.x.saturating_add(field_x),
-                        area.y.saturating_add(edit_line as u16),
-                        area.width.saturating_sub(field_x),
-                        1,
-                    ),
-                    action: super::shell::SettingsPointerAction::Page(
-                        super::pointer_actions::SettingsPointerAction::Harnesses(
-                            super::pointer_actions::HarnessesAction::EditField(field.pointer_id()),
-                        ),
-                    ),
-                    enabled: true,
-                    disabled_reason: None,
-                });
+            let line = lines.len();
+            lines.extend([Line::default(), Line::default(), Line::default()]);
+            edit_field_line = Some((line, field, buf));
         }
         if let Some(status) = &s.status {
             lines.push(Line::default());
@@ -733,6 +734,37 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, field, buf)) = edit_field_line {
+            let offset = self.scroll_states.offset_for("harnesses:edit");
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row + 3 <= usize::from(area.height)
+            {
+                let rect = Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    crate::tui::chrome::scrollbar_content(area).width,
+                    3,
+                );
+                if let Some(caret) =
+                    crate::tui::chrome::render_field(frame, rect, field.label(), buf, true, "")
+                {
+                    frame.set_cursor_position(caret);
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Harnesses(
+                                super::pointer_actions::HarnessesAction::EditField(
+                                    field.pointer_id(),
+                                ),
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+        }
     }
 }
 
@@ -918,7 +950,8 @@ impl SettingsPage for HarnessesPage {
                 .find(|target| {
                     target.action == super::shell::SettingsPointerAction::Page(action.clone())
                 })
-                .map_or(column, |target| target.rect.x);
+                // `render_field`'s text starts after its border and padding.
+                .map_or(column, |target| target.rect.x.saturating_add(2));
             buf.set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
         }
         self.handle_pointer_control(cx, action)

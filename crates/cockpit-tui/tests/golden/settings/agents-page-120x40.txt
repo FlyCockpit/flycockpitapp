@@ -4,11 +4,11 @@
   + New session               ▌R│Agents                                                                             █│ │
                               ▌ │                                                                                   █│ │
  SESSIONS                       │Enter opens a structured tool editor; e edits a daemon snapshot. Workspace agents c█│ │
- no active sessions in all pr   │n use $EDITOR through a private, securely seeded leased staging file; its edited by█│ │
-                                │es are committed by the daemon. Assistants use the in-TUI editor. Editing a built-i█│ │
-                              no│ ejects its default first. The model is the `model:` frontmatter field (provider/mo█│ │
-                              ┊ │el). Delete uses the source-specific daemon authority; reset reverts an overridden █│ │
-                              ▌ │uilt-in.                                                                           █│ │
+ no active sessions in all pr   │an use $EDITOR through a private, securely seeded leased staging file; its edited b█│ │
+                                │ytes are committed by the daemon. Assistants use the in-TUI editor. Editing a built█│ │
+                              no│-in ejects its default first. The model is the `model:` frontmatter field (provider█│ │
+                              ┊ │/model). Delete uses the source-specific daemon authority; reset reverts an overrid█│ │
+                              ▌ │den built-in.                                                                      █│ │
                                 │                                                                                   █│ █
                                 │› Assistant (built-in)  model: session default                                     █│ █
                                 │    General-purpose personal assistant; file-capable and knowledge-aware, delegates█│ █

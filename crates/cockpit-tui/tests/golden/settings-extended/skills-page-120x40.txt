@@ -4,9 +4,9 @@
   + New session               ▌R│Skills                                                                              │ │
                               ▌ │                                                                                    │ │
  SESSIONS                       │Scan dirs hold `<name>/SKILL.md` skills. Entries support `~`, `$VAR`, and relative  │ │
- no active sessions in all pr   │aths. The list ships pre-seeded (~/.agents/skills + ./.agents/skills); an empty lis │ │
-                                │ scans nothing. Ancestor walk extends relative entries to every dir up to the git r │ │
-                              no│ot.                                                                                 │ │
+ no active sessions in all pr   │paths. The list ships pre-seeded (~/.agents/skills + ./.agents/skills); an empty li │ │
+                                │st scans nothing. Ancestor walk extends relative entries to every dir up to the git │ │
+                              no│ root.                                                                              │ │
                               ┊ │                                                                                    │ │
                               ▌ │› ▢ auto-! commands  Codex mode (default — inject !`command` verbatim; never runs)  │ │
                                 │  ▢ ancestor walk    off (default — relative entries resolve against cwd only)      │ █

@@ -4071,7 +4071,7 @@ impl SettingsCx {
         let mut controls = vec![None; lines.len()];
         push_wrapped_text(
             &mut lines,
-            area.width,
+            crate::tui::chrome::scrollbar_content(area).width,
             "Enter opens a structured tool editor; e edits a daemon snapshot. \
              Workspace agents can use $EDITOR through a private, securely seeded leased staging file; its edited bytes are committed by the daemon. Assistants use the in-TUI editor. Editing a built-in ejects its default first. The model is \
              the `model:` frontmatter field (provider/model). Delete uses the source-specific daemon authority; reset reverts an overridden built-in.",

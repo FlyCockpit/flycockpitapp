@@ -211,7 +211,7 @@ impl SettingsCx {
         let mut controls = vec![None; lines.len()];
         push_wrapped_text(
             &mut lines,
-            area.width,
+            crate::tui::chrome::scrollbar_content(area).width,
             "Scan dirs hold `<name>/SKILL.md` skills. Entries support \
              `~`, `$VAR`, and relative paths. The list ships pre-seeded \
              (~/.agents/skills + ./.agents/skills); an empty list scans \

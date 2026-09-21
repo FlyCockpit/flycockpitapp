@@ -157,7 +157,7 @@ impl Scene {
                         x: x + col as i32,
                         y: y + row as i32,
                         ch: glyph.chars().next().unwrap_or(' '),
-                        fg: Color::Indexed(*fg),
+                        fg: crate::tui::theme::indexed_color(*fg),
                         bg: bg.map(Color::Indexed).unwrap_or(Color::Reset),
                     });
                 }

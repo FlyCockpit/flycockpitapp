@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::textfield::TextField;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 use cockpit_config::providers::ProvidersConfig;
 
 use super::grab;
@@ -579,7 +579,7 @@ impl SettingsCx {
         picker: &UtilityModelSelector,
         target: super::category::SettingId,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let pointer_enabled = self.pointer_surface.enabled.get();
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -669,7 +669,7 @@ impl SettingsCx {
                     SettingsPointerAction::UtilityModel(UtilityModelAction::Clear),
                 ));
                 lines.push(Line::from(vec![
-                    Span::raw(if clear_active { "▸ " } else { "  " }),
+                    Span::raw(if clear_active { "› " } else { "  " }),
                     Span::styled(
                         if pointer_enabled {
                             format!("[clear — unset]{clear_suffix}")
@@ -684,7 +684,7 @@ impl SettingsCx {
                     SettingsPointerAction::UtilityModel(UtilityModelAction::OpenCustom),
                 ));
                 lines.push(Line::from(vec![
-                    Span::raw(if custom_active { "▸ " } else { "  " }),
+                    Span::raw(if custom_active { "› " } else { "  " }),
                     Span::styled(
                         if pointer_enabled {
                             "[custom provider:model-id…]"
@@ -712,7 +712,7 @@ impl SettingsCx {
                         last_provider = Some(e.provider_id.as_str());
                     }
                     let active = *cursor == i + PICKER_ACTION_ROWS;
-                    let marker = if active { "▸ " } else { "  " };
+                    let marker = if active { "› " } else { "  " };
                     let label_style = if active {
                         yellow.add_modifier(Modifier::BOLD)
                     } else {
@@ -805,7 +805,7 @@ fn render_grab_list(
     status: Option<&str>,
     delete: &RowDeleteConfirm,
 ) {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled(

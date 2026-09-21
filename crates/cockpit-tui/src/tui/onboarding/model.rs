@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 
 use super::theme::{BAD, BRASS, FOG, INK, NIGHT};
 use super::ui::{self, ListNav, STAR};
@@ -549,7 +549,7 @@ impl ModelScreen {
             ModelPhase::Limits => unreachable!(),
         };
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(NIGHT))
             .title(Span::styled(title, Style::new().fg(INK)))
             .padding(Padding::horizontal(1));

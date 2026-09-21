@@ -562,7 +562,7 @@ impl QuestionDialog {
         }
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(border_color))
             .title(Span::styled(title, Style::default().fg(border_color)));
         let inner = block.inner(area);

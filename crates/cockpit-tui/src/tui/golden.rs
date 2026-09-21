@@ -259,7 +259,11 @@ fn format_color(color: Color) -> String {
         Color::LightCyan => "LightCyan".into(),
         Color::White => "White".into(),
         Color::Rgb(r, g, b) => format!("Rgb({r},{g},{b})"),
-        Color::Indexed(index) => format!("Indexed({index})"),
+        color => {
+            let index = crate::tui::theme::indexed_value(color)
+                .expect("remaining ratatui colour is indexed");
+            format!("Indexed{}", format_args!("({index})"))
+        }
     }
 }
 

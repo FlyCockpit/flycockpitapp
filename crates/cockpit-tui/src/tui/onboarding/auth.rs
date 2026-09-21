@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use super::{chrome, theme, ui};
 use crate::tui::settings::{
@@ -173,7 +173,7 @@ impl AuthScreen {
             AuthPhase::DeviceIdle | AuthPhase::DevicePolling | AuthPhase::PasteCallback => {
                 "Sign in to your subscription"
             }
-            AuthPhase::ApiKey => "Add your API key",
+            AuthPhase::ApiKey => provider_api_key_copy(self.template).0,
         }
     }
     pub(crate) fn subtitle(&self) -> String {
@@ -187,7 +187,7 @@ impl AuthScreen {
             AuthPhase::PasteCallback => {
                 "Approve access in the browser, then paste the result back.".into()
             }
-            AuthPhase::ApiKey => format!("Paste a key for {}.", self.template.display),
+            AuthPhase::ApiKey => provider_api_key_copy(self.template).1,
         }
     }
 
@@ -620,7 +620,7 @@ impl AuthScreen {
             rows[1],
         );
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::new().fg(theme::NIGHT))
             .title(" One-time code ");
         let inner = block.inner(rows[3]);
@@ -751,4 +751,13 @@ impl AuthScreen {
             frame.set_cursor_position(caret);
         }
     }
+}
+
+/// Copy seam shared by first-run and `/setup provider`; the settings wizard
+/// keeps its mature reducer but presents the same Authenticate screen shape.
+pub(crate) fn provider_api_key_copy(template: &'static ProviderTemplate) -> (&'static str, String) {
+    (
+        "Add your API key",
+        format!("Paste a key for {}.", template.display),
+    )
 }

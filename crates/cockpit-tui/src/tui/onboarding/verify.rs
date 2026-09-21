@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use super::{ProviderSettlementEvidence, auth::SPINNER, chrome, theme, ui};
 
@@ -151,7 +151,7 @@ impl VerifyScreen {
         match &self.phase {
             VerifyPhase::Fetching => frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("{} ", SPINNER[self.spinner]), Style::new().fg(theme::BRASS)), Span::styled("Fetching models from the provider…", Style::new().fg(theme::FOG))])), area),
             VerifyPhase::Success(models) => {
-                let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::GOOD)).title(Span::styled(" Models ", Style::new().fg(theme::GOOD)));
+                let block = Block::bordered().border_type(crate::tui::chrome::rounded_border_type()).border_style(Style::new().fg(theme::GOOD)).title(Span::styled(" Models ", Style::new().fg(theme::GOOD)));
                 let inner = block.inner(area);
                 frame.render_widget(block, area);
                 let count = models.len();
@@ -220,6 +220,19 @@ impl VerifyScreen {
                 );
             }
         }
+    }
+}
+
+/// Copy seam shared by the onboarding Verify screen and settings' retained
+/// provider wizard reducer.
+pub(crate) fn provider_verify_copy(provider_id: &str, fetching: bool) -> (&'static str, String) {
+    if fetching {
+        (
+            "Verifying provider",
+            format!("Checking {provider_id} through the Cockpit daemon."),
+        )
+    } else {
+        ("✓ Connected", format!("{provider_id} is ready."))
     }
 }
 

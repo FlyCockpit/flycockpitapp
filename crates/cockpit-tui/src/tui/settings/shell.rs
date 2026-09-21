@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -14,9 +14,12 @@ use crate::tui::button::{
     ButtonDispatch, ButtonId, ButtonKind, ButtonRegistry, ButtonSpec, RowControlId,
     RowControlRegistry, RowDispatch, RowTarget, first_bracketed_label,
 };
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{
+    BRASS, BRASS_INDEX, FOG, FOG_INDEX, GOOD, GOOD_INDEX, INK, INK_INDEX, RED, RED_INDEX, YELLOW,
+    YELLOW_INDEX, resolve_color,
+};
 
-pub(super) const SELECTED_MARKER: &str = "▸ ";
+pub(super) const SELECTED_MARKER: &str = "› ";
 pub(super) const ROW_MARKER_WIDTH: usize = 2;
 const CURSOR_MARKER: &str = "\u{E000}";
 pub(super) const TEXT_COLUMN_GUTTER_WIDTH: u16 = 2;
@@ -57,17 +60,15 @@ pub(super) fn settings_text_columns(area: Rect) -> TextColumnLayout {
 }
 
 pub(super) fn normal_style() -> Style {
-    Style::default()
+    Style::default().fg(resolve_color(INK, INK_INDEX))
 }
 
 pub(super) fn muted_style() -> Style {
-    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
+    Style::default().fg(resolve_color(FOG, FOG_INDEX))
 }
 
 pub(super) fn selected_style() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD)
+    crate::tui::chrome::selection_style()
 }
 
 pub(super) fn heading_style() -> Style {
@@ -75,7 +76,7 @@ pub(super) fn heading_style() -> Style {
 }
 
 pub(super) fn focused_field_style() -> Style {
-    Style::default().fg(Color::White)
+    Style::default().fg(resolve_color(INK, INK_INDEX))
 }
 
 pub(super) fn inactive_field_style() -> Style {
@@ -83,7 +84,7 @@ pub(super) fn inactive_field_style() -> Style {
 }
 
 pub(super) fn caret_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    Style::default().fg(resolve_color(BRASS, BRASS_INDEX))
 }
 
 pub(super) fn cursor_marker_span() -> Span<'static> {
@@ -107,15 +108,15 @@ pub(super) fn park_cursor_from_markers(frame: &mut Frame, area: Rect) -> Option<
 }
 
 pub(super) fn success_style() -> Style {
-    Style::default().fg(Color::Green)
+    Style::default().fg(resolve_color(GOOD, GOOD_INDEX))
 }
 
 pub(super) fn warning_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    Style::default().fg(resolve_color(YELLOW, YELLOW_INDEX))
 }
 
 pub(super) fn error_style() -> Style {
-    Style::default().fg(Color::Red)
+    Style::default().fg(resolve_color(RED, RED_INDEX))
 }
 
 pub(super) fn marker(selected: bool) -> &'static str {
@@ -417,7 +418,27 @@ impl SettingsScrollStates {
         let mut states = self.states.borrow_mut();
         let state = states.entry(key.into()).or_default();
         state.select(selected);
-        frame.render_stateful_widget(List::new(items).scroll_padding(1), area, state);
+        // The enclosing rounded section owns the column immediately to the
+        // right of `area`; use that border column as the permanently reserved
+        // scrollbar track so page wrapping retains the full inner width.
+        let track_area = Rect {
+            width: area.width.saturating_add(1),
+            ..area
+        };
+        let content = crate::tui::chrome::scrollbar(
+            frame,
+            track_area,
+            item_count,
+            usize::from(area.height),
+            state.offset(),
+        );
+        frame.render_stateful_widget(
+            List::new(items)
+                .scroll_padding(1)
+                .highlight_style(crate::tui::chrome::selection_style()),
+            content,
+            state,
+        );
     }
 
     /// Render a list and publish its page-declared semantic controls from the

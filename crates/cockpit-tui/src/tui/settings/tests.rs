@@ -5003,7 +5003,7 @@ fn boxed_settings_page_can_be_pushed_driven_rendered_and_popped() {
 
     // The dialog reserves one row each for its header and help strip. Include
     // one body row inside the border so the boxed page can render content.
-    let rows = render_settings_rows(&d, 40, 5).join("\n");
+    let rows = render_settings_rows(&d, 40, 7).join("\n");
     assert!(rows.contains("probe page"), "rendered rows were {rows:?}");
 
     d.handle_key(press(KeyCode::Esc));
@@ -5011,7 +5011,7 @@ fn boxed_settings_page_can_be_pushed_driven_rendered_and_popped() {
 }
 
 fn settings_body_area(width: u16, height: u16) -> Rect {
-    Rect::new(1, 1, width.saturating_sub(2), height.saturating_sub(3))
+    Rect::new(2, 3, width.saturating_sub(4), height.saturating_sub(6))
 }
 
 #[test]
@@ -5074,7 +5074,7 @@ fn category_wrapped_values_continue_under_value_column() {
         .find(|line| line.contains("approval to leave the"))
         .unwrap_or_else(|| panic!("expected wrapped approval-mode value:\n{rendered}"));
     assert!(
-        continuation.starts_with("│     "),
+        continuation.starts_with("││     "),
         "continuation should stay in the value column, not column 0:\n{rendered}"
     );
     assert!(
@@ -5104,7 +5104,13 @@ fn category_two_column_render_reserves_blank_gutter() {
     );
     for y in left.y..left.y + left.height {
         let row = &rendered[usize::from(y)];
-        for x in left.x + left.width..right.x {
+        let track_x = left.x + left.width;
+        assert!(
+            matches!(rendered_char(row, track_x), '│' | '█' | ' '),
+            "first gutter column is the reserved scrollbar track:\n{}",
+            rendered.join("\n")
+        );
+        for x in track_x.saturating_add(1)..right.x {
             assert_eq!(
                 rendered_char(row, x),
                 ' ',
@@ -5425,8 +5431,17 @@ fn mcp_add_form_renders_cursor_at_textfield_position() {
         .position(|row| row.contains("name: abX"))
         .expect("name row rendered") as u16;
     let row = &rendered[usize::from(y)];
-    let value_start = row.find("name: ").expect("name label rendered") + "name: ".len();
-    let value_end = row.find("cd").expect("tail rendered") + "cd".len();
+    let row_chars = row.chars().collect::<Vec<_>>();
+    let value_start = row_chars
+        .windows(6)
+        .position(|text| text == ['n', 'a', 'm', 'e', ':', ' '])
+        .expect("name label rendered")
+        + 6;
+    let value_end = row_chars
+        .windows(2)
+        .position(|pair| pair == ['c', 'd'])
+        .expect("tail rendered")
+        + 2;
     let cursor = terminal.backend_mut().get_cursor_position().unwrap();
     assert_eq!(cursor.y, y);
     assert!(
@@ -7400,7 +7415,7 @@ fn lsp_severity_is_muted_non_selectable_info_line() {
         severity
             .spans
             .iter()
-            .any(|span| span.style.fg == Some(Color::Indexed(MUTED_COLOR_INDEX))),
+            .any(|span| span.style.fg == Some(resolve_color(FOG, FOG_INDEX))),
         "severity info line is muted"
     );
 
@@ -7411,7 +7426,7 @@ fn lsp_severity_is_muted_non_selectable_info_line() {
         let selected = lsp_rows(&d, p)
             .0
             .into_iter()
-            .find(|line| line.to_string().starts_with("▸ "))
+            .find(|line| line.to_string().starts_with("› "))
             .expect("one selected row");
         assert!(
             !selected.to_string().contains("severity"),
@@ -8165,9 +8180,13 @@ fn popped_parent_renders_updated_subpage_values() {
             .any(|path| path == "STACK.md"),
         "restored category should see updated instructions config"
     );
-    let rendered = render_settings_rows(&d, 100, 20).join("\n");
+    let rendered = render_settings_rows(&d, 100, 24).join("\n");
+    let compact = rendered
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
     assert!(
-        rendered.contains("STACK") && rendered.contains(".md"),
+        compact.contains("AGENTSmdSTACKmd"),
         "restored category should render updated instructions value; got:\n{rendered}"
     );
 }
@@ -8888,7 +8907,7 @@ fn selected_tools_line_for_cursor(d: &mut SettingsDialog, cursor: usize) -> Opti
     set_tools_cursor(d, cursor);
     tools_page_lines(d)
         .into_iter()
-        .find(|line| line.starts_with("▸ "))
+        .find(|line| line.starts_with("› "))
 }
 
 fn tools_cursor_for_label(d: &mut SettingsDialog, label: &str) -> usize {

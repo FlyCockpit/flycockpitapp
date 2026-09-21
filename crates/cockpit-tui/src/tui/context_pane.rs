@@ -30,7 +30,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -336,7 +336,7 @@ fn body_lines(snapshot: &ContextSnapshot, width: u16) -> Vec<Line<'static>> {
         for seg in segments {
             spans.push(Span::styled(
                 BLOCK.to_string().repeat(seg.width as usize),
-                Style::default().fg(Color::Indexed(seg.color_index)),
+                Style::default().fg(crate::tui::theme::indexed_color(seg.color_index)),
             ));
         }
         if !spans.is_empty() {
@@ -362,7 +362,7 @@ fn body_lines(snapshot: &ContextSnapshot, width: u16) -> Vec<Line<'static>> {
             out.push(Line::from(vec![
                 Span::styled(
                     format!("{BLOCK} "),
-                    Style::default().fg(Color::Indexed(c.color_index)),
+                    Style::default().fg(crate::tui::theme::indexed_color(c.color_index)),
                 ),
                 Span::raw(format!("{}  ", c.name)),
                 Span::styled(k_notation(c.tokens), muted),

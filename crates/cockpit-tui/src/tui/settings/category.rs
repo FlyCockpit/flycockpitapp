@@ -2343,7 +2343,11 @@ impl SettingsCx {
 }
 
 fn on_off(v: bool, on: &str, off: &str) -> String {
-    if v { on.to_string() } else { off.to_string() }
+    if v {
+        format!("▣ {on}")
+    } else {
+        format!("▢ {off}")
+    }
 }
 
 fn model_role_value(value: Option<&str>) -> String {
@@ -4056,6 +4060,7 @@ impl SettingsCx {
         let mut sel = 0usize;
         let mut inline_actions = None;
         let mut cursor_external_action = None;
+        let mut reset_action_line = None;
         for row in &p.rows {
             match row {
                 Row::Heading(heading) => {
@@ -4161,6 +4166,7 @@ impl SettingsCx {
             if Some(p.cursor) == p.reset_cursor() {
                 selected_line = lines.len();
             }
+            reset_action_line = Some((lines.len(), label, Some(p.cursor) == p.reset_cursor()));
             lines.push(
                 p.reset
                     .render_line(Some(p.cursor) == p.reset_cursor(), label),
@@ -4193,6 +4199,30 @@ impl SettingsCx {
             )
                 .into(),
         );
+        if let Some((line, label, selected)) = reset_action_line {
+            let key = format!("category:{:?}", p.category);
+            let offset = self.scroll_states.offset_for(&key);
+            if let Some(screen_row) = line
+                .checked_sub(offset)
+                .filter(|row| *row < usize::from(settings_area.height))
+            {
+                let row = Rect::new(
+                    settings_area.x,
+                    settings_area.y.saturating_add(screen_row as u16),
+                    settings_area.width.saturating_sub(1),
+                    1,
+                );
+                for x in row.x..row.right() {
+                    frame.buffer_mut()[(x, row.y)].set_symbol(" ");
+                }
+                crate::tui::chrome::render_action_bar(
+                    frame,
+                    row,
+                    &[crate::tui::chrome::ActionButton::secondary(label)],
+                    selected.then_some(0),
+                );
+            }
+        }
         if let Some((line, id)) = inline_actions {
             let offset = self
                 .scroll_states

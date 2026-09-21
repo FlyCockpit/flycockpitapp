@@ -1,0 +1,40 @@
+                                                                                                               ● Working
+ ◆ Cockpit             [Hide] ⎇ ╭ Settings — /fixture/project/.cockpit/config.json › Behavior ───────────────────────╮e]
+                              ──│[Close settings]  [Back]                                                            │──
+  + New session               ▌R│╭ Options ─────────────────────────────────────────────────────────────────────────╮│ │
+                              ▌ ││                                           sive r█ How sessions and agents behave:││ │
+ SESSIONS                       ││                                           ounds █ which agent you start on, how  ││ │
+ no active sessions in all pr   ││                                           before█ strongly tools are steered,    ││ │
+                                ││                                            inter│ when commands need approval,   ││ │
+                              no││                                           ventio│ and how plans run. The Advanced││ │
+                              ┊ ││                                           n; def│ block holds tuning knobs most  ││ │
+                              ▌ ││                                           ault 4│ users never need to touch.     ││ │
+                                ││                                           )     │                                ││ █
+                                ││  dialog lockout (ms)                      1500 (│ reset behavior settings to     ││ █
+                                ││                                           answer│ defaults                       ││ █
+                                ││                                           -dialo│ Restore this category's        ││ █
+                                ││                                           g inpu│ settings to their built-in     ││ █
+                                ││                                           t lock│ defaults. Your content (names, ││ █
+                                ││                                           out; d│ languages, model picks, file   ││ █
+                                ││                                           efault│ lists, privacy lists) is kept. ││ █
+                                ││                                            1500)│                                ││ █
+                                ││  time-injection interval (min)            5 (min│                                ││ █
+                                ││                                           utes b│                                ││ █
+                              ▌ ││                                           etween│                                ││ █
+                              ▌ ││                                            [time│                                ││ █
+                                ││                                           :] pre│                                ││ █
+                              ▌ ││                                           ludes;│                                ││ █
+                                ││                                            defau│                                ││ █
+                                ││                                           lt 5) │                                ││ █
+                                ││  packages dir                             (unset│                                ││ █
+                                ││                                            — age│                                ││ █
+                                ││                                           nt pic│                                ││ █
+                                ││                                           ks def│                                ││ █
+                               ⋯││                                           ault) │                                ││ █
+                                ││  agent dirs                               (none)│                                ││ █
+                                ││                                                 │                                ││ █
+                                ││         [ reset behavior settings to defaults ]r│                                ││ █
+                              ▌ │╰──────────────────────────────────────────────────────────────────────────────────╯│ █
+ ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit / cycle / drill  esc/│ █
+                                ╰────────────────────────────────────────────────────────────────────────────────────╯ █
+                                Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

@@ -504,7 +504,7 @@ fn highlight_style(index: usize, base_style: Style) -> Style {
     };
     if *name == "comment" {
         Style::default()
-            .fg(Color::Indexed(MUTED_COLOR_INDEX))
+            .fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX))
             .add_modifier(Modifier::ITALIC)
     } else if name.starts_with("keyword") || name.starts_with("operator") {
         Style::default()

@@ -4,18 +4,15 @@
 //! scrolls and pages the same way.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Margin, Position, Rect};
+use ratatui::layout::{Constraint, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use ratatui::widgets::Paragraph;
 
-use super::theme::{BRASS, FOG, GOOD, INK, NIGHT, PLACEHOLDER};
-use crate::tui::textfield::TextField;
-
-pub(super) const CHECK_ON: &str = "\u{25a3} "; // ▣
-pub(super) const CHECK_OFF: &str = "\u{25a2} "; // ▢
-pub(super) const RADIO_ON: &str = "\u{25c9} "; // ◉
-pub(super) const RADIO_OFF: &str = "\u{25cb} "; // ○
+use super::theme::{BRASS, FOG, INK, NIGHT};
+pub(super) use crate::tui::chrome::{
+    RADIO_OFF, RADIO_ON, check_mark, radio_mark, render_field, render_field_masked,
+};
 #[allow(dead_code)] // starred default-model rows land in #430.
 pub(super) const STAR: &str = "\u{2605}"; // ★
 pub(super) const SCROLL_TRACK: &str = "\u{2502}"; // │
@@ -54,41 +51,6 @@ pub(super) fn render_help(frame: &mut Frame, area: Rect, text: &str) {
         ))),
         area,
     );
-}
-
-/// A bordered single-line text field; returns the caret position when focused
-/// so the caller can park the real terminal cursor there.
-pub(super) fn render_field(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    field: &TextField,
-    focused: bool,
-    placeholder: &str,
-) -> Option<Position> {
-    render_field_masked(frame, area, title, field, focused, placeholder, false)
-}
-
-pub(super) fn render_field_masked(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    field: &TextField,
-    focused: bool,
-    placeholder: &str,
-    masked: bool,
-) -> Option<Position> {
-    let border = if focused { BRASS } else { NIGHT };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(border))
-        .title(Span::styled(format!(" {title} "), Style::new().fg(border)))
-        .padding(Padding::horizontal(1));
-    let inner = block.inner(area);
-    frame.render_widget(&block, area);
-    let (line, _) = field.render(inner.width, masked, placeholder, INK, PLACEHOLDER);
-    frame.render_widget(Paragraph::new(line), inner);
-    focused.then(|| field.caret_position(inner)).flatten()
 }
 
 /// Hand-drawn scrollbar thumb, sized to the visible fraction of the list.
@@ -197,25 +159,6 @@ impl ListNav {
         let max_offset = n.saturating_sub(self.view_h) as isize;
         self.offset = (self.offset as isize + delta).clamp(0, max_offset.max(0)) as usize;
     }
-}
-
-/// A checkbox mark span for a multi-select row.
-#[allow(dead_code)] // multi-select rows land in #430.
-pub(super) fn check_mark(on: bool, focused: bool) -> Span<'static> {
-    let (mark, color) = if on {
-        (CHECK_ON, if focused { BRASS } else { GOOD })
-    } else {
-        (CHECK_OFF, if focused { BRASS } else { FOG })
-    };
-    Span::styled(mark, Style::new().fg(color))
-}
-
-/// A radio mark span for a single-select row.
-#[allow(dead_code)] // single-select rows land in #430.
-pub(super) fn radio_mark(on: bool, focused: bool) -> Span<'static> {
-    let mark = if on { RADIO_ON } else { RADIO_OFF };
-    let color = if focused || on { BRASS } else { FOG };
-    Span::styled(mark, Style::new().fg(color))
 }
 
 #[cfg(test)]

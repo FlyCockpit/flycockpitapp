@@ -23,7 +23,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::theme::{BRASS, BRASS_INDEX, INK, INK_INDEX, resolve_color};
@@ -184,7 +184,7 @@ pub fn render_context_menu(frame: &mut Frame, full_area: Rect, menu: &ContextMen
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::tui::chrome::rounded_border_type())
         .border_style(Style::default().fg(resolve_color(BRASS, BRASS_INDEX)));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);

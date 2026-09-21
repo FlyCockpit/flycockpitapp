@@ -16,8 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::{border, merge::MergeStrategy};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    Wrap,
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1548,7 +1547,7 @@ impl App {
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(crate::tui::theme::BRASS))
             .title(Span::styled(
                 " Daemon stopped ",
@@ -1676,7 +1675,7 @@ impl App {
         frame.render_widget(ratatui::widgets::Clear, rect);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(crate::tui::pins_overlay::PIN_YELLOW));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
@@ -1697,7 +1696,7 @@ impl App {
         frame.render_widget(ratatui::widgets::Clear, rect);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(crate::tui::rules_overlay::RULES_YELLOW));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
@@ -2972,7 +2971,7 @@ impl App {
             prefix_rows.push(Rc::new(Line::from(vec![Span::styled(
                 marker,
                 Style::default()
-                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX))
                     .add_modifier(Modifier::ITALIC),
             )])));
             prefix_meta.push(ChatRowMeta::other());
@@ -3042,7 +3041,7 @@ impl App {
                     vec![Line::from(vec![Span::styled(
                         notice.clone(),
                         Style::default()
-                            .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                            .fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX))
                             .add_modifier(Modifier::ITALIC),
                     )])],
                     ChatRowMeta::other(),
@@ -3073,7 +3072,7 @@ impl App {
             box_lines.push(Line::from(Span::styled(
                 hint.clone(),
                 Style::default()
-                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX))
                     .add_modifier(Modifier::ITALIC),
             )));
         }
@@ -3250,7 +3249,7 @@ impl App {
                 self.transcript_find.as_ref(),
                 self.partial_history_find_note().as_deref(),
                 Style::default()
-                    .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                    .fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX))
                     .add_modifier(Modifier::DIM),
             );
         }
@@ -3359,13 +3358,13 @@ impl App {
         let border_color = Self::input_border_color(self.composer_controls.picker.is_some());
         let mut input_block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(border_color));
         if let Some(label) = self.history_position_label() {
             input_block = input_block.title(Line::from(Span::styled(
                 format!(" {label} "),
                 Style::default()
-                    .fg(Color::Indexed(255))
+                    .fg(crate::tui::theme::indexed_color(255))
                     .add_modifier(Modifier::BOLD),
             )));
         } else if shell_mode {
@@ -3431,7 +3430,7 @@ impl App {
             None
         };
         if let Some(ghost) = ghost_display {
-            let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+            let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
             for (li, gline) in ghost.split('\n').enumerate() {
                 let chunks = wrap_ghost_line_chunks(
                     gline,
@@ -4009,7 +4008,7 @@ impl App {
             let slash_area = Rect::new(area.x, area.y, width, detached_height);
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::tui::chrome::rounded_border_type())
                 .border_style(Style::default().fg(BRASS))
                 .title(" Commands ");
             let content_area = block.inner(slash_area);
@@ -4041,7 +4040,7 @@ impl App {
     }
 
     fn render_vim_hint_box(&self, frame: &mut ratatui::Frame, content_area: Rect) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
         let line = Line::from(vec![
             Span::raw(" "),
             Span::styled("Press ", muted),
@@ -4140,7 +4139,9 @@ impl App {
                 "no matching files"
             };
             frame.render_widget(
-                Paragraph::new(text).style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))),
+                Paragraph::new(text).style(
+                    Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX)),
+                ),
                 content_area,
             );
             return;
@@ -4153,7 +4154,7 @@ impl App {
         list.clamp_scroll(suggestions.len(), window);
         let selected = list.cursor();
         let offset = list.scroll();
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
         let mut lines = Vec::new();
         for (row, (i, sug)) in suggestions
             .iter()
@@ -4288,7 +4289,7 @@ impl App {
                 let hint = Line::from(Span::styled(
                     label,
                     Style::default()
-                        .fg(Color::Indexed(MUTED_COLOR_INDEX))
+                        .fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX))
                         .add_modifier(Modifier::ITALIC),
                 ));
                 frame.render_widget(
@@ -4334,7 +4335,7 @@ impl App {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(border))
             .title(Span::styled(title, Style::default().fg(border)));
         let inner = block.inner(area);
@@ -4388,7 +4389,7 @@ impl App {
 
         let input_block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::tui::chrome::rounded_border_type())
             .border_style(Style::default().fg(border))
             .title(" btw message ");
         let input_inner = input_block.inner(input_area);

@@ -7,17 +7,25 @@
 //! additive transient indicators (longcache, caffeination, lock wait, …).
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, HighlightSpacing, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, BorderType, HighlightSpacing, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
 };
 
+use crate::tui::textfield::TextField;
 use crate::tui::theme::{
-    BRASS, BRASS_INDEX, GOOD, GOOD_INDEX, HOVER_BG, HOVER_BG_INDEX, NIGHT, NIGHT_INDEX,
+    BRASS, BRASS_INDEX, DISABLED, DISABLED_INDEX, FOG, FOG_INDEX, GOOD, GOOD_INDEX, HOVER_BG,
+    HOVER_BG_INDEX, INK, INK_INDEX, NIGHT, NIGHT_INDEX, PLACEHOLDER, PLACEHOLDER_INDEX,
     resolve_color,
 };
+
+pub(crate) const CHECK_ON: &str = "▣ ";
+pub(crate) const CHECK_OFF: &str = "▢ ";
+pub(crate) const RADIO_ON: &str = "◉ ";
+pub(crate) const RADIO_OFF: &str = "○ ";
 
 #[cfg(feature = "remote")]
 use crate::tui::theme::PLAN_YELLOW;
@@ -31,6 +39,12 @@ pub enum PopoverSide {
     Above,
     Below,
     Center,
+}
+
+/// The sole constructor for the rounded border shape. Use [`rounded_block`]
+/// when the standard focused/idle colour contract is also appropriate.
+pub const fn rounded_border_type() -> BorderType {
+    BorderType::Rounded
 }
 
 /// The single excoc hover rule: brass foreground on the hover wash, bold.
@@ -106,7 +120,7 @@ pub fn rounded_block(title: impl Into<Line<'static>>, focused: bool) -> Block<'s
     let border_index = if focused { BRASS_INDEX } else { NIGHT_INDEX };
     let style = Style::default().fg(resolve_color(border, border_index));
     Block::bordered()
-        .border_type(BorderType::Rounded)
+        .border_type(rounded_border_type())
         .border_style(style)
         .title(title)
         .title_style(style)
@@ -116,10 +130,201 @@ pub fn rounded_block(title: impl Into<Line<'static>>, focused: bool) -> Block<'s
 pub fn rounded_block_success(title: impl Into<Line<'static>>) -> Block<'static> {
     let style = Style::default().fg(resolve_color(GOOD, GOOD_INDEX));
     Block::bordered()
-        .border_type(BorderType::Rounded)
+        .border_type(rounded_border_type())
         .border_style(style)
         .title(title)
         .title_style(style)
+}
+
+/// Shared single-line form field used by onboarding and settings. The
+/// returned position is the real terminal caret.
+pub(crate) fn render_field(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    field: &TextField,
+    focused: bool,
+    placeholder: &str,
+) -> Option<Position> {
+    render_field_masked(frame, area, title, field, focused, placeholder, false)
+}
+
+pub(crate) fn render_field_masked(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    field: &TextField,
+    focused: bool,
+    placeholder: &str,
+    masked: bool,
+) -> Option<Position> {
+    let block = rounded_block(format!(" {title} "), focused).padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(&block, area);
+    let (line, _) = field.render(
+        inner.width,
+        masked,
+        placeholder,
+        resolve_color(INK, INK_INDEX),
+        resolve_color(PLACEHOLDER, PLACEHOLDER_INDEX),
+    );
+    frame.render_widget(Paragraph::new(line), inner);
+    focused.then(|| field.caret_position(inner)).flatten()
+}
+
+pub(crate) fn check_mark(on: bool, focused: bool) -> Span<'static> {
+    let (mark, color, index) = if on {
+        (
+            CHECK_ON,
+            if focused { BRASS } else { GOOD },
+            if focused { BRASS_INDEX } else { GOOD_INDEX },
+        )
+    } else {
+        (
+            CHECK_OFF,
+            if focused { BRASS } else { FOG },
+            if focused { BRASS_INDEX } else { FOG_INDEX },
+        )
+    };
+    Span::styled(mark, Style::new().fg(resolve_color(color, index)))
+}
+
+pub(crate) fn radio_mark(on: bool, focused: bool) -> Span<'static> {
+    let mark = if on { RADIO_ON } else { RADIO_OFF };
+    let (color, index) = if focused || on {
+        (BRASS, BRASS_INDEX)
+    } else {
+        (FOG, FOG_INDEX)
+    };
+    Span::styled(mark, Style::new().fg(resolve_color(color, index)))
+}
+
+/// One clickable action in an [`ActionBar`].
+pub(crate) struct ActionButton<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) enabled: bool,
+    pub(crate) primary: bool,
+}
+
+impl<'a> ActionButton<'a> {
+    pub(crate) fn primary(label: &'a str) -> Self {
+        Self {
+            label,
+            enabled: true,
+            primary: true,
+        }
+    }
+
+    pub(crate) fn secondary(label: &'a str) -> Self {
+        Self {
+            label,
+            enabled: true,
+            primary: false,
+        }
+    }
+
+    pub(crate) fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+}
+
+pub(crate) fn action_bar_width(buttons: &[ActionButton<'_>]) -> u16 {
+    if buttons.is_empty() {
+        return 0;
+    }
+    buttons
+        .iter()
+        .map(|button| button.label.chars().count() as u16 + 4)
+        .sum::<u16>()
+        + (buttons.len() as u16).saturating_sub(1)
+}
+
+pub(crate) fn render_action_bar(
+    frame: &mut Frame,
+    area: Rect,
+    buttons: &[ActionButton<'_>],
+    hover: Option<usize>,
+) -> Vec<Rect> {
+    let mut rects = vec![Rect::default(); buttons.len()];
+    if area.width == 0 || area.height == 0 || buttons.is_empty() {
+        return rects;
+    }
+    let widths = buttons
+        .iter()
+        .map(|button| button.label.chars().count() as u16 + 4)
+        .collect::<Vec<_>>();
+    let total = widths.iter().sum::<u16>() + (buttons.len() as u16).saturating_sub(1);
+    let mut x = if total >= area.width {
+        area.x
+    } else {
+        area.right() - total
+    };
+    for (index, button) in buttons.iter().enumerate() {
+        if x >= area.right() {
+            break;
+        }
+        let rect = Rect::new(x, area.y, widths[index].min(area.right() - x), 1);
+        let style = if !button.enabled {
+            Style::new().fg(resolve_color(DISABLED, DISABLED_INDEX))
+        } else if hover == Some(index) {
+            chip_style(
+                Style::new().fg(resolve_color(
+                    if button.primary { BRASS } else { INK },
+                    if button.primary {
+                        BRASS_INDEX
+                    } else {
+                        INK_INDEX
+                    },
+                )),
+                true,
+            )
+        } else if button.primary {
+            Style::new()
+                .fg(resolve_color(BRASS, BRASS_INDEX))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(resolve_color(FOG, FOG_INDEX))
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("[ {} ]", button.label),
+                style,
+            ))),
+            rect,
+        );
+        if button.enabled {
+            rects[index] = rect;
+        }
+        x = x.saturating_add(widths[index]).saturating_add(1);
+    }
+    rects
+}
+
+pub(crate) fn action_button_at(rects: &[Rect], pos: Position) -> Option<usize> {
+    rects
+        .iter()
+        .position(|rect| rect.width > 0 && rect.height > 0 && rect.contains(pos))
+}
+
+#[derive(Default)]
+pub(crate) struct ActionBar {
+    rects: Vec<Rect>,
+    hover: Option<usize>,
+}
+
+impl ActionBar {
+    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect, buttons: &[ActionButton<'_>]) {
+        self.rects = render_action_bar(frame, area, buttons, self.hover);
+    }
+
+    pub(crate) fn track(&mut self, pos: Position) {
+        self.hover = action_button_at(&self.rects, pos);
+    }
+
+    pub(crate) fn clicked(&self, pos: Position) -> Option<usize> {
+        action_button_at(&self.rects, pos)
+    }
 }
 
 /// `area` with the rightmost column permanently reserved for the scrollbar
@@ -283,7 +488,7 @@ pub fn left_status(longcache: LongcacheStatus) -> LeftStatus {
         enabled: longcache_enabled,
         supported: longcache_supported,
     } = longcache;
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(crate::tui::theme::indexed_color(MUTED_COLOR_INDEX));
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut col: u16 = 0;
 
@@ -427,8 +632,14 @@ mod tests {
             let _pin = crate::tui::theme::pin_truecolor(false);
             chip_style(base, true)
         };
-        assert_eq!(fallback.fg, Some(Color::Indexed(BRASS_INDEX)));
-        assert_eq!(fallback.bg, Some(Color::Indexed(HOVER_BG_INDEX)));
+        assert_eq!(
+            fallback.fg,
+            Some(crate::tui::theme::indexed_color(BRASS_INDEX))
+        );
+        assert_eq!(
+            fallback.bg,
+            Some(crate::tui::theme::indexed_color(HOVER_BG_INDEX))
+        );
         assert!(fallback.add_modifier.contains(Modifier::BOLD));
     }
 

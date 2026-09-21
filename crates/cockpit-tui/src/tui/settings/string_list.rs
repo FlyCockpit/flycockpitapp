@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 
 use super::grab;
 use super::pointer_actions::{ListAction, ListKind, ListRowId, SettingsPointerAction};
@@ -443,7 +443,7 @@ impl SettingsCx {
         area: Rect,
         p: &StringListPage,
     ) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(Span::styled(

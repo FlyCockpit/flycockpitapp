@@ -417,7 +417,9 @@ fn button_hover_paints_through_the_chip_rule() {
     assert_eq!(fallback, chip_fallback);
     assert_eq!(
         fallback.fg,
-        Some(Color::Indexed(crate::tui::theme::BRASS_INDEX)),
+        Some(crate::tui::theme::indexed_color(
+            crate::tui::theme::BRASS_INDEX
+        )),
         "the shared hover rule resolves to the indexed fallback"
     );
 }

@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use chrono::TimeZone;
 use ratatui::buffer::Buffer;
 
 use super::{App, Overlay};
@@ -124,7 +125,10 @@ fn transcript_fixture_app() -> App {
     // stays covered by `diff::tests::side_by_side_uses_separator_when_wide`
     // and its narrow-degradation sibling).
     app.diff_style = cockpit_config::extended::DiffStyle::Inline;
-    let now = chrono::Local::now();
+    let now = chrono::Local
+        .with_ymd_and_hms(2024, 1, 2, 8, 45, 0)
+        .single()
+        .expect("unambiguous golden fixture time");
     let user = |text: &str, seq| HistoryEntry::User {
         text: text.to_string(),
         cleaned: None,
@@ -1128,6 +1132,74 @@ mod seed_tests {
     fn golden_product_popovers() {
         let _env = isolate_render_env();
         assert_product_popovers();
+    }
+
+    #[test]
+    fn golden_settings_inventory() {
+        let _env = isolate_render_env();
+        let product_offset = if cfg!(feature = "extended") { 3 } else { 0 };
+        let golden_group = if cfg!(feature = "extended") {
+            "settings-extended"
+        } else {
+            "settings"
+        };
+        let mut scenes: Vec<(&str, Option<usize>)> = vec![
+            ("root-mod", None),
+            ("category", Some(4)),
+            ("ui-page", None),
+            ("settings-editor", None),
+            ("agent-editor", None),
+            ("string-list", None),
+            ("reset", None),
+            ("providers-mod", None),
+            ("oauth-flow", None),
+            ("auth", Some(1)),
+            ("dependencies-page", Some(2)),
+            ("agents-page", Some(3)),
+            ("tools-page", Some(8 + product_offset)),
+            ("harnesses-page", Some(9 + product_offset)),
+            ("skills-page", Some(10 + product_offset)),
+            ("mcp-page", Some(12 + product_offset)),
+            ("lsp-page", Some(13 + product_offset)),
+            ("setup-wizard", None),
+        ];
+        if cfg!(feature = "extended") {
+            scenes.extend([
+                ("image-spend", Some(6)),
+                ("image-generation", Some(7)),
+                ("image-sidecar", Some(8)),
+            ]);
+        }
+
+        for (name, root_index) in scenes {
+            let mut app = transcript_fixture_app();
+            app.dialog = if name == "setup-wizard" {
+                Dialog::open_setup(Path::new("/fixture/project"))
+            } else {
+                Dialog::Settings(Box::new(
+                    crate::tui::settings::SettingsDialog::golden_fixture(name),
+                ))
+            };
+            if let Some(root_index) = root_index {
+                for _ in 0..root_index {
+                    app.dialog.handle_key(KeyEvent::new(
+                        KeyCode::Down,
+                        crossterm::event::KeyModifiers::NONE,
+                    ));
+                }
+                app.dialog.handle_key(KeyEvent::new(
+                    KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            }
+            let buffer = render_app(&mut app, 120, 40);
+            let dump = buffer_text(&buffer);
+            assert!(
+                dump.contains('◆') && dump.contains("Cockpit"),
+                "settings golden {name} must retain the session rail"
+            );
+            crate::tui::golden::assert_golden(golden_group, name, 120, 40, &buffer);
+        }
     }
 
     #[test]

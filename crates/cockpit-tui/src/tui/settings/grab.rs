@@ -14,16 +14,16 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{FOG, FOG_INDEX, resolve_color};
 
 use super::shell::cursor_marker_span;
 
 /// Marker prefixing the currently-grabbed (held) row. Distinct from the
-/// browse cursor (`▸ `) so a held row reads as "picked up, moving".
+/// browse cursor (`› `) so a held row reads as "picked up, moving".
 pub(super) const GRAB_MARKER: &str = "✥ ";
 
 /// Marker prefixing the (non-grabbed) browse cursor row.
-pub(super) const CURSOR_MARKER: &str = "▸ ";
+pub(super) const CURSOR_MARKER: &str = "› ";
 
 /// Marker prefixing a non-selected row.
 pub(super) const IDLE_MARKER: &str = "  ";
@@ -52,7 +52,7 @@ pub(super) fn grabbed_row_spans(
     cursor: usize,
     empty_hint: &str,
 ) -> Vec<Span<'static>> {
-    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let muted = Style::default().fg(resolve_color(FOG, FOG_INDEX));
     let cursor = cockpit_host::text::floor_char_boundary(buf_text, cursor);
     let (before, after) = buf_text.split_at(cursor);
     let mut spans = vec![

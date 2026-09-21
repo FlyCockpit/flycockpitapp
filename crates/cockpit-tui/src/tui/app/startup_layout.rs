@@ -1283,20 +1283,6 @@ impl App {
             .startup_lifecycle
             .as_ref()
             .map(|selected| selected.endpoint.clone());
-        // The provider mutation is global configuration. Use the canonical
-        // global root for its generation read: onboarding deliberately runs
-        // before workspace trust, so resolving the launch project here would
-        // turn a valid settled Provider transition into a trust failure.
-        let config_root = match cockpit_config::config::dirs::global_config_dir() {
-            Ok(root) => root.display().to_string(),
-            Err(error) => {
-                self.show_toast(
-                    format!("Could not resolve the provider config authority: {error}"),
-                    super::ToastKind::Error,
-                );
-                return;
-            }
-        };
         // Latch the in-flight transition on the shell so a duplicate stage
         // completion cannot request a second advance before the
         // authoritative revision lands. The latch belongs to the settled
@@ -1349,45 +1335,6 @@ impl App {
                             break;
                         }
                     };
-                    // Provider discovery can persist its catalog in a worker
-                    // that is replaced before this separate stage transition
-                    // reaches the daemon. The mutation receipt keeps proving
-                    // the original provider write, while this read binds the
-                    // transition fence to the current worker's authority.
-                    if let Some(provider_settlement) = settlement
-                        .as_mut()
-                        .filter(|settlement| settlement.provider_id.is_some())
-                    {
-                        let response = match client
-                            .request(cockpit_proto::Request::GetExtendedConfigSnapshot {
-                                project_root: config_root.clone(),
-                                snapshot_session_id: uuid::Uuid::new_v4().to_string(),
-                            })
-                            .await
-                        {
-                            Ok(Ok(response)) => response,
-                            Ok(Err(error)) => return Err(error.to_string()),
-                            Err(error) => {
-                                last_transport_error = Some(error.to_string());
-                                if attempt + 1 < HANDOFF_ATTEMPTS {
-                                    tokio::time::sleep(std::time::Duration::from_millis(500))
-                                        .await;
-                                    continue;
-                                }
-                                break;
-                            }
-                        };
-                        let cockpit_proto::Response::ExtendedConfigSnapshot {
-                            config_generation, ..
-                        } = response
-                        else {
-                            return Err(
-                                "daemon returned the wrong onboarding config generation response"
-                                    .to_string(),
-                            );
-                        };
-                        provider_settlement.config_generation = config_generation;
-                    }
                     let request = cockpit_proto::ApplyOnboardingTransition {
                         run_id: snapshot.run_id,
                         attempt_id: snapshot.attempt_id,
@@ -1734,12 +1681,12 @@ impl App {
                 else {
                     return Err("daemon returned the wrong provider mutation response".to_string());
                 };
-                let (outcome, verification_generation) =
+                let outcome =
                     match fetch_onboarding_provider_models(&client, &project_root, &provider_id)
                         .await
                     {
-                        Ok((outcome, generation)) => (Ok(outcome), Some(generation)),
-                        Err(error) => (Err(error), None),
+                        Ok((outcome, _)) => Ok(outcome),
+                        Err(error) => Err(error),
                     };
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::StartupProviderVerification(
@@ -1750,10 +1697,11 @@ impl App {
                                 operation_id: client_operation_id,
                                 mutation_intent_hash,
                                 mutation_config_generation: config_generation,
-                                config_generation: verification_generation
-                                    .unwrap_or(config_generation),
+                                // The Provider advance is authorized by this
+                                // terminal mutation receipt, not by a later
+                                // catalog read or a replacement worker.
+                                config_generation,
                             }),
-                            config_generation: verification_generation,
                         },
                     ),
                 )
@@ -1779,12 +1727,12 @@ impl App {
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
                     .map_err(|error| error.to_string())?;
-                let (outcome, config_generation) =
+                let outcome =
                     match fetch_onboarding_provider_models(&client, &project_root, &provider_id)
                         .await
                     {
-                        Ok((outcome, generation)) => (Ok(outcome), Some(generation)),
-                        Err(error) => (Err(error), None),
+                        Ok((outcome, _)) => Ok(outcome),
+                        Err(error) => Err(error),
                     };
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::StartupProviderVerification(
@@ -1792,7 +1740,6 @@ impl App {
                             provider_id,
                             outcome,
                             settlement: None,
-                            config_generation,
                         },
                     ),
                 )

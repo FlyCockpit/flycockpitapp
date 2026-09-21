@@ -83,7 +83,6 @@ pub struct ProviderVerificationCompletion {
     pub provider_id: String,
     pub outcome: Result<VerifyOutcome, String>,
     pub settlement: Option<ProviderSettlementEvidence>,
-    pub config_generation: Option<u64>,
 }
 
 pub use secure_store::SecureStoreSubmission;
@@ -850,18 +849,6 @@ impl OnboardingShell {
             && screen.provider_id() == provider_id
         {
             screen.apply(outcome, evidence);
-        }
-    }
-
-    pub(crate) fn update_provider_settlement_generation(
-        &mut self,
-        provider_id: &str,
-        config_generation: u64,
-    ) {
-        if let OnboardingScreen::Verify(screen) = &mut self.screen
-            && screen.provider_id() == provider_id
-        {
-            screen.update_settlement_generation(config_generation);
         }
     }
 

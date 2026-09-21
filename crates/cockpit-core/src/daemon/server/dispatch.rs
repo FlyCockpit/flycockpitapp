@@ -204,6 +204,20 @@ async fn validate_settlement_operation_fence(
     Ok(())
 }
 
+/// A restarted daemon may restore its process-local generation from the
+/// receipt that committed this Provider mutation. It must never restore from
+/// a client claim or roll the authority back across a later publication.
+fn provider_receipt_can_restore_authority(
+    receipt_generation: u64,
+    mutation_generation: u64,
+    settlement_generation: u64,
+    current_generation: u64,
+) -> bool {
+    receipt_generation == mutation_generation
+        && receipt_generation == settlement_generation
+        && current_generation <= receipt_generation
+}
+
 async fn validate_terminal_local_operation_settlement(
     ctx: &DaemonContext,
     owner: &str,
@@ -302,7 +316,12 @@ async fn validate_onboarding_stage_settlement(
                     status: proto::ConfigCommitStatus::Committed,
                     ..
                 } if client_operation_id == operation_id
-                    && config_generation == mutation_config_generation
+                    && provider_receipt_can_restore_authority(
+                        config_generation,
+                        mutation_config_generation,
+                        settlement.config_generation,
+                        inventory::current_config_generation(),
+                    )
                     && committed_intent_hash == mutation_intent_hash
                     && upserted_provider_ids.iter().any(|id| id == provider_id) =>
                 {
@@ -24656,6 +24675,18 @@ struct ProviderConfigJournal {
 #[cfg(test)]
 mod provider_atomic_authority_tests {
     use super::*;
+
+    #[test]
+    fn provider_settlement_receipt_fence_rejects_later_publication_and_client_rebinding() {
+        // A replacement daemon starts below the durable receipt and may
+        // restore that exact authority. A newer publication is a distinct
+        // write and must reject the stale Provider advance instead.
+        assert!(provider_receipt_can_restore_authority(5, 5, 5, 0));
+        assert!(!provider_receipt_can_restore_authority(5, 5, 5, 6));
+        // The transition's claimed generation is untrusted until it matches
+        // the terminal mutation receipt.
+        assert!(!provider_receipt_can_restore_authority(5, 5, 999, 0));
+    }
 
     #[test]
     fn detected_environment_copy_is_resolved_inside_daemon_boundary() {

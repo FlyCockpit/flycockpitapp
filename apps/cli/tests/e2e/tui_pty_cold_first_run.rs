@@ -22,6 +22,7 @@ use crate::support::{
 const COLD_WELCOME_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(30);
 const ASYNC_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
+const DAEMON_STABILITY_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 enum WalkthroughInput {
@@ -121,16 +122,27 @@ fn daemon_generation(session: &HermeticCockpit) -> u64 {
         .expect("daemon rendezvous has a numeric generation")
 }
 
-fn wait_for_daemon_roll(session: &HermeticCockpit, previous_generation: u64) {
+fn wait_for_daemon_roll_to_stability(session: &HermeticCockpit, previous_generation: u64) {
     let deadline = Instant::now() + TRANSITION_TIMEOUT;
+    let mut observed_generation = previous_generation;
+    let mut stable_since = None;
     loop {
-        if daemon_generation(session) > previous_generation {
+        let generation = daemon_generation(session);
+        if generation > previous_generation {
             session.wait_for_daemon_handshake(TRANSITION_TIMEOUT);
-            return;
+            if generation != observed_generation {
+                observed_generation = generation;
+                stable_since = Some(Instant::now());
+            }
+            if stable_since.is_some_and(|since| since.elapsed() >= DAEMON_STABILITY_WINDOW)
+                && daemon_generation(session) == observed_generation
+            {
+                return;
+            }
         }
         assert!(
             Instant::now() < deadline,
-            "workspace-trust publication did not roll the daemon worker"
+            "provider-config publication did not produce a stable daemon worker"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -181,22 +193,8 @@ fn configure_custom_provider(
     }
 
     wait_for_text(session, "provider verification result", "Connected");
-    wait_for_daemon_roll(session, generation);
+    wait_for_daemon_roll_to_stability(session, generation);
     activate(session, input, "[ Done ]");
-    if session
-        .wait_until_screen(
-            "provider settlement after daemon roll",
-            Duration::from_secs(5),
-            |screen| screen.contains("Choose your default model"),
-        )
-        .is_err()
-    {
-        // The TUI connection predates the config-watch worker roll. Its
-        // fail-closed first attempt clears the pending transition and
-        // refreshes authority; the user-visible retry uses the replacement
-        // worker and must settle the same intent.
-        activate(session, input, "[ Done ]");
-    }
     session
         .wait_until_screen("native model screen", Duration::from_secs(15), |screen| {
             screen.contains("Choose your default model")
@@ -345,8 +343,6 @@ fn assert_daemon_onboarding_complete(session: &HermeticCockpit) {
 fn complete_cold_first_run(input: WalkthroughInput) {
     let (provider_url, provider_shutdown) = spawn_loopback_models_provider();
     let mut session = HermeticCockpit::prepare_fresh(HermeticProfile::Default);
-    let config_path = session.home().home_dir().join("explicit-config.json");
-    session.set_extra_env("COCKPIT_CONFIG", config_path.display().to_string());
     session.set_extra_env("COCKPIT_REDUCE_MOTION", "1");
     session
         .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
@@ -377,13 +373,7 @@ fn complete_cold_first_run(input: WalkthroughInput) {
         WalkthroughInput::Mouse => click_text_twice(&mut session, "Machine-bound encrypted file"),
     }
     wait_for_text(&mut session, "provider catalog", "Let's add a provider");
-    // Resolve trust before the provider mutation captures its expected config
-    // generation; changing it after verification would correctly stale that
-    // settlement receipt.
     session.wait_for_daemon_handshake(TRANSITION_TIMEOUT);
-    let generation = daemon_generation(&session);
-    session.home().set_workspace_trust_via_daemon();
-    wait_for_daemon_roll(&session, generation);
     configure_custom_provider(&mut session, input, &provider_url);
 
     complete_model(&mut session, input);

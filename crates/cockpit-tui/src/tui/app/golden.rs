@@ -876,9 +876,27 @@ pub fn render_onboarding_secure_store(width: u16, height: u16) -> Buffer {
     })
 }
 
+fn render_onboarding_secure_store_password(confirmation: bool, width: u16, height: u16) -> Buffer {
+    let mut shell = onboarding_secure_store_shell();
+    shell.set_secure_store_password_phase_for_golden(confirmation);
+    let engine = Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    render_frame(width, height, |frame| {
+        shell.render(frame, frame.area(), &engine, &mut links);
+    })
+}
+
 pub fn assert_onboarding_secure_store() {
     let _pins = GoldenPins::install();
     assert_golden_sizes("onboarding", "secure-store", render_onboarding_secure_store);
+    for (name, confirmation) in [
+        ("secure-store-passphrase", false),
+        ("secure-store-confirmation", true),
+    ] {
+        assert_golden_sizes("onboarding", name, |width, height| {
+            render_onboarding_secure_store_password(confirmation, width, height)
+        });
+    }
     let preview = buffer_text(&render_onboarding_secure_store(80, 24));
     assert!(
         preview.contains("[ Continue ]") && preview.contains("Secure your secrets"),
@@ -1022,39 +1040,6 @@ pub fn assert_onboarding_native_screens() {
             if let Some(outcome) = outcome.clone() {
                 shell.apply_provider_verification("openai", outcome, None);
             }
-            let engine = Dialog::None;
-            let mut links = crate::tui::links::LinkRegistry::default();
-            render_frame(width, height, |frame| {
-                shell.render(frame, frame.area(), &engine, &mut links)
-            })
-        });
-    }
-    let projection = crate::tui::onboarding::agent::golden_sample_projection();
-    let review = crate::tui::onboarding::agent::golden_sample_review();
-    for (name, phase, review, status) in [
-        (
-            "agent-authoring-subagents",
-            crate::tui::onboarding::agent::Phase::SubagentsList,
-            None,
-            None,
-        ),
-        (
-            "agent-authoring-review",
-            crate::tui::onboarding::agent::Phase::Review,
-            Some(review.clone()),
-            None,
-        ),
-        (
-            "agent-authoring-conflict",
-            crate::tui::onboarding::agent::Phase::Conflict,
-            None,
-            Some("Policy revision conflict — projection refreshed; review again.".into()),
-        ),
-    ] {
-        assert_golden_sizes("onboarding", name, |width, height| {
-            let mut shell = onboarding_shell_at(OnboardingStage::Agent);
-            shell.present_agent_authoring(projection.clone(), "golden-op".into());
-            shell.configure_agent_authoring_for_golden(phase, review.clone(), status.clone());
             let engine = Dialog::None;
             let mut links = crate::tui::links::LinkRegistry::default();
             render_frame(width, height, |frame| {

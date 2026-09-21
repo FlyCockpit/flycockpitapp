@@ -703,18 +703,6 @@ impl OnboardingShell {
         self.escape = None;
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn configure_agent_authoring_for_golden(
-        &mut self,
-        phase: agent::Phase,
-        review: Option<cockpit_proto::AuthoredAgentReview>,
-        status: Option<String>,
-    ) {
-        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
-            screen.configure_for_golden(phase, review, status);
-        }
-    }
-
     pub(crate) fn present_model(
         &mut self,
         config: &cockpit_config::config::providers::ProvidersConfig,
@@ -1043,6 +1031,18 @@ impl OnboardingShell {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_frame_for_golden(&mut self, frame: usize) {
         self.frame = frame;
+    }
+
+    /// Select a password-entry sub-step for deterministic secure-store dumps.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_secure_store_password_phase_for_golden(&mut self, confirmation: bool) {
+        if let OnboardingScreen::SecureStore(screen) = &mut self.screen {
+            screen.phase = if confirmation {
+                secure_store::SecureStoreInputPhase::Confirmation
+            } else {
+                secure_store::SecureStoreInputPhase::Passphrase
+            };
+        }
     }
 
     /// Pin procedural cloud generation for deterministic screen dumps.

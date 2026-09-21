@@ -487,18 +487,6 @@ impl AgentAuthoringScreen {
             || matches!(self.phase, Phase::Create) && self.status.is_some()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn configure_for_golden(
-        &mut self,
-        phase: Phase,
-        review: Option<AuthoredAgentReview>,
-        status: Option<String>,
-    ) {
-        self.phase = phase;
-        self.review = review;
-        self.status = status;
-    }
-
     pub fn help_text(&self) -> &'static str {
         match self.phase {
             Phase::SourceIdentity => "type name   enter continue   esc back   ^c quit",
@@ -2988,7 +2976,7 @@ fn enable_required_tools(tiers: &mut std::collections::BTreeMap<String, ToolTier
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn golden_sample_projection() -> AgentAuthoringProjection {
     use cockpit_proto::{
         AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
@@ -3042,44 +3030,6 @@ pub(crate) fn golden_sample_projection() -> AgentAuthoringProjection {
         }],
         review_trust_disclosure: "Trust classification is shared global provider/model policy."
             .into(),
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn golden_sample_review() -> AuthoredAgentReview {
-    use cockpit_proto::AgentPolicyTrustClassification;
-    AuthoredAgentReview {
-        agent_name: "navigator".into(),
-        grants: vec![cockpit_proto::AuthoredAgentReviewGrant {
-            provider_id: "vendor".into(),
-            model_id: "exact-a".into(),
-            is_default: true,
-            trust: AgentPolicyTrustClassification::Untrusted,
-            trust_is_shared: true,
-        }],
-        tool_tier_preferences: vec![("read".into(), "enabled".into())],
-        verification_label: Some("Self-verification (1 rules)".into()),
-        interactive_subagents: true,
-        auto_prune: false,
-        max_subagent_recursion: 2,
-        tool_steering: "terse".into(),
-        goal_skeptics_label: "2 goal skeptics".into(),
-        verification_surfaces: vec![cockpit_proto::AuthoredAgentReviewVerificationSurface {
-            surface: "Writes & edits".into(),
-            adjudicators: vec![cockpit_proto::AuthoredAgentReviewAdjudicator {
-                provider_id: "vendor".into(),
-                model_id: "exact-a".into(),
-                copies: 1,
-                is_default_model: true,
-            }],
-            enforcement_note: None,
-        }],
-        children: vec![],
-        sidecars: vec![],
-        source: "catalog/frontier@rev".into(),
-        make_default: true,
-        trust_is_shared: true,
-        trust_disclosure: "Trust classification is shared global provider/model policy.".into(),
     }
 }
 

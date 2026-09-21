@@ -1212,6 +1212,33 @@ mod tests {
     }
 
     #[test]
+    fn all_zero_surface_emits_no_verification_rule() {
+        let projection = sample_projection();
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
+        draft.trust_confirmations[0] = true;
+        draft.self_verification[1].copies.fill(0);
+        let package = build_package_draft(&projection, &draft).unwrap();
+        let yaml = package
+            .markdown
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("---\n")
+            .unwrap()
+            .0;
+        let frontmatter: AgentDefinitionFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        let verification = frontmatter
+            .verification
+            .expect("default writes rule remains");
+        assert_eq!(verification.rules.len(), 1);
+        assert_eq!(
+            verification.rules[0].selector.any_of,
+            vec![SelectorPredicate::ToolClass {
+                tool_class: ToolClass::ArtifactWrite
+            }]
+        );
+    }
+
+    #[test]
     fn toggle_route_grant_draft_replaces_disabled_default() {
         let mut grants = vec![
             RouteGrantDraft { enabled: true },

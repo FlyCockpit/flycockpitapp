@@ -1,13 +1,13 @@
 ╭ Optimizations ───────────────────────────────────────────────────────────────╮
-│ ▸ Auto-prune: off                                                            │
-│   Interactive subagents: on                                                  │
+│ ▸ Auto-prune: [ off ]                                                        │
+│   Interactive subagents: [ on ]                                              │
 │   Max subagent recursion: ◂ 2 ▸                                              │
-│   Tool steering: ◂ terse ▸                                                   │
-│   Goal-completion skeptics: 2 goal skeptics                                  │
+│   Tool steering: terse                                                       │
+│   Goal-completion skeptics: 2                                                │
 │   Self-verify: 1 of 3 surfaces ›                                             │
-│   Make default agent: on                                                     │
+│   Make default agent: [ on ]                                                 │
 │                                                                              │
-│ Losslessly drop duplicated context before it forces a summary.               │
+│ Auto-prune losslessly drops duplicate context before it forces a summary. It │
 │                                                                              │
 │                                                                              │
 │                                                                              │

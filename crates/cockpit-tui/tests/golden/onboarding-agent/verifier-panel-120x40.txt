@@ -1,6 +1,6 @@
 ╭ Verifier panel — Writes & edits ─────────────────────────────────────────────────────────────────────────────────────╮
-│ ▸ [−] ×1 [+]  vendor/exact-a  reuses cache                                                                           │
-│   [−] ×0 [+]  vendor/exact-b                                                                                         │
+│ ▸ [−] ×1 [+]  Same model  reuses cache                                                                               │
+│   [−]  · [+]  vendor/exact-b                                                                                         │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

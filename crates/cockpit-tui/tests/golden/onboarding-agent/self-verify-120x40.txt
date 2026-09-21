@@ -1,9 +1,9 @@
 ╭ Self-verify ─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ ▸ Writes & edits: same model ×1  ›                                                                                   │
+│ ▸ Writes & edits: ◂ same model ×1 ▸  ›                                                                               │
 │   Commands: off  ›                                                                                                   │
 │   Monty: off  ›                                                                                                      │
 │                                                                                                                      │
-│                                                                                                                      │
+│ ←/→ changes the same-model copies; space opens the verifier panel for other models and copy steppers.                │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

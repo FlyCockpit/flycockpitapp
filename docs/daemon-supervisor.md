@@ -78,10 +78,11 @@ Roll and upgrade share three installation-scoped deadlines under
 `daemon.handover`: `drain_ms` defaults to 30000, `hard_ms` to 5000, and
 `grace_ms` to 10000. `T_drain` waits for live turns to settle while the
 handover gate rejects new turns; the gate is reversible until successor
-readiness has passed, so a failed successor leaves the predecessor serving. At `T_hard`, remaining turns go through the existing
-noninteractive cancellation path and receive one durable `InterruptDecision`;
-accepted queue rows remain in `message_queue_items`. `T_grace` bounds the
-predecessor's `Reconnect` frame-flush interval (capped at 200ms); it then
+readiness has passed, so a failed successor leaves the predecessor serving. At `T_hard`, remaining turns and session-owned background work go through the
+existing session-work cancellation root; foreground turns receive one durable
+`InterruptDecision` and accepted queue rows remain in `message_queue_items`.
+`T_grace` bounds the
+predecessor's `Reconnect` frame-flush interval; it then
 closes predecessor streams so clients reconnect through the supervisor-owned
 listener backlog rather than reattaching to the retiring worker.
 

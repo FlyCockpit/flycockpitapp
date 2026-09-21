@@ -281,10 +281,15 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             println!("{}", restart_started_message(restarted, pid, &paths.socket));
             Ok(())
         }
-        DaemonCommand::Upgrade { binary } => {
-            let command = binary.map_or(daemon::supervisor::AdminCommand::Roll, |binary| {
-                daemon::supervisor::AdminCommand::Upgrade { binary }
-            });
+        DaemonCommand::Upgrade {
+            binary,
+            binary_path,
+        } => {
+            let command = binary
+                .or(binary_path)
+                .map_or(daemon::supervisor::AdminCommand::Roll, |binary| {
+                    daemon::supervisor::AdminCommand::Upgrade { binary }
+                });
             let response = daemon::supervisor::request(&paths, command).await?;
             match response {
                 daemon::supervisor::AdminResponse::Rolled {

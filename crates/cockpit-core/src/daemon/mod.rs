@@ -3377,11 +3377,11 @@ async fn prepare_worker_handover(
         generation: handover.generation,
         resume_from,
     });
-    // `Reconnect` is event-queue based. Give existing writers a bounded flush
-    // window, then let the accept loop close their streams. Waiting for a
+    // `Reconnect` is event-queue based. Honor the configured flush window,
+    // then let the accept loop close their streams. Waiting for a
     // client detach here is incorrect: the client intentionally keeps its old
     // clone until the replacement attachment succeeds.
-    tokio::time::sleep(handover.timers.grace().min(Duration::from_millis(200))).await;
+    tokio::time::sleep(handover.timers.grace()).await;
     supervisor::worker_handover_reconnect_dispatched();
     Ok(())
 }

@@ -50,6 +50,11 @@ const HANDOVER_STANDBY_ENV: &str = "COCKPIT_WORKER_HANDOVER_STANDBY";
 // session. Keep the same-user admin protocol bounded while leaving room for a
 // large live-session set.
 const MAX_ADMIN_LINE: usize = 512 * 1024;
+// `T_drain` and `T_hard` are worker-owned execution budgets. Once both have
+// elapsed, the predecessor still needs a short, local admin RPC to announce
+// its durable marker; do not race that acknowledgement against the work
+// budget itself.
+const HANDOVER_BOUNDARY_ANNOUNCE_SLACK: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WorkerHandoverRequest {
@@ -817,6 +822,19 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                         break;
                     }
                     command @ (AdminCommand::Roll | AdminCommand::Upgrade { .. }) => {
+                        #[cfg(windows)]
+                        {
+                            let reason =
+                                "boundary-aware worker handover is not available on Windows"
+                                    .to_string();
+                            tracing::warn!(%reason, "worker handover rejected before successor staging");
+                            last_handover = Some(format!("aborted: {reason}"));
+                            write_admin(&mut stream, &AdminResponse::Error {
+                                version: ADMIN_PROTOCOL_VERSION,
+                                message: reason,
+                            }).await?;
+                            continue;
+                        }
                         let handover_timers = match crate::config::config::extended::load_installation_handover_timers() {
                             Ok(timers) => timers,
                             Err(error) => {
@@ -892,7 +910,9 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             &mut admin,
                             worker.pid,
                             generation,
-                            handover_timers.drain() + handover_timers.hard(),
+                            handover_timers.drain()
+                                + handover_timers.hard()
+                                + HANDOVER_BOUNDARY_ANNOUNCE_SLACK,
                             opened_at_unix_ms,
                             last_handover.clone(),
                         ).await;
@@ -1010,28 +1030,15 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             uptime_ms: now_unix_ms().saturating_sub(opened_at_unix_ms),
                         }).await?;
                     }
-                    AdminCommand::WorkerBoundary { worker_pid, generation: report_generation, last_boundary } => {
-                        if report_generation.saturating_add(1) != generation
-                            || worker_pid == worker.pid
-                        {
-                            write_admin(&mut stream, &AdminResponse::Error {
-                                version: ADMIN_PROTOCOL_VERSION,
-                                message: "stale worker boundary report".to_string(),
-                            }).await?;
-                        } else {
-                            last_handover = Some(format!(
-                                "completed: generation {generation}; {} session boundaries",
-                                last_boundary.len()
-                            ));
-                            write_admin(&mut stream, &AdminResponse::Status {
-                                version: ADMIN_PROTOCOL_VERSION,
-                                supervisor_pid: std::process::id(),
-                                worker_pid: worker.pid,
-                                generation,
-                                uptime_ms: now_unix_ms().saturating_sub(opened_at_unix_ms),
-                                last_handover: last_handover.clone(),
-                            }).await?;
-                        }
+                    AdminCommand::WorkerBoundary { .. } => {
+                        // Boundary reports are accepted only by the dedicated
+                        // handover wait loop, where the predecessor PID and
+                        // generation are exact. Accepting one here lets a
+                        // stale predecessor overwrite the committed result.
+                        write_admin(&mut stream, &AdminResponse::Error {
+                            version: ADMIN_PROTOCOL_VERSION,
+                            message: "stale worker boundary report".to_string(),
+                        }).await?;
                     }
                     AdminCommand::Reexec => {
                         write_admin(&mut stream, &AdminResponse::Reexecing { version: ADMIN_PROTOCOL_VERSION }).await?;
@@ -1543,6 +1550,18 @@ fn wait_ready_report(
 ) -> Result<Option<WorkerReadyReport>> {
     use std::os::fd::AsRawFd as _;
     let deadline = Instant::now() + timeout;
+    let fd = read.as_raw_fd();
+    // A readiness writer is untrusted until its whole hello has been
+    // validated. Make the pipe nonblocking so a partial frame cannot park
+    // the supervisor after poll has reported its first byte.
+    // SAFETY: fd is borrowed from the live readiness-pipe owner.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: fd remains live and only its nonblocking status changes.
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("making worker readiness pipe nonblocking");
+    }
+    let mut encoded = Vec::new();
     loop {
         if child.try_wait()?.is_some() {
             return Ok(None);
@@ -1553,7 +1572,7 @@ fn wait_ready_report(
         }
         let millis = remaining.as_millis().min(100) as libc::c_int;
         let mut pollfd = libc::pollfd {
-            fd: read.as_raw_fd(),
+            fd,
             events: libc::POLLIN,
             revents: 0,
         };
@@ -1563,16 +1582,39 @@ fn wait_ready_report(
             return Err(std::io::Error::last_os_error()).context("polling worker readiness");
         }
         if ready > 0 {
-            use std::io::Read as _;
-            let file = std::fs::File::from(read);
-            let mut encoded = Vec::new();
-            file.take(MAX_ADMIN_LINE as u64).read_to_end(&mut encoded)?;
-            if encoded.is_empty() {
-                return Ok(None);
+            let mut chunk = [0_u8; 4096];
+            loop {
+                // SAFETY: fd is owned by `read`, and chunk is a live writable
+                // buffer for exactly this syscall.
+                let bytes = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+                if bytes > 0 {
+                    let bytes = usize::try_from(bytes).expect("positive read fits usize");
+                    if encoded.len().saturating_add(bytes) > MAX_ADMIN_LINE {
+                        bail!("worker readiness hello exceeds maximum frame length");
+                    }
+                    encoded.extend_from_slice(&chunk[..bytes]);
+                    if let Some(newline) = encoded.iter().position(|byte| *byte == b'\n') {
+                        return serde_json::from_slice(&encoded[..newline])
+                            .map(Some)
+                            .context("decoding worker readiness hello");
+                    }
+                    continue;
+                }
+                if bytes == 0 {
+                    if encoded.is_empty() {
+                        return Ok(None);
+                    }
+                    return serde_json::from_slice(&encoded)
+                        .map(Some)
+                        .context("decoding worker readiness hello");
+                }
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    Some(libc::EAGAIN) => break,
+                    _ => return Err(error).context("reading worker readiness hello"),
+                }
             }
-            return serde_json::from_slice(&encoded)
-                .map(Some)
-                .context("decoding worker readiness hello");
         }
     }
 }
@@ -2437,6 +2479,40 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("timed out waiting for worker"));
         assert!(message.contains("readiness-timeout-evidence"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_readiness_hello_cannot_outlive_spawn_timeout() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("daemon.log");
+        std::fs::write(&log_path, b"partial-readiness-evidence\n").unwrap();
+        let (read, write) = create_ready_pipe().unwrap();
+        let mut writer = std::fs::File::from(write);
+        writer.write_all(b"{").unwrap();
+        writer.flush().unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+
+        let error = enforce_unix_worker_readiness(
+            read,
+            &mut child,
+            Duration::from_millis(20),
+            &log_path,
+            1,
+            1,
+        )
+        .unwrap_err();
+
+        assert!(child.try_wait().unwrap().is_some());
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out waiting for worker"));
+        assert!(message.contains("partial-readiness-evidence"));
+        drop(writer);
     }
 
     #[cfg(unix)]

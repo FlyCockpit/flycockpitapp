@@ -142,6 +142,7 @@ impl AgentAuthoringDraft {
             .get(source_index)
             .and_then(|source| source.slug.clone())
             .unwrap_or_else(|| "pilot".to_string());
+        let default_route_index = 0;
         Self {
             name: catalog_name,
             source_selection: if projection.sources.is_empty() {
@@ -153,7 +154,7 @@ impl AgentAuthoringDraft {
             third_party_locator: String::new(),
             third_party_trust_confirmed: false,
             route_grants,
-            default_route_index: 0,
+            default_route_index,
             trust_confirmations: vec![false; route_count],
             interactive_subagents: true,
             auto_prune: false,
@@ -166,7 +167,7 @@ impl AgentAuthoringDraft {
                 .map(|(surface_index, surface)| {
                     let mut copies = vec![0; route_count];
                     if surface_index == 0 && route_count > 0 {
-                        copies[0] = 1;
+                        copies[default_route_index] = 1;
                     }
                     SurfaceVerificationDraft { surface, copies }
                 })
@@ -232,7 +233,9 @@ pub fn toggle_route_grant_draft(
     grants: &mut [RouteGrantDraft],
     cursor: usize,
     default_route_index: &mut usize,
+    self_verification: &mut [SurfaceVerificationDraft],
 ) {
+    let previous_default = *default_route_index;
     let enabled_count = grants.iter().filter(|entry| entry.enabled).count();
     let Some(grant) = grants.get_mut(cursor) else {
         return;
@@ -250,6 +253,27 @@ pub fn toggle_route_grant_draft(
         *default_route_index = cursor;
     }
     reconcile_route_grant_default(grants, default_route_index);
+    migrate_default_route_verification(self_verification, previous_default, *default_route_index);
+}
+
+/// Preserve the distinguished same-model verifier when the agent's default
+/// route changes. The former default's copies become the new default's copies;
+/// existing copies on the newly selected route remain attached to the former
+/// default as an ordinary verifier. This keeps the cache-warm quick dial
+/// semantic without discarding any configured copy counts.
+pub fn migrate_default_route_verification(
+    self_verification: &mut [SurfaceVerificationDraft],
+    previous_default: usize,
+    next_default: usize,
+) {
+    if previous_default == next_default {
+        return;
+    }
+    for surface in self_verification {
+        if previous_default < surface.copies.len() && next_default < surface.copies.len() {
+            surface.copies.swap(previous_default, next_default);
+        }
+    }
 }
 
 impl ChildAuthoringDraft {
@@ -956,10 +980,11 @@ pub fn default_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthor
     if route_count > 0 {
         route_grants[0].enabled = true;
     }
+    let default_route_index = 0;
     ChildAuthoringDraft {
         name: "runner".to_string(),
         route_grants,
-        default_route_index: 0,
+        default_route_index,
         trust_confirmations: vec![false; route_count],
         tool_tiers: child_default_tool_tiers(),
         tool_models: BTreeMap::new(),
@@ -974,7 +999,7 @@ pub fn default_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthor
             .map(|(surface_index, surface)| {
                 let mut copies = vec![0; route_count];
                 if surface_index == 0 && route_count > 0 {
-                    copies[0] = 1;
+                    copies[default_route_index] = 1;
                 }
                 SurfaceVerificationDraft { surface, copies }
             })
@@ -1245,10 +1270,20 @@ mod tests {
             RouteGrantDraft { enabled: true },
         ];
         let mut default_route_index = 0;
-        toggle_route_grant_draft(&mut grants, 0, &mut default_route_index);
+        let mut self_verification = vec![SurfaceVerificationDraft {
+            surface: VerificationSurface::ArtifactWrite,
+            copies: vec![1, 3],
+        }];
+        toggle_route_grant_draft(
+            &mut grants,
+            0,
+            &mut default_route_index,
+            &mut self_verification,
+        );
         assert!(!grants[0].enabled);
         assert!(grants[1].enabled);
         assert_eq!(default_route_index, 1);
+        assert_eq!(self_verification[0].copies, vec![3, 1]);
     }
 
     #[test]
@@ -1258,7 +1293,13 @@ mod tests {
             RouteGrantDraft { enabled: false },
         ];
         let mut default_route_index = 0;
-        toggle_route_grant_draft(&mut grants, 0, &mut default_route_index);
+        let mut self_verification = Vec::new();
+        toggle_route_grant_draft(
+            &mut grants,
+            0,
+            &mut default_route_index,
+            &mut self_verification,
+        );
         assert!(grants[0].enabled);
         assert_eq!(default_route_index, 0);
     }

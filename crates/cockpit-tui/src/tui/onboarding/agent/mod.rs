@@ -824,10 +824,20 @@ impl AgentAuthoringScreen {
         if let Some(child) = self.current_child_mut() {
             if let Some(grant) = child.route_grants.get_mut(index) {
                 grant.enabled = true;
+                cockpit_core::authoring_draft::migrate_default_route_verification(
+                    &mut child.self_verification,
+                    child.default_route_index,
+                    index,
+                );
                 child.default_route_index = index;
             }
         } else if let Some(grant) = self.draft.route_grants.get_mut(index) {
             grant.enabled = true;
+            cockpit_core::authoring_draft::migrate_default_route_verification(
+                &mut self.draft.self_verification,
+                self.draft.default_route_index,
+                index,
+            );
             self.draft.default_route_index = index;
         }
     }
@@ -927,6 +937,7 @@ impl AgentAuthoringScreen {
                     &mut self.draft.route_grants,
                     cursor,
                     &mut self.draft.default_route_index,
+                    &mut self.draft.self_verification,
                 );
             }
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
@@ -936,6 +947,7 @@ impl AgentAuthoringScreen {
                         &mut child.route_grants,
                         cursor,
                         &mut child.default_route_index,
+                        &mut child.self_verification,
                     );
                 }
             }
@@ -2370,7 +2382,14 @@ impl AgentAuthoringScreen {
                     opt_line(
                         2,
                         self.cursor,
-                        &format!("Max subagent recursion: ◂ {recursion} ▸"),
+                        &format!(
+                            "Max subagent recursion: {}",
+                            if self.cursor == 2 {
+                                format!("◂ {recursion} ▸")
+                            } else {
+                                recursion.to_string()
+                            }
+                        ),
                     ),
                 ));
                 lines.push((
@@ -2442,10 +2461,9 @@ impl AgentAuthoringScreen {
                     ));
                 }
                 lines.push((None, Line::default()));
-                lines.push((
-                    None,
-                    Line::from(Span::styled(optimization_detail(self.cursor), muted)),
-                ));
+                for detail in optimization_detail_lines(self.cursor) {
+                    lines.push((None, Line::from(Span::styled(*detail, muted))));
+                }
             }
             Phase::SelfVerify => {
                 let default_route_index = self
@@ -2640,10 +2658,7 @@ impl AgentAuthoringScreen {
                     ));
                     lines.push((
                         None,
-                        Line::from(format!(
-                            "Auto-prune  {} (not yet enforced)",
-                            on_off(review.auto_prune)
-                        )),
+                        Line::from(format!("Auto-prune  {}", on_off(review.auto_prune))),
                     ));
                     lines.push((
                         None,
@@ -2852,28 +2867,35 @@ fn verifier_panel_line(
     Line::from(spans)
 }
 
-fn optimization_detail(index: usize) -> &'static str {
+fn optimization_detail_lines(index: usize) -> &'static [&'static str] {
     match index {
-        0 => {
-            "Auto-prune losslessly drops duplicate context before it forces a summary. It starts off because some frontier-model caches are more valuable than the reclaimed context."
-        }
-        1 => {
-            "Interactive subagents take the foreground, then hand control back. They do not consume the recursion depth below."
-        }
-        2 => {
-            "How many levels of non-interactive subagents may delegate again. Zero lets only this agent delegate."
-        }
-        3 => {
-            "Terse tool and MCP descriptions save tokens and keep caches stable; verbose descriptions can help smaller models."
-        }
-        4 => {
-            "Before completion, skeptics independently try to refute the goal. Zero turns that gate off."
-        }
-        5 => {
-            "Re-check risky actions before they land. Configure writes, commands, and Monty independently."
-        }
-        6 => "Use this agent for new sessions by default.",
-        _ => "",
+        0 => &[
+            "Auto-prune losslessly drops duplicate context before it forces a summary.",
+            "It starts off because some frontier-model caches are more valuable than the",
+            "reclaimed context.",
+        ],
+        1 => &[
+            "Interactive subagents take the foreground, then hand control back.",
+            "They do not consume the recursion depth below.",
+        ],
+        2 => &[
+            "How many levels of non-interactive subagents may delegate again.",
+            "Zero lets only this agent delegate.",
+        ],
+        3 => &[
+            "Terse tool and MCP descriptions save tokens and keep caches stable;",
+            "verbose descriptions can help smaller models.",
+        ],
+        4 => &[
+            "Before completion, skeptics independently try to refute the goal.",
+            "Zero turns that gate off.",
+        ],
+        5 => &[
+            "Re-check risky actions before they land.",
+            "Configure writes, commands, and Monty independently.",
+        ],
+        6 => &["Use this agent for new sessions by default."],
+        _ => &[],
     }
 }
 
@@ -3178,7 +3200,7 @@ fn review_child_lines(child: &AuthoredAgentReviewChild, indent: usize) -> Vec<Li
         }
     )));
     lines.push(Line::from(format!(
-        "{prefix}  auto-prune: {} (not yet enforced)",
+        "{prefix}  auto-prune: {}",
         on_off(child.auto_prune)
     )));
     lines.push(Line::from(format!(

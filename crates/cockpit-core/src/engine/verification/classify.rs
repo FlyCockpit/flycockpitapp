@@ -13,7 +13,7 @@ use crate::agents::ToolClass;
 pub(crate) fn classify_tool(tool_id: &str) -> Option<ToolClass> {
     match tool_id {
         "write" | "edit" | "delete" => Some(ToolClass::ArtifactWrite),
-        "bash" | "shell" => Some(ToolClass::Command),
+        "bash" => Some(ToolClass::Command),
         "mcp" => Some(ToolClass::Monty),
         _ => None,
     }
@@ -37,13 +37,14 @@ mod tests {
     #[test]
     fn classifier_maps_command_and_monty_surfaces() {
         assert_eq!(classify_tool("bash"), Some(ToolClass::Command));
-        assert_eq!(classify_tool("shell"), Some(ToolClass::Command));
         assert_eq!(classify_tool("mcp"), Some(ToolClass::Monty));
     }
 
     #[test]
     fn classifier_leaves_other_tools_unclassified() {
-        for name in ["read", "search", "grep", "glob", "task", "question"] {
+        for name in [
+            "read", "search", "grep", "glob", "shell", "task", "question",
+        ] {
             assert_eq!(classify_tool(name), None, "{name}");
         }
     }

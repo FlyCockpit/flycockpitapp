@@ -10,7 +10,7 @@
   │ Verification  Self-verification (1 rules)                                │  
   │ Goal skeptics  2 goal skeptics                                           │  
   │ Interactive subagents  on                                                │  
-  │ Auto-prune  off (not yet enforced)                                       │  
+  │ Auto-prune  off                                                          │  
   │ Max subagent recursion  2                                                │  
   │ Tool steering  terse                                                     │  
   │ Self-verify Writes & edits  vendor/exact-a ×1                            │  

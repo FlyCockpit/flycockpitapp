@@ -1,5 +1,38 @@
 use super::*;
 
+fn set_authored_auto_prune(driver: &mut Driver, enabled: bool) {
+    let mut definition = crate::agents::embedded_default("Build").expect("known Build definition");
+    let vnext = definition
+        .vnext
+        .as_mut()
+        .expect("Build carries a launch-v1 definition");
+    vnext.agent_id = "authored/auto-prune-test".to_string();
+    if enabled {
+        vnext
+            .capabilities
+            .insert(crate::agents::AgentCapability::AutoPrune);
+    } else {
+        vnext
+            .capabilities
+            .remove(&crate::agents::AgentCapability::AutoPrune);
+    }
+    let mut agent = (*driver.stack[0].agent).clone();
+    agent.definition = Some(std::sync::Arc::new(definition));
+    driver.stack[0].agent = std::sync::Arc::new(agent);
+}
+
+fn set_provider_auto_prune(driver: &mut Driver, enabled: bool) {
+    driver
+        .test_providers_override
+        .as_mut()
+        .expect("test provider config")
+        .0
+        .providers
+        .get_mut("lmstudio")
+        .expect("fixture provider")
+        .auto_prune = Some(enabled);
+}
+
 /// `/prune` (and auto-prune) target the **foreground** agent only —
 /// the top of the interactive-agent stack. A suspended parent frame's
 /// history is never touched (GOALS §3b scope).
@@ -144,6 +177,77 @@ async fn auto_prune_master_switch_off_suppresses_auto_prune() {
     );
     drop(tx);
     while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn auto_prune_authored_on_overrides_provider_off() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        100_000,
+    );
+    set_provider_auto_prune(&mut driver, false);
+    set_authored_auto_prune(&mut driver, true);
+    driver.stack[0].history = dup_read_history_big();
+
+    assert!(
+        driver.maybe_auto_prune(&tx).await,
+        "an authored AutoPrune capability must override a provider default of off"
+    );
+}
+
+#[tokio::test]
+async fn auto_prune_authored_off_overrides_provider_on() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        100_000,
+    );
+    set_provider_auto_prune(&mut driver, true);
+    set_authored_auto_prune(&mut driver, false);
+    driver.stack[0].history = dup_read_history_big();
+
+    assert!(
+        !driver.maybe_auto_prune(&tx).await,
+        "an authored agent without AutoPrune must override a provider default of on"
+    );
+}
+
+#[tokio::test]
+async fn auto_prune_without_authored_definition_follows_provider_default() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        100_000,
+    );
+    set_provider_auto_prune(&mut driver, false);
+    driver.stack[0].history = dup_read_history_big();
+    assert!(
+        !driver.maybe_auto_prune(&tx).await,
+        "a session without an authored definition must honor provider auto-prune off"
+    );
+
+    set_provider_auto_prune(&mut driver, true);
+    driver.stack[0].history.extend(dup_read_history_big());
+    assert!(
+        driver.maybe_auto_prune(&tx).await,
+        "a session without an authored definition must honor provider auto-prune on"
+    );
 }
 
 #[tokio::test]

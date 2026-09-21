@@ -515,6 +515,11 @@ fn review_render_matches_canonical_projection_without_secrets() {
     assert!(rendered.contains("navigator"));
     assert!(rendered.contains("vendor/exact-a"));
     assert!(rendered.contains("2 goal skeptics"));
+    assert!(rendered.contains("Auto-prune  off"));
+    assert!(
+        !rendered.contains("Auto-prune  off (not yet enforced)"),
+        "the enabled runtime setting must not be labeled unsupported"
+    );
     assert!(rendered.contains("shared global provider/model policy"));
     for secret in [
         "api_key",
@@ -710,6 +715,24 @@ fn verifier_panel_keeps_default_model_first_and_labels_cache_reuse() {
     let first = &rows[0].1;
     assert_eq!(first.spans[6].content, "Same model");
     assert_eq!(first.spans[7].content, "  reuses cache");
+}
+
+#[test]
+fn changing_the_default_model_moves_same_model_verification_copies() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-default".into());
+    screen.phase = Phase::ModelGrants;
+    screen.cursor = 1;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    screen.handle_key(key(KeyCode::Char('d')));
+
+    assert_eq!(screen.draft.default_route_index, 1);
+    assert_eq!(screen.draft.self_verification[0].copies, vec![0, 1]);
+    screen.phase = Phase::VerifierPanel(0);
+    let rows = screen.phase_rows();
+    assert_eq!(screen.verifier_route_index(0), Some(1));
+    assert_eq!(rows[0].1.spans[3].content, "×1 ");
+    assert_eq!(rows[0].1.spans[6].content, "Same model");
+    assert_eq!(rows[0].1.spans[7].content, "  reuses cache");
 }
 
 #[test]

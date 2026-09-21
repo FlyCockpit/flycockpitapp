@@ -948,7 +948,7 @@ impl Driver {
         // Master switch: auto-prune off for this (provider, model) means no
         // automatic pruning at all — neither the cache-cold branch nor the
         // ctx%-threshold branch. Manual `/prune` is unaffected.
-        if !Self::auto_prune_enabled_from(providers_cfg.as_ref()) {
+        if !self.auto_prune_enabled_from(providers_cfg.as_ref()) {
             // Advance the watermark so we don't re-walk the config chain until
             // growth. Flipping auto-prune back on mid-session won't re-evaluate
             // until history grows past the watermark, matching the sibling

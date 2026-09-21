@@ -2,8 +2,8 @@
 //! and review projection onto canonical `AgentDef` authorities.
 //!
 //! This module does not persist a second agent schema. Drafts parse as
-//! launch-v1 markdown; trust and auto-prune stay on the global provider/model
-//! policy snapshot.
+//! launch-v1 markdown; trust stays on the global provider/model policy
+//! snapshot while authored auto-prune is the `autoPrune` agent capability.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,12 +15,15 @@ use cockpit_proto::{
     AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
     AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageReceipt,
     AuthoredAgentPackageDraft, AuthoredAgentReceiptStatus, AuthoredAgentRejectReason,
-    AuthoredAgentReview, AuthoredAgentReviewChild, AuthoredAgentReviewGrant, AuthoredAgentSource,
+    AuthoredAgentReview, AuthoredAgentReviewAdjudicator, AuthoredAgentReviewChild,
+    AuthoredAgentReviewGrant, AuthoredAgentReviewVerificationSurface, AuthoredAgentSource,
     AuthoredSidecarDeclaration, ModelTrustConfirmation,
 };
 use sha2::{Digest, Sha256};
 
-use crate::agents::{AgentDef, GoalSkepticsPolicy};
+use crate::agents::{
+    AgentCapability, AgentDef, GoalSkepticsPolicy, SelectorPredicate, ToolClass, ToolSteering,
+};
 use crate::daemon::agent_catalog::{
     AgentCatalogEntry, AgentCatalogIndex, AgentCatalogOrigin, BUNDLED_FRONTIER_SLUG,
     bundled_frontier_entry,
@@ -1039,13 +1042,34 @@ fn review_from_definition(
             }
         })
     });
+    let auto_prune = frontmatter
+        .as_ref()
+        .is_some_and(|fm| fm.capabilities.contains(&AgentCapability::AutoPrune));
+    let max_subagent_recursion = frontmatter
+        .as_ref()
+        .and_then(|fm| fm.delegation.as_ref())
+        .and_then(|policy| policy.max_descendant_depth)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .try_into()
+        .unwrap_or(u8::MAX);
+    let tool_steering = match frontmatter.as_ref().and_then(|fm| fm.tool_steering) {
+        Some(ToolSteering::Verbose) => "verbose",
+        Some(ToolSteering::Terse) | None => "terse",
+    }
+    .to_string();
+    let verification_surfaces = review_verification_surfaces(frontmatter.as_ref());
     AuthoredAgentReview {
         agent_name: draft.name.clone(),
         grants,
         tool_tier_preferences,
         verification_label,
         interactive_subagents,
+        auto_prune,
+        max_subagent_recursion,
+        tool_steering,
         goal_skeptics_label: goal_skeptics.review_label().to_string(),
+        verification_surfaces,
         children: review_children_from_package_files(draft, snapshot, &files),
         sidecars: draft
             .sidecars
@@ -1057,6 +1081,49 @@ fn review_from_definition(
         trust_is_shared: true,
         trust_disclosure: REVIEW_TRUST_DISCLOSURE.to_string(),
     }
+}
+
+fn review_verification_surfaces(
+    frontmatter: Option<&crate::agents::AgentDefinitionFrontmatter>,
+) -> Vec<AuthoredAgentReviewVerificationSurface> {
+    [(ToolClass::ArtifactWrite, "Writes & edits"), (ToolClass::Command, "Commands"), (ToolClass::Monty, "Monty")]
+        .into_iter()
+        .map(|(tool_class, label)| {
+            let rule = frontmatter
+                .and_then(|fm| fm.verification.as_ref())
+                .and_then(|policy| policy.rules.iter().find(|rule| {
+                    rule.selector.any_of.iter().any(|predicate| {
+                        matches!(predicate, SelectorPredicate::ToolClass { tool_class: candidate } if *candidate == tool_class)
+                    })
+                }));
+            let adjudicators = rule
+                .map(|rule| {
+                    rule.adjudicators
+                        .iter()
+                        .map(|adjudicator| AuthoredAgentReviewAdjudicator {
+                            provider_id: adjudicator.model_ref.provider_id.clone(),
+                            model_id: adjudicator.model_ref.model_id.clone(),
+                            copies: adjudicator.copies,
+                            is_default_model: adjudicator.model_ref.default,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let active = adjudicators
+                .iter()
+                .filter(|adjudicator| adjudicator.copies > 0)
+                .collect::<Vec<_>>();
+            let enforced = active.len() == 1
+                && active[0].is_default_model
+                && active[0].copies == 1;
+            AuthoredAgentReviewVerificationSurface {
+                surface: label.to_string(),
+                enforcement_note: (rule.is_some() && !enforced)
+                    .then(|| "not yet enforced".to_string()),
+                adjudicators,
+            }
+        })
+        .collect()
 }
 
 fn review_children_from_package_files(
@@ -1149,6 +1216,23 @@ fn review_child_at_path(
         .and_then(|vnext| vnext.verification.as_ref())
         .map(|policy| policy.goal_skeptics)
         .unwrap_or(GoalSkepticsPolicy::Off);
+    let auto_prune = frontmatter
+        .capabilities
+        .contains(&AgentCapability::AutoPrune);
+    let max_subagent_recursion = frontmatter
+        .delegation
+        .as_ref()
+        .and_then(|policy| policy.max_descendant_depth)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .try_into()
+        .unwrap_or(u8::MAX);
+    let tool_steering = match frontmatter.tool_steering {
+        Some(ToolSteering::Verbose) => "verbose",
+        Some(ToolSteering::Terse) | None => "terse",
+    }
+    .to_string();
+    let verification_surfaces = review_verification_surfaces(Some(&frontmatter));
     let nested_prefix = format!("{child_name}/");
     let nested = files
         .iter()
@@ -1171,7 +1255,11 @@ fn review_child_at_path(
         grants,
         tool_tier_preferences,
         interactive_subagents,
+        auto_prune,
+        max_subagent_recursion,
+        tool_steering,
         goal_skeptics_label: goal_skeptics.review_label().to_string(),
+        verification_surfaces,
         children: nested,
     })
 }
@@ -1295,7 +1383,10 @@ mod tests {
             ("mcp", "mcp.json package file"),
             ("sidecar", "sidecar.json package file + remote-egress gate"),
             ("trust", "global ModelTrust via AgentPolicySnapshot"),
-            ("auto-prune", "ProvidersConfig::resolve_auto_prune"),
+            (
+                "auto-prune",
+                "AgentDefinitionFrontmatter.capabilities.autoPrune",
+            ),
             ("install", "agent installation authority"),
             ("default selection", "set_default_agent_installation"),
         ];
@@ -1354,6 +1445,87 @@ mod tests {
             AgentPolicyTrustClassification::Trusted
         );
         assert!(!rendered.contains("trust:"));
+    }
+
+    #[test]
+    fn authoring_optimizations_round_trip_through_canonical_review() {
+        let mut providers = providers_with("exact-a", Some(ModelTrust::Trusted));
+        providers
+            .providers
+            .get_mut("vendor")
+            .unwrap()
+            .models
+            .push(ModelEntry {
+                id: "exact-b".into(),
+                trust: Some(ModelTrust::Trusted),
+                ..ModelEntry::default()
+            });
+        let snapshot = snapshot_for(&providers);
+        let projection = AgentAuthoringProjection {
+            dto_version: AGENT_AUTHORING_DTO_VERSION,
+            policy: snapshot.clone(),
+            sources: vec![],
+            review_trust_disclosure: REVIEW_TRUST_DISCLOSURE.into(),
+        };
+        let mut authored =
+            crate::authoring_draft::AgentAuthoringDraft::from_projection(&projection);
+        authored.name = "optimizer".into();
+        authored.route_grants[1].enabled = true;
+        authored.default_route_index = 1;
+        authored.auto_prune = true;
+        authored.interactive_subagents = false;
+        authored.max_subagent_recursion = 4;
+        authored.tool_steering = ToolSteering::Verbose;
+        authored.goal_skeptics = GoalSkepticsPolicy::Count { count: 3 };
+        authored.self_verification[0].copies = vec![2, 1];
+        authored.self_verification[1].copies = vec![0, 3];
+        authored.self_verification[2].copies = vec![1, 0];
+        authored.sidecar_route_index = None;
+        authored.children = vec![crate::authoring_draft::default_child_draft(&projection)];
+
+        let package = crate::authoring_draft::build_package_draft(&projection, &authored).unwrap();
+        let canonical = canonicalize(&package, &snapshot, &providers).unwrap();
+        let frontmatter = canonical.definition.definition_frontmatter().unwrap();
+        let rules = &frontmatter.verification.as_ref().unwrap().rules;
+        assert_eq!(
+            rules.len(),
+            3,
+            "one rule must be emitted per configured surface"
+        );
+        assert_eq!(rules[0].adjudicators[0].model_ref.model_id, "exact-b");
+        assert_eq!(rules[0].adjudicators[0].copies, 1);
+        assert_eq!(rules[0].adjudicators[1].copies, 2);
+        assert!(
+            frontmatter
+                .capabilities
+                .contains(&AgentCapability::AutoPrune)
+        );
+        assert_eq!(frontmatter.tool_steering, Some(ToolSteering::Verbose));
+        assert_eq!(
+            frontmatter
+                .delegation
+                .as_ref()
+                .and_then(|policy| policy.max_descendant_depth),
+            Some(5)
+        );
+
+        let review = canonical.review;
+        assert!(review.auto_prune);
+        assert!(!review.interactive_subagents);
+        assert_eq!(review.max_subagent_recursion, 4);
+        assert_eq!(review.tool_steering, "verbose");
+        assert_eq!(review.goal_skeptics_label, "3 goal skeptics");
+        assert!(review.make_default);
+        assert_eq!(review.verification_surfaces.len(), 3);
+        assert_eq!(review.verification_surfaces[0].adjudicators[0].copies, 1);
+        assert_eq!(review.verification_surfaces[0].adjudicators[1].copies, 2);
+        assert_eq!(review.verification_surfaces[1].adjudicators[0].copies, 3);
+        assert_eq!(review.verification_surfaces[2].adjudicators[0].copies, 0);
+        assert_eq!(review.verification_surfaces[2].adjudicators[1].copies, 1);
+        assert_eq!(
+            review.verification_surfaces[0].enforcement_note.as_deref(),
+            Some("not yet enforced")
+        );
     }
 
     #[test]

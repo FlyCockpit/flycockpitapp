@@ -2332,6 +2332,10 @@ impl CompiledVerificationPolicy {
 pub struct VerificationRule {
     pub selector: VerificationSelector,
     pub action: VerificationAction,
+    /// Ordered verifier models. Authoring keeps the agent's default model
+    /// first so warm-cache verification is dispatched before other copies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adjudicators: Vec<VerificationAdjudicator>,
     #[serde(
         rename = "maxCandidates",
         default,
@@ -2392,6 +2396,7 @@ impl Default for VerificationRule {
                 any_of: Vec::new(),
             },
             action: VerificationAction::Off,
+            adjudicators: Vec::new(),
             max_candidates: None,
             max_total_tokens: None,
             max_estimated_cost_microusd: None,
@@ -2736,7 +2741,8 @@ impl VerificationRule {
         }
         match rule.action {
             VerificationAction::Off => {
-                if rule.max_candidates.is_some()
+                if !rule.adjudicators.is_empty()
+                    || rule.max_candidates.is_some()
                     || rule.max_total_tokens.is_some()
                     || rule.max_estimated_cost_microusd.is_some()
                     || rule.max_collection_millis.is_some()
@@ -2757,6 +2763,11 @@ impl VerificationRule {
                 };
                 if !slots.contains_key(slot) {
                     bail!("verification.adjudicatorSlot `{slot}` does not name a model slot");
+                }
+                for adjudicator in &rule.adjudicators {
+                    if adjudicator.copies > 9 {
+                        bail!("verification adjudicator copies must not exceed 9");
+                    }
                 }
                 if rule.generators.len() > usize::from(rule.resolved_max_candidates()) {
                     bail!("verification generators must not exceed maxCandidates");
@@ -2824,6 +2835,17 @@ impl VerificationRule {
 pub enum VerificationAction {
     Off,
     Verify,
+}
+
+/// A concrete verifier model and its requested copy count.
+///
+/// The engine still dispatches through `adjudicatorSlot`; this ordered list
+/// preserves authoring intent while multi-model dispatch is implemented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct VerificationAdjudicator {
+    pub model_ref: SlotModelRef,
+    pub copies: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2899,6 +2921,12 @@ impl<'de> Deserialize<'de> for SelectorPredicate {
                 "artifact_write" => Ok(Self::ToolClass {
                     tool_class: ToolClass::ArtifactWrite,
                 }),
+                "command" => Ok(Self::ToolClass {
+                    tool_class: ToolClass::Command,
+                }),
+                "monty" => Ok(Self::ToolClass {
+                    tool_class: ToolClass::Monty,
+                }),
                 "shell" => Ok(Self::ToolClass {
                     tool_class: ToolClass::Shell,
                 }),
@@ -2933,6 +2961,8 @@ impl SelectorPredicate {
 pub enum ToolClass {
     Evidence,
     ArtifactWrite,
+    Command,
+    Monty,
     Shell,
     Computer,
 }

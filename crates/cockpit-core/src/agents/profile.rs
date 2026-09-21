@@ -1887,6 +1887,8 @@ fn predicate_label(predicate: &SelectorPredicate) -> String {
             match tool_class {
                 super::ToolClass::Evidence => "evidence",
                 super::ToolClass::ArtifactWrite => "artifact_write",
+                super::ToolClass::Command => "command",
+                super::ToolClass::Monty => "monty",
                 super::ToolClass::Shell => "shell",
                 super::ToolClass::Computer => "computer",
             }

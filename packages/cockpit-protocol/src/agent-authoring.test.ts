@@ -84,14 +84,35 @@ describe("agent authoring wire projection", () => {
       ],
       tool_tier_preferences: [],
       interactive_subagents: false,
+      auto_prune: true,
+      max_subagent_recursion: 4,
+      tool_steering: "verbose",
       goal_skeptics_label: "Goal skeptics off",
+      verification_surfaces: [
+        {
+          surface: "Writes & edits",
+          adjudicators: [
+            {
+              provider_id: "vendor",
+              model_id: "exact-a",
+              copies: 2,
+              is_default_model: true,
+            },
+          ],
+          enforcement_note: "not yet enforced",
+        },
+      ],
       children: [
         {
           path: "subagents/reviewer.md",
           grants: [],
           tool_tier_preferences: [["shell", "read_only"]],
           interactive_subagents: false,
+          auto_prune: false,
+          max_subagent_recursion: 2,
+          tool_steering: "terse",
           goal_skeptics_label: "Goal skeptics on",
+          verification_surfaces: [],
           children: [],
         },
       ],

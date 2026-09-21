@@ -169,6 +169,23 @@ export const authoredAgentReviewGrantSchema = z
   })
   .strict();
 
+export const authoredAgentReviewAdjudicatorSchema = z
+  .object({
+    provider_id: z.string(),
+    model_id: z.string(),
+    copies: z.number().int().min(0).max(9),
+    is_default_model: z.boolean(),
+  })
+  .strict();
+
+export const authoredAgentReviewVerificationSurfaceSchema = z
+  .object({
+    surface: z.string(),
+    adjudicators: z.array(authoredAgentReviewAdjudicatorSchema),
+    enforcement_note: z.string().optional(),
+  })
+  .strict();
+
 export const authoredAgentReviewChildSchema: z.ZodType<AuthoredAgentReviewChild> = z.lazy(() =>
   z
     .object({
@@ -176,7 +193,11 @@ export const authoredAgentReviewChildSchema: z.ZodType<AuthoredAgentReviewChild>
       grants: z.array(authoredAgentReviewGrantSchema),
       tool_tier_preferences: z.array(z.tuple([z.string(), z.string()])),
       interactive_subagents: z.boolean(),
+      auto_prune: z.boolean(),
+      max_subagent_recursion: z.number().int().min(0).max(255),
+      tool_steering: z.enum(["terse", "verbose"]),
       goal_skeptics_label: z.string(),
+      verification_surfaces: z.array(authoredAgentReviewVerificationSurfaceSchema),
       children: z.array(authoredAgentReviewChildSchema),
     })
     .strict(),
@@ -187,7 +208,11 @@ export type AuthoredAgentReviewChild = {
   grants: z.infer<typeof authoredAgentReviewGrantSchema>[];
   tool_tier_preferences: [string, string][];
   interactive_subagents: boolean;
+  auto_prune: boolean;
+  max_subagent_recursion: number;
+  tool_steering: "terse" | "verbose";
   goal_skeptics_label: string;
+  verification_surfaces: z.infer<typeof authoredAgentReviewVerificationSurfaceSchema>[];
   children: AuthoredAgentReviewChild[];
 };
 
@@ -198,7 +223,11 @@ export const authoredAgentReviewSchema = z
     tool_tier_preferences: z.array(z.tuple([z.string(), z.string()])),
     verification_label: z.string().optional(),
     interactive_subagents: z.boolean(),
+    auto_prune: z.boolean(),
+    max_subagent_recursion: z.number().int().min(0).max(255),
+    tool_steering: z.enum(["terse", "verbose"]),
     goal_skeptics_label: z.string(),
+    verification_surfaces: z.array(authoredAgentReviewVerificationSurfaceSchema),
     children: z.array(authoredAgentReviewChildSchema),
     sidecars: z.array(z.string()).nonempty().optional(),
     source: z.string(),

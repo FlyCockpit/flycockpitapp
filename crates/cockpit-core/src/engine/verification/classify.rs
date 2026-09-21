@@ -1,4 +1,4 @@
-//! Minimal, hardcoded ToolClass classifier for ArtifactWrite verification.
+//! Minimal, hardcoded ToolClass classifier for risky-action verification.
 //!
 //! A future change should make [`crate::agents::ToolClass`] a declared field
 //! on standard tool definitions; until then this mapping is the only
@@ -8,11 +8,13 @@ use crate::agents::ToolClass;
 
 /// Classify an ordinary tool name for verification matching.
 ///
-/// Returns [`ToolClass::ArtifactWrite`] for `write`/`edit`. Every other name
-/// is unclassified: no verification rule can match it yet.
+/// Classifies the three authoring self-verification surfaces. Every other name
+/// remains unclassified.
 pub(crate) fn classify_tool(tool_id: &str) -> Option<ToolClass> {
     match tool_id {
         "write" | "edit" | "delete" => Some(ToolClass::ArtifactWrite),
+        "bash" | "shell" => Some(ToolClass::Command),
+        "mcp" => Some(ToolClass::Monty),
         _ => None,
     }
 }
@@ -33,8 +35,15 @@ mod tests {
     }
 
     #[test]
-    fn classifier_leaves_non_write_tools_unclassified() {
-        for name in ["read", "bash", "search", "grep", "glob", "task", "question"] {
+    fn classifier_maps_command_and_monty_surfaces() {
+        assert_eq!(classify_tool("bash"), Some(ToolClass::Command));
+        assert_eq!(classify_tool("shell"), Some(ToolClass::Command));
+        assert_eq!(classify_tool("mcp"), Some(ToolClass::Monty));
+    }
+
+    #[test]
+    fn classifier_leaves_other_tools_unclassified() {
+        for name in ["read", "search", "grep", "glob", "task", "question"] {
             assert_eq!(classify_tool(name), None, "{name}");
         }
     }

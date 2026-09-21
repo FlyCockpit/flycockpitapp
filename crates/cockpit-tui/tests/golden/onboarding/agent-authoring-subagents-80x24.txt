@@ -4,7 +4,7 @@
   ────────────────────────────                                                  
   ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
   ╭ Subagents  ·  1 ─────────────────────────────────────────────────────────╮  
-  │ ▸ runner  ·  untrusted                                                   │  
+  │ ▸ runner  ·  unset                                                       │  
   │   Review agent package                                                   │  
   │                                                                          │  
   │                                                                          │  

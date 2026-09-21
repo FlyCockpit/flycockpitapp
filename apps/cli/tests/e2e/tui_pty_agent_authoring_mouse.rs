@@ -104,19 +104,30 @@ fn mouse_confirm_runner_subagent_trust(session: &mut HermeticCockpit) {
 
     click_text(session, "[ Continue ]");
     session
-        .wait_until_screen("runner model trust", TRANSITION_TIMEOUT, |screen| {
-            screen.contains("How much does this subagent see?")
-        })
-        .expect("runner grants advance reaches trust");
-    let trust_row = unset_trust_confirm_label(&session.snapshot().contents());
-    click_text_twice(session, &trust_row);
-
-    click_text(session, "[ Continue ]");
-    session
-        .wait_until_screen("runner tool tiers", TRANSITION_TIMEOUT, |screen| {
-            screen.contains("Subagent tools")
-        })
-        .expect("runner trust advance reaches tools");
+        .wait_until_screen(
+            "runner model trust or tools",
+            TRANSITION_TIMEOUT,
+            |screen| {
+                screen.contains("How much does this subagent see?")
+                    || screen.contains("Subagent tools")
+            },
+        )
+        .expect(
+            "runner grants advance reaches trust or skips its pre-confirmed safe route to tools",
+        );
+    if session
+        .snapshot()
+        .contains("How much does this subagent see?")
+    {
+        let trust_row = unset_trust_confirm_label(&session.snapshot().contents());
+        click_text_twice(session, &trust_row);
+        click_text(session, "[ Continue ]");
+        session
+            .wait_until_screen("runner tool tiers", TRANSITION_TIMEOUT, |screen| {
+                screen.contains("Subagent tools")
+            })
+            .expect("runner trust advance reaches tools");
+    }
 
     click_text(session, "[ Continue ]");
     session

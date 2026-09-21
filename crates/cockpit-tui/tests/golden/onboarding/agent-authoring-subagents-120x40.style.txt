@@ -6,7 +6,7 @@
 3	17:Reset/Reset/- 28:Rgb(224,177,86)/Reset/- 75:Reset/Reset/-
 4	17:Reset/Reset/- 8:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 5:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 13:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 9:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 6:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 6:Rgb(224,177,86)/Reset/BOLD 1:Reset/Reset/- 9:Rgb(74,90,106)/Reset/- 1:Reset/Reset/- 6:Rgb(74,90,106)/Reset/- 34:Reset/Reset/-
 5	17:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 17:Rgb(244,239,230)/Reset/- 68:Rgb(74,90,106)/Reset/- 17:Reset/Reset/-
-6	17:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 1:Reset/Reset/- 22:Rgb(224,177,86)/Reset/BOLD 61:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 17:Reset/Reset/-
+6	17:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 1:Reset/Reset/- 18:Rgb(224,177,86)/Reset/BOLD 65:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 17:Reset/Reset/-
 7	17:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 84:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 17:Reset/Reset/-
 8	17:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 84:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 17:Reset/Reset/-
 9	17:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 84:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 17:Reset/Reset/-

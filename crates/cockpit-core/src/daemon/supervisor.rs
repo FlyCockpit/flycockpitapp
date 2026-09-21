@@ -40,16 +40,74 @@ const READY_FD: libc::c_int = 4;
 const CONTROL_FD: libc::c_int = 3;
 #[cfg(unix)]
 const REVEAL_FD: libc::c_int = 5;
-const MAX_ADMIN_LINE: usize = 16 * 1024;
+// Boundary reports carry one compact `(session, marker)` pair per active
+// session. Keep the same-user admin protocol bounded while leaving room for a
+// large live-session set.
+const MAX_ADMIN_LINE: usize = 512 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WorkerHandoverRequest {
+    pub generation: u64,
+    pub timers: crate::config::config::extended::HandoverTimersConfig,
+}
+
+static WORKER_HANDOVER: OnceLock<std::sync::Mutex<Option<WorkerHandoverRequest>>> = OnceLock::new();
+
+pub(crate) fn begin_worker_handover(generation: u64) -> Result<()> {
+    let timers = crate::config::config::extended::load_installation_handover_timers()
+        .context("loading worker handover timers")?;
+    let slot = WORKER_HANDOVER.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(WorkerHandoverRequest { generation, timers });
+    Ok(())
+}
+
+pub(crate) fn take_worker_handover() -> Option<WorkerHandoverRequest> {
+    WORKER_HANDOVER.get().and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    })
+}
+
+pub(crate) async fn announce_worker_boundary(
+    paths: &DaemonPaths,
+    generation: u64,
+    last_boundary: Vec<super::proto::SessionBoundaryMarker>,
+) -> Result<()> {
+    let response = request(
+        paths,
+        AdminCommand::WorkerBoundary {
+            worker_pid: std::process::id(),
+            generation,
+            last_boundary,
+        },
+    )
+    .await?;
+    match response {
+        AdminResponse::Status { .. } => Ok(()),
+        AdminResponse::Error { message, .. } => bail!(message),
+        other => bail!("unexpected worker boundary acknowledgement: {other:?}"),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum AdminCommand {
     Status,
     Roll,
-    Upgrade { binary: PathBuf },
+    Upgrade {
+        binary: PathBuf,
+    },
     Stop,
     Reexec,
+    /// Worker-internal report emitted after the predecessor has closed new
+    /// turn admission and captured its durable per-session boundaries.
+    WorkerBoundary {
+        worker_pid: u32,
+        generation: u64,
+        last_boundary: Vec<super::proto::SessionBoundaryMarker>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +126,8 @@ pub enum AdminResponse {
         worker_pid: u32,
         generation: u64,
         uptime_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_handover: Option<String>,
     },
     Rolled {
         version: u32,
@@ -296,17 +356,35 @@ pub(crate) fn report_worker_ready() -> Result<()> {
     }
     #[cfg(unix)]
     {
-        let byte = [1_u8];
+        let report = WorkerReadyReport {
+            protocol_version: super::proto::PROTOCOL_VERSION,
+            pid: std::process::id(),
+            generation: worker_generation(),
+            opened_at_unix_ms: std::env::var(OPENED_AT_ENV)
+                .context("supervised worker missing inherited open time")?
+                .parse()
+                .context("supervised worker inherited malformed open time")?,
+        };
+        let mut encoded = serde_json::to_vec(&report)?;
+        encoded.push(b'\n');
         // SAFETY: fd 4 is the inherited write end of this generation's
-        // readiness pipe and `byte` is valid for one byte.
-        let written = unsafe { libc::write(READY_FD, byte.as_ptr().cast(), 1) };
-        if written != 1 {
+        // readiness pipe and `encoded` remains valid for the write.
+        let written = unsafe { libc::write(READY_FD, encoded.as_ptr().cast(), encoded.len()) };
+        if written != isize::try_from(encoded.len()).unwrap_or(-1) {
             return Err(std::io::Error::last_os_error()).context("signaling worker readiness");
         }
         // SAFETY: fd 4 belongs to this process and is no longer needed.
         unsafe { libc::close(READY_FD) };
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkerReadyReport {
+    protocol_version: u32,
+    pid: u32,
+    generation: u64,
+    opened_at_unix_ms: u64,
 }
 
 #[cfg(windows)]
@@ -522,6 +600,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
     let _database_owner = database_owner;
 
     let mut storm = cockpit_client::RestartStormGuard::default();
+    let mut last_handover: Option<String> = None;
     'supervision: loop {
         tokio::select! {
             exit = worker.exited.recv() => {
@@ -580,7 +659,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                 }
                 match request.command {
                     AdminCommand::Status => {
-                        write_admin(&mut stream, &status_response(worker.pid, generation, opened_at_unix_ms)).await?;
+                        write_admin(&mut stream, &status_response(worker.pid, generation, opened_at_unix_ms, last_handover.clone())).await?;
                     }
                     AdminCommand::Stop => {
                         write_admin(&mut stream, &AdminResponse::Stopping { version: ADMIN_PROTOCOL_VERSION }).await?;
@@ -588,9 +667,33 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                         break;
                     }
                     command @ (AdminCommand::Roll | AdminCommand::Upgrade { .. }) => {
+                        let handover_timers = match crate::config::config::extended::load_installation_handover_timers() {
+                            Ok(timers) => timers,
+                            Err(error) => {
+                                let reason = format!("loading worker handover timers: {error:#}");
+                                tracing::warn!(%reason, "worker handover aborted before readiness");
+                                last_handover = Some(format!("aborted: {reason}"));
+                                write_admin(&mut stream, &AdminResponse::Error {
+                                    version: ADMIN_PROTOCOL_VERSION,
+                                    message: reason,
+                                }).await?;
+                                continue;
+                            }
+                        };
                         let binary = match command {
-                            AdminCommand::Upgrade { binary } => std::fs::canonicalize(&binary)
-                                .with_context(|| format!("resolving upgrade binary {}", binary.display()))?,
+                            AdminCommand::Upgrade { binary } => match std::fs::canonicalize(&binary) {
+                                Ok(binary) => binary,
+                                Err(error) => {
+                                    let reason = format!("resolving upgrade binary {}: {error}", binary.display());
+                                    tracing::warn!(%reason, "worker handover aborted before readiness");
+                                    last_handover = Some(format!("aborted: {reason}"));
+                                    write_admin(&mut stream, &AdminResponse::Error {
+                                        version: ADMIN_PROTOCOL_VERSION,
+                                        message: reason,
+                                    }).await?;
+                                    continue;
+                                }
+                            },
                             _ => executable.clone(),
                         };
                         let next_generation = generation.saturating_add(1);
@@ -611,11 +714,18 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 publish_generation(
                                     &paths, &receipt, successor.pid, next_generation, opened_at_unix_ms,
                                 )?;
-                                // Plain drain seam. #440 will replace this with
-                                // boundary-aware handover timers.
+                                // The listener is already live in the successor;
+                                // retire the predecessor through the boundary-aware
+                                // drain signaled by `terminate_worker(..., true)`.
                                 let predecessor = std::mem::replace(&mut worker, successor);
-                                reap_retired_worker(predecessor);
+                                reap_retired_worker(
+                                    predecessor,
+                                    handover_timers.drain()
+                                        + handover_timers.hard()
+                                        + handover_timers.grace(),
+                                );
                                 generation = next_generation;
+                                last_handover = Some(format!("in progress: generation {generation}"));
                                 write_admin(&mut stream, &AdminResponse::Rolled {
                                     version: ADMIN_PROTOCOL_VERSION,
                                     old_worker_pid: old_pid,
@@ -625,11 +735,37 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 }).await?;
                             }
                             Err(error) => {
+                                let reason = format!("{error:#}");
+                                tracing::warn!(%reason, "worker handover aborted; predecessor remains serving");
+                                last_handover = Some(format!("aborted: {reason}"));
                                 write_admin(&mut stream, &AdminResponse::Error {
                                     version: ADMIN_PROTOCOL_VERSION,
-                                    message: format!("{error:#}"),
+                                    message: reason,
                                 }).await?;
                             }
+                        }
+                    }
+                    AdminCommand::WorkerBoundary { worker_pid, generation: report_generation, last_boundary } => {
+                        if report_generation.saturating_add(1) != generation
+                            || worker_pid == worker.pid
+                        {
+                            write_admin(&mut stream, &AdminResponse::Error {
+                                version: ADMIN_PROTOCOL_VERSION,
+                                message: "stale worker boundary report".to_string(),
+                            }).await?;
+                        } else {
+                            last_handover = Some(format!(
+                                "completed: generation {generation}; {} session boundaries",
+                                last_boundary.len()
+                            ));
+                            write_admin(&mut stream, &AdminResponse::Status {
+                                version: ADMIN_PROTOCOL_VERSION,
+                                supervisor_pid: std::process::id(),
+                                worker_pid: worker.pid,
+                                generation,
+                                uptime_ms: now_unix_ms().saturating_sub(opened_at_unix_ms),
+                                last_handover: last_handover.clone(),
+                            }).await?;
                         }
                     }
                     AdminCommand::Reexec => {
@@ -918,6 +1054,8 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
             &mut child,
             super::DAEMON_SPAWN_TIMEOUT,
             &request.log_path,
+            request.generation,
+            request.opened_at_unix_ms,
         )?;
     }
     #[cfg(windows)]
@@ -996,9 +1134,10 @@ fn worker_exit_succeeded(worker: &mut Worker) -> bool {
     false
 }
 
-fn reap_retired_worker(mut worker: Worker) {
+fn reap_retired_worker(mut worker: Worker, timeout: Duration) {
     tokio::spawn(async move {
-        if let Err(error) = await_drained_worker_exit(&mut worker, true).await {
+        if let Err(error) = await_drained_worker_exit_with_timeout(&mut worker, true, timeout).await
+        {
             tracing::error!(pid = worker.pid, %error, "retired worker process watch failed");
         }
         if let Some(mut child) = worker.child {
@@ -1032,24 +1171,30 @@ async fn drain_and_reap_worker(worker: &mut Worker, reconnect: bool) -> Result<(
 }
 
 async fn await_drained_worker_exit(worker: &mut Worker, reconnect: bool) -> Result<()> {
+    await_drained_worker_exit_with_timeout(worker, reconnect, super::shutdown::SHUTDOWN_DRAIN_GRACE)
+        .await
+}
+
+async fn await_drained_worker_exit_with_timeout(
+    worker: &mut Worker,
+    reconnect: bool,
+    timeout: Duration,
+) -> Result<()> {
     terminate_worker(worker, reconnect)?;
-    let exit =
-        match tokio::time::timeout(super::shutdown::SHUTDOWN_DRAIN_GRACE, worker.exited.recv())
-            .await
-        {
-            Ok(exit) => exit,
-            Err(_) => {
-                tracing::warn!(
-                    pid = worker.pid,
-                    "worker exceeded the daemon drain grace; forcing shutdown"
-                );
-                // The worker's shutdown authority treats a second stop signal as
-                // the existing force transition. This is the ordinary daemon
-                // drain bound, not #440's future boundary-aware roll policy.
-                terminate_worker(worker, false)?;
-                worker.exited.recv().await
-            }
-        };
+    let exit = match tokio::time::timeout(timeout, worker.exited.recv()).await {
+        Ok(exit) => exit,
+        Err(_) => {
+            tracing::warn!(
+                pid = worker.pid,
+                "worker exceeded the daemon drain grace; forcing shutdown"
+            );
+            // The worker's shutdown authority treats a second stop signal as
+            // the existing force transition. This is the ordinary daemon
+            // drain bound, not #440's future boundary-aware roll policy.
+            terminate_worker(worker, false)?;
+            worker.exited.recv().await
+        }
+    };
     match exit {
         Some(Ok(())) => {}
         Some(Err(error)) => bail!("stable worker process watch failed while draining: {error}"),
@@ -1088,16 +1233,16 @@ fn create_ready_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
 }
 
 #[cfg(unix)]
-fn wait_ready_byte(
+fn wait_ready_report(
     read: std::os::fd::OwnedFd,
     child: &mut std::process::Child,
     timeout: Duration,
-) -> Result<bool> {
+) -> Result<Option<WorkerReadyReport>> {
     use std::os::fd::AsRawFd as _;
     let deadline = Instant::now() + timeout;
     loop {
         if child.try_wait()?.is_some() {
-            return Ok(false);
+            return Ok(None);
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1115,9 +1260,16 @@ fn wait_ready_byte(
             return Err(std::io::Error::last_os_error()).context("polling worker readiness");
         }
         if ready > 0 {
-            let mut byte = [0_u8];
-            // SAFETY: byte is valid for one byte and the pipe is readable.
-            return Ok(unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) } == 1);
+            use std::io::Read as _;
+            let file = std::fs::File::from(read);
+            let mut encoded = Vec::new();
+            file.take(MAX_ADMIN_LINE as u64).read_to_end(&mut encoded)?;
+            if encoded.is_empty() {
+                return Ok(None);
+            }
+            return serde_json::from_slice(&encoded)
+                .map(Some)
+                .context("decoding worker readiness hello");
         }
     }
 }
@@ -1128,10 +1280,30 @@ fn enforce_unix_worker_readiness(
     child: &mut std::process::Child,
     timeout: Duration,
     log_path: &Path,
+    expected_generation: u64,
+    expected_opened_at_unix_ms: u64,
 ) -> Result<()> {
-    match wait_ready_byte(read, child, timeout) {
-        Ok(true) => Ok(()),
-        Ok(false) => {
+    match wait_ready_report(read, child, timeout) {
+        Ok(Some(report))
+            if report.protocol_version == super::proto::PROTOCOL_VERSION
+                && report.pid == child.id()
+                && report.generation == expected_generation
+                && report.opened_at_unix_ms == expected_opened_at_unix_ms =>
+        {
+            Ok(())
+        }
+        Ok(Some(report)) => {
+            let pid = child.id();
+            super::spawn_notify::reap_or_kill(child);
+            Err(super::spawn_notify::error_with_log_tail(
+                format!(
+                    "worker pid {pid} readiness hello mismatch: expected protocol {} generation {expected_generation} open time {expected_opened_at_unix_ms}, got {report:?}",
+                    super::proto::PROTOCOL_VERSION,
+                ),
+                log_path,
+            ))
+        }
+        Ok(None) => {
             let pid = child.id();
             super::spawn_notify::reap_or_kill(child);
             Err(super::spawn_notify::error_with_log_tail(
@@ -1320,8 +1492,19 @@ fn publish_generation(
     })
 }
 
-fn status_response(worker_pid: u32, generation: u64, opened_at_unix_ms: u64) -> AdminResponse {
-    status_response_at(worker_pid, generation, opened_at_unix_ms, now_unix_ms())
+fn status_response(
+    worker_pid: u32,
+    generation: u64,
+    opened_at_unix_ms: u64,
+    last_handover: Option<String>,
+) -> AdminResponse {
+    status_response_at(
+        worker_pid,
+        generation,
+        opened_at_unix_ms,
+        now_unix_ms(),
+        last_handover,
+    )
 }
 
 fn status_response_at(
@@ -1329,6 +1512,7 @@ fn status_response_at(
     generation: u64,
     opened_at_unix_ms: u64,
     now_unix_ms: u64,
+    last_handover: Option<String>,
 ) -> AdminResponse {
     AdminResponse::Status {
         version: ADMIN_PROTOCOL_VERSION,
@@ -1336,6 +1520,7 @@ fn status_response_at(
         worker_pid,
         generation,
         uptime_ms: now_unix_ms.saturating_sub(opened_at_unix_ms),
+        last_handover,
     }
 }
 
@@ -1652,8 +1837,14 @@ mod tests {
 
     #[test]
     fn status_clock_is_continuous_across_worker_generations() {
-        let first = status_response_at(101, 4, 1_000, 6_000);
-        let replacement = status_response_at(202, 5, 1_000, 6_750);
+        let first = status_response_at(101, 4, 1_000, 6_000, None);
+        let replacement = status_response_at(
+            202,
+            5,
+            1_000,
+            6_750,
+            Some("completed: generation 5".to_string()),
+        );
         assert!(matches!(
             first,
             AdminResponse::Status {
@@ -1669,8 +1860,9 @@ mod tests {
                 worker_pid: 202,
                 generation: 5,
                 uptime_ms: 5_750,
+                last_handover: Some(ref outcome),
                 ..
-            }
+            } if outcome == "completed: generation 5"
         ));
     }
 
@@ -1792,14 +1984,63 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let error =
-            enforce_unix_worker_readiness(read, &mut child, Duration::from_millis(20), &log_path)
-                .unwrap_err();
+        let error = enforce_unix_worker_readiness(
+            read,
+            &mut child,
+            Duration::from_millis(20),
+            &log_path,
+            1,
+            1,
+        )
+        .unwrap_err();
 
         assert!(child.try_wait().unwrap().is_some());
         let message = format!("{error:#}");
         assert!(message.contains("timed out waiting for worker"));
         assert!(message.contains("readiness-timeout-evidence"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_hello_mismatch_aborts_before_predecessor_signal() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("daemon.log");
+        std::fs::write(&log_path, b"predecessor-still-serving\n").unwrap();
+        let (read, write) = create_ready_pipe().unwrap();
+        let mut writer = std::fs::File::from(write);
+        serde_json::to_writer(
+            &mut writer,
+            &WorkerReadyReport {
+                protocol_version: super::super::proto::PROTOCOL_VERSION,
+                pid: 999_999,
+                generation: 8,
+                opened_at_unix_ms: 1_001,
+            },
+        )
+        .unwrap();
+        writeln!(writer).unwrap();
+        drop(writer);
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+
+        let error = enforce_unix_worker_readiness(
+            read,
+            &mut child,
+            Duration::from_secs(1),
+            &log_path,
+            8,
+            1_000,
+        )
+        .unwrap_err();
+
+        assert!(child.try_wait().unwrap().is_some());
+        let message = format!("{error:#}");
+        assert!(message.contains("readiness hello mismatch"));
+        assert!(message.contains("predecessor-still-serving"));
     }
 
     #[cfg(windows)]

@@ -34,6 +34,47 @@ async fn lifecycle_provider_for_command(command: &str) -> ScriptedProvider {
         .await
 }
 
+#[cfg(unix)]
+async fn wait_for_handover_side_effect(path: &Path) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            return contents;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handover-spanning tool did not commit its side effect within 20s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_single_handover_tool_result(db_path: &Path, session_id: Uuid) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if tool_call_count(db_path, session_id) == 1 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handover-spanning tool result did not commit exactly once within 20s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn supervisor_status_json(daemon: &SpawnedDaemon) -> serde_json::Value {
+    let output = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("run daemon status");
+    assert!(output.status.success(), "{}", output_text(&output));
+    serde_json::from_slice(&output.stdout).expect("decode daemon status JSON")
+}
+
 #[derive(Debug, Clone)]
 struct InterruptRow {
     state: String,
@@ -472,6 +513,92 @@ async fn restart_daemon_gracefully(daemon: &SpawnedDaemon) {
     assert!(output.status.success(), "daemon restart failed: {text}");
     assert!(text.contains("daemon: rolled worker"));
     daemon.wait_for_handshake().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
+    let home = IsolatedHome::new();
+    let side_effect = home.project_path().join("handover-side-effect.txt");
+    let command = format!(
+        "sleep 1; printf 'committed\\n' >> {}",
+        side_effect.display()
+    );
+    let provider = lifecycle_provider_for_command(&command).await;
+    home.write_local_provider_config(&provider.base_url());
+    std::fs::write(
+        home.config_dir().join("config.json"),
+        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto"}"#,
+    )
+    .expect("write handover auto-approval config");
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
+    let client = daemon.client().await;
+    let attached = client
+        .attach(daemon.project_path(), None, None, true)
+        .await
+        .expect("attach handover session");
+    client
+        .send_user_message("run the handover-spanning tool")
+        .await
+        .expect("send handover turn");
+
+    loop {
+        match client
+            .next_event_unbounded()
+            .await
+            .expect("event before handover tool start")
+        {
+            DaemonEvent::InterruptRaised {
+                session_id,
+                interrupt_id,
+                ..
+            } if session_id == attached.session_id => {
+                let approve = offered_approval_option(&daemon.db_path(), interrupt_id);
+                client
+                    .answer_interrupt_option(interrupt_id, approve)
+                    .await
+                    .expect("approve handover-spanning tool");
+            }
+            DaemonEvent::ToolStart {
+                session_id,
+                call_id,
+                ..
+            } if session_id == attached.session_id && call_id == TOOL_CALL_ID => break,
+            _ => {}
+        }
+    }
+
+    let before = supervisor_status_json(&daemon);
+    let roll = daemon.restart_via_command(2).await;
+    assert!(roll.status.success(), "{}", output_text(&roll));
+    drop(client);
+
+    assert_eq!(
+        wait_for_handover_side_effect(&side_effect).await,
+        "committed\n",
+        "the host side effect must execute exactly once across the roll"
+    );
+    wait_for_single_handover_tool_result(&daemon.db_path(), attached.session_id).await;
+    let replacement = daemon.client().await;
+    let reattached = replacement
+        .attach(daemon.project_path(), Some(attached.session_id), None, true)
+        .await
+        .expect("reattach same session after handover");
+    assert_eq!(reattached.session_id, attached.session_id);
+    // Wait beyond the scripted tool's full runtime after successor attach.
+    // A mistaken post-boundary replay would otherwise be able to append only
+    // after the first successful observation and make this test vacuous.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    assert_eq!(
+        std::fs::read_to_string(&side_effect).expect("read settled side effect"),
+        "committed\n",
+        "the successor must not replay the predecessor's committed side effect"
+    );
+    assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 1);
+    let after = supervisor_status_json(&daemon);
+    assert!(after["generation"].as_u64().unwrap() > before["generation"].as_u64().unwrap());
+    assert!(after["uptime_ms"].as_u64().unwrap() >= before["uptime_ms"].as_u64().unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]

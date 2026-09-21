@@ -195,6 +195,68 @@ async fn restart_running_daemon_rolls_worker_and_keeps_socket_usable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_upgrade_readiness_keeps_predecessor_serving_and_reports_abort() {
+    let daemon = SpawnedDaemon::start().await;
+    let status_before = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("status before failed upgrade");
+    assert_success(
+        "status before failed upgrade",
+        &status_before,
+        daemon.home(),
+    );
+    let before: serde_json::Value =
+        serde_json::from_slice(&status_before.stdout).expect("decode status before upgrade");
+    let missing = daemon.home().home_dir().join("missing-upgrade-binary");
+
+    let upgrade = daemon
+        .command()
+        .args(["daemon", "upgrade", "--binary"])
+        .arg(&missing)
+        .output()
+        .expect("failed upgrade command");
+
+    assert!(
+        !upgrade.status.success(),
+        "missing binary must abort upgrade"
+    );
+    let status_after = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("status after failed upgrade");
+    assert_success("status after failed upgrade", &status_after, daemon.home());
+    let after: serde_json::Value =
+        serde_json::from_slice(&status_after.stdout).expect("decode status after upgrade");
+    assert_eq!(after["worker_pid"], before["worker_pid"]);
+    assert_eq!(after["generation"], before["generation"]);
+    assert!(
+        after["last_handover"]
+            .as_str()
+            .is_some_and(|outcome| outcome.starts_with("aborted: resolving upgrade binary")),
+        "status must retain the concrete abort reason: {after}"
+    );
+    let text_status = daemon
+        .command()
+        .args(["daemon", "status"])
+        .output()
+        .expect("text status after failed upgrade");
+    assert_success(
+        "text status after failed upgrade",
+        &text_status,
+        daemon.home(),
+    );
+    assert!(
+        output_text(&text_status).contains("last handover: aborted: resolving upgrade binary"),
+        "text status must retain the abort outcome: {}",
+        output_text(&text_status)
+    );
+    daemon.status().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_when_not_running_starts_daemon() {
     let daemon = SpawnedDaemon::start().await;
     let stop = daemon.stop_via_command(0);

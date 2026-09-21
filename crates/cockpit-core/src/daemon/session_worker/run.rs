@@ -11817,7 +11817,15 @@ pub(super) async fn run_worker(
                         None
                     };
                     adopted_processes.cancel_all(&driver_input_queue).await;
-                    if let Some(staged) = driver_input_queue.stage_discard_pending().await {
+                    let preserves_handover_queue = matches!(
+                        work,
+                        SessionWork::Cancel {
+                            origin: CancelOrigin::Handover
+                        }
+                    );
+                    if !preserves_handover_queue
+                        && let Some(staged) = driver_input_queue.stage_discard_pending().await
+                    {
                         let disposition =
                             crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled;
                         match persist_staged_terminal_removal(

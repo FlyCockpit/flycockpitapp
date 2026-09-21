@@ -1940,6 +1940,27 @@ fn current_last_applied_seq(last_applied_seq: &Arc<Mutex<Option<i64>>>) -> Optio
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Pin the next attachment replay to the predecessor's verified boundary.
+/// Rows after this cursor are deliberately returned as pending/replay history;
+/// issue #441 owns the later decision about which pending effects are safe to
+/// execute. This function only selects the resume point.
+fn apply_handover_resume_boundary(
+    last_applied_seq: &Arc<Mutex<Option<i64>>>,
+    session_id: Uuid,
+    resume_from: &[proto::SessionBoundaryMarker],
+) -> bool {
+    let Some(boundary) = resume_from
+        .iter()
+        .find(|boundary| boundary.session_id == session_id)
+    else {
+        return false;
+    };
+    *last_applied_seq
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(boundary.marker);
+    true
+}
+
 async fn run_skill_inventory_refresh(
     current_client: Arc<RwLock<DaemonClient>>,
     attach_context: Arc<RwLock<AttachRequestContext>>,
@@ -3386,8 +3407,16 @@ async fn try_spawn_inner(
                     if matches!(event, proto::Event::DaemonDraining { .. }) {
                         saw_draining = true;
                     }
-                    if let proto::Event::Reconnect { .. } = event {
+                    if let proto::Event::Reconnect {
+                        ref resume_from, ..
+                    } = event
+                    {
                         saw_draining = true;
+                        let _ = apply_handover_resume_boundary(
+                            &last_applied_seq,
+                            event_state.session_id(),
+                            resume_from,
+                        );
                         push_turn_event(
                             &events,
                             &event_notify,
@@ -7600,6 +7629,35 @@ mod tests {
                 client_submission_ids,
             }) if client_submission_ids.is_empty()
         ));
+    }
+
+    #[test]
+    fn reconnect_boundary_rewinds_only_the_named_session_cursor() {
+        let session_id = uuid::Uuid::new_v4();
+        let other_session = uuid::Uuid::new_v4();
+        let cursor = Arc::new(Mutex::new(Some(42)));
+
+        assert!(apply_handover_resume_boundary(
+            &cursor,
+            session_id,
+            &[
+                proto::SessionBoundaryMarker {
+                    session_id: other_session,
+                    marker: 11,
+                },
+                proto::SessionBoundaryMarker {
+                    session_id,
+                    marker: 17,
+                },
+            ],
+        ));
+        assert_eq!(current_last_applied_seq(&cursor), Some(17));
+        assert!(!apply_handover_resume_boundary(
+            &cursor,
+            uuid::Uuid::new_v4(),
+            &[],
+        ));
+        assert_eq!(current_last_applied_seq(&cursor), Some(17));
     }
 
     #[test]

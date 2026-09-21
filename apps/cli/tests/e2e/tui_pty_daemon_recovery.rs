@@ -230,20 +230,33 @@ fn daemon_restart_reconnects_attached_tui_without_prompt() {
         stdout.contains("attached clients will reconnect"),
         "restart output must describe attached-client behavior: {stdout}"
     );
-    let saw_reconnect_chrome = Cell::new(false);
-    let _ = session.wait_until_screen(
-        "trusted restart reconnecting",
-        Duration::from_secs(10),
-        |screen| screen.contains("daemon restarting") || screen.contains("daemon connection lost"),
-    );
+    let reconnect_blips = Cell::new(0_u32);
+    let reconnect_visible = Cell::new(false);
+    let observe_reconnect_blip = |screen: &crate::support::ScreenSnapshot| {
+        let visible = screen.contains("daemon restarting")
+            || screen.contains("daemon connection lost")
+            || screen.contains("daemon reconnected");
+        if visible && !reconnect_visible.replace(visible) {
+            reconnect_blips.set(reconnect_blips.get() + 1);
+        }
+        if !visible {
+            reconnect_visible.set(false);
+        }
+        visible
+    };
+    session
+        .wait_until_screen(
+            "trusted restart reconnecting",
+            Duration::from_secs(10),
+            &observe_reconnect_blip,
+        )
+        .expect("trusted restart must show one reconnecting blip");
     session
         .wait_until_screen(
             "trusted restart reattached",
             Duration::from_secs(30),
             |screen| {
-                if screen.contains("daemon reconnected") {
-                    saw_reconnect_chrome.set(true);
-                }
+                observe_reconnect_blip(screen);
                 screen.contains(COMPOSER_PLACEHOLDER)
                     && screen.contains(HISTORY_MARKER)
                     && !screen.contains("The daemon stopped unexpectedly")
@@ -253,9 +266,10 @@ fn daemon_restart_reconnects_attached_tui_without_prompt() {
             },
         )
         .expect("trusted restart must reconnect without user input");
-    assert!(
-        saw_reconnect_chrome.get(),
-        "trusted restart must surface the daemon reconnected toast during reattach"
+    assert_eq!(
+        reconnect_blips.get(),
+        1,
+        "trusted restart must surface exactly one reconnecting blip"
     );
     session
         .wait_until_screen(

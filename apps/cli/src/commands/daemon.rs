@@ -282,11 +282,10 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             Ok(())
         }
         DaemonCommand::Upgrade { binary } => {
-            let response = daemon::supervisor::request(
-                &paths,
-                daemon::supervisor::AdminCommand::Upgrade { binary },
-            )
-            .await?;
+            let command = binary.map_or(daemon::supervisor::AdminCommand::Roll, |binary| {
+                daemon::supervisor::AdminCommand::Upgrade { binary }
+            });
+            let response = daemon::supervisor::request(&paths, command).await?;
             match response {
                 daemon::supervisor::AdminResponse::Rolled {
                     old_worker_pid,
@@ -328,6 +327,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     worker_pid,
                     generation,
                     uptime_ms,
+                    last_handover,
                     ..
                 } = status
             {
@@ -368,10 +368,17 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     object.insert("worker_pid".into(), worker_pid.into());
                     object.insert("generation".into(), generation.into());
                     object.insert("uptime_ms".into(), uptime_ms.into());
+                    object.insert(
+                        "last_handover".into(),
+                        last_handover
+                            .map(serde_json::Value::String)
+                            .unwrap_or(serde_json::Value::Null),
+                    );
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
+                    let outcome = last_handover.as_deref().unwrap_or("none");
                     println!(
-                        "daemon: running\n  supervisor pid: {supervisor_pid}\n  worker pid: {worker_pid}\n  generation: {generation}\n  uptime: {:.3}s\n  socket: {}",
+                        "daemon: running\n  supervisor pid: {supervisor_pid}\n  worker pid: {worker_pid}\n  generation: {generation}\n  uptime: {:.3}s\n  last handover: {outcome}\n  socket: {}",
                         uptime_ms as f64 / 1000.0,
                         paths.socket.display(),
                     );

@@ -3195,6 +3195,74 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Interrupt every still-running foreground turn through the same
+    /// cancellation path used by daemon control requests. Durable accepted
+    /// queue rows are intentionally retained for the successor.
+    pub async fn interrupt_for_handover(&self) -> Result<usize> {
+        let handles: Vec<SessionWorkerHandle> = {
+            let workers = crate::sync::lock_or_recover(&self.inner.workers);
+            workers
+                .live
+                .values()
+                .map(|entry| entry.handle.clone())
+                .filter(|handle| handle.live_status().1)
+                .collect()
+        };
+        let mut interrupted = 0;
+        for handle in handles {
+            let session_id = handle.session_id();
+            let already_recorded = self
+                .inner
+                .db
+                .list_session_events(session_id)
+                .await?
+                .into_iter()
+                .any(|event| {
+                    event.kind == "interrupt_decision"
+                        && event.data["reason"] == "worker_handover_hard_deadline"
+                });
+            if already_recorded {
+                continue;
+            }
+            let decision = crate::daemon::proto::InterruptDecision {
+                permission: false,
+                cancelled: true,
+                lines: vec![crate::daemon::proto::InterruptDecisionLine {
+                    prompt: "Worker handover hard deadline".to_string(),
+                    answer: "Interrupted through the daemon cancellation path".to_string(),
+                }],
+            };
+            let data = json!({
+                "reason": "worker_handover_hard_deadline",
+                "decision": decision,
+            });
+            self.inner
+                .db
+                .insert_session_event(
+                    session_id,
+                    crate::db::session_log::SessionEventKind::InterruptDecision,
+                    Some(&handle.active_agent_name),
+                    None,
+                    &data,
+                )
+                .await?;
+            handle
+                .send_work(crate::daemon::session_worker::SessionWork::Cancel {
+                    origin: crate::daemon::session_worker::CancelOrigin::Handover,
+                })
+                .await?;
+            interrupted += 1;
+        }
+        Ok(interrupted)
+    }
+
+    pub fn has_handover_inflight(&self) -> bool {
+        crate::sync::lock_or_recover(&self.inner.workers)
+            .live
+            .values()
+            .any(|entry| entry.handle.live_status().1)
+    }
+
     /// Snapshot live handles belonging to the supplied durable trust root.
     ///
     /// The comparison intentionally uses the worker's already-captured policy
@@ -5789,6 +5857,88 @@ mod tests {
             .expect("turn_interrupted event");
         assert_eq!(interrupted.data["reason"], "daemon_shutdown_grace_expired");
         assert_eq!(interrupted.data["activity_state"], "tool_running");
+    }
+
+    #[tokio::test]
+    async fn handover_hard_deadline_records_one_decision_and_preserves_completed_turns() {
+        let reg = test_registry();
+
+        let completed = persisted_test_session(&reg);
+        let completed_id = completed.id;
+        completed
+            .record_event(
+                crate::db::session_log::SessionEventKind::AssistantMessage,
+                Some("Build"),
+                Some("completed-turn"),
+                &json!({"text": "completed on predecessor"}),
+            )
+            .await
+            .unwrap();
+        let completed_handle = test_handle(&reg, completed);
+        completed_handle.set_test_live_status(false, false, false);
+        reg.insert_test_worker_without_join(completed_handle);
+
+        let interrupted = persisted_test_session(&reg);
+        let interrupted_id = interrupted.id;
+        let (interrupted_handle, mut work_rx) = test_handle_with_rx(&reg, interrupted);
+        interrupted_handle.set_test_live_status(false, true, true);
+        reg.insert_test_worker_without_join(interrupted_handle);
+
+        assert_eq!(reg.interrupt_for_handover().await.unwrap(), 1);
+        assert!(matches!(
+            work_rx.recv().await,
+            Some(session_worker::SessionWork::Cancel {
+                origin: session_worker::CancelOrigin::Handover
+            })
+        ));
+        assert_eq!(
+            reg.interrupt_for_handover().await.unwrap(),
+            0,
+            "a repeated hard-deadline observation must not record or deliver a second decision"
+        );
+
+        let completed_events = reg
+            .inner
+            .db
+            .list_session_events(completed_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            completed_events
+                .iter()
+                .filter(|event| event.kind == "assistant_message")
+                .count(),
+            1
+        );
+        assert_eq!(
+            completed_events
+                .iter()
+                .filter(|event| event.kind == "interrupt_decision")
+                .count(),
+            0,
+            "a predecessor-completed turn is never also classified as interrupted"
+        );
+        let interrupted_events = reg
+            .inner
+            .db
+            .list_session_events(interrupted_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            interrupted_events
+                .iter()
+                .filter(|event| event.kind == "interrupt_decision")
+                .count(),
+            1
+        );
+        assert_eq!(
+            interrupted_events
+                .iter()
+                .filter(|event| event.kind == "assistant_message")
+                .count(),
+            0,
+            "an interrupted turn is never also recorded as predecessor-completed"
+        );
     }
 
     #[tokio::test]

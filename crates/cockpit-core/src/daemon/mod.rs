@@ -3020,11 +3020,22 @@ async fn run_foreground_inner_with_boot_db_impl(
                         _ = async { if let Some(s) = roll.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => true,
                     };
                     if reconnect {
-                        ctx.broadcast_global(proto::Event::Reconnect {
-                            generation: supervisor::worker_generation().saturating_add(1),
-                        });
+                        let generation = supervisor::worker_generation().saturating_add(1);
+                        match supervisor::begin_worker_handover(generation) {
+                            Ok(()) => {
+                                if ctx.shutdown_signal().begin_drain() {
+                                    tracing::info!(generation, "worker handover drain begun");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "worker handover setup failed");
+                                server::request_shutdown(&ctx);
+                            }
+                        }
+                        break;
+                    } else {
+                        server::request_shutdown(&ctx);
                     }
-                    server::request_shutdown(&ctx);
                     if ctx.shutdown_signal().is_forced() {
                         break;
                     }
@@ -3140,6 +3151,10 @@ async fn run_foreground_inner_with_boot_db_impl(
     };
     initial_retention.abort_and_join().await;
 
+    if let Some(handover) = supervisor::take_worker_handover() {
+        prepare_worker_handover(&ctx, handover).await?;
+    }
+
     // The accept loop normally stops because `request_shutdown` already began
     // the drain. Do not call it a second time here: a second request is the
     // explicit force-stop signal and would cancel the interrupt-park fence we
@@ -3220,6 +3235,74 @@ async fn run_foreground_inner_with_boot_db_impl(
     } else {
         anyhow::bail!(failures.join("; "))
     }
+}
+
+async fn prepare_worker_handover(
+    ctx: &std::sync::Arc<server::DaemonContext>,
+    handover: supervisor::WorkerHandoverRequest,
+) -> Result<()> {
+    let drain_deadline = tokio::time::Instant::now() + handover.timers.drain();
+    while ctx.registry.has_handover_inflight() && tokio::time::Instant::now() < drain_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if ctx.registry.has_handover_inflight() {
+        let interrupted = ctx.registry.interrupt_for_handover().await?;
+        tracing::warn!(
+            interrupted,
+            "worker handover hard deadline interrupted live turns"
+        );
+        let hard_deadline = tokio::time::Instant::now() + handover.timers.hard();
+        while ctx.registry.has_handover_inflight() && tokio::time::Instant::now() < hard_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::ensure!(
+            !ctx.registry.has_handover_inflight(),
+            "worker handover interrupt path did not reach a durable boundary before T_hard"
+        );
+    }
+
+    let active_sessions = ctx
+        .registry
+        .active_session_ids()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let resume_from = ctx
+        .db
+        .session_boundary_markers()
+        .await?
+        .into_iter()
+        .filter(|boundary| active_sessions.contains(&boundary.session_id))
+        .map(|boundary| proto::SessionBoundaryMarker {
+            session_id: boundary.session_id,
+            marker: boundary.marker,
+        })
+        .collect::<Vec<_>>();
+    supervisor::announce_worker_boundary(
+        &ctx.paths,
+        supervisor::worker_generation(),
+        resume_from.clone(),
+    )
+    .await?;
+    ctx.broadcast_global(proto::Event::Reconnect {
+        generation: handover.generation,
+        resume_from,
+    });
+
+    let grace_deadline = tokio::time::Instant::now() + handover.timers.grace();
+    let mut clients = ctx.client_presence();
+    while clients.borrow().count > 0 && tokio::time::Instant::now() < grace_deadline {
+        if tokio::time::timeout_at(grace_deadline, clients.changed())
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    anyhow::ensure!(
+        clients.borrow().count == 0,
+        "worker handover T_grace expired before attached clients reconnected"
+    );
+    Ok(())
 }
 
 /// Locked bootstrap exists before `DaemonContext` and therefore before its

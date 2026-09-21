@@ -1369,10 +1369,10 @@ pub enum DaemonCommand {
         #[arg(long)]
         no_sandbox: bool,
     },
-    /// Roll the worker to a specific Cockpit binary.
+    /// Roll the worker, optionally using a specific Cockpit binary.
     Upgrade {
-        #[arg(value_name = "BINARY")]
-        binary: std::path::PathBuf,
+        #[arg(long, value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
     },
     /// Re-execute the stable supervisor from its current binary.
     Reexec,

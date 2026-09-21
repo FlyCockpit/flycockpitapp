@@ -109,11 +109,23 @@ mod tests {
     }
 
     #[test]
-    fn disabled_buttons_are_unclickable() {
+    fn disabled_buttons_paint_but_action_bar_rejects_clicks() {
         let buttons = [Button::primary("Next").enabled(false)];
-        let (rects, _) = render(&buttons, None);
-        assert_eq!(rects[0], Rect::default());
-        assert_eq!(button_at(&rects, Position::ORIGIN), None);
+        let (rects, text) = render(&buttons, None);
+        let rect = rects[0];
+        assert!(text.contains("[ Next ]"), "{text}");
+        assert!(rect.width > 0 && rect.height > 0);
+        // Raw geometry remains visible to settings' pointer registry; the
+        // stateful ActionBar is the interaction boundary and rejects it.
+        assert_eq!(button_at(&rects, Position::new(rect.x, rect.y)), Some(0));
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut action_bar = ActionBar::default();
+        terminal
+            .draw(|frame| action_bar.render(frame, frame.area(), &buttons))
+            .unwrap();
+        assert_eq!(action_bar.clicked(Position::new(rect.x, rect.y)), None);
     }
 
     #[test]

@@ -530,21 +530,69 @@ async fn await_reexec_supervisor(
 
     let deadline = Instant::now() + super::DAEMON_SPAWN_TIMEOUT;
     loop {
-        if let Some(receipt) = replacement_supervisor_receipt(
-            super::read_endpoint_record(canonical),
+        let record = super::read_endpoint_record(canonical);
+        match reexec_supervisor_observation(
+            record,
+            canonical.pid_file.exists(),
+            socket.exists(),
             socket,
             previous,
             opened_at_unix_ms,
-        ) && let VerifiedProcessOutcome::Verified(process) =
-            acquire_verified_daemon_process(&receipt)
-        {
-            return Some((receipt, process));
+        ) {
+            ReexecSupervisorObservation::Replacement(receipt) => {
+                if let VerifiedProcessOutcome::Verified(process) =
+                    acquire_verified_daemon_process(&receipt)
+                {
+                    return Some((receipt, process));
+                }
+            }
+            ReexecSupervisorObservation::Retired => return None,
+            ReexecSupervisorObservation::Waiting => {}
         }
         if Instant::now() >= deadline {
             return None;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+))]
+#[derive(Debug, PartialEq, Eq)]
+enum ReexecSupervisorObservation {
+    Replacement(cockpit_host::daemon_lifecycle::DaemonPidReceipt),
+    Waiting,
+    Retired,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+))]
+fn reexec_supervisor_observation(
+    record: Option<super::DaemonEndpointRecord>,
+    pid_file_exists: bool,
+    socket_exists: bool,
+    socket: &Path,
+    previous: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+    opened_at_unix_ms: u64,
+) -> ReexecSupervisorObservation {
+    if !pid_file_exists || !socket_exists {
+        return ReexecSupervisorObservation::Retired;
+    }
+    let Some(record) = record else {
+        return ReexecSupervisorObservation::Retired;
+    };
+    replacement_supervisor_receipt(Some(record), socket, previous, opened_at_unix_ms)
+        .map_or(ReexecSupervisorObservation::Waiting, |receipt| {
+            ReexecSupervisorObservation::Replacement(receipt)
+        })
 }
 
 #[cfg(any(
@@ -1713,6 +1761,61 @@ fn reexec_watch_accepts_only_a_replacement_with_the_same_endpoint_and_clock() {
     let mut unchanged = record(socket.clone(), 900);
     unchanged.receipt = previous.clone();
     assert!(replacement_supervisor_receipt(Some(unchanged), &socket, &previous, 900).is_none());
+
+    let mut unchanged = record(socket.clone(), 900);
+    unchanged.receipt = previous.clone();
+    assert_eq!(
+        reexec_supervisor_observation(Some(unchanged), true, true, &socket, &previous, 900),
+        ReexecSupervisorObservation::Waiting
+    );
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    )
+))]
+#[test]
+fn reexec_watch_stops_immediately_when_owner_metadata_is_retired() {
+    let socket = PathBuf::from("daemon-endpoint");
+    let executable = std::env::current_exe().unwrap();
+    let process_start =
+        cockpit_host::daemon_lifecycle::process_start_identity(std::process::id()).unwrap();
+    let previous = cockpit_host::daemon_lifecycle::DaemonPidReceipt {
+        pid: std::process::id(),
+        executable,
+        process_start,
+        publication_nonce: [1; 32],
+    };
+    let record = || super::DaemonEndpointRecord {
+        pid: previous.pid,
+        start_time: process_start,
+        socket_path: socket.clone(),
+        protocol_version: super::proto::PROTOCOL_VERSION,
+        daemon_version: super::proto::DAEMON_VERSION.to_string(),
+        worker_pid: Some(77),
+        generation: 4,
+        opened_at_unix_ms: 900,
+        receipt: previous.clone(),
+        ephemeral: false,
+    };
+
+    assert_eq!(
+        reexec_supervisor_observation(None, true, true, &socket, &previous, 900),
+        ReexecSupervisorObservation::Retired
+    );
+    assert_eq!(
+        reexec_supervisor_observation(Some(record()), false, true, &socket, &previous, 900),
+        ReexecSupervisorObservation::Retired
+    );
+    assert_eq!(
+        reexec_supervisor_observation(Some(record()), true, false, &socket, &previous, 900),
+        ReexecSupervisorObservation::Retired
+    );
 }
 
 #[cfg(test)]

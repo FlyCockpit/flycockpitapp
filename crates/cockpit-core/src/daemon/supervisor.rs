@@ -708,6 +708,8 @@ struct Worker {
     binary: PathBuf,
     #[cfg(windows)]
     receipt: cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+    #[cfg(windows)]
+    exit_status: cockpit_host::daemon_lifecycle::VerifiedDaemonProcess,
     child: Option<std::process::Child>,
     exited: tokio::sync::mpsc::Receiver<std::result::Result<(), String>>,
 }
@@ -933,12 +935,22 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
         promote_windows_identity(&staged_identity, &request.paths.socket)?;
     }
     let receipt = worker_receipt(pid, &request.binary)?;
+    #[cfg(windows)]
+    let exit_status = match verified_worker_process(&receipt) {
+        Ok(process) => process,
+        Err(error) => {
+            super::spawn_notify::reap_or_kill(&mut child);
+            return Err(error);
+        }
+    };
     let exited = watch_worker(&receipt)?;
     Ok(Worker {
         pid,
         binary: std::fs::canonicalize(&request.binary)?,
         #[cfg(windows)]
         receipt,
+        #[cfg(windows)]
+        exit_status,
         child: Some(child),
         exited,
     })
@@ -946,11 +958,15 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
 
 fn resume_worker(pid: u32, binary: &Path) -> Result<Worker> {
     let receipt = worker_receipt(pid, binary)?;
+    #[cfg(windows)]
+    let exit_status = verified_worker_process(&receipt)?;
     Ok(Worker {
         pid,
         binary: std::fs::canonicalize(binary)?,
         #[cfg(windows)]
         receipt: receipt.clone(),
+        #[cfg(windows)]
+        exit_status,
         child: None,
         exited: watch_worker(&receipt)?,
     })
@@ -972,7 +988,11 @@ fn worker_exit_succeeded(worker: &mut Worker) -> bool {
         let waited = unsafe { libc::waitpid(worker.pid as libc::pid_t, &mut status, 0) };
         waited > 0 && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        worker.exit_status.exit_succeeded().unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
     false
 }
 
@@ -1190,6 +1210,18 @@ fn watch_worker(
     receipt: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
 ) -> Result<tokio::sync::mpsc::Receiver<std::result::Result<(), String>>> {
     watch_worker_with_interval(receipt, Duration::from_secs(365 * 24 * 60 * 60))
+}
+
+#[cfg(windows)]
+fn verified_worker_process(
+    receipt: &cockpit_host::daemon_lifecycle::DaemonPidReceipt,
+) -> Result<cockpit_host::daemon_lifecycle::VerifiedDaemonProcess> {
+    match cockpit_host::daemon_lifecycle::acquire_verified_daemon_process(receipt) {
+        cockpit_host::daemon_lifecycle::VerifiedProcessOutcome::Verified(process) => Ok(process),
+        cockpit_host::daemon_lifecycle::VerifiedProcessOutcome::Identity(identity) => {
+            bail!("could not acquire stable worker exit-status witness: {identity:?}")
+        }
+    }
 }
 
 fn watch_worker_with_interval(
@@ -1666,6 +1698,35 @@ mod tests {
                 .unwrap(),
             Some(Ok(()))
         );
+        child.wait().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resumed_worker_clean_exit_is_recognized_after_windows_reexec() {
+        let binary = super::super::discover_daemon_spawn_harness_executable().unwrap();
+        let mut child = std::process::Command::new(&binary)
+            .args(["daemon", "worker"])
+            .env("COCKPIT_WORKER_WATCH_TEST_EXIT_SUCCESS", "1")
+            .spawn()
+            .unwrap();
+        let receipt = worker_receipt(child.id(), &binary).unwrap();
+        let mut worker = Worker {
+            pid: child.id(),
+            binary: std::fs::canonicalize(&binary).unwrap(),
+            receipt: receipt.clone(),
+            exit_status: verified_worker_process(&receipt).unwrap(),
+            child: None,
+            exited: watch_worker(&receipt).unwrap(),
+        };
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), worker.exited.recv())
+                .await
+                .unwrap(),
+            Some(Ok(()))
+        );
+        assert!(worker_exit_succeeded(&mut worker));
         child.wait().unwrap();
     }
 

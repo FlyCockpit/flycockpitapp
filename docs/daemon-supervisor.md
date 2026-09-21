@@ -51,6 +51,15 @@ live while the replacement acquires the released named mutex and republishes
 the v2 supervisor receipt. Neither path resets the supervisor start clock or
 worker generation.
 
+Client process watches are advisory supervision signals, not substitutes for
+the live worker stream. If the supervisor is lost while its worker connection
+is still serving, the TUI keeps that session attached and does not show the
+modal restart decision. A later socket drop is untrusted and presents the
+restart decision before lifecycle owner resolution. During a trusted worker
+roll or crash recovery, reconnect continues to observe the supervisor watch;
+owner exit or a spawn-timeout-sized recovery deadline falls back to that same
+restart decision instead of reconnecting forever.
+
 The public protocol's `Reconnect { generation }` event means a supervisor has
 made a successor generation available and attached clients should reattach to
 the same durable session. It is unrelated to `Reconnecting`, which describes a

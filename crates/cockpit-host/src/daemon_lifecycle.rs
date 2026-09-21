@@ -695,6 +695,27 @@ impl VerifiedDaemonProcess {
             ))),
         }
     }
+
+    /// Read the exit status from this exact receipt-bound process handle.
+    /// Callers first observe process completion through the same generation's
+    /// independent wait handle, so `STILL_ACTIVE` is an invalid state here.
+    pub fn exit_succeeded(&self) -> std::io::Result<bool> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::STILL_ACTIVE;
+        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+
+        let mut exit_code = 0_u32;
+        // SAFETY: self retains the verified process handle for this call.
+        if unsafe { GetExitCodeProcess(self.handle.as_raw_handle(), &mut exit_code) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if exit_code == STILL_ACTIVE as u32 {
+            return Err(std::io::Error::other(
+                "verified process is still active after its exit notification",
+            ));
+        }
+        Ok(exit_code == 0)
+    }
 }
 
 #[cfg(windows)]

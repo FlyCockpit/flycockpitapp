@@ -6676,12 +6676,14 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
         }
     }
 
-    // Client handlers retain the central context, database handles, and their
-    // reader/writer/executor children.  Keep them under the accept loop's
-    // ownership so foreground shutdown has an explicit cancellation
-    // completion boundary instead of leaving process teardown to Tokio's
-    // runtime-drop scheduling.
-    clients.abort_all();
+    // A handover must deliver `Reconnect` on the predecessor stream before
+    // that stream is closed.  Keep established handlers alive in that one
+    // case; new admission is already closed by the shutdown gate and the
+    // handlers leave after clients reattach to the successor.  Ordinary
+    // shutdown retains the explicit cancellation completion boundary.
+    if !super::supervisor::worker_handover_active() {
+        clients.abort_all();
+    }
     while clients.join_next().await.is_some() {}
 
     Ok(())

@@ -11,8 +11,10 @@
 //! public NDJSON protocol.
 
 use std::path::{Path, PathBuf};
-#[cfg(any(unix, windows))]
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -52,6 +54,7 @@ pub(crate) struct WorkerHandoverRequest {
 }
 
 static WORKER_HANDOVER: OnceLock<std::sync::Mutex<Option<WorkerHandoverRequest>>> = OnceLock::new();
+static WORKER_HANDOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn begin_worker_handover(generation: u64) -> Result<()> {
     let timers = crate::config::config::extended::load_installation_handover_timers()
@@ -59,7 +62,22 @@ pub(crate) fn begin_worker_handover(generation: u64) -> Result<()> {
     let slot = WORKER_HANDOVER.get_or_init(|| std::sync::Mutex::new(None));
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
         Some(WorkerHandoverRequest { generation, timers });
+    WORKER_HANDOVER_ACTIVE.store(true, Ordering::Release);
     Ok(())
+}
+
+/// The accept loop keeps established streams alive during a handover so the
+/// predecessor can send its final `Reconnect` frame.  New admission is still
+/// closed by the ordinary shutdown gate.
+pub(crate) fn worker_handover_active() -> bool {
+    WORKER_HANDOVER_ACTIVE.load(Ordering::Acquire)
+}
+
+pub(crate) fn abort_worker_handover() {
+    WORKER_HANDOVER_ACTIVE.store(false, Ordering::Release);
+    if let Some(slot) = WORKER_HANDOVER.get() {
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
 }
 
 pub(crate) fn take_worker_handover() -> Option<WorkerHandoverRequest> {
@@ -696,6 +714,41 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             },
                             _ => executable.clone(),
                         };
+                        // Close admission and wait until the predecessor has
+                        // reached a durable boundary *before* creating another
+                        // worker with the inherited listener.  Readiness-first
+                        // would let both workers attach/write the same session.
+                        if let Err(error) = terminate_worker(&mut worker, true) {
+                            let reason = format!("starting worker handover: {error:#}");
+                            tracing::warn!(%reason, "worker handover aborted; predecessor remains serving");
+                            last_handover = Some(format!("aborted: {reason}"));
+                            write_admin(&mut stream, &AdminResponse::Error {
+                                version: ADMIN_PROTOCOL_VERSION,
+                                message: reason,
+                            }).await?;
+                            continue;
+                        }
+                        let boundary = wait_for_worker_boundary(
+                            &mut admin,
+                            worker.pid,
+                            generation,
+                            handover_timers.drain() + handover_timers.hard(),
+                            opened_at_unix_ms,
+                            last_handover.clone(),
+                        ).await;
+                        let boundary = match boundary {
+                            Ok(boundary) => boundary,
+                            Err(error) => {
+                                let reason = format!("waiting for predecessor boundary: {error:#}");
+                                tracing::warn!(%reason, "worker handover aborted before successor spawn");
+                                last_handover = Some(format!("aborted: {reason}"));
+                                write_admin(&mut stream, &AdminResponse::Error {
+                                    version: ADMIN_PROTOCOL_VERSION,
+                                    message: reason,
+                                }).await?;
+                                continue;
+                            }
+                        };
                         let next_generation = generation.saturating_add(1);
                         let successor = spawn_ready_worker(WorkerSpawnRequest {
                             endpoints: &endpoint_owner,
@@ -714,18 +767,18 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 publish_generation(
                                     &paths, &receipt, successor.pid, next_generation, opened_at_unix_ms,
                                 )?;
-                                // The listener is already live in the successor;
-                                // retire the predecessor through the boundary-aware
-                                // drain signaled by `terminate_worker(..., true)`.
+                                // The predecessor has already closed admission
+                                // and reported `boundary`; it now broadcasts the
+                                // redirect and exits through its normal drain.
+                                // Do not signal it a second time: a second signal
+                                // is the daemon's force-stop transition.
                                 let predecessor = std::mem::replace(&mut worker, successor);
-                                reap_retired_worker(
-                                    predecessor,
-                                    handover_timers.drain()
-                                        + handover_timers.hard()
-                                        + handover_timers.grace(),
-                                );
+                                reap_worker_after_exit(predecessor);
                                 generation = next_generation;
-                                last_handover = Some(format!("in progress: generation {generation}"));
+                                last_handover = Some(format!(
+                                    "in progress: generation {generation}; {} session boundaries",
+                                    boundary.len()
+                                ));
                                 write_admin(&mut stream, &AdminResponse::Rolled {
                                     version: ADMIN_PROTOCOL_VERSION,
                                     old_worker_pid: old_pid,
@@ -1134,11 +1187,16 @@ fn worker_exit_succeeded(worker: &mut Worker) -> bool {
     false
 }
 
-fn reap_retired_worker(mut worker: Worker, timeout: Duration) {
+fn reap_worker_after_exit(mut worker: Worker) {
     tokio::spawn(async move {
-        if let Err(error) = await_drained_worker_exit_with_timeout(&mut worker, true, timeout).await
-        {
-            tracing::error!(pid = worker.pid, %error, "retired worker process watch failed");
+        match worker.exited.recv().await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                tracing::error!(pid = worker.pid, %error, "retired worker process watch failed");
+            }
+            None => {
+                tracing::error!(pid = worker.pid, "retired worker process watch stopped");
+            }
         }
         if let Some(mut child) = worker.child {
             let _ = child.wait();
@@ -1541,9 +1599,73 @@ fn terminate_worker(worker: &mut Worker, reconnect: bool) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn terminate_worker(worker: &mut Worker, _reconnect: bool) -> Result<()> {
+fn terminate_worker(worker: &mut Worker, reconnect: bool) -> Result<()> {
+    if reconnect {
+        // Windows has no process signal equivalent to SIGUSR1.  Failing
+        // closed is preferable to terminating a live worker without its
+        // boundary/interrupt/reconnect protocol.
+        bail!("boundary-aware worker handover is not available on Windows");
+    }
     cockpit_host::daemon_lifecycle::terminate_verified_daemon_process(&worker.receipt)
         .context("terminating supervised worker")
+}
+
+async fn wait_for_worker_boundary(
+    admin: &mut AdminListener,
+    expected_worker_pid: u32,
+    expected_generation: u64,
+    timeout: Duration,
+    opened_at_unix_ms: u64,
+    last_handover: Option<String>,
+) -> Result<Vec<super::proto::SessionBoundaryMarker>> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let stream = accept_admin(admin).await?;
+            let (request, mut stream) = read_admin(stream).await?;
+            if request.version != ADMIN_PROTOCOL_VERSION {
+                write_admin(
+                    &mut stream,
+                    &AdminResponse::Error {
+                        version: ADMIN_PROTOCOL_VERSION,
+                        message: "unsupported supervisor admin protocol".to_string(),
+                    },
+                )
+                .await?;
+                continue;
+            }
+            match request.command {
+                AdminCommand::WorkerBoundary {
+                    worker_pid,
+                    generation,
+                    last_boundary,
+                } if worker_pid == expected_worker_pid && generation == expected_generation => {
+                    write_admin(
+                        &mut stream,
+                        &status_response(
+                            expected_worker_pid,
+                            expected_generation,
+                            opened_at_unix_ms,
+                            last_handover,
+                        ),
+                    )
+                    .await?;
+                    return Ok(last_boundary);
+                }
+                _ => {
+                    write_admin(
+                        &mut stream,
+                        &AdminResponse::Error {
+                            version: ADMIN_PROTOCOL_VERSION,
+                            message: "worker handover is in progress".to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("T_drain + T_hard elapsed before predecessor boundary"))?
 }
 
 #[cfg(unix)]

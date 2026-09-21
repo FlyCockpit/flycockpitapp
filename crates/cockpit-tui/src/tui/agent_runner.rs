@@ -3418,16 +3418,11 @@ async fn try_spawn_inner(
                             event_state.session_id(),
                             resume_from,
                         );
-                        push_turn_event(
-                            &events,
-                            &event_notify,
-                            GLOBAL_ATTACHMENT_EPOCH,
-                            TurnEvent::DaemonLinkReconnecting {
-                                restarting: true,
-                                attempt: 1,
-                            },
-                        );
-                        continue;
+                        // The predecessor deliberately keeps this stream
+                        // alive long enough to deliver the control frame. Do
+                        // not continue consuming it: drop it and take the
+                        // normal attach/hello recovery path to the successor.
+                        break;
                     }
                     let resync_driver = driver.clone();
                     let resync_current_client = current_client.clone();

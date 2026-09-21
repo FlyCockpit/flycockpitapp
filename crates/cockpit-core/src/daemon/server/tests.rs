@@ -19937,24 +19937,6 @@ fn authz_session_reader(kind: &'static str) -> AuthzDispatchCase {
     }
 }
 
-fn authz_attach() -> AuthzDispatchCase {
-    AuthzDispatchCase {
-        kind: "attach",
-        owner: authz_allow("attach"),
-        // Remote readers and writers pass the session-access gate, then the
-        // ephemeral matrix daemon correctly refuses the owner-only lifetime
-        // promotion before starting any worker-side effect.
-        #[cfg(feature = "remote")]
-        writer: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::Authorization)),
-        #[cfg(feature = "remote")]
-        readonly: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::Authorization)),
-        #[cfg(feature = "remote")]
-        no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
-        #[cfg(feature = "remote")]
-        known_holes: &[],
-    }
-}
-
 fn authz_project_files(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
@@ -20205,12 +20187,17 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_redaction"
         | "set_tandem_models"
         | "refresh_config"
+        | "refresh_host_capabilities"
         | "cancel_schedule"
         | "prune"
         | "compact"
         | "resume_from_compaction"
         | "pin"
         | "promote_conversation_rule" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        // Discard is deliberately idempotent. The owner reaches the handler,
+        // and an unknown/already-removed ephemeral lineage acknowledges
+        // without inventing state.
+        "discard_session" => AuthzAllowedOutcome::Response,
         // `recover_security_blocked_media` validates the owner-principal binding
         // first, then short-circuits on the missing storage authority before the
         // attach check, so a detached owner reaches the `Internal` "media storage
@@ -20317,6 +20304,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // intent therefore reaches the post-owner-gate capability CAS and
         // returns the precise stale/missing-authority conflict.
         "save_mcp_config" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
+        // The legacy catalog constructor remains on the wire for an explicit,
+        // typed retirement error. Authorization succeeds for the owner before
+        // dispatch directs callers to the owner-declared sink replacement.
+        "create_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // `import_policy` and `apply_setup_wizard` validate their caller-supplied
         // payload inside the owner handler, which maps every parse /
         // unsupported-descriptor failure through `internal` (not `bad_request`),
@@ -20343,6 +20334,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "list_failed_tool_calls"
         | "get_assistant"
         | "get_session_compactions"
+        | "list_media_egress_verdicts"
         | "diagnose_media_reservation"
         | "get_doctor_snapshot"
         | "get_agent_inventory"
@@ -20448,10 +20440,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
 
 fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
     vec![
-        authz_attach(),
+        authz_session_reader("attach"),
         authz_session_reader("subagent_transcript"),
-        authz_owner_only("attach_knowledge_base_session"),
-        authz_owner_only("detach_knowledge_base_session"),
+        authz_session_writer("attach_knowledge_base_session"),
+        authz_session_writer("detach_knowledge_base_session"),
         authz_session_writer("send_user_message"),
         authz_session_writer("acknowledge_assistant_inbox_human_read"),
         authz_bulk_user_message(),
@@ -20463,9 +20455,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("remove_queued_user_message"),
         authz_session_writer("remove_newest_queued_user_message"),
         authz_session_writer("remove_editable_queued_user_messages"),
-        authz_owner_only("set_queued_user_message_class"),
-        authz_owner_only("promote_queued_user_messages"),
-        authz_owner_only("send_now_queued_user_message"),
+        authz_session_writer("set_queued_user_message_class"),
+        authz_session_writer("promote_queued_user_messages"),
+        authz_session_writer("send_now_queued_user_message"),
         authz_session_writer("resume_paused_work"),
         authz_session_writer("cancel_paused_work"),
         authz_session_writer("repair_resume"),
@@ -20565,7 +20557,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("delete_session"),
         authz_session_reader("get_inventory_bundle"),
         authz_session_reader("get_session_setup_snapshot"),
-        authz_owner_only("get_guidance_enablement_trace"),
+        authz_session_reader("get_guidance_enablement_trace"),
         authz_session_reader("read_agent_tree"),
         authz_session_reader("read_agent_attention"),
         authz_session_reader("get_agent_effective_settings"),
@@ -20740,13 +20732,13 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("set_workspace_trust"),
         authz_owner_only("recover_security_blocked_media"),
         authz_owner_only("register_local_path_media"),
-        authz_owner_only("admit_image_ingress"),
-        authz_owner_only("discard_image_ingress_draft"),
-        authz_owner_only("begin_media_upload"),
-        authz_owner_only("append_media_upload_chunk"),
-        authz_owner_only("cancel_media_upload"),
-        authz_owner_only("finalize_media_upload"),
-        authz_owner_only("discard_unreferenced_media_attachment"),
+        authz_session_writer("admit_image_ingress"),
+        authz_session_writer("discard_image_ingress_draft"),
+        authz_session_writer("begin_media_upload"),
+        authz_session_writer("append_media_upload_chunk"),
+        authz_session_writer("cancel_media_upload"),
+        authz_session_writer("finalize_media_upload"),
+        authz_session_writer("discard_unreferenced_media_attachment"),
         authz_session_writer("resolve_agent_decision"),
         authz_session_writer("apply_agent_session_override"),
         authz_owner_only("retain_https_media"),
@@ -21488,12 +21480,7 @@ async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSo
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
-    let (session_id, work_rx) = if kind == "attach" {
-        live_worker_with_receiver_and_mode(&ctx, tmp.path(), proto::SessionEntryMode::Assistant)
-            .await
-    } else {
-        live_worker_with_receiver(&ctx, tmp.path()).await
-    };
+    let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     ctx.db
         .set_session_shared_with_collaborators(session_id, true)
         .await
@@ -24999,14 +24986,6 @@ async fn live_worker_with_receiver(
     ctx: &Arc<DaemonContext>,
     project_root: &Path,
 ) -> (Uuid, tokio::sync::mpsc::Receiver<SessionWork>) {
-    live_worker_with_receiver_and_mode(ctx, project_root, proto::SessionEntryMode::Code).await
-}
-
-async fn live_worker_with_receiver_and_mode(
-    ctx: &Arc<DaemonContext>,
-    project_root: &Path,
-    entry_mode: proto::SessionEntryMode,
-) -> (Uuid, tokio::sync::mpsc::Receiver<SessionWork>) {
     let normalized_root = project_root
         .canonicalize()
         .unwrap()
@@ -25030,7 +25009,6 @@ async fn live_worker_with_receiver_and_mode(
         Path::new(&project_root),
         "Build",
         crate::session::TestSessionRowOptions::default()
-            .with_entry_mode(entry_mode)
             .with_model_selection(stub_active_model_ref()),
     )
     .await
@@ -30980,7 +30958,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 admission_id: Uuid::now_v7(),
             },
             kind: "admit_image_ingress",
-            session_id: Some(attached_session_id),
+            session_id: Some(Uuid::nil()),
             audit_path: None,
             mutating: true,
         },
@@ -31059,7 +31037,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 },
             ),
             kind: "begin_media_upload",
-            session_id: Some(attached_session_id),
+            session_id: None,
             audit_path: None,
             mutating: true,
         },
@@ -31088,7 +31066,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 },
             ),
             kind: "append_media_upload_chunk",
-            session_id: Some(attached_session_id),
+            session_id: None,
             audit_path: None,
             mutating: true,
         },
@@ -31111,7 +31089,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 },
             ),
             kind: "cancel_media_upload",
-            session_id: Some(attached_session_id),
+            session_id: None,
             audit_path: None,
             mutating: true,
         },
@@ -31137,7 +31115,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 },
             ),
             kind: "discard_unreferenced_media_attachment",
-            session_id: Some(attached_session_id),
+            session_id: None,
             audit_path: None,
             mutating: true,
         },
@@ -31180,7 +31158,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 },
             ),
             kind: "finalize_media_upload",
-            session_id: Some(attached_session_id),
+            session_id: None,
             audit_path: None,
             mutating: true,
         },
@@ -31282,175 +31260,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ApplyAuthoredAgentPackage(cockpit_proto::ApplyAuthoredAgentPackageRequest { client_operation_id: "authored-package-apply".into(), expected_policy_revision: "aa".repeat(32), package: cockpit_proto::AuthoredAgentPackageDraft { dto_version: cockpit_proto::AGENT_AUTHORING_DTO_VERSION, name: "helper".into(), markdown: "---\ndescription: helper\n---\nbody\n".into(), source: cockpit_proto::AuthoredAgentSource { kind: cockpit_proto::AgentAuthoringSourceKind::Authored, source_locator: "authored/helper".into(), pin: None, third_party_trust_confirmed: false }, children: vec![], mcp_json: None, sidecars: vec![], policy_revision: "aa".repeat(32), model_trust_confirmations: vec![], make_default: true, draft_revision: None }, onboarding: None, validate_only: false }), kind: "apply_authored_agent_package", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetAuthoredAgentPackageReceipt(cockpit_proto::AuthoredAgentPackageReceiptQuery { client_operation_id: "authored-package-apply".into() }), kind: "get_authored_agent_package_receipt", session_id: None, audit_path: None, mutating: false },
     ]);
-    cases.extend(
-        [
-            ("create_code_root_v1", true),
-            ("attach_existing_code_root_v1", true),
-            ("close_code_root_attachment_v1", true),
-            ("create_code_root_with_acp_ingress_v1", true),
-            ("attach_existing_code_root_with_acp_ingress_v1", true),
-            ("close_acp_code_root_attachment_v1", true),
-            ("discover_code_roots_v1", false),
-            ("read_code_root_v1", false),
-            ("read_code_root_deliveries_v1", false),
-            ("ack_code_root_deliveries_v1", true),
-            ("resolve_code_root_interrupt_v1", true),
-        ]
-        .into_iter()
-        .map(|(kind, mutating)| CommandMetadataCase {
-            request: authz_matrix_request(kind, session_id, Path::new(&project_root)),
-            kind,
-            session_id: None,
-            audit_path: None,
-            mutating,
-        }),
-    );
-    cases.extend([
-        CommandMetadataCase {
-            request: Request::RetryOnboardingReadyConstruction,
-            kind: "retry_onboarding_ready_construction",
-            session_id: None,
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
-            request: Request::GetStorageReport,
-            kind: "get_storage_report",
-            session_id: None,
-            audit_path: None,
-            mutating: false,
-        },
-        CommandMetadataCase {
-            request: Request::CancelAllSessionWork,
-            kind: "cancel_all_session_work",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
-            request: Request::PromoteToPersistent,
-            kind: "promote_to_persistent",
-            session_id: None,
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
-            request: Request::ExitGuardStatus,
-            kind: "exit_guard_status",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: false,
-        },
-        CommandMetadataCase {
-            request: Request::ReleaseExitGuard,
-            kind: "release_exit_guard",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: false,
-        },
-        CommandMetadataCase {
-            request: Request::ResumeFromCompaction,
-            kind: "resume_from_compaction",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
-            request: Request::ExchangeLocalPeerCredential,
-            kind: "exchange_local_peer_credential",
-            session_id: None,
-            audit_path: None,
-            mutating: false,
-        },
-        CommandMetadataCase {
-            request: Request::ListGuidanceProposals,
-            kind: "list_guidance_proposals",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: false,
-        },
-        CommandMetadataCase {
-            request: Request::GetGuidanceEnablementTrace,
-            kind: "get_guidance_enablement_trace",
-            session_id: Some(attached_session_id),
-            audit_path: None,
-            mutating: false,
-        },
-    ]);
-    cases.extend(
-        [
-            (
-                "get_redaction_coverage_status",
-                Some(session_id),
-                None,
-                false,
-            ),
-            ("render_input_prediction", Some(session_id), None, false),
-            ("resolve_tag_preview", Some(session_id), None, false),
-            (
-                "attach_knowledge_base_session",
-                Some(session_id),
-                None,
-                true,
-            ),
-            (
-                "detach_knowledge_base_session",
-                Some(session_id),
-                None,
-                true,
-            ),
-            ("knowledge_dream_status", None, Some("/repo"), false),
-            ("run_knowledge_dream", None, Some("/repo"), true),
-            ("set_workspace_history_scope", None, Some("/repo"), true),
-            ("get_workspace_history_scope", None, Some("/repo"), false),
-            ("preview_storage_cleanup", None, None, true),
-            ("execute_storage_cleanup", None, None, true),
-            ("git_diff", None, None, false),
-            ("git_review_sources", None, None, false),
-            ("git_repo_status", None, None, false),
-            ("find_worktree_root", None, None, false),
-            (
-                "acknowledge_assistant_inbox_human_read",
-                Some(session_id),
-                None,
-                true,
-            ),
-            ("read_agent_tree", Some(session_id), None, false),
-            ("read_agent_attention", Some(session_id), None, false),
-            ("resolve_agent_decision", Some(session_id), None, true),
-            (
-                "get_agent_effective_settings",
-                Some(session_id),
-                None,
-                false,
-            ),
-            ("apply_agent_session_override", Some(session_id), None, true),
-            ("clean_managed_workspace_lease", None, None, true),
-            (
-                "review_guidance_proposal",
-                Some(attached_session_id),
-                None,
-                true,
-            ),
-            ("discard_image_ingress_draft", None, None, true),
-        ]
-        .into_iter()
-        .map(
-            |(kind, request_session_id, audit_path, mutating)| CommandMetadataCase {
-                request: if kind == "get_redaction_coverage_status" {
-                    Request::GetRedactionCoverageStatus {
-                        session_id: Some(session_id),
-                    }
-                } else {
-                    authz_matrix_request(kind, session_id, Path::new(&project_root))
-                },
-                kind,
-                session_id: request_session_id,
-                audit_path,
-                mutating,
-            },
-        ),
-    );
 
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the
     // single variant list below feeds both an exhaustive `match` with no

@@ -2403,7 +2403,7 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
     ) -> Result<SessionWorkerHandle> {
-        if self.inner.shutdown.is_draining() {
+        if self.inner.shutdown.is_draining() || super::supervisor::worker_handover_active() {
             bail!("daemon is shutting down; not starting session workers");
         }
         let session_id = session.id;
@@ -3248,10 +3248,13 @@ impl SessionRegistry {
         for (handle, turn_start_seq) in candidates {
             let session_id = handle.session_id();
             let events = self.inner.db.list_session_events(session_id).await?;
-            if events
-                .iter()
-                .any(|event| event.seq > turn_start_seq && event.kind == "assistant_message")
-            {
+            if events.iter().any(|event| {
+                event.seq > turn_start_seq
+                    && matches!(
+                        event.kind.as_str(),
+                        "assistant_message" | "tool_call_completed"
+                    )
+            }) {
                 continue;
             }
             if events.iter().any(|event| {
@@ -5918,10 +5921,10 @@ mod tests {
             ));
             completed
                 .record_event(
-                    crate::db::session_log::SessionEventKind::AssistantMessage,
+                    crate::db::session_log::SessionEventKind::ToolCallCompleted,
                     Some("Build"),
                     Some("completed-turn"),
-                    &json!({"text": "completed on predecessor"}),
+                    &json!({"tool": "bash", "result": "side effect committed"}),
                 )
                 .await
                 .unwrap();
@@ -5978,7 +5981,7 @@ mod tests {
         assert_eq!(
             completed_events
                 .iter()
-                .filter(|event| event.kind == "assistant_message")
+                .filter(|event| event.kind == "tool_call_completed")
                 .count(),
             1
         );
@@ -5988,7 +5991,7 @@ mod tests {
                 .filter(|event| event.kind == "interrupt_decision")
                 .count(),
             0,
-            "a predecessor-completed turn is never also classified as interrupted"
+            "a predecessor tool completion is never also classified as interrupted"
         );
         let interrupted_events = reg
             .inner
@@ -6015,7 +6018,9 @@ mod tests {
             (completed_id, &completed_events),
             (interrupted_id, &interrupted_events),
         ] {
-            let completed = events.iter().any(|event| event.kind == "assistant_message");
+            let completed = events
+                .iter()
+                .any(|event| event.kind == "tool_call_completed");
             let interrupted = events
                 .iter()
                 .any(|event| event.kind == "interrupt_decision");

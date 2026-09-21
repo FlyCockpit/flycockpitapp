@@ -10,8 +10,8 @@ shared client restart-storm guard, protocol version constants used in endpoint
 discovery, the daemon module's endpoint bind helpers, and the database crate's
 opaque `SupervisorDatabaseOwner` lock witness. The witness exposes no
 connection, migration, query, or writer API; retaining it in the wrapper lets a
-ready successor overlap a draining predecessor without creating a second
-database owner. The module must never import the engine, model providers,
+successor replace a predecessor at its durable handover boundary without
+creating a second database owner. The module must never import the engine, model providers,
 session workers, registry, or database implementation. Those remain inside
 `cockpit daemon worker`. This deliberately small binary boundary is what makes
 wrapper re-execution and worker upgrades independent of application behavior.
@@ -22,7 +22,8 @@ On Unix the supervisor retains the public listener and passes a duplicate as fd
 3 with `LISTEN_FDS`/`LISTEN_PID`. A worker writes one byte to fd 4 only after
 boot, recovery, and listener construction reach the normal publication
 barrier. Cockpit's required sensitive/reveal sibling is also inherited on the
-internal fd 5 so a ready successor can overlap a draining predecessor.
+internal fd 5 for the successor after the predecessor has reported its
+boundary.
 
 On Windows each worker creates a fresh random named pipe using the existing
 owner-only DACL, remote-client rejection, finite instance pool, and
@@ -75,13 +76,15 @@ unrelated to `Reconnecting`, which describes a model-provider network retry.
 Roll and upgrade share three installation-scoped deadlines under
 `daemon.handover`: `drain_ms` defaults to 30000, `hard_ms` to 5000, and
 `grace_ms` to 10000. `T_drain` closes new-turn admission and waits for live
-turns to settle. At `T_hard`, remaining turns go through the existing
+turns to settle; this admission gate is reversible until successor readiness
+has passed, so a failed successor leaves the predecessor serving. At `T_hard`, remaining turns go through the existing
 noninteractive cancellation path and receive one durable `InterruptDecision`;
 accepted queue rows remain in `message_queue_items`. `T_grace` retains the
 predecessor until its attached clients have consumed the reconnect instruction
 and detached.
 
-The successor's fd-4 readiness payload is a structured hello containing its
+Only after that boundary report does the supervisor start the successor. Its
+fd-4 readiness payload is a structured hello containing its
 protocol version, PID, generation, and inherited open time. A missing payload,
 protocol/open-time mismatch, or process-identity mismatch aborts the roll and
 leaves the predecessor serving. `daemon status` exposes the most recent result

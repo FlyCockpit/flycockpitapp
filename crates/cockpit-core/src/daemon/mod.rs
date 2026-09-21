@@ -3004,9 +3004,13 @@ async fn run_foreground_inner_with_boot_db_impl(
     // begins the drain; a **second** signal while still draining shortens
     // to an immediate force-exit (`request_shutdown`'s begin → force
     // promotion). The task therefore loops rather than firing once.
+    let (handover_done_tx, handover_done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+    let handover_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut signal_task = ForegroundTask::new({
         let ctx = ctx.clone();
+        let handover_started = handover_started.clone();
         tokio::spawn(async move {
+            let mut handover_done_tx = Some(handover_done_tx);
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{SignalKind, signal};
@@ -3023,8 +3027,21 @@ async fn run_foreground_inner_with_boot_db_impl(
                         let generation = supervisor::worker_generation().saturating_add(1);
                         match supervisor::begin_worker_handover(generation) {
                             Ok(()) => {
-                                if ctx.shutdown_signal().begin_drain() {
-                                    tracing::info!(generation, "worker handover drain begun");
+                                handover_started.store(true, std::sync::atomic::Ordering::Release);
+                                let result = match supervisor::take_worker_handover() {
+                                    Some(handover) => prepare_worker_handover(&ctx, handover).await,
+                                    None => Err(anyhow::anyhow!(
+                                        "worker handover request disappeared before drain"
+                                    )),
+                                };
+                                if result.is_ok() && ctx.shutdown_signal().begin_drain() {
+                                    tracing::info!(generation, "worker handover drain completed");
+                                }
+                                if result.is_err() {
+                                    supervisor::abort_worker_handover();
+                                }
+                                if let Some(done) = handover_done_tx.take() {
+                                    let _ = done.send(result);
                                 }
                             }
                             Err(error) => {
@@ -3032,7 +3049,10 @@ async fn run_foreground_inner_with_boot_db_impl(
                                 server::request_shutdown(&ctx);
                             }
                         }
-                        break;
+                        // Keep receiving SIGINT/SIGTERM while the main task
+                        // performs the metadata-gated drain.  A second stop
+                        // signal must still promote that drain to force.
+                        continue;
                     } else {
                         server::request_shutdown(&ctx);
                     }
@@ -3151,8 +3171,10 @@ async fn run_foreground_inner_with_boot_db_impl(
     };
     initial_retention.abort_and_join().await;
 
-    if let Some(handover) = supervisor::take_worker_handover() {
-        prepare_worker_handover(&ctx, handover).await?;
+    if handover_started.load(std::sync::atomic::Ordering::Acquire) {
+        handover_done_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("worker handover task stopped before completion"))??;
     }
 
     // The accept loop normally stops because `request_shutdown` already began

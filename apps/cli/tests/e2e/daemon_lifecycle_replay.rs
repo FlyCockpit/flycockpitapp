@@ -650,7 +650,11 @@ async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
         "the roll must begin only after the real tool process is running"
     );
     let before = supervisor_status_json(&daemon);
-    let roll = daemon.restart_via_command(2).await;
+    let roll = daemon
+        .command()
+        .args(["daemon", "upgrade"])
+        .output()
+        .expect("run daemon upgrade during handover-spanning tool");
     assert!(roll.status.success(), "{}", output_text(&roll));
     drop(client);
 
@@ -669,7 +673,7 @@ async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
     // Wait beyond the scripted tool's full runtime after successor attach.
     // A mistaken post-boundary replay would otherwise be able to append only
     // after the first successful observation and make this test vacuous.
-    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3_250)).await;
     assert_eq!(
         std::fs::read_to_string(&side_effect).expect("read settled side effect"),
         "committed\n",

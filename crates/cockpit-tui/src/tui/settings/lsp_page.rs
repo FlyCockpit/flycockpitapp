@@ -393,12 +393,12 @@ impl SettingsPage for LspPage {
         }
     }
 
-    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
         use super::pointer_actions::{LspAction, SettingsPointerAction};
         if let Some(edit) = self.editing {
             let edit = pointer_edit(edit);
             return super::shell::finish_help_row(
-                _cx,
+                cx,
                 vec![
                     super::shell::SettingsHelpAction {
                         label: "Cancel",
@@ -420,15 +420,15 @@ impl SettingsPage for LspPage {
         } else {
             "restore LSP defaults"
         };
-        super::shell::SettingsHelpRow {
-            actions: vec![super::shell::SettingsHelpAction {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
                 label,
                 enabled: true,
                 primary: false,
                 action: SettingsPointerAction::Lsp(LspAction::Reset),
             }],
-            hover: None,
-        }
+        )
     }
 
     fn as_any(&self) -> &dyn Any {

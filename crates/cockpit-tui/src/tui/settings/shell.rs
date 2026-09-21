@@ -130,6 +130,7 @@ pub(super) struct SettingsHelpAction<'a> {
 pub(super) struct SettingsHelpRow<'a> {
     pub actions: Vec<SettingsHelpAction<'a>>,
     pub hover: Option<usize>,
+    disabled_reasons: Vec<Option<&'static str>>,
 }
 
 pub(super) fn finish_help_row<'a>(
@@ -137,8 +138,40 @@ pub(super) fn finish_help_row<'a>(
     actions: Vec<SettingsHelpAction<'a>>,
 ) -> SettingsHelpRow<'a> {
     SettingsHelpRow {
+        disabled_reasons: vec![None; actions.len()],
         actions,
         hover: cx.pointer_surface.help_row_hover.get(),
+    }
+}
+
+impl<'a> SettingsHelpRow<'a> {
+    /// Attach the domain reason for a disabled action without forcing every
+    /// always-enabled ActionBar call site to carry redundant metadata.
+    pub(super) fn with_disabled_reason(
+        mut self,
+        index: usize,
+        disabled_reason: Option<&'static str>,
+    ) -> Self {
+        if let Some(reason) = self.disabled_reasons.get_mut(index) {
+            *reason = disabled_reason;
+        }
+        self
+    }
+
+    pub(super) fn disabled_reason(&self, index: usize) -> Option<&'static str> {
+        if self
+            .actions
+            .get(index)
+            .is_some_and(|action| !action.enabled)
+        {
+            self.disabled_reasons
+                .get(index)
+                .copied()
+                .flatten()
+                .or(Some("action unavailable"))
+        } else {
+            None
+        }
     }
 }
 

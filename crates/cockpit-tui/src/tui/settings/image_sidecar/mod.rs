@@ -2755,7 +2755,8 @@ impl SettingsPage for SidecarPage {
                 Some(REASON_AUTHORITATIVE_UNAVAILABLE)
             };
             let (label, binding) = selection_save_row(self, can_mutate, mutate_reason);
-            let (_, enabled, _) = binding.expect("selection editor always has a save action");
+            let (_, enabled, disabled_reason) =
+                binding.expect("selection editor always has a save action");
             return super::shell::finish_help_row(
                 cx,
                 vec![
@@ -2772,17 +2773,26 @@ impl SettingsPage for SidecarPage {
                         action: SettingsPointerAction::Sidecar(SidecarAction::SaveSelection),
                     },
                 ],
-            );
+            )
+            .with_disabled_reason(1, disabled_reason);
         }
         if self.kind != SidecarPageKind::CentralPolicyEditor {
             return super::shell::finish_help_row(cx, Vec::new());
         }
-        let enabled = self.session.authoritative_mutations
-            && self.session.principal.can_mutate()
-            && !self.session.requires_reload_before_reapply()
-            && !self.session.save_pending
-            && !self.session.busy
-            && self.session.form.local_edits_preserved;
+        let disabled_reason = if !self.session.authoritative_mutations {
+            Some(REASON_AUTHORITATIVE_UNAVAILABLE)
+        } else if let Some(reason) = self.session.principal.config_reason() {
+            Some(reason)
+        } else if self.session.requires_reload_before_reapply() {
+            Some(REASON_RELOAD_REQUIRED)
+        } else if self.session.save_pending || self.session.busy {
+            Some(REASON_SAVE_PENDING)
+        } else if !self.session.form.local_edits_preserved {
+            Some(REASON_NO_PENDING_CHANGES)
+        } else {
+            None
+        };
+        let enabled = disabled_reason.is_none();
         super::shell::finish_help_row(
             cx,
             vec![
@@ -2800,6 +2810,7 @@ impl SettingsPage for SidecarPage {
                 },
             ],
         )
+        .with_disabled_reason(1, disabled_reason)
     }
 
     fn as_any(&self) -> &dyn Any {

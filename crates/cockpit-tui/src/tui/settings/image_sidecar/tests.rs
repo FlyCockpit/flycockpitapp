@@ -329,21 +329,32 @@ fn sidecar_save_preserves_existing_discovered_selection_without_offering_it_agai
 }
 
 #[test]
-fn sidecar_editors_expose_a_named_dirty_save_control() {
+fn sidecar_editors_expose_a_help_row_dirty_save_control() {
     let mut page = page_with(SidecarPageKind::ModeEditor);
-    let save = page
-        .named_actions()
-        .into_iter()
-        .find(|(action, _, _)| matches!(action, SidecarAction::SaveSelection))
+    let dialog = test_dialog();
+    let help = page.help_row_actions(&dialog);
+    let save = help
+        .actions
+        .iter()
+        .position(|action| {
+            matches!(
+                action.action,
+                SettingsPointerAction::Sidecar(SidecarAction::SaveSelection)
+            )
+        })
         .expect("mode editor must expose Save changes");
-    assert!(!save.1);
-    assert_eq!(save.2, Some(REASON_NO_PENDING_CHANGES));
+    assert!(!help.actions[save].enabled);
+    assert_eq!(help.disabled_reason(save), Some(REASON_NO_PENDING_CHANGES));
     page.session.form.local_edits_preserved = true;
     assert!(
-        page.named_actions()
+        page.help_row_actions(&dialog)
+            .actions
             .into_iter()
-            .any(|(action, enabled, reason)| {
-                matches!(action, SidecarAction::SaveSelection) && enabled && reason.is_none()
+            .any(|action| {
+                matches!(
+                    action.action,
+                    SettingsPointerAction::Sidecar(SidecarAction::SaveSelection)
+                ) && action.enabled
             })
     );
 }
@@ -377,13 +388,20 @@ fn sidecar_releases_only_the_matching_rejected_config_save() {
     let mut page = page_with(SidecarPageKind::ModeEditor);
     page.session.form.local_edits_preserved = true;
     page.session.reload_required_before_reapply = true;
-    let save = page
-        .named_actions()
-        .into_iter()
-        .find(|(action, _, _)| matches!(action, SidecarAction::SaveSelection))
+    let dialog = test_dialog();
+    let help = page.help_row_actions(&dialog);
+    let save = help
+        .actions
+        .iter()
+        .position(|action| {
+            matches!(
+                action.action,
+                SettingsPointerAction::Sidecar(SidecarAction::SaveSelection)
+            )
+        })
         .expect("mode editor exposes Save changes");
-    assert!(!save.1);
-    assert_eq!(save.2, Some(REASON_RELOAD_REQUIRED));
+    assert!(!help.actions[save].enabled);
+    assert_eq!(help.disabled_reason(save), Some(REASON_RELOAD_REQUIRED));
 }
 
 #[test]

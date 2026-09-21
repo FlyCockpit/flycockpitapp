@@ -2908,11 +2908,8 @@ pub(super) trait SettingsPage: Any {
     fn help_text(&self, cx: &SettingsCx) -> &'static str;
     /// Optional help-row ActionBar actions (Save/Cancel/Reset). When empty,
     /// the dialog footer shows help text only.
-    fn help_row_actions(&self, _cx: &SettingsCx) -> shell::SettingsHelpRow<'_> {
-        shell::SettingsHelpRow {
-            actions: Vec::new(),
-            hover: None,
-        }
+    fn help_row_actions(&self, cx: &SettingsCx) -> shell::SettingsHelpRow<'_> {
+        shell::finish_help_row(cx, Vec::new())
     }
     /// Resolve a semantic control registered by this page. Implementations
     /// must validate the stable identity against current state before
@@ -8745,7 +8742,7 @@ impl SettingsDialog {
                     rect,
                     action: shell::SettingsPointerAction::Page(action.action.clone()),
                     enabled: action.enabled,
-                    disabled_reason: None,
+                    disabled_reason: help_row.disabled_reason(index),
                 });
                 #[cfg(test)]
                 pointer_acceptance_tests::record_rendered_action(&action.action, action.enabled);

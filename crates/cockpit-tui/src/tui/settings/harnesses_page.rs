@@ -1072,25 +1072,22 @@ impl SettingsPage for HarnessesPage {
                     ],
                 );
             }
-            return super::shell::SettingsHelpRow {
-                actions: Vec::new(),
-                hover: cx.pointer_surface.help_row_hover.get(),
-            };
+            return super::shell::finish_help_row(cx, Vec::new());
         };
         let label = if state.reset.is_pending() {
             "confirm reset"
         } else {
             "reset to verified presets"
         };
-        super::shell::SettingsHelpRow {
-            actions: vec![super::shell::SettingsHelpAction {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
                 label,
                 enabled: true,
                 primary: false,
                 action: SettingsPointerAction::Harnesses(HarnessesAction::ResetAndSeedPresets),
             }],
-            hover: cx.pointer_surface.help_row_hover.get(),
-        }
+        )
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

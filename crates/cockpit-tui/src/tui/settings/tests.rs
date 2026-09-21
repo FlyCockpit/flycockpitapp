@@ -7853,6 +7853,7 @@ fn tools_footer_reset_remains_operable_while_a_field_is_focused() {
         &mut dialog,
         &SettingsPointerAction::Tools(ToolsAction::EditCredential(CredentialKind::Firecrawl)),
     );
+    dialog.handle_key(press(KeyCode::Char('s')));
     let _ = render_settings_rows(&dialog, 120, 40);
     let reset = dialog
         .cx
@@ -7878,6 +7879,21 @@ fn tools_footer_reset_remains_operable_while_a_field_is_focused() {
         );
     }
     assert!(matches!(dialog.test_page(), TestPageRef::Tools(page) if page.reset.is_pending()));
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            dialog.handle_pointer(settings_mouse(kind, reset.rect.x, reset.rect.y)),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    assert!(matches!(dialog.test_page(), TestPageRef::Tools(page)
+        if !page.reset.is_pending() && page.editing.is_none() && page.buf.text().is_empty()));
+    dialog.handle_key(press(KeyCode::Enter));
+    assert!(matches!(dialog.test_page(), TestPageRef::Tools(page)
+        if matches!(page.editing, Some(tools_page::ToolField::WebKey(tools_page::WebKeyProvider::Firecrawl)))
+            && page.buf.text().is_empty()));
 }
 
 #[test]

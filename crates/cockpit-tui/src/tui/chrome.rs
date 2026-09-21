@@ -293,9 +293,10 @@ pub(crate) fn render_action_bar(
             ))),
             rect,
         );
-        if button.enabled {
-            rects[index] = rect;
-        }
+        // Keep geometry for disabled controls too.  Callers that own a
+        // pointer registry need to expose a dimmed control as an explicit,
+        // non-operable target rather than losing its identity at paint time.
+        rects[index] = rect;
         x = x.saturating_add(widths[index]).saturating_add(1);
     }
     rects
@@ -310,20 +311,24 @@ pub(crate) fn action_button_at(rects: &[Rect], pos: Position) -> Option<usize> {
 #[derive(Default)]
 pub(crate) struct ActionBar {
     rects: Vec<Rect>,
+    enabled: Vec<bool>,
     hover: Option<usize>,
 }
 
 impl ActionBar {
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect, buttons: &[ActionButton<'_>]) {
         self.rects = render_action_bar(frame, area, buttons, self.hover);
+        self.enabled = buttons.iter().map(|button| button.enabled).collect();
     }
 
     pub(crate) fn track(&mut self, pos: Position) {
-        self.hover = action_button_at(&self.rects, pos);
+        self.hover = action_button_at(&self.rects, pos)
+            .filter(|index| self.enabled.get(*index).copied().unwrap_or(false));
     }
 
     pub(crate) fn clicked(&self, pos: Position) -> Option<usize> {
         action_button_at(&self.rects, pos)
+            .filter(|index| self.enabled.get(*index).copied().unwrap_or(false))
     }
 }
 

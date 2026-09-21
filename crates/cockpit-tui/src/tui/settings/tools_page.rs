@@ -1193,10 +1193,15 @@ impl SettingsPage for ToolsPage {
         if matches!(action, ToolsAction::Reset) {
             match self.reset.activate() {
                 ResetOutcome::Apply => {
+                    self.editing = None;
+                    self.buf = TextField::default();
                     cx.reset_tools_to_defaults();
                     self.status = save_status(cx.save_extended());
                 }
-                ResetOutcome::Armed => {}
+                ResetOutcome::Armed => {
+                    self.editing = None;
+                    self.buf = TextField::default();
+                }
             }
             return Nav::Stay;
         }
@@ -1345,22 +1350,22 @@ impl SettingsPage for ToolsPage {
         }
     }
 
-    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
         use super::pointer_actions::{SettingsPointerAction, ToolsAction};
         let label = if self.reset.is_pending() {
             "confirm reset"
         } else {
             "reset to defaults"
         };
-        super::shell::SettingsHelpRow {
-            actions: vec![super::shell::SettingsHelpAction {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
                 label,
                 enabled: true,
                 primary: false,
                 action: SettingsPointerAction::Tools(ToolsAction::Reset),
             }],
-            hover: None,
-        }
+        )
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

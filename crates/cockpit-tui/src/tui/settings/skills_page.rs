@@ -568,28 +568,25 @@ impl SettingsPage for SkillsPage {
         }
     }
 
-    fn help_row_actions(&self, _cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
+    fn help_row_actions(&self, cx: &SettingsCx) -> super::shell::SettingsHelpRow<'_> {
         use super::pointer_actions::{SettingsPointerAction, SkillsAction};
         if self.grabbed.is_some() {
-            return super::shell::SettingsHelpRow {
-                actions: Vec::new(),
-                hover: None,
-            };
+            return super::shell::finish_help_row(cx, Vec::new());
         }
         let label = if self.reset.is_pending() {
             "confirm reset"
         } else {
             "reset to defaults"
         };
-        super::shell::SettingsHelpRow {
-            actions: vec![super::shell::SettingsHelpAction {
+        super::shell::finish_help_row(
+            cx,
+            vec![super::shell::SettingsHelpAction {
                 label,
                 enabled: true,
                 primary: false,
                 action: SettingsPointerAction::Skills(SkillsAction::Reset),
             }],
-            hover: None,
-        }
+        )
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

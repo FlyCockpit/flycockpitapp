@@ -1,14 +1,14 @@
  ‹ Back                                                                         
-  The model policy changed · step 6/8                                           
-  Policy revision conflict — review the refreshed projection.                   
+  Self-verify risky actions · step 6/8                                          
+  Re-check writes, commands, and Monty before they land.                        
   ────────────────────────────                                                  
   ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
-  ╭ Status ──────────────────────────────────────────────────────────────────╮  
-  │ ◐  Projection refreshed; review the new policy before retrying.          │  
+  ╭ Self-verify ─────────────────────────────────────────────────────────────╮  
+  │ ▸ Writes & edits: ◂ same model ×1 ▸  ›                                   │  
+  │   Commands: off  ›                                                       │  
+  │   Monty: off  ›                                                          │  
   │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
+  │ ←/→ changes the same-model copies; space opens the verifier panel for ot │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  
@@ -20,5 +20,5 @@
   │                                                                          │  
   │                                                                          │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
-  enter retry   esc review                                [ Review ] [ Retry ]  
+  ↑↓ surface   ←→ same model   space configure   x off   esc back     [ Done ]  
                                                                                 

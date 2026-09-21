@@ -1,13 +1,13 @@
  ‹ Back                                                                         
-  The model policy changed · step 6/8                                           
-  Policy revision conflict — review the refreshed projection.                   
+  Subagent models · step 6/8                                                    
+  Tick every model this subagent may use. Star one as the default.              
   ────────────────────────────                                                  
   ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
-  ╭ Status ──────────────────────────────────────────────────────────────────╮  
-  │ ◐  Projection refreshed; review the new policy before retrying.          │  
+  ╭ Models  ·  1 of 2 ───────────────────────────────────────────────────────╮  
+  │ ▣ ★ vendor/exact-a                                                       │  
+  │ ▢   vendor/exact-b                                                       │  
   │                                                                          │  
-  │                                                                          │  
-  │                                                                          │  
+  │ Space toggles grants; disabling the default selects another enabled rout │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  
@@ -20,5 +20,5 @@
   │                                                                          │  
   │                                                                          │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
-  enter retry   esc review                                [ Review ] [ Retry ]  
+  ↑↓ move   space toggle   d default   enter continue   esc back  [ Continue ]  
                                                                                 

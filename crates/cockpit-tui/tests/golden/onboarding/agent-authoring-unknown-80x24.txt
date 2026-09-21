@@ -1,10 +1,10 @@
  ‹ Back                                                                         
-  The model policy changed · step 6/8                                           
-  Policy revision conflict — review the refreshed projection.                   
+  Let's check what happened · step 6/8                                          
+  Create outcome unknown — query the receipt before retrying.                   
   ────────────────────────────                                                  
   ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
   ╭ Status ──────────────────────────────────────────────────────────────────╮  
-  │ ◐  Projection refreshed; review the new policy before retrying.          │  
+  │ ◐  Create outcome unknown — query the receipt before retrying.           │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

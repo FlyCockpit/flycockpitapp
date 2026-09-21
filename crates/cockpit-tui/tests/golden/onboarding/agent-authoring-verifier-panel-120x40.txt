@@ -1,11 +1,11 @@
  ‹ Back                                                                                                                 
-                 The model policy changed · step 6/8                                                                    
-                 Policy revision conflict — review the refreshed projection.                                            
+                 Verifier panel — Writes & edits · step 6/8                                                             
+                 Writes & edits verifier models and copy counts.                                                        
                  ────────────────────────────                                                                           
                  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
-                 ╭ Status ────────────────────────────────────────────────────────────────────────────╮                 
-                 │ ◐  Projection refreshed; review the new policy before retrying.                    │                 
-                 │                                                                                    │                 
+                 ╭ Verifier panel — Writes & edits ───────────────────────────────────────────────────╮                 
+                 │ ▸ [−] ×1 [+]  Same model  reuses cache                                             │                 
+                 │   [−]  · [+]  vendor/exact-b                                                       │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
@@ -36,5 +36,5 @@
                  │                                                                                    │                 
                  │                                                                                    │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
-                 enter retry   esc review                                          [ Review ] [ Retry ]                 
+                 ↑↓ move   -/+ or [−][+] copies   space bump   enter done   esc back           [ Done ]                 
                                                                                                                         

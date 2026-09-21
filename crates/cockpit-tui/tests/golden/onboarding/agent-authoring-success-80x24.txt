@@ -1,10 +1,10 @@
  ‹ Back                                                                         
-  The model policy changed · step 6/8                                           
-  Policy revision conflict — review the refreshed projection.                   
+  Your agent is ready · step 6/8                                                
+  The agent package was committed successfully.                                 
   ────────────────────────────                                                  
   ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
   ╭ Status ──────────────────────────────────────────────────────────────────╮  
-  │ ◐  Projection refreshed; review the new policy before retrying.          │  
+  │ ◐  Agent package committed successfully.  ✓                              │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  
@@ -20,5 +20,5 @@
   │                                                                          │  
   │                                                                          │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
-  enter retry   esc review                                [ Review ] [ Retry ]  
+  enter continue setup                                                [ Done ]  
                                                                                 

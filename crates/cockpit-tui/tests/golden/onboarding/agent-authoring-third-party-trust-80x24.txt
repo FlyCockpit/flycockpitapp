@@ -1,11 +1,11 @@
  ‹ Back                                                                         
-  The model policy changed · step 6/8                                           
-  Policy revision conflict — review the refreshed projection.                   
+  Trust this publisher? · step 6/8                                              
+  Confirm who published this pinned definition before it can run.               
   ────────────────────────────                                                  
   ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
-  ╭ Status ──────────────────────────────────────────────────────────────────╮  
-  │ ◐  Projection refreshed; review the new policy before retrying.          │  
-  │                                                                          │  
+  ╭ Trust ───────────────────────────────────────────────────────────────────╮  
+  │ ○ I trust this publisher and pinned source                               │  
+  │ Click once to select; click the selected row again to confirm.           │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  
@@ -20,5 +20,5 @@
   │                                                                          │  
   │                                                                          │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
-  enter retry   esc review                                [ Review ] [ Retry ]  
+  ↑↓ choose   space confirm   enter continue   esc back           [ Continue ]  
                                                                                 

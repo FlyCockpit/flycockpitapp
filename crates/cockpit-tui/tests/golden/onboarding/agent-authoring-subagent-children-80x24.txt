@@ -1,10 +1,10 @@
  ‹ Back                                                                         
-  The model policy changed · step 6/8                                           
-  Policy revision conflict — review the refreshed projection.                   
+  Subagent helpers · step 6/8                                                   
+  Add a bounded helper beneath this subagent, or save it as-is.                 
   ────────────────────────────                                                  
   ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
-  ╭ Status ──────────────────────────────────────────────────────────────────╮  
-  │ ◐  Projection refreshed; review the new policy before retrying.          │  
+  ╭ Subagents  ·  1 ─────────────────────────────────────────────────────────╮  
+  │ ▸ Add nested subagent                                                    │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  
@@ -20,5 +20,5 @@
   │                                                                          │  
   │                                                                          │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
-  enter retry   esc review                                [ Review ] [ Retry ]  
+  ↑↓ move   space add/edit   enter save   esc cancel                  [ Save ]  
                                                                                 

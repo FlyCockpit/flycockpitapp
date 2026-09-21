@@ -1,0 +1,24 @@
+ ‹ Back                                                                         
+  Tune the agent · step 6/8                                                     
+  These settings are independent; the defaults are a sane starting point.       
+  ────────────────────────────                                                  
+  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ╭ Optimizations ───────────────────────────────────────────────────────────╮  
+  │ ▸ Auto-prune: [ off ]                                                    │  
+  │   Interactive subagents: [ on ]                                          │  
+  │   Max subagent recursion: 2                                              │  
+  │   Tool steering: terse                                                   │  
+  │   Goal-completion skeptics: 2                                            │  
+  │   Self-verify: 1 of 3 surfaces ›                                         │  
+  │   Make default agent: [ on ]                                             │  
+  │                                                                          │  
+  │ Auto-prune losslessly drops duplicate context before it forces a summary │  
+  │ It starts off because some frontier-model caches are more valuable than  │  
+  │ reclaimed context.                                                       │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  ↑↓ move   space toggle/open   ←→ adjust   enter continue   esc  [ Continue ]  
+                                                                                

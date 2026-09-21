@@ -1,16 +1,16 @@
  ‹ Back                                                                                                                 
-                 The model policy changed · step 6/8                                                                    
-                 Policy revision conflict — review the refreshed projection.                                            
+                 Create your first agent · step 6/8                                                                     
+                 An agent is a saved configuration you can fly again and again.                                         
                  ────────────────────────────                                                                           
                  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
-                 ╭ Status ────────────────────────────────────────────────────────────────────────────╮                 
-                 │ ◐  Projection refreshed; review the new policy before retrying.                    │                 
+                 ╭ Name ──────────────────────────────────────────────────────────────────────────────╮                 
+                 │ navigator                                                                          │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 ╭ Agent ─────────────────────────────────────────────────────────────────────────────╮                 
                  │                                                                                    │                 
-                 │                                                                                    │                 
-                 │                                                                                    │                 
-                 │                                                                                    │                 
-                 │                                                                                    │                 
-                 │                                                                                    │                 
+                 │ ◉ Navigator                                                                        │                 
+                 │ ○ Custom authored agent                                                            │                 
+                 │ ○ Third-party pinned source                                                        │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
@@ -36,5 +36,5 @@
                  │                                                                                    │                 
                  │                                                                                    │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
-                 enter retry   esc review                                          [ Review ] [ Retry ]                 
+                 type name   enter continue   esc back   ^c quit                           [ Continue ]                 
                                                                                                                         

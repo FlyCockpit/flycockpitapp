@@ -1,11 +1,11 @@
  ‹ Back                                                                                                                 
-                 The model policy changed · step 6/8                                                                    
-                 Policy revision conflict — review the refreshed projection.                                            
+                 How much does this agent see? · step 6/8                                                               
+                 Untrusted models keep secrets and sealed values out of context.                                        
                  ────────────────────────────                                                                           
                  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
-                 ╭ Status ────────────────────────────────────────────────────────────────────────────╮                 
-                 │ ◐  Projection refreshed; review the new policy before retrying.                    │                 
-                 │                                                                                    │                 
+                 ╭ Trust ─────────────────────────────────────────────────────────────────────────────╮                 
+                 │ ○ Confirm vendor/exact-a as unset                                                  │                 
+                 │ Click a row twice to confirm its shared trust classification.                      │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
@@ -36,5 +36,5 @@
                  │                                                                                    │                 
                  │                                                                                    │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
-                 enter retry   esc review                                          [ Review ] [ Retry ]                 
+                 ↑↓ choose   space confirm   enter continue   esc back                     [ Continue ]                 
                                                                                                                         

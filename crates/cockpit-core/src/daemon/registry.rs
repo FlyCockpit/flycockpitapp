@@ -792,6 +792,11 @@ fn cleanup_worker_on_exit(
     }
 }
 
+fn handover_activity(handle: &SessionWorkerHandle) -> bool {
+    let (has_active_schedules, processing, tool_running) = handle.live_status();
+    has_active_schedules || processing || tool_running
+}
+
 impl SessionRegistry {
     pub fn new(
         db: Db,
@@ -3205,7 +3210,7 @@ impl SessionRegistry {
                 .live
                 .values()
                 .map(|entry| entry.handle.clone())
-                .filter(|handle| handle.live_status().1)
+                .filter(|handle| handover_activity(handle))
                 .collect()
         };
         let mut candidates = Vec::with_capacity(handles.len());
@@ -3234,13 +3239,17 @@ impl SessionRegistry {
         }
 
         let deadline = tokio::time::Instant::now() + hard_timeout;
-        while candidates.iter().any(|(handle, _)| handle.live_status().1)
+        while candidates
+            .iter()
+            .any(|(handle, _)| handover_activity(handle))
             && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         anyhow::ensure!(
-            candidates.iter().all(|(handle, _)| !handle.live_status().1),
+            candidates
+                .iter()
+                .all(|(handle, _)| !handover_activity(handle)),
             "worker handover interrupt path did not reach an idle boundary before T_hard"
         );
 
@@ -3295,7 +3304,7 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.workers)
             .live
             .values()
-            .any(|entry| entry.handle.live_status().1)
+            .any(|entry| handover_activity(&entry.handle))
     }
 
     /// Snapshot live handles belonging to the supplied durable trust root.
@@ -6129,6 +6138,29 @@ mod tests {
         assert_eq!(summary.activity_state, None);
         let events = reg.inner.db.list_session_events(id).await.unwrap();
         assert!(events.iter().all(|event| event.kind != "turn_interrupted"));
+    }
+
+    #[test]
+    fn handover_waits_for_schedule_and_tool_activity_not_only_processing() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let handle = test_handle(&reg, session);
+        reg.insert_test_worker_without_join(handle.clone());
+
+        handle.set_test_live_status(true, false, false);
+        assert!(
+            reg.has_handover_inflight(),
+            "a schedule can still dispatch side effects during a handover"
+        );
+
+        handle.set_test_live_status(false, false, true);
+        assert!(
+            reg.has_handover_inflight(),
+            "an asynchronous tool must reach a boundary before handover"
+        );
+
+        handle.set_test_live_status(false, false, false);
+        assert!(!reg.has_handover_inflight());
     }
 
     #[tokio::test]

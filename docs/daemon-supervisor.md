@@ -22,8 +22,9 @@ On Unix the supervisor retains the public listener and passes a duplicate as fd
 3 with `LISTEN_FDS`/`LISTEN_PID`. A worker writes one byte to fd 4 only after
 boot, recovery, and listener construction reach the normal publication
 barrier. Cockpit's required sensitive/reveal sibling is also inherited on the
-internal fd 5 for the successor after the predecessor has reported its
-boundary.
+internal fd 5. A rolling successor additionally waits on an internal fd 6
+promotion pipe after reporting ready, so it cannot accept or resume a session
+until the predecessor has exited.
 
 On Windows each worker creates a fresh random named pipe using the existing
 owner-only DACL, remote-client rejection, finite instance pool, and
@@ -83,9 +84,13 @@ accepted queue rows remain in `message_queue_items`. `T_grace` retains the
 predecessor until its attached clients have consumed the reconnect instruction
 and detached.
 
-Only after that boundary report does the supervisor start the successor. Its
-fd-4 readiness payload is a structured hello containing its
-protocol version, PID, generation, and inherited open time. A missing payload,
-protocol/open-time mismatch, or process-identity mismatch aborts the roll and
-leaves the predecessor serving. `daemon status` exposes the most recent result
-as `last_handover` in JSON and `last handover` in text.
+The supervisor first starts a successor in standby and validates its fd-4
+readiness payload (protocol version, PID, generation, and inherited open time).
+Only then does it ask the predecessor to close admission and report its durable
+boundary. It commits that predecessor to send `Reconnect`, waits for it to exit,
+and finally releases the ready successor through fd 6; reconnect attempts queue
+on the supervisor-owned listener in between. A missing payload,
+protocol/open-time mismatch, or process-identity mismatch aborts before the
+predecessor is committed. A committed `T_grace` expiry logs and continues the
+drain rather than reopening admission. `daemon status` remains available while
+the boundary is pending and exposes the most recent result as `last_handover`.

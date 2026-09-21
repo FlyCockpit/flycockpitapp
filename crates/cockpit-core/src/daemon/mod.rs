@@ -2925,6 +2925,7 @@ async fn run_foreground_inner_with_boot_db_impl(
                 None => prepare_and_publish_socket_pair(&paths)?,
             };
             supervisor::report_worker_ready()?;
+            supervisor::wait_for_worker_promotion()?;
             let locked_outcome = tokio::select! {
                 result = server::run_locked_until_ready(
                     std::sync::Arc::new(locked),
@@ -2958,8 +2959,6 @@ async fn run_foreground_inner_with_boot_db_impl(
     // is still being reconciled.
     boot_dbg!("before_recover");
     server::recover_before_socket_publish(&ctx).await?;
-    recover_paused_sessions(&ctx, resume_all_sessions).await?;
-    boot_dbg!("after_resume");
     timer.phase("boot");
     boot_dbg!("after_recover");
 
@@ -2995,9 +2994,16 @@ async fn run_foreground_inner_with_boot_db_impl(
                 None => prepare_and_publish_socket_pair(&paths)?,
             };
             supervisor::report_worker_ready()?;
+            supervisor::wait_for_worker_promotion()?;
             listeners
         }
     };
+    // A staged rolling successor has reported boot readiness but remains
+    // paused above until the predecessor has exited.  Do not attach paused
+    // sessions before that promotion gate: attachment itself starts a local
+    // session worker and would otherwise duplicate durable ownership.
+    recover_paused_sessions(&ctx, resume_all_sessions).await?;
+    boot_dbg!("after_resume");
 
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
     // route into the single graceful-shutdown path. The **first** signal
@@ -3017,31 +3023,55 @@ async fn run_foreground_inner_with_boot_db_impl(
                 let mut int = signal(SignalKind::interrupt()).ok();
                 let mut term = signal(SignalKind::terminate()).ok();
                 let mut roll = signal(SignalKind::user_defined1()).ok();
+                let mut commit = signal(SignalKind::user_defined2()).ok();
+                let mut abort = signal(SignalKind::window_change()).ok();
                 loop {
-                    let reconnect = tokio::select! {
-                        _ = async { if let Some(s) = int.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => false,
-                        _ = async { if let Some(s) = term.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => false,
-                        _ = async { if let Some(s) = roll.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => true,
+                    let signal = tokio::select! {
+                        _ = async { if let Some(s) = int.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => 0,
+                        _ = async { if let Some(s) = term.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => 0,
+                        _ = async { if let Some(s) = roll.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => 1,
+                        _ = async { if let Some(s) = commit.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => 2,
+                        _ = async { if let Some(s) = abort.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => 3,
                     };
-                    if reconnect {
+                    if signal == 2 {
+                        supervisor::commit_worker_handover();
+                        continue;
+                    }
+                    if signal == 3 {
+                        supervisor::abort_worker_handover();
+                        continue;
+                    }
+                    if signal == 1 {
                         let generation = supervisor::worker_generation().saturating_add(1);
                         match supervisor::begin_worker_handover(generation) {
                             Ok(()) => {
                                 handover_started.store(true, std::sync::atomic::Ordering::Release);
-                                let result = match supervisor::take_worker_handover() {
-                                    Some(handover) => prepare_worker_handover(&ctx, handover).await,
+                                let handover = match supervisor::take_worker_handover() {
+                                    Some(handover) => Ok(handover),
                                     None => Err(anyhow::anyhow!(
                                         "worker handover request disappeared before drain"
                                     )),
                                 };
-                                if result.is_ok() && ctx.shutdown_signal().begin_drain() {
-                                    tracing::info!(generation, "worker handover drain completed");
-                                }
-                                if result.is_err() {
-                                    supervisor::abort_worker_handover();
-                                }
                                 if let Some(done) = handover_done_tx.take() {
-                                    let _ = done.send(result);
+                                    let ctx = ctx.clone();
+                                    tokio::spawn(async move {
+                                        let result = match handover {
+                                            Ok(handover) => {
+                                                prepare_worker_handover(&ctx, handover).await
+                                            }
+                                            Err(error) => Err(error),
+                                        };
+                                        if result.is_ok() && ctx.shutdown_signal().begin_drain() {
+                                            tracing::info!(
+                                                generation,
+                                                "worker handover drain completed"
+                                            );
+                                        }
+                                        if result.is_err() {
+                                            supervisor::abort_worker_handover();
+                                        }
+                                        let _ = done.send(result);
+                                    });
                                 }
                             }
                             Err(error) => {
@@ -3304,6 +3334,10 @@ async fn prepare_worker_handover(
         resume_from.clone(),
     )
     .await?;
+    // The supervisor has now seen the durable boundary but has not committed
+    // the roll.  Keep serving established clients until it has health-checked
+    // the staged successor; an abort leaves this generation untouched.
+    supervisor::wait_for_worker_handover_decision().await?;
     ctx.broadcast_global(proto::Event::Reconnect {
         generation: handover.generation,
         resume_from,
@@ -3319,10 +3353,12 @@ async fn prepare_worker_handover(
             break;
         }
     }
-    anyhow::ensure!(
-        clients.borrow().count == 0,
-        "worker handover T_grace expired before attached clients reconnected"
-    );
+    if clients.borrow().count != 0 {
+        tracing::warn!(
+            remaining = clients.borrow().count,
+            "worker handover T_grace expired; draining committed predecessor"
+        );
+    }
     Ok(())
 }
 

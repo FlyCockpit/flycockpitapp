@@ -35,6 +35,6 @@
                                 │╭ Auth environment ───────────────────────────────────────────────────────────────╮││ █
                                 ││ KEY=VALUE per row                                                               │││ █
                               ▌ │╰─────────────────────────────────────────────────────────────────────────────────╯││ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab  enter: cycle / save  type to edit  [ save ]│ █
+ ● working  ● waiting  ● done   │↑/↓/Tab  enter: cycle / save  type to edit name/endpoint  esc: back         [ save ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

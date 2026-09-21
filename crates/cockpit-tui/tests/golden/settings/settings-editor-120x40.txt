@@ -35,6 +35,6 @@
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                               ▌ │                                                                                    │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit/cycl [ save changes ]│ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: edit/cycle  h: back  q: close             [ save changes ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

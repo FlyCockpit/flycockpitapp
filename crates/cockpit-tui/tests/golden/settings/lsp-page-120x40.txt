@@ -35,6 +35,6 @@
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                               ▌ │                                                                                    │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: t [ restore LSP defaults ]│ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: toggle / edit  r: reset  esc/h: b [ restore LSP defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

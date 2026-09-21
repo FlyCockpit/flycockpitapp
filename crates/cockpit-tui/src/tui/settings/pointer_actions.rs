@@ -408,6 +408,7 @@ pub(crate) enum SettingsPointerAction {
     Mcp(McpAction),
     Providers(ProvidersAction),
     Lsp(LspAction),
+    ImageSpend(ImageSpendAction),
     List(ListAction),
     UtilityModel(UtilityModelAction),
     DefaultModel(DefaultModelAction),
@@ -615,6 +616,16 @@ pub(super) enum LspAction {
     Restart(LspServerId),
 }
 
+/// Image-spend's field target is deliberately distinct from its footer
+/// controls: a click in the field parks its caret, while Save and Cancel must
+/// still reach the page while that field is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ImageSpendAction {
+    EditField,
+    Save,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ListAction {
     Add,
@@ -816,6 +827,7 @@ impl SettingsPointerAction {
                     | LspAction::ToggleDiagnostics
                     | LspAction::Edit(_)
             ),
+            Self::ImageSpend(action) => matches!(action, ImageSpendAction::EditField),
             Self::List(action) => matches!(action, ListAction::Edit(_)),
             Self::UtilityModel(action) => matches!(action, UtilityModelAction::Select(_)),
             Self::DefaultModel(_) => false,
@@ -872,6 +884,8 @@ impl SettingsPointerAction {
             Self::Lsp(LspAction::SaveEdit(_)) => "Save",
             Self::Lsp(LspAction::CancelEdit(_)) => "Cancel",
             Self::Lsp(LspAction::Reset) => "reset to defaults",
+            Self::ImageSpend(ImageSpendAction::Save) => "Save",
+            Self::ImageSpend(ImageSpendAction::Cancel) => "Cancel",
             Self::List(ListAction::Add) => "Add",
             Self::List(ListAction::Save) => "Save",
             Self::List(ListAction::Cancel) => "Cancel",

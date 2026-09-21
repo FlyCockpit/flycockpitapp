@@ -35,6 +35,6 @@
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                               ▌ │                                                                                    │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  r: retry  o: continue offline  esc: cancel [ Retry ]│ █
+ ● working  ● waiting  ● done   │r: retry  o: continue offline  esc: cancel                                 [ Retry ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

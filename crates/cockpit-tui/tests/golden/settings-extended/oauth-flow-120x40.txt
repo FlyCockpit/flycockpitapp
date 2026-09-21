@@ -35,6 +35,6 @@
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                               ▌ │                                                                                    │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  enter: acknowledge  esc:  [ I acknowledge the risk ]│ █
+ ● working  ● waiting  ● done   │enter: acknowledge  esc: back                             [ I acknowledge the risk ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

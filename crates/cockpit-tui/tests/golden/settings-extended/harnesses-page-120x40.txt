@@ -35,6 +35,6 @@
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                               ▌ │                                                                                    │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  ent [ reset to verified presets ]│ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: edit/seed  a: add  d: delete [ reset to verified presets ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

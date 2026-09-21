@@ -259,6 +259,11 @@ fixture_enum!(LspFixture {
     Uninstall,
     Restart
 });
+fixture_enum!(ImageSpendFixture {
+    EditField,
+    Save,
+    Cancel
+});
 fixture_enum!(ListFixture {
     Add,
     Edit,
@@ -341,6 +346,7 @@ pub(super) enum ActionFixtureKey {
     Mcp(McpFixture),
     Providers(ProvidersFixture),
     Lsp(LspFixture),
+    ImageSpend(ImageSpendFixture),
     List(ListFixture),
     Utility(UtilityFixture),
     DefaultModel(DefaultModelFixture),
@@ -587,6 +593,7 @@ pub(super) fn payload_keys_for(action: &SettingsPointerAction) -> Vec<PayloadFix
             | ListAction::MoveDown(id) => vec![PayloadFixtureKey::List(id.kind)],
             ListAction::Add | ListAction::Save | ListAction::Cancel => Vec::new(),
         },
+        SettingsPointerAction::ImageSpend(_) => Vec::new(),
         SettingsPointerAction::Agents(_)
         | SettingsPointerAction::Tools(_)
         | SettingsPointerAction::Harnesses(_)
@@ -633,6 +640,7 @@ impl ActionFixtureKey {
             | Self::Mcp(_)
             | Self::Providers(_)
             | Self::Lsp(_)
+            | Self::ImageSpend(_)
             | Self::List(_)
             | Self::Utility(_)
             | Self::DefaultModel(DefaultModelFixture::Choose)
@@ -712,6 +720,12 @@ pub(super) fn all_keys() -> Vec<ActionFixtureKey> {
     );
     #[cfg(feature = "extended")]
     {
+        all.extend(
+            ImageSpendFixture::ALL
+                .iter()
+                .copied()
+                .map(ActionFixtureKey::ImageSpend),
+        );
         all.extend(
             GenerationFixture::ALL
                 .iter()
@@ -910,6 +924,11 @@ pub(super) fn key_for(action: &SettingsPointerAction) -> ActionFixtureKey {
         }),
         SettingsPointerAction::Providers(action) => K::Providers(provider_key(action)),
         SettingsPointerAction::Lsp(action) => K::Lsp(lsp_key(action)),
+        SettingsPointerAction::ImageSpend(action) => K::ImageSpend(match action {
+            ImageSpendAction::EditField => ImageSpendFixture::EditField,
+            ImageSpendAction::Save => ImageSpendFixture::Save,
+            ImageSpendAction::Cancel => ImageSpendFixture::Cancel,
+        }),
         SettingsPointerAction::List(action) => K::List(match action {
             ListAction::Add => ListFixture::Add,
             ListAction::Edit(_) => ListFixture::Edit,

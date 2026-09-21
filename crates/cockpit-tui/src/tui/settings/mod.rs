@@ -8716,7 +8716,8 @@ impl SettingsDialog {
         if let Some(cursor) = shell::park_cursor_from_markers(frame, section_inner) {
             frame.set_cursor_position(cursor);
         }
-        let help = if self.pointer_surface.enabled.get() {
+        let mut help_row = self.page.help_row_actions(&self.cx);
+        let help = if self.pointer_surface.enabled.get() && help_row.actions.is_empty() {
             // Pointer hints stay leftmost so an 80-column pane still shows
             // both phrases when the page help string is the longer picker form.
             format!(
@@ -8726,7 +8727,6 @@ impl SettingsDialog {
         } else {
             self.page.help_text(&self.cx).to_string()
         };
-        let mut help_row = self.page.help_row_actions(&self.cx);
         help_row.hover = self.cx.pointer_surface.help_row_hover.get();
         let help_action_rects = shell::render_settings_help_row(frame, layout[2], &help, &help_row);
         self.cx

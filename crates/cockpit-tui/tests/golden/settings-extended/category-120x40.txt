@@ -35,6 +35,6 @@
                                 │                           )                     │                                  │ █
                                 │  attention notifications  ▣ on (default — toast │                                  │ █
                               ▌ │                           for attention events) │                                  │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift [ reset display settings to defaults ]│ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: edit / cycle / dril [ reset display settings to defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

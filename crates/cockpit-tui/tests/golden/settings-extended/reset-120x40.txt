@@ -35,6 +35,6 @@
                                 │                                           ything│                                  │ █
                                 │                                            that │                                  │ █
                               ▌ │                                           needs │                                  │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shif [ reset behavior settings to defaults ]│ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: edit / cycle / dri [ reset behavior settings to defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

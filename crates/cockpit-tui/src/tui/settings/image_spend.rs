@@ -348,16 +348,9 @@ impl ImageSpendPage {
         }
     }
 
-    fn edit_micros(&mut self, code: KeyCode) {
-        let Some(scope) = self.editing_micros else {
-            return;
-        };
-        match code {
-            KeyCode::Esc => {
-                self.editing_micros = None;
-                self.micros_buffer = TextField::default();
-            }
-            KeyCode::Enter => match self.micros_buffer.text().parse::<u64>() {
+    fn commit_active_field(&mut self) -> bool {
+        if let Some(scope) = self.editing_micros {
+            return match self.micros_buffer.text().parse::<u64>() {
                 Ok(value) if value > 0 => {
                     let policy = match scope {
                         0 => &mut self.draft.request,
@@ -368,9 +361,45 @@ impl ImageSpendPage {
                     self.editing_micros = None;
                     self.micros_buffer = TextField::default();
                     self.status = "Finite micros updated; save to authorize.".into();
+                    true
                 }
-                _ => self.status = "Enter a positive whole u64 micros value.".into(),
-            },
+                _ => {
+                    self.status = "Enter a positive whole u64 micros value.".into();
+                    false
+                }
+            };
+        }
+        if self.editing_time_zone {
+            if let Some(ProjectEpochPolicy::CalendarMonth { time_zone }) =
+                &mut self.draft.project_epoch
+            {
+                *time_zone = self.time_zone_buffer.text().to_string();
+                self.editing_time_zone = false;
+                self.time_zone_buffer = TextField::default();
+                return true;
+            }
+            self.editing_time_zone = false;
+            return false;
+        }
+        true
+    }
+
+    fn cancel_active_field(&mut self) {
+        self.editing_micros = None;
+        self.editing_time_zone = false;
+        self.micros_buffer = TextField::default();
+        self.time_zone_buffer = TextField::default();
+    }
+
+    fn edit_micros(&mut self, code: KeyCode) {
+        if self.editing_micros.is_none() {
+            return;
+        }
+        match code {
+            KeyCode::Esc => self.cancel_active_field(),
+            KeyCode::Enter => {
+                self.commit_active_field();
+            }
             KeyCode::Backspace | KeyCode::Char('0'..='9') => {
                 self.micros_buffer
                     .handle_key(KeyEvent::new(code, crossterm::event::KeyModifiers::NONE));
@@ -389,18 +418,9 @@ impl ImageSpendPage {
         }
         match code {
             KeyCode::Enter => {
-                if let Some(ProjectEpochPolicy::CalendarMonth { time_zone }) =
-                    &mut self.draft.project_epoch
-                {
-                    *time_zone = self.time_zone_buffer.text().to_string();
-                }
-                self.editing_time_zone = false;
-                self.time_zone_buffer = TextField::default();
+                self.commit_active_field();
             }
-            KeyCode::Esc => {
-                self.editing_time_zone = false;
-                self.time_zone_buffer = TextField::default();
-            }
+            KeyCode::Esc => self.cancel_active_field(),
             KeyCode::Char(character)
                 if character.is_ascii_alphanumeric()
                     || matches!(character, '/' | '_' | '-' | '+') =>
@@ -778,8 +798,8 @@ impl SettingsPage for ImageSpendPage {
                     .register(super::shell::SettingsPointerTarget {
                         rect,
                         action: super::shell::SettingsPointerAction::Page(
-                            super::pointer_actions::SettingsPointerAction::List(
-                                super::pointer_actions::ListAction::Save,
+                            super::pointer_actions::SettingsPointerAction::ImageSpend(
+                                super::pointer_actions::ImageSpendAction::EditField,
                             ),
                         ),
                         enabled: true,
@@ -801,15 +821,24 @@ impl SettingsPage for ImageSpendPage {
         action: super::pointer_actions::SettingsPointerAction,
     ) -> Nav {
         match action {
-            super::pointer_actions::SettingsPointerAction::List(
-                super::pointer_actions::ListAction::Save,
+            super::pointer_actions::SettingsPointerAction::ImageSpend(
+                super::pointer_actions::ImageSpendAction::Save,
             ) => {
-                self.save(cx);
+                if self.commit_active_field() {
+                    self.save(cx);
+                }
                 Nav::Stay
             }
-            super::pointer_actions::SettingsPointerAction::List(
-                super::pointer_actions::ListAction::Cancel,
-            ) => Nav::Back,
+            super::pointer_actions::SettingsPointerAction::ImageSpend(
+                super::pointer_actions::ImageSpendAction::Cancel,
+            ) => {
+                if self.editing_micros.is_some() || self.editing_time_zone {
+                    self.cancel_active_field();
+                    Nav::Stay
+                } else {
+                    Nav::Back
+                }
+            }
             _ => Nav::Stay,
         }
     }
@@ -820,7 +849,13 @@ impl SettingsPage for ImageSpendPage {
         column: u16,
         _row: u16,
     ) -> Nav {
-        if self.editing_micros.is_some() || self.editing_time_zone {
+        if matches!(
+            action,
+            super::pointer_actions::SettingsPointerAction::ImageSpend(
+                super::pointer_actions::ImageSpendAction::EditField
+            )
+        ) && (self.editing_micros.is_some() || self.editing_time_zone)
+        {
             let value_x = cx
                 .pointer_surface
                 .targets
@@ -848,16 +883,16 @@ impl SettingsPage for ImageSpendPage {
                     label: "Cancel",
                     enabled: true,
                     primary: false,
-                    action: super::pointer_actions::SettingsPointerAction::List(
-                        super::pointer_actions::ListAction::Cancel,
+                    action: super::pointer_actions::SettingsPointerAction::ImageSpend(
+                        super::pointer_actions::ImageSpendAction::Cancel,
                     ),
                 },
                 super::shell::SettingsHelpAction {
                     label: "Save",
                     enabled: true,
                     primary: true,
-                    action: super::pointer_actions::SettingsPointerAction::List(
-                        super::pointer_actions::ListAction::Save,
+                    action: super::pointer_actions::SettingsPointerAction::ImageSpend(
+                        super::pointer_actions::ImageSpendAction::Save,
                     ),
                 },
             ],

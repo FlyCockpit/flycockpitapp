@@ -3708,6 +3708,7 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
             | SettingsPointerAction::Mcp(_)
             | SettingsPointerAction::Providers(_)
             | SettingsPointerAction::Lsp(_)
+            | SettingsPointerAction::ImageSpend(_)
             | SettingsPointerAction::List(_)
             | SettingsPointerAction::UtilityModel(_)
             | SettingsPointerAction::DefaultModel(_)
@@ -7737,6 +7738,146 @@ fn harness_add_name_field_click_repositions_caret_without_saving() {
         Some("abXcd"),
         "field click must place the next character at its text coordinate"
     );
+}
+
+#[cfg(feature = "extended")]
+pub(super) fn run_image_spend_footer_actions_regression() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use pointer_actions::{ImageSpendAction, SettingsPointerAction};
+
+    fn prepare_edit(dialog: &mut SettingsDialog) {
+        enter_root_node(dialog, "Image spend budgets");
+        // Make the policy valid before opening the request editor: request and
+        // session are finite; project is advanced to explicit unlimited.
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Down));
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Down));
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Up));
+        dialog.handle_key(press(KeyCode::Up));
+        dialog.handle_key(press(KeyCode::Char('e')));
+        dialog.handle_key(press(KeyCode::Char('2')));
+    }
+
+    fn footer_target(
+        dialog: &SettingsDialog,
+        action: ImageSpendAction,
+    ) -> shell::SettingsPointerTarget {
+        dialog
+            .cx
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.action
+                    == shell::SettingsPointerAction::Page(SettingsPointerAction::ImageSpend(action))
+            })
+            .cloned()
+            .expect("focused image-spend page renders its footer action")
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let mut save_dialog = fresh_dialog(&tmp);
+    prepare_edit(&mut save_dialog);
+    let _ = render_settings_rows(&save_dialog, 120, 40);
+    let field = footer_target(&save_dialog, ImageSpendAction::EditField);
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            save_dialog.handle_pointer(settings_mouse(
+                kind,
+                field.rect.x.saturating_add(2),
+                field.rect.y
+            )),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    let save = footer_target(&save_dialog, ImageSpendAction::Save);
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            save_dialog.handle_pointer(settings_mouse(kind, save.rect.x, save.rect.y)),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    let saved = render_settings_rows(&save_dialog, 120, 40).join("\n");
+    assert!(
+        saved.contains("Request: finite $10.000002")
+            && saved.contains("Status: Saving reviewed policy…")
+            && !saved.contains("Exact micros"),
+        "footer Save must commit the focused micros buffer and queue persistence; page:\n{saved}"
+    );
+
+    let mut cancel_dialog = fresh_dialog(&TempDir::new().unwrap());
+    prepare_edit(&mut cancel_dialog);
+    let _ = render_settings_rows(&cancel_dialog, 120, 40);
+    let cancel = footer_target(&cancel_dialog, ImageSpendAction::Cancel);
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            cancel_dialog.handle_pointer(settings_mouse(kind, cancel.rect.x, cancel.rect.y)),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    let rendered = render_settings_rows(&cancel_dialog, 120, 40).join("\n");
+    assert!(
+        !rendered.contains("Exact micros"),
+        "footer Cancel must dismiss the focused field instead of navigating away or leaving it active"
+    );
+}
+
+#[cfg(feature = "extended")]
+#[test]
+fn image_spend_footer_actions_commit_or_cancel_the_focused_field() {
+    run_image_spend_footer_actions_regression();
+}
+
+#[test]
+fn tools_footer_reset_remains_operable_while_a_field_is_focused() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use pointer_actions::{CredentialKind, SettingsPointerAction, ToolsAction};
+
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut dialog);
+    click_settings_action(
+        &mut dialog,
+        &SettingsPointerAction::Tools(ToolsAction::EditCredential(CredentialKind::Firecrawl)),
+    );
+    let _ = render_settings_rows(&dialog, 120, 40);
+    let reset = dialog
+        .cx
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.action
+                == shell::SettingsPointerAction::Page(SettingsPointerAction::Tools(
+                    ToolsAction::Reset,
+                ))
+        })
+        .cloned()
+        .expect("focused Tools page renders reset footer action");
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert_eq!(
+            dialog.handle_pointer(settings_mouse(kind, reset.rect.x, reset.rect.y)),
+            SettingsPointerOutcome::Consumed
+        );
+    }
+    assert!(matches!(dialog.test_page(), TestPageRef::Tools(page) if page.reset.is_pending()));
 }
 
 #[test]

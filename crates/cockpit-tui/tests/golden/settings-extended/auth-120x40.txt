@@ -35,6 +35,6 @@
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                               ▌ │                                                                                    │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  type/paste  enter: save  esc [ Continue ] [ Cancel ]│ █
+ ● working  ● waiting  ● done   │type/paste  enter: save  esc: cancel                         [ Continue ] [ Cancel ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

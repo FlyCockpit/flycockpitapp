@@ -35,6 +35,6 @@
                                 │                                                                                    │ █
                                 │                                                                                    │ █
                               ▌ │                                                                                    │ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: togg [ reset to defaults ]│ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: toggle / edit  a: add dir  d: delete [ reset to defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

@@ -1279,7 +1279,18 @@ impl SettingsPage for ToolsPage {
         column: u16,
         _row: u16,
     ) -> Nav {
-        if self.editing.is_some() {
+        if self.editing.is_some()
+            && matches!(
+                action,
+                super::pointer_actions::SettingsPointerAction::Tools(
+                    super::pointer_actions::ToolsAction::EditFirecrawlBaseUrl
+                        | super::pointer_actions::ToolsAction::EditCredential(_)
+                        | super::pointer_actions::ToolsAction::EditWebFetchCommand
+                        | super::pointer_actions::ToolsAction::EditWebSearchCommand
+                        | super::pointer_actions::ToolsAction::EditUserToolCommand(_)
+                )
+            )
+        {
             let value_x = cx
                 .pointer_surface
                 .targets

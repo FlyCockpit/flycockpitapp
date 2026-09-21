@@ -35,6 +35,6 @@
                                 │  start_build         Start a build from the current plan.                         ││ █
                                 │  todo                Manage session todos and notes. (interactive sessions)       ││ █
                               ▌ │  Session                                                                          ││ █
- ● working  ● waiting  ● done   │click: activate  wheel: scroll  ↑/↓/Tab/Shift+Tab  enter: edit [ reset to defaults ]│ █
+ ● working  ● waiting  ● done   │↑/↓/Tab/Shift+Tab  enter: edit/cycle  t: toggle  d: remove  r: [ reset to defaults ]│ █
                                 ╰────────────────────────────────────────────────────────────────────────────────────╯ █
                                 Streaming the final response with a stable caret while the viewport remains scrolled.▌ █

@@ -910,6 +910,7 @@ fn render_onboarding_stage(stage: OnboardingStage, width: u16, height: u16) -> B
 }
 
 pub fn assert_onboarding_native_screens() {
+    let _pins = GoldenPins::install();
     for (name, stage) in [
         ("profile", OnboardingStage::Profile),
         ("lifetime", OnboardingStage::Lifetime),
@@ -1137,6 +1138,7 @@ mod seed_tests {
     #[test]
     fn golden_settings_inventory() {
         let _env = isolate_render_env();
+        let _pins = GoldenPins::install();
         let product_offset = if cfg!(feature = "extended") { 3 } else { 0 };
         let golden_group = if cfg!(feature = "extended") {
             "settings-extended"
@@ -1211,6 +1213,7 @@ mod seed_tests {
     #[test]
     fn golden_setup_wizard_text() {
         let _env = isolate_render_env();
+        let _pins = GoldenPins::install();
         let mut app = transcript_fixture_app();
         app.dialog = crate::tui::settings::golden_setup_wizard_text();
         app.dialog.handle_key(KeyEvent::new(

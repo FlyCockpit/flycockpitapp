@@ -41,7 +41,7 @@ pub use crate::config::delegation_budget::{
 #[allow(unused_imports)]
 pub use daemon::{
     DaemonBootConfig, DaemonConfig, DaemonContainerProbePaths, DaemonSecretStoreBackend,
-    DaemonUploadLimitsConfig, RetentionConfig,
+    DaemonUploadLimitsConfig, HandoverTimersConfig, RetentionConfig,
 };
 #[allow(unused_imports)]
 pub use data_syntax::DataSyntaxConfig;
@@ -2227,6 +2227,24 @@ pub fn load_installation_daemon_boot() -> Result<DaemonBootConfig> {
     };
     boot.validate_paths()?;
     Ok(boot)
+}
+
+/// Load machine-wide handover deadlines from the canonical global layer.
+/// Workspace and remote layers cannot tune process-lifecycle safety bounds.
+pub fn load_installation_handover_timers() -> Result<HandoverTimersConfig> {
+    let path = crate::config::dirs::global_config_dir()?.join(crate::config::dirs::CONFIG_FILE);
+    if !path.exists() {
+        return Ok(HandoverTimersConfig::default());
+    }
+    let doc = ExtendedConfigDoc::load(&path)?;
+    Ok(match doc.raw_field("daemon") {
+        Some(raw) => {
+            serde_json::from_value::<DaemonConfig>(raw.clone())
+                .context("invalid installation daemon configuration")?
+                .handover
+        }
+        None => HandoverTimersConfig::default(),
+    })
 }
 
 /// Read the only installation-wide setting that participates in interactive

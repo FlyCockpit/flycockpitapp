@@ -835,6 +835,10 @@ pub enum Event {
     /// [`Self::Reconnecting`], which reports a model-provider network retry.
     Reconnect {
         generation: u64,
+        /// Per-session durable resume positions committed by the predecessor.
+        /// Work after these markers is pending; replay policy belongs to #441.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        resume_from: Vec<SessionBoundaryMarker>,
     },
 
     /// A configured stream wait threshold elapsed. Without a backup model the
@@ -1781,6 +1785,14 @@ pub enum Event {
 
     #[serde(other)]
     Unknown,
+}
+
+/// Public, authority-free projection of a durable session boundary.
+/// `(session_id, marker)` is the intent key reserved for issue #441.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBoundaryMarker {
+    pub session_id: Uuid,
+    pub marker: i64,
 }
 #[macro_export]
 macro_rules! event_variants {

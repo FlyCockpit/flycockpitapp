@@ -2269,8 +2269,8 @@ mod event;
 pub use event::{
     AgentTreeEventSubject, AgentTreeTransition, AuthFailureKind, DefaultModelStandaloneOutcome,
     DefaultModelUpdateOutcome, Event, InferenceErrorClass, ModelSelectionActiveState,
-    ModelSelectionOutcome, ResponsePerformance, UserMessageTerminalDisposition,
-    WorkspaceTrustReconciliationState,
+    ModelSelectionOutcome, ResponsePerformance, SessionBoundaryMarker,
+    UserMessageTerminalDisposition, WorkspaceTrustReconciliationState,
 };
 
 // ---- Errors ----------------------------------------------------------------

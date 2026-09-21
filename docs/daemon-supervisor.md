@@ -38,10 +38,10 @@ public endpoint. It is same-user trusted under
 authentication boundary, and never carries public NDJSON envelopes.
 
 Its independent protocol version is `1` (`ADMIN_PROTOCOL_VERSION`). Every
-request and response carries that version. Version 1 commands are `status`,
-`roll`, `upgrade { binary }`, `stop`, and `reexec`. Upgrade currently uses the
-plain ready-successor-then-drain-predecessor seam; issue #440 owns
-boundary-aware handover timers and issue #441 owns fencing/intent rows.
+request and response carries that version. User-facing version 1 commands are
+`status`, `roll`, `upgrade { binary }`, `stop`, and `reexec`; the worker-only
+`worker_boundary` report carries the predecessor's marker set after admission
+has closed. Issue #441 owns fencing/intent rows.
 
 On Unix, `reexec` preserves the lifetime and published-PID locks plus the
 public, reveal, and admin listeners across an in-place `exec`, then restores
@@ -60,7 +60,29 @@ roll or crash recovery, reconnect continues to observe the supervisor watch;
 owner exit or a spawn-timeout-sized recovery deadline falls back to that same
 restart decision instead of reconnecting forever.
 
-The public protocol's `Reconnect { generation }` event means a supervisor has
-made a successor generation available and attached clients should reattach to
-the same durable session. It is unrelated to `Reconnecting`, which describes a
-model-provider network retry.
+The public protocol's `Reconnect { generation, resume_from }` event means a
+supervisor has made a successor generation available and attached clients
+should reattach to the same durable session. `resume_from` contains the latest
+SQLite-committed safe marker for each session. A tool result advances the
+marker in the same transaction as `tool_call_completed`; a completed turn does
+the same with `assistant_message`. `(session_id, marker)` is the stable intent
+key reserved for #441. Work observed after a marker without a committed result
+is pending and is never replayed by the handover implementation. The event is
+unrelated to `Reconnecting`, which describes a model-provider network retry.
+
+## Boundary-aware worker handover
+
+Roll and upgrade share three installation-scoped deadlines under
+`daemon.handover`: `drain_ms` defaults to 30000, `hard_ms` to 5000, and
+`grace_ms` to 10000. `T_drain` closes new-turn admission and waits for live
+turns to settle. At `T_hard`, remaining turns go through the existing
+noninteractive cancellation path and receive one durable `InterruptDecision`;
+accepted queue rows remain in `message_queue_items`. `T_grace` retains the
+predecessor until its attached clients have consumed the reconnect instruction
+and detached.
+
+The successor's fd-4 readiness payload is a structured hello containing its
+protocol version, PID, generation, and inherited open time. A missing payload,
+protocol/open-time mismatch, or process-identity mismatch aborts the roll and
+leaves the predecessor serving. `daemon status` exposes the most recent result
+as `last_handover` in JSON and `last handover` in text.

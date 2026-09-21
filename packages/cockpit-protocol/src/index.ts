@@ -2960,6 +2960,19 @@ const historyReplayDataSchema = z
     max_seq: safeI64NumberSchema,
   })
   .passthrough();
+const reconnectDataSchema = z
+  .object({
+    generation: safeU64NumberSchema,
+    resume_from: z
+      .array(
+        z.object({
+          session_id: uuidSchema,
+          marker: safeI64NumberSchema.nonnegative(),
+        }),
+      )
+      .optional(),
+  })
+  .passthrough();
 const hostCapabilityFeatureSchema = z
   .object({
     id: z.string().min(1),
@@ -3225,6 +3238,7 @@ const structuredEventDataSchemas = {
   interrupt_resolved: interruptResolvedDataSchema,
   preflight_started: correlatedPreflightDataSchema,
   queued_user_messages_folded: queuedUserMessagesFoldedDataSchema,
+  reconnect: reconnectDataSchema,
   session_persist_failed: sessionPersistFailedDataSchema,
   user_message_recorded: userMessageRecordedDataSchema,
   user_message_removed: userMessageRemovedDataSchema,

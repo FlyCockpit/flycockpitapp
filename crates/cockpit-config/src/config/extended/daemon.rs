@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 pub use crate::db::retention::RetentionConfig;
 
@@ -15,6 +16,48 @@ pub struct DaemonConfig {
     /// keyring and container-environment detection behavior.
     #[serde(default)]
     pub boot: DaemonBootConfig,
+    /// Boundary-aware worker handover deadlines.
+    #[serde(default)]
+    pub handover: HandoverTimersConfig,
+}
+
+/// Default handover drain window before the existing interrupt path is used.
+pub const DEFAULT_HANDOVER_DRAIN_MS: u64 = 30_000;
+/// Default post-interrupt window for tools to settle at a durable boundary.
+pub const DEFAULT_HANDOVER_HARD_MS: u64 = 5_000;
+/// Default window for attached clients to reconnect before predecessor exit.
+pub const DEFAULT_HANDOVER_GRACE_MS: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandoverTimersConfig {
+    pub drain_ms: u64,
+    pub hard_ms: u64,
+    pub grace_ms: u64,
+}
+
+impl Default for HandoverTimersConfig {
+    fn default() -> Self {
+        Self {
+            drain_ms: DEFAULT_HANDOVER_DRAIN_MS,
+            hard_ms: DEFAULT_HANDOVER_HARD_MS,
+            grace_ms: DEFAULT_HANDOVER_GRACE_MS,
+        }
+    }
+}
+
+impl HandoverTimersConfig {
+    pub fn drain(self) -> Duration {
+        Duration::from_millis(self.drain_ms)
+    }
+
+    pub fn hard(self) -> Duration {
+        Duration::from_millis(self.hard_ms)
+    }
+
+    pub fn grace(self) -> Duration {
+        Duration::from_millis(self.grace_ms)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +168,7 @@ impl Default for DaemonConfig {
             uploads: DaemonUploadLimitsConfig::default(),
             background_agents: true,
             boot: DaemonBootConfig::default(),
+            handover: HandoverTimersConfig::default(),
         }
     }
 }
@@ -178,8 +222,9 @@ default_const!(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
-    use super::{DaemonConfig, DaemonSecretStoreBackend};
+    use super::{DaemonConfig, DaemonSecretStoreBackend, HandoverTimersConfig};
 
     #[test]
     fn background_agents_defaults_to_persistent_owners() {
@@ -247,6 +292,26 @@ mod tests {
             config.boot.container_probe_paths.init_cgroup,
             PathBuf::from("/isolated/probes/cgroup")
         );
+    }
+
+    #[test]
+    fn handover_timer_overrides_are_independent_and_typed() {
+        let config: DaemonConfig = serde_json::from_value(serde_json::json!({
+            "handover": { "drain_ms": 17, "hard_ms": 23, "grace_ms": 31 }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.handover,
+            HandoverTimersConfig {
+                drain_ms: 17,
+                hard_ms: 23,
+                grace_ms: 31,
+            }
+        );
+        assert_eq!(config.handover.drain(), Duration::from_millis(17));
+        assert_eq!(config.handover.hard(), Duration::from_millis(23));
+        assert_eq!(config.handover.grace(), Duration::from_millis(31));
     }
 
     #[test]

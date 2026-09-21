@@ -1143,7 +1143,13 @@
   },
   "reconnect": {
     "data": {
-      "generation": 7
+      "generation": 7,
+      "resume_from": [
+        {
+          "marker": 42,
+          "session_id": "123e4567-e89b-12d3-a456-426614174000"
+        }
+      ]
     },
     "event": "reconnect",
     "kind": "evt",

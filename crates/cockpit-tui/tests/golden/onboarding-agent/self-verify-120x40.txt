@@ -1,13 +1,13 @@
-╭ Optimizations ───────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ ▸ Auto-prune: off                                                                                                    │
-│   Interactive subagents: on                                                                                          │
-│   Max subagent recursion: ◂ 2 ▸                                                                                      │
-│   Tool steering: ◂ terse ▸                                                                                           │
-│   Goal-completion skeptics: 2 goal skeptics                                                                          │
-│   Self-verify: 1 of 3 surfaces ›                                                                                     │
-│   Make default agent: on                                                                                             │
+╭ Self-verify ─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ▸ Writes & edits: same model ×1  ›                                                                                   │
+│   Commands: off  ›                                                                                                   │
+│   Monty: off  ›                                                                                                      │
 │                                                                                                                      │
-│ Losslessly drop duplicated context before it forces a summary.                                                       │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

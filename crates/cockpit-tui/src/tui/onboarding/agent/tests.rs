@@ -12,7 +12,8 @@ use cockpit_proto::{
     AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
     AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
     AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
-    AuthoredAgentReview, AuthoredAgentReviewGrant,
+    AuthoredAgentReview, AuthoredAgentReviewAdjudicator, AuthoredAgentReviewGrant,
+    AuthoredAgentReviewVerificationSurface,
 };
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -83,7 +84,20 @@ fn sample_review() -> AuthoredAgentReview {
         tool_tier_preferences: vec![("read".into(), "enabled".into())],
         verification_label: Some("Self-verification (1 rules)".into()),
         interactive_subagents: true,
+        auto_prune: false,
+        max_subagent_recursion: 2,
+        tool_steering: "terse".into(),
         goal_skeptics_label: "2 goal skeptics".into(),
+        verification_surfaces: vec![AuthoredAgentReviewVerificationSurface {
+            surface: "Writes & edits".into(),
+            adjudicators: vec![AuthoredAgentReviewAdjudicator {
+                provider_id: "vendor".into(),
+                model_id: "exact-a".into(),
+                copies: 1,
+                is_default_model: true,
+            }],
+            enforcement_note: None,
+        }],
         children: vec![],
         sidecars: vec![],
         source: "catalog/frontier@rev".into(),
@@ -247,6 +261,11 @@ fn advance_subagent_to_helpers(screen: &mut AgentAuthoringScreen) {
         screen.handle_key(key(KeyCode::Char(' ')));
         screen.handle_key(key(KeyCode::Enter));
     }
+    assert!(matches!(
+        screen.phase,
+        Phase::SubagentEdit(SubagentPhase::Optimizations)
+    ));
+    screen.handle_key(key(KeyCode::Enter));
     assert!(matches!(
         screen.phase,
         Phase::SubagentEdit(SubagentPhase::ToolTiers)
@@ -474,26 +493,9 @@ fn invalid_nested_depth_surfaces_canonical_failure() {
     }];
     let mut screen = AgentAuthoringScreen::new(projection, "op-depth".into());
     advance_to_subagents(&mut screen);
-    screen.draft.children = vec![
-        cockpit_core::authoring_draft::ChildAuthoringDraft {
-            name: "child-a".into(),
-            route_grants: vec![cockpit_core::authoring_draft::RouteGrantDraft { enabled: true }],
-            default_route_index: 0,
-            trust_confirmations: vec![false],
-            tool_tiers: Default::default(),
-            tool_models: Default::default(),
-            children: vec![],
-        },
-        cockpit_core::authoring_draft::ChildAuthoringDraft {
-            name: "child-a".into(),
-            route_grants: vec![cockpit_core::authoring_draft::RouteGrantDraft { enabled: true }],
-            default_route_index: 0,
-            trust_confirmations: vec![false],
-            tool_tiers: Default::default(),
-            tool_models: Default::default(),
-            children: vec![],
-        },
-    ];
+    let mut duplicate = cockpit_core::authoring_draft::default_child_draft(&screen.projection);
+    duplicate.name = "child-a".into();
+    screen.draft.children = vec![duplicate.clone(), duplicate];
     let error = build_package_draft(&screen.projection, &screen.draft)
         .expect_err("duplicate child names must fail canonical package construction");
     assert!(
@@ -586,11 +588,11 @@ fn model_tool_optimization_and_subagent_rows_activate_on_first_click() {
     assert!(screen.draft.route_grants[1].enabled);
 
     screen.phase = Phase::Optimizations;
-    let interactive_before = screen.draft.interactive_subagents;
+    let auto_prune_before = screen.draft.auto_prune;
     render_buffer(&mut screen, 120, 40);
     let optimization = screen.list_row_rects[0];
     assert!(screen.handle_mouse(click_at(Position::new(optimization.x, optimization.y))));
-    assert_ne!(screen.draft.interactive_subagents, interactive_before);
+    assert_ne!(screen.draft.auto_prune, auto_prune_before);
 
     screen.phase = Phase::ToolTiers;
     render_buffer(&mut screen, 120, 40);
@@ -614,6 +616,37 @@ fn model_tool_optimization_and_subagent_rows_activate_on_first_click() {
         screen.phase,
         Phase::SubagentEdit(SubagentPhase::Identity)
     ));
+}
+
+#[test]
+fn verifier_panel_keeps_default_model_first_and_labels_cache_reuse() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-order".into());
+    screen.draft.default_route_index = 1;
+    screen.phase = Phase::VerifierPanel(0);
+    let rendered = render_string(&mut screen, 120, 40);
+    let default = rendered
+        .find("vendor/exact-b  reuses cache")
+        .expect("default verifier row must be labelled as cache reuse");
+    let other = rendered
+        .find("vendor/exact-a")
+        .expect("other catalog verifier must be rendered");
+    assert!(
+        default < other,
+        "default verifier row must be first: {rendered}"
+    );
+}
+
+#[test]
+fn verifier_minus_at_zero_is_a_no_op_and_surface_off_requires_all_zero() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-zero".into());
+    screen.draft.self_verification[1].copies.fill(0);
+    assert!(screen.draft.self_verification[1].is_off());
+    screen.adjust_verifier(1, 0, -1);
+    assert_eq!(screen.draft.self_verification[1].copies, vec![0, 0]);
+    screen.adjust_verifier(1, 1, 1);
+    assert!(!screen.draft.self_verification[1].is_off());
+    screen.adjust_verifier(1, 1, -1);
+    assert!(screen.draft.self_verification[1].is_off());
 }
 
 #[test]
@@ -902,7 +935,7 @@ fn golden_screen(phase: Phase) -> AgentAuthoringScreen {
 }
 
 #[test]
-fn golden_agent_authoring_all_twenty_states() {
+fn golden_agent_authoring_screens() {
     let _pins = crate::tui::golden::GoldenPins::install();
     let states = [
         ("name", Phase::SourceIdentity),
@@ -912,6 +945,8 @@ fn golden_agent_authoring_all_twenty_states() {
         ("trust", Phase::ModelTrust),
         ("sidecar-egress", Phase::SidecarEgress),
         ("optimizations", Phase::Optimizations),
+        ("self-verify", Phase::SelfVerify),
+        ("verifier-panel", Phase::VerifierPanel(0)),
         ("tools", Phase::ToolTiers),
         ("subagents", Phase::SubagentsList),
         (
@@ -941,7 +976,7 @@ fn golden_agent_authoring_all_twenty_states() {
         ("unknown", Phase::Unknown),
         ("success", Phase::Success),
     ];
-    assert_eq!(states.len(), 20);
+    assert_eq!(states.len(), 22);
     for (name, phase) in states {
         let mut screen = golden_screen(phase);
         if phase == Phase::SubagentEdit(SubagentPhase::ModelTrust) {

@@ -8,11 +8,11 @@
 5	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
 6	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
 7	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
-8	1:Rgb(127,201,138)/Reset/- 1:Reset/Reset/- 60:Rgb(138,155,176)/Reset/- 17:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+8	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
 9	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
 10	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
 11	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
-12	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
+12	1:Rgb(127,201,138)/Reset/- 1:Reset/Reset/- 60:Rgb(138,155,176)/Reset/- 17:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
 13	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
 14	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-
 15	1:Rgb(127,201,138)/Reset/- 78:Reset/Reset/- 1:Rgb(127,201,138)/Reset/-

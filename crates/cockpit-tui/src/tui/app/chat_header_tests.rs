@@ -145,10 +145,18 @@ fn update_available_is_a_header_pill_and_not_a_persistent_row() {
     let meta = row_text(&buffer, layout.area.y + 1);
     assert!(meta.contains("[update 9.9.9]"), "{meta:?}");
     assert_eq!(app.persistent_notice_text(), None);
-    let _ = futures::executor::block_on(cockpit_core::updater::run_startup_check_with(
+    let result = futures::executor::block_on(cockpit_core::updater::run_startup_check_with(
         &CurrentUpdate,
         UpdateChannel::Auto,
     ));
+    assert_eq!(result, UpdateCheckResult::Current);
+    assert!(app.sync_update_notice());
+    assert!(
+        !app.chat_header_state()
+            .pills
+            .iter()
+            .any(|pill| pill.kind == HeaderPillKind::Update)
+    );
 }
 
 fn click(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {

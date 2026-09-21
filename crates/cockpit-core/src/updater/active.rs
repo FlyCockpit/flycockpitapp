@@ -3,7 +3,6 @@
 //! never simulated by production code.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,6 +11,7 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::disabled::{HOMEBREW_UPGRADE_COMMAND, resolve_brew_prefix};
 use super::traits::{
     BinaryReplacer, MetadataRepository, SupervisorMaintenanceClient, TargetFetcher, TrustRoot,
     UpdateLockStore, Updater,
@@ -23,7 +23,6 @@ use super::types::{
     VerifiedRepositoryMetadata,
 };
 
-pub const HOMEBREW_UPGRADE_COMMAND: &str = "brew upgrade cockpit";
 /// cargo-dist's `app_name` is the distributable package name, not the binary
 /// or Homebrew formula name. Keep receipt discovery on that exact contract.
 pub const CARGO_DIST_APP_NAME: &str = "cockpit-cli";
@@ -126,19 +125,6 @@ fn cargo_dist_config_home(
     xdg_config_home
         .map(PathBuf::from)
         .or_else(|| home.map(PathBuf::from).map(|path| path.join(".config")))
-}
-
-fn resolve_brew_prefix() -> Option<PathBuf> {
-    if let Some(prefix) = std::env::var_os("HOMEBREW_PREFIX").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(prefix));
-    }
-    let output = Command::new("brew").arg("--prefix").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let prefix = String::from_utf8(output.stdout).ok()?;
-    let prefix = prefix.trim();
-    (!prefix.is_empty()).then(|| PathBuf::from(prefix))
 }
 
 pub struct ActiveUpdater {
@@ -443,7 +429,7 @@ fn extract_tar_member(archive: &[u8]) -> Result<tempfile::NamedTempFile, Updater
         let data = archive.get(data_start..data_end).ok_or_else(|| {
             UpdaterError::InvalidArchive(format!("truncated tar member `{name}`"))
         })?;
-        let is_executable = matches!(name.as_str(), "cockpit" | "cockpit-cli")
+        let is_executable = tar_member_is_cockpit_executable(&name)
             && matches!(header[156], 0 | b'0')
             && mode & 0o111 != 0;
         if is_executable && executable.replace((data.to_vec(), mode)).is_some() {
@@ -500,7 +486,25 @@ fn tar_name(header: &[u8]) -> Result<String, UpdaterError> {
             "tar member name is empty".into(),
         ));
     }
-    Ok(name.to_owned())
+    let prefix = std::str::from_utf8(&header[345..500])
+        .map_err(|_| UpdaterError::InvalidArchive("tar member prefix is not UTF-8".into()))?
+        .trim_end_matches('\0');
+    if prefix.is_empty() {
+        Ok(name.to_owned())
+    } else {
+        Ok(format!("{prefix}/{name}"))
+    }
+}
+
+/// cargo-dist wraps each executable in an artifact-id directory. We only
+/// materialize the member bytes, so its path is never used as a filesystem
+/// destination; match the executable basename while retaining the exactly-one
+/// regular executable rule for the complete archive.
+fn tar_member_is_cockpit_executable(name: &str) -> bool {
+    matches!(
+        Path::new(name).file_name().and_then(|name| name.to_str()),
+        Some("cockpit" | "cockpit-cli")
+    )
 }
 
 #[cfg(windows)]
@@ -668,6 +672,18 @@ mod tests {
             _request: SupervisorMaintenanceRequest,
         ) -> Result<(), UpdaterError> {
             panic!("unsupported platforms must not request maintenance")
+        }
+    }
+
+    struct RecordingSupervisor;
+
+    #[async_trait]
+    impl SupervisorMaintenanceClient for RecordingSupervisor {
+        async fn request_maintenance(
+            &self,
+            _request: SupervisorMaintenanceRequest,
+        ) -> Result<(), UpdaterError> {
+            Ok(())
         }
     }
 
@@ -852,35 +868,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_tarball_places_its_executable_member_not_archive_bytes() {
+    async fn wrapped_cargo_dist_tarball_applies_through_the_updater() {
+        use super::super::fake::{
+            FakeFixtureMetadataRepository, FakeFixtureTargetFetcher, FakeFixtureTrustRoot,
+        };
         use super::super::platform::PlatformBinaryReplacer;
+        use super::super::types::FakeFixtureEvidence;
 
         let temp = tempfile::tempdir().unwrap();
-        let archive = temp.path().join("cockpit.tar.gz");
         let installed = temp.path().join("cockpit");
-        let executable = b"new executable member";
-        let archive_bytes = tar_gz(&[("cockpit", executable, 0o755)]);
-        std::fs::write(&archive, &archive_bytes).unwrap();
         std::fs::write(&installed, b"old executable").unwrap();
+        let executable: &[u8] = b"new executable member";
+        let artifact_id = "cockpit-x86_64-unknown-linux-gnu";
+        let archive_bytes = tar_gz(&[
+            (
+                &format!("{artifact_id}/README.md"),
+                &b"cargo-dist fixture"[..],
+                0o644,
+            ),
+            (&format!("{artifact_id}/cockpit"), executable, 0o755),
+        ]);
+        let archive = temp.path().join("cockpit-x86_64-unknown-linux-gnu.tar.gz");
+        std::fs::write(&archive, &archive_bytes).unwrap();
+        let receipt = temp.path().join("cockpit-cli-receipt.json");
+        write_receipt(&receipt, temp.path());
         let target = UpdateTargetDescriptor {
             version: "9.9.9".into(),
-            platform: "test".into(),
-            path: "cockpit.tar.gz".into(),
+            platform: "fixture-platform".into(),
+            path: "cockpit-x86_64-unknown-linux-gnu.tar.gz".into(),
             length: archive_bytes.len() as u64,
             sha256: hex_sha256(&archive_bytes),
         };
-        verify_target(&archive, &target).unwrap();
-        let extracted = extract_executable(&archive, &target).unwrap();
-        let mut receipt = UpdateApplyReceipt {
-            update_id: Uuid::now_v7(),
-            state: UpdateApplyReceiptState::VerifiedStaged,
-            target: Some(target),
-            updated_at_unix_ms: 1,
-        };
-        PlatformBinaryReplacer::new(installed.clone())
-            .stage_and_swap(extracted.path(), &mut receipt)
-            .await
-            .unwrap();
+        let root = FakeFixtureTrustRoot::new(FakeFixtureEvidence {
+            release_tag: "v9.9.9".into(),
+            commit: "fixture-commit".into(),
+            targets: vec![target],
+        });
+        let updater = ActiveUpdater::new(
+            InstallationPolicy::new(InstallationPaths {
+                current_exe: installed.clone(),
+                receipt,
+                brew_prefix: None,
+            }),
+            "fixture-platform",
+            Some(Arc::new(root.clone())),
+            Arc::new(FakeFixtureMetadataRepository {
+                metadata: root.metadata(),
+            }),
+            Arc::new(FakeFixtureTargetFetcher { path: archive }),
+            Arc::new(PlatformBinaryReplacer::new(installed.clone())),
+            Arc::new(RecordingSupervisor),
+            Arc::new(MemoryLock),
+        );
+
+        assert_eq!(
+            updater
+                .apply_manual(UpdateChannel::Auto, None)
+                .await
+                .unwrap(),
+            ManualUpdateOutcome::Updated {
+                version: "9.9.9".into()
+            }
+        );
         assert_eq!(std::fs::read(installed).unwrap(), executable);
     }
 

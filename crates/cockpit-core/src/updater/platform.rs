@@ -267,6 +267,67 @@ fn update_lock_owner_is_live(record: &UpdateLockRecord) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_maintenance_client_requests_one_upgrade_and_preserves_admin_uptime() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let paths = crate::daemon::DaemonPaths::resolve_canonical().unwrap();
+        let admin = crate::daemon::supervisor::admin_socket(&paths).unwrap();
+        let listener = tokio::net::UnixListener::bind(&admin).unwrap();
+        let installed = PathBuf::from("/receipt-authorized/bin/cockpit");
+        let expected_binary = installed.clone();
+        let server = tokio::spawn(async move {
+            for (expected, response) in [
+                (
+                    crate::daemon::supervisor::AdminCommand::Status,
+                    crate::daemon::supervisor::AdminResponse::Status {
+                        version: crate::daemon::supervisor::ADMIN_PROTOCOL_VERSION,
+                        supervisor_pid: 10,
+                        worker_pid: 101,
+                        generation: 4,
+                        uptime_ms: 5_000,
+                    },
+                ),
+                (
+                    crate::daemon::supervisor::AdminCommand::Upgrade {
+                        binary: expected_binary,
+                    },
+                    crate::daemon::supervisor::AdminResponse::Rolled {
+                        version: crate::daemon::supervisor::ADMIN_PROTOCOL_VERSION,
+                        old_worker_pid: 101,
+                        worker_pid: 202,
+                        generation: 5,
+                        uptime_ms: 5_750,
+                    },
+                ),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = tokio::io::BufReader::new(stream);
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).await.unwrap();
+                let request: crate::daemon::supervisor::AdminRequest =
+                    serde_json::from_slice(&line).unwrap();
+                assert_eq!(request.command, expected);
+                let mut stream = reader.into_inner();
+                let mut response = serde_json::to_vec(&response).unwrap();
+                response.push(b'\n');
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+
+        LiveSupervisorMaintenanceClient::new(installed)
+            .request_maintenance(SupervisorMaintenanceRequest {
+                update_id: uuid::Uuid::now_v7(),
+                target_version: "9.9.9".into(),
+                installed_path_digest: "fixture".into(),
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
     fn lock_record(update_id: uuid::Uuid, owner_start_id: String) -> UpdateLockRecord {
         UpdateLockRecord {
             update_id,

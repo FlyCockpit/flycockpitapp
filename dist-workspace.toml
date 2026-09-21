@@ -32,8 +32,8 @@ install-updater = true
 # `brew install flycockpit/tap/cockpit`.
 formula = "cockpit"
 # The GitHub repo that hosts your Homebrew tap. dist generates cockpit.rb as a
-# release artifact; the root Release workflow then commits that file into this
-# tap with HOMEBREW_TAP_TOKEN.
+# release artifact; the root Release workflow verifies the owner-maintained
+# formula instead of publishing it automatically.
 tap = "FlyCockpit/homebrew-tap"
 # Keep this aligned with the root Release workflow's publish-homebrew-formula
 # job. If the workflow is regenerated from cargo-dist, review the generated

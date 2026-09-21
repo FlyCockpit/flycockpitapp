@@ -14,12 +14,12 @@ mod types;
 
 #[cfg(not(feature = "no-self-update"))]
 pub use active::{
-    ActiveUpdater, CARGO_DIST_APP_NAME, HOMEBREW_UPGRADE_COMMAND, InstallationPolicy,
-    cargo_dist_receipt_path, current_platform,
+    ActiveUpdater, CARGO_DIST_APP_NAME, InstallationPolicy, cargo_dist_receipt_path,
+    current_platform,
 };
 pub use background::spawn_background;
 pub use composition::{InstalledUpdaterComposition, installed_composition, installed_updater};
-pub use disabled::PackageManagerUpdater;
+pub use disabled::{HOMEBREW_UPGRADE_COMMAND, PackageManagerUpdater};
 #[cfg(not(feature = "no-self-update"))]
 pub use platform::{
     FileUpdateLockStore, LiveSupervisorMaintenanceClient, PlatformBinaryReplacer,

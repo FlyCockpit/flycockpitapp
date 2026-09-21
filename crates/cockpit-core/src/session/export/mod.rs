@@ -525,7 +525,6 @@ pub async fn build_redacted_transcript_json_bytes(
         let export_redactor = export_redaction_table_for_sessions(
             Some(&vault),
             Some(conn),
-            &target,
             std::slice::from_ref(&target),
             Some(resolver.as_ref()),
             base_redactor.as_ref(),
@@ -983,14 +982,7 @@ fn build_zip_with_options_and_env_conn(
         let resolver =
             resolver.context("a redacted export requires a warm redaction key resolver")?;
         let base_redactor = base_redactor.context("redacted export requires bound coverage")?;
-        export_redaction_table_for_bundle(
-            vault,
-            Some(conn),
-            target,
-            bundle,
-            resolver,
-            base_redactor,
-        )?
+        export_redaction_table_for_bundle(vault, Some(conn), bundle, resolver, base_redactor)?
     } else {
         // Explicit local raw export: a no-op table so every member body and
         // member path is emitted exactly as stored. No journal rehydration and
@@ -2061,21 +2053,19 @@ fn session_required_vault_redaction_json(
 fn export_redaction_table_for_bundle(
     vault: Option<&crate::secure_key::SecretVault>,
     conn: Option<&Connection>,
-    target: &SessionRow,
     bundle: &[SessionRow],
     resolver: &dyn crate::redact::protected_redaction_history::RedactionKeyResolver,
     base_redactor: &RedactionTable,
 ) -> Result<RedactionTable> {
     // The debug bundle folds history IN-SNAPSHOT via the resolver so the folded
     // set equals the assembled set (`bundle` was discovered on the same `conn`).
-    export_redaction_table_for_sessions(vault, conn, target, bundle, Some(resolver), base_redactor)
+    export_redaction_table_for_sessions(vault, conn, bundle, Some(resolver), base_redactor)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn export_redaction_table_for_sessions(
     vault: Option<&crate::secure_key::SecretVault>,
     conn: Option<&Connection>,
-    target: &SessionRow,
     sessions: &[SessionRow],
     resolver: Option<&dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     base_redactor: &RedactionTable,

@@ -294,7 +294,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     ..
                 } => {
                     println!(
-                        "daemon: upgraded worker {old_worker_pid} -> {worker_pid} (generation {generation})"
+                        "daemon: upgraded worker {old_worker_pid} -> {worker_pid} (generation {generation}); attached clients will reconnect"
                     );
                     Ok(())
                 }

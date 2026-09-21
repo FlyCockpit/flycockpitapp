@@ -59,6 +59,11 @@ pub(crate) struct WorkerHandoverRequest {
 
 static WORKER_HANDOVER: OnceLock<std::sync::Mutex<Option<WorkerHandoverRequest>>> = OnceLock::new();
 static WORKER_HANDOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
+// The hard-deadline cancellation phase is narrower than ordinary handover
+// draining. A tool that naturally reaches its boundary during `T_drain` is a
+// predecessor completion; a tool observing this flag has been cancelled and
+// must leave its result uncommitted for the handover interruption record.
+static WORKER_HANDOVER_HARD_INTERRUPT: AtomicBool = AtomicBool::new(false);
 // The predecessor closes admission before it redirects clients.  Its accept
 // loop waits for this edge before closing the established streams, so every
 // attached client gets one bounded opportunity to receive `Reconnect`.
@@ -76,6 +81,7 @@ pub(crate) fn begin_worker_handover(generation: u64) -> Result<()> {
         bail!("worker handover is already in progress");
     }
     WORKER_HANDOVER_DECISION.store(0, Ordering::Release);
+    WORKER_HANDOVER_HARD_INTERRUPT.store(false, Ordering::Release);
     WORKER_HANDOVER_RECONNECT_DISPATCHED.store(false, Ordering::Release);
     let slot = WORKER_HANDOVER.get_or_init(|| std::sync::Mutex::new(None));
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -86,6 +92,17 @@ pub(crate) fn begin_worker_handover(generation: u64) -> Result<()> {
 /// Whether this worker is draining a committed-or-pending handover.
 pub(crate) fn worker_handover_active() -> bool {
     WORKER_HANDOVER_ACTIVE.load(Ordering::Acquire)
+}
+
+pub(crate) fn begin_worker_handover_hard_interrupt() {
+    if worker_handover_active() {
+        WORKER_HANDOVER_HARD_INTERRUPT.store(true, Ordering::Release);
+    }
+}
+
+/// Whether an in-flight tool was cancelled because `T_hard` elapsed.
+pub(crate) fn worker_handover_hard_interrupting() -> bool {
+    WORKER_HANDOVER_HARD_INTERRUPT.load(Ordering::Acquire)
 }
 
 pub(crate) fn worker_handover_aborted() -> bool {
@@ -119,6 +136,7 @@ pub(crate) async fn wait_for_worker_handover_reconnect_dispatch() -> bool {
 pub(crate) fn abort_worker_handover() {
     WORKER_HANDOVER_DECISION.store(2, Ordering::Release);
     WORKER_HANDOVER_ACTIVE.store(false, Ordering::Release);
+    WORKER_HANDOVER_HARD_INTERRUPT.store(false, Ordering::Release);
     if let Some(slot) = WORKER_HANDOVER.get() {
         *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }

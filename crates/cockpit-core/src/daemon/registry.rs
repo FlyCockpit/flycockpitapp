@@ -3204,6 +3204,7 @@ impl SessionRegistry {
     /// cancellation path used by daemon control requests. Durable accepted
     /// queue rows are intentionally retained for the successor.
     pub async fn interrupt_for_handover(&self, hard_timeout: Duration) -> Result<usize> {
+        super::supervisor::begin_worker_handover_hard_interrupt();
         let handles: Vec<SessionWorkerHandle> = {
             let workers = crate::sync::lock_or_recover(&self.inner.workers);
             workers

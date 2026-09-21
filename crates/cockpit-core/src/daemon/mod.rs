@@ -3324,7 +3324,10 @@ async fn prepare_worker_handover(
     if ctx.registry.has_handover_inflight() {
         let interrupted = tokio::select! {
             result = ctx.registry.interrupt_for_handover(handover.timers.hard()) => result?,
-            result = supervisor::wait_for_worker_handover_abort() => result?,
+            result = supervisor::wait_for_worker_handover_abort() => {
+                result?;
+                anyhow::bail!("worker handover abort watcher returned without an abort")
+            }
         };
         tracing::warn!(
             interrupted,

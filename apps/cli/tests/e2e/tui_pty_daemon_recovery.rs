@@ -224,16 +224,12 @@ fn supervisor_reexec_keeps_attached_session_and_listener() {
 fn daemon_upgrade_reconnects_attached_tui_without_prompt() {
     let mut session = attach_with_durable_history();
     let session_id = session_id_with_durable_marker(&session.home().db_path(), HISTORY_MARKER);
-    let output = session.upgrade_daemon();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("attached clients will reconnect"),
-        "upgrade output must describe attached-client behavior: {stdout}"
-    );
+    let before = session.daemon_status_json();
+    let upgrade = session.begin_upgrade_daemon();
     let reconnect_blips = Cell::new(0_u32);
     let reconnect_visible = Cell::new(false);
     let observe_reconnect_blip = |screen: &crate::support::ScreenSnapshot| {
-        let visible = screen.contains("reconnecting");
+        let visible = screen.contains("● Reconnecting");
         if visible && !reconnect_visible.replace(visible) {
             reconnect_blips.set(reconnect_blips.get() + 1);
         }
@@ -249,6 +245,12 @@ fn daemon_upgrade_reconnects_attached_tui_without_prompt() {
             &observe_reconnect_blip,
         )
         .expect("trusted restart must show one reconnecting blip");
+    let output = session.finish_upgrade_daemon(before, upgrade);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("attached clients will reconnect"),
+        "upgrade output must describe attached-client behavior: {stdout}"
+    );
     session
         .wait_until_screen(
             "trusted upgrade reattached",
@@ -259,7 +261,7 @@ fn daemon_upgrade_reconnects_attached_tui_without_prompt() {
                     && screen.contains(HISTORY_MARKER)
                     && !screen.contains("The daemon stopped unexpectedly")
                     && !screen.contains("Loading session setup")
-                    && !screen.contains("reconnecting")
+                    && !screen.contains("● Reconnecting")
             },
         )
         .expect("trusted restart must reconnect without user input");

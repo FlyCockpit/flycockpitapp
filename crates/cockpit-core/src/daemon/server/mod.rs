@@ -8165,6 +8165,16 @@ where
     let mut writer_task = writer_task;
     let mut event_task = event_task;
     let mut executor_task = executor_task;
+    // The listener aborts these outer client tasks at handover after the
+    // `Reconnect` flush. Dropping a JoinHandle detaches its task, so keep
+    // abort handles in a drop guard: cancellation of this handler must also
+    // close its reader/writer and release the predecessor socket connection.
+    let _abort_children = AbortClientTasksOnDrop::new([
+        reader_task.abort_handle(),
+        writer_task.abort_handle(),
+        event_task.abort_handle(),
+        executor_task.abort_handle(),
+    ]);
 
     let completed = select_client_task(
         &mut reader_task,
@@ -8219,6 +8229,24 @@ enum ClientTaskKind {
     Writer,
     Event,
     Executor,
+}
+
+struct AbortClientTasksOnDrop {
+    handles: [tokio::task::AbortHandle; 4],
+}
+
+impl AbortClientTasksOnDrop {
+    fn new(handles: [tokio::task::AbortHandle; 4]) -> Self {
+        Self { handles }
+    }
+}
+
+impl Drop for AbortClientTasksOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
 }
 
 struct CompletedClientTask {

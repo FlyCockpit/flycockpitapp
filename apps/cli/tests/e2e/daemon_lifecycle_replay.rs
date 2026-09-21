@@ -254,6 +254,22 @@ fn session_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
     .collect()
 }
 
+fn has_handover_interrupt_decision(db_path: &Path, session_id: Uuid) -> bool {
+    let conn = open_db(db_path);
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM session_events
+              WHERE session_id = ?1
+                AND type = 'interrupt_decision'
+                AND json_extract(data_json, '$.reason') = 'worker_handover_hard_deadline'
+         )",
+        params![session_id.to_string()],
+        |row| row.get(0),
+    )
+    .expect("query handover interrupt decision")
+}
+
 fn tool_call_command(db_path: &Path, session_id: Uuid) -> String {
     let conn = open_db(db_path);
     let raw: String = conn
@@ -680,13 +696,13 @@ async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
     );
     assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 1);
     let terminal_rows = session_event_rows(&daemon.db_path(), attached.session_id);
+    let handover_interrupted =
+        has_handover_interrupt_decision(&daemon.db_path(), attached.session_id);
     assert_ne!(
         terminal_rows
             .iter()
             .any(|(_, kind)| kind == "tool_call_completed" || kind == "assistant_message"),
-        terminal_rows
-            .iter()
-            .any(|(_, kind)| kind == "interrupt_decision"),
+        handover_interrupted,
         "the live predecessor turn must be completed XOR interrupted"
     );
     let after = supervisor_status_json(&daemon);
@@ -770,9 +786,7 @@ async fn handover_hard_deadline_records_interrupt_not_tool_completion() {
     let completed = terminal_rows
         .iter()
         .any(|(_, kind)| kind == "tool_call_completed" || kind == "assistant_message");
-    let interrupted = terminal_rows
-        .iter()
-        .any(|(_, kind)| kind == "interrupt_decision");
+    let interrupted = has_handover_interrupt_decision(&daemon.db_path(), attached.session_id);
     assert_ne!(
         completed, interrupted,
         "the live hard-deadline turn must record completion XOR interruption"

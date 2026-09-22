@@ -960,6 +960,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                         }
                         let ready = wait_for_worker_handover_ready(
                             &mut admin,
+                            &mut successor,
                             worker.pid,
                             generation,
                             handover_timers.drain() + HANDOVER_BOUNDARY_ANNOUNCE_SLACK,
@@ -972,6 +973,15 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 let stopping = error
                                     .to_string()
                                     .contains("administrative stop requested during worker handover");
+                                // SIGUSR1 fenced the predecessor. Every
+                                // pre-commit exit must release that fence so
+                                // an aborted upgrade resumes admissions
+                                // immediately instead of waiting for T_drain.
+                                if let Err(abort_error) =
+                                    signal_worker_handover_decision(&worker, false)
+                                {
+                                    tracing::warn!(%abort_error, pid = worker.pid, "could not abort predecessor handover fence");
+                                }
                                 let _ = terminate_worker(&mut successor, false);
                                 reap_worker_after_exit(successor);
                                 if stopping {
@@ -2175,6 +2185,7 @@ async fn wait_for_worker_boundary(
 
 async fn wait_for_worker_handover_ready(
     admin: &mut AdminListener,
+    successor: &mut Worker,
     expected_worker_pid: u32,
     expected_generation: u64,
     timeout: Duration,
@@ -2183,7 +2194,14 @@ async fn wait_for_worker_handover_ready(
 ) -> Result<()> {
     tokio::time::timeout(timeout, async {
         loop {
-            let stream = accept_admin(admin).await?;
+            let stream = tokio::select! {
+                exit = successor.exited.recv() => match exit {
+                    Some(Ok(())) => bail!("staged successor pid {} exited before handover commitment", successor.pid),
+                    Some(Err(error)) => bail!("staged successor pid {} process watch failed before handover commitment: {error}", successor.pid),
+                    None => bail!("staged successor pid {} process watch stopped before handover commitment", successor.pid),
+                },
+                stream = accept_admin(admin) => stream?,
+            };
             let (request, mut stream) = read_admin(stream).await?;
             if request.version != ADMIN_PROTOCOL_VERSION {
                 write_admin(
@@ -2223,6 +2241,7 @@ async fn wait_for_worker_handover_ready(
                     worker_pid,
                     generation,
                 } if worker_pid == expected_worker_pid && generation == expected_generation => {
+                    ensure_staged_successor_live(successor)?;
                     write_admin(
                         &mut stream,
                         &status_response(
@@ -2252,6 +2271,38 @@ async fn wait_for_worker_handover_ready(
     .map_err(|_| {
         anyhow::anyhow!("T_drain elapsed before predecessor handover-ready acknowledgement")
     })?
+}
+
+/// Close the tiny gap between an exit-watch wakeup and the predecessor's
+/// commit signal.  The child handle is checked too because the process watch
+/// is intentionally asynchronous.
+fn ensure_staged_successor_live(successor: &mut Worker) -> Result<()> {
+    match successor.exited.try_recv() {
+        Ok(Ok(())) => bail!(
+            "staged successor pid {} exited before handover commitment",
+            successor.pid
+        ),
+        Ok(Err(error)) => bail!(
+            "staged successor pid {} process watch failed before handover commitment: {error}",
+            successor.pid
+        ),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => bail!(
+            "staged successor pid {} process watch stopped before handover commitment",
+            successor.pid
+        ),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+    }
+    if let Some(child) = successor.child.as_mut()
+        && let Some(status) = child
+            .try_wait()
+            .context("checking staged successor liveness before handover commitment")?
+    {
+        bail!(
+            "staged successor pid {} exited with status {status} before handover commitment",
+            successor.pid
+        );
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2698,6 +2749,36 @@ mod tests {
         assert_eq!(worker, None);
         assert_eq!(generation, 14);
         assert_eq!(attempts, vec![12, 13, 14]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_successor_exit_aborts_before_predecessor_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut admin = bind_admin(&directory.path().join("sup.ctl")).unwrap();
+        let (exited_tx, exited) = tokio::sync::mpsc::channel(1);
+        exited_tx.send(Ok(())).await.unwrap();
+        let mut successor = Worker {
+            pid: 123,
+            binary: std::fs::canonicalize("/bin/true").unwrap(),
+            child: None,
+            exited,
+            promotion: None,
+        };
+
+        let error = wait_for_worker_handover_ready(
+            &mut admin,
+            &mut successor,
+            456,
+            7,
+            Duration::from_secs(1),
+            1,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("staged successor pid 123 exited"));
     }
 
     #[cfg(unix)]

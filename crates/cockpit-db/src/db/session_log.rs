@@ -678,6 +678,18 @@ pub struct SessionBoundaryMarker {
     pub marker: i64,
 }
 
+/// Terminal handover state for the latest user turn in a session.
+///
+/// This deliberately contains only the fields the handover interrupt path
+/// needs.  Reading a complete session timeline there can delay the hard
+/// deadline behind unrelated historical events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoverTurnOutcome {
+    pub turn_start_seq: i64,
+    pub completed: bool,
+    pub hard_deadline_interrupted: bool,
+}
+
 impl std::fmt::Debug for SessionEventRow {
     /// `data` is the raw trusted per-event JSON payload; never print it
     /// verbatim. Show its structural descriptor plus the (non-body) event
@@ -1471,6 +1483,13 @@ impl Db {
             .await
     }
 
+    /// Inspect just the current turn's terminal handover state without
+    /// decoding or hydrating the session's full historical event timeline.
+    pub async fn handover_turn_outcome(&self, session_id: Uuid) -> Result<HandoverTurnOutcome> {
+        self.read(move |conn| Self::handover_turn_outcome_conn(conn, session_id))
+            .await
+    }
+
     /// Remove exactly the latest user event in a session when it is the named
     /// message. This is the sole narrow exception to the append-only ledger:
     /// the caller has proved that the directly answering turn emitted neither
@@ -1902,6 +1921,46 @@ impl Db {
         let mut events = decode_event_rows(raw)?;
         hydrate_compaction_payloads_conn(conn, session_id, &mut events)?;
         Ok(events)
+    }
+
+    pub fn handover_turn_outcome_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<HandoverTurnOutcome> {
+        let session_id = session_id.to_string();
+        let (turn_start_seq, completed, hard_deadline_interrupted) = conn
+            .query_row(
+                "WITH latest_user AS (
+                     SELECT COALESCE(MAX(seq), 0) AS seq
+                       FROM session_events
+                      WHERE session_id = ?1 AND type = 'user_message'
+                 )
+                 SELECT seq,
+                        EXISTS(
+                            SELECT 1
+                              FROM session_events
+                             WHERE session_id = ?1
+                               AND seq > latest_user.seq
+                               AND type IN ('assistant_message', 'tool_call_completed')
+                        ),
+                        EXISTS(
+                            SELECT 1
+                              FROM session_events
+                             WHERE session_id = ?1
+                               AND seq > latest_user.seq
+                               AND type = 'interrupt_decision'
+                               AND json_extract(data_json, '$.reason') = 'worker_handover_hard_deadline'
+                        )
+                   FROM latest_user",
+                [&session_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?)),
+            )
+            .context("looking up indexed handover turn outcome")?;
+        Ok(HandoverTurnOutcome {
+            turn_start_seq,
+            completed,
+            hard_deadline_interrupted,
+        })
     }
 
     pub fn list_session_events_since_conn(
@@ -4391,6 +4450,87 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handover_turn_outcome_ignores_prior_turn_history() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let prior_turn = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "prior turn"}),
+            )
+            .await
+            .unwrap();
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::ToolCallCompleted,
+            Some("builder"),
+            Some("prior-call"),
+            &json!({"result": "prior side effect"}),
+        )
+        .await
+        .unwrap();
+        let current_turn = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("builder"),
+                None,
+                &json!({"text": "current turn"}),
+            )
+            .await
+            .unwrap();
+        assert!(current_turn > prior_turn);
+
+        assert_eq!(
+            db.handover_turn_outcome(session.session_id).await.unwrap(),
+            HandoverTurnOutcome {
+                turn_start_seq: current_turn,
+                completed: false,
+                hard_deadline_interrupted: false,
+            }
+        );
+
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::InterruptDecision,
+            Some("builder"),
+            None,
+            &json!({"reason": "worker_handover_hard_deadline"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.handover_turn_outcome(session.session_id).await.unwrap(),
+            HandoverTurnOutcome {
+                turn_start_seq: current_turn,
+                completed: false,
+                hard_deadline_interrupted: true,
+            }
+        );
+
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::AssistantMessage,
+            Some("builder"),
+            None,
+            &json!({"text": "completion race"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.handover_turn_outcome(session.session_id).await.unwrap(),
+            HandoverTurnOutcome {
+                turn_start_seq: current_turn,
+                completed: true,
+                hard_deadline_interrupted: true,
+            }
+        );
     }
 
     #[tokio::test]

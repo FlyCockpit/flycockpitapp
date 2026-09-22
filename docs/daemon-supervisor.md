@@ -19,12 +19,13 @@ wrapper re-execution and worker upgrades independent of application behavior.
 ## Endpoint and readiness ABI
 
 On Unix the supervisor retains the public listener and passes a duplicate as fd
-3 with `LISTEN_FDS`/`LISTEN_PID`. A worker writes one byte to fd 4 only after
-boot, recovery, and listener construction reach the normal publication
-barrier. Cockpit's required sensitive/reveal sibling is also inherited on the
-internal fd 5. A rolling successor additionally waits on an internal fd 6
-promotion pipe after reporting ready, so it cannot accept or resume a session
-until the predecessor has exited.
+3 with `LISTEN_FDS`/`LISTEN_PID`. A normal worker writes its fd-4 readiness
+report after boot, recovery, and listener construction reach the normal
+publication barrier. A rolling standby writes the same identity-validated
+report before boot, then waits on an internal fd-6 promotion pipe; it therefore
+cannot touch durable recovery, accept, or resume a session until the
+predecessor has exited. Cockpit's required sensitive/reveal sibling is also
+inherited on the internal fd 5.
 
 On Windows each worker creates a fresh random named pipe using the existing
 owner-only DACL, remote-client rejection, finite instance pool, and
@@ -96,7 +97,8 @@ before sending `Reconnect`, waits for its bounded frame flush and exit, and the
 supervisor finally releases the ready successor through fd 6; reconnect
 attempts queue on the supervisor-owned listener in between. A standby successor
 does no durable recovery before fd-6 promotion. A missing payload,
-protocol/open-time mismatch, process-identity mismatch, or a pre-commit drain
-failure aborts while the predecessor remains serving. `daemon status` remains
-available while the boundary is pending and exposes the most recent result as
-`last_handover`.
+protocol/open-time mismatch, process-identity mismatch, staged-successor exit,
+or a pre-commit drain failure aborts while the predecessor remains serving.
+Every pre-commit abort releases the predecessor's admission fence immediately.
+`daemon status` remains available while the boundary is pending and exposes the
+most recent result as `last_handover`.

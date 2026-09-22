@@ -3217,18 +3217,8 @@ impl SessionRegistry {
         let mut candidates = Vec::with_capacity(handles.len());
         for handle in handles {
             let session_id = handle.session_id();
-            let events = self.inner.db.list_session_events(session_id).await?;
-            let turn_start_seq = events
-                .iter()
-                .rev()
-                .find(|event| event.kind == "user_message")
-                .map_or(0, |event| event.seq);
-            let already_recorded = events.iter().any(|event| {
-                event.seq > turn_start_seq
-                    && event.kind == "interrupt_decision"
-                    && event.data["reason"] == "worker_handover_hard_deadline"
-            });
-            if already_recorded {
+            let outcome = self.inner.db.handover_turn_outcome(session_id).await?;
+            if outcome.hard_deadline_interrupted {
                 continue;
             }
             handle
@@ -3236,7 +3226,7 @@ impl SessionRegistry {
                     origin: crate::daemon::session_worker::CancelOrigin::Handover,
                 })
                 .await?;
-            candidates.push((handle, turn_start_seq));
+            candidates.push((handle, outcome.turn_start_seq));
         }
 
         let deadline = tokio::time::Instant::now() + hard_timeout;
@@ -3257,21 +3247,18 @@ impl SessionRegistry {
         let mut interrupted = 0;
         for (handle, turn_start_seq) in candidates {
             let session_id = handle.session_id();
-            let events = self.inner.db.list_session_events(session_id).await?;
-            if events.iter().any(|event| {
-                event.seq > turn_start_seq
-                    && matches!(
-                        event.kind.as_str(),
-                        "assistant_message" | "tool_call_completed"
-                    )
-            }) {
+            let outcome = self.inner.db.handover_turn_outcome(session_id).await?;
+            // A newly submitted user message cannot have started while this
+            // predecessor was fenced, so a different latest turn is a real
+            // ownership violation rather than a reason to record against it.
+            anyhow::ensure!(
+                outcome.turn_start_seq == turn_start_seq,
+                "worker handover observed a new user turn after admission was fenced"
+            );
+            if outcome.completed {
                 continue;
             }
-            if events.iter().any(|event| {
-                event.seq > turn_start_seq
-                    && event.kind == "interrupt_decision"
-                    && event.data["reason"] == "worker_handover_hard_deadline"
-            }) {
+            if outcome.hard_deadline_interrupted {
                 continue;
             }
             let decision = crate::daemon::proto::InterruptDecision {

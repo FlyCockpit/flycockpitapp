@@ -288,6 +288,7 @@ mod tests {
                         worker_pid: 101,
                         generation: 4,
                         uptime_ms: 5_000,
+                        last_handover: None,
                     },
                 ),
                 (

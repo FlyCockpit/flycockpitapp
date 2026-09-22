@@ -376,6 +376,10 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    #[cfg(target_os = "linux")]
+    const CRASH_MATRIX_PROCESS_TEST: &str =
+        "db::tool_recovery::tests::crash_matrix_kills_worker_process_at_each_boundary";
+
     async fn session(db: &Db) -> Uuid {
         db.create_session("project", "/workspace", "pilot")
             .await
@@ -525,6 +529,225 @@ mod tests {
             };
             if self.receipts.insert(receipt.to_string()) {
                 self.counter += 1;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn record_persistent_fake_effect(db: &Db, class: ToolIdempotency, key: Option<&str>) {
+        let receipt = match class {
+            ToolIdempotency::Idempotent => "semantic-value-1".to_string(),
+            ToolIdempotency::IdempotentWithKey => key.expect("keyed call has key").to_string(),
+            ToolIdempotency::NotIdempotent => "not-idempotent-counter".to_string(),
+        };
+        db.write(move |conn| {
+            match class {
+                ToolIdempotency::Idempotent | ToolIdempotency::IdempotentWithKey => {
+                    conn.execute(
+                        "INSERT INTO app_flags(key, seen_at) VALUES (?1, 1)
+                         ON CONFLICT(key) DO NOTHING",
+                        [receipt],
+                    )?;
+                }
+                ToolIdempotency::NotIdempotent => {
+                    conn.execute(
+                        "INSERT INTO app_flags(key, seen_at) VALUES (?1, 1)
+                         ON CONFLICT(key) DO UPDATE SET seen_at=seen_at+1",
+                        [receipt],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn persistent_fake_effect_count(
+        db: &Db,
+        class: ToolIdempotency,
+        key: Option<&str>,
+    ) -> i64 {
+        let receipt = match class {
+            ToolIdempotency::Idempotent => "semantic-value-1".to_string(),
+            ToolIdempotency::IdempotentWithKey => key.expect("keyed call has key").to_string(),
+            ToolIdempotency::NotIdempotent => "not-idempotent-counter".to_string(),
+        };
+        db.read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT seen_at FROM app_flags WHERE key=?1",
+                    [receipt],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0))
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_crash_matrix_child() -> bool {
+        let Ok(crash) = std::env::var("COCKPIT_441_CHILD_CRASH") else {
+            return false;
+        };
+        let path = std::path::PathBuf::from(
+            std::env::var("COCKPIT_441_CHILD_DB").expect("child database path"),
+        );
+        let session_id =
+            Uuid::parse_str(&std::env::var("COCKPIT_441_CHILD_SESSION").expect("child session id"))
+                .unwrap();
+        let call_id = std::env::var("COCKPIT_441_CHILD_CALL").expect("child call id");
+        let class =
+            ToolIdempotency::parse(&std::env::var("COCKPIT_441_CHILD_CLASS").expect("child class"))
+                .unwrap();
+        let db = Db::open_supervised_worker_for_test(&path, 1).unwrap();
+        if crash == "before_intent" {
+            println!("RECOVERY_READY");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            std::future::pending::<()>().await;
+        }
+        let input = begin(session_id, &call_id, class);
+        db.begin_tool_execution_intent(input.clone()).await.unwrap();
+        if crash == "after_intent" {
+            println!("RECOVERY_READY");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            std::future::pending::<()>().await;
+        }
+        record_persistent_fake_effect(&db, class, input.idempotency_key.as_deref()).await;
+        println!("RECOVERY_READY");
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        std::future::pending::<()>().await;
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn kill_worker_at_boundary(
+        path: &std::path::Path,
+        session_id: Uuid,
+        call_id: &str,
+        class: ToolIdempotency,
+        crash: &str,
+    ) {
+        use std::io::BufRead;
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CRASH_MATRIX_PROCESS_TEST, "--nocapture"])
+            .env("COCKPIT_441_CHILD_DB", path)
+            .env("COCKPIT_441_CHILD_SESSION", session_id.to_string())
+            .env("COCKPIT_441_CHILD_CALL", call_id)
+            .env("COCKPIT_441_CHILD_CLASS", class.as_str())
+            .env("COCKPIT_441_CHILD_CRASH", crash)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let ready = std::io::BufReader::new(stdout)
+            .lines()
+            .map(|line| line.unwrap())
+            .find(|line| line == "RECOVERY_READY");
+        assert_eq!(ready.as_deref(), Some("RECOVERY_READY"));
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "worker must be terminated at {crash}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn crash_matrix_kills_worker_process_at_each_boundary() {
+        if run_crash_matrix_child().await {
+            return;
+        }
+        for class in [
+            ToolIdempotency::Idempotent,
+            ToolIdempotency::IdempotentWithKey,
+            ToolIdempotency::NotIdempotent,
+        ] {
+            for crash in [
+                "before_intent",
+                "after_intent",
+                "after_result_before_commit",
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("crash-matrix.db");
+                let setup = Db::open(&path).unwrap();
+                let session_id = session(&setup).await;
+                drop(setup);
+                let call_id = format!("process-{class:?}-{crash}");
+                kill_worker_at_boundary(&path, session_id, &call_id, class, crash).await;
+
+                let successor = Db::open_supervised_worker_for_test(&path, 2).unwrap();
+                let mut input = begin(session_id, &call_id, class);
+                input.generation = 2;
+                let intent = match successor
+                    .list_open_tool_execution_intents()
+                    .await
+                    .unwrap()
+                    .pop()
+                {
+                    Some(intent) => intent,
+                    None => successor
+                        .begin_tool_execution_intent(input.clone())
+                        .await
+                        .unwrap(),
+                };
+                match class {
+                    ToolIdempotency::Idempotent | ToolIdempotency::IdempotentWithKey => {
+                        successor
+                            .begin_tool_execution_intent(input.clone())
+                            .await
+                            .unwrap();
+                        record_persistent_fake_effect(
+                            &successor,
+                            class,
+                            intent.idempotency_key.as_deref(),
+                        )
+                        .await;
+                        successor
+                            .transaction(move |conn| {
+                                Db::close_tool_execution_intent_for_result_conn(
+                                    conn, session_id, &call_id,
+                                )
+                            })
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            persistent_fake_effect_count(
+                                &successor,
+                                class,
+                                input.idempotency_key.as_deref(),
+                            )
+                            .await,
+                            1,
+                            "{class:?} at {crash}"
+                        );
+                    }
+                    ToolIdempotency::NotIdempotent => {
+                        successor
+                            .queue_tool_recovery_decision(&intent)
+                            .await
+                            .unwrap();
+                        successor
+                            .queue_tool_recovery_decision(&intent)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            persistent_fake_effect_count(&successor, class, None).await,
+                            i64::from(crash == "after_result_before_commit"),
+                            "non-idempotent tool reran at {crash}"
+                        );
+                        assert_eq!(
+                            successor
+                                .list_open_interrupts(session_id)
+                                .await
+                                .unwrap()
+                                .len(),
+                            1
+                        );
+                    }
+                }
             }
         }
     }

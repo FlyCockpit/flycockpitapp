@@ -242,7 +242,7 @@ fn session_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
             "SELECT seq, type
                FROM session_events
               WHERE session_id = ?1
-                AND type IN ('user_message', 'assistant_message', 'tool_call_completed', 'interrupt_decision')
+                AND type IN ('user_message', 'assistant_message', 'tool_call', 'tool_call_completed', 'interrupt_decision')
               ORDER BY seq",
         )
         .expect("prepare session event rows");

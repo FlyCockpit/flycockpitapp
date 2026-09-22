@@ -876,14 +876,74 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                     command @ (AdminCommand::Roll | AdminCommand::Upgrade { .. }) => {
                         #[cfg(windows)]
                         {
-                            let reason =
-                                "boundary-aware worker handover is not available on Windows"
-                                    .to_string();
-                            tracing::warn!(%reason, "worker handover rejected before successor staging");
-                            last_handover = Some(format!("aborted: {reason}"));
-                            write_admin(&mut stream, &AdminResponse::Error {
+                            // Windows has no signal-based boundary protocol. Keep the
+                            // pre-handover rolling replacement behavior here so `restart`
+                            // and `upgrade` do not regress into permanent failures there.
+                            let binary = match command {
+                                AdminCommand::Upgrade { binary } => {
+                                    match std::fs::canonicalize(&binary) {
+                                        Ok(binary) => binary,
+                                        Err(error) => {
+                                            write_admin(&mut stream, &AdminResponse::Error {
+                                                version: ADMIN_PROTOCOL_VERSION,
+                                                message: format!(
+                                                    "resolving upgrade binary {}: {error}",
+                                                    binary.display()
+                                                ),
+                                            })
+                                            .await?;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                AdminCommand::Roll => executable.clone(),
+                                _ => unreachable!("roll command was matched above"),
+                            };
+                            let next_generation = generation.saturating_add(1);
+                            let successor = match spawn_ready_worker(WorkerSpawnRequest {
+                                endpoints: &endpoint_owner,
+                                binary: &binary,
+                                paths: &paths,
+                                log: &log,
+                                log_path: &log_path,
+                                generation: next_generation,
+                                opened_at_unix_ms,
+                                no_sandbox,
+                                resume_all_sessions,
+                                hold_for_promotion: false,
+                            })
+                            .await
+                            {
+                                Ok(successor) => successor,
+                                Err(error) => {
+                                    write_admin(&mut stream, &AdminResponse::Error {
+                                        version: ADMIN_PROTOCOL_VERSION,
+                                        message: format!("{error:#}"),
+                                    })
+                                    .await?;
+                                    continue;
+                                }
+                            };
+                            let old_worker_pid = worker.pid;
+                            publish_generation(
+                                &paths,
+                                &receipt,
+                                successor.pid,
+                                next_generation,
+                                opened_at_unix_ms,
+                            )?;
+                            let predecessor = std::mem::replace(&mut worker, successor);
+                            reap_retired_worker(predecessor);
+                            generation = next_generation;
+                            last_handover = Some(format!(
+                                "completed without boundary handover: generation {generation}"
+                            ));
+                            write_admin(&mut stream, &AdminResponse::Rolled {
                                 version: ADMIN_PROTOCOL_VERSION,
-                                message: reason,
+                                old_worker_pid,
+                                worker_pid: worker.pid,
+                                generation,
+                                uptime_ms: now_unix_ms().saturating_sub(opened_at_unix_ms),
                             }).await?;
                             continue;
                         }
@@ -997,6 +1057,21 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 }).await?;
                                 continue;
                             }
+                        }
+                        if let Err(error) = ensure_staged_successor_live(&mut successor) {
+                            let _ = signal_worker_handover_decision(&worker, false);
+                            let _ = terminate_worker(&mut successor, false);
+                            reap_worker_after_exit(successor);
+                            let reason = format!(
+                                "checking staged successor before handover commitment: {error:#}"
+                            );
+                            tracing::warn!(%reason, "worker handover aborted; predecessor remains serving");
+                            last_handover = Some(format!("aborted: {reason}"));
+                            write_admin(&mut stream, &AdminResponse::Error {
+                                version: ADMIN_PROTOCOL_VERSION,
+                                message: reason,
+                            }).await?;
+                            continue;
                         }
                         if let Err(error) = signal_worker_handover_decision(&worker, true) {
                             let _ = signal_worker_handover_decision(&worker, false);
@@ -2082,15 +2157,21 @@ async fn await_worker_exit(worker: &mut Worker) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn terminate_worker(worker: &mut Worker, reconnect: bool) -> Result<()> {
-    if reconnect {
-        // Windows has no process signal equivalent to SIGUSR1.  Failing
-        // closed is preferable to terminating a live worker without its
-        // boundary/interrupt/reconnect protocol.
-        bail!("boundary-aware worker handover is not available on Windows");
-    }
+fn terminate_worker(worker: &mut Worker, _reconnect: bool) -> Result<()> {
     cockpit_host::daemon_lifecycle::terminate_verified_daemon_process(&worker.receipt)
         .context("terminating supervised worker")
+}
+
+#[cfg(windows)]
+fn reap_retired_worker(mut worker: Worker) {
+    tokio::spawn(async move {
+        if let Err(error) = await_drained_worker_exit(&mut worker, true).await {
+            tracing::error!(pid = worker.pid, %error, "retired worker process watch failed");
+        }
+        if let Some(mut child) = worker.child {
+            let _ = child.wait();
+        }
+    });
 }
 
 #[cfg(windows)]

@@ -274,6 +274,7 @@ async fn production_crash_matrix_child() {
     let class = class(&std::env::var("COCKPIT_RECOVERY_MATRIX_CLASS").unwrap());
     let responses = std::env::var("COCKPIT_RECOVERY_MATRIX_RESPONSES").unwrap() == "true";
     let choice = std::env::var("COCKPIT_RECOVERY_MATRIX_CHOICE").unwrap();
+    let planted_call = std::env::var("COCKPIT_RECOVERY_MATRIX_PLANTED_CALL").unwrap() == "true";
     let generation = crate::daemon::supervisor::worker_generation();
     let db = Db::open_supervised_worker_for_test(&root.join("db.sqlite"), generation).unwrap();
     let fixture = Fixture {
@@ -305,18 +306,22 @@ async fn production_crash_matrix_child() {
             )
             .await
             .unwrap();
-        // Durable assistant identity, as reconstructed from an interrupted
-        // transcript. This is deliberately present before intent creation.
-        session
-            .record_event(
-                crate::db::session_log::SessionEventKind::ToolCall,
-                Some("Build"),
-                Some("call-1"),
-                &serde_json::json!({"tool":"crash_matrix_effect", "wire_input":{},
+        // Cover both a pre-existing transcript call and ordinary production
+        // dispatch, which has only a lifecycle start before the intent.
+        if planted_call {
+            // Durable assistant identity, as reconstructed from an interrupted
+            // transcript. This is deliberately present before intent creation.
+            session
+                .record_event(
+                    crate::db::session_log::SessionEventKind::ToolCall,
+                    Some("Build"),
+                    Some("call-1"),
+                    &serde_json::json!({"tool":"crash_matrix_effect", "wire_input":{},
                 "provider_call_id":"provider-call-1", "provider_item_id":"item-1"}),
-            )
-            .await
-            .unwrap();
+                )
+                .await
+                .unwrap();
+        }
         let call = rig::message::ToolCall {
             id: rig::message::ToolCallId::new_or_mint("call-1"),
             provider: rig::message::ProviderCallId::new("provider-call-1")
@@ -389,7 +394,7 @@ async fn production_crash_matrix_child() {
     worker_barrier(&handle).await;
     assert_eq!(
         handle.repair_required().is_some(),
-        responses && boundary == "before_intent",
+        responses && planted_call && boundary == "before_intent",
         "only an orphan without a durable intent requires Responses repair"
     );
     let ambiguous = class == ToolIdempotency::NotIdempotent && boundary != "before_intent";
@@ -477,7 +482,7 @@ async fn production_crash_matrix_child() {
             .is_empty()
     );
     assert_status(&ctx, vec![]).await;
-    let expected_result = boundary != "before_intent" && (!ambiguous || choice == "rerun");
+    let expected_result = boundary != "before_intent";
     assert_eq!(
         db.list_tool_calls_for_session(session_id)
             .await
@@ -499,6 +504,19 @@ async fn production_crash_matrix_child() {
         );
         assert_eq!(call_count(&rebuilt.history), 1);
         assert!(rebuilt.heals.is_empty());
+        if ambiguous && choice == "skip" {
+            let rows = db.list_tool_calls_for_session(session_id).await.unwrap();
+            assert!(rows[0].hard_fail);
+            assert_eq!(
+                rows[0].output,
+                crate::db::tool_recovery::SKIPPED_TOOL_RECOVERY_BODY
+            );
+            assert_eq!(rows[0].provider_call_id.as_deref(), Some("provider-call-1"));
+            assert_eq!(rows[0].provider_item_id.as_deref(), Some("item-1"));
+            assert!(rebuilt.history.iter().any(|message| matches!(message,
+                Message::User { content } if content.iter().any(|part| matches!(part,
+                    UserContent::ToolResult(result) if result.content == vec![rig::message::ToolResultContent::text(crate::db::tool_recovery::SKIPPED_TOOL_RECOVERY_BODY)])))));
+        }
     }
     stop_worker(&handle, join).await;
     // A second successor must not reopen the decision or execute again.
@@ -543,81 +561,86 @@ fn production_crash_matrix_kills_dispatch_and_recovers_through_session_worker() 
     use std::process::{Command, Stdio};
     let executable = std::env::current_exe().unwrap();
     let mut cells = 0;
-    for responses in [false, true] {
-        for class in ["safe", "keyed", "ambiguous"] {
-            for boundary in ["before_intent", "after_intent", "after_result"] {
-                let choices: &[&str] = if class == "ambiguous" && boundary != "before_intent" {
-                    &["skip", "rerun"]
-                } else {
-                    &["skip"]
-                };
-                for choice in choices {
-                    let tmp = tempfile::tempdir().unwrap();
-                    let log_path = tmp.path().join("child.log");
-                    let command = |phase: &str, generation: &str| {
-                        let mut command = Command::new(&executable);
-                        command.args(["--exact", "daemon::server::tests::tool_recovery_tests::production_crash_matrix_child", "--nocapture"])
+    for planted_call in [false, true] {
+        for responses in [false, true] {
+            for class in ["safe", "keyed", "ambiguous"] {
+                for boundary in ["before_intent", "after_intent", "after_result"] {
+                    let choices: &[&str] = if class == "ambiguous" && boundary != "before_intent" {
+                        &["skip", "rerun"]
+                    } else {
+                        &["skip"]
+                    };
+                    for choice in choices {
+                        let tmp = tempfile::tempdir().unwrap();
+                        let log_path = tmp.path().join("child.log");
+                        let command = |phase: &str, generation: &str| {
+                            let mut command = Command::new(&executable);
+                            command.args(["--exact", "daemon::server::tests::tool_recovery_tests::production_crash_matrix_child", "--nocapture"])
                             .env("COCKPIT_RECOVERY_MATRIX_ROOT", tmp.path())
                             .env("COCKPIT_RECOVERY_MATRIX_PHASE", phase)
                             .env("COCKPIT_RECOVERY_MATRIX_BOUNDARY", boundary)
                             .env("COCKPIT_RECOVERY_MATRIX_CLASS", class)
                             .env("COCKPIT_RECOVERY_MATRIX_RESPONSES", responses.to_string())
                             .env("COCKPIT_RECOVERY_MATRIX_CHOICE", choice)
+                            .env("COCKPIT_RECOVERY_MATRIX_PLANTED_CALL", planted_call.to_string())
                             .env("COCKPIT_WORKER_GENERATION", generation)
                             .stdin(Stdio::null())
                             .stdout(std::fs::OpenOptions::new().create(true).append(true).open(&log_path).unwrap())
                             .stderr(std::fs::OpenOptions::new().create(true).append(true).open(&log_path).unwrap());
-                        command
-                    };
-                    let mut child = command("crash", "1").spawn().unwrap();
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    while !tmp.path().join("ready").exists() {
+                            command
+                        };
+                        let mut child = command("crash", "1").spawn().unwrap();
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(30);
+                        while !tmp.path().join("ready").exists() {
+                            assert!(
+                                child.try_wait().unwrap().is_none(),
+                                "predecessor exited early: {}",
+                                std::fs::read_to_string(&log_path).unwrap()
+                            );
+                            if std::time::Instant::now() >= deadline {
+                                child.kill().unwrap();
+                                child.wait().unwrap();
+                                panic!(
+                                    "predecessor missed checkpoint: {}",
+                                    std::fs::read_to_string(&log_path).unwrap()
+                                );
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        assert_eq!(
+                            std::fs::read_to_string(tmp.path().join("ready")).unwrap(),
+                            boundary
+                        );
+                        child.kill().unwrap();
+                        assert!(!child.wait().unwrap().success());
+                        let mut successor = command("recover", "2").spawn().unwrap();
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        let status = loop {
+                            if let Some(status) = successor.try_wait().unwrap() {
+                                break status;
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                successor.kill().unwrap();
+                                successor.wait().unwrap();
+                                panic!(
+                                    "successor stalled: {}",
+                                    std::fs::read_to_string(&log_path).unwrap()
+                                );
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        };
                         assert!(
-                            child.try_wait().unwrap().is_none(),
-                            "predecessor exited early: {}",
+                            status.success(),
+                            "{class}/{boundary}/{choice}/responses={responses}: {}",
                             std::fs::read_to_string(&log_path).unwrap()
                         );
-                        if std::time::Instant::now() >= deadline {
-                            child.kill().unwrap();
-                            child.wait().unwrap();
-                            panic!(
-                                "predecessor missed checkpoint: {}",
-                                std::fs::read_to_string(&log_path).unwrap()
-                            );
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        cells += 1;
                     }
-                    assert_eq!(
-                        std::fs::read_to_string(tmp.path().join("ready")).unwrap(),
-                        boundary
-                    );
-                    child.kill().unwrap();
-                    assert!(!child.wait().unwrap().success());
-                    let mut successor = command("recover", "2").spawn().unwrap();
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    let status = loop {
-                        if let Some(status) = successor.try_wait().unwrap() {
-                            break status;
-                        }
-                        if std::time::Instant::now() >= deadline {
-                            successor.kill().unwrap();
-                            successor.wait().unwrap();
-                            panic!(
-                                "successor stalled: {}",
-                                std::fs::read_to_string(&log_path).unwrap()
-                            );
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    };
-                    assert!(
-                        status.success(),
-                        "{class}/{boundary}/{choice}/responses={responses}: {}",
-                        std::fs::read_to_string(&log_path).unwrap()
-                    );
-                    cells += 1;
                 }
             }
         }
     }
-    assert_eq!(cells, 22);
+    assert_eq!(cells, 44);
 }

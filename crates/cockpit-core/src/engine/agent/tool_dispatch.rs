@@ -1390,12 +1390,32 @@ async fn execute_ordinary_call_unscoped(
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
         let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
         let ledger_wire = model_history_args(env, resolved_name, &args);
+        // Recovery needs the same provider identity before the effect that
+        // the completed audit row would carry after it.
+        let start_identity = crate::session::ToolCallProviderIdentity::from_provider_call(
+            Some(&tool_provider),
+            Some(&tool_model),
+            Some(&env.ctx.config.providers()),
+            Some(env.model.current_wire_api()),
+            tc.provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.clone())
+                .unwrap_or_else(|| tc.id.to_string()),
+            tc.provider
+                .as_ref()
+                .map(|provider| provider.call_id.clone()),
+        );
         let start_data = serde_json::json!({
             "tool": resolved_name,
             "original_input": ledger_original,
             "wire_input": ledger_wire,
             "recovery_kind": start_recovery_kind,
             "recovery_stage": start_recovery_stage,
+            "provider_item_id": start_identity.provider_item_id,
+            "provider_call_id": start_identity.provider_call_id,
+            "provider_call_id_source": start_identity.provider_call_id_source,
+            "wire_api": start_identity.wire_api,
+            "provider_family": start_identity.provider_family,
         });
         match env
             .session
@@ -1412,7 +1432,8 @@ async fn execute_ordinary_call_unscoped(
                 assistant_seq = Some(seq);
             }
             Err(e) => {
-                tracing::warn!(error = %e, tool = %resolved_name, "record tool_call_started event failed");
+                scheduler_release_started().await;
+                return Err(e.context("persisting tool call identity before dispatch"));
             }
         }
     }
@@ -5439,6 +5460,69 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none(),
             "result transaction must close the observed intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_start_persistence_failure_prevents_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed_intent = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(ReadOnlyIntentObservingTool {
+            observed_intent: observed_intent.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("readonly_with_admission", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        session.db.write(|conn| {
+            conn.execute_batch("CREATE TRIGGER reject_tool_start BEFORE INSERT ON session_events
+                WHEN NEW.type='tool_call_started' BEGIN SELECT RAISE(ABORT, 'start identity failure'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        let error = execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "readonly_with_admission",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("start identity failure"));
+        assert!(!observed_intent.load(Ordering::SeqCst));
+        assert!(
+            session
+                .db
+                .list_open_tool_execution_intents()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            session
+                .db
+                .list_tool_calls_for_session(session.id)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

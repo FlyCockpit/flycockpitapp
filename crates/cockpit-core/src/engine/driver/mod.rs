@@ -269,6 +269,11 @@ pub enum DriverControl {
         intent_id: uuid::Uuid,
         respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
+    /// Project a committed crash-skip result into the live model history.
+    ApplyCrashToolSkip {
+        call_id: String,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Execute a parked interrupt's persisted tool call through the canonical
     /// ordinary-tool dispatcher, injecting the already-recorded answer at the
     /// interrupt seam so approval/question behavior matches the live path.
@@ -5379,6 +5384,75 @@ impl Driver {
         Ok(())
     }
 
+    async fn apply_crash_tool_skip(&mut self, call_id: &str) -> Result<()> {
+        use rig::message::{
+            AssistantContent, ToolCall, ToolCallId, ToolFunction, ToolResult, ToolResultContent,
+            UserContent,
+        };
+
+        let event = self
+            .session
+            .db
+            .get_tool_call_by_call_id(self.session.live_id(), call_id)
+            .await?
+            .context("committed crash-skip result is missing")?;
+        ensure!(
+            event.output == crate::db::tool_recovery::SKIPPED_TOOL_RECOVERY_BODY,
+            "crash-skip projection targets a different result"
+        );
+        let frame = self
+            .stack
+            .iter_mut()
+            .find(|frame| frame.agent.name == event.agent)
+            .context("crash-skip owner is not in the live driver stack")?;
+        let provider = event
+            .provider_call_id
+            .and_then(rig::message::ProviderCallId::new)
+            .map(|provider| match event.provider_item_id {
+                Some(item_id) => provider.with_item_id(item_id),
+                None => provider,
+            });
+        let call = ToolCall {
+            id: ToolCallId::new_or_mint(call_id),
+            provider,
+            function: ToolFunction {
+                name: event.tool,
+                arguments: event.wire_input_json,
+            },
+            signature: None,
+            additional_params: None,
+        };
+        // Replace any earlier wire-only heal, and make duplicate delivery
+        // harmless without discarding intervening user messages or siblings.
+        for message in &mut frame.history {
+            if let Message::User { content } = message {
+                content.retain(|part| !matches!(part, UserContent::ToolResult(result) if result.call.as_str() == call_id));
+            }
+        }
+        frame
+            .history
+            .retain(|message| !matches!(message, Message::User { content } if content.is_empty()));
+        let position = frame.history.iter().position(|message| {
+            matches!(message, Message::Assistant { content, .. } if content.iter().any(|part|
+                matches!(part, AssistantContent::ToolCall(existing) if existing.id.as_str() == call_id)))
+        }).unwrap_or_else(|| {
+            frame.history.push(Message::Assistant { id: None, content: vec![AssistantContent::ToolCall(call.clone())] });
+            frame.history.len() - 1
+        });
+        frame.history.insert(
+            position + 1,
+            Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: call.id,
+                    provider: call.provider,
+                    name: call.function.name,
+                    content: vec![ToolResultContent::text(event.output)],
+                })],
+            },
+        );
+        Ok(())
+    }
+
     async fn replay_crash_tool_intents_matching(
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
@@ -7340,6 +7414,16 @@ impl Driver {
             } => {
                 let result = self
                     .replay_crash_tool_intent(tx, intent_id)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                let _ = respond_to.send(result);
+            }
+            DriverControl::ApplyCrashToolSkip {
+                call_id,
+                respond_to,
+            } => {
+                let result = self
+                    .apply_crash_tool_skip(&call_id)
                     .await
                     .map_err(|error| format!("{error:#}"));
                 let _ = respond_to.send(result);

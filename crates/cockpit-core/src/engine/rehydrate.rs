@@ -2619,7 +2619,15 @@ fn rebuild_history(
                     pending.text_parts.push(text.to_string());
                 }
             }
-            "tool_call" if ev.agent.as_deref() == Some(root_agent) && !is_mcp_child_event(ev) => {
+            "tool_call" | "tool_call_started"
+                if ev.agent.as_deref() == Some(root_agent)
+                    && !is_mcp_child_event(ev)
+                    && (ev.kind == "tool_call"
+                        || ev
+                            .call_id
+                            .as_ref()
+                            .is_some_and(|id| recovery_calls.contains(id))) =>
+            {
                 let Some(call_id) = ev.call_id.as_deref() else {
                     return Err(anyhow!("tool_call event without a call_id (corrupt row)"));
                 };

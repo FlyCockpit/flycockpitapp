@@ -12363,7 +12363,41 @@ pub(super) async fn run_worker(
                                 interrupts.emit_queue_state().await;
                                 continue;
                             }
-                            crate::db::tool_recovery::ToolRecoveryResolution::Skip => {}
+                            crate::db::tool_recovery::ToolRecoveryResolution::Skip { call_id } => {
+                                let (respond_to, response_rx) = oneshot::channel();
+                                if !send_driver_control_or_fail(
+                                    &driver_control_tx,
+                                    crate::engine::driver::DriverControl::ApplyCrashToolSkip {
+                                        call_id,
+                                        respond_to,
+                                    },
+                                    &event_tx,
+                                    &turn_completions,
+                                    &redaction,
+                                    session_id,
+                                    &mut driver_failed,
+                                )
+                                .await
+                                {
+                                    break WorkerStop::DriverFailed;
+                                }
+                                match response_rx.await {
+                                    Ok(Ok(())) => {}
+                                    result => {
+                                        emit_session_driver_failed_once(
+                                            &event_tx,
+                                            &turn_completions,
+                                            &redaction,
+                                            session_id,
+                                            &mut driver_failed,
+                                            format!(
+                                                "committed crash-skip projection failed: {result:?}"
+                                            ),
+                                        );
+                                        break WorkerStop::DriverFailed;
+                                    }
+                                }
+                            }
                             crate::db::tool_recovery::ToolRecoveryResolution::Rerun(intent) => {
                                 let (respond_to, response_rx) = oneshot::channel();
                                 let sent = driver_control_tx

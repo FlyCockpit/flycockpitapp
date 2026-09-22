@@ -10,6 +10,9 @@ use uuid::Uuid;
 use super::{Db, WriterGenerationFenced};
 use crate::db::wire::{InterruptOption, InterruptQuestion};
 
+/// A user decision, never a claim that the interrupted effect was undone.
+pub const SKIPPED_TOOL_RECOVERY_BODY: &str = "Skipped by the user after a crash. This command may have partially run; its effects are unknown. Do not rerun it without explicit user authorization.";
+
 pub(crate) fn advance_writer_generation(conn: &Connection, generation: u64) -> Result<()> {
     ensure!(
         generation > 0,
@@ -109,7 +112,7 @@ pub struct BeginToolExecutionIntent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolRecoveryResolution {
     Inspect,
-    Skip,
+    Skip { call_id: String },
     Rerun(Box<ToolExecutionIntent>),
 }
 
@@ -366,11 +369,13 @@ impl Db {
                           WHERE interrupt_id=?1 AND state='open'",
                         params![interrupt_id.to_string(), now, response_json],
                     )?;
-                    conn.execute(
-                        "DELETE FROM tool_execution_intents WHERE intent_id=?1",
-                        [interrupt_id.to_string()],
-                    )?;
-                    Ok(Some(ToolRecoveryResolution::Skip))
+                    // The result, transcript anchor, answer receipt, and intent
+                    // closure are one transaction. A crash cannot turn Skip into
+                    // an orphan call or erase it from the next model request.
+                    persist_skipped_tool_conn(conn, &intent)?;
+                    Ok(Some(ToolRecoveryResolution::Skip {
+                        call_id: intent.call_id,
+                    }))
                 }
                 "rerun" => {
                     let changed = conn.execute(
@@ -465,6 +470,100 @@ impl Db {
         .context("closing tool execution intent with result")?;
         Ok(())
     }
+}
+
+fn persist_skipped_tool_conn(conn: &Connection, intent: &ToolExecutionIntent) -> Result<()> {
+    use super::session_log::{SessionEventContext, SessionEventKind};
+    use super::tool_calls::{Recovery, ToolCallEvent};
+
+    let session = Db::get_session_conn(conn, intent.session_id)?
+        .context("skipped recovery session disappeared")?;
+    let events = Db::list_session_events_conn(conn, intent.session_id)?;
+    let source = events.iter().rev().find(|event| {
+        event.call_id.as_deref() == Some(&intent.call_id)
+            && matches!(event.kind.as_str(), "tool_call" | "tool_call_started")
+    });
+    let data = source.map(|event| &event.data);
+    let identity = |key: &str| {
+        data.and_then(|data| {
+            data.get(key).or_else(|| {
+                data.get("provider_identity")
+                    .and_then(|value| value.get(key))
+            })
+        })
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    };
+    let now = Utc::now();
+    let event = ToolCallEvent {
+        event_id: Uuid::new_v4(),
+        session_id: intent.session_id,
+        call_id: intent.call_id.clone(),
+        parent_call_id: None,
+        parent_child_index: None,
+        provider_item_id: identity("provider_item_id"),
+        provider_call_id: identity("provider_call_id"),
+        provider_call_id_source: identity("provider_call_id_source"),
+        wire_api: identity("wire_api"),
+        provider_family: identity("provider_family"),
+        timestamp: now.timestamp(),
+        model: source
+            .and_then(|event| event.model_id.clone())
+            .or(session.model)
+            .unwrap_or_default(),
+        provider: source
+            .and_then(|event| event.provider_id.clone())
+            .or(session.provider)
+            .unwrap_or_default(),
+        project_id: session.project_id,
+        project_root: session.project_root,
+        agent: source
+            .and_then(|event| event.agent.clone())
+            .unwrap_or(session.active_agent),
+        tool: intent.tool.clone(),
+        mcp_server: None,
+        path: None,
+        recovery: Recovery::Clean,
+        hard_fail: true,
+        exit_code: None,
+        sandbox_enabled: false,
+        sandboxed: false,
+        sandbox_unavailable_reason: None,
+        original_input_json: data
+            .and_then(|data| data.get("original_input"))
+            .cloned()
+            .unwrap_or_else(|| intent.args.clone()),
+        wire_input_json: data
+            .and_then(|data| data.get("wire_input"))
+            .cloned()
+            .unwrap_or_else(|| intent.args.clone()),
+        output: SKIPPED_TOOL_RECOVERY_BODY.to_string(),
+        truncated: false,
+        duration_ms: 0,
+        cockpit_version: Some(env!("CARGO_PKG_VERSION").into()),
+        shape_fingerprint: None,
+        hint: None,
+    };
+    Db::insert_tool_call_conn(conn, &event)?;
+    Db::insert_session_event_json_conn(
+        conn,
+        intent.session_id,
+        SessionEventKind::ToolCall,
+        Some(&event.agent),
+        Some(&intent.call_id),
+        SessionEventContext::default(),
+        now.timestamp_millis(),
+        &serde_json::json!({
+            "tool": event.tool,
+            "wire_input": event.wire_input_json,
+            "original_input": event.original_input_json,
+            "output": event.output,
+            "hard_fail": true,
+            "recovery_decision": "skip",
+        })
+        .to_string(),
+    )?;
+    Ok(())
 }
 
 fn load_for_call_conn(
@@ -628,6 +727,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skip_result_and_transcript_failure_rolls_back_the_decision_and_intent() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = session(&db).await;
+        let intent = db
+            .begin_tool_execution_intent(begin(
+                session_id,
+                "skip-call",
+                ToolIdempotency::NotIdempotent,
+            ))
+            .await
+            .unwrap();
+        db.queue_tool_recovery_decision(&intent).await.unwrap();
+        db.write(|conn| {
+            conn.execute_batch("CREATE TRIGGER reject_skip_transcript BEFORE INSERT ON session_events
+                WHEN NEW.type='tool_call' BEGIN SELECT RAISE(ABORT, 'skip transcript failure'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        let response = crate::db::wire::ResolveResponse::Single {
+            selected_id: "skip".into(),
+        };
+        let error = db
+            .begin_tool_recovery_resolution(intent.intent_id, &response, 2)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("skip transcript failure"));
+        assert_eq!(
+            db.list_open_tool_execution_intents().await.unwrap(),
+            vec![intent.clone()]
+        );
+        let receipt = db.get_interrupt(intent.intent_id).await.unwrap().unwrap();
+        assert_eq!(
+            receipt.state,
+            crate::db::needs_attention::InterruptState::Open
+        );
+        assert!(receipt.response.is_none());
+        assert!(
+            db.list_tool_calls_for_session(session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.list_session_events(session_id).await.unwrap().is_empty());
+        db.write(|conn| {
+            conn.execute_batch("DROP TRIGGER reject_skip_transcript")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            db.begin_tool_recovery_resolution(intent.intent_id, &response, 2)
+                .await
+                .unwrap(),
+            Some(ToolRecoveryResolution::Skip { .. })
+        ));
+        assert_eq!(
+            db.list_tool_calls_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.list_session_events(session_id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn recovery_answers_inspect_skip_and_rerun_change_the_durable_intent() {
         use crate::db::wire::ResolveResponse;
 
@@ -685,7 +849,36 @@ mod tests {
             )
             .await
             .unwrap(),
-            Some(ToolRecoveryResolution::Skip)
+            Some(ToolRecoveryResolution::Skip {
+                call_id: "skip-call".into()
+            })
+        );
+        let skipped_result = db
+            .get_tool_call_by_call_id(session_id, "skip-call")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(skipped_result.hard_fail);
+        assert_eq!(skipped_result.output, SKIPPED_TOOL_RECOVERY_BODY);
+        assert_eq!(skipped_result.wire_input_json, skipped.args);
+        assert!(
+            db.begin_tool_recovery_resolution(
+                skipped.intent_id,
+                &ResolveResponse::Single {
+                    selected_id: "skip".into(),
+                },
+                2
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            db.list_tool_calls_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
         assert!(
             db.tool_execution_intent_for_call(session_id, "skip-call".into())

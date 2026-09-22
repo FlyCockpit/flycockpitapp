@@ -79,6 +79,52 @@ impl DatabaseOwnerLock {
     }
 }
 
+/// Process-independent serialization for supervised worker writes and fence
+/// advancement.
+///
+/// A retiring worker holds this lock from its durable generation check through
+/// the end of one writer job. A successor takes the same lock while advancing
+/// the durable generation. Consequently every predecessor job either finishes
+/// before the successor is current or observes the successor's generation and
+/// is rejected; there is no check/commit window between those two events.
+pub(crate) struct DatabaseWriterFenceLock {
+    file: std::fs::File,
+}
+
+impl DatabaseWriterFenceLock {
+    pub(crate) fn open(database: &Path) -> Result<Self> {
+        let lock_path = database.with_extension("writer.lock");
+        ensure_parent_dir_private(&lock_path)?;
+        create_private_file_if_missing(&lock_path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening database writer lock {}", lock_path.display()))?;
+        repair_private_file(&lock_path, "database writer lock")?;
+        Ok(Self { file })
+    }
+
+    pub(crate) fn lock(&self) -> Result<DatabaseWriterFenceGuard<'_>> {
+        self.file
+            .lock()
+            .context("locking supervised database writer fence")?;
+        Ok(DatabaseWriterFenceGuard { file: &self.file })
+    }
+}
+
+pub(crate) struct DatabaseWriterFenceGuard<'a> {
+    file: &'a std::fs::File,
+}
+
+impl Drop for DatabaseWriterFenceGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            tracing::error!(%error, "unlocking supervised database writer fence failed");
+        }
+    }
+}
+
 /// Non-mutating diagnostic ownership. It can coexist with other diagnostic
 /// readers, but never with the daemon's exclusive lifetime owner.
 pub(crate) struct DatabaseDiagnosticLock {

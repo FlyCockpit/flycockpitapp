@@ -192,6 +192,11 @@ struct WriteRequest {
     reply: WriteReplySink,
 }
 
+struct SupervisedWriterFence {
+    generation: u64,
+    lock: files::DatabaseWriterFenceLock,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("database writer generation {attempted} is fenced by durable generation {current}")]
 pub struct WriterGenerationFenced {
@@ -327,7 +332,7 @@ impl Writer {
         conn: Connection,
         capacity: usize,
         durable_enqueue_timeout: Duration,
-        generation: Option<u64>,
+        supervised_fence: Option<SupervisedWriterFence>,
     ) -> Result<Self> {
         anyhow::ensure!(capacity > 0, "db writer queue capacity must be nonzero");
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(capacity);
@@ -336,9 +341,13 @@ impl Writer {
             .spawn(move || -> Result<()> {
                 while let Ok(request) = rx.recv() {
                     let result = catch_unwind(AssertUnwindSafe(|| {
-                        if let Some(generation) = generation {
-                            tool_recovery::verify_writer_generation(&conn, generation)?;
-                        }
+                        let _fence_guard = if let Some(fence) = supervised_fence.as_ref() {
+                            let guard = fence.lock.lock()?;
+                            tool_recovery::verify_writer_generation(&conn, fence.generation)?;
+                            Some(guard)
+                        } else {
+                            None
+                        };
                         (request.job)(&conn)
                     }))
                     .map_err(|_| anyhow::anyhow!("db writer job panicked"))
@@ -915,9 +924,16 @@ impl Db {
         timer.phase("connect_and_pragmas");
         migrate(&conn)?;
         reconcile_interrupted_sealed_value_acquisitions(&conn)?;
-        if let Some(generation) = generation {
-            tool_recovery::advance_writer_generation(&conn, generation)?;
-        }
+        let supervised_fence = generation
+            .map(|generation| -> Result<_> {
+                let lock = files::DatabaseWriterFenceLock::open(path)?;
+                {
+                    let _guard = lock.lock()?;
+                    tool_recovery::advance_writer_generation(&conn, generation)?;
+                }
+                Ok(SupervisedWriterFence { generation, lock })
+            })
+            .transpose()?;
         timer.phase("migrate");
 
         // The migrated, pragma-configured connection becomes the writer's
@@ -928,7 +944,7 @@ impl Db {
             conn,
             writer_capacity,
             durable_enqueue_timeout,
-            generation,
+            supervised_fence,
         )?;
         let db = Self {
             memory: None,

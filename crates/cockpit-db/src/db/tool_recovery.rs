@@ -470,10 +470,56 @@ mod tests {
             .await
             .unwrap();
 
-        let successor = Db::open_supervised_worker_for_test(&path, 2).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let predecessor_job_db = predecessor.clone();
+        let predecessor_job = tokio::spawn(async move {
+            predecessor_job_db
+                .write(move |conn| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    conn.execute("UPDATE app_flags SET seen_at=11 WHERE key='owner'", [])?;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let successor_path = path.clone();
+        let (successor_tx, successor_rx) = std::sync::mpsc::sync_channel(0);
+        let successor_open = std::thread::spawn(move || {
+            successor_tx
+                .send(Db::open_supervised_worker_for_test(&successor_path, 2))
+                .unwrap();
+        });
+        assert!(matches!(
+            successor_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        predecessor_job.await.unwrap().unwrap();
+        let successor = successor_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        successor_open.join().unwrap();
+        let predecessor_commit: i64 = successor
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT seen_at FROM app_flags WHERE key='owner'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(predecessor_commit, 11);
+
         let stale = predecessor
             .write(|conn| {
-                conn.execute("UPDATE app_flags SET seen_at=11 WHERE key='owner'", [])?;
+                conn.execute("UPDATE app_flags SET seen_at=33 WHERE key='owner'", [])?;
                 Ok(())
             })
             .await

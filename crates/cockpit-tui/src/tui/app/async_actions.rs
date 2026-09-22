@@ -1255,6 +1255,7 @@ impl App {
                     .remove(&result.id);
                 match result.payload {
                     Ok(AsyncActionPayload::StartupOnboardingBootstrap {
+                        lifetime_client,
                         generation,
                         request_id,
                         receipt,
@@ -1277,6 +1278,11 @@ impl App {
                         self.startup_background.retry = None;
                         if self.mark_startup_trace_milestone("onboarding-ready") {
                             tracing::info!(target: cockpit_core::startup::TARGET, event = "onboarding-ready", "startup");
+                        }
+                        if let (Some(selected), Some(client)) =
+                            (self.startup_lifecycle.as_mut(), lifetime_client)
+                        {
+                            selected.lifetime_client = Some(client);
                         }
                         self.apply_onboarding_bootstrap_snapshot(snapshot);
                     }
@@ -1303,7 +1309,10 @@ impl App {
             // generation fence or pending-operation correlation: a stale
             // read is inert by construction.
             AsyncActionKind::DaemonRpc("onboarding.bootstrap_refresh") => match result.payload {
-                Ok(AsyncActionPayload::OnboardingBootstrap(snapshot)) => {
+                Ok(AsyncActionPayload::OnboardingBootstrap(snapshot, client)) => {
+                    if let Some(selected) = self.startup_lifecycle.as_mut() {
+                        selected.lifetime_client = Some(client);
+                    }
                     self.apply_onboarding_bootstrap_snapshot(snapshot);
                 }
                 Err(error) => {
@@ -1375,6 +1384,11 @@ impl App {
                         );
                         match verdict {
                             OnboardingTransitionCorrelation::Apply => {
+                                if let (Some(selected), Some(client)) =
+                                    (self.startup_lifecycle.as_mut(), completion.lifetime_client)
+                                {
+                                    selected.lifetime_client = Some(client);
+                                }
                                 if label == "onboarding.model" {
                                     self.refresh_bootstrap_config_snapshot();
                                 }

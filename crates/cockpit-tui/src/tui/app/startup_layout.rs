@@ -75,7 +75,13 @@ async fn apply_onboarding_transition_after_handoff(
     lifecycle: &cockpit_client::LifecycleClient,
     selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
     request: cockpit_proto::ApplyOnboardingTransition,
-) -> Result<cockpit_proto::OnboardingTransitionResult, String> {
+) -> Result<
+    (
+        cockpit_proto::OnboardingTransitionResult,
+        cockpit_client::DaemonClient,
+    ),
+    String,
+> {
     const HANDOFF_ATTEMPTS: usize = 6;
     let mut last_transport_error = None;
     for attempt in 0..HANDOFF_ATTEMPTS {
@@ -107,7 +113,9 @@ async fn apply_onboarding_transition_after_handoff(
             ))
             .await
         {
-            Ok(Ok(cockpit_proto::Response::OnboardingTransition(result))) => return Ok(result),
+            Ok(Ok(cockpit_proto::Response::OnboardingTransition(result))) => {
+                return Ok((result, client));
+            }
             Ok(Ok(other)) => return Err(format!("unexpected onboarding response: {other:?}")),
             Ok(Err(error)) if onboarding_handoff_retry_required(&error) => {
                 last_transport_error = Some(error.to_string());
@@ -128,7 +136,7 @@ async fn onboarding_request_after_handoff(
     lifecycle: &cockpit_client::LifecycleClient,
     selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
     request: cockpit_proto::Request,
-) -> Result<cockpit_proto::Response, String> {
+) -> Result<(cockpit_proto::Response, cockpit_client::DaemonClient), String> {
     const HANDOFF_ATTEMPTS: usize = 6;
     let mut last_transport_error = None;
     for attempt in 0..HANDOFF_ATTEMPTS {
@@ -155,7 +163,7 @@ async fn onboarding_request_after_handoff(
             }
         };
         match client.request(request.clone()).await {
-            Ok(Ok(response)) => return Ok(response),
+            Ok(Ok(response)) => return Ok((response, client)),
             Ok(Err(error)) if onboarding_handoff_retry_required(&error) => {
                 last_transport_error = Some(error.to_string());
             }
@@ -243,10 +251,35 @@ async fn fetch_onboarding_provider_models(
     Ok((outcome, config_generation))
 }
 
+/// A locked control connection is closed when ready services take ownership.
+/// Acquire and retain a ready connection before presenting the next stage;
+/// otherwise the last one-shot RPC can tear down an incomplete daemon.
+async fn retain_ready_onboarding_client(
+    lifecycle: &cockpit_client::LifecycleClient,
+    selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
+) -> Result<cockpit_client::DaemonClient, String> {
+    let (response, client) = onboarding_request_after_handoff(
+        lifecycle,
+        selected_endpoint,
+        cockpit_proto::Request::GetOnboardingBootstrapSnapshot,
+    )
+    .await?;
+    match response {
+        cockpit_proto::Response::OnboardingBootstrapSnapshot(_) => Ok(client),
+        other => Err(format!("unexpected onboarding response: {other:?}")),
+    }
+}
+
 async fn retry_onboarding_ready_construction_snapshot(
     lifecycle: &cockpit_client::LifecycleClient,
     selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
-) -> Result<Option<cockpit_proto::OnboardingBootstrapSnapshot>, String> {
+) -> Result<
+    (
+        Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+        cockpit_client::DaemonClient,
+    ),
+    String,
+> {
     let endpoint = onboarding_authority_endpoint(lifecycle, selected_endpoint).await?;
     let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
         .await
@@ -256,7 +289,10 @@ async fn retry_onboarding_ready_construction_snapshot(
         .await
         .map_err(|error| error.to_string())?
     {
-        Ok(snapshot) => Ok(Some(snapshot)),
+        Ok(snapshot) => {
+            let ready_client = retain_ready_onboarding_client(lifecycle, selected_endpoint).await?;
+            Ok((Some(snapshot), ready_client))
+        }
         Err(error) => Err(error.to_string()),
     }
 }
@@ -269,6 +305,7 @@ async fn onboarding_snapshot_after_secure_intent(
     (
         Option<cockpit_proto::OnboardingBootstrapSnapshot>,
         Option<cockpit_proto::OnboardingTransitionReceipt>,
+        cockpit_client::DaemonClient,
     ),
     String,
 > {
@@ -286,11 +323,14 @@ async fn onboarding_snapshot_after_secure_intent(
         .await
         .map_err(|error| error.to_string())?
     {
-        Ok(result) => Ok((Some(result.snapshot), Some(result.receipt))),
+        Ok(result) => {
+            let ready_client = retain_ready_onboarding_client(lifecycle, selected_endpoint).await?;
+            Ok((Some(result.snapshot), Some(result.receipt), ready_client))
+        }
         Err(error) if onboarding_ready_construction_retry_required(&error) => {
-            let snapshot =
+            let (snapshot, ready_client) =
                 retry_onboarding_ready_construction_snapshot(lifecycle, selected_endpoint).await?;
-            let receipt = match client
+            let receipt = match ready_client
                 .request(cockpit_proto::Request::GetOnboardingTransitionReceipt(
                     receipt_query,
                 ))
@@ -306,7 +346,7 @@ async fn onboarding_snapshot_after_secure_intent(
                 }
                 Err(error) => return Err(error.to_string()),
             };
-            Ok((snapshot, Some(receipt)))
+            Ok((snapshot, Some(receipt), ready_client))
         }
         Err(error) => Err(error.to_string()),
     }
@@ -642,11 +682,12 @@ impl App {
                     )
                     .await
                     {
-                        Ok(snapshot) => Ok(
+                        Ok((snapshot, lifetime_client)) => Ok(
                             crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
                                 generation,
                                 request_id,
                                 receipt: None,
+                                lifetime_client: Some(lifetime_client),
                                 snapshot,
                             },
                         ),
@@ -667,6 +708,7 @@ impl App {
                             generation,
                             request_id,
                             receipt: None,
+                            lifetime_client: Some(client),
                             snapshot: current,
                         },
                     );
@@ -682,6 +724,7 @@ impl App {
                                 generation,
                                 request_id,
                                 receipt: Some(result.receipt),
+                                lifetime_client: Some(client),
                                 snapshot: Some(result.snapshot),
                         },
                     ),
@@ -900,9 +943,17 @@ impl App {
                         selected_endpoint.as_ref(),
                     )
                     .await
-                    .map(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap);
+                    .map(|(snapshot, client)| {
+                        crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap(
+                            snapshot, client,
+                        )
+                    });
                 }
-                Ok(crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap(current))
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap(
+                        current, client,
+                    ),
+                )
             },
         );
     }
@@ -1208,6 +1259,7 @@ pub(crate) struct StartupPendingTrust {
 
 #[derive(Debug)]
 pub(crate) struct StartupOnboardingCompletion {
+    pub(crate) lifetime_client: Option<cockpit_client::DaemonClient>,
     pub(crate) generation: u64,
     pub(crate) run_id: uuid::Uuid,
     pub(crate) attempt_id: uuid::Uuid,
@@ -1240,9 +1292,10 @@ impl App {
             async move {
                 retry_onboarding_ready_construction_snapshot(&lifecycle, selected_endpoint.as_ref())
                     .await
-                    .map(|snapshot| {
+                    .map(|(snapshot, lifetime_client)| {
                         crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                             StartupOnboardingCompletion {
+                                lifetime_client: Some(lifetime_client),
                                 generation,
                                 run_id,
                                 attempt_id,
@@ -1351,6 +1404,7 @@ impl App {
                             return Ok(
                                 crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                                     StartupOnboardingCompletion {
+                                        lifetime_client: Some(client),
                                         generation,
                                         run_id,
                                         attempt_id,
@@ -1998,9 +2052,10 @@ impl App {
                     request,
                 )
                 .await
-                .map(|(snapshot, receipt)| {
+                .map(|(snapshot, receipt, lifetime_client)| {
                     crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                         StartupOnboardingCompletion {
+                            lifetime_client: Some(lifetime_client),
                             generation,
                             run_id,
                             attempt_id,
@@ -2077,7 +2132,7 @@ impl App {
                     transition: cockpit_proto::OnboardingTransitionKind::Advance,
                     settlement: None,
                 };
-                let result = apply_onboarding_transition_after_handoff(
+                let (result, lifetime_client) = apply_onboarding_transition_after_handoff(
                     &lifecycle,
                     selected_endpoint.as_ref(),
                     transition,
@@ -2086,6 +2141,7 @@ impl App {
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                         StartupOnboardingCompletion {
+                            lifetime_client: Some(lifetime_client),
                             generation,
                             run_id,
                             attempt_id,
@@ -2167,7 +2223,7 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("onboarding.model"),
             ),
             async move {
-                let response = onboarding_request_after_handoff(
+                let (response, _lifetime_client) = onboarding_request_after_handoff(
                     &lifecycle,
                     selected_endpoint.as_ref(),
                     cockpit_proto::Request::ApplySetupWizard {
@@ -2207,7 +2263,7 @@ impl App {
                     transition: cockpit_proto::OnboardingTransitionKind::Advance,
                     settlement: Some(settlement),
                 };
-                let result = apply_onboarding_transition_after_handoff(
+                let (result, lifetime_client) = apply_onboarding_transition_after_handoff(
                     &lifecycle,
                     selected_endpoint.as_ref(),
                     transition,
@@ -2216,6 +2272,7 @@ impl App {
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                         StartupOnboardingCompletion {
+                            lifetime_client: Some(lifetime_client),
                             generation,
                             run_id,
                             attempt_id,
@@ -2320,7 +2377,7 @@ impl App {
                     transition: cockpit_proto::OnboardingTransitionKind::Advance,
                     settlement: None,
                 };
-                let result = apply_onboarding_transition_after_handoff(
+                let (result, lifetime_client) = apply_onboarding_transition_after_handoff(
                     &lifecycle,
                     selected_endpoint.as_ref(),
                     transition,
@@ -2329,6 +2386,7 @@ impl App {
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                         StartupOnboardingCompletion {
+                            lifetime_client: Some(lifetime_client),
                             generation,
                             run_id,
                             attempt_id,

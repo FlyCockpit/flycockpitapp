@@ -85,6 +85,15 @@ impl App {
             self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
             self.close_composer_picker_on_outside_press(mouse.column, mouse.row);
         }
+        if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
+            if self.pending_workspace_trust.is_none() {
+                self.dialog.handle_workspace_trust_pointer(mouse);
+                if let Some((root, mode)) = self.dialog.take_workspace_trust_choice() {
+                    self.apply_workspace_trust_choice(root, mode);
+                }
+            }
+            return;
+        }
         // The full-screen onboarding shell owns the whole screen while
         // active: its native surfaces consume their events, engine screens
         // route pointer input to the embedded settings dialog, and nothing

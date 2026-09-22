@@ -297,6 +297,7 @@ fn land_onboarding_lifetime_completion(
         payload: Ok(
             crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                 super::StartupOnboardingCompletion {
+                    lifetime_client: None,
                     generation: app.startup_background.generation,
                     run_id: snapshot.run_id,
                     attempt_id: snapshot.attempt_id,
@@ -1098,7 +1099,13 @@ fn late_engine_completion_after_close_is_inert() {
 
     // Cancel mid-flight, then deliver a settlement for the dropped engine.
     shell_key(&mut app, KeyCode::Esc);
-    shell_key(&mut app, KeyCode::Down);
+    assert_eq!(
+        shell_screen_kind(&app),
+        Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+    );
+    // Authenticate returns to provider search; Escape there opens the two
+    // legal leave choices (Defer, Cancel).
+    shell_key(&mut app, KeyCode::Esc);
     shell_key(&mut app, KeyCode::Down);
     shell_key(&mut app, KeyCode::Enter);
     assert!(app.onboarding_shell.is_none());
@@ -1295,6 +1302,7 @@ fn transition_correlation_failure_clears_latch_and_surfaces_retryable_error() {
         payload: Ok(
             crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                 super::StartupOnboardingCompletion {
+                    lifetime_client: None,
                     generation: app.startup_background.generation,
                     run_id: snapshot.run_id,
                     attempt_id: snapshot.attempt_id,
@@ -1349,6 +1357,7 @@ fn stale_generation_transition_completion_is_inert_not_erroring() {
         payload: Ok(
             crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
                 super::StartupOnboardingCompletion {
+                    lifetime_client: None,
                     generation: app.startup_background.generation + 1,
                     run_id: uuid::Uuid::from_u128(1),
                     attempt_id: uuid::Uuid::from_u128(2),
@@ -1396,4 +1405,64 @@ fn workspace_resolution_waits_for_the_onboarding_run_to_complete() {
         app.async_actions.has_pending_kind(&workspace_kind),
         "the deferred workspace resolution starts once the run completes"
     );
+}
+
+#[test]
+fn onboarding_workspace_trust_pointer_uses_painted_wrapped_choices() {
+    use cockpit_config::WorkspaceTrustMode;
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    for width in [40, 80] {
+        for (label, expected) in [
+            ("1. trust", WorkspaceTrustMode::Trust),
+            ("2. ignore-config", WorkspaceTrustMode::IgnoreConfig),
+            ("3. untrusted", WorkspaceTrustMode::Untrusted),
+        ] {
+            let mut dialog = Dialog::open_workspace_trust(cockpit_config::trust::TrustRoot {
+                opened_path: PathBuf::from("/project"),
+                root: PathBuf::from("/a/long/workspace/path/that/wraps/on/the/narrow/terminal"),
+                kind: cockpit_config::trust::TrustRootKind::Directory,
+            });
+            let click = |column, row, button| MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            dialog.handle_workspace_trust_pointer(click(4, 6, MouseButton::Left));
+            assert!(dialog.take_workspace_trust_choice().is_none());
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let mut links = crate::tui::links::LinkRegistry::default();
+            terminal
+                .draw(|frame| dialog.render(frame, frame.area(), &mut links))
+                .unwrap();
+            let (row, column) = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(usize::from(width))
+                .enumerate()
+                .find_map(|(row, cells)| {
+                    let line: String = cells.iter().map(|cell| cell.symbol()).collect();
+                    line.find(label).map(|column| (row as u16, column as u16))
+                })
+                .expect("visible trust choice");
+            dialog.handle_workspace_trust_pointer(click(column, row, MouseButton::Right));
+            dialog.handle_workspace_trust_pointer(click(0, 0, MouseButton::Left));
+            assert!(dialog.take_workspace_trust_choice().is_none());
+            dialog.handle_workspace_trust_pointer(click(column, row, MouseButton::Left));
+            let (_, actual) = dialog
+                .take_workspace_trust_choice()
+                .expect("explicit choice");
+            assert_eq!(actual, expected);
+            terminal
+                .draw(|frame| dialog.render(frame, Rect::new(0, 0, width, 5), &mut links))
+                .unwrap();
+            dialog.handle_workspace_trust_pointer(click(column, row, MouseButton::Left));
+            assert!(
+                dialog.take_workspace_trust_choice().is_none(),
+                "clipped choices are inert"
+            );
+        }
+    }
 }

@@ -1200,6 +1200,10 @@ fn golden_agent_authoring_live_shell_screens() {
                     last_receipt: None,
                 };
                 let mut shell = super::super::OnboardingShell::new(&snapshot, false);
+                // #432 composition seam: inject a deterministic inner phase
+                // so the live shell owns title, help, actions, and content
+                // layout. These goldens cover composition, not navigation;
+                // the cold first-run PTYs cover the production present path.
                 shell.screen =
                     super::super::OnboardingScreen::AgentAuthoring(Box::new(golden_screen(phase)));
                 let engine = crate::tui::settings::Dialog::None;

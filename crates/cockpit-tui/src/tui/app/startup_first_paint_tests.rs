@@ -723,6 +723,7 @@ fn exit_rejects_every_late_startup_stage_completion() {
         93,
         AsyncActionKind::DaemonRpc("onboarding.bootstrap"),
         AsyncActionPayload::StartupOnboardingBootstrap {
+            lifetime_client: None,
             generation,
             request_id: "late-bootstrap".into(),
             receipt: None,
@@ -807,6 +808,7 @@ fn onboarding_completion_requires_matching_generation_operation_and_receipt() {
             presentation_stale: false,
             payload: Ok(AsyncActionPayload::StartupOnboardingTransition(
                 super::StartupOnboardingCompletion {
+                    lifetime_client: None,
                     generation,
                     run_id: uuid::Uuid::from_u128(11),
                     attempt_id: uuid::Uuid::from_u128(12),

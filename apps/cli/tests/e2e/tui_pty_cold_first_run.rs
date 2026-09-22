@@ -122,28 +122,18 @@ fn daemon_generation(session: &HermeticCockpit) -> u64 {
         .expect("daemon rendezvous has a numeric generation")
 }
 
-fn wait_for_daemon_roll_to_stability(session: &HermeticCockpit, previous_generation: u64) {
-    let deadline = Instant::now() + TRANSITION_TIMEOUT;
-    let mut observed_generation = previous_generation;
-    let mut stable_since = None;
+fn assert_daemon_stays_alive(session: &HermeticCockpit, expected_generation: u64) {
+    let deadline = Instant::now() + DAEMON_STABILITY_WINDOW;
     loop {
-        let generation = daemon_generation(session);
-        if generation > previous_generation {
-            session.wait_for_daemon_handshake(TRANSITION_TIMEOUT);
-            if generation != observed_generation {
-                observed_generation = generation;
-                stable_since = Some(Instant::now());
-            }
-            if stable_since.is_some_and(|since| since.elapsed() >= DAEMON_STABILITY_WINDOW)
-                && daemon_generation(session) == observed_generation
-            {
-                return;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "provider-config publication did not produce a stable daemon worker"
+        assert_eq!(
+            daemon_generation(session),
+            expected_generation,
+            "onboarding must retain its daemon across provider verification"
         );
+        session.wait_for_daemon_handshake(TRANSITION_TIMEOUT);
+        if Instant::now() >= deadline {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -193,7 +183,7 @@ fn configure_custom_provider(
     }
 
     wait_for_text(session, "provider verification result", "Connected");
-    wait_for_daemon_roll_to_stability(session, generation);
+    assert_daemon_stays_alive(session, generation);
     activate(session, input, "[ Done ]");
     session
         .wait_until_screen("native model screen", ASYNC_STAGE_TIMEOUT, |screen| {
@@ -350,6 +340,7 @@ fn complete_cold_first_run(input: WalkthroughInput) {
     let (provider_url, provider_shutdown) = spawn_loopback_models_provider();
     let mut session = HermeticCockpit::prepare_fresh(HermeticProfile::Default);
     session.set_extra_env("COCKPIT_REDUCE_MOTION", "1");
+    session.set_extra_env("COCKPIT_LOG", "warn,cockpit_core::daemon=info");
     session
         .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
         .expect("spawn complete cold first-run PTY child");
@@ -385,6 +376,14 @@ fn complete_cold_first_run(input: WalkthroughInput) {
     complete_model(&mut session, input);
     complete_agent(&mut session, input);
     activate(&mut session, input, "[ Continue ]");
+    // Complete unlocks the real workspace decision; it is deliberately not
+    // seeded by the fixture. Both input routes answer the visible modal.
+    wait_for_text(
+        &mut session,
+        "workspace trust decision",
+        "Choose workspace trust:",
+    );
+    activate(&mut session, input, "1. trust - open");
     wait_for_text(&mut session, "completion summary", "You're ready to fly");
     assert_daemon_onboarding_complete(&session);
     activate(&mut session, input, "[ Start coding ]");

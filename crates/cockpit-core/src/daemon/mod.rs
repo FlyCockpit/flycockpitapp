@@ -2769,6 +2769,18 @@ async fn run_foreground_inner_with_boot_db_impl(
     timer.phase("global_config_dir");
     let supervised_worker = supervisor::is_worker_process();
     let mut inherited_listeners = supervisor::take_worker_listeners(&paths)?;
+    // A staged rolling successor proves only its inherited process identity on
+    // fd 4.  In particular, it must not open the tenant database before fd 6:
+    // opening migrates the schema and performs recovery, either of which
+    // would make a readiness abort observable to the still-serving worker.
+    // The supervisor owns the listener, so this wait does not expose an
+    // unbooted service to clients.
+    let standby_promoted_before_recovery =
+        supervised_worker && supervisor::worker_handover_standby();
+    if standby_promoted_before_recovery {
+        supervisor::report_worker_ready()?;
+        supervisor::wait_for_worker_promotion()?;
+    }
     if !supervised_worker {
         match probe(&paths).await {
             DaemonStatus::Running => {
@@ -2880,7 +2892,6 @@ async fn run_foreground_inner_with_boot_db_impl(
     }
 
     let uses_supplied_boot_db = boot_db.is_some();
-    let mut standby_promoted_before_recovery = false;
     let services = match boot_db {
         Some(db) => {
             server::boot_with_db(
@@ -2925,9 +2936,6 @@ async fn run_foreground_inner_with_boot_db_impl(
                 Some(listeners) => listeners,
                 None => prepare_and_publish_socket_pair(&paths)?,
             };
-            supervisor::report_worker_ready()?;
-            supervisor::wait_for_worker_promotion()?;
-            standby_promoted_before_recovery = supervisor::worker_handover_standby();
             let locked_outcome = tokio::select! {
                 result = server::run_locked_until_ready(
                     std::sync::Arc::new(locked),
@@ -2956,16 +2964,6 @@ async fn run_foreground_inner_with_boot_db_impl(
         }
     };
     boot_dbg!("after_ctx_boot");
-    // A staged successor must not replay journals, settle leases, expire
-    // guidance, or otherwise reconcile the shared durable authority while the
-    // predecessor still owns its sessions.  Its boot barrier deliberately
-    // excludes recovery; the supervisor can validate the inherited endpoint
-    // and identity without allowing a second recovery owner.
-    if supervisor::worker_handover_standby() {
-        supervisor::report_worker_ready()?;
-        supervisor::wait_for_worker_promotion()?;
-        standby_promoted_before_recovery = true;
-    }
     // Recovery is part of the socket-publication barrier. Neither the control
     // socket nor its reveal sibling may be observable while durable authority
     // is still being reconciled.
@@ -3099,6 +3097,13 @@ async fn run_foreground_inner_with_boot_db_impl(
                                             generation,
                                             "committed worker handover failed; draining predecessor"
                                         );
+                                        // The accept loop is waiting for either a
+                                        // reconnect dispatch or a retired handover.
+                                        // A committed preparation error has neither:
+                                        // release that wait before beginning normal
+                                        // shutdown so the supervisor can reap this
+                                        // worker and recover a sole successor.
+                                        supervisor::retire_worker_handover();
                                         server::request_shutdown(&ctx);
                                     } else {
                                         supervisor::abort_worker_handover();
@@ -3108,6 +3113,11 @@ async fn run_foreground_inner_with_boot_db_impl(
                             }
                             Err(error) => {
                                 tracing::error!(%error, "worker handover setup failed");
+                                if supervisor::worker_handover_committed() {
+                                    supervisor::retire_worker_handover();
+                                } else if supervisor::worker_handover_active() {
+                                    supervisor::abort_worker_handover();
+                                }
                                 server::request_shutdown(&ctx);
                             }
                         }

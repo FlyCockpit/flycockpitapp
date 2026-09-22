@@ -154,6 +154,23 @@ pub(crate) fn abort_worker_handover() {
         .notify_waiters();
 }
 
+/// Retire a committed predecessor which cannot dispatch `Reconnect`.
+///
+/// This is deliberately distinct from [`abort_worker_handover`]: after a
+/// commit, the predecessor may already have cancelled live work and therefore
+/// must not resume admission.  It only releases local waiters while ordinary
+/// daemon shutdown retires the process.
+pub(crate) fn retire_worker_handover() {
+    WORKER_HANDOVER_ACTIVE.store(false, Ordering::Release);
+    WORKER_HANDOVER_HARD_INTERRUPT.store(false, Ordering::Release);
+    if let Some(slot) = WORKER_HANDOVER.get() {
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+    WORKER_HANDOVER_DECISION_NOTIFY
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_waiters();
+}
+
 pub(crate) fn commit_worker_handover() {
     if worker_handover_active() {
         WORKER_HANDOVER_DECISION.store(1, Ordering::Release);
@@ -1603,10 +1620,7 @@ async fn await_drained_worker_exit_with_timeout(
                 pid = worker.pid,
                 "worker exceeded the daemon drain grace; forcing shutdown"
             );
-            // The worker's shutdown authority treats a second stop signal as
-            // the existing force transition. This is the ordinary daemon
-            // drain bound, not #440's future boundary-aware roll policy.
-            terminate_worker(worker, false)?;
+            force_kill_worker(worker)?;
             worker.exited.recv().await
         }
     };
@@ -1991,6 +2005,23 @@ fn terminate_worker(worker: &mut Worker, reconnect: bool) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn force_kill_worker(worker: &mut Worker) -> Result<()> {
+    let pid = libc::pid_t::try_from(worker.pid).context("worker pid does not fit pid_t")?;
+    // SAFETY: pid is range checked. The supervisor retains the exact Child and
+    // stable watcher until this generation exits.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // The watcher can lag a process which exited just as the grace timer
+        // elapsed. There is nothing left to signal in that case; keep waiting
+        // for its authoritative exit observation.
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("force-killing supervised worker");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn signal_worker_handover_decision(worker: &Worker, commit: bool) -> Result<()> {
     let signal = if commit { libc::SIGUSR2 } else { libc::SIGURG };
     let pid = libc::pid_t::try_from(worker.pid).context("worker pid does not fit pid_t")?;
@@ -2050,6 +2081,16 @@ fn terminate_worker(worker: &mut Worker, reconnect: bool) -> Result<()> {
     }
     cockpit_host::daemon_lifecycle::terminate_verified_daemon_process(&worker.receipt)
         .context("terminating supervised worker")
+}
+
+#[cfg(windows)]
+fn force_kill_worker(worker: &mut Worker) -> Result<()> {
+    if let Some(child) = worker.child.as_mut() {
+        child.kill().context("force-killing supervised worker")?;
+        return Ok(());
+    }
+    cockpit_host::daemon_lifecycle::terminate_verified_daemon_process(&worker.receipt)
+        .context("force-killing supervised worker")
 }
 
 async fn wait_for_worker_boundary(
@@ -2488,6 +2529,30 @@ fn reexec_supervisor(request: ReexecRequest<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retiring_committed_handover_releases_reconnect_waiter() {
+        WORKER_HANDOVER_ACTIVE.store(true, Ordering::Release);
+        WORKER_HANDOVER_HARD_INTERRUPT.store(true, Ordering::Release);
+        WORKER_HANDOVER_RECONNECT_DISPATCHED.store(false, Ordering::Release);
+        WORKER_HANDOVER_DECISION.store(1, Ordering::Release);
+
+        let waiter = tokio::spawn(wait_for_worker_handover_reconnect_dispatch());
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a committed handover must wait for reconnect or retirement"
+        );
+
+        retire_worker_handover();
+        assert!(
+            !waiter.await.unwrap(),
+            "retiring a committed handover must release the accept-loop waiter"
+        );
+        assert!(!worker_handover_active());
+        assert!(!worker_handover_hard_interrupting());
+        WORKER_HANDOVER_DECISION.store(0, Ordering::Release);
+    }
 
     #[tokio::test]
     async fn admin_protocol_rejects_public_proto_shape() {

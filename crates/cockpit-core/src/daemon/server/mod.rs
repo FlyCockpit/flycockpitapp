@@ -6681,10 +6681,21 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
     // Reconnect attempts then remain in the supervisor-owned listener backlog
     // until promotion; keeping these streams alive would let them attach back
     // to the only current acceptor and deadlock the roll.
-    if super::supervisor::worker_handover_active()
-        && !super::supervisor::wait_for_worker_handover_reconnect_dispatch().await
-    {
-        tracing::info!("worker handover aborted before reconnect dispatch");
+    if super::supervisor::worker_handover_active() {
+        tokio::select! {
+            dispatched = super::supervisor::wait_for_worker_handover_reconnect_dispatch() => {
+                if !dispatched {
+                    tracing::info!("worker handover retired before reconnect dispatch");
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || ctx.shutdown.is_forced() {
+                    tracing::info!("forced daemon shutdown ended handover reconnect wait");
+                } else {
+                    tracing::info!("daemon shutdown changed during handover reconnect wait");
+                }
+            }
+        }
     }
     clients.abort_all();
     while clients.join_next().await.is_some() {}

@@ -1468,6 +1468,10 @@ mod safety_gate_tests {
 
     #[async_trait]
     impl Tool for SleepTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "sleepy"
         }

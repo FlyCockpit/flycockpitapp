@@ -12,6 +12,10 @@ pub struct LspTool;
 
 #[async_trait]
 impl Tool for LspTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "lsp"
     }

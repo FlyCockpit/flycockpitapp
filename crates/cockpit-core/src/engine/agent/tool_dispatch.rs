@@ -1390,12 +1390,32 @@ async fn execute_ordinary_call_unscoped(
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
         let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
         let ledger_wire = model_history_args(env, resolved_name, &args);
+        // Recovery needs the same provider identity before the effect that
+        // the completed audit row would carry after it.
+        let start_identity = crate::session::ToolCallProviderIdentity::from_provider_call(
+            Some(&tool_provider),
+            Some(&tool_model),
+            Some(&env.ctx.config.providers()),
+            Some(env.model.current_wire_api()),
+            tc.provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.clone())
+                .unwrap_or_else(|| tc.id.to_string()),
+            tc.provider
+                .as_ref()
+                .map(|provider| provider.call_id.clone()),
+        );
         let start_data = serde_json::json!({
             "tool": resolved_name,
             "original_input": ledger_original,
             "wire_input": ledger_wire,
             "recovery_kind": start_recovery_kind,
             "recovery_stage": start_recovery_stage,
+            "provider_item_id": start_identity.provider_item_id,
+            "provider_call_id": start_identity.provider_call_id,
+            "provider_call_id_source": start_identity.provider_call_id_source,
+            "wire_api": start_identity.wire_api,
+            "provider_family": start_identity.provider_family,
         });
         match env
             .session
@@ -1412,7 +1432,8 @@ async fn execute_ordinary_call_unscoped(
                 assistant_seq = Some(seq);
             }
             Err(e) => {
-                tracing::warn!(error = %e, tool = %resolved_name, "record tool_call_started event failed");
+                scheduler_release_started().await;
+                return Err(e.context("persisting tool call identity before dispatch"));
             }
         }
     }
@@ -2460,8 +2481,7 @@ async fn execute_ordinary_call_unscoped(
     let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
     let ledger_wire = model_history_args(env, resolved_name, &args);
     scheduler_await_commit().await;
-    let tool_audit_committed = match env
-        .session
+    env.session
         .record_tool_call_journaled(
             ToolCallRow {
                 event_id: Uuid::new_v4(),
@@ -2503,15 +2523,8 @@ async fn execute_ordinary_call_unscoped(
             audit_target_trusted,
         )
         .await
-    {
-        Ok(()) => true,
-        Err(e) => {
-            // Auditing must not break the live conversation. Log and
-            // continue — the model still sees the tool result.
-            tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
-            false
-        }
-    };
+        .with_context(|| format!("persisting `{resolved_name}` result and closing its intent"))?;
+    let tool_audit_committed = true;
 
     let event_canonical_output = result.as_ref().ok().and_then(|output| {
         (!hard_fail
@@ -3425,10 +3438,92 @@ async fn execute_ordinary_call_unscoped(
 async fn dispatch_authorized_tool(
     env: &DispatchEnv<'_>,
     resolved_name: &str,
-    args: Value,
+    mut args: Value,
     call_id: &str,
 ) -> (Result<ToolOutput>, u64) {
-    if resolved_name == "acquire_sealed_value" {
+    #[cfg(test)]
+    crate::daemon::server::tests::tool_recovery_tests::checkpoint(env.session.id, "before_intent")
+        .await;
+    let tool = env.active_tools.get(resolved_name);
+    let requires_recovery_intent = tool.as_ref().is_some_and(|tool| {
+        !matches!(tool.effect(), crate::engine::tool::ToolEffect::ReadOnly)
+            || !matches!(
+                tool.idempotency(),
+                crate::engine::tool::ToolIdempotency::Idempotent
+            )
+    });
+    if let Some(tool) = tool.as_ref()
+        && requires_recovery_intent
+    {
+        let idempotency = tool.idempotency();
+        let existing_intent = match env
+            .session
+            .db
+            .tool_execution_intent_for_call(env.session.live_id(), call_id.to_string())
+            .await
+        {
+            Ok(intent) => intent,
+            Err(error) => return (Err(error.context("reading prior tool intent")), 0),
+        };
+        let idempotency_key = matches!(
+            idempotency,
+            crate::engine::tool::ToolIdempotency::IdempotentWithKey
+        )
+        .then(|| {
+            existing_intent
+                .as_ref()
+                .and_then(|intent| intent.idempotency_key.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+        });
+        let db_idempotency = match idempotency {
+            crate::engine::tool::ToolIdempotency::Idempotent => {
+                crate::db::tool_recovery::ToolIdempotency::Idempotent
+            }
+            crate::engine::tool::ToolIdempotency::IdempotentWithKey => {
+                crate::db::tool_recovery::ToolIdempotency::IdempotentWithKey
+            }
+            crate::engine::tool::ToolIdempotency::NotIdempotent => {
+                crate::db::tool_recovery::ToolIdempotency::NotIdempotent
+            }
+        };
+        let intent = match env
+            .session
+            .db
+            .begin_tool_execution_intent(crate::db::tool_recovery::BeginToolExecutionIntent {
+                session_id: env.session.live_id(),
+                call_id: call_id.to_string(),
+                tool: resolved_name.to_string(),
+                args: args.clone(),
+                generation: crate::daemon::supervisor::worker_generation(),
+                idempotency: db_idempotency,
+                idempotency_key,
+            })
+            .await
+        {
+            Ok(intent) => intent,
+            Err(error) => return (Err(error.context("committing write-ahead tool intent")), 0),
+        };
+        if let (Some(key), Some(object)) = (intent.idempotency_key, args.as_object_mut()) {
+            object.insert("_cockpit_idempotency_key".to_string(), Value::String(key));
+        }
+    }
+    #[cfg(test)]
+    crate::daemon::server::tests::tool_recovery_tests::checkpoint(env.session.id, "after_intent")
+        .await;
+    let _effect_generation_guard = if requires_recovery_intent {
+        match env.session.db.enter_tool_effect_generation().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return (
+                    Err(error.context("entering supervised tool effect generation")),
+                    0,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let result = if resolved_name == "acquire_sealed_value" {
         let started = std::time::Instant::now();
         let result =
             crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
@@ -3445,7 +3540,11 @@ async fn dispatch_authorized_tool(
             Some(call_id),
         )
         .await
-    }
+    };
+    #[cfg(test)]
+    crate::daemon::server::tests::tool_recovery_tests::checkpoint(env.session.id, "after_result")
+        .await;
+    result
 }
 
 fn render_unavailable_tool_artifact_frame(
@@ -3475,7 +3574,7 @@ fn render_unavailable_tool_artifact_frame(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         approval::{Approver, store::GrantStore},
@@ -3597,6 +3696,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for EchoTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "echo"
         }
@@ -3632,6 +3735,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for LedgerProjectedTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "ledger_projected"
         }
@@ -3662,6 +3769,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for ModelEphemeralTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "model_ephemeral"
         }
@@ -3758,6 +3869,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for ReadOnlyEchoTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::Idempotent
+        }
+
         fn name(&self) -> &str {
             "readonly_echo"
         }
@@ -3790,12 +3905,59 @@ mod tests {
         }
     }
 
+    struct ReadOnlyIntentObservingTool {
+        observed_intent: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for ReadOnlyIntentObservingTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
+        fn name(&self) -> &str {
+            "readonly_with_admission"
+        }
+
+        fn description(&self) -> &str {
+            "Test that recovery intent precedes a nominally read-only call."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn effect(&self) -> crate::engine::tool::ToolEffect {
+            crate::engine::tool::ToolEffect::ReadOnly
+        }
+
+        async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+            let call_id = ctx
+                .current_tool_call_id
+                .as_ref()
+                .context("test tool call id missing")?
+                .to_string();
+            let intent = ctx
+                .session
+                .db
+                .tool_execution_intent_for_call(ctx.session.live_id(), call_id)
+                .await?;
+            self.observed_intent
+                .store(intent.is_some(), Ordering::SeqCst);
+            Ok(ToolOutput::text("observed"))
+        }
+    }
+
     struct NestedCaptureTool {
         received: Arc<Mutex<Option<Value>>>,
     }
 
     #[async_trait]
     impl crate::engine::tool::Tool for NestedCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "nested_capture"
         }
@@ -3831,6 +3993,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for FailTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "fail"
         }
@@ -3852,6 +4018,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for TruncatedTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "big"
         }
@@ -3873,6 +4043,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for ArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "big"
         }
@@ -3901,6 +4075,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for DisplayAndAttachmentsTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "mcp"
         }
@@ -3944,6 +4122,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for RedactedArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "redacted_big"
         }
@@ -3975,6 +4157,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for NamedArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -4009,6 +4195,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for PartialArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "big_partial"
         }
@@ -4037,6 +4227,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for InterruptWaitTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "interrupt_wait"
         }
@@ -4085,6 +4279,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for GatedInterruptWaitTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "bash"
         }
@@ -4142,6 +4340,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for NeverCalledTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -4173,6 +4375,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for CapabilityUnavailableTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "capability_unavailable_tool"
         }
@@ -4204,6 +4410,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for IntegerOnlyTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "number"
         }
@@ -4232,6 +4442,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for BashFixtureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "bash"
         }
@@ -4259,6 +4473,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for BashArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "bash"
         }
@@ -5154,6 +5372,158 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
         assert_eq!(rows[0].output, "hello");
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn dispatch_crash_matrix_call(
+        session: Arc<Session>,
+        root: &std::path::Path,
+        tools: ToolBox,
+        call: ToolCall,
+    ) {
+        let agent = test_agent(tools.clone());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(64);
+        let ctx = tool_ctx(session.clone(), root, &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: root,
+        };
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            &call.function.name,
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+        panic!("crash checkpoint did not stop dispatch");
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_readonly_tool_has_intent_before_call_and_closes_with_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed_intent = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(ReadOnlyIntentObservingTool {
+            observed_intent: observed_intent.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("readonly_with_admission", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "readonly_with_admission",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(observed_intent.load(Ordering::SeqCst));
+        assert!(
+            session
+                .db
+                .tool_execution_intent_for_call(session.id, call.id.to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "result transaction must close the observed intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_start_persistence_failure_prevents_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed_intent = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(ReadOnlyIntentObservingTool {
+            observed_intent: observed_intent.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("readonly_with_admission", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        session.db.write(|conn| {
+            conn.execute_batch("CREATE TRIGGER reject_tool_start BEFORE INSERT ON session_events
+                WHEN NEW.type='tool_call_started' BEGIN SELECT RAISE(ABORT, 'start identity failure'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        let error = execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "readonly_with_admission",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("start identity failure"));
+        assert!(!observed_intent.load(Ordering::SeqCst));
+        assert!(
+            session
+                .db
+                .list_open_tool_execution_intents()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            session
+                .db
+                .list_tool_calls_for_session(session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -7061,7 +7431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_tool_terminal_seq_requires_committed_audit_row() {
+    async fn ordinary_tool_terminal_audit_failure_fails_the_turn() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(FailTool));
         let agent = test_agent(tools.clone());
@@ -7099,22 +7469,32 @@ mod tests {
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
 
-        execute_ordinary_call(&env, &mut history, &call, "fail", Recovery::Clean, None)
+        let original_history = history.clone();
+        let error = execute_ordinary_call(&env, &mut history, &call, "fail", Recovery::Clean, None)
             .await
-            .unwrap();
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("persisting `fail` result and closing its intent"),
+            "{error}"
+        );
+        assert!(
+            error.contains("forced ordinary tool audit failure"),
+            "{error}"
+        );
+        assert_eq!(
+            history, original_history,
+            "failed persistence must not publish a history result"
+        );
 
         assert!(matches!(
             rx.recv().await,
             Some(TurnEvent::ToolStart { tool, .. }) if tool == "fail"
         ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(TurnEvent::ToolError {
-                tool,
-                seq: None,
-                ..
-            }) if tool == "fail"
-        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "failed persistence must not emit completion"
+        );
         assert!(
             session
                 .db
@@ -7125,15 +7505,135 @@ mod tests {
             "audit failure must not be presented as sequenced durable completion"
         );
         assert!(
-            session
+            !session
                 .db
                 .list_session_events(session.id)
                 .await
                 .unwrap()
                 .iter()
                 .any(|event| event.kind == "tool_call"),
-            "the distinguishing edge is an audit failure after timeline persistence succeeds"
+            "failed persistence must not publish a terminal timeline event"
         );
+        assert!(
+            session
+                .db
+                .tool_execution_intent_for_call(session.id, call.id.to_string())
+                .await
+                .unwrap()
+                .is_some(),
+            "failed persistence must leave the intent open for recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_blocks_live_turn_before_history_heal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent(ToolBox::new());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let call = tool_call("bash", serde_json::json!({"command": "printf done"}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        let original_history = history.clone();
+        let intent = session
+            .db
+            .begin_tool_execution_intent(crate::db::tool_recovery::BeginToolExecutionIntent {
+                session_id: session.id,
+                call_id: call.id.to_string(),
+                tool: "bash".into(),
+                args: call.function.arguments.clone(),
+                generation: 0,
+                idempotency: crate::db::tool_recovery::ToolIdempotency::NotIdempotent,
+                idempotency_key: None,
+            })
+            .await
+            .unwrap();
+        session
+            .db
+            .queue_tool_recovery_decision(&intent)
+            .await
+            .unwrap();
+
+        // Call the turn funnel directly: queued work and non-inbox callers
+        // must be blocked even if they bypass fresh-message admission.
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::super::turn(
+                &agent,
+                &model,
+                &mut history,
+                Message::user("continue"),
+                session.clone(),
+                ctx.locks.clone(),
+                ctx.redact.clone(),
+                ctx.cwd.clone(),
+                ctx.config.clone(),
+                ctx.interrupts.clone(),
+                ctx.cancel.clone(),
+                None,
+                None,
+                None,
+                10,
+                true,
+                ctx.skill_write_origin,
+                None,
+                crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                ctx.deferred_log.clone(),
+                true,
+                Uuid::new_v4(),
+                0,
+                None,
+                None,
+                None,
+                &tx,
+                None,
+            ),
+        )
+        .await
+        .expect("recovery refuses the turn before provider I/O")
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("pending tool recovery decision"),
+            "{error:#}"
+        );
+        assert_eq!(
+            history, original_history,
+            "live history must retain the unresolved call without a stub"
+        );
+        assert!(rx.try_recv().is_err(), "no provider or tool turn may start");
+        assert!(
+            session
+                .db
+                .list_tool_calls_for_session(session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            session.db.list_open_tool_execution_intents().await.unwrap(),
+            vec![intent.clone()]
+        );
+
+        // The guard is session-specific and clears after a real skip receipt.
+        crate::engine::rehydrate::ensure_tool_recovery_resolved(&session.db, Uuid::new_v4())
+            .await
+            .unwrap();
+        session
+            .db
+            .begin_tool_recovery_resolution(
+                intent.intent_id,
+                &crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: "skip".into(),
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        crate::engine::rehydrate::ensure_tool_recovery_resolved(&session.db, session.id)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

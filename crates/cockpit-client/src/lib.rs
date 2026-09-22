@@ -1699,6 +1699,7 @@ mod tests {
             paused_sessions: 0,
             database_path: ":memory:".to_string(),
             schema_version: 1,
+            pending_recovery_sessions: Vec::new(),
         }
     }
 
@@ -1905,6 +1906,7 @@ mod tests {
                 paused_sessions: 0,
                 database_path: "/tmp/cockpit.db".to_string(),
                 schema_version: 1,
+                pending_recovery_sessions: Vec::new(),
             },
         ));
     }
@@ -1923,6 +1925,7 @@ mod tests {
                 paused_sessions: 0,
                 database_path: "/tmp/cockpit.db".to_string(),
                 schema_version: 1,
+                pending_recovery_sessions: Vec::new(),
             },
         ));
         assert!(!is_nil_daemon_status_hello(Uuid::nil(), &Response::Ack));
@@ -2497,6 +2500,7 @@ mod tests {
                         paused_sessions: 0,
                         database_path: ":memory:".to_string(),
                         schema_version: 1,
+                        pending_recovery_sessions: Vec::new(),
                     },
                 ))
                 .await
@@ -2614,6 +2618,7 @@ mod tests {
                         paused_sessions: 0,
                         database_path: ":memory:".to_string(),
                         schema_version: 1,
+                        pending_recovery_sessions: Vec::new(),
                     },
                 ))
                 .await

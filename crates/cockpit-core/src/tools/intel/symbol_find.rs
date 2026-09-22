@@ -6,6 +6,10 @@ pub(in crate::tools::intel) struct SymbolFindTool;
 
 #[async_trait]
 impl Tool for SymbolFindTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "symbol_find"
     }

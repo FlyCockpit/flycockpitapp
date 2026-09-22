@@ -39,6 +39,10 @@ pub struct EditTool;
 
 #[async_trait]
 impl Tool for EditTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "edit"
     }

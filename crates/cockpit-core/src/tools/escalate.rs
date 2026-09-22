@@ -43,6 +43,10 @@ impl From<EscalateAccess> for SandboxPathAccess {
 
 #[async_trait]
 impl Tool for EscalateTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "escalate"
     }

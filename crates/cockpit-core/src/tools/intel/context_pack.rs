@@ -36,6 +36,10 @@ struct ContextFileMeta {
 
 #[async_trait]
 impl Tool for ContextPackTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "context_pack"
     }

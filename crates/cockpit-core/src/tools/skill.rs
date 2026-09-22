@@ -21,6 +21,10 @@ const UNKNOWN_SKILL_AVAILABLE_LIMIT: usize = 20;
 
 #[async_trait]
 impl Tool for SkillTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "skill"
     }

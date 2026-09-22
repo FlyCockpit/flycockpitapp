@@ -93,6 +93,10 @@ impl Default for UseSealedValueTool {
 
 #[async_trait]
 impl Tool for UseSealedValueTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         crate::sealed::USE_SEALED_VALUE_TOOL
     }

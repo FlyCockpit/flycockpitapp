@@ -134,6 +134,10 @@ pub(crate) fn advert_message_from_lines(adverts: &[String]) -> Option<String> {
 
 #[async_trait]
 impl Tool for McpTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "mcp"
     }

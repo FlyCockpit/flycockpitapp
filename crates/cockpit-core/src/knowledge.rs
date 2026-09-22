@@ -183,14 +183,16 @@ pub use dream::build_dream_prompt;
 /// floor beneath the utility-model guard, and a missing utility model
 /// degrades to that floor rather than to near-nothing — is documented there.
 pub(crate) mod injection_scan;
-#[cfg(test)]
-pub(crate) use injection_scan::{fence_knowledge_tool_output_if_needed, knowledge_content_has_injection};
 pub(crate) use injection_scan::{
     DREAM_INJECTION_NEUTRALIZED_MARKER, KbUtilityGuard, fence_knowledge_content,
     fence_knowledge_content_if_needed, fence_knowledge_model_text_layered,
     fence_knowledge_tool_output_layered, fence_knowledge_with_utility_model,
     knowledge_injection_findings, neutralize_dream_injection,
     utility_quarantine_finding_for_dream_write,
+};
+#[cfg(test)]
+pub(crate) use injection_scan::{
+    fence_knowledge_tool_output_if_needed, knowledge_content_has_injection,
 };
 
 /// Durable, paid projection of local KB chunks.  This database deliberately
@@ -6965,6 +6967,10 @@ struct KnowledgeDreamWrite {
 
 #[async_trait]
 impl Tool for KnowledgeDreamSourcesTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         KNOWLEDGE_DREAM_SOURCES_TOOL_NAME
     }
@@ -7073,6 +7079,10 @@ impl Tool for KnowledgeDreamSourcesTool {
 
 #[async_trait]
 impl Tool for KnowledgeDreamApplyTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         KNOWLEDGE_DREAM_APPLY_TOOL_NAME
     }
@@ -7572,6 +7582,10 @@ impl FreshKnowledgeHistorySearchTool {
 
 #[async_trait]
 impl Tool for FreshKnowledgeHistorySearchTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "history_search"
     }
@@ -7793,6 +7807,10 @@ fn render_fresh_session_retrieval(
 
 #[async_trait]
 impl Tool for SemanticSearchTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         SEMANTIC_SEARCH_TOOL_NAME
     }
@@ -7884,6 +7902,10 @@ impl Tool for SemanticSearchTool {
 
 #[async_trait]
 impl Tool for StructuredSearchTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         STRUCTURED_SEARCH_TOOL_NAME
     }

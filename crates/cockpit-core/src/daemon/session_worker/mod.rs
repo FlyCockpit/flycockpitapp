@@ -744,7 +744,7 @@ mod run;
 #[cfg(test)]
 pub(crate) use run::replay_accepted_message_attachment_queue;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use self::helpers::queue_target_to_proto;
 

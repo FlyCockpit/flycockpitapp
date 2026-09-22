@@ -100,6 +100,10 @@ pub struct ScheduleTool;
 
 #[async_trait]
 impl Tool for ScheduleTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "schedule"
     }
@@ -393,6 +397,10 @@ impl IdleWakeActionTool {
 
 #[async_trait]
 impl Tool for IdleWakeActionTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -498,6 +506,10 @@ impl NoteTool {
 
 #[async_trait]
 impl Tool for NoteTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "note"
     }
@@ -578,6 +590,10 @@ impl ForkScheduleTool {
 
 #[async_trait]
 impl Tool for ForkScheduleTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "schedule"
     }
@@ -657,6 +673,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for DynamicTestTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "dynamic-test"
         }

@@ -274,6 +274,10 @@ pub(crate) struct WebFetchTool;
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         WEBSEARCH
     }
@@ -371,6 +375,10 @@ impl Tool for WebSearchTool {
 
 #[async_trait]
 impl Tool for WebFetchTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         WEBFETCH
     }

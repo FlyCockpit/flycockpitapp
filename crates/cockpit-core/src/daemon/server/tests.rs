@@ -3,6 +3,9 @@
 #[path = "provider_onboarding_settlement_tests.rs"]
 mod provider_onboarding_settlement_tests;
 
+#[path = "tool_recovery_tests.rs"]
+pub(crate) mod tool_recovery_tests;
+
 use super::{attachments::*, authz::*, dispatch::*, sessions::*, *};
 use crate::{
     daemon::{

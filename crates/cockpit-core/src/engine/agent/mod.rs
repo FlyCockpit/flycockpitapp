@@ -1422,6 +1422,10 @@ mod wire_null_normalization_tests {
 
     #[async_trait::async_trait]
     impl crate::engine::tool::Tool for CaptureArgsTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "capture_args"
         }
@@ -1509,6 +1513,10 @@ mod redaction_placeholder_guard_tests {
 
     #[async_trait::async_trait]
     impl crate::engine::tool::Tool for CaptureArgsTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "capture_args"
         }

@@ -43,6 +43,10 @@ impl SpawnTool {
 
 #[async_trait]
 impl Tool for SpawnTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "spawn"
     }

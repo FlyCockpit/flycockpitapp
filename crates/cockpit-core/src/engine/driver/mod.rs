@@ -263,6 +263,17 @@ pub enum DriverControl {
         root_agent: String,
         respond_to: tokio::sync::oneshot::Sender<std::result::Result<usize, String>>,
     },
+    /// Execute one user-authorized rerun of an ambiguous crash intent at the
+    /// driver's safe boundary with its reconstructed toolbox and history.
+    ReplayCrashToolIntent {
+        intent_id: uuid::Uuid,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Project a committed crash-skip result into the live model history.
+    ApplyCrashToolSkip {
+        call_id: String,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Execute a parked interrupt's persisted tool call through the canonical
     /// ordinary-tool dispatcher, injecting the already-recorded answer at the
     /// interrupt seam so approval/question behavior matches the live path.
@@ -1382,6 +1393,9 @@ pub struct Driver {
     goal_root_turn: Option<(uuid::Uuid, i64, uuid::Uuid)>,
     goal_scratch: Option<cockpit_host::goal_scratch::GoalScratchRoot>,
     pending_idle_reason: Option<crate::engine::IdleReason>,
+    /// Once observed, recovery owns admission until this driver projects the
+    /// committed skip/rerun result. The worker's DB commit alone cannot release it.
+    tool_recovery_projection_pending: bool,
     /// Interrupt wakeup hub (GOALS §3b) threaded into every tool call so
     /// the `question` tool can block on a human answer. Defaults to a
     /// [`detached`](crate::engine::interrupt::InterruptHub::detached) hub
@@ -2510,6 +2524,7 @@ impl Driver {
             // Forks never own or clean the root driver's supervised-goal scratch.
             goal_scratch: None,
             pending_idle_reason: self.pending_idle_reason.clone(),
+            tool_recovery_projection_pending: self.tool_recovery_projection_pending,
             interrupts: self.interrupts.clone(),
             skills_no_utility_model_logged: self.skills_no_utility_model_logged,
             injection_no_scan_logged: self.injection_no_scan_logged,
@@ -2911,6 +2926,7 @@ impl Driver {
             goal_root_turn: None,
             goal_scratch: None,
             pending_idle_reason: None,
+            tool_recovery_projection_pending: false,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             skills_no_utility_model_logged: false,
             injection_no_scan_logged: false,
@@ -5350,6 +5366,309 @@ impl Driver {
         Ok(())
     }
 
+    /// Replay open crash intents only after the session's exact root toolbox,
+    /// config snapshot, custody, and durable history have been reconstructed.
+    pub(crate) async fn replay_crash_tool_intents(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<usize> {
+        self.replay_crash_tool_intents_matching(tx, None).await
+    }
+
+    pub(crate) async fn replay_crash_tool_intent(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+        intent_id: uuid::Uuid,
+    ) -> Result<()> {
+        ensure!(
+            self.replay_crash_tool_intents_matching(tx, Some(intent_id))
+                .await?
+                == 1,
+            "recovery rerun intent was not replayed"
+        );
+        self.refresh_tool_recovery_admission().await?;
+        Ok(())
+    }
+
+    async fn apply_crash_tool_skip(&mut self, call_id: &str) -> Result<()> {
+        use rig::message::{
+            AssistantContent, ToolCall, ToolCallId, ToolFunction, ToolResult, ToolResultContent,
+            UserContent,
+        };
+
+        let event = self
+            .session
+            .db
+            .get_tool_call_by_call_id(self.session.live_id(), call_id)
+            .await?
+            .context("committed crash-skip result is missing")?;
+        ensure!(
+            event.output == crate::db::tool_recovery::SKIPPED_TOOL_RECOVERY_BODY,
+            "crash-skip projection targets a different result"
+        );
+        let frame = self
+            .stack
+            .iter_mut()
+            .find(|frame| frame.agent.name == event.agent)
+            .context("crash-skip owner is not in the live driver stack")?;
+        let provider = event
+            .provider_call_id
+            .and_then(rig::message::ProviderCallId::new)
+            .map(|provider| match event.provider_item_id {
+                Some(item_id) => provider.with_item_id(item_id),
+                None => provider,
+            });
+        let call = ToolCall {
+            id: ToolCallId::new_or_mint(call_id),
+            provider,
+            function: ToolFunction {
+                name: event.tool,
+                arguments: event.wire_input_json,
+            },
+            signature: None,
+            additional_params: None,
+        };
+        // Replace any earlier wire-only heal, and make duplicate delivery
+        // harmless without discarding intervening user messages or siblings.
+        for message in &mut frame.history {
+            if let Message::User { content } = message {
+                content.retain(|part| !matches!(part, UserContent::ToolResult(result) if result.call.as_str() == call_id));
+            }
+        }
+        frame
+            .history
+            .retain(|message| !matches!(message, Message::User { content } if content.is_empty()));
+        let position = frame.history.iter().position(|message| {
+            matches!(message, Message::Assistant { content, .. } if content.iter().any(|part|
+                matches!(part, AssistantContent::ToolCall(existing) if existing.id.as_str() == call_id)))
+        }).unwrap_or_else(|| {
+            frame.history.push(Message::Assistant { id: None, content: vec![AssistantContent::ToolCall(call.clone())] });
+            frame.history.len() - 1
+        });
+        frame.history.insert(
+            position + 1,
+            Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: call.id,
+                    provider: call.provider,
+                    name: call.function.name,
+                    content: vec![ToolResultContent::text(event.output)],
+                })],
+            },
+        );
+        self.refresh_tool_recovery_admission().await?;
+        Ok(())
+    }
+
+    async fn replay_crash_tool_intents_matching(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+        only_intent: Option<uuid::Uuid>,
+    ) -> Result<usize> {
+        use crate::engine::message::AssistantContent;
+
+        let intents = self
+            .session
+            .db
+            .list_open_tool_execution_intents()
+            .await?
+            .into_iter()
+            .filter(|intent| intent.session_id == self.session.live_id())
+            .filter(|intent| {
+                only_intent.is_some_and(|intent_id| intent.intent_id == intent_id)
+                    || (only_intent.is_none()
+                        && intent.idempotency
+                            != crate::db::tool_recovery::ToolIdempotency::NotIdempotent)
+            })
+            .collect::<Vec<_>>();
+        if intents.is_empty() {
+            return Ok(0);
+        }
+
+        let agent = self
+            .stack
+            .last()
+            .context("driver stack is empty during tool recovery")?
+            .agent
+            .clone();
+        let active_tools =
+            crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config)
+                .await;
+        let media_available = active_tools.has_direct_native_media();
+        let ctx = crate::engine::tool::ToolCtx {
+            agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
+            executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+            knowledge_access_trusted: agent.model.is_trusted(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
+            agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
+            lock_identity: agent.lock_identity.clone(),
+            write_scope: agent.write_scope.clone(),
+            dream_read_scope: self.dream_read_scope.clone(),
+            workspace_lease: agent.workspace_lease.clone(),
+            current_tool_call_id: None,
+            current_tool_call_scope: Some("crash-tool-recovery".to_string()),
+            tool_steering: agent.tool_steering,
+            locks: self.locks.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            redact: self.redact.clone(),
+            interrupts: self.interrupts.clone(),
+            cancel: self.live_or_session_cancel(),
+            shutdown_gate: agent.model.shutdown_gate(),
+            approver: self.approver.clone(),
+            #[cfg(feature = "extended")]
+            image_generation_dispatch: self.session.image_generation_dispatch(),
+            transcription_dispatch: self.session.transcription_dispatch(
+                agent.model.provider_id(),
+                agent.model.model_id_ref(),
+                self.config.generation(),
+            ),
+            deferred_log: self
+                .stack
+                .last()
+                .context("driver stack is empty during tool recovery")?
+                .deferred_log
+                .clone(),
+            root_agent_frame: true,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
+            context_usage: Some(self.context_usage_snapshot()),
+            available_tools: Arc::new(
+                active_tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry_for_context(&agent.name),
+            has_tree: active_tools.get("code").is_some(),
+            has_bash: active_tools.get("bash").is_some(),
+            events: Some(tx.clone()),
+            lsp: self.lsp.clone(),
+            resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: if media_available {
+                self.session.tool_media_authority()
+            } else {
+                None
+            },
+            media_availability: {
+                let snapshot = self.config.snapshot();
+                let providers = self.config.providers();
+                crate::tool_media_authority::MediaToolAvailability::from_spawn_inputs(
+                    media_available && self.session.tool_media_authority().is_some(),
+                    &snapshot.host_capabilities,
+                    &providers,
+                    agent.model.provider_id(),
+                    agent.model.model_id_ref(),
+                )
+            },
+            env_overlay: agent.env_overlay.clone(),
+            config: self.config.clone(),
+            mcp_resolver: agent.mcp_resolver.clone(),
+        };
+        let snapshot = self.config.snapshot();
+        let mut replayed = 0;
+        for intent in intents {
+            let tool = active_tools.get(&intent.tool).with_context(|| {
+                format!("recovery tool `{}` is no longer registered", intent.tool)
+            })?;
+            let current_class = match tool.idempotency() {
+                crate::engine::tool::ToolIdempotency::Idempotent => {
+                    crate::db::tool_recovery::ToolIdempotency::Idempotent
+                }
+                crate::engine::tool::ToolIdempotency::IdempotentWithKey => {
+                    crate::db::tool_recovery::ToolIdempotency::IdempotentWithKey
+                }
+                crate::engine::tool::ToolIdempotency::NotIdempotent => {
+                    crate::db::tool_recovery::ToolIdempotency::NotIdempotent
+                }
+            };
+            ensure!(
+                current_class == intent.idempotency,
+                "recovery classification changed for tool `{}`",
+                intent.tool
+            );
+            let durable_call = self
+                .stack
+                .last()
+                .context("driver stack is empty during tool recovery")?
+                .history
+                .iter()
+                .find_map(|message| match message {
+                    Message::Assistant { content, .. } => {
+                        content.iter().find_map(|part| match part {
+                            AssistantContent::ToolCall(call)
+                                if call.id.as_str() == intent.call_id =>
+                            {
+                                Some(call.clone())
+                            }
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                });
+            let reconstructed_call = durable_call.is_none();
+            let call = durable_call.unwrap_or_else(|| rig::message::ToolCall {
+                id: rig::message::ToolCallId::new_or_mint(intent.call_id.clone()),
+                provider: None,
+                function: rig::message::ToolFunction {
+                    name: intent.tool.clone(),
+                    arguments: intent.args.clone(),
+                },
+                signature: None,
+                additional_params: None,
+            });
+            ensure!(
+                call.function.name == intent.tool,
+                "recovery tool name changed"
+            );
+            ensure!(
+                call.function.arguments == intent.args,
+                "recovery arguments changed"
+            );
+            let env = crate::engine::agent::tool_dispatch::DispatchEnv {
+                agent: &agent,
+                session: &self.session,
+                model: &agent.model,
+                active_tools: &active_tools,
+                ctx: &ctx,
+                tx,
+                hint_corrections: crate::engine::agent::hint_tool_call_corrections_enabled(
+                    &self.session,
+                    &self.config,
+                ),
+                loop_guard_threshold: self.loop_guard_threshold,
+                cwd: &self.cwd,
+                hooks: snapshot.hooks(),
+            };
+            let frame = self.stack.last_mut().context("driver stack is empty")?;
+            if reconstructed_call {
+                frame.history.push(Message::Assistant {
+                    id: None,
+                    content: vec![AssistantContent::ToolCall(call.clone())],
+                });
+            }
+            crate::engine::agent::tool_dispatch::execute_ordinary_call(
+                &env,
+                &mut frame.history,
+                &call,
+                &intent.tool,
+                crate::db::tool_calls::Recovery::Clean,
+                None,
+            )
+            .await?;
+            replayed += 1;
+        }
+        Ok(replayed)
+    }
+
     /// Run seed calls that were declared in the interactive child's durable
     /// history before its first model inference.  Recovery reuses the same
     /// declarations and call IDs, so publication never depends on the
@@ -6160,8 +6479,14 @@ impl Driver {
             // post-select idle tail (shadow brief / auto-compact) is the
             // same ownership window: compact replaces history without
             // settling the in-memory plan.
-            let waiting_for_keep_parked_siblings =
-                self.persist_on_reentry_owns_started_unsettled_siblings();
+            let waiting_for_tool_recovery = self.park_for_tool_recovery().await?;
+            if waiting_for_tool_recovery {
+                // Publish a normal intervention idle without binding or settling
+                // any queued turn. Recovery controls remain live in the select.
+                self.emit_turn_idle_if_settled(tx).await;
+            }
+            let waiting_for_turn_admission = waiting_for_tool_recovery
+                || self.persist_on_reentry_owns_started_unsettled_siblings();
             // Ready human input takes priority over a previously completed
             // noninteractive result before the boundary select runs. Deferred
             // input remains owned by the queue but must not suppress idle work
@@ -6173,10 +6498,10 @@ impl Driver {
             // arms explicitly; the biased select remains the honest arbiter
             // only for input that becomes ready after this snapshot.
             let assistant_inbox_timers_armed =
-                !waiting_for_keep_parked_siblings && !human_input_already_ready;
+                !waiting_for_turn_admission && !human_input_already_ready;
             assistant_inbox_defer_heartbeat.set_armed(assistant_inbox_timers_armed);
             assistant_inbox_idle_poll.set_armed(assistant_inbox_timers_armed);
-            if !waiting_for_keep_parked_siblings
+            if !waiting_for_turn_admission
                 && !self.pending_noninteractive_completions.is_empty()
                 && !human_input_already_ready
                 && self
@@ -6223,7 +6548,7 @@ impl Driver {
                 // for a driver that intentionally refuses the message arm.
                 _ = input_queue.wait_closed() => break,
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
-                    if !waiting_for_keep_parked_siblings => {
+                    if !waiting_for_turn_admission => {
                     goal_watchdog = None;
                     let Some(first) = msg else { break };
                     // Fold anything else that's already queued behind the
@@ -6344,7 +6669,7 @@ impl Driver {
                     }
                 }
                 ev = self.job_event_rx.recv(),
-                    if !waiting_for_keep_parked_siblings => {
+                    if !waiting_for_turn_admission => {
                     goal_watchdog = None;
                     match ev {
                         Some(event) => {
@@ -6359,7 +6684,7 @@ impl Driver {
                 }
                 completion = self.noninteractive_complete_rx.recv() => {
                     goal_watchdog = None;
-                    if waiting_for_keep_parked_siblings {
+                    if waiting_for_turn_admission {
                         // Receive so the bounded job channel cannot stall, but
                         // do not finalize/claim/inject: Inline would push into
                         // the open tool_call group and AsyncUser would treat
@@ -6401,7 +6726,7 @@ impl Driver {
                         Some(timer) => timer.as_mut().await,
                         None => std::future::pending().await,
                     }
-                }, if !waiting_for_keep_parked_siblings => {
+                }, if !waiting_for_turn_admission => {
                     goal_watchdog = None;
                     match self.goal_usage_limit_watchdog_action().await? {
                         GoalUsageLimitWatchdogAction::AutoResume => {
@@ -6442,7 +6767,7 @@ impl Driver {
             // history on that tail.
             let settled_user_turn =
                 self.current_lifecycle_turn_id.is_some() || self.pending_idle_reason.is_some();
-            if !waiting_for_keep_parked_siblings && settled_user_turn {
+            if !waiting_for_turn_admission && settled_user_turn {
                 self.maybe_shadow_brief(tx).await;
                 self.maybe_auto_compact(tx).await;
                 self.maybe_schedule_keep_warm().await;
@@ -7096,6 +7421,26 @@ impl Driver {
                 };
                 let _ = respond_to.send(result);
             }
+            DriverControl::ReplayCrashToolIntent {
+                intent_id,
+                respond_to,
+            } => {
+                let result = self
+                    .replay_crash_tool_intent(tx, intent_id)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                let _ = respond_to.send(result);
+            }
+            DriverControl::ApplyCrashToolSkip {
+                call_id,
+                respond_to,
+            } => {
+                let result = self
+                    .apply_crash_tool_skip(&call_id)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                let _ = respond_to.send(result);
+            }
             DriverControl::ReplayParkedInterrupt {
                 interrupt_id,
                 agent_instance_id,
@@ -7384,7 +7729,9 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+        if self.park_for_tool_recovery().await?
+            || self.persist_on_reentry_owns_started_unsettled_siblings()
+        {
             // A keep-parked goal-root turn is not finished: do not take
             // `goal_root_turn` or dispatch a new root turn until persist-on-
             // re-entry has CAS-committed every started sibling.
@@ -7700,7 +8047,9 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+        if self.park_for_tool_recovery().await?
+            || self.persist_on_reentry_owns_started_unsettled_siblings()
+        {
             // Do not `begin_goal_root_turn` before `run_user_input`: keep-park
             // `Ok(())` would leave this owner set and the next
             // `maybe_continue_active_goal` would finish a turn that never ran.
@@ -10052,6 +10401,15 @@ impl Driver {
         &self,
         include_deferred: bool,
     ) -> Result<Option<(String, Vec<Uuid>)>> {
+        if self.tool_recovery_projection_pending
+            || crate::engine::rehydrate::tool_recovery_pending(
+                &self.session.db,
+                self.session.live_id(),
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         let items = self
             .session
             .db
@@ -10963,6 +11321,13 @@ impl Driver {
         cancel: tokio_util::sync::CancellationToken,
         input_queue: &crate::engine::message::UserSubmissionQueue,
     ) -> std::result::Result<String, String> {
+        if self
+            .park_for_tool_recovery()
+            .await
+            .map_err(|error| format!("{error:#}"))?
+        {
+            return Ok("skipped: pending tool recovery decision".to_string());
+        }
         let elapsed = chrono::Utc::now()
             .timestamp_millis()
             .saturating_sub(cache_send_identity.unix_millis)
@@ -12317,6 +12682,39 @@ impl Driver {
         Ok(())
     }
 
+    /// An ambiguous crash effect owns the next turn boundary. Keep normal
+    /// work pending while the recovery controls resolve that ownership.
+    async fn park_for_tool_recovery(&mut self) -> Result<bool> {
+        self.tool_recovery_projection_pending |= crate::engine::rehydrate::tool_recovery_pending(
+            &self.session.db,
+            self.session.live_id(),
+        )
+        .await?;
+        if self.tool_recovery_projection_pending {
+            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                code: "pending_tool_recovery".to_string(),
+            });
+        }
+        Ok(self.tool_recovery_projection_pending)
+    }
+
+    async fn refresh_tool_recovery_admission(&mut self) -> Result<()> {
+        let pending = crate::engine::rehydrate::tool_recovery_pending(
+            &self.session.db,
+            self.session.live_id(),
+        )
+        .await?;
+        self.tool_recovery_projection_pending = pending;
+        if !pending
+            && matches!(self.pending_idle_reason.as_ref(),
+                Some(crate::engine::IdleReason::NeedsIntervention { code })
+                    if code == "pending_tool_recovery")
+        {
+            self.pending_idle_reason = None;
+        }
+        Ok(())
+    }
+
     pub async fn run_user_input(
         &mut self,
         submission: UserSubmission,
@@ -12343,6 +12741,17 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        if self.park_for_tool_recovery().await? {
+            // This entry also serves direct callers outside the idle loop.
+            // No receipt, transcript, media ownership, or finish may change
+            // for a submission that has not been admitted.
+            if !submission.queue_item_ids.is_empty() {
+                input_rx
+                    .requeue_front(submission, self.active_queue_target())
+                    .await;
+            }
+            return Ok(());
+        }
         if self.persist_on_reentry_owns_started_unsettled_siblings() {
             // User submissions are not persist-on-re-entry paired bodies.
             // Leave history unchanged and put a queued payload back so the

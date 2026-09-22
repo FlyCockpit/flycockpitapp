@@ -1755,6 +1755,10 @@ macro_rules! media_tool {
         }
         #[async_trait]
         impl Tool for $name {
+            fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+                crate::engine::tool::ToolIdempotency::NotIdempotent
+            }
+
             fn name(&self) -> &str {
                 $wire
             }

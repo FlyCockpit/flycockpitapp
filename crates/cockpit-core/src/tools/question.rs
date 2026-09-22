@@ -55,6 +55,10 @@ struct QuestionOptionArg {
 
 #[async_trait]
 impl Tool for QuestionTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "question"
     }

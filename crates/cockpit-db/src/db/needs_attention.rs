@@ -482,6 +482,9 @@ impl Db {
         .await
     }
 
+    /// Driver continuations eligible for parked-payload reconciliation.
+    /// Crash-tool decisions are owned by the intent state machine and have no
+    /// parked payload; they must remain answerable across worker attachment.
     pub async fn list_reconcilable_interrupts(
         &self,
         session_id: Uuid,
@@ -497,6 +500,7 @@ impl Db {
                       WHERE session_id = ?1
                         AND (decision_request_id IS NULL
                              OR question_json IS NOT NULL OR questions_json IS NOT NULL)
+                        AND recovery_intent_id IS NULL
                         AND state IN ('open', 'parked', 'executing')
                       ORDER BY raised_at ASC, rowid ASC",
                 )

@@ -2161,6 +2161,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for MontyAdapterTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             &self.name
         }
@@ -2215,6 +2219,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for PendingMontyTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "pending"
         }

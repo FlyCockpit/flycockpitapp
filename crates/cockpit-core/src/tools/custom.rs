@@ -20,10 +20,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-#[cfg(test)]
-use crate::redact::RedactionTable;
 use crate::config::extended::ToolCommandTemplate;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
+#[cfg(test)]
+use crate::redact::RedactionTable;
 use crate::tools::common::{
     OUTPUT_BYTE_CAP, boundary_safe_capture, boundary_safe_join, truncate_head_tail_redacted,
 };
@@ -130,6 +130,10 @@ impl CustomBashTool {
 
 #[async_trait]
 impl Tool for CustomBashTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

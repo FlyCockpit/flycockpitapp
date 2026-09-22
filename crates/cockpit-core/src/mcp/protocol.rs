@@ -77,6 +77,14 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
 }
 
+impl ToolDescriptor {
+    /// Remote/web idempotency negotiation is deliberately deferred. Every MCP
+    /// descriptor is therefore classified conservatively at this boundary.
+    pub fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+}
+
 pub fn sanitize_tool_descriptor(mut tool: ToolDescriptor) -> ToolDescriptor {
     tool.name = sanitize_tool_name(&tool.name);
     tool.description = sanitize_tool_description(&tool.description);

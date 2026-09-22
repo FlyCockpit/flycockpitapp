@@ -6,6 +6,10 @@ pub(in crate::tools::intel) struct OutlineTool;
 
 #[async_trait]
 impl Tool for OutlineTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "outline"
     }

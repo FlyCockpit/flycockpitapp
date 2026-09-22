@@ -22,6 +22,10 @@ pub struct ReturnTool;
 
 #[async_trait]
 impl Tool for ReturnTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "return"
     }

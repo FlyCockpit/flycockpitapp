@@ -12,6 +12,10 @@ pub struct ThreadStartTool;
 
 #[async_trait]
 impl Tool for ThreadStartTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "thread_start"
     }

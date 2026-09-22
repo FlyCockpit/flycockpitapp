@@ -11,6 +11,10 @@ const MAX_SEARCH_MATCHES: usize = 2_000;
 
 #[async_trait]
 impl Tool for SearchTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "search"
     }

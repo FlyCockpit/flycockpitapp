@@ -34,6 +34,10 @@ struct GlobArgs {
 
 #[async_trait]
 impl Tool for GlobTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "glob"
     }

@@ -59,6 +59,10 @@ pub struct CodeTool;
 
 #[async_trait]
 impl Tool for CodeTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "code"
     }

@@ -351,6 +351,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                         protocol_version,
                         database_path,
                         schema_version,
+                        pending_recovery_sessions,
                     } = worker_status
                     else {
                         bail!("unexpected supervised daemon status response: {worker_status:?}");
@@ -365,6 +366,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                         protocol_version,
                         database_path,
                         schema_version,
+                        pending_recovery_sessions,
                     });
                     let object = value
                         .as_object_mut()
@@ -382,8 +384,30 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
                     let outcome = last_handover.as_deref().unwrap_or("none");
+                    let pending_recovery_sessions = match DaemonClient::connect(&paths.socket)
+                        .await?
+                        .request_ok(Request::DaemonStatus)
+                        .await?
+                    {
+                        Response::DaemonStatus {
+                            pending_recovery_sessions,
+                            ..
+                        } => pending_recovery_sessions,
+                        response => {
+                            bail!("unexpected supervised daemon status response: {response:?}")
+                        }
+                    };
+                    let pending = if pending_recovery_sessions.is_empty() {
+                        "none".to_string()
+                    } else {
+                        pending_recovery_sessions
+                            .iter()
+                            .map(uuid::Uuid::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
                     println!(
-                        "daemon: running\n  supervisor pid: {supervisor_pid}\n  worker pid: {worker_pid}\n  generation: {generation}\n  uptime: {:.3}s\n  last handover: {outcome}\n  socket: {}",
+                        "daemon: running\n  supervisor pid: {supervisor_pid}\n  worker pid: {worker_pid}\n  generation: {generation}\n  uptime: {:.3}s\n  last handover: {outcome}\n  pending recovery: {pending}\n  socket: {}",
                         uptime_ms as f64 / 1000.0,
                         paths.socket.display(),
                     );
@@ -601,6 +625,7 @@ async fn print_json_status(probe: &crate::daemon::DaemonProbe) -> Result<()> {
             paused_sessions,
             database_path,
             schema_version,
+            pending_recovery_sessions,
         } = response
         else {
             bail!("unexpected daemon status response: {response:?}");
@@ -615,6 +640,7 @@ async fn print_json_status(probe: &crate::daemon::DaemonProbe) -> Result<()> {
             protocol_version,
             database_path,
             schema_version,
+            pending_recovery_sessions,
         });
     }
 
@@ -626,6 +652,7 @@ async fn print_json_status(probe: &crate::daemon::DaemonProbe) -> Result<()> {
 struct DaemonVersions {
     daemon_version: String,
     protocol_version: u32,
+    pending_recovery_sessions: Vec<uuid::Uuid>,
 }
 
 enum RunningStatusVersionRead {
@@ -645,6 +672,7 @@ struct RunningJsonStatus {
     protocol_version: u32,
     database_path: String,
     schema_version: i64,
+    pending_recovery_sessions: Vec<uuid::Uuid>,
 }
 
 async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
@@ -670,10 +698,12 @@ async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
         Response::DaemonStatus {
             daemon_version,
             protocol_version,
+            pending_recovery_sessions,
             ..
         } => RunningStatusVersionRead::Versions(DaemonVersions {
             daemon_version,
             protocol_version,
+            pending_recovery_sessions,
         }),
         Response::LockedBootstrapHello(hello) => RunningStatusVersionRead::BootstrapLocked {
             protocol_version: hello.protocol_version,
@@ -705,6 +735,17 @@ fn render_running_status(
         if let Some(reason) = version_skew_reason(&daemon.daemon_version, daemon.protocol_version) {
             output.push_str(&format!("\n  version skew: {reason}"));
         }
+        let pending = if daemon.pending_recovery_sessions.is_empty() {
+            "none".to_string()
+        } else {
+            daemon
+                .pending_recovery_sessions
+                .iter()
+                .map(uuid::Uuid::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        output.push_str(&format!("\n  pending recovery: {pending}"));
     } else if let Some(error) = read_error {
         output.push_str(&format!("\n  could not read daemon version: {error}"));
     }
@@ -755,6 +796,7 @@ fn running_json_status(status: RunningJsonStatus) -> serde_json::Value {
         "protocol_version": status.protocol_version,
         "database_path": status.database_path,
         "schema_version": status.schema_version,
+        "pending_recovery_sessions": status.pending_recovery_sessions,
         "version_skew": version_skew_reason.is_some(),
         "version_skew_reason": version_skew_reason,
     })
@@ -898,6 +940,7 @@ mod tests {
         let versions = DaemonVersions {
             daemon_version: proto::DAEMON_VERSION.to_string(),
             protocol_version: proto::PROTOCOL_VERSION,
+            pending_recovery_sessions: Vec::new(),
         };
 
         let output = render_running_status("/tmp/cockpit.sock", Some(&versions), None);
@@ -905,7 +948,7 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "daemon: running\n  socket: /tmp/cockpit.sock\n  daemon: {} (protocol v{})\n  client: {} (protocol v{})",
+                "daemon: running\n  socket: /tmp/cockpit.sock\n  daemon: {} (protocol v{})\n  client: {} (protocol v{})\n  pending recovery: none",
                 proto::DAEMON_VERSION,
                 proto::PROTOCOL_VERSION,
                 proto::DAEMON_VERSION,
@@ -915,12 +958,27 @@ mod tests {
     }
 
     #[test]
+    fn daemon_status_text_lists_sessions_with_pending_recovery() {
+        let session_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000441").unwrap();
+        let versions = DaemonVersions {
+            daemon_version: proto::DAEMON_VERSION.to_string(),
+            protocol_version: proto::PROTOCOL_VERSION,
+            pending_recovery_sessions: vec![session_id],
+        };
+
+        let output = render_running_status("/tmp/cockpit.sock", Some(&versions), None);
+
+        assert!(output.contains(&format!("pending recovery: {session_id}")));
+    }
+
+    #[test]
     fn daemon_status_version_skew_older_daemon_names_restart() {
         let protocol_version = proto::PROTOCOL_VERSION.saturating_sub(1);
         assert!(protocol_version < proto::PROTOCOL_VERSION);
         let versions = DaemonVersions {
             daemon_version: proto::DAEMON_VERSION.to_string(),
             protocol_version,
+            pending_recovery_sessions: Vec::new(),
         };
 
         let output = render_running_status("/tmp/cockpit.sock", Some(&versions), None);
@@ -940,6 +998,7 @@ mod tests {
         let versions = DaemonVersions {
             daemon_version: proto::DAEMON_VERSION.to_string(),
             protocol_version,
+            pending_recovery_sessions: Vec::new(),
         };
 
         let output = render_running_status("/tmp/cockpit.sock", Some(&versions), None);
@@ -954,6 +1013,7 @@ mod tests {
         let versions = DaemonVersions {
             daemon_version: "0.0.test-skew".to_string(),
             protocol_version: proto::PROTOCOL_VERSION,
+            pending_recovery_sessions: Vec::new(),
         };
 
         let output = render_running_status("/tmp/cockpit.sock", Some(&versions), None);
@@ -1086,6 +1146,7 @@ mod tests {
             protocol_version: proto::PROTOCOL_VERSION,
             database_path: "/tmp/cockpit.db".to_string(),
             schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+            pending_recovery_sessions: vec![uuid::Uuid::nil()],
         });
         let object = value.as_object().expect("json object");
         let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
@@ -1098,6 +1159,7 @@ mod tests {
                 "daemon_version",
                 "database_path",
                 "paused_sessions",
+                "pending_recovery_sessions",
                 "pid",
                 "protocol_version",
                 "schema_version",
@@ -1113,6 +1175,10 @@ mod tests {
         assert!(value["uptime_secs"].is_u64());
         assert!(value["active_sessions"].is_u64());
         assert!(value["paused_sessions"].is_u64());
+        assert_eq!(
+            value["pending_recovery_sessions"],
+            serde_json::json!([uuid::Uuid::nil()])
+        );
         assert!(value["socket_path"].is_string());
         assert!(value["daemon_version"].is_string());
         assert!(value["protocol_version"].is_u64());

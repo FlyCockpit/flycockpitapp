@@ -6,6 +6,10 @@ pub(in crate::tools::intel) struct DepsTool;
 
 #[async_trait]
 impl Tool for DepsTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "graph"
     }

@@ -43,6 +43,10 @@ struct SetArgs {
 
 #[async_trait]
 impl Tool for SetConversationRuleTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "set_conversation_rule"
     }
@@ -126,6 +130,10 @@ pub struct ListConversationRulesTool;
 
 #[async_trait]
 impl Tool for ListConversationRulesTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "list_conversation_rules"
     }
@@ -191,6 +199,10 @@ struct RemoveArgs {
 
 #[async_trait]
 impl Tool for RemoveConversationRuleTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "remove_conversation_rule"
     }

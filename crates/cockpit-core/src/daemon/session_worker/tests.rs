@@ -3625,6 +3625,107 @@ async fn driver_join_outcome_observes_panics() {
     assert!(matches!(outcome, DriverOutcome::Panicked(error) if error == "driver panic for test"));
 }
 
+pub(crate) fn spawn_recovery_test_worker(
+    session: Arc<Session>,
+    root: &std::path::Path,
+    responses: bool,
+) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
+    let (handle, join, _) = spawn_recovery_test_worker_with_url(session, root, responses, None);
+    (handle, join)
+}
+
+pub(crate) fn spawn_recovery_test_worker_with_url(
+    session: Arc<Session>,
+    root: &std::path::Path,
+    responses: bool,
+    provider_url: Option<String>,
+) -> (
+    SessionWorkerHandle,
+    tokio::task::JoinHandle<()>,
+    crate::daemon::EventReceiver,
+) {
+    session
+        .set_active_model("lmstudio", "session-model")
+        .unwrap();
+    let mut providers = lmstudio_test_providers();
+    if let Some(url) = provider_url {
+        providers.providers.get_mut("lmstudio").unwrap().url = url;
+    }
+    if responses {
+        providers.providers.get_mut("lmstudio").unwrap().wire_api =
+            crate::config::providers::WireApi::Responses;
+    }
+    assert_eq!(
+        active_wire_api_for_session(&session, &providers).2,
+        if responses {
+            crate::config::providers::WireApi::Responses
+        } else {
+            crate::config::providers::WireApi::Completions
+        },
+    );
+    let redact = Arc::new(RedactionTable::empty());
+    let model =
+        Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxIntent::Off;
+    let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::TrustRoot {
+            opened_path: root.to_path_buf(),
+            root: root.to_path_buf(),
+            kind: crate::config::trust::TrustRootKind::Directory,
+        },
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+
+    let (handle, join, start_permit) = spawn(
+        session.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::computer::guidance::service::GuidanceProposalService::new(Arc::new(
+                session.db.clone(),
+            )),
+        )),
+        Arc::new(LockManager::in_memory(session.db.clone())),
+        redact,
+        model,
+        None,
+        None,
+        None,
+        root.to_path_buf(),
+        test_workspace_root_authority(root, &trust_policy),
+        false,
+        false,
+        &extended,
+        Arc::new(crate::daemon::lsp::LspManager::new()),
+        None,
+        None,
+        #[cfg(feature = "extended")]
+        Arc::new(StdMutex::new(None)),
+        Arc::new(StdMutex::new(None)),
+        None,
+        trust_policy,
+        0,
+        None,
+        Arc::new(tokio::sync::Mutex::new(())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            Default::default(),
+        ),
+        Uuid::now_v7(),
+        std::time::Instant::now(),
+        None,
+        #[cfg(feature = "extended")]
+        crate::daemon::image_runtime::DaemonImageDispatchRegistry::default(),
+        SessionConfigSnapshot::new(0, providers, extended.clone()),
+    )
+    .unwrap();
+
+    let events = handle.subscribe();
+    start_permit.release();
+    (handle, join, events)
+}
+
 #[tokio::test]
 async fn absent_scheduler_is_not_an_error() {
     let tmp = tempfile::tempdir().unwrap();

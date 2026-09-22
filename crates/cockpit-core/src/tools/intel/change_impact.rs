@@ -47,6 +47,10 @@ impl RiskTier {
 
 #[async_trait]
 impl Tool for ChangeImpactTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "change_impact"
     }

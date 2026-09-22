@@ -1271,3 +1271,125 @@ fn stop_continuation_prompt_is_host_internal_and_carries_feedback() {
         "just the reason"
     );
 }
+
+#[tokio::test]
+async fn crash_skip_updates_live_history_without_losing_later_messages() {
+    use crate::db::tool_recovery::{
+        BeginToolExecutionIntent, SKIPPED_TOOL_RECOVERY_BODY, ToolIdempotency,
+    };
+    use rig::message::{
+        AssistantContent, ToolCall, ToolCallId, ToolFunction, ToolResult, ToolResultContent,
+        UserContent,
+    };
+
+    for prior in ["missing", "pending", "healed"] {
+        let (mut driver, _tmp) = test_driver_without_network(1);
+        let call = ToolCall {
+            id: ToolCallId::new_or_mint("crashed-call"),
+            provider: rig::message::ProviderCallId::new("provider-call")
+                .map(|id| id.with_item_id("provider-item")),
+            function: ToolFunction {
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":"echo effect"}),
+            },
+            signature: None,
+            additional_params: None,
+        };
+        driver
+            .session
+            .record_event(
+                crate::db::session_log::SessionEventKind::ToolCallStarted,
+                Some("Build"),
+                Some(call.id.as_str()),
+                &serde_json::json!({
+                    "tool":"bash", "wire_input":call.function.arguments,
+                    "provider_call_id":"provider-call", "provider_item_id":"provider-item",
+                }),
+            )
+            .await
+            .unwrap();
+        let intent = driver
+            .session
+            .db
+            .begin_tool_execution_intent(BeginToolExecutionIntent {
+                session_id: driver.session.live_id(),
+                call_id: call.id.to_string(),
+                tool: "bash".into(),
+                args: call.function.arguments.clone(),
+                generation: 0,
+                idempotency: ToolIdempotency::NotIdempotent,
+                idempotency_key: None,
+            })
+            .await
+            .unwrap();
+        driver
+            .session
+            .db
+            .queue_tool_recovery_decision(&intent)
+            .await
+            .unwrap();
+        let history = &mut driver.stack[0].history;
+        history.push(Message::user("original request"));
+        if prior != "missing" {
+            history.push(Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(call.clone())],
+            });
+        }
+        if prior == "healed" {
+            history.push(Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: call.id.clone(),
+                    provider: call.provider.clone(),
+                    name: "bash".into(),
+                    content: vec![ToolResultContent::text("old wire-only aborted stub")],
+                })],
+            });
+        }
+        history.push(Message::user("later user message"));
+        driver
+            .session
+            .db
+            .begin_tool_recovery_resolution(
+                intent.intent_id,
+                &crate::db::wire::ResolveResponse::Single {
+                    selected_id: "skip".into(),
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        driver
+            .apply_crash_tool_skip(call.id.as_str())
+            .await
+            .unwrap();
+        let once = driver.stack[0].history.clone();
+        driver
+            .apply_crash_tool_skip(call.id.as_str())
+            .await
+            .unwrap();
+        let history = &driver.stack[0].history;
+        assert_eq!(*history, once, "duplicate projection must be harmless");
+        assert!(history.contains(&Message::user("original request")));
+        assert!(history.contains(&Message::user("later user message")));
+        crate::engine::rehydrate::validate_pairing(history).unwrap();
+        let results = history
+            .iter()
+            .flat_map(|message| match message {
+                Message::User { content } => content.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|part| match part {
+                UserContent::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].call, call.id);
+        assert_eq!(results[0].provider, call.provider);
+        assert_eq!(
+            results[0].content,
+            vec![ToolResultContent::text(SKIPPED_TOOL_RECOVERY_BODY)]
+        );
+    }
+}

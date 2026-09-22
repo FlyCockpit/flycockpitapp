@@ -26,6 +26,10 @@ struct TodoArgs {
 
 #[async_trait]
 impl Tool for TodoTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "todo"
     }

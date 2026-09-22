@@ -76,6 +76,10 @@ impl ListPackagesTool {
 
 #[async_trait]
 impl Tool for ListPackagesTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "list-packages"
     }
@@ -202,6 +206,10 @@ enum CloneApproval {
 
 #[async_trait]
 impl Tool for AddPackageTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "add-package"
     }

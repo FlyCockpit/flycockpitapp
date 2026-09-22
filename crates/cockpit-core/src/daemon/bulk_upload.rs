@@ -203,6 +203,7 @@ mod tests {
                         paused_sessions: 0,
                         database_path: ":memory:".to_owned(),
                         schema_version: 0,
+                        pending_recovery_sessions: Vec::new(),
                     },
                 ))
                 .await
@@ -237,6 +238,7 @@ mod tests {
                         paused_sessions: 0,
                         database_path: ":memory:".to_owned(),
                         schema_version: 0,
+                        pending_recovery_sessions: Vec::new(),
                     },
                 ))
                 .await

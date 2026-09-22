@@ -1439,6 +1439,7 @@ mod tests {
                 daemon_version: "0.1.0".to_string(),
                 protocol_version: proto::PROTOCOL_VERSION,
                 paused_sessions: 0,
+                pending_recovery_sessions: Vec::new(),
                 database_path: "/tmp/cockpit.db".to_string(),
                 schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
             },

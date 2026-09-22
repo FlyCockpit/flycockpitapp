@@ -1142,6 +1142,7 @@ mod tests {
                         daemon_version: "test".to_string(),
                         protocol_version: cockpit_proto::PROTOCOL_VERSION,
                         paused_sessions: 0,
+                        pending_recovery_sessions: Vec::new(),
                         database_path: "test.db".to_string(),
                         schema_version: 0,
                     },
@@ -1172,6 +1173,7 @@ mod tests {
                         daemon_version: "test".to_string(),
                         protocol_version: cockpit_proto::PROTOCOL_VERSION,
                         paused_sessions: 0,
+                        pending_recovery_sessions: Vec::new(),
                         database_path: "test.db".to_string(),
                         // Handshake negotiation intentionally ignores database
                         // metadata; keep this socket fixture independent of

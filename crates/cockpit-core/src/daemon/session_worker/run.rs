@@ -6691,6 +6691,9 @@ pub(super) async fn run_worker(
         }
     };
     #[cfg(test)]
+    let root_result =
+        crate::daemon::server::tests::tool_recovery_tests::install_tool(session_id, root_result);
+    #[cfg(test)]
     session.record_booted_root_for_test(&root_result);
     let root = Arc::new(root_result);
     let root_is_vnext = root
@@ -8589,6 +8592,19 @@ pub(super) async fn run_worker(
         );
     }
     // Spawn the driver loop.
+    match driver.replay_crash_tool_intents(&engine_event_tx).await {
+        Ok(replayed) if replayed > 0 => {
+            tracing::info!(%session_id, replayed, "replayed crash-interrupted tool calls");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, %session_id, "crash-interrupted tool replay failed closed");
+            if let Some(gate) = root_activation_gate.as_ref() {
+                gate.abort();
+            }
+            return;
+        }
+    }
     if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
         terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
         return;
@@ -10208,6 +10224,22 @@ pub(super) async fn run_worker(
                     // the live window. Spawn identity stays on `session_id` for
                     // locks, lifecycle, and agent-tree.
                     let conversation_id = session.live_id();
+                    // Apply this before every delivery class and admission
+                    // path, so typing after inspect or from another client
+                    // cannot settle a crash-interrupted call via live healing.
+                    if let Err(error) = crate::engine::rehydrate::ensure_tool_recovery_resolved(
+                        &session.db,
+                        conversation_id,
+                    )
+                    .await
+                    {
+                        let _ = respond_to.send(Err(user_message_database_error(
+                            &error,
+                            proto::ErrorCode::UserMessageNotAccepted,
+                            error.to_string(),
+                        )));
+                        continue;
+                    }
                     // Inline external-root submissions become accepted at the
                     // queue insert below. Oversized submissions have only a
                     // phase-one reservation here; their activity stays owned
@@ -12312,6 +12344,136 @@ pub(super) async fn run_worker(
                             .is_some_and(|permit| permit.belongs_to(live_session_id))
                     {
                         tracing::warn!(%interrupt_id, "rejecting governed network answer without its rendering attachment permit");
+                        interrupts.emit_queue_state().await;
+                        continue;
+                    }
+                    let recovery_resolution = match session
+                        .db
+                        .begin_tool_recovery_resolution(
+                            interrupt_id,
+                            &response,
+                            crate::daemon::supervisor::worker_generation(),
+                        )
+                        .await
+                    {
+                        Ok(resolution) => resolution,
+                        Err(error) => {
+                            tracing::warn!(%error, %interrupt_id, "settling crash-tool recovery answer failed");
+                            interrupts.emit_queue_state().await;
+                            continue;
+                        }
+                    };
+                    if let Some(recovery_resolution) = recovery_resolution {
+                        match recovery_resolution {
+                            crate::db::tool_recovery::ToolRecoveryResolution::Inspect => {
+                                send_current_session_event(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
+                                    proto::Event::Notice {
+                                        session_id,
+                                        text: "Recovery remains pending while you inspect the session; choose rerun or skip when ready.".to_string(),
+                                    },
+                                    NoticeSource::DaemonDirect,
+                                );
+                                interrupts.emit_queue_state().await;
+                                continue;
+                            }
+                            crate::db::tool_recovery::ToolRecoveryResolution::Skip { call_id } => {
+                                let (respond_to, response_rx) = oneshot::channel();
+                                if !send_driver_control_or_fail(
+                                    &driver_control_tx,
+                                    crate::engine::driver::DriverControl::ApplyCrashToolSkip {
+                                        call_id,
+                                        respond_to,
+                                    },
+                                    &event_tx,
+                                    &turn_completions,
+                                    &redaction,
+                                    session_id,
+                                    &mut driver_failed,
+                                )
+                                .await
+                                {
+                                    break WorkerStop::DriverFailed;
+                                }
+                                match response_rx.await {
+                                    Ok(Ok(())) => {}
+                                    result => {
+                                        emit_session_driver_failed_once(
+                                            &event_tx,
+                                            &turn_completions,
+                                            &redaction,
+                                            session_id,
+                                            &mut driver_failed,
+                                            format!(
+                                                "committed crash-skip projection failed: {result:?}"
+                                            ),
+                                        );
+                                        break WorkerStop::DriverFailed;
+                                    }
+                                }
+                            }
+                            crate::db::tool_recovery::ToolRecoveryResolution::Rerun(intent) => {
+                                let (respond_to, response_rx) = oneshot::channel();
+                                let sent = driver_control_tx
+                                    .send(crate::engine::driver::DriverControl::ReplayCrashToolIntent {
+                                        intent_id: intent.intent_id,
+                                        respond_to,
+                                    })
+                                    .await
+                                    .is_ok();
+                                let replayed = if sent {
+                                    matches!(response_rx.await, Ok(Ok(())))
+                                } else {
+                                    false
+                                };
+                                if let Err(error) = session
+                                    .db
+                                    .finish_tool_recovery_rerun(interrupt_id, replayed)
+                                    .await
+                                {
+                                    tracing::warn!(%error, %interrupt_id, "finalizing crash-tool recovery rerun failed");
+                                    interrupts.emit_queue_state().await;
+                                    continue;
+                                }
+                                if !replayed {
+                                    tracing::warn!(%interrupt_id, "crash-tool recovery rerun failed; decision reopened");
+                                    interrupts.emit_queue_state().await;
+                                    continue;
+                                }
+                            }
+                        }
+                        let decision = session
+                            .db
+                            .get_interrupt(interrupt_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|row| {
+                                crate::db::needs_attention::summarize_interrupt_decision(
+                                    &row, &response,
+                                )
+                            });
+                        let seq = decision.as_ref().and_then(|decision| {
+                            record_interrupt_decision_event(
+                                &session,
+                                &redaction,
+                                interrupt_id,
+                                decision,
+                            )
+                        });
+                        send_current_event(
+                            &event_tx,
+                            &redaction,
+                            proto::Event::InterruptResolved {
+                                session_id,
+                                interrupt_id,
+                                decision,
+                                seq,
+                            },
+                        );
+                        interrupts.resolve(interrupt_id, response);
                         interrupts.emit_queue_state().await;
                         continue;
                     }

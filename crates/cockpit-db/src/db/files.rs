@@ -89,6 +89,7 @@ impl DatabaseOwnerLock {
 /// is rejected; there is no check/commit window between those two events.
 pub(crate) struct DatabaseWriterFenceLock {
     file: std::fs::File,
+    local_holders: std::sync::Mutex<usize>,
 }
 
 impl DatabaseWriterFenceLock {
@@ -102,24 +103,43 @@ impl DatabaseWriterFenceLock {
             .open(&lock_path)
             .with_context(|| format!("opening database writer lock {}", lock_path.display()))?;
         repair_private_file(&lock_path, "database writer lock")?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            local_holders: std::sync::Mutex::new(0),
+        })
     }
 
     pub(crate) fn lock(&self) -> Result<DatabaseWriterFenceGuard<'_>> {
-        self.file
+        let mut holders = self
+            .local_holders
             .lock()
-            .context("locking supervised database writer fence")?;
-        Ok(DatabaseWriterFenceGuard { file: &self.file })
+            .map_err(|_| anyhow::anyhow!("database writer fence holder count poisoned"))?;
+        if *holders == 0 {
+            self.file
+                .lock()
+                .context("locking supervised database writer fence")?;
+        }
+        *holders = holders
+            .checked_add(1)
+            .context("database writer fence holder count overflow")?;
+        Ok(DatabaseWriterFenceGuard { lock: self })
     }
 }
 
 pub(crate) struct DatabaseWriterFenceGuard<'a> {
-    file: &'a std::fs::File,
+    lock: &'a DatabaseWriterFenceLock,
 }
 
 impl Drop for DatabaseWriterFenceGuard<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.file.unlock() {
+        let Ok(mut holders) = self.lock.local_holders.lock() else {
+            tracing::error!("database writer fence holder count poisoned during release");
+            return;
+        };
+        *holders = holders.saturating_sub(1);
+        if *holders == 0
+            && let Err(error) = self.lock.file.unlock()
+        {
             tracing::error!(%error, "unlocking supervised database writer fence failed");
         }
     }

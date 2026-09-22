@@ -263,6 +263,12 @@ pub enum DriverControl {
         root_agent: String,
         respond_to: tokio::sync::oneshot::Sender<std::result::Result<usize, String>>,
     },
+    /// Execute one user-authorized rerun of an ambiguous crash intent at the
+    /// driver's safe boundary with its reconstructed toolbox and history.
+    ReplayCrashToolIntent {
+        intent_id: uuid::Uuid,
+        respond_to: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Execute a parked interrupt's persisted tool call through the canonical
     /// ordinary-tool dispatcher, injecting the already-recorded answer at the
     /// interrupt seam so approval/question behavior matches the live path.
@@ -5356,6 +5362,28 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<usize> {
+        self.replay_crash_tool_intents_matching(tx, None).await
+    }
+
+    pub(crate) async fn replay_crash_tool_intent(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+        intent_id: uuid::Uuid,
+    ) -> Result<()> {
+        ensure!(
+            self.replay_crash_tool_intents_matching(tx, Some(intent_id))
+                .await?
+                == 1,
+            "recovery rerun intent was not replayed"
+        );
+        Ok(())
+    }
+
+    async fn replay_crash_tool_intents_matching(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+        only_intent: Option<uuid::Uuid>,
+    ) -> Result<usize> {
         use crate::engine::message::AssistantContent;
 
         let intents = self
@@ -5366,7 +5394,10 @@ impl Driver {
             .into_iter()
             .filter(|intent| intent.session_id == self.session.live_id())
             .filter(|intent| {
-                intent.idempotency != crate::db::tool_recovery::ToolIdempotency::NotIdempotent
+                only_intent.is_some_and(|intent_id| intent.intent_id == intent_id)
+                    || (only_intent.is_none()
+                        && intent.idempotency
+                            != crate::db::tool_recovery::ToolIdempotency::NotIdempotent)
             })
             .collect::<Vec<_>>();
         if intents.is_empty() {
@@ -5483,7 +5514,7 @@ impl Driver {
                 "recovery classification changed for tool `{}`",
                 intent.tool
             );
-            let call = self
+            let durable_call = self
                 .stack
                 .last()
                 .context("driver stack is empty during tool recovery")?
@@ -5501,13 +5532,18 @@ impl Driver {
                         })
                     }
                     _ => None,
-                })
-                .with_context(|| {
-                    format!(
-                        "recovery call `{}` is absent from durable history",
-                        intent.call_id
-                    )
-                })?;
+                });
+            let reconstructed_call = durable_call.is_none();
+            let call = durable_call.unwrap_or_else(|| rig::message::ToolCall {
+                id: rig::message::ToolCallId::new_or_mint(intent.call_id.clone()),
+                provider: None,
+                function: rig::message::ToolFunction {
+                    name: intent.tool.clone(),
+                    arguments: intent.args.clone(),
+                },
+                signature: None,
+                additional_params: None,
+            });
             ensure!(
                 call.function.name == intent.tool,
                 "recovery tool name changed"
@@ -5532,6 +5568,12 @@ impl Driver {
                 hooks: snapshot.hooks(),
             };
             let frame = self.stack.last_mut().context("driver stack is empty")?;
+            if reconstructed_call {
+                frame.history.push(Message::Assistant {
+                    id: None,
+                    content: vec![AssistantContent::ToolCall(call.clone())],
+                });
+            }
             crate::engine::agent::tool_dispatch::execute_ordinary_call(
                 &env,
                 &mut frame.history,
@@ -7290,6 +7332,16 @@ impl Driver {
                     Ok(None) => Ok(0),
                     Err(error) => Err(format!("{error:#}")),
                 };
+                let _ = respond_to.send(result);
+            }
+            DriverControl::ReplayCrashToolIntent {
+                intent_id,
+                respond_to,
+            } => {
+                let result = self
+                    .replay_crash_tool_intent(tx, intent_id)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
                 let _ = respond_to.send(result);
             }
             DriverControl::ReplayParkedInterrupt {

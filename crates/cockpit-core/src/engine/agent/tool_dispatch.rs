@@ -2460,8 +2460,7 @@ async fn execute_ordinary_call_unscoped(
     let ledger_original = ordinary_ledger_args(env, resolved_name, &original);
     let ledger_wire = model_history_args(env, resolved_name, &args);
     scheduler_await_commit().await;
-    let tool_audit_committed = match env
-        .session
+    env.session
         .record_tool_call_journaled(
             ToolCallRow {
                 event_id: Uuid::new_v4(),
@@ -2503,15 +2502,8 @@ async fn execute_ordinary_call_unscoped(
             audit_target_trusted,
         )
         .await
-    {
-        Ok(()) => true,
-        Err(e) => {
-            // Auditing must not break the live conversation. Log and
-            // continue — the model still sees the tool result.
-            tracing::warn!(error = %e, tool = %resolved_name, "persisting tool_call_event failed");
-            false
-        }
-    };
+        .with_context(|| format!("persisting `{resolved_name}` result and closing its intent"))?;
+    let tool_audit_committed = true;
 
     let event_canonical_output = result.as_ref().ok().and_then(|output| {
         (!hard_fail
@@ -3429,8 +3421,15 @@ async fn dispatch_authorized_tool(
     call_id: &str,
 ) -> (Result<ToolOutput>, u64) {
     let tool = env.active_tools.get(resolved_name);
+    let requires_recovery_intent = tool.as_ref().is_some_and(|tool| {
+        !matches!(tool.effect(), crate::engine::tool::ToolEffect::ReadOnly)
+            || !matches!(
+                tool.idempotency(),
+                crate::engine::tool::ToolIdempotency::Idempotent
+            )
+    });
     if let Some(tool) = tool.as_ref()
-        && !matches!(tool.effect(), crate::engine::tool::ToolEffect::ReadOnly)
+        && requires_recovery_intent
     {
         let idempotency = tool.idempotency();
         let existing_intent = match env
@@ -3484,6 +3483,19 @@ async fn dispatch_authorized_tool(
             object.insert("_cockpit_idempotency_key".to_string(), Value::String(key));
         }
     }
+    let _effect_generation_guard = if requires_recovery_intent {
+        match env.session.db.enter_tool_effect_generation().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return (
+                    Err(error.context("entering supervised tool effect generation")),
+                    0,
+                );
+            }
+        }
+    } else {
+        None
+    };
     if resolved_name == "acquire_sealed_value" {
         let started = std::time::Instant::now();
         let result =
@@ -3859,6 +3871,49 @@ mod tests {
                     .unwrap_or_default()
                     .to_string(),
             ))
+        }
+    }
+
+    struct ReadOnlyIntentObservingTool {
+        observed_intent: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for ReadOnlyIntentObservingTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
+        fn name(&self) -> &str {
+            "readonly_with_admission"
+        }
+
+        fn description(&self) -> &str {
+            "Test that recovery intent precedes a nominally read-only call."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn effect(&self) -> crate::engine::tool::ToolEffect {
+            crate::engine::tool::ToolEffect::ReadOnly
+        }
+
+        async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+            let call_id = ctx
+                .current_tool_call_id
+                .as_ref()
+                .context("test tool call id missing")?
+                .to_string();
+            let intent = ctx
+                .session
+                .db
+                .tool_execution_intent_for_call(ctx.session.live_id(), call_id)
+                .await?;
+            self.observed_intent
+                .store(intent.is_some(), Ordering::SeqCst);
+            Ok(ToolOutput::text("observed"))
         }
     }
 
@@ -5286,6 +5341,57 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
         assert_eq!(rows[0].output, "hello");
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_readonly_tool_has_intent_before_call_and_closes_with_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed_intent = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(ReadOnlyIntentObservingTool {
+            observed_intent: observed_intent.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("readonly_with_admission", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "readonly_with_admission",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(observed_intent.load(Ordering::SeqCst));
+        assert!(
+            session
+                .db
+                .tool_execution_intent_for_call(session.id, call.id.to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "result transaction must close the observed intent"
+        );
     }
 
     #[tokio::test]

@@ -192,9 +192,20 @@ struct WriteRequest {
     reply: WriteReplySink,
 }
 
+#[derive(Clone)]
 struct SupervisedWriterFence {
     generation: u64,
-    lock: files::DatabaseWriterFenceLock,
+    lock: Arc<files::DatabaseWriterFenceLock>,
+}
+
+/// Keeps one supervised tool effect inside the generation that authorized it.
+///
+/// The guard is deliberately opaque. While it is alive a successor cannot
+/// advance the process-independent generation fence, so a file, process, or
+/// outbound effect either completes in the predecessor generation or never
+/// starts there.
+pub struct ToolEffectGenerationGuard<'a> {
+    _guard: files::DatabaseWriterFenceGuard<'a>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -646,6 +657,7 @@ pub struct Db {
     _owner_lock: Option<Arc<files::DatabaseOwnerLock>>,
     _diagnostic_lock: Option<Arc<files::DatabaseDiagnosticLock>>,
     read_only: bool,
+    supervised_fence: Option<SupervisedWriterFence>,
     /// Process-local revocation fence for history disclosure. A reader keeps
     /// the shared permit until its tool call returns; a consent mutation takes
     /// the exclusive side before its SQLite write can commit.
@@ -926,7 +938,7 @@ impl Db {
         reconcile_interrupted_sealed_value_acquisitions(&conn)?;
         let supervised_fence = generation
             .map(|generation| -> Result<_> {
-                let lock = files::DatabaseWriterFenceLock::open(path)?;
+                let lock = Arc::new(files::DatabaseWriterFenceLock::open(path)?);
                 {
                     let _guard = lock.lock()?;
                     tool_recovery::advance_writer_generation(&conn, generation)?;
@@ -944,7 +956,7 @@ impl Db {
             conn,
             writer_capacity,
             durable_enqueue_timeout,
-            supervised_fence,
+            supervised_fence.clone(),
         )?;
         let db = Self {
             memory: None,
@@ -955,6 +967,7 @@ impl Db {
             _owner_lock: owner_lock,
             _diagnostic_lock: None,
             read_only: false,
+            supervised_fence,
             history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
             monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
         };
@@ -1048,6 +1061,7 @@ impl Db {
             _owner_lock: None,
             _diagnostic_lock: None,
             read_only: false,
+            supervised_fence: None,
             history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
             monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
         };
@@ -1145,6 +1159,7 @@ impl Db {
             _owner_lock: None,
             _diagnostic_lock: diagnostic_lock,
             read_only: true,
+            supervised_fence: None,
             history_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
             monty_network_egress_gate: Arc::new(tokio::sync::RwLock::new(())),
         })

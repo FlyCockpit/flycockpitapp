@@ -106,7 +106,30 @@ pub struct BeginToolExecutionIntent {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolRecoveryResolution {
+    Inspect,
+    Skip,
+    Rerun(Box<ToolExecutionIntent>),
+}
+
 impl Db {
+    /// Fence the actual host/external effect, not only its later SQLite result.
+    /// Unsupervised and in-memory handles have no overlapping generation and
+    /// therefore need no guard.
+    pub async fn enter_tool_effect_generation(
+        &self,
+    ) -> Result<Option<super::ToolEffectGenerationGuard<'_>>> {
+        let Some(fence) = self.supervised_fence.as_ref() else {
+            return Ok(None);
+        };
+        let guard = fence.lock.lock()?;
+        let generation = fence.generation;
+        self.read(move |conn| verify_writer_generation(conn, generation))
+            .await?;
+        Ok(Some(super::ToolEffectGenerationGuard { _guard: guard }))
+    }
+
     /// Commit the intent before the caller crosses the tool's effect boundary.
     pub async fn begin_tool_execution_intent(
         &self,
@@ -262,8 +285,10 @@ impl Db {
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, recovery_intent_id, agent_id, description,
                   state, question_json, raised_at)
-                 VALUES (?1, ?2, ?3, 'recovery', ?4, 'open', ?5, ?6)
-                 ON CONFLICT(recovery_intent_id) DO NOTHING",
+                VALUES (?1, ?2, ?3, 'recovery', ?4, 'open', ?5, ?6)
+                 ON CONFLICT(recovery_intent_id) DO UPDATE SET
+                    state='open', resolved_at=NULL, response_json=NULL
+                  WHERE needs_attention.state IN ('executing', 'interrupted', 'resolved')",
                 params![
                     interrupt_id.to_string(),
                     session_id.to_string(),
@@ -277,6 +302,118 @@ impl Db {
         })
         .await?;
         Ok(interrupt_id)
+    }
+
+    /// Apply a recovery answer at the durable intent/interrupt authority.
+    /// `inspect` deliberately leaves both records open. `skip` resolves and
+    /// closes them atomically. `rerun` claims the intent for this generation
+    /// and marks the prompt executing until the driver reports completion.
+    pub async fn begin_tool_recovery_resolution(
+        &self,
+        interrupt_id: Uuid,
+        response: &crate::db::wire::ResolveResponse,
+        generation: u64,
+    ) -> Result<Option<ToolRecoveryResolution>> {
+        let selected_id = match response {
+            crate::db::wire::ResolveResponse::Single { selected_id } => selected_id.clone(),
+            _ => return Ok(None),
+        };
+        if !matches!(selected_id.as_str(), "rerun" | "skip" | "inspect") {
+            return Ok(None);
+        }
+        let response_json = serde_json::to_string(response)?;
+        self.transaction(move |conn| {
+            let recovery_intent_id: Option<String> = conn
+                .query_row(
+                    "SELECT recovery_intent_id FROM needs_attention
+                      WHERE interrupt_id=?1 AND state='open'",
+                    [interrupt_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let Some(recovery_intent_id) = recovery_intent_id else {
+                return Ok(None);
+            };
+            ensure!(
+                recovery_intent_id == interrupt_id.to_string(),
+                "recovery interrupt is not bound to its intent id"
+            );
+            let mut intent = load_for_intent_conn(conn, interrupt_id)?
+                .context("recovery interrupt has no open tool intent")?;
+            ensure!(
+                intent.idempotency == ToolIdempotency::NotIdempotent,
+                "recovery answer targets a replay-safe intent"
+            );
+            match selected_id.as_str() {
+                "inspect" => Ok(Some(ToolRecoveryResolution::Inspect)),
+                "skip" => {
+                    let now = Utc::now().timestamp();
+                    conn.execute(
+                        "UPDATE needs_attention SET state='resolved', resolved_at=?2,
+                                response_json=?3 WHERE interrupt_id=?1 AND state='open'",
+                        params![interrupt_id.to_string(), now, response_json],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM tool_execution_intents WHERE intent_id=?1",
+                        [interrupt_id.to_string()],
+                    )?;
+                    Ok(Some(ToolRecoveryResolution::Skip))
+                }
+                "rerun" => {
+                    let changed = conn.execute(
+                        "UPDATE tool_execution_intents SET generation=?2
+                          WHERE intent_id=?1 AND generation<=?2",
+                        params![interrupt_id.to_string(), i64::try_from(generation)?],
+                    )?;
+                    ensure!(changed == 1, "recovery rerun generation claim raced");
+                    conn.execute(
+                        "UPDATE needs_attention SET state='executing', response_json=?2
+                          WHERE interrupt_id=?1 AND state='open'",
+                        params![interrupt_id.to_string(), response_json],
+                    )?;
+                    intent.generation = generation;
+                    Ok(Some(ToolRecoveryResolution::Rerun(Box::new(intent))))
+                }
+                _ => unreachable!(),
+            }
+        })
+        .await
+    }
+
+    pub async fn finish_tool_recovery_rerun(
+        &self,
+        interrupt_id: Uuid,
+        succeeded: bool,
+    ) -> Result<()> {
+        self.transaction(move |conn| {
+            if succeeded {
+                let remains: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1 FROM tool_execution_intents WHERE intent_id=?1",
+                        [interrupt_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                ensure!(
+                    remains.is_none(),
+                    "recovery rerun did not commit its tool result"
+                );
+                conn.execute(
+                    "UPDATE needs_attention SET state='resolved', resolved_at=?2
+                      WHERE interrupt_id=?1 AND state='executing'",
+                    params![interrupt_id.to_string(), Utc::now().timestamp()],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE needs_attention SET state='open', response_json=NULL
+                      WHERE interrupt_id=?1 AND state='executing'",
+                    [interrupt_id.to_string()],
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     pub async fn sessions_with_pending_tool_recovery(&self) -> Result<Vec<Uuid>> {
@@ -317,6 +454,19 @@ fn load_for_call_conn(
                 generation, idempotency, idempotency_key
            FROM tool_execution_intents WHERE session_id=?1 AND call_id=?2",
         params![session_id.to_string(), call_id],
+        decode_intent,
+    )
+    .optional()?
+    .map(TryInto::try_into)
+    .transpose()
+}
+
+fn load_for_intent_conn(conn: &Connection, intent_id: Uuid) -> Result<Option<ToolExecutionIntent>> {
+    conn.query_row(
+        "SELECT intent_id, session_id, marker, call_id, tool, args_hash, args_json,
+                generation, idempotency, idempotency_key
+           FROM tool_execution_intents WHERE intent_id=?1",
+        [intent_id.to_string()],
         decode_intent,
     )
     .optional()?
@@ -376,7 +526,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     const CRASH_MATRIX_PROCESS_TEST: &str =
         "db::tool_recovery::tests::crash_matrix_kills_worker_process_at_each_boundary";
 
@@ -452,6 +602,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(committed, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_answers_inspect_skip_and_rerun_change_the_durable_intent() {
+        use crate::db::wire::ResolveResponse;
+
+        let db = Db::open_in_memory().unwrap();
+        let session_id = session(&db).await;
+
+        let inspect = db
+            .begin_tool_execution_intent(begin(
+                session_id,
+                "inspect-call",
+                ToolIdempotency::NotIdempotent,
+            ))
+            .await
+            .unwrap();
+        db.queue_tool_recovery_decision(&inspect).await.unwrap();
+        assert_eq!(
+            db.begin_tool_recovery_resolution(
+                inspect.intent_id,
+                &ResolveResponse::Single {
+                    selected_id: "inspect".into(),
+                },
+                2,
+            )
+            .await
+            .unwrap(),
+            Some(ToolRecoveryResolution::Inspect)
+        );
+        assert!(
+            db.tool_execution_intent_for_call(session_id, "inspect-call".into())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            db.sessions_with_pending_tool_recovery().await.unwrap(),
+            vec![session_id]
+        );
+
+        let skipped = db
+            .begin_tool_execution_intent(begin(
+                session_id,
+                "skip-call",
+                ToolIdempotency::NotIdempotent,
+            ))
+            .await
+            .unwrap();
+        db.queue_tool_recovery_decision(&skipped).await.unwrap();
+        assert_eq!(
+            db.begin_tool_recovery_resolution(
+                skipped.intent_id,
+                &ResolveResponse::Single {
+                    selected_id: "skip".into(),
+                },
+                2,
+            )
+            .await
+            .unwrap(),
+            Some(ToolRecoveryResolution::Skip)
+        );
+        assert!(
+            db.tool_execution_intent_for_call(session_id, "skip-call".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let rerun = db
+            .begin_tool_execution_intent(begin(
+                session_id,
+                "rerun-call",
+                ToolIdempotency::NotIdempotent,
+            ))
+            .await
+            .unwrap();
+        db.queue_tool_recovery_decision(&rerun).await.unwrap();
+        let resolution = db
+            .begin_tool_recovery_resolution(
+                rerun.intent_id,
+                &ResolveResponse::Single {
+                    selected_id: "rerun".into(),
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        let Some(ToolRecoveryResolution::Rerun(claimed)) = resolution else {
+            panic!("rerun was not claimed");
+        };
+        assert_eq!(claimed.generation, 2);
+        assert_eq!(
+            db.get_interrupt(rerun.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::needs_attention::InterruptState::Executing
+        );
+        db.finish_tool_recovery_rerun(rerun.intent_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.sessions_with_pending_tool_recovery().await.unwrap(),
+            vec![session_id]
+        );
     }
 
     #[tokio::test]
@@ -550,6 +807,61 @@ mod tests {
         assert_eq!(winner, 22);
     }
 
+    #[tokio::test]
+    async fn tool_effect_generation_blocks_successor_and_allows_nested_db_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let predecessor = Db::open_supervised_worker_for_test(&path, 1).unwrap();
+        let session_id = session(&predecessor).await;
+        let guard = predecessor
+            .enter_tool_effect_generation()
+            .await
+            .unwrap()
+            .unwrap();
+
+        predecessor
+            .begin_tool_execution_intent(begin(
+                session_id,
+                "nested-write",
+                ToolIdempotency::NotIdempotent,
+            ))
+            .await
+            .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let successor_path = path.clone();
+        let successor = std::thread::spawn(move || {
+            let opened = Db::open_supervised_worker_for_test(&successor_path, 2);
+            tx.send(opened).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "successor advanced while predecessor effect guard was live"
+        );
+        drop(guard);
+        let successor_db = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        successor.join().unwrap();
+        drop(successor_db);
+
+        let error = predecessor
+            .begin_tool_execution_intent(begin(
+                session_id,
+                "stale-write",
+                ToolIdempotency::NotIdempotent,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::super::WriterGenerationFenced>()
+                .is_some()
+        );
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum CrashPoint {
         BeforeIntent,
@@ -579,7 +891,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     async fn record_persistent_fake_effect(db: &Db, class: ToolIdempotency, key: Option<&str>) {
         let receipt = match class {
             ToolIdempotency::Idempotent => "semantic-value-1".to_string(),
@@ -609,7 +921,7 @@ mod tests {
         .unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     async fn persistent_fake_effect_count(
         db: &Db,
         class: ToolIdempotency,
@@ -634,7 +946,7 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     async fn run_crash_matrix_child() -> bool {
         let Ok(crash) = std::env::var("COCKPIT_441_CHILD_CRASH") else {
             return false;
@@ -669,7 +981,7 @@ mod tests {
         true
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     async fn kill_worker_at_boundary(
         path: &std::path::Path,
         session_id: Uuid,
@@ -700,7 +1012,7 @@ mod tests {
         assert!(!status.success(), "worker must be terminated at {crash}");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[tokio::test]
     async fn crash_matrix_kills_worker_process_at_each_boundary() {
         if run_crash_matrix_child().await {

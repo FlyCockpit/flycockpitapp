@@ -5674,7 +5674,6 @@ pub(crate) async fn boot_supervised_worker(
     let mut timer = crate::startup::PhaseTimer::start("daemon::boot");
     let db = Db::open_supervised_worker_default(crate::daemon::supervisor::worker_generation())
         .context("opening supervised session DB")?;
-    reconcile_crash_interrupted_tools(&db).await?;
     let services = boot_with_db(
         paths,
         db,
@@ -5724,6 +5723,7 @@ pub(crate) async fn boot_with_db(
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
     config_source: crate::daemon::config_source::ConfigSource,
 ) -> Result<BootServices> {
+    reconcile_crash_interrupted_tools(&db).await?;
     let locked = LockedServices::prepare(paths, db, terminal_factory, config_source).await?;
     timer.phase("locked_services");
     let vault_authority_exists = locked.vault_authority_exists()?;

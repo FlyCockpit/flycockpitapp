@@ -12328,6 +12328,102 @@ pub(super) async fn run_worker(
                         interrupts.emit_queue_state().await;
                         continue;
                     }
+                    let recovery_resolution = match session
+                        .db
+                        .begin_tool_recovery_resolution(
+                            interrupt_id,
+                            &response,
+                            crate::daemon::supervisor::worker_generation(),
+                        )
+                        .await
+                    {
+                        Ok(resolution) => resolution,
+                        Err(error) => {
+                            tracing::warn!(%error, %interrupt_id, "settling crash-tool recovery answer failed");
+                            interrupts.emit_queue_state().await;
+                            continue;
+                        }
+                    };
+                    if let Some(recovery_resolution) = recovery_resolution {
+                        match recovery_resolution {
+                            crate::db::tool_recovery::ToolRecoveryResolution::Inspect => {
+                                send_current_session_event(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
+                                    proto::Event::Notice {
+                                        session_id,
+                                        text: "Recovery remains pending while you inspect the session; choose rerun or skip when ready.".to_string(),
+                                    },
+                                    NoticeSource::DaemonDirect,
+                                );
+                                interrupts.emit_queue_state().await;
+                                continue;
+                            }
+                            crate::db::tool_recovery::ToolRecoveryResolution::Skip => {}
+                            crate::db::tool_recovery::ToolRecoveryResolution::Rerun(intent) => {
+                                let (respond_to, response_rx) = oneshot::channel();
+                                let sent = driver_control_tx
+                                    .send(crate::engine::driver::DriverControl::ReplayCrashToolIntent {
+                                        intent_id: intent.intent_id,
+                                        respond_to,
+                                    })
+                                    .await
+                                    .is_ok();
+                                let replayed = if sent {
+                                    matches!(response_rx.await, Ok(Ok(())))
+                                } else {
+                                    false
+                                };
+                                if let Err(error) = session
+                                    .db
+                                    .finish_tool_recovery_rerun(interrupt_id, replayed)
+                                    .await
+                                {
+                                    tracing::warn!(%error, %interrupt_id, "finalizing crash-tool recovery rerun failed");
+                                    interrupts.emit_queue_state().await;
+                                    continue;
+                                }
+                                if !replayed {
+                                    tracing::warn!(%interrupt_id, "crash-tool recovery rerun failed; decision reopened");
+                                    interrupts.emit_queue_state().await;
+                                    continue;
+                                }
+                            }
+                        }
+                        let decision = session
+                            .db
+                            .get_interrupt(interrupt_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|row| {
+                                crate::db::needs_attention::summarize_interrupt_decision(
+                                    &row, &response,
+                                )
+                            });
+                        let seq = decision.as_ref().and_then(|decision| {
+                            record_interrupt_decision_event(
+                                &session,
+                                &redaction,
+                                interrupt_id,
+                                decision,
+                            )
+                        });
+                        send_current_event(
+                            &event_tx,
+                            &redaction,
+                            proto::Event::InterruptResolved {
+                                session_id,
+                                interrupt_id,
+                                decision,
+                                seq,
+                            },
+                        );
+                        interrupts.resolve(interrupt_id, response);
+                        interrupts.emit_queue_state().await;
+                        continue;
+                    }
                     // A QuestionTool interrupt is both the legacy continuation
                     // rendezvous and an AgentTree decision.  Settle the latter
                     // first; only a successful/idempotent terminal receipt may

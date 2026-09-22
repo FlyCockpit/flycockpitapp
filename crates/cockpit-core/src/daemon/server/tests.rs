@@ -3,6 +3,9 @@
 #[path = "provider_onboarding_settlement_tests.rs"]
 mod provider_onboarding_settlement_tests;
 
+#[path = "tool_recovery_tests.rs"]
+pub(crate) mod tool_recovery_tests;
+
 use super::{attachments::*, authz::*, dispatch::*, sessions::*, *};
 use crate::{
     daemon::{
@@ -24,42 +27,6 @@ use std::{
 use std::{io::Write as _, sync::Mutex as StdMutex};
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
-
-#[tokio::test]
-async fn daemon_status_after_recovery_lists_the_pending_session() {
-    let ctx = test_ctx();
-    let session_id = ctx
-        .db
-        .create_session("project", "/workspace", "pilot")
-        .await
-        .unwrap()
-        .session_id;
-    ctx.db
-        .begin_tool_execution_intent(crate::db::tool_recovery::BeginToolExecutionIntent {
-            session_id,
-            call_id: "crash-call".into(),
-            tool: "bash".into(),
-            args: serde_json::json!({"command": "printf done"}),
-            generation: 1,
-            idempotency: crate::db::tool_recovery::ToolIdempotency::NotIdempotent,
-            idempotency_key: None,
-        })
-        .await
-        .unwrap();
-    reconcile_crash_interrupted_tools(&ctx.db).await.unwrap();
-
-    let response = dispatch_matrix_request(&ctx, Request::DaemonStatus)
-        .await
-        .unwrap();
-    let Response::DaemonStatus {
-        pending_recovery_sessions,
-        ..
-    } = response
-    else {
-        panic!("expected daemon status");
-    };
-    assert_eq!(pending_recovery_sessions, vec![session_id]);
-}
 
 fn test_principal_tx_sender() -> &'static tokio::sync::watch::Sender<ClientPrincipal> {
     static HOLDER: std::sync::OnceLock<(

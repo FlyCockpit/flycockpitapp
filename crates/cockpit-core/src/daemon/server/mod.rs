@@ -9785,7 +9785,7 @@ pub(crate) mod sessions;
 mod sessions_remote;
 pub(crate) mod storage;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg(test)]
 pub(crate) use tests::{disk_test_ctx, test_ctx};
 

@@ -225,6 +225,17 @@ impl Db {
         .await
     }
 
+    /// Calls whose pairing is still owned by replay or a recovery decision.
+    pub fn open_tool_execution_call_ids_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut statement =
+            conn.prepare("SELECT call_id FROM tool_execution_intents WHERE session_id=?1")?;
+        let rows = statement.query_map([session_id.to_string()], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
     pub async fn tool_execution_intent_for_call(
         &self,
         session_id: Uuid,
@@ -351,7 +362,8 @@ impl Db {
                     let now = Utc::now().timestamp();
                     conn.execute(
                         "UPDATE needs_attention SET state='resolved', resolved_at=?2,
-                                response_json=?3 WHERE interrupt_id=?1 AND state='open'",
+                                recovery_intent_id=NULL, response_json=?3
+                          WHERE interrupt_id=?1 AND state='open'",
                         params![interrupt_id.to_string(), now, response_json],
                     )?;
                     conn.execute(
@@ -435,6 +447,17 @@ impl Db {
         session_id: Uuid,
         call_id: &str,
     ) -> Result<()> {
+        // Preserve the answer receipt and settle it in the result transaction.
+        // Detach before deleting the intent: a crash between result commit and
+        // worker notification must neither erase the receipt nor reopen it.
+        conn.execute(
+            "UPDATE needs_attention SET state='resolved', resolved_at=?3,
+                    recovery_intent_id=NULL
+              WHERE recovery_intent_id IN (
+                  SELECT intent_id FROM tool_execution_intents
+                   WHERE session_id=?1 AND call_id=?2)",
+            params![session_id.to_string(), call_id, Utc::now().timestamp()],
+        )?;
         conn.execute(
             "DELETE FROM tool_execution_intents WHERE session_id=?1 AND call_id=?2",
             params![session_id.to_string(), call_id],
@@ -671,6 +694,18 @@ mod tests {
                 .is_none()
         );
 
+        let skip_receipt = db.get_interrupt(skipped.intent_id).await.unwrap().unwrap();
+        assert_eq!(
+            skip_receipt.state,
+            crate::db::needs_attention::InterruptState::Resolved
+        );
+        assert_eq!(
+            skip_receipt.response,
+            Some(ResolveResponse::Single {
+                selected_id: "skip".into()
+            })
+        );
+
         let rerun = db
             .begin_tool_execution_intent(begin(
                 session_id,
@@ -708,6 +743,70 @@ mod tests {
         assert_eq!(
             db.sessions_with_pending_tool_recovery().await.unwrap(),
             vec![session_id]
+        );
+        let response = ResolveResponse::Single {
+            selected_id: "rerun".into(),
+        };
+        assert!(matches!(
+            db.begin_tool_recovery_resolution(rerun.intent_id, &response, 2)
+                .await
+                .unwrap(),
+            Some(ToolRecoveryResolution::Rerun(_))
+        ));
+        let rolled_back = db
+            .transaction(move |conn| -> Result<()> {
+                Db::close_tool_execution_intent_for_result_conn(conn, session_id, "rerun-call")?;
+                anyhow::bail!("result transaction rollback");
+            })
+            .await;
+        assert!(rolled_back.is_err());
+        assert_eq!(
+            db.get_interrupt(rerun.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::needs_attention::InterruptState::Executing
+        );
+        assert!(
+            db.tool_execution_intent_for_call(session_id, "rerun-call".into())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        db.transaction(move |conn| {
+            Db::close_tool_execution_intent_for_result_conn(conn, session_id, "rerun-call")
+        })
+        .await
+        .unwrap();
+        // Simulate a crash before the worker calls finish: the committed result
+        // has already settled the decision and preserved its answer.
+        let receipt = db.get_interrupt(rerun.intent_id).await.unwrap().unwrap();
+        assert_eq!(
+            receipt.state,
+            crate::db::needs_attention::InterruptState::Resolved
+        );
+        assert_eq!(receipt.response, Some(response));
+        assert!(receipt.resolved_at.is_some());
+        assert!(
+            db.tool_execution_intent_for_call(session_id, "rerun-call".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.finish_tool_recovery_rerun(rerun.intent_id, false)
+            .await
+            .unwrap();
+        db.finish_tool_recovery_rerun(rerun.intent_id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_interrupt(rerun.intent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::needs_attention::InterruptState::Resolved
         );
     }
 

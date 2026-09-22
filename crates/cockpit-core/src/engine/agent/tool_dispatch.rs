@@ -3420,6 +3420,9 @@ async fn dispatch_authorized_tool(
     mut args: Value,
     call_id: &str,
 ) -> (Result<ToolOutput>, u64) {
+    #[cfg(test)]
+    crate::daemon::server::tests::tool_recovery_tests::checkpoint(env.session.id, "before_intent")
+        .await;
     let tool = env.active_tools.get(resolved_name);
     let requires_recovery_intent = tool.as_ref().is_some_and(|tool| {
         !matches!(tool.effect(), crate::engine::tool::ToolEffect::ReadOnly)
@@ -3483,6 +3486,9 @@ async fn dispatch_authorized_tool(
             object.insert("_cockpit_idempotency_key".to_string(), Value::String(key));
         }
     }
+    #[cfg(test)]
+    crate::daemon::server::tests::tool_recovery_tests::checkpoint(env.session.id, "after_intent")
+        .await;
     let _effect_generation_guard = if requires_recovery_intent {
         match env.session.db.enter_tool_effect_generation().await {
             Ok(guard) => guard,
@@ -3496,7 +3502,7 @@ async fn dispatch_authorized_tool(
     } else {
         None
     };
-    if resolved_name == "acquire_sealed_value" {
+    let result = if resolved_name == "acquire_sealed_value" {
         let started = std::time::Instant::now();
         let result =
             crate::engine::trusted_child_acquisition_coordinator::run_parent_acquisition_tool(
@@ -3513,7 +3519,11 @@ async fn dispatch_authorized_tool(
             Some(call_id),
         )
         .await
-    }
+    };
+    #[cfg(test)]
+    crate::daemon::server::tests::tool_recovery_tests::checkpoint(env.session.id, "after_result")
+        .await;
+    result
 }
 
 fn render_unavailable_tool_artifact_frame(
@@ -3543,7 +3553,7 @@ fn render_unavailable_tool_artifact_frame(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         approval::{Approver, store::GrantStore},
@@ -5341,6 +5351,44 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
         assert_eq!(rows[0].output, "hello");
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn dispatch_crash_matrix_call(
+        session: Arc<Session>,
+        root: &std::path::Path,
+        tools: ToolBox,
+        call: ToolCall,
+    ) {
+        let agent = test_agent(tools.clone());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(64);
+        let ctx = tool_ctx(session.clone(), root, &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: root,
+        };
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            &call.function.name,
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+        panic!("crash checkpoint did not stop dispatch");
     }
 
     #[tokio::test]

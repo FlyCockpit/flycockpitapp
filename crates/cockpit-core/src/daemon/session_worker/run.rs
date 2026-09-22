@@ -6691,6 +6691,9 @@ pub(super) async fn run_worker(
         }
     };
     #[cfg(test)]
+    let root_result =
+        crate::daemon::server::tests::tool_recovery_tests::install_tool(session_id, root_result);
+    #[cfg(test)]
     session.record_booted_root_for_test(&root_result);
     let root = Arc::new(root_result);
     let root_is_vnext = root

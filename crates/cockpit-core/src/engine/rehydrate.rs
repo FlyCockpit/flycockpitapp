@@ -270,6 +270,7 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
     }
     let tool_calls = Db::list_tool_calls_for_session_conn(conn, session_id)
         .map_err(|e| anyhow!("loading tool calls for rehydration: {e}"))?;
+    let recovery_calls = Db::open_tool_execution_call_ids_conn(conn, session_id)?;
     let scheduler_continuations = Db::list_turn_scheduler_continuations_conn(conn, session_id)
         .map_err(|e| anyhow!("loading turn scheduler continuations for rehydration: {e}"))?;
 
@@ -290,10 +291,13 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
         &events,
         &tool_calls,
         &scheduler_continuations,
-        root_agent,
-        session_id,
         &mut heals,
-        policy,
+        RebuildContext {
+            root_agent,
+            session_id,
+            policy,
+            recovery_calls: &recovery_calls,
+        },
     )?;
     if history.is_empty() {
         // No recorded turns — a fresh session, nothing to rehydrate.
@@ -309,21 +313,23 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
         redaction,
     )?;
 
-    // Heal pass (implementation note): stub honest
-    // results for orphan tool_uses and drop orphan tool_results so the
-    // pairing is provider-valid, degrading gracefully instead of dead-ending.
-    if policy.is_strict() {
-        detect_responses_identity_gaps(&history)?;
-    } else {
-        heal_pairing(&mut history, &mut heals);
+    // Recovery owns these unfinished pairs. Validate all other history, but
+    // neither synthesize a result nor demand Responses repair for an open
+    // intent. The driver will supply the real result after replay/decision.
+    if !policy.is_strict() {
+        heal_pairing_deferred(
+            &mut history,
+            &[],
+            &recovery_calls,
+            ABORTED_CALL_BODY,
+            &mut heals,
+        );
     }
-
-    // Provider-validity gate: every tool_use must have a paired
-    // tool_result, and vice-versa, or the provider rejects the request. After
-    // the heal pass this is a final assertion (defense-in-depth) — a failure
-    // here is a genuine bug in the heal, and must never fire in normal
-    // operation.
-    validate_pairing(&history)?;
+    let settled_history = history_without_recovery_calls(&history, &recovery_calls);
+    if policy.is_strict() {
+        detect_responses_identity_gaps(&settled_history)?;
+    }
+    validate_pairing(&settled_history)?;
 
     // Re-apply the prune ledger so the rebuilt history returns in pruned
     // form. A missing/corrupt/inconsistent ledger falls back to the full
@@ -2366,6 +2372,7 @@ fn append_interrupted_scheduler_continuation(
     pending: &mut PendingTurn,
     continuation: &crate::db::turn_scheduler_continuations::TurnSchedulerContinuationRow,
     durable_tool_call: Option<&ToolCallEvent>,
+    recovery_owned: bool,
 ) {
     pending.scheduler_source_order.insert(
         continuation.call_id.clone(),
@@ -2390,6 +2397,9 @@ fn append_interrupted_scheduler_continuation(
         additional_params: None,
     };
     pending.calls.push(call.clone());
+    if recovery_owned {
+        return;
+    }
     pending.results.push((
         call.id,
         provider,
@@ -2409,15 +2419,26 @@ fn append_interrupted_scheduler_continuation(
     ));
 }
 
+struct RebuildContext<'a> {
+    root_agent: &'a str,
+    session_id: Uuid,
+    policy: RehydratePolicy,
+    recovery_calls: &'a std::collections::HashSet<String>,
+}
+
 fn rebuild_history(
     events: &[SessionEventRow],
     tool_calls: &[ToolCallEvent],
     scheduler_continuations: &[crate::db::turn_scheduler_continuations::TurnSchedulerContinuationRow],
-    root_agent: &str,
-    session_id: Uuid,
     heals: &mut Vec<Recovery>,
-    policy: RehydratePolicy,
+    context: RebuildContext<'_>,
 ) -> Result<Vec<Message>> {
+    let RebuildContext {
+        root_agent,
+        session_id,
+        policy,
+        recovery_calls,
+    } = context;
     // A scheduler plan durably claims every original source call id before
     // execution. If a worker dies before a real tool/task row settles one of
     // them, recovery pairs that exact id with a scheduler-specific interruption
@@ -2557,6 +2578,19 @@ fn rebuild_history(
         })
         .filter_map(|event| event.call_id.clone())
         .collect::<std::collections::HashSet<_>>();
+    // A recovery attempt can append the result event for an identity already
+    // present in the interrupted transcript. Keep its original position and
+    // use the final event's canonical projection, exactly once.
+    let tool_event_by_call = events
+        .iter()
+        .filter(|event| {
+            event.kind == "tool_call"
+                && event.agent.as_deref() == Some(root_agent)
+                && !is_mcp_child_event(event)
+        })
+        .filter_map(|event| event.call_id.as_deref().map(|id| (id, event)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut rebuilt_tool_calls = std::collections::HashSet::new();
     let mut anchored_scheduler_turns = std::collections::HashSet::new();
 
     for ev in events {
@@ -2589,6 +2623,10 @@ fn rebuild_history(
                 let Some(call_id) = ev.call_id.as_deref() else {
                     return Err(anyhow!("tool_call event without a call_id (corrupt row)"));
                 };
+                if !rebuilt_tool_calls.insert(call_id) {
+                    continue;
+                }
+                let ev = tool_event_by_call.get(call_id).copied().unwrap_or(ev);
                 // Oversized forced skills are durably accepted with the user
                 // envelope first, then their synthetic audit row is applied.
                 // Live dispatch still presents the native seed pair before
@@ -2703,6 +2741,34 @@ fn rebuild_history(
                             .push((call.id, provider, tc.tool.clone(), result_content));
                     }
                     None => {
+                        if recovery_calls.contains(call_id) {
+                            let provider = event_provider_call_id(ev)
+                                .and_then(ProviderCallId::new)
+                                .map(|provider| match event_provider_item_id(ev) {
+                                    Some(item_id) => provider.with_item_id(item_id),
+                                    None => provider,
+                                });
+                            pending.calls.push(ToolCall {
+                                id: ToolCallId::new_or_mint(call_id.to_string()),
+                                provider,
+                                function: ToolFunction {
+                                    name: ev
+                                        .data
+                                        .get("tool")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    arguments: ev
+                                        .data
+                                        .get("wire_input")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null),
+                                },
+                                signature: None,
+                                additional_params: None,
+                            });
+                            continue;
+                        }
                         if scheduler_owned_calls.contains(call_id) {
                             let tool = ev
                                 .data
@@ -3051,6 +3117,7 @@ fn rebuild_history(
                             &mut pending,
                             continuation,
                             tc_by_id.get(continuation.call_id.as_str()).copied(),
+                            recovery_calls.contains(&continuation.call_id),
                         );
                     }
                 }
@@ -3076,6 +3143,7 @@ fn rebuild_history(
             &mut pending,
             continuation,
             tc_by_id.get(continuation.call_id.as_str()).copied(),
+            recovery_calls.contains(&continuation.call_id),
         );
     }
     // Flush the final assistant turn (+ results), if any.
@@ -3254,6 +3322,7 @@ fn stub_result_message(call: &ToolCall, body: &str) -> Message {
 /// not-yet-pushed `prompt` so a structural tool's own driver-injected result
 /// (delivered out of band as that `prompt`) is treated as covering its
 /// tool_use rather than being wrongly stubbed.
+#[cfg(test)]
 fn heal_pairing(history: &mut Vec<Message>, heals: &mut Vec<Recovery>) {
     heal_pairing_pending(history, &[], ABORTED_CALL_BODY, heals);
 }
@@ -3270,6 +3339,44 @@ fn heal_pairing(history: &mut Vec<Message>, heals: &mut Vec<Recovery>) {
 fn heal_pairing_pending(
     history: &mut Vec<Message>,
     pending_results: &[String],
+    orphan_body: &str,
+    heals: &mut Vec<Recovery>,
+) {
+    heal_pairing_deferred(
+        history,
+        pending_results,
+        &Default::default(),
+        orphan_body,
+        heals,
+    );
+}
+
+fn history_without_recovery_calls(
+    history: &[Message],
+    recovery_calls: &std::collections::HashSet<String>,
+) -> Vec<Message> {
+    history
+        .iter()
+        .filter_map(|message| {
+            let mut message = message.clone();
+            if let Message::Assistant { content, .. } = &mut message {
+                content.retain(|part| {
+                    !matches!(part, AssistantContent::ToolCall(call)
+                if recovery_calls.contains(call.id.as_str()))
+                });
+                if content.is_empty() {
+                    return None;
+                }
+            }
+            Some(message)
+        })
+        .collect()
+}
+
+fn heal_pairing_deferred(
+    history: &mut Vec<Message>,
+    pending_results: &[String],
+    recovery_calls: &std::collections::HashSet<String>,
     orphan_body: &str,
     heals: &mut Vec<Recovery>,
 ) {
@@ -3378,7 +3485,9 @@ fn heal_pairing_pending(
                 }
                 // `j` is the insertion point (just past the result run).
                 for call in &calls {
-                    if !covered.contains(&call.id.to_string()) {
+                    if !covered.contains(&call.id.to_string())
+                        && !recovery_calls.contains(call.id.as_str())
+                    {
                         history.insert(j, stub_result_message(call, orphan_body));
                         j += 1;
                         heals.push(Recovery::ResumeHeal {

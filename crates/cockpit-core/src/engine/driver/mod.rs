@@ -1393,6 +1393,9 @@ pub struct Driver {
     goal_root_turn: Option<(uuid::Uuid, i64, uuid::Uuid)>,
     goal_scratch: Option<cockpit_host::goal_scratch::GoalScratchRoot>,
     pending_idle_reason: Option<crate::engine::IdleReason>,
+    /// Once observed, recovery owns admission until this driver projects the
+    /// committed skip/rerun result. The worker's DB commit alone cannot release it.
+    tool_recovery_projection_pending: bool,
     /// Interrupt wakeup hub (GOALS §3b) threaded into every tool call so
     /// the `question` tool can block on a human answer. Defaults to a
     /// [`detached`](crate::engine::interrupt::InterruptHub::detached) hub
@@ -2521,6 +2524,7 @@ impl Driver {
             // Forks never own or clean the root driver's supervised-goal scratch.
             goal_scratch: None,
             pending_idle_reason: self.pending_idle_reason.clone(),
+            tool_recovery_projection_pending: self.tool_recovery_projection_pending,
             interrupts: self.interrupts.clone(),
             skills_no_utility_model_logged: self.skills_no_utility_model_logged,
             injection_no_scan_logged: self.injection_no_scan_logged,
@@ -2922,6 +2926,7 @@ impl Driver {
             goal_root_turn: None,
             goal_scratch: None,
             pending_idle_reason: None,
+            tool_recovery_projection_pending: false,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             skills_no_utility_model_logged: false,
             injection_no_scan_logged: false,
@@ -5381,6 +5386,7 @@ impl Driver {
                 == 1,
             "recovery rerun intent was not replayed"
         );
+        self.refresh_tool_recovery_admission().await?;
         Ok(())
     }
 
@@ -5450,6 +5456,7 @@ impl Driver {
                 })],
             },
         );
+        self.refresh_tool_recovery_admission().await?;
         Ok(())
     }
 
@@ -6472,8 +6479,14 @@ impl Driver {
             // post-select idle tail (shadow brief / auto-compact) is the
             // same ownership window: compact replaces history without
             // settling the in-memory plan.
-            let waiting_for_keep_parked_siblings =
-                self.persist_on_reentry_owns_started_unsettled_siblings();
+            let waiting_for_tool_recovery = self.park_for_tool_recovery().await?;
+            if waiting_for_tool_recovery {
+                // Publish a normal intervention idle without binding or settling
+                // any queued turn. Recovery controls remain live in the select.
+                self.emit_turn_idle_if_settled(tx).await;
+            }
+            let waiting_for_turn_admission = waiting_for_tool_recovery
+                || self.persist_on_reentry_owns_started_unsettled_siblings();
             // Ready human input takes priority over a previously completed
             // noninteractive result before the boundary select runs. Deferred
             // input remains owned by the queue but must not suppress idle work
@@ -6485,10 +6498,10 @@ impl Driver {
             // arms explicitly; the biased select remains the honest arbiter
             // only for input that becomes ready after this snapshot.
             let assistant_inbox_timers_armed =
-                !waiting_for_keep_parked_siblings && !human_input_already_ready;
+                !waiting_for_turn_admission && !human_input_already_ready;
             assistant_inbox_defer_heartbeat.set_armed(assistant_inbox_timers_armed);
             assistant_inbox_idle_poll.set_armed(assistant_inbox_timers_armed);
-            if !waiting_for_keep_parked_siblings
+            if !waiting_for_turn_admission
                 && !self.pending_noninteractive_completions.is_empty()
                 && !human_input_already_ready
                 && self
@@ -6535,7 +6548,7 @@ impl Driver {
                 // for a driver that intentionally refuses the message arm.
                 _ = input_queue.wait_closed() => break,
                 msg = input_queue.recv_group_order_for(Some(&active_target_id)),
-                    if !waiting_for_keep_parked_siblings => {
+                    if !waiting_for_turn_admission => {
                     goal_watchdog = None;
                     let Some(first) = msg else { break };
                     // Fold anything else that's already queued behind the
@@ -6656,7 +6669,7 @@ impl Driver {
                     }
                 }
                 ev = self.job_event_rx.recv(),
-                    if !waiting_for_keep_parked_siblings => {
+                    if !waiting_for_turn_admission => {
                     goal_watchdog = None;
                     match ev {
                         Some(event) => {
@@ -6671,7 +6684,7 @@ impl Driver {
                 }
                 completion = self.noninteractive_complete_rx.recv() => {
                     goal_watchdog = None;
-                    if waiting_for_keep_parked_siblings {
+                    if waiting_for_turn_admission {
                         // Receive so the bounded job channel cannot stall, but
                         // do not finalize/claim/inject: Inline would push into
                         // the open tool_call group and AsyncUser would treat
@@ -6713,7 +6726,7 @@ impl Driver {
                         Some(timer) => timer.as_mut().await,
                         None => std::future::pending().await,
                     }
-                }, if !waiting_for_keep_parked_siblings => {
+                }, if !waiting_for_turn_admission => {
                     goal_watchdog = None;
                     match self.goal_usage_limit_watchdog_action().await? {
                         GoalUsageLimitWatchdogAction::AutoResume => {
@@ -6754,7 +6767,7 @@ impl Driver {
             // history on that tail.
             let settled_user_turn =
                 self.current_lifecycle_turn_id.is_some() || self.pending_idle_reason.is_some();
-            if !waiting_for_keep_parked_siblings && settled_user_turn {
+            if !waiting_for_turn_admission && settled_user_turn {
                 self.maybe_shadow_brief(tx).await;
                 self.maybe_auto_compact(tx).await;
                 self.maybe_schedule_keep_warm().await;
@@ -7716,7 +7729,9 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+        if self.park_for_tool_recovery().await?
+            || self.persist_on_reentry_owns_started_unsettled_siblings()
+        {
             // A keep-parked goal-root turn is not finished: do not take
             // `goal_root_turn` or dispatch a new root turn until persist-on-
             // re-entry has CAS-committed every started sibling.
@@ -8032,7 +8047,9 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        if self.persist_on_reentry_owns_started_unsettled_siblings() {
+        if self.park_for_tool_recovery().await?
+            || self.persist_on_reentry_owns_started_unsettled_siblings()
+        {
             // Do not `begin_goal_root_turn` before `run_user_input`: keep-park
             // `Ok(())` would leave this owner set and the next
             // `maybe_continue_active_goal` would finish a turn that never ran.
@@ -10384,6 +10401,15 @@ impl Driver {
         &self,
         include_deferred: bool,
     ) -> Result<Option<(String, Vec<Uuid>)>> {
+        if self.tool_recovery_projection_pending
+            || crate::engine::rehydrate::tool_recovery_pending(
+                &self.session.db,
+                self.session.live_id(),
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         let items = self
             .session
             .db
@@ -11295,6 +11321,13 @@ impl Driver {
         cancel: tokio_util::sync::CancellationToken,
         input_queue: &crate::engine::message::UserSubmissionQueue,
     ) -> std::result::Result<String, String> {
+        if self
+            .park_for_tool_recovery()
+            .await
+            .map_err(|error| format!("{error:#}"))?
+        {
+            return Ok("skipped: pending tool recovery decision".to_string());
+        }
         let elapsed = chrono::Utc::now()
             .timestamp_millis()
             .saturating_sub(cache_send_identity.unix_millis)
@@ -12649,6 +12682,39 @@ impl Driver {
         Ok(())
     }
 
+    /// An ambiguous crash effect owns the next turn boundary. Keep normal
+    /// work pending while the recovery controls resolve that ownership.
+    async fn park_for_tool_recovery(&mut self) -> Result<bool> {
+        self.tool_recovery_projection_pending |= crate::engine::rehydrate::tool_recovery_pending(
+            &self.session.db,
+            self.session.live_id(),
+        )
+        .await?;
+        if self.tool_recovery_projection_pending {
+            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
+                code: "pending_tool_recovery".to_string(),
+            });
+        }
+        Ok(self.tool_recovery_projection_pending)
+    }
+
+    async fn refresh_tool_recovery_admission(&mut self) -> Result<()> {
+        let pending = crate::engine::rehydrate::tool_recovery_pending(
+            &self.session.db,
+            self.session.live_id(),
+        )
+        .await?;
+        self.tool_recovery_projection_pending = pending;
+        if !pending
+            && matches!(self.pending_idle_reason.as_ref(),
+                Some(crate::engine::IdleReason::NeedsIntervention { code })
+                    if code == "pending_tool_recovery")
+        {
+            self.pending_idle_reason = None;
+        }
+        Ok(())
+    }
+
     pub async fn run_user_input(
         &mut self,
         submission: UserSubmission,
@@ -12675,6 +12741,17 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        if self.park_for_tool_recovery().await? {
+            // This entry also serves direct callers outside the idle loop.
+            // No receipt, transcript, media ownership, or finish may change
+            // for a submission that has not been admitted.
+            if !submission.queue_item_ids.is_empty() {
+                input_rx
+                    .requeue_front(submission, self.active_queue_target())
+                    .await;
+            }
+            return Ok(());
+        }
         if self.persist_on_reentry_owns_started_unsettled_siblings() {
             // User submissions are not persist-on-re-entry paired bodies.
             // Leave history unchanged and put a queued payload back so the

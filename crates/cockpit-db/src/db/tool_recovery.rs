@@ -437,7 +437,7 @@ impl Db {
         self.read(|conn| {
             let mut statement = conn.prepare(
                 "SELECT DISTINCT session_id FROM needs_attention
-                  WHERE recovery_intent_id IS NOT NULL AND state IN ('open', 'parked')
+                  WHERE recovery_intent_id IS NOT NULL AND state IN ('open', 'parked', 'executing')
                   ORDER BY session_id",
             )?;
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
@@ -922,6 +922,11 @@ mod tests {
             panic!("rerun was not claimed");
         };
         assert_eq!(claimed.generation, 2);
+        assert_eq!(
+            db.sessions_with_pending_tool_recovery().await.unwrap(),
+            vec![session_id],
+            "claiming rerun must not admit turns before its result commits"
+        );
         assert_eq!(
             db.get_interrupt(rerun.intent_id)
                 .await

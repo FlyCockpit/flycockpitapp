@@ -3515,13 +3515,18 @@ fn heal_pairing_deferred(
 /// can synthesize a result or the provider can interpret the call as settled.
 pub(crate) async fn ensure_tool_recovery_resolved(db: &Db, session_id: Uuid) -> Result<()> {
     anyhow::ensure!(
-        !db.sessions_with_pending_tool_recovery()
-            .await
-            .context("checking pending tool recovery decisions")?
-            .contains(&session_id),
+        !tool_recovery_pending(db, session_id).await?,
         "This session has a pending tool recovery decision; choose rerun or skip before sending another message. Inspect keeps the decision pending."
     );
     Ok(())
+}
+
+pub(crate) async fn tool_recovery_pending(db: &Db, session_id: Uuid) -> Result<bool> {
+    Ok(db
+        .sessions_with_pending_tool_recovery()
+        .await
+        .context("checking pending tool recovery decisions")?
+        .contains(&session_id))
 }
 
 /// Live pre-send pairing heal (implementation note).

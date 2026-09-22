@@ -14,6 +14,191 @@ fn event_harness() -> (
     (queue, turn_tx, turn_rx)
 }
 
+#[tokio::test]
+async fn pending_recovery_defers_driver_owned_work_without_mutation() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("must wait for recovery".into()))
+        .repeat_last()
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let (queue, tx, mut events) = event_harness();
+    let db = driver.session.db.clone();
+    let session_id = driver.session.live_id();
+    let intent = db
+        .begin_tool_execution_intent(crate::db::tool_recovery::BeginToolExecutionIntent {
+            session_id,
+            call_id: "pending-call".into(),
+            tool: "bash".into(),
+            args: serde_json::json!({"command":"echo effect"}),
+            generation: 0,
+            idempotency: crate::db::tool_recovery::ToolIdempotency::NotIdempotent,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    db.queue_tool_recovery_decision(&intent).await.unwrap();
+    let goal = db
+        .create_session_goal(
+            session_id,
+            &driver.session.project_id,
+            "pending goal",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    insert_pending_assistant_inbox_item(&driver, "immediate", "immediate work").await;
+    insert_pending_assistant_inbox_item(&driver, "defer", "deferred work").await;
+    let history = driver.stack[0].history.clone();
+    let transcript = db.list_session_events(session_id).await.unwrap();
+    let (queued_id, _) = queue
+        .push(
+            UserSubmission::text("accepted queued work"),
+            driver.active_queue_target(),
+        )
+        .await;
+    let submission = queue.recv().await.unwrap();
+    driver
+        .run_user_input_with_leading_history(
+            submission,
+            vec![Message::user("leading folded work")],
+            Vec::new(),
+            true,
+            &queue,
+            &tx,
+        )
+        .await
+        .unwrap();
+    let snapshot = queue.snapshot().await;
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].id, queued_id);
+    assert_eq!(
+        snapshot[0].status,
+        crate::proto_crate::QueueItemStatus::Queued
+    );
+    assert_eq!(
+        queue.pending_submission(queued_id).await.unwrap().text,
+        "accepted queued work"
+    );
+    assert_eq!(queue.accepted_receipts(&[queued_id]).await.len(), 1);
+    for origin in [
+        crate::engine::message::SubmissionOrigin::Internal,
+        crate::engine::message::SubmissionOrigin::GoalContinuation,
+        crate::engine::message::SubmissionOrigin::ScheduledJob,
+    ] {
+        let mut submission = UserSubmission::text("driver-originated work");
+        submission.origin = origin;
+        driver
+            .run_user_input(submission, &queue, &tx)
+            .await
+            .unwrap();
+    }
+    driver
+        .dispatch_goal_root_turn(&goal, &queue, &tx)
+        .await
+        .unwrap();
+    driver
+        .maybe_continue_active_goal(&queue, &tx)
+        .await
+        .unwrap();
+    assert!(driver.goal_root_turn.is_none());
+    let root_turn_count: i64 = db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM goal_root_turns WHERE goal_id = ?1",
+                [goal.id.to_string()],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        root_turn_count, 0,
+        "a deferred goal cannot begin or finish a root turn"
+    );
+    assert!(
+        driver
+            .claim_assistant_inbox_text(true)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !driver
+            .try_deliver_immediate_assistant_inbox(&queue, &tx, &mut None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.claim_assistant_inbox_for_delivery(session_id, true)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "both immediate and deferred inbox items must remain unacknowledged"
+    );
+    assert_eq!(driver.stack[0].history, history);
+    assert_eq!(
+        db.list_session_events(session_id).await.unwrap().len(),
+        transcript.len()
+    );
+    assert!(
+        db.list_tool_calls_for_session(session_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(provider.request_count(), 0);
+    driver.emit_turn_idle_if_settled(&tx).await;
+    assert!(
+        matches!(events.recv().await.unwrap(), TurnEvent::AgentIdle {
+        turn_id: None,
+        reason: crate::engine::IdleReason::NeedsIntervention { code },
+    } if code == "pending_tool_recovery")
+    );
+    db.begin_tool_recovery_resolution(
+        intent.intent_id,
+        &crate::db::wire::ResolveResponse::Single {
+            selected_id: "skip".into(),
+        },
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.sessions_with_pending_tool_recovery()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let after_commit = db.list_session_events(session_id).await.unwrap().len();
+    // Simulate a control arriving between the worker's durable skip commit
+    // and ApplyCrashToolSkip. Admission remains owned by the live projection.
+    driver
+        .run_user_input(queue.recv().await.unwrap(), &queue, &tx)
+        .await
+        .unwrap();
+    assert_eq!(driver.stack[0].history, history);
+    assert_eq!(queue.snapshot().await[0].id, queued_id);
+    assert_eq!(
+        db.list_session_events(session_id).await.unwrap().len(),
+        after_commit
+    );
+    assert_eq!(provider.request_count(), 0);
+    assert!(
+        driver
+            .claim_assistant_inbox_text(true)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    driver.apply_crash_tool_skip("pending-call").await.unwrap();
+    assert!(!driver.park_for_tool_recovery().await.unwrap());
+    crate::engine::rehydrate::validate_pairing(&driver.stack[0].history).unwrap();
+}
+
 async fn insert_pending_assistant_inbox_item(driver: &Driver, delivery: &str, summary: &str) {
     let db = driver.session.db.clone();
     db.upsert_assistant("inbox-source", "/tmp/inbox-source", "{}", &"0".repeat(64))

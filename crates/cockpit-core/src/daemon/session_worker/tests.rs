@@ -3630,10 +3630,27 @@ pub(crate) fn spawn_recovery_test_worker(
     root: &std::path::Path,
     responses: bool,
 ) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
+    let (handle, join, _) = spawn_recovery_test_worker_with_url(session, root, responses, None);
+    (handle, join)
+}
+
+pub(crate) fn spawn_recovery_test_worker_with_url(
+    session: Arc<Session>,
+    root: &std::path::Path,
+    responses: bool,
+    provider_url: Option<String>,
+) -> (
+    SessionWorkerHandle,
+    tokio::task::JoinHandle<()>,
+    crate::daemon::EventReceiver,
+) {
     session
         .set_active_model("lmstudio", "session-model")
         .unwrap();
     let mut providers = lmstudio_test_providers();
+    if let Some(url) = provider_url {
+        providers.providers.get_mut("lmstudio").unwrap().url = url;
+    }
     if responses {
         providers.providers.get_mut("lmstudio").unwrap().wire_api =
             crate::config::providers::WireApi::Responses;
@@ -3704,8 +3721,9 @@ pub(crate) fn spawn_recovery_test_worker(
     )
     .unwrap();
 
+    let events = handle.subscribe();
     start_permit.release();
-    (handle, join)
+    (handle, join, events)
 }
 
 #[tokio::test]

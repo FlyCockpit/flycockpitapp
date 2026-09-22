@@ -110,6 +110,7 @@ fn test_daemon_status_response() -> Response {
         paused_sessions: 0,
         database_path: "test.db".into(),
         schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+        pending_recovery_sessions: Vec::new(),
     }
 }
 

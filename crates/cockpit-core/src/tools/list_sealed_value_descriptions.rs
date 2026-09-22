@@ -16,6 +16,10 @@ pub struct ListSealedValueDescriptionsTool;
 
 #[async_trait]
 impl Tool for ListSealedValueDescriptionsTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         crate::sealed::LIST_SEALED_VALUE_DESCRIPTIONS_TOOL
     }

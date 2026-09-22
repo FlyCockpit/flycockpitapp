@@ -4820,6 +4820,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::engine::tool::Tool for ModelEphemeralHistoryTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "model_ephemeral_history"
         }

@@ -21,6 +21,7 @@ fn daemon_status_response_with(
         paused_sessions: 0,
         database_path: ":memory:".to_string(),
         schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+        pending_recovery_sessions: Vec::new(),
     }
 }
 

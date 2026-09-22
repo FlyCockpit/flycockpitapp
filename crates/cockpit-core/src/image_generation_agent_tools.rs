@@ -864,6 +864,10 @@ pub struct ListImageGenerationTargetsTool;
 
 #[async_trait::async_trait]
 impl Tool for ListImageGenerationTargetsTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "list_image_generation_targets"
     }
@@ -996,6 +1000,10 @@ pub struct GenerateImageTool;
 
 #[async_trait::async_trait]
 impl Tool for GenerateImageTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "generate_image"
     }
@@ -1315,6 +1323,10 @@ pub struct GetImageGenerationJobTool;
 
 #[async_trait::async_trait]
 impl Tool for GetImageGenerationJobTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "get_image_generation_job"
     }
@@ -1403,6 +1415,10 @@ pub struct CancelImageGenerationJobTool;
 
 #[async_trait::async_trait]
 impl Tool for CancelImageGenerationJobTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "cancel_image_generation_job"
     }

@@ -11,6 +11,10 @@ pub struct DelegationPayloadRetrieveTool;
 
 #[async_trait]
 impl Tool for DelegationPayloadRetrieveTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "delegation_payload_retrieve"
     }

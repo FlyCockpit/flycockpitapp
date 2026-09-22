@@ -1508,6 +1508,34 @@ CREATE TABLE tool_call_events (
     -- parent_call_id is denormalized attribution (including scrubbed
     -- placeholders after journal failure) and is not a hard parent pointer.
 );
+
+-- Crash-proof ordinary-tool dispatch. The singleton generation row is the
+-- durable writer fence advanced by each supervised worker before readiness.
+CREATE TABLE worker_generation_fence (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    generation INTEGER NOT NULL CHECK (generation >= 0)
+);
+
+CREATE TABLE tool_execution_intents (
+    intent_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    marker INTEGER NOT NULL CHECK (marker >= 0),
+    call_id TEXT NOT NULL,
+    tool TEXT NOT NULL CHECK (length(tool) BETWEEN 1 AND 256),
+    args_hash TEXT NOT NULL CHECK (length(args_hash) = 64),
+    args_json TEXT NOT NULL CHECK (
+        json_valid(args_json)
+        AND length(CAST(args_json AS BLOB)) <= 8388608
+    ),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    idempotency TEXT NOT NULL CHECK (idempotency IN ('idempotent', 'idempotent_with_key', 'not_idempotent')),
+    idempotency_key TEXT,
+    opened_at_unix_ms INTEGER NOT NULL,
+    UNIQUE(session_id, call_id),
+    CHECK ((idempotency = 'idempotent_with_key') = (idempotency_key IS NOT NULL))
+);
+CREATE INDEX idx_tool_execution_intents_session_marker
+    ON tool_execution_intents(session_id, marker, intent_id);
 -- Leading-timestamp index for retention sweeps (issue #308): deletes filter on timestamp alone for closed sessions; a session_id-leading index cannot satisfy that predicate without a full scan.
 CREATE INDEX idx_tool_call_events_retention_ts ON tool_call_events (timestamp);
 
@@ -2681,6 +2709,7 @@ END;
 CREATE TABLE needs_attention (
     interrupt_id   TEXT    PRIMARY KEY,
     session_id     TEXT    NOT NULL,
+    recovery_intent_id TEXT UNIQUE REFERENCES tool_execution_intents(intent_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     -- Human-readable executor/profile name for display only. Never use this
     -- mutable/shared label to choose a parked continuation.
     agent_id       TEXT    NOT NULL,

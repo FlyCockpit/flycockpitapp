@@ -1270,6 +1270,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for ReadFixtureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::Idempotent
+        }
+
         fn name(&self) -> &str {
             "read"
         }
@@ -1293,6 +1297,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for RevisionFailureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "write"
         }
@@ -1323,6 +1331,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for NamedFixtureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             &self.name
         }

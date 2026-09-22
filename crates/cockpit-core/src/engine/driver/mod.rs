@@ -5350,6 +5350,202 @@ impl Driver {
         Ok(())
     }
 
+    /// Replay open crash intents only after the session's exact root toolbox,
+    /// config snapshot, custody, and durable history have been reconstructed.
+    pub(crate) async fn replay_crash_tool_intents(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<usize> {
+        use crate::engine::message::AssistantContent;
+
+        let intents = self
+            .session
+            .db
+            .list_open_tool_execution_intents()
+            .await?
+            .into_iter()
+            .filter(|intent| intent.session_id == self.session.live_id())
+            .filter(|intent| {
+                intent.idempotency != crate::db::tool_recovery::ToolIdempotency::NotIdempotent
+            })
+            .collect::<Vec<_>>();
+        if intents.is_empty() {
+            return Ok(0);
+        }
+
+        let agent = self
+            .stack
+            .last()
+            .context("driver stack is empty during tool recovery")?
+            .agent
+            .clone();
+        let active_tools =
+            crate::engine::agent::turn_toolbox(&agent, &self.session, &self.cwd, &self.config)
+                .await;
+        let media_available = active_tools.has_direct_native_media();
+        let ctx = crate::engine::tool::ToolCtx {
+            agent_id: agent.name.clone(),
+            allowed_knowledge_bases: agent
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.allowed_knowledge_bases())
+                .cloned(),
+            executing_model_trusted: !agent.delegated && agent.model.is_trusted(),
+            knowledge_access_trusted: agent.model.is_trusted(),
+            caller_model: Some(crate::engine::tool::CallerModel::from_model(
+                agent.model.as_ref(),
+            )),
+            agent_instance_id: self.stack.last().and_then(|frame| frame.agent_instance_id),
+            lock_identity: agent.lock_identity.clone(),
+            write_scope: agent.write_scope.clone(),
+            dream_read_scope: self.dream_read_scope.clone(),
+            workspace_lease: agent.workspace_lease.clone(),
+            current_tool_call_id: None,
+            current_tool_call_scope: Some("crash-tool-recovery".to_string()),
+            tool_steering: agent.tool_steering,
+            locks: self.locks.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            redact: self.redact.clone(),
+            interrupts: self.interrupts.clone(),
+            cancel: self.live_or_session_cancel(),
+            shutdown_gate: agent.model.shutdown_gate(),
+            approver: self.approver.clone(),
+            #[cfg(feature = "extended")]
+            image_generation_dispatch: self.session.image_generation_dispatch(),
+            transcription_dispatch: self.session.transcription_dispatch(
+                agent.model.provider_id(),
+                agent.model.model_id_ref(),
+                self.config.generation(),
+            ),
+            deferred_log: self
+                .stack
+                .last()
+                .context("driver stack is empty during tool recovery")?
+                .deferred_log
+                .clone(),
+            root_agent_frame: true,
+            skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
+            review_cage: None,
+            context_usage: Some(self.context_usage_snapshot()),
+            available_tools: Arc::new(
+                active_tools
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            mcp_builtin_registry: active_tools.mcp_builtin_registry_for_context(&agent.name),
+            has_tree: active_tools.get("code").is_some(),
+            has_bash: active_tools.get("bash").is_some(),
+            events: Some(tx.clone()),
+            lsp: self.lsp.clone(),
+            resource_scheduler: self.resource_scheduler.clone(),
+            media_authority: if media_available {
+                self.session.tool_media_authority()
+            } else {
+                None
+            },
+            media_availability: {
+                let snapshot = self.config.snapshot();
+                let providers = self.config.providers();
+                crate::tool_media_authority::MediaToolAvailability::from_spawn_inputs(
+                    media_available && self.session.tool_media_authority().is_some(),
+                    &snapshot.host_capabilities,
+                    &providers,
+                    agent.model.provider_id(),
+                    agent.model.model_id_ref(),
+                )
+            },
+            env_overlay: agent.env_overlay.clone(),
+            config: self.config.clone(),
+            mcp_resolver: agent.mcp_resolver.clone(),
+        };
+        let snapshot = self.config.snapshot();
+        let mut replayed = 0;
+        for intent in intents {
+            let tool = active_tools.get(&intent.tool).with_context(|| {
+                format!("recovery tool `{}` is no longer registered", intent.tool)
+            })?;
+            let current_class = match tool.idempotency() {
+                crate::engine::tool::ToolIdempotency::Idempotent => {
+                    crate::db::tool_recovery::ToolIdempotency::Idempotent
+                }
+                crate::engine::tool::ToolIdempotency::IdempotentWithKey => {
+                    crate::db::tool_recovery::ToolIdempotency::IdempotentWithKey
+                }
+                crate::engine::tool::ToolIdempotency::NotIdempotent => {
+                    crate::db::tool_recovery::ToolIdempotency::NotIdempotent
+                }
+            };
+            ensure!(
+                current_class == intent.idempotency,
+                "recovery classification changed for tool `{}`",
+                intent.tool
+            );
+            let call = self
+                .stack
+                .last()
+                .context("driver stack is empty during tool recovery")?
+                .history
+                .iter()
+                .find_map(|message| match message {
+                    Message::Assistant { content, .. } => {
+                        content.iter().find_map(|part| match part {
+                            AssistantContent::ToolCall(call)
+                                if call.id.as_str() == intent.call_id =>
+                            {
+                                Some(call.clone())
+                            }
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .with_context(|| {
+                    format!(
+                        "recovery call `{}` is absent from durable history",
+                        intent.call_id
+                    )
+                })?;
+            ensure!(
+                call.function.name == intent.tool,
+                "recovery tool name changed"
+            );
+            ensure!(
+                call.function.arguments == intent.args,
+                "recovery arguments changed"
+            );
+            let env = crate::engine::agent::tool_dispatch::DispatchEnv {
+                agent: &agent,
+                session: &self.session,
+                model: &agent.model,
+                active_tools: &active_tools,
+                ctx: &ctx,
+                tx,
+                hint_corrections: crate::engine::agent::hint_tool_call_corrections_enabled(
+                    &self.session,
+                    &self.config,
+                ),
+                loop_guard_threshold: self.loop_guard_threshold,
+                cwd: &self.cwd,
+                hooks: snapshot.hooks(),
+            };
+            let frame = self.stack.last_mut().context("driver stack is empty")?;
+            crate::engine::agent::tool_dispatch::execute_ordinary_call(
+                &env,
+                &mut frame.history,
+                &call,
+                &intent.tool,
+                crate::db::tool_calls::Recovery::Clean,
+                None,
+            )
+            .await?;
+            replayed += 1;
+        }
+        Ok(replayed)
+    }
+
     /// Run seed calls that were declared in the interactive child's durable
     /// history before its first model inference.  Recovery reuses the same
     /// declarations and call IDs, so publication never depends on the

@@ -6,6 +6,10 @@ pub(in crate::tools::intel) struct CircularTool;
 
 #[async_trait]
 impl Tool for CircularTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "graph"
     }

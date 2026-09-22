@@ -1162,6 +1162,9 @@ pub enum Response {
         protocol_version: u32,
         #[serde(default)]
         paused_sessions: u32,
+        /// Sessions blocked on an explicit crash-recovery choice.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_recovery_sessions: Vec<Uuid>,
         /// Resolved backing SQLite path used by this daemon process.
         #[serde(default)]
         database_path: String,
@@ -1955,6 +1958,36 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_status_round_trips_pending_recovery_sessions() {
+        let session_id = Uuid::parse_str("00000000-0000-0000-0000-000000000441").unwrap();
+        let response = Response::DaemonStatus {
+            pid: 41,
+            uptime_secs: 2,
+            active_sessions: 1,
+            socket_path: "cockpit.sock".into(),
+            daemon_version: crate::DAEMON_VERSION.into(),
+            protocol_version: crate::PROTOCOL_VERSION,
+            paused_sessions: 0,
+            pending_recovery_sessions: vec![session_id],
+            database_path: "cockpit.db".into(),
+            schema_version: 1,
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+        let decoded: Response = serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(
+            value["data"]["pending_recovery_sessions"][0],
+            session_id.to_string()
+        );
+        assert!(matches!(
+            decoded,
+            Response::DaemonStatus { pending_recovery_sessions, .. }
+                if pending_recovery_sessions == vec![session_id]
+        ));
+    }
 
     #[test]
     fn mcp_oauth_wire_responses_are_opaque_to_tokens() {

@@ -5487,6 +5487,10 @@ struct SchedulerReadProbe;
 
 #[async_trait::async_trait]
 impl crate::engine::tool::Tool for SchedulerReadProbe {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "scheduler_read_probe"
     }
@@ -5514,6 +5518,10 @@ impl crate::engine::tool::Tool for SchedulerReadProbe {
 
 #[async_trait::async_trait]
 impl crate::engine::tool::Tool for SchedulerSerialBarrier {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "scheduler_serial_barrier"
     }

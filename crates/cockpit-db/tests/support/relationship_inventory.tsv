@@ -1625,6 +1625,7 @@ local	needs_attention	parked_verification_json	non_relationship
 local	needs_attention	question_json	non_relationship
 local	needs_attention	questions_json	non_relationship
 local	needs_attention	raised_at	non_relationship
+local	needs_attention	recovery_intent_id	foreign
 local	needs_attention	resolved_at	non_relationship
 local	needs_attention	response_json	non_relationship
 local	needs_attention	revision	non_relationship
@@ -2351,6 +2352,17 @@ local	tool_call_stats	severity	non_relationship
 local	tool_call_stats	shape_fingerprint	non_relationship
 local	tool_call_stats	timestamp	non_relationship
 local	tool_call_stats	tool	denormalized
+local	tool_execution_intents	args_hash	non_relationship
+local	tool_execution_intents	args_json	non_relationship
+local	tool_execution_intents	call_id	non_relationship
+local	tool_execution_intents	generation	non_relationship
+local	tool_execution_intents	idempotency	non_relationship
+local	tool_execution_intents	idempotency_key	external
+local	tool_execution_intents	intent_id	primary
+local	tool_execution_intents	marker	non_relationship
+local	tool_execution_intents	opened_at_unix_ms	non_relationship
+local	tool_execution_intents	session_id	foreign
+local	tool_execution_intents	tool	denormalized
 local	tool_media_authorization_epochs	created_at	non_relationship
 local	tool_media_authorization_epochs	epoch	non_relationship
 local	tool_media_authorization_epochs	issuer_kind	primary
@@ -2479,6 +2491,8 @@ local	verification_synthesis_artifacts	ordinal	primary
 local	verification_synthesis_artifacts	source_artifact_ordinal	foreign
 local	verification_synthesis_artifacts	source_candidate_id	foreign
 local	verification_synthesis_artifacts	synthesis_id	foreign
+local	worker_generation_fence	generation	non_relationship
+local	worker_generation_fence	singleton	primary
 local	workspace_history_scopes	inbound_enabled	non_relationship
 local	workspace_history_scopes	outbound_enabled	non_relationship
 local	workspace_history_scopes	project_id	primary

@@ -33,6 +33,10 @@ pub struct PlanWriteTool;
 
 #[async_trait]
 impl Tool for WriteTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "write"
     }
@@ -376,6 +380,10 @@ pub(crate) fn bounded_pre_write_content(
 
 #[async_trait]
 impl Tool for PlanWriteTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "write"
     }

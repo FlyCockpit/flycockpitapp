@@ -60,6 +60,10 @@ pub struct GraphTool;
 
 #[async_trait]
 impl Tool for GraphTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "graph"
     }

@@ -140,6 +140,10 @@ fn macos_sed_prelude() -> String {
 
 #[async_trait]
 impl Tool for BashTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "bash"
     }

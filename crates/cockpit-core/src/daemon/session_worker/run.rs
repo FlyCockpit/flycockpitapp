@@ -8589,6 +8589,19 @@ pub(super) async fn run_worker(
         );
     }
     // Spawn the driver loop.
+    match driver.replay_crash_tool_intents(&engine_event_tx).await {
+        Ok(replayed) if replayed > 0 => {
+            tracing::info!(%session_id, replayed, "replayed crash-interrupted tool calls");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, %session_id, "crash-interrupted tool replay failed closed");
+            if let Some(gate) = root_activation_gate.as_ref() {
+                gate.abort();
+            }
+            return;
+        }
+    }
     if abort_startup_if_only_stop(&mut startup_inbox, &mut work_rx) {
         terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
         return;

@@ -976,6 +976,7 @@ mod tests {
             paused_sessions: 0,
             database_path: "fixture.db".to_string(),
             schema_version: 1,
+            pending_recovery_sessions: Vec::new(),
         }
     }
 

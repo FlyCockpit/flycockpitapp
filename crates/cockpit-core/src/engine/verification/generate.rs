@@ -1457,6 +1457,10 @@ mod tests {
         struct Fixture(&'static str, ToolEffect);
         #[async_trait::async_trait]
         impl crate::engine::tool::Tool for Fixture {
+            fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+                crate::engine::tool::ToolIdempotency::NotIdempotent
+            }
+
             fn name(&self) -> &str {
                 self.0
             }

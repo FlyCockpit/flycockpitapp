@@ -340,6 +340,20 @@ pub enum ToolEffect {
     Dynamic,
 }
 
+/// Crash-recovery contract for a tool invocation whose host effect may have
+/// crossed the process boundary before its result was committed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolIdempotency {
+    /// Repeating the same canonical arguments has the same host effect.
+    Idempotent,
+    /// Repeating the call is safe only when the original operation key is
+    /// supplied again.
+    IdempotentWithKey,
+    /// Host completion cannot be proved after a crash; recovery asks the user.
+    NotIdempotent,
+}
+
 /// Shared permission predicate for Cockpit-owned tools. Transport-specific
 /// callers must use this instead of reinterpreting [`ToolEffect`] locally so a
 /// native call and a Monty `mcp.invoke('cockpit', ...)` call agree.
@@ -1008,6 +1022,10 @@ mod typed_args_tests {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Required crash-recovery classification. There is deliberately no
+    /// default: every tool implementation must make an explicit choice.
+    fn idempotency(&self) -> ToolIdempotency;
 
     /// One-sentence description per GOALS §10. Keep this terse enough for the
     /// default tool array; the invariant test treats ~200 chars as the
@@ -3049,6 +3067,10 @@ mod capability_tests {
 
     #[async_trait]
     impl Tool for RequirementTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -3108,6 +3130,10 @@ mod capability_tests {
         struct NoRequirementTool;
         #[async_trait]
         impl Tool for NoRequirementTool {
+            fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+                crate::engine::tool::ToolIdempotency::NotIdempotent
+            }
+
             fn name(&self) -> &str {
                 "none"
             }
@@ -3321,6 +3347,10 @@ mod definition_cache_tests {
 
     #[async_trait]
     impl Tool for CountingTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -3492,6 +3522,10 @@ mod definition_cache_tests {
 
     #[async_trait]
     impl Tool for DormantMediaTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             self.0
         }
@@ -4256,6 +4290,10 @@ mod steering_tests {
         struct Terse;
         #[async_trait]
         impl Tool for Terse {
+            fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+                crate::engine::tool::ToolIdempotency::NotIdempotent
+            }
+
             fn name(&self) -> &str {
                 "terse"
             }
@@ -4363,6 +4401,10 @@ mod steering_tests {
 
         #[async_trait]
         impl Tool for FakeTool {
+            fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+                crate::engine::tool::ToolIdempotency::NotIdempotent
+            }
+
             fn name(&self) -> &str {
                 "fake"
             }
@@ -4559,6 +4601,10 @@ mod steering_tests {
         struct Unknown;
         #[async_trait]
         impl Tool for Unknown {
+            fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+                crate::engine::tool::ToolIdempotency::NotIdempotent
+            }
+
             fn name(&self) -> &str {
                 "unknown"
             }
@@ -4584,6 +4630,10 @@ mod steering_tests {
         struct DefaultPresentationTool;
         #[async_trait]
         impl Tool for DefaultPresentationTool {
+            fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+                crate::engine::tool::ToolIdempotency::NotIdempotent
+            }
+
             fn name(&self) -> &str {
                 "plain"
             }
@@ -4604,6 +4654,10 @@ mod steering_tests {
         struct CustomPresentationTool;
         #[async_trait]
         impl Tool for CustomPresentationTool {
+            fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+                crate::engine::tool::ToolIdempotency::NotIdempotent
+            }
+
             fn name(&self) -> &str {
                 "custom"
             }

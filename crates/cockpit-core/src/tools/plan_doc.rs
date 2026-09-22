@@ -14,6 +14,10 @@ pub struct StartBuildTool;
 
 #[async_trait]
 impl Tool for StartBuildTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "start_build"
     }

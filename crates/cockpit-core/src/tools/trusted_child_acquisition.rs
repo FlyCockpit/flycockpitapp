@@ -244,6 +244,10 @@ pub struct RunAcquisitionCommandTool;
 
 #[async_trait]
 impl Tool for RunAcquisitionCommandTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "run_acquisition_command"
     }
@@ -289,6 +293,10 @@ pub struct AcquireSealedValueTool;
 
 #[async_trait]
 impl Tool for AcquireSealedValueTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "acquire_sealed_value"
     }
@@ -325,6 +333,10 @@ impl Tool for AcquireSealedValueTool {
 
 #[async_trait]
 impl Tool for CaptureSealedValueTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "capture_sealed_value"
     }
@@ -362,6 +374,10 @@ pub struct AcquisitionRequiresUserTool;
 
 #[async_trait]
 impl Tool for AcquisitionRequiresUserTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "acquisition_requires_user"
     }
@@ -405,6 +421,10 @@ pub struct AcquisitionFailTool;
 
 #[async_trait]
 impl Tool for AcquisitionFailTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "acquisition_fail"
     }

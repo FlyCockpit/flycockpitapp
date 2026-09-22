@@ -131,6 +131,7 @@ pub mod text_artifacts;
 pub mod tokenizer_calibration;
 pub mod tool_calls;
 pub mod tool_media_subject_bindings;
+pub mod tool_recovery;
 pub mod turn_scheduler_continuations;
 pub mod usage_events;
 pub mod verification_ledger;
@@ -189,6 +190,13 @@ impl WriteReplySink {
 struct WriteRequest {
     job: DbJob,
     reply: WriteReplySink,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("database writer generation {attempted} is fenced by durable generation {current}")]
+pub struct WriterGenerationFenced {
+    pub attempted: u64,
+    pub current: u64,
 }
 
 /// Returned when the file-backed writer queue cannot accept another job via
@@ -319,6 +327,7 @@ impl Writer {
         conn: Connection,
         capacity: usize,
         durable_enqueue_timeout: Duration,
+        generation: Option<u64>,
     ) -> Result<Self> {
         anyhow::ensure!(capacity > 0, "db writer queue capacity must be nonzero");
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(capacity);
@@ -326,10 +335,15 @@ impl Writer {
             .name("cockpit-db-writer".into())
             .spawn(move || -> Result<()> {
                 while let Ok(request) = rx.recv() {
-                    let result = catch_unwind(AssertUnwindSafe(|| (request.job)(&conn)))
-                        .map_err(|_| anyhow::anyhow!("db writer job panicked"))
-                        .and_then(|result| result)
-                        .map_err(annotate_database_storage_failure);
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        if let Some(generation) = generation {
+                            tool_recovery::verify_writer_generation(&conn, generation)?;
+                        }
+                        (request.job)(&conn)
+                    }))
+                    .map_err(|_| anyhow::anyhow!("db writer job panicked"))
+                    .and_then(|result| result)
+                    .map_err(annotate_database_storage_failure);
                     let poison = result.as_ref().err().is_some_and(writer_error_poisoned);
                     request.reply.send(result);
                     if poison {
@@ -825,14 +839,20 @@ impl Db {
     ///
     /// This is intentionally separate from the general unowned API: callers
     /// must first establish the supervisor's opaque lifetime witness.
-    pub fn open_default_supervised_worker() -> Result<Self> {
+    pub fn open_supervised_worker_default(generation: u64) -> Result<Self> {
         OPEN_DEFAULT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let path = Self::default_path()?;
         let dir = path
             .parent()
             .context("canonical cockpit DB path has no parent")?;
         files::ensure_private_dir(dir).with_context(|| format!("securing {}", dir.display()))?;
-        Self::open_impl(&path, false)
+        Self::open_impl_with_writer_capacity(
+            &path,
+            false,
+            WRITER_QUEUE_CAPACITY,
+            WRITER_DURABLE_ENQUEUE_TIMEOUT,
+            Some(generation),
+        )
     }
 
     /// Open a database at an arbitrary path without claiming daemon ownership.
@@ -855,6 +875,7 @@ impl Db {
             daemon_owned,
             WRITER_QUEUE_CAPACITY,
             WRITER_DURABLE_ENQUEUE_TIMEOUT,
+            None,
         )
     }
 
@@ -863,6 +884,7 @@ impl Db {
         daemon_owned: bool,
         writer_capacity: usize,
         durable_enqueue_timeout: Duration,
+        generation: Option<u64>,
     ) -> Result<Self> {
         let mut timer = files::PhaseTimer::start("Db::open");
         files::ensure_parent_dir_private(path)
@@ -893,6 +915,9 @@ impl Db {
         timer.phase("connect_and_pragmas");
         migrate(&conn)?;
         reconcile_interrupted_sealed_value_acquisitions(&conn)?;
+        if let Some(generation) = generation {
+            tool_recovery::advance_writer_generation(&conn, generation)?;
+        }
         timer.phase("migrate");
 
         // The migrated, pragma-configured connection becomes the writer's
@@ -903,6 +928,7 @@ impl Db {
             conn,
             writer_capacity,
             durable_enqueue_timeout,
+            generation,
         )?;
         let db = Self {
             memory: None,
@@ -930,6 +956,7 @@ impl Db {
             false,
             writer_capacity,
             WRITER_DURABLE_ENQUEUE_TIMEOUT,
+            None,
         )
     }
 
@@ -943,7 +970,26 @@ impl Db {
         writer_capacity: usize,
         durable_enqueue_timeout: Duration,
     ) -> Result<Self> {
-        Self::open_impl_with_writer_capacity(path, false, writer_capacity, durable_enqueue_timeout)
+        Self::open_impl_with_writer_capacity(
+            path,
+            false,
+            writer_capacity,
+            durable_enqueue_timeout,
+            None,
+        )
+    }
+
+    /// Open a test database as one supervised generation. Multiple handles
+    /// model overlapping predecessor/successor writer processes.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_supervised_worker_for_test(path: &Path, generation: u64) -> Result<Self> {
+        Self::open_impl_with_writer_capacity(
+            path,
+            false,
+            WRITER_QUEUE_CAPACITY,
+            WRITER_DURABLE_ENQUEUE_TIMEOUT,
+            Some(generation),
+        )
     }
 
     /// Park the writer thread until the returned guard is released. Subsequent
@@ -2722,7 +2768,7 @@ mod tests {
         env.set_var("XDG_DATA_HOME", tmp.path());
 
         let owner = SupervisorDatabaseOwner::acquire_default().unwrap();
-        let worker = Db::open_default_supervised_worker().unwrap();
+        let worker = Db::open_supervised_worker_default(1).unwrap();
         let error = Db::open_default().expect_err("second daemon owner must remain excluded");
         assert!(error.to_string().contains("live exclusive owner"));
 

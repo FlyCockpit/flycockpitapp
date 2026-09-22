@@ -867,6 +867,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             daemon_version: _,
             protocol_version: _,
             paused_sessions: _,
+            pending_recovery_sessions: _,
             database_path,
             schema_version: _,
         } => {
@@ -5671,7 +5672,9 @@ pub(crate) async fn boot_supervised_worker(
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
 ) -> Result<BootServices> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::boot");
-    let db = Db::open_default_supervised_worker().context("opening supervised session DB")?;
+    let db = Db::open_supervised_worker_default(crate::daemon::supervisor::worker_generation())
+        .context("opening supervised session DB")?;
+    reconcile_crash_interrupted_tools(&db).await?;
     let services = boot_with_db(
         paths,
         db,
@@ -5682,6 +5685,36 @@ pub(crate) async fn boot_supervised_worker(
     .await?;
     timer.done();
     Ok(services)
+}
+
+async fn reconcile_crash_interrupted_tools(db: &Db) -> Result<()> {
+    let intents = db.list_open_tool_execution_intents().await?;
+    let mut outcomes = std::collections::BTreeMap::<uuid::Uuid, (usize, usize)>::new();
+    for intent in intents {
+        let outcome = outcomes.entry(intent.session_id).or_default();
+        match intent.idempotency {
+            crate::db::tool_recovery::ToolIdempotency::NotIdempotent => {
+                db.queue_tool_recovery_decision(&intent).await?;
+                outcome.1 += 1;
+            }
+            crate::db::tool_recovery::ToolIdempotency::Idempotent
+            | crate::db::tool_recovery::ToolIdempotency::IdempotentWithKey => {
+                // The session driver owns the replay because only it can
+                // reconstruct the exact tool context and toolbox. Keep the
+                // durable intent open until that driver attaches.
+                outcome.0 += 1;
+            }
+        }
+    }
+    for (session_id, (replay_pending, decisions_queued)) in outcomes {
+        tracing::info!(
+            %session_id,
+            replay_pending,
+            decisions_queued,
+            "crash-interrupted tool recovery classified"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn boot_with_db(
@@ -8119,6 +8152,11 @@ where
                 .await
                 .map(|r| r.len())
                 .unwrap_or(0) as u32,
+            pending_recovery_sessions: ctx
+                .db
+                .sessions_with_pending_tool_recovery()
+                .await
+                .unwrap_or_default(),
             database_path: ctx
                 .db
                 .path()

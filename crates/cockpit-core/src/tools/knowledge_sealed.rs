@@ -63,6 +63,10 @@ pub struct CreateKnowledgeBaseSealedValueTool;
 
 #[async_trait]
 impl Tool for CreateKnowledgeBaseSealedValueTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         CREATE_KB_SEALED_VALUE_TOOL
     }
@@ -112,6 +116,10 @@ pub struct CopyKnowledgeBaseSealedValueTool;
 
 #[async_trait]
 impl Tool for CopyKnowledgeBaseSealedValueTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         COPY_KB_SEALED_VALUE_TOOL
     }

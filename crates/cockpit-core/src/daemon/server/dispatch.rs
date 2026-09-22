@@ -18824,6 +18824,11 @@ async fn handle_serialized_request_impl(
                 .await
                 .map_err(internal)?
                 .len() as u32,
+            pending_recovery_sessions: ctx
+                .db
+                .sessions_with_pending_tool_recovery()
+                .await
+                .map_err(internal)?,
             database_path: ctx
                 .db
                 .path()
@@ -20940,6 +20945,11 @@ async fn handle_concurrent_request_impl(
                 .await
                 .map_err(internal)?
                 .len() as u32,
+            pending_recovery_sessions: ctx
+                .db
+                .sessions_with_pending_tool_recovery()
+                .await
+                .map_err(internal)?,
             database_path: ctx
                 .db
                 .path()

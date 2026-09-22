@@ -3425,9 +3425,65 @@ async fn execute_ordinary_call_unscoped(
 async fn dispatch_authorized_tool(
     env: &DispatchEnv<'_>,
     resolved_name: &str,
-    args: Value,
+    mut args: Value,
     call_id: &str,
 ) -> (Result<ToolOutput>, u64) {
+    let tool = env.active_tools.get(resolved_name);
+    if let Some(tool) = tool.as_ref()
+        && !matches!(tool.effect(), crate::engine::tool::ToolEffect::ReadOnly)
+    {
+        let idempotency = tool.idempotency();
+        let existing_intent = match env
+            .session
+            .db
+            .tool_execution_intent_for_call(env.session.live_id(), call_id.to_string())
+            .await
+        {
+            Ok(intent) => intent,
+            Err(error) => return (Err(error.context("reading prior tool intent")), 0),
+        };
+        let idempotency_key = matches!(
+            idempotency,
+            crate::engine::tool::ToolIdempotency::IdempotentWithKey
+        )
+        .then(|| {
+            existing_intent
+                .as_ref()
+                .and_then(|intent| intent.idempotency_key.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+        });
+        let db_idempotency = match idempotency {
+            crate::engine::tool::ToolIdempotency::Idempotent => {
+                crate::db::tool_recovery::ToolIdempotency::Idempotent
+            }
+            crate::engine::tool::ToolIdempotency::IdempotentWithKey => {
+                crate::db::tool_recovery::ToolIdempotency::IdempotentWithKey
+            }
+            crate::engine::tool::ToolIdempotency::NotIdempotent => {
+                crate::db::tool_recovery::ToolIdempotency::NotIdempotent
+            }
+        };
+        let intent = match env
+            .session
+            .db
+            .begin_tool_execution_intent(crate::db::tool_recovery::BeginToolExecutionIntent {
+                session_id: env.session.live_id(),
+                call_id: call_id.to_string(),
+                tool: resolved_name.to_string(),
+                args: args.clone(),
+                generation: crate::daemon::supervisor::worker_generation(),
+                idempotency: db_idempotency,
+                idempotency_key,
+            })
+            .await
+        {
+            Ok(intent) => intent,
+            Err(error) => return (Err(error.context("committing write-ahead tool intent")), 0),
+        };
+        if let (Some(key), Some(object)) = (intent.idempotency_key, args.as_object_mut()) {
+            object.insert("_cockpit_idempotency_key".to_string(), Value::String(key));
+        }
+    }
     if resolved_name == "acquire_sealed_value" {
         let started = std::time::Instant::now();
         let result =
@@ -3597,6 +3653,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for EchoTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "echo"
         }
@@ -3632,6 +3692,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for LedgerProjectedTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "ledger_projected"
         }
@@ -3662,6 +3726,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for ModelEphemeralTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "model_ephemeral"
         }
@@ -3758,6 +3826,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for ReadOnlyEchoTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::Idempotent
+        }
+
         fn name(&self) -> &str {
             "readonly_echo"
         }
@@ -3796,6 +3868,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for NestedCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "nested_capture"
         }
@@ -3831,6 +3907,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for FailTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "fail"
         }
@@ -3852,6 +3932,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for TruncatedTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "big"
         }
@@ -3873,6 +3957,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for ArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "big"
         }
@@ -3901,6 +3989,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for DisplayAndAttachmentsTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "mcp"
         }
@@ -3944,6 +4036,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for RedactedArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "redacted_big"
         }
@@ -3975,6 +4071,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for NamedArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -4009,6 +4109,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for PartialArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "big_partial"
         }
@@ -4037,6 +4141,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for InterruptWaitTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "interrupt_wait"
         }
@@ -4085,6 +4193,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for GatedInterruptWaitTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "bash"
         }
@@ -4142,6 +4254,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for NeverCalledTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -4173,6 +4289,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for CapabilityUnavailableTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "capability_unavailable_tool"
         }
@@ -4204,6 +4324,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for IntegerOnlyTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "number"
         }
@@ -4232,6 +4356,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for BashFixtureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "bash"
         }
@@ -4259,6 +4387,10 @@ mod tests {
 
     #[async_trait]
     impl crate::engine::tool::Tool for BashArtifactCaptureTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "bash"
         }

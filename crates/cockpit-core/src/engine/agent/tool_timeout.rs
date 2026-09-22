@@ -608,6 +608,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for TimedTestTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -653,6 +657,10 @@ mod tests {
 
     #[async_trait]
     impl Tool for DeadlineCleanupTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "deadline-cleanup"
         }

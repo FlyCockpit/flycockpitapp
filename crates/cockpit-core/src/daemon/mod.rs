@@ -3936,6 +3936,7 @@ mod tests {
                 paused_sessions: 0,
                 database_path: "test.db".to_string(),
                 schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+                pending_recovery_sessions: Vec::new(),
             },
         );
         spawn_hello_socket_with_line(socket, serde_json::to_string(&hello).unwrap())
@@ -4119,6 +4120,7 @@ mod tests {
                 paused_sessions: 0,
                 database_path: ":memory:".to_string(),
                 schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+                pending_recovery_sessions: Vec::new(),
             },
         );
         let listener = spawn_hello_socket_with_line(
@@ -5489,6 +5491,7 @@ mod windows_pipe_tests {
             paused_sessions: 0,
             database_path: "test.db".into(),
             schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+            pending_recovery_sessions: Vec::new(),
         }
     }
 

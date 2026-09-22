@@ -1948,6 +1948,10 @@ struct FifoLaneTool {
 
 #[async_trait::async_trait]
 impl crate::engine::tool::Tool for FifoLaneTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "fifo_lane"
     }

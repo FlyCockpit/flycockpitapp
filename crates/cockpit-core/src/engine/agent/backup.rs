@@ -1476,6 +1476,10 @@ mod backup_fallback_tests {
 
     #[async_trait::async_trait]
     impl crate::engine::tool::Tool for CapabilityFlippingTool {
+        fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+            crate::engine::tool::ToolIdempotency::NotIdempotent
+        }
+
         fn name(&self) -> &str {
             "capability_flipping_tool"
         }

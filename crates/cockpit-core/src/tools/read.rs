@@ -23,6 +23,10 @@ pub struct ReadTool;
 
 #[async_trait]
 impl Tool for ReadTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::Idempotent
+    }
+
     fn name(&self) -> &str {
         "read"
     }

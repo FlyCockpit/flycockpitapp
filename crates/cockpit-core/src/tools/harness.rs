@@ -45,6 +45,10 @@ struct HarnessListArgs {
 
 #[async_trait]
 impl Tool for HarnessListTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "harness_list"
     }
@@ -287,6 +291,10 @@ struct HarnessInvokeArgs {
 
 #[async_trait]
 impl Tool for HarnessInvokeTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "harness_invoke"
     }

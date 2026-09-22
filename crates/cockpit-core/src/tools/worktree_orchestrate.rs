@@ -16,6 +16,10 @@ pub struct WorktreeOrchestrateTool;
 
 #[async_trait]
 impl Tool for WorktreeOrchestrateTool {
+    fn idempotency(&self) -> crate::engine::tool::ToolIdempotency {
+        crate::engine::tool::ToolIdempotency::NotIdempotent
+    }
+
     fn name(&self) -> &str {
         "worktree_orchestrate"
     }

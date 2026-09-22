@@ -10224,6 +10224,22 @@ pub(super) async fn run_worker(
                     // the live window. Spawn identity stays on `session_id` for
                     // locks, lifecycle, and agent-tree.
                     let conversation_id = session.live_id();
+                    // Apply this before every delivery class and admission
+                    // path, so typing after inspect or from another client
+                    // cannot settle a crash-interrupted call via live healing.
+                    if let Err(error) = crate::engine::rehydrate::ensure_tool_recovery_resolved(
+                        &session.db,
+                        conversation_id,
+                    )
+                    .await
+                    {
+                        let _ = respond_to.send(Err(user_message_database_error(
+                            &error,
+                            proto::ErrorCode::UserMessageNotAccepted,
+                            error.to_string(),
+                        )));
+                        continue;
+                    }
                     // Inline external-root submissions become accepted at the
                     // queue insert below. Oversized submissions have only a
                     // phase-one reservation here; their activity stays owned

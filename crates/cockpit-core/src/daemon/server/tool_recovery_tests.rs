@@ -186,6 +186,59 @@ async fn answer(handle: &SessionWorkerHandle, interrupt_id: Uuid, selected_id: &
     worker_barrier(handle).await;
 }
 
+async fn assert_recovery_rejects_user_turns(handle: &SessionWorkerHandle, session: &Session) {
+    let before = session.db.list_session_events(session.id).await.unwrap();
+    for delivery in [
+        None,
+        Some(proto::QueueDeliveryClass::Held),
+        Some(proto::QueueDeliveryClass::Steering),
+    ] {
+        let mut submission =
+            crate::engine::message::UserSubmission::text("continue after the interrupted command");
+        submission.delivery_class_override = delivery;
+        let (respond_to, reply) = tokio::sync::oneshot::channel();
+        handle
+            .send_work(SessionWork::UserMessage {
+                submission: Box::new(submission),
+                #[cfg(feature = "remote")]
+                remote_operation: None,
+                artifact_admission: None,
+                respond_to,
+            })
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(20), reply)
+            .await
+            .expect("worker answers without starting a provider turn")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, proto::ErrorCode::UserMessageNotAccepted);
+        assert!(
+            error.message.contains("pending tool recovery decision"),
+            "{}",
+            error.message
+        );
+    }
+    assert_eq!(
+        session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .len(),
+        before.len(),
+        "rejected messages must not enter the transcript or create a synthetic result"
+    );
+    assert!(
+        session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 async fn stop_worker(handle: &SessionWorkerHandle, join: tokio::task::JoinHandle<()>) {
     handle
         .send_work(SessionWork::Shutdown {
@@ -246,8 +299,10 @@ async fn daemon_status_after_recovery_lists_the_pending_session() {
         1
     );
     assert_status(&ctx, vec![session.id]).await;
+    assert_recovery_rejects_user_turns(&handle, &session).await;
     answer(&handle, intent.intent_id, "inspect").await;
     assert_status(&ctx, vec![session.id]).await;
+    assert_recovery_rejects_user_turns(&handle, &session).await;
     answer(&handle, intent.intent_id, "skip").await;
     assert_status(&ctx, vec![]).await;
     assert_eq!(
@@ -415,9 +470,11 @@ async fn production_crash_matrix_child() {
             usize::from(boundary == "after_result")
         );
         assert_status(&ctx, vec![session_id]).await;
+        assert_recovery_rejects_user_turns(&handle, &session).await;
         answer(&handle, interrupt_id, "inspect").await;
         assert_eq!(db.list_open_interrupts(session_id).await.unwrap().len(), 1);
         assert_status(&ctx, vec![session_id]).await;
+        assert_recovery_rejects_user_turns(&handle, &session).await;
         answer(&handle, interrupt_id, &choice).await;
         let receipt = db
             .get_interrupt(interrupt_id)

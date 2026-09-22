@@ -2318,6 +2318,8 @@ pub(crate) async fn run_turn(
     let tx = ctx.tx;
     let shared_display_slot = ctx.display_slot;
 
+    crate::engine::rehydrate::ensure_tool_recovery_resolved(&session.db, session.live_id()).await?;
+
     phase_01_pre_send_history_mutation();
     phase_02_dispatch_time_record();
     phase_03_tandem_shadow_dispatch();

@@ -3510,6 +3510,20 @@ fn heal_pairing_deferred(
     }
 }
 
+/// Recovery decisions own ambiguous effects until the user skips or reruns
+/// them. Refuse new turns, including already-queued work, before live healing
+/// can synthesize a result or the provider can interpret the call as settled.
+pub(crate) async fn ensure_tool_recovery_resolved(db: &Db, session_id: Uuid) -> Result<()> {
+    anyhow::ensure!(
+        !db.sessions_with_pending_tool_recovery()
+            .await
+            .context("checking pending tool recovery decisions")?
+            .contains(&session_id),
+        "This session has a pending tool recovery decision; choose rerun or skip before sending another message. Inspect keeps the decision pending."
+    );
+    Ok(())
+}
+
 /// Live pre-send pairing heal (implementation note).
 ///
 /// Run this on the LIVE root history immediately before each provider request

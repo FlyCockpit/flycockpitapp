@@ -7431,7 +7431,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_tool_terminal_seq_requires_committed_audit_row() {
+    async fn ordinary_tool_terminal_audit_failure_fails_the_turn() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(FailTool));
         let agent = test_agent(tools.clone());
@@ -7469,22 +7469,32 @@ pub(crate) mod tests {
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
 
-        execute_ordinary_call(&env, &mut history, &call, "fail", Recovery::Clean, None)
+        let original_history = history.clone();
+        let error = execute_ordinary_call(&env, &mut history, &call, "fail", Recovery::Clean, None)
             .await
-            .unwrap();
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("persisting `fail` result and closing its intent"),
+            "{error}"
+        );
+        assert!(
+            error.contains("forced ordinary tool audit failure"),
+            "{error}"
+        );
+        assert_eq!(
+            history, original_history,
+            "failed persistence must not publish a history result"
+        );
 
         assert!(matches!(
             rx.recv().await,
             Some(TurnEvent::ToolStart { tool, .. }) if tool == "fail"
         ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(TurnEvent::ToolError {
-                tool,
-                seq: None,
-                ..
-            }) if tool == "fail"
-        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "failed persistence must not emit completion"
+        );
         assert!(
             session
                 .db
@@ -7495,15 +7505,135 @@ pub(crate) mod tests {
             "audit failure must not be presented as sequenced durable completion"
         );
         assert!(
-            session
+            !session
                 .db
                 .list_session_events(session.id)
                 .await
                 .unwrap()
                 .iter()
                 .any(|event| event.kind == "tool_call"),
-            "the distinguishing edge is an audit failure after timeline persistence succeeds"
+            "failed persistence must not publish a terminal timeline event"
         );
+        assert!(
+            session
+                .db
+                .tool_execution_intent_for_call(session.id, call.id.to_string())
+                .await
+                .unwrap()
+                .is_some(),
+            "failed persistence must leave the intent open for recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_blocks_live_turn_before_history_heal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = test_agent(ToolBox::new());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let call = tool_call("bash", serde_json::json!({"command": "printf done"}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        let original_history = history.clone();
+        let intent = session
+            .db
+            .begin_tool_execution_intent(crate::db::tool_recovery::BeginToolExecutionIntent {
+                session_id: session.id,
+                call_id: call.id.to_string(),
+                tool: "bash".into(),
+                args: call.function.arguments.clone(),
+                generation: 0,
+                idempotency: crate::db::tool_recovery::ToolIdempotency::NotIdempotent,
+                idempotency_key: None,
+            })
+            .await
+            .unwrap();
+        session
+            .db
+            .queue_tool_recovery_decision(&intent)
+            .await
+            .unwrap();
+
+        // Call the turn funnel directly: queued work and non-inbox callers
+        // must be blocked even if they bypass fresh-message admission.
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::super::turn(
+                &agent,
+                &model,
+                &mut history,
+                Message::user("continue"),
+                session.clone(),
+                ctx.locks.clone(),
+                ctx.redact.clone(),
+                ctx.cwd.clone(),
+                ctx.config.clone(),
+                ctx.interrupts.clone(),
+                ctx.cancel.clone(),
+                None,
+                None,
+                None,
+                10,
+                true,
+                ctx.skill_write_origin,
+                None,
+                crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                ctx.deferred_log.clone(),
+                true,
+                Uuid::new_v4(),
+                0,
+                None,
+                None,
+                None,
+                &tx,
+                None,
+            ),
+        )
+        .await
+        .expect("recovery refuses the turn before provider I/O")
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("pending tool recovery decision"),
+            "{error:#}"
+        );
+        assert_eq!(
+            history, original_history,
+            "live history must retain the unresolved call without a stub"
+        );
+        assert!(rx.try_recv().is_err(), "no provider or tool turn may start");
+        assert!(
+            session
+                .db
+                .list_tool_calls_for_session(session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            session.db.list_open_tool_execution_intents().await.unwrap(),
+            vec![intent.clone()]
+        );
+
+        // The guard is session-specific and clears after a real skip receipt.
+        crate::engine::rehydrate::ensure_tool_recovery_resolved(&session.db, Uuid::new_v4())
+            .await
+            .unwrap();
+        session
+            .db
+            .begin_tool_recovery_resolution(
+                intent.intent_id,
+                &crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: "skip".into(),
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        crate::engine::rehydrate::ensure_tool_recovery_resolved(&session.db, session.id)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

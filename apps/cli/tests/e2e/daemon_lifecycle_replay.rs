@@ -34,6 +34,120 @@ async fn lifecycle_provider_for_command(command: &str) -> ScriptedProvider {
         .await
 }
 
+#[cfg(unix)]
+async fn wait_for_handover_file(path: &Path, label: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            return contents;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handover-spanning tool did not {label} within 20s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_handover_process_start(
+    client: &cockpit_cli::integration::DaemonClient,
+    daemon: &SpawnedDaemon,
+    session_id: Uuid,
+    path: &Path,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            return contents;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handover-spanning tool did not start its host process within 20s"
+        );
+        if let Ok(event) = tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            client.next_event_unbounded(),
+        )
+        .await
+        {
+            match event.expect("event while waiting for handover tool process") {
+                DaemonEvent::InterruptRaised {
+                    session_id: got,
+                    interrupt_id,
+                    ..
+                } if got == session_id => {
+                    let approve = offered_approval_option(&daemon.db_path(), interrupt_id);
+                    client
+                        .answer_interrupt_option(interrupt_id, approve)
+                        .await
+                        .expect("approve handover-spanning tool execution");
+                }
+                DaemonEvent::ToolEnd {
+                    session_id: got,
+                    call_id,
+                    ..
+                }
+                | DaemonEvent::ToolError {
+                    session_id: got,
+                    call_id,
+                    ..
+                } if got == session_id && call_id == TOOL_CALL_ID => {
+                    let terminal = open_db(&daemon.db_path())
+                        .query_row(
+                            "SELECT output, hard_fail, exit_code, sandbox_unavailable_reason \
+                               FROM tool_call_events \
+                              WHERE session_id = ?1 AND call_id = ?2 \
+                              ORDER BY timestamp DESC LIMIT 1",
+                            params![session_id.to_string(), TOOL_CALL_ID],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, Option<i64>>(2)?,
+                                    row.get::<_, Option<String>>(3)?,
+                                ))
+                            },
+                        )
+                        .ok();
+                    panic!(
+                        "handover-spanning tool reached a terminal event before its start marker; \
+                         terminal row: {terminal:?}; log tail:\n{}",
+                        log_tail(daemon.home())
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_single_handover_tool_result(db_path: &Path, session_id: Uuid) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if tool_call_count(db_path, session_id) == 1 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handover-spanning tool result did not commit exactly once within 20s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn supervisor_status_json(daemon: &SpawnedDaemon) -> serde_json::Value {
+    let output = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("run daemon status");
+    assert!(output.status.success(), "{}", output_text(&output));
+    serde_json::from_slice(&output.stdout).expect("decode daemon status JSON")
+}
+
 #[derive(Debug, Clone)]
 struct InterruptRow {
     state: String,
@@ -128,7 +242,7 @@ fn session_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
             "SELECT seq, type
                FROM session_events
               WHERE session_id = ?1
-                AND type IN ('user_message', 'assistant_message', 'tool_call', 'interrupt_decision')
+                AND type IN ('user_message', 'assistant_message', 'tool_call', 'tool_call_completed', 'interrupt_decision')
               ORDER BY seq",
         )
         .expect("prepare session event rows");
@@ -138,6 +252,22 @@ fn session_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
     .expect("query session event rows")
     .map(|row| row.expect("session event row"))
     .collect()
+}
+
+fn has_handover_interrupt_decision(db_path: &Path, session_id: Uuid) -> bool {
+    let conn = open_db(db_path);
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM session_events
+              WHERE session_id = ?1
+                AND type = 'interrupt_decision'
+                AND json_extract(data_json, '$.reason') = 'worker_handover_hard_deadline'
+         )",
+        params![session_id.to_string()],
+        |row| row.get(0),
+    )
+    .expect("query handover interrupt decision")
 }
 
 fn tool_call_command(db_path: &Path, session_id: Uuid) -> String {
@@ -472,6 +602,203 @@ async fn restart_daemon_gracefully(daemon: &SpawnedDaemon) {
     assert!(output.status.success(), "daemon restart failed: {text}");
     assert!(text.contains("daemon: rolled worker"));
     daemon.wait_for_handshake().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn handover_spanning_tool_commits_once_and_session_stays_reattachable() {
+    let home = IsolatedHome::new();
+    let started = home.project_path().join("handover-tool-started.txt");
+    let side_effect = home.project_path().join("handover-side-effect.txt");
+    let command = format!(
+        "printf 'started\\n' > {}; sleep 3; printf 'committed\\n' >> {}",
+        started.display(),
+        side_effect.display(),
+    );
+    let provider = lifecycle_provider_for_command(&command).await;
+    home.write_local_provider_config(&provider.base_url());
+    std::fs::write(
+        home.config_dir().join("config.json"),
+        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox":{"defaultMode":"off"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto","daemon":{"handover":{"drain_ms":5000,"hard_ms":1000,"grace_ms":50}}}"#,
+    )
+    .expect("write handover auto-approval config");
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
+    let client = daemon.client().await;
+    let attached = client
+        .attach(daemon.project_path(), None, None, true)
+        .await
+        .expect("attach handover session");
+    client
+        .send_user_message("run the handover-spanning tool")
+        .await
+        .expect("send handover turn");
+
+    loop {
+        match client
+            .next_event_unbounded()
+            .await
+            .expect("event before handover tool start")
+        {
+            DaemonEvent::InterruptRaised {
+                session_id,
+                interrupt_id,
+                ..
+            } if session_id == attached.session_id => {
+                let approve = offered_approval_option(&daemon.db_path(), interrupt_id);
+                client
+                    .answer_interrupt_option(interrupt_id, approve)
+                    .await
+                    .expect("approve handover-spanning tool");
+            }
+            DaemonEvent::ToolStart {
+                session_id,
+                call_id,
+                ..
+            } if session_id == attached.session_id && call_id == TOOL_CALL_ID => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        wait_for_handover_process_start(&client, &daemon, attached.session_id, &started).await,
+        "started\n",
+        "the roll must begin only after the real tool process is running"
+    );
+    let before = supervisor_status_json(&daemon);
+    let roll = daemon
+        .command()
+        .args(["daemon", "upgrade"])
+        .output()
+        .expect("run daemon upgrade during handover-spanning tool");
+    assert!(roll.status.success(), "{}", output_text(&roll));
+
+    assert_eq!(
+        wait_for_handover_file(&side_effect, "commit its side effect").await,
+        "committed\n",
+        "the host side effect must execute exactly once across the roll"
+    );
+    wait_for_single_handover_tool_result(&daemon.db_path(), attached.session_id).await;
+    let replacement = daemon.client().await;
+    let reattached = replacement
+        .attach(daemon.project_path(), Some(attached.session_id), None, true)
+        .await
+        .expect("reattach same session after handover");
+    assert_eq!(reattached.session_id, attached.session_id);
+    // Wait beyond the scripted tool's full runtime after successor attach.
+    // A mistaken post-boundary replay would otherwise be able to append only
+    // after the first successful observation and make this test vacuous.
+    tokio::time::sleep(std::time::Duration::from_millis(3_250)).await;
+    assert_eq!(
+        std::fs::read_to_string(&side_effect).expect("read settled side effect"),
+        "committed\n",
+        "the successor must not replay the predecessor's committed side effect"
+    );
+    assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 1);
+    let terminal_rows = session_event_rows(&daemon.db_path(), attached.session_id);
+    let handover_interrupted =
+        has_handover_interrupt_decision(&daemon.db_path(), attached.session_id);
+    assert_ne!(
+        terminal_rows
+            .iter()
+            .any(|(_, kind)| kind == "tool_call_completed" || kind == "assistant_message"),
+        handover_interrupted,
+        "the live predecessor turn must be completed XOR interrupted"
+    );
+    let after = supervisor_status_json(&daemon);
+    assert!(after["generation"].as_u64().unwrap() > before["generation"].as_u64().unwrap());
+    assert!(after["uptime_ms"].as_u64().unwrap() >= before["uptime_ms"].as_u64().unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn handover_hard_deadline_records_interrupt_not_tool_completion() {
+    let home = IsolatedHome::new();
+    let started = home.project_path().join("handover-hard-started.txt");
+    let side_effect = home.project_path().join("handover-hard-side-effect.txt");
+    let command = format!(
+        "printf 'started\\n' > {}; sleep 10; printf 'committed\\n' >> {}",
+        started.display(),
+        side_effect.display(),
+    );
+    let provider = lifecycle_provider_for_command(&command).await;
+    home.write_local_provider_config(&provider.base_url());
+    std::fs::write(
+        home.config_dir().join("config.json"),
+        r#"{"active_model":{"provider":"local","model":"scripted"},"sandbox":{"defaultMode":"off"},"sandbox_escalation_enabled":true,"defaultApprovalMode":"auto","daemon":{"handover":{"drain_ms":25,"hard_ms":5000,"grace_ms":50}}}"#,
+    )
+    .expect("write hard-deadline handover config");
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    daemon.home().trust_project();
+    let client = daemon.client().await;
+    let attached = client
+        .attach(daemon.project_path(), None, None, true)
+        .await
+        .expect("attach hard-deadline handover session");
+    client
+        .send_user_message("run the handover hard-deadline tool")
+        .await
+        .expect("send hard-deadline turn");
+
+    loop {
+        match client
+            .next_event_unbounded()
+            .await
+            .expect("event before hard-deadline tool start")
+        {
+            DaemonEvent::InterruptRaised {
+                session_id,
+                interrupt_id,
+                ..
+            } if session_id == attached.session_id => {
+                client
+                    .answer_interrupt_option(
+                        interrupt_id,
+                        offered_approval_option(&daemon.db_path(), interrupt_id),
+                    )
+                    .await
+                    .expect("approve hard-deadline handover tool");
+            }
+            DaemonEvent::ToolStart {
+                session_id,
+                call_id,
+                ..
+            } if session_id == attached.session_id && call_id == TOOL_CALL_ID => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        wait_for_handover_process_start(&client, &daemon, attached.session_id, &started).await,
+        "started\n"
+    );
+
+    let roll = daemon
+        .command()
+        .args(["daemon", "upgrade"])
+        .output()
+        .expect("run daemon upgrade through hard deadline");
+    assert!(roll.status.success(), "{}", output_text(&roll));
+    assert!(
+        !side_effect.exists(),
+        "the interrupted tool must not reach its side effect"
+    );
+    let terminal_rows = session_event_rows(&daemon.db_path(), attached.session_id);
+    let completed = terminal_rows
+        .iter()
+        .any(|(_, kind)| kind == "tool_call_completed" || kind == "assistant_message");
+    let interrupted = has_handover_interrupt_decision(&daemon.db_path(), attached.session_id);
+    assert_ne!(
+        completed, interrupted,
+        "the live hard-deadline turn must record completion XOR interruption"
+    );
+    assert!(
+        interrupted,
+        "hard deadline must durably record InterruptDecision"
+    );
+    assert!(
+        !completed,
+        "interrupted tool must not later commit a result"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -2829,6 +2829,9 @@ pub enum SessionWork {
 pub enum CancelOrigin {
     InteractiveTurn,
     Noninteractive,
+    /// Supervisor hard-deadline cancellation. Unlike ordinary destructive
+    /// cancellation, durable queued user messages remain accepted in SQLite.
+    Handover,
 }
 
 /// Union a persisted redaction table onto the live scan. Load and union

@@ -115,6 +115,10 @@ CREATE TABLE sessions (
     ),
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
     active_model_revision INTEGER NOT NULL DEFAULT 0 CHECK (active_model_revision >= 0),
+    -- Latest committed safe handover boundary. The value is the globally
+    -- monotone session_events.seq of a tool result or completed turn. Together
+    -- with session_id this is the stable intent key reserved for issue #441.
+    handover_boundary INTEGER NOT NULL DEFAULT 0 CHECK (handover_boundary >= 0),
     session_entry_mode TEXT NOT NULL DEFAULT 'code'
         CHECK (session_entry_mode IN ('code', 'assistant', 'computer')),
     tool_surface_override_json TEXT CHECK (

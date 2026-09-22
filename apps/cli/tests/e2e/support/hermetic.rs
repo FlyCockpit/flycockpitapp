@@ -33,7 +33,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -770,6 +770,45 @@ impl HermeticCockpit {
         output
     }
 
+    /// Exercise the explicit rolling-upgrade command while retaining the
+    /// receipt-bound supervisor witness used by PTY recovery assertions.
+    pub fn upgrade_daemon(&mut self) -> Output {
+        let before = self.daemon_status_json();
+        let child = self.begin_upgrade_daemon();
+        self.finish_upgrade_daemon(before, child)
+    }
+
+    /// Start the real upgrade command without waiting for its supervisor
+    /// response. PTY scenarios use this to observe the live reconnect frame
+    /// before collecting the command result.
+    pub fn begin_upgrade_daemon(&self) -> Child {
+        self.spawn_command(&["daemon", "upgrade"])
+    }
+
+    /// Collect an upgrade command after a live observer has seen its handover,
+    /// then retain the receipt-bound ownership assertions used by the
+    /// synchronous helper.
+    pub fn finish_upgrade_daemon(&mut self, before: serde_json::Value, child: Child) -> Output {
+        let output = child
+            .wait_with_output()
+            .expect("wait for hermetic cockpit daemon upgrade");
+        assert_success("hermetic cockpit daemon upgrade", &output, &self.home);
+        self.wait_for_daemon(DEFAULT_DAEMON_TIMEOUT);
+        let after = self.daemon_status_json();
+        assert_eq!(after["supervisor_pid"], before["supervisor_pid"]);
+        assert_ne!(after["worker_pid"], before["worker_pid"]);
+        assert!(after["generation"].as_u64().unwrap() > before["generation"].as_u64().unwrap());
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        self.verify_current_supervisor_after_roll()
+            .expect("verify receipt-bound supervisor after worker upgrade");
+        output
+    }
+
     pub fn reexec_daemon_supervisor(&self) -> Output {
         let output = self.command(&["daemon", "reexec"]);
         assert_success("hermetic cockpit daemon reexec", &output, &self.home);
@@ -885,14 +924,27 @@ impl HermeticCockpit {
     }
 
     fn command(&self, args: &[&str]) -> Output {
+        self.configured_command(args)
+            .output()
+            .expect("run hermetic cockpit command")
+    }
+
+    fn spawn_command(&self, args: &[&str]) -> Child {
+        self.configured_command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start hermetic cockpit command")
+    }
+
+    fn configured_command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(self.spec.executable());
         command
             .env_clear()
             .envs(self.spec.subprocess_env())
             .current_dir(self.project_path())
-            .args(args)
-            .output()
-            .expect("run hermetic cockpit command")
+            .args(args);
+        command
     }
 
     #[cfg(any(

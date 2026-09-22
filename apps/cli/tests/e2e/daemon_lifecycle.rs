@@ -194,6 +194,126 @@ async fn restart_running_daemon_rolls_worker_and_keeps_socket_usable() {
     daemon.status().await;
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_pipe_failure_after_canonicalized_upgrade_keeps_predecessor_serving() {
+    let daemon = SpawnedDaemon::start().await;
+    let status_before = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("status before failed upgrade");
+    assert_success(
+        "status before failed upgrade",
+        &status_before,
+        daemon.home(),
+    );
+    let before: serde_json::Value =
+        serde_json::from_slice(&status_before.stdout).expect("decode status before upgrade");
+    let non_worker_binary = std::fs::canonicalize("/bin/sleep")
+        .expect("canonicalize a real non-worker binary before upgrade spawn");
+
+    let upgrade = daemon
+        .command()
+        .args(["daemon", "upgrade", "--binary"])
+        .arg(&non_worker_binary)
+        .output()
+        .expect("upgrade with ready-pipe-failing binary");
+
+    assert!(
+        !upgrade.status.success(),
+        "a successor that never writes fd 4 must abort upgrade"
+    );
+    let status_after = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("status after failed upgrade");
+    assert_success("status after failed upgrade", &status_after, daemon.home());
+    let after: serde_json::Value =
+        serde_json::from_slice(&status_after.stdout).expect("decode status after upgrade");
+    assert_eq!(after["worker_pid"], before["worker_pid"]);
+    assert_eq!(after["generation"], before["generation"]);
+    assert!(
+        after["last_handover"]
+            .as_str()
+            .is_some_and(|outcome| outcome.starts_with("aborted: staging successor readiness")),
+        "status must retain the post-canonicalization readiness abort reason: {after}"
+    );
+    let text_status = daemon
+        .command()
+        .args(["daemon", "status"])
+        .output()
+        .expect("text status after failed upgrade");
+    assert_success(
+        "text status after failed upgrade",
+        &text_status,
+        daemon.home(),
+    );
+    assert!(
+        output_text(&text_status).contains("last handover: aborted: staging successor readiness"),
+        "text status must retain the abort outcome: {}",
+        output_text(&text_status)
+    );
+    daemon.status().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_precommit_handover_attempt_does_not_poison_next_upgrade() {
+    let daemon = SpawnedDaemon::start().await;
+    let before_output = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("status before predecessor-side abort");
+    assert_success(
+        "status before predecessor-side abort",
+        &before_output,
+        daemon.home(),
+    );
+    let before: serde_json::Value =
+        serde_json::from_slice(&before_output.stdout).expect("decode status before abort");
+    let worker_pid = before["worker_pid"]
+        .as_u64()
+        .expect("supervisor worker pid")
+        .try_into()
+        .expect("worker pid fits pid_t");
+
+    // This is the predecessor-side failure path: there is no staged
+    // successor, so its ready acknowledgement is rejected by the ordinary
+    // supervisor loop. The next real upgrade must get a fresh completion
+    // channel and proceed normally.
+    // SAFETY: the PID came from this test daemon's same-user supervisor.
+    assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGUSR1) }, 0);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let upgrade = daemon
+        .command()
+        .args(["daemon", "upgrade"])
+        .output()
+        .expect("run upgrade after aborted predecessor attempt");
+    assert!(upgrade.status.success(), "{}", output_text(&upgrade));
+    let after_output = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("status after retry upgrade");
+    assert_success("status after retry upgrade", &after_output, daemon.home());
+    let after: serde_json::Value =
+        serde_json::from_slice(&after_output.stdout).expect("decode status after retry");
+    assert!(
+        after["generation"]
+            .as_u64()
+            .expect("generation after upgrade")
+            > before["generation"]
+                .as_u64()
+                .expect("generation before upgrade"),
+        "the retry must roll a new worker generation: {after}"
+    );
+    daemon.status().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_when_not_running_starts_daemon() {
     let daemon = SpawnedDaemon::start().await;

@@ -1369,10 +1369,14 @@ pub enum DaemonCommand {
         #[arg(long)]
         no_sandbox: bool,
     },
-    /// Roll the worker to a specific Cockpit binary.
+    /// Roll the worker, optionally using a specific Cockpit binary.
     Upgrade {
-        #[arg(value_name = "BINARY")]
-        binary: std::path::PathBuf,
+        /// Cockpit binary for the staged successor.
+        #[arg(long, value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
+        /// Positional compatibility spelling for the staged successor binary.
+        #[arg(value_name = "BINARY", conflicts_with = "binary")]
+        binary_path: Option<std::path::PathBuf>,
     },
     /// Re-execute the stable supervisor from its current binary.
     Reexec,
@@ -2751,6 +2755,41 @@ mod tests {
                 assert_eq!(grace, Some(0));
             }
             other => panic!("expected daemon stop command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_upgrade_accepts_legacy_positional_binary_and_binary_flag() {
+        let positional =
+            Cli::try_parse_from(["cockpit", "daemon", "upgrade", "/tmp/next-cockpit"]).unwrap();
+        match positional.command {
+            Some(Command::Daemon(DaemonCommand::Upgrade {
+                binary,
+                binary_path,
+            })) => {
+                assert_eq!(binary, None);
+                assert_eq!(binary_path, Some(PathBuf::from("/tmp/next-cockpit")));
+            }
+            other => panic!("expected daemon upgrade command, got {other:?}"),
+        }
+
+        let flag = Cli::try_parse_from([
+            "cockpit",
+            "daemon",
+            "upgrade",
+            "--binary",
+            "/tmp/next-cockpit",
+        ])
+        .unwrap();
+        match flag.command {
+            Some(Command::Daemon(DaemonCommand::Upgrade {
+                binary,
+                binary_path,
+            })) => {
+                assert_eq!(binary, Some(PathBuf::from("/tmp/next-cockpit")));
+                assert_eq!(binary_path, None);
+            }
+            other => panic!("expected daemon upgrade command, got {other:?}"),
         }
     }
 

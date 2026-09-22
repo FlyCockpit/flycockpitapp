@@ -7770,6 +7770,8 @@ async fn attach_history_is_scrubbed_only_for_non_owner() {
         hard_fail: false,
         truncated: false,
         hint: Some("history-secret".to_string()),
+        pre_write_content: None,
+        write_applied: false,
     }];
 
     let owner = scrub_history_for_principal(&ClientPrincipal::owner(), history.clone(), &table);
@@ -41698,6 +41700,8 @@ async fn history_redaction_preserves_typed_fields() {
             hard_fail: false,
             truncated: false,
             hint: Some("hint call-secret-123".to_string()),
+            pre_write_content: None,
+            write_applied: false,
         };
 
         let scrubbed =

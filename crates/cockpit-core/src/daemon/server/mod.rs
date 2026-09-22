@@ -6676,11 +6676,27 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
         }
     }
 
-    // Client handlers retain the central context, database handles, and their
-    // reader/writer/executor children.  Keep them under the accept loop's
-    // ownership so foreground shutdown has an explicit cancellation
-    // completion boundary instead of leaving process teardown to Tokio's
-    // runtime-drop scheduling.
+    // Handover closes admission before it emits `Reconnect`. Once that frame
+    // has had its bounded flush interval, close every predecessor stream.
+    // Reconnect attempts then remain in the supervisor-owned listener backlog
+    // until promotion; keeping these streams alive would let them attach back
+    // to the only current acceptor and deadlock the roll.
+    if super::supervisor::worker_handover_active() {
+        tokio::select! {
+            dispatched = super::supervisor::wait_for_worker_handover_reconnect_dispatch() => {
+                if !dispatched {
+                    tracing::info!("worker handover retired before reconnect dispatch");
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || ctx.shutdown.is_forced() {
+                    tracing::info!("forced daemon shutdown ended handover reconnect wait");
+                } else {
+                    tracing::info!("daemon shutdown changed during handover reconnect wait");
+                }
+            }
+        }
+    }
     clients.abort_all();
     while clients.join_next().await.is_some() {}
 
@@ -8160,6 +8176,16 @@ where
     let mut writer_task = writer_task;
     let mut event_task = event_task;
     let mut executor_task = executor_task;
+    // The listener aborts these outer client tasks at handover after the
+    // `Reconnect` flush. Dropping a JoinHandle detaches its task, so keep
+    // abort handles in a drop guard: cancellation of this handler must also
+    // close its reader/writer and release the predecessor socket connection.
+    let _abort_children = AbortClientTasksOnDrop::new([
+        reader_task.abort_handle(),
+        writer_task.abort_handle(),
+        event_task.abort_handle(),
+        executor_task.abort_handle(),
+    ]);
 
     let completed = select_client_task(
         &mut reader_task,
@@ -8214,6 +8240,24 @@ enum ClientTaskKind {
     Writer,
     Event,
     Executor,
+}
+
+struct AbortClientTasksOnDrop {
+    handles: [tokio::task::AbortHandle; 4],
+}
+
+impl AbortClientTasksOnDrop {
+    fn new(handles: [tokio::task::AbortHandle; 4]) -> Self {
+        Self { handles }
+    }
+}
+
+impl Drop for AbortClientTasksOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
 }
 
 struct CompletedClientTask {

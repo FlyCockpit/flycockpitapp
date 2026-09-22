@@ -10,8 +10,8 @@ shared client restart-storm guard, protocol version constants used in endpoint
 discovery, the daemon module's endpoint bind helpers, and the database crate's
 opaque `SupervisorDatabaseOwner` lock witness. The witness exposes no
 connection, migration, query, or writer API; retaining it in the wrapper lets a
-ready successor overlap a draining predecessor without creating a second
-database owner. The module must never import the engine, model providers,
+successor replace a predecessor at its durable handover boundary without
+creating a second database owner. The module must never import the engine, model providers,
 session workers, registry, or database implementation. Those remain inside
 `cockpit daemon worker`. This deliberately small binary boundary is what makes
 wrapper re-execution and worker upgrades independent of application behavior.
@@ -19,10 +19,13 @@ wrapper re-execution and worker upgrades independent of application behavior.
 ## Endpoint and readiness ABI
 
 On Unix the supervisor retains the public listener and passes a duplicate as fd
-3 with `LISTEN_FDS`/`LISTEN_PID`. A worker writes one byte to fd 4 only after
-boot, recovery, and listener construction reach the normal publication
-barrier. Cockpit's required sensitive/reveal sibling is also inherited on the
-internal fd 5 so a ready successor can overlap a draining predecessor.
+3 with `LISTEN_FDS`/`LISTEN_PID`. A normal worker writes its fd-4 readiness
+report after boot, recovery, and listener construction reach the normal
+publication barrier. A rolling standby writes the same identity-validated
+report before boot, then waits on an internal fd-6 promotion pipe; it therefore
+cannot touch durable recovery, accept, or resume a session until the
+predecessor has exited. Cockpit's required sensitive/reveal sibling is also
+inherited on the internal fd 5.
 
 On Windows each worker creates a fresh random named pipe using the existing
 owner-only DACL, remote-client rejection, finite instance pool, and
@@ -38,10 +41,10 @@ public endpoint. It is same-user trusted under
 authentication boundary, and never carries public NDJSON envelopes.
 
 Its independent protocol version is `1` (`ADMIN_PROTOCOL_VERSION`). Every
-request and response carries that version. Version 1 commands are `status`,
-`roll`, `upgrade { binary }`, `stop`, and `reexec`. Upgrade currently uses the
-plain ready-successor-then-drain-predecessor seam; issue #440 owns
-boundary-aware handover timers and issue #441 owns fencing/intent rows.
+request and response carries that version. User-facing version 1 commands are
+`status`, `roll`, `upgrade { binary }`, `stop`, and `reexec`; the worker-only
+`worker_boundary` report carries the predecessor's marker set after admission
+has closed. Issue #441 owns fencing/intent rows.
 
 On Unix, `reexec` preserves the lifetime and published-PID locks plus the
 public, reveal, and admin listeners across an in-place `exec`, then restores
@@ -60,7 +63,42 @@ roll or crash recovery, reconnect continues to observe the supervisor watch;
 owner exit or a spawn-timeout-sized recovery deadline falls back to that same
 restart decision instead of reconnecting forever.
 
-The public protocol's `Reconnect { generation }` event means a supervisor has
-made a successor generation available and attached clients should reattach to
-the same durable session. It is unrelated to `Reconnecting`, which describes a
-model-provider network retry.
+The public protocol's `Reconnect { generation, resume_from }` event means a
+supervisor has made a successor generation available and attached clients
+should reattach to the same durable session. `resume_from` contains the latest
+SQLite-committed safe marker for each session. A tool result advances the
+marker in the same transaction as `tool_call_completed`; a completed turn does
+the same with `assistant_message`. `(session_id, marker)` is the stable intent
+key reserved for #441. Work observed after a marker without a committed result
+is pending and is never replayed by the handover implementation. The event is
+unrelated to `Reconnecting`, which describes a model-provider network retry.
+
+## Boundary-aware worker handover
+
+Roll and upgrade share three installation-scoped deadlines under
+`daemon.handover`: `drain_ms` defaults to 30000, `hard_ms` to 5000, and
+`grace_ms` to 10000. `T_drain` waits for live turns to settle while the
+handover gate rejects new turns; the gate is reversible until successor
+readiness has passed, so a failed successor leaves the predecessor serving. At `T_hard`, remaining turns and session-owned background work go through the
+existing session-work cancellation root; foreground turns receive one durable
+`InterruptDecision` and accepted queue rows remain in `message_queue_items`.
+`T_grace` bounds the
+predecessor's `Reconnect` frame-flush interval; it then
+closes predecessor streams so clients reconnect through the supervisor-owned
+listener backlog rather than reattaching to the retiring worker.
+
+The supervisor first starts a successor in standby and validates its fd-4
+readiness payload (protocol version, PID, generation, and inherited open time).
+After `T_drain`, the predecessor acknowledges that it is ready for the hard
+phase; only then does the supervisor commit the staged successor. This ordering
+means `T_hard` cancellation cannot occur on an abort-and-keep path. The
+predecessor records and reports its final durable boundary, closes admission
+before sending `Reconnect`, waits for its bounded frame flush and exit, and the
+supervisor finally releases the ready successor through fd 6; reconnect
+attempts queue on the supervisor-owned listener in between. A standby successor
+does no durable recovery before fd-6 promotion. A missing payload,
+protocol/open-time mismatch, process-identity mismatch, staged-successor exit,
+or a pre-commit drain failure aborts while the predecessor remains serving.
+Every pre-commit abort releases the predecessor's admission fence immediately.
+`daemon status` remains available while the boundary is pending and exposes the
+most recent result as `last_handover`.

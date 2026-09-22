@@ -11805,19 +11805,35 @@ pub(super) async fn run_worker(
                     ) {
                         cancel_handle.cancel_turn();
                         None
-                    } else if matches!(work, SessionWork::CancelAll) {
-                        // Stop-all: cancel the live turn slot, then the
-                        // session-work root (loops, swarm children, background
-                        // shells, background delegates), and rotate. Capture
-                        // the cancelled generation so the later registry sweep
-                        // cannot kill work admitted after this rotate.
+                    } else if matches!(
+                        work,
+                        SessionWork::CancelAll
+                            | SessionWork::Cancel {
+                                origin: CancelOrigin::Handover
+                            }
+                    ) {
+                        // Stop-all and the handover hard deadline cancel the
+                        // live turn slot and the session-work root (loops,
+                        // swarm children, background shells, background
+                        // delegates). Capture the cancelled generation so the
+                        // later registry sweep cannot kill work admitted after
+                        // this rotate. Handover separately preserves durable
+                        // queued user messages for the successor below.
                         Some(cancel_handle.cancel_all_session_work())
                     } else {
                         cancel_handle.cancel_noninteractive();
                         None
                     };
                     adopted_processes.cancel_all(&driver_input_queue).await;
-                    if let Some(staged) = driver_input_queue.stage_discard_pending().await {
+                    let preserves_handover_queue = matches!(
+                        work,
+                        SessionWork::Cancel {
+                            origin: CancelOrigin::Handover
+                        }
+                    );
+                    if !preserves_handover_queue
+                        && let Some(staged) = driver_input_queue.stage_discard_pending().await
+                    {
                         let disposition =
                             crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled;
                         match persist_staged_terminal_removal(

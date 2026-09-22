@@ -3652,7 +3652,7 @@ async fn handle_send_user_message_v2(
     ingress: crate::proto_crate::send_user_message_v2::MessageIngressV2,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    if ctx.shutdown.is_draining() {
+    if ctx.shutdown.is_draining() || crate::daemon::supervisor::worker_handover_active() {
         return Err(ErrorPayload {
             code: ErrorCode::Shutdown,
             message: "daemon is shutting down; not accepting new messages".into(),
@@ -4416,7 +4416,7 @@ async fn handle_send_user_message(
             message: "user-message origin must be external_root".to_owned(),
         });
     }
-    if ctx.shutdown.is_draining() {
+    if ctx.shutdown.is_draining() || crate::daemon::supervisor::worker_handover_active() {
         return Err(ErrorPayload {
             code: ErrorCode::Shutdown,
             message: "daemon is shutting down; not accepting new messages".into(),

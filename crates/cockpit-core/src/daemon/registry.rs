@@ -792,6 +792,11 @@ fn cleanup_worker_on_exit(
     }
 }
 
+fn handover_activity(handle: &SessionWorkerHandle) -> bool {
+    let (has_active_schedules, processing, tool_running) = handle.live_status();
+    has_active_schedules || processing || tool_running
+}
+
 impl SessionRegistry {
     pub fn new(
         db: Db,
@@ -2403,7 +2408,7 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
     ) -> Result<SessionWorkerHandle> {
-        if self.inner.shutdown.is_draining() {
+        if self.inner.shutdown.is_draining() || super::supervisor::worker_handover_active() {
             bail!("daemon is shutting down; not starting session workers");
         }
         let session_id = session.id;
@@ -3193,6 +3198,101 @@ impl SessionRegistry {
             .keys()
             .copied()
             .collect()
+    }
+
+    /// Interrupt every still-running foreground turn through the same
+    /// cancellation path used by daemon control requests. Durable accepted
+    /// queue rows are intentionally retained for the successor.
+    pub async fn interrupt_for_handover(&self, hard_timeout: Duration) -> Result<usize> {
+        super::supervisor::begin_worker_handover_hard_interrupt();
+        let handles: Vec<SessionWorkerHandle> = {
+            let workers = crate::sync::lock_or_recover(&self.inner.workers);
+            workers
+                .live
+                .values()
+                .map(|entry| entry.handle.clone())
+                .filter(handover_activity)
+                .collect()
+        };
+        let mut candidates = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let session_id = handle.session_id();
+            let outcome = self.inner.db.handover_turn_outcome(session_id).await?;
+            if outcome.hard_deadline_interrupted {
+                continue;
+            }
+            handle
+                .send_work(crate::daemon::session_worker::SessionWork::Cancel {
+                    origin: crate::daemon::session_worker::CancelOrigin::Handover,
+                })
+                .await?;
+            candidates.push((handle, outcome.turn_start_seq));
+        }
+
+        let deadline = tokio::time::Instant::now() + hard_timeout;
+        while candidates
+            .iter()
+            .any(|(handle, _)| handover_activity(handle))
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::ensure!(
+            candidates
+                .iter()
+                .all(|(handle, _)| !handover_activity(handle)),
+            "worker handover interrupt path did not reach an idle boundary before T_hard"
+        );
+
+        let mut interrupted = 0;
+        for (handle, turn_start_seq) in candidates {
+            let session_id = handle.session_id();
+            let outcome = self.inner.db.handover_turn_outcome(session_id).await?;
+            // A newly submitted user message cannot have started while this
+            // predecessor was fenced, so a different latest turn is a real
+            // ownership violation rather than a reason to record against it.
+            anyhow::ensure!(
+                outcome.turn_start_seq == turn_start_seq,
+                "worker handover observed a new user turn after admission was fenced"
+            );
+            if outcome.completed {
+                continue;
+            }
+            if outcome.hard_deadline_interrupted {
+                continue;
+            }
+            let decision = crate::daemon::proto::InterruptDecision {
+                permission: false,
+                cancelled: true,
+                lines: vec![crate::daemon::proto::InterruptDecisionLine {
+                    prompt: "Worker handover hard deadline".to_string(),
+                    answer: "Interrupted through the daemon cancellation path".to_string(),
+                }],
+            };
+            let data = json!({
+                "reason": "worker_handover_hard_deadline",
+                "decision": decision,
+            });
+            self.inner
+                .db
+                .insert_session_event(
+                    session_id,
+                    crate::db::session_log::SessionEventKind::InterruptDecision,
+                    Some(&handle.active_agent_name),
+                    None,
+                    &data,
+                )
+                .await?;
+            interrupted += 1;
+        }
+        Ok(interrupted)
+    }
+
+    pub fn has_handover_inflight(&self) -> bool {
+        crate::sync::lock_or_recover(&self.inner.workers)
+            .live
+            .values()
+            .any(|entry| handover_activity(&entry.handle))
     }
 
     /// Snapshot live handles belonging to the supplied durable trust root.
@@ -4948,7 +5048,7 @@ mod tests {
         let session = test_session(&reg);
         let session_id = session.id;
         let (handle, closed_rx) = test_handle_with_rx(&reg, session);
-        let generation = reg.insert_test_worker_without_join(handle);
+        reg.insert_test_worker_without_join(handle);
         {
             let workers = crate::sync::lock_or_recover(&reg.inner.workers);
             let entry = workers.live.get(&session_id).expect("test generation");
@@ -5792,6 +5892,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handover_hard_deadline_records_one_decision_and_preserves_completed_turns() {
+        let reg = test_registry();
+
+        let completed = persisted_test_session(&reg);
+        let completed_id = completed.id;
+        completed
+            .record_event(
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "complete during cancellation race"}),
+            )
+            .await
+            .unwrap();
+        let (completed_handle, mut completed_rx) = test_handle_with_rx(&reg, completed.clone());
+        completed_handle.set_test_live_status(false, true, true);
+        reg.insert_test_worker_without_join(completed_handle.clone());
+        let completion_ack = tokio::spawn(async move {
+            assert!(matches!(
+                completed_rx.recv().await,
+                Some(session_worker::SessionWork::Cancel {
+                    origin: session_worker::CancelOrigin::Handover
+                })
+            ));
+            completed
+                .record_event(
+                    crate::db::session_log::SessionEventKind::ToolCallCompleted,
+                    Some("Build"),
+                    Some("completed-turn"),
+                    &json!({"tool": "bash", "result": "side effect committed"}),
+                )
+                .await
+                .unwrap();
+            completed_handle.set_test_live_status(false, false, false);
+        });
+
+        let interrupted = persisted_test_session(&reg);
+        let interrupted_id = interrupted.id;
+        interrupted
+            .record_event(
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({"text": "interrupt at hard deadline"}),
+            )
+            .await
+            .unwrap();
+        let (interrupted_handle, mut work_rx) = test_handle_with_rx(&reg, interrupted);
+        interrupted_handle.set_test_live_status(false, true, true);
+        reg.insert_test_worker_without_join(interrupted_handle.clone());
+
+        let cancel_ack = tokio::spawn(async move {
+            assert!(matches!(
+                work_rx.recv().await,
+                Some(session_worker::SessionWork::Cancel {
+                    origin: session_worker::CancelOrigin::Handover
+                })
+            ));
+            interrupted_handle.set_test_live_status(false, false, false);
+        });
+
+        assert_eq!(
+            reg.interrupt_for_handover(Duration::from_secs(1))
+                .await
+                .unwrap(),
+            1
+        );
+        completion_ack.await.unwrap();
+        cancel_ack.await.unwrap();
+        assert_eq!(
+            reg.interrupt_for_handover(Duration::from_secs(1))
+                .await
+                .unwrap(),
+            0,
+            "a repeated hard-deadline observation must not record or deliver a second decision"
+        );
+
+        let completed_events = reg
+            .inner
+            .db
+            .list_session_events(completed_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            completed_events
+                .iter()
+                .filter(|event| event.kind == "tool_call_completed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            completed_events
+                .iter()
+                .filter(|event| event.kind == "interrupt_decision")
+                .count(),
+            0,
+            "a predecessor tool completion is never also classified as interrupted"
+        );
+        let interrupted_events = reg
+            .inner
+            .db
+            .list_session_events(interrupted_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            interrupted_events
+                .iter()
+                .filter(|event| event.kind == "interrupt_decision")
+                .count(),
+            1
+        );
+        assert_eq!(
+            interrupted_events
+                .iter()
+                .filter(|event| event.kind == "assistant_message")
+                .count(),
+            0,
+            "an interrupted turn is never also recorded as predecessor-completed"
+        );
+        for (session_id, events) in [
+            (completed_id, &completed_events),
+            (interrupted_id, &interrupted_events),
+        ] {
+            let completed = events
+                .iter()
+                .any(|event| event.kind == "tool_call_completed");
+            let interrupted = events
+                .iter()
+                .any(|event| event.kind == "interrupt_decision");
+            assert_ne!(
+                completed, interrupted,
+                "handover turn {session_id} must be completed XOR interrupted"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn mixed_session_drain_clean_blocked_worker_and_forces_long_running_tool_worker() {
         let reg = test_registry();
         let blocked = test_session(&reg);
@@ -5889,6 +6126,29 @@ mod tests {
         assert_eq!(summary.activity_state, None);
         let events = reg.inner.db.list_session_events(id).await.unwrap();
         assert!(events.iter().all(|event| event.kind != "turn_interrupted"));
+    }
+
+    #[test]
+    fn handover_waits_for_schedule_and_tool_activity_not_only_processing() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let handle = test_handle(&reg, session);
+        reg.insert_test_worker_without_join(handle.clone());
+
+        handle.set_test_live_status(true, false, false);
+        assert!(
+            reg.has_handover_inflight(),
+            "a schedule can still dispatch side effects during a handover"
+        );
+
+        handle.set_test_live_status(false, false, true);
+        assert!(
+            reg.has_handover_inflight(),
+            "an asynchronous tool must reach a boundary before handover"
+        );
+
+        handle.set_test_live_status(false, false, false);
+        assert!(!reg.has_handover_inflight());
     }
 
     #[tokio::test]

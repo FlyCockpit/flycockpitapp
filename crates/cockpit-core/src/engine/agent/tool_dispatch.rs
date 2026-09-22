@@ -3009,7 +3009,13 @@ async fn execute_ordinary_call_unscoped(
     for text in notices {
         let _ = env.tx.send(TurnEvent::Notice { text }).await;
     }
-    if lifecycle_started {
+    // A tool cancelled at the handover hard deadline has not reached a safe
+    // result boundary. Do not turn its cancellation fallback into a normal
+    // completed result: the registry durably records the handover interruption
+    // after the worker becomes idle.
+    let handover_hard_interrupted = crate::daemon::supervisor::worker_handover_hard_interrupting()
+        && env.ctx.cancel.is_cancelled();
+    if lifecycle_started && !handover_hard_interrupted {
         let lifecycle_status = if repeated_recoverable_tool_call_reject {
             "blocked_recoverable_repeat_guard"
         } else if loop_guard_reject {

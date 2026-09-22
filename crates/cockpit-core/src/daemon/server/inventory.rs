@@ -28,6 +28,16 @@ pub const MAX_INVENTORY_ENCODED_BYTES: usize = 4 * 1024 * 1024;
 /// inventory source changes. Combined with the skills catalog generation.
 static INVENTORY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Only a contiguous catalog-only publication for the same provider may
+/// extend a Provider receipt. A normal publication breaks this chain by
+/// advancing CONFIG_GENERATION without extending it.
+struct ProviderCatalogPublication {
+    provider_id: String,
+    receipt_generation: u64,
+    published_generation: u64,
+}
+
+static PROVIDER_CATALOG_PUBLICATION: Mutex<Option<ProviderCatalogPublication>> = Mutex::new(None);
 /// A generation is meaningful only together with the authority projection it
 /// labels. Readers hold the shared side while collecting rows and the
 /// generation; agent/assistant writers hold the exclusive side from their CAS
@@ -81,6 +91,14 @@ pub fn current_config_generation() -> u64 {
     CONFIG_GENERATION.load(Ordering::SeqCst)
 }
 
+#[cfg(test)]
+pub(super) fn reset_config_generation_for_test(generation: u64) {
+    CONFIG_GENERATION.store(generation, Ordering::SeqCst);
+    *PROVIDER_CATALOG_PUBLICATION
+        .lock()
+        .expect("catalog publication") = None;
+}
+
 /// A stable-per-boot daemon instance identifier, lazily minted on first read.
 /// Used as the `daemonInstanceId` in image-control read replies so a client can
 /// tell a snapshot apart across daemon restarts. A restart mints a fresh value
@@ -106,6 +124,43 @@ pub fn publish_committed_config_generation() -> u64 {
     let generation = CONFIG_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     bump_inventory_generation();
     generation
+}
+
+pub(super) fn publish_provider_catalog_generation(provider_id: &str, consumed: u64) -> u64 {
+    let mut publication = PROVIDER_CATALOG_PUBLICATION
+        .lock()
+        .expect("catalog publication");
+    let published = publish_committed_config_generation();
+    // Even a publisher outside the RPC lock must not be mistaken for part of
+    // this fetch. `consumed` was captured before the network/persistence work.
+    if consumed.checked_add(1) != Some(published) {
+        *publication = None;
+        return published;
+    }
+    let receipt_generation = publication
+        .as_ref()
+        .filter(|previous| {
+            previous.provider_id == provider_id && previous.published_generation == consumed
+        })
+        .map_or(consumed, |previous| previous.receipt_generation);
+    *publication = Some(ProviderCatalogPublication {
+        provider_id: provider_id.to_owned(),
+        receipt_generation,
+        published_generation: published,
+    });
+    published
+}
+
+pub(super) fn provider_catalog_extends_receipt(provider_id: &str, receipt: u64) -> bool {
+    PROVIDER_CATALOG_PUBLICATION
+        .lock()
+        .expect("catalog publication")
+        .as_ref()
+        .is_some_and(|publication| {
+            publication.provider_id == provider_id
+                && publication.receipt_generation == receipt
+                && publication.published_generation == current_config_generation()
+        })
 }
 
 /// Restore a generation already durably assigned to a recoverable config

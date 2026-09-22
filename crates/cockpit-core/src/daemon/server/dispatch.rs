@@ -183,11 +183,6 @@ async fn validate_settlement_operation_fence(
             "onboarding settlement config generation does not advance the stage checkpoint",
         ));
     }
-    if config_generation != inventory::current_config_generation() {
-        return Err(bad_request(
-            "onboarding settlement config generation does not match the current authority",
-        ));
-    }
     let started_at = ctx
         .db
         .local_operation_started_at_unix_ms(owner.to_owned(), operation_id.to_owned())
@@ -202,20 +197,6 @@ async fn validate_settlement_operation_fence(
         ));
     }
     Ok(())
-}
-
-/// A restarted daemon may restore its process-local generation from the
-/// receipt that committed this Provider mutation. It must never restore from
-/// a client claim or roll the authority back across a later publication.
-fn provider_receipt_can_restore_authority(
-    receipt_generation: u64,
-    mutation_generation: u64,
-    settlement_generation: u64,
-    current_generation: u64,
-) -> bool {
-    receipt_generation == mutation_generation
-        && receipt_generation == settlement_generation
-        && current_generation <= receipt_generation
 }
 
 async fn validate_terminal_local_operation_settlement(
@@ -316,12 +297,8 @@ async fn validate_onboarding_stage_settlement(
                     status: proto::ConfigCommitStatus::Committed,
                     ..
                 } if client_operation_id == operation_id
-                    && provider_receipt_can_restore_authority(
-                        config_generation,
-                        mutation_config_generation,
-                        settlement.config_generation,
-                        inventory::current_config_generation(),
-                    )
+                    && config_generation == mutation_config_generation
+                    && config_generation == settlement.config_generation
                     && committed_intent_hash == mutation_intent_hash
                     && upserted_provider_ids.iter().any(|id| id == provider_id) =>
                 {
@@ -413,12 +390,26 @@ async fn validate_onboarding_stage_settlement(
             "onboarding settlement correlation is only valid for provider, model, or agent advance",
         )),
     }?;
-    // The terminal receipt is durable, but config generation is process-local.
-    // A worker can restart after the mutation commits and before this separate
-    // transition reaches the authority. Only after the stage-specific receipt
-    // has proved the exact generation may recovery restore that authority;
-    // a later, different config publication still fails the equality fence.
-    inventory::publish_committed_config_generation_at_least(settlement.config_generation);
+    // Verify the receipt, authority lineage, and operation timing before
+    // restoring any process-local authority. Catalog verification may extend
+    // this Provider mutation, but never changes the generation the client
+    // must echo from its terminal receipt.
+    if inventory::current_config_generation() > settlement.config_generation
+        && !(stage == proto::OnboardingStage::Provider
+            && settlement
+                .provider_id
+                .as_deref()
+                .is_some_and(|provider_id| {
+                    inventory::provider_catalog_extends_receipt(
+                        provider_id,
+                        settlement.config_generation,
+                    )
+                }))
+    {
+        return Err(bad_request(
+            "onboarding settlement config generation does not match the current authority",
+        ));
+    }
     validate_settlement_operation_fence(
         ctx,
         owner,
@@ -427,7 +418,9 @@ async fn validate_onboarding_stage_settlement(
         stage_entry_config_generation,
         settlement.config_generation,
     )
-    .await
+    .await?;
+    inventory::publish_committed_config_generation_at_least(settlement.config_generation);
+    Ok(())
 }
 
 /// Recover the catalog `(provider_id, model_id)` whose identity digests match
@@ -6511,6 +6504,7 @@ async fn handle_serialized_request_impl(
             "onboarding profile apply is only valid during locked bootstrap",
         )),
         Request::ApplyOnboardingTransition(request) => {
+            let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
             let capabilities = ctx
                 .host_capabilities
                 .current()
@@ -6522,6 +6516,14 @@ async fn handle_serialized_request_impl(
                 .await
                 .map_err(onboarding_error)?
                 .ok_or_else(|| bad_request("no onboarding run exists"))?;
+            if request.run_id != snapshot.run_id
+                || request.attempt_id != snapshot.attempt_id
+                || request.expected_revision != snapshot.revision
+            {
+                return Err(onboarding_error(anyhow::anyhow!(
+                    "onboarding revision conflict"
+                )));
+            }
             let (snapshot, receipt) = if request.transition
                 == proto::OnboardingTransitionKind::Advance
                 && matches!(
@@ -23769,6 +23771,7 @@ pub(super) async fn provider_models_fetch(
     // owns a layer entry.  A crash after the file replacement must not turn a
     // later delete into an early no-op that forgets its vault cleanup.
     recover_provider_config_journals(ctx, project_root, provider_id).await?;
+    let consumed_config_generation = inventory::current_config_generation();
     let (cwd, trust_policy, mut config) = daemon_provider_config(ctx, project_root).await?;
     // An all-provider probe is one user-visible operation.  Keep its original
     // catalog until every selected provider has yielded a durable-safe result:
@@ -24081,7 +24084,17 @@ pub(super) async fn provider_models_fetch(
         )?;
     }
     let config_generation = if config_changed {
-        inventory::publish_committed_config_generation()
+        if let Some(provider_id) = provider_id.filter(|_| {
+            !deep
+                && matches!(
+                    on_unlisted,
+                    None | Some(crate::config::providers::OnUnlistedModelsFetch::Keep)
+                )
+        }) {
+            inventory::publish_provider_catalog_generation(provider_id, consumed_config_generation)
+        } else {
+            inventory::publish_committed_config_generation()
+        }
     } else {
         inventory::current_config_generation()
     };
@@ -24675,18 +24688,6 @@ struct ProviderConfigJournal {
 #[cfg(test)]
 mod provider_atomic_authority_tests {
     use super::*;
-
-    #[test]
-    fn provider_settlement_receipt_fence_rejects_later_publication_and_client_rebinding() {
-        // A replacement daemon starts below the durable receipt and may
-        // restore that exact authority. A newer publication is a distinct
-        // write and must reject the stale Provider advance instead.
-        assert!(provider_receipt_can_restore_authority(5, 5, 5, 0));
-        assert!(!provider_receipt_can_restore_authority(5, 5, 5, 6));
-        // The transition's claimed generation is untrusted until it matches
-        // the terminal mutation receipt.
-        assert!(!provider_receipt_can_restore_authority(5, 5, 999, 0));
-    }
 
     #[test]
     fn detected_environment_copy_is_resolved_inside_daemon_boundary() {

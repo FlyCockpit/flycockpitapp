@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
 #[cfg(test)]
 use super::MAX_PROCESS_STDERR_BYTES;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 

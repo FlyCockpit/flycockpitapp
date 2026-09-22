@@ -3024,13 +3024,17 @@ async fn run_foreground_inner_with_boot_db_impl(
     // begins the drain; a **second** signal while still draining shortens
     // to an immediate force-exit (`request_shutdown`'s begin → force
     // promotion). The task therefore loops rather than firing once.
-    let (handover_done_tx, handover_done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
-    let handover_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // A failed pre-commit handover leaves this worker serving and must not
+    // poison its next attempt. Keep only the currently-running attempt's
+    // completion receiver; it is replaced for every SIGUSR1 admission rather
+    // than being consumed for the process lifetime.
+    let handover_done = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<tokio::sync::oneshot::Receiver<Result<()>>>,
+    ));
     let mut signal_task = ForegroundTask::new({
         let ctx = ctx.clone();
-        let handover_started = handover_started.clone();
+        let handover_done = handover_done.clone();
         tokio::spawn(async move {
-            let mut handover_done_tx = Some(handover_done_tx);
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{SignalKind, signal};
@@ -3062,34 +3066,45 @@ async fn run_foreground_inner_with_boot_db_impl(
                         let generation = supervisor::worker_generation().saturating_add(1);
                         match supervisor::begin_worker_handover(generation) {
                             Ok(()) => {
-                                handover_started.store(true, std::sync::atomic::Ordering::Release);
                                 let handover = match supervisor::take_worker_handover() {
                                     Some(handover) => Ok(handover),
                                     None => Err(anyhow::anyhow!(
                                         "worker handover request disappeared before drain"
                                     )),
                                 };
-                                if let Some(done) = handover_done_tx.take() {
-                                    let ctx = ctx.clone();
-                                    tokio::spawn(async move {
-                                        let result = match handover {
-                                            Ok(handover) => {
-                                                prepare_worker_handover(&ctx, handover).await
-                                            }
-                                            Err(error) => Err(error),
-                                        };
-                                        if result.is_ok() {
-                                            tracing::info!(
-                                                generation,
-                                                "worker handover drain completed"
-                                            );
+                                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                                *handover_done
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(done_rx);
+                                let ctx = ctx.clone();
+                                tokio::spawn(async move {
+                                    let result = match handover {
+                                        Ok(handover) => {
+                                            prepare_worker_handover(&ctx, handover).await
                                         }
-                                        if result.is_err() {
-                                            supervisor::abort_worker_handover();
-                                        }
-                                        let _ = done.send(result);
-                                    });
-                                }
+                                        Err(error) => Err(error),
+                                    };
+                                    if result.is_ok() {
+                                        tracing::info!(
+                                            generation,
+                                            "worker handover drain completed"
+                                        );
+                                    } else if supervisor::worker_handover_committed() {
+                                        // Once the supervisor has committed the staged
+                                        // successor, this worker may have issued the
+                                        // hard-deadline cancellation. It must drain rather
+                                        // than silently resume admission.
+                                        tracing::warn!(
+                                            generation,
+                                            "committed worker handover failed; draining predecessor"
+                                        );
+                                        server::request_shutdown(&ctx);
+                                    } else {
+                                        supervisor::abort_worker_handover();
+                                    }
+                                    let _ = done_tx.send(result);
+                                });
                             }
                             Err(error) => {
                                 tracing::error!(%error, "worker handover setup failed");
@@ -3218,10 +3233,24 @@ async fn run_foreground_inner_with_boot_db_impl(
     };
     initial_retention.abort_and_join().await;
 
-    if handover_started.load(std::sync::atomic::Ordering::Acquire) {
-        handover_done_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("worker handover task stopped before completion"))??;
+    let handover_done = handover_done
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(handover_done) = handover_done {
+        match handover_done.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                // An abort-before-commit intentionally leaves this process
+                // alive. A concurrent Stop must still enter the ordinary
+                // daemon drain instead of returning this recoverable attempt
+                // failure from the process lifetime.
+                tracing::warn!(%error, "worker handover attempt ended before daemon shutdown");
+            }
+            Err(_) => {
+                tracing::warn!("worker handover task stopped before completion");
+            }
+        }
     }
 
     // The accept loop normally stops because `request_shutdown` already began
@@ -3321,14 +3350,17 @@ async fn prepare_worker_handover(
         !supervisor::worker_handover_aborted(),
         "worker handover was aborted before hard deadline"
     );
+    // The successor has already crossed its readiness barrier. Ask the
+    // supervisor to commit that successor before the hard deadline can cancel
+    // any live session work. A pre-commit failure therefore still leaves the
+    // predecessor completely untouched and retryable.
+    supervisor::announce_worker_handover_ready(&ctx.paths, supervisor::worker_generation()).await?;
+    supervisor::wait_for_worker_handover_decision().await?;
     if ctx.registry.has_handover_inflight() {
-        let interrupted = tokio::select! {
-            result = ctx.registry.interrupt_for_handover(handover.timers.hard()) => result?,
-            result = supervisor::wait_for_worker_handover_abort() => {
-                result?;
-                anyhow::bail!("worker handover abort watcher returned without an abort")
-            }
-        };
+        let interrupted = ctx
+            .registry
+            .interrupt_for_handover(handover.timers.hard())
+            .await?;
         tracing::warn!(
             interrupted,
             "worker handover hard deadline interrupted live turns"
@@ -3361,10 +3393,6 @@ async fn prepare_worker_handover(
         resume_from.clone(),
     )
     .await?;
-    // The supervisor has now seen the durable boundary but has not committed
-    // the roll.  Keep serving established clients until it has health-checked
-    // the staged successor; an abort leaves this generation untouched.
-    supervisor::wait_for_worker_handover_decision().await?;
     // Close admission before redirecting.  The inherited listener remains
     // supervisor-owned, so reconnect attempts made after this point queue in
     // its backlog until the successor is promoted; they can never attach to

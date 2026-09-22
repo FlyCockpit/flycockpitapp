@@ -258,6 +258,62 @@ async fn ready_pipe_failure_after_canonicalized_upgrade_keeps_predecessor_servin
     daemon.status().await;
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_precommit_handover_attempt_does_not_poison_next_upgrade() {
+    let daemon = SpawnedDaemon::start().await;
+    let before_output = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("status before predecessor-side abort");
+    assert_success(
+        "status before predecessor-side abort",
+        &before_output,
+        daemon.home(),
+    );
+    let before: serde_json::Value =
+        serde_json::from_slice(&before_output.stdout).expect("decode status before abort");
+    let worker_pid = before["worker_pid"]
+        .as_u64()
+        .expect("supervisor worker pid")
+        .try_into()
+        .expect("worker pid fits pid_t");
+
+    // This is the predecessor-side failure path: there is no staged
+    // successor, so its ready acknowledgement is rejected by the ordinary
+    // supervisor loop. The next real upgrade must get a fresh completion
+    // channel and proceed normally.
+    // SAFETY: the PID came from this test daemon's same-user supervisor.
+    assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGUSR1) }, 0);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let upgrade = daemon
+        .command()
+        .args(["daemon", "upgrade"])
+        .output()
+        .expect("run upgrade after aborted predecessor attempt");
+    assert!(upgrade.status.success(), "{}", output_text(&upgrade));
+    let after_output = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .expect("status after retry upgrade");
+    assert_success("status after retry upgrade", &after_output, daemon.home());
+    let after: serde_json::Value =
+        serde_json::from_slice(&after_output.stdout).expect("decode status after retry");
+    assert!(
+        after["generation"]
+            .as_u64()
+            .expect("generation after upgrade")
+            > before["generation"]
+                .as_u64()
+                .expect("generation before upgrade"),
+        "the retry must roll a new worker generation: {after}"
+    );
+    daemon.status().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_when_not_running_starts_daemon() {
     let daemon = SpawnedDaemon::start().await;

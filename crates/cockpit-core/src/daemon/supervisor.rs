@@ -114,6 +114,10 @@ pub(crate) fn worker_handover_aborted() -> bool {
     WORKER_HANDOVER_DECISION.load(Ordering::Acquire) == 2
 }
 
+pub(crate) fn worker_handover_committed() -> bool {
+    WORKER_HANDOVER_DECISION.load(Ordering::Acquire) == 1
+}
+
 pub(crate) fn worker_handover_reconnect_dispatched() {
     WORKER_HANDOVER_RECONNECT_DISPATCHED.store(true, Ordering::Release);
     WORKER_HANDOVER_DECISION_NOTIFY
@@ -214,6 +218,29 @@ pub(crate) async fn announce_worker_boundary(
     }
 }
 
+/// Tell the supervisor that ordinary draining has ended and that the
+/// predecessor is about to enter its hard-deadline phase.  This is deliberately
+/// separate from the final boundary report: the supervisor must commit the
+/// staged successor before the predecessor is allowed to cancel live work.
+pub(crate) async fn announce_worker_handover_ready(
+    paths: &DaemonPaths,
+    generation: u64,
+) -> Result<()> {
+    let response = request(
+        paths,
+        AdminCommand::WorkerHandoverReady {
+            worker_pid: std::process::id(),
+            generation,
+        },
+    )
+    .await?;
+    match response {
+        AdminResponse::Status { .. } => Ok(()),
+        AdminResponse::Error { message, .. } => bail!(message),
+        other => bail!("unexpected worker handover-ready acknowledgement: {other:?}"),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum AdminCommand {
@@ -224,6 +251,14 @@ pub enum AdminCommand {
     },
     Stop,
     Reexec,
+    /// Worker-internal acknowledgement that `T_drain` elapsed. The
+    /// supervisor may now commit the staged successor, allowing the worker to
+    /// use its `T_hard` cancellation path before it reports the final durable
+    /// boundary.
+    WorkerHandoverReady {
+        worker_pid: u32,
+        generation: u64,
+    },
     /// Worker-internal report emitted after the predecessor has closed new
     /// turn admission and captured its durable per-session boundaries.
     WorkerBoundary {
@@ -906,23 +941,20 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             }).await?;
                             continue;
                         }
-                        let boundary = wait_for_worker_boundary(
+                        let ready = wait_for_worker_handover_ready(
                             &mut admin,
                             worker.pid,
                             generation,
-                            handover_timers.drain()
-                                + handover_timers.hard()
-                                + HANDOVER_BOUNDARY_ANNOUNCE_SLACK,
+                            handover_timers.drain() + HANDOVER_BOUNDARY_ANNOUNCE_SLACK,
                             opened_at_unix_ms,
                             last_handover.clone(),
                         ).await;
-                        let boundary = match boundary {
-                            Ok(boundary) => boundary,
+                        match ready {
+                            Ok(()) => {}
                             Err(error) => {
                                 let stopping = error
                                     .to_string()
                                     .contains("administrative stop requested during worker handover");
-                                let _ = signal_worker_handover_decision(&worker, false);
                                 let _ = terminate_worker(&mut successor, false);
                                 reap_worker_after_exit(successor);
                                 if stopping {
@@ -938,7 +970,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 }).await?;
                                 continue;
                             }
-                        };
+                        }
                         if let Err(error) = signal_worker_handover_decision(&worker, true) {
                             let _ = signal_worker_handover_decision(&worker, false);
                             let _ = terminate_worker(&mut successor, false);
@@ -951,6 +983,73 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             }).await?;
                             continue;
                         }
+                        let boundary = wait_for_worker_boundary(
+                            &mut admin,
+                            worker.pid,
+                            generation,
+                            handover_timers.hard() + HANDOVER_BOUNDARY_ANNOUNCE_SLACK,
+                            opened_at_unix_ms,
+                            last_handover.clone(),
+                        )
+                        .await;
+                        let boundary = match boundary {
+                            Ok(boundary) => boundary,
+                            Err(error) => {
+                                let stopping = error
+                                    .to_string()
+                                    .contains("administrative stop requested during worker handover");
+                                // `SIGUSR2` committed the staged successor before the
+                                // predecessor was permitted to cancel live work. Never
+                                // report this as an abort-and-keep: a hard cancellation
+                                // may already be in flight. Retire both workers and let
+                                // the stable supervisor's ordinary crash-recovery path
+                                // restore a sole durable owner.
+                                let _ = terminate_worker(&mut successor, false);
+                                reap_worker_after_exit(successor);
+                                if stopping {
+                                    drain_and_reap_worker(&mut worker, false).await?;
+                                    break 'supervision;
+                                }
+                                let reason = format!(
+                                    "waiting for predecessor boundary after handover commitment: {error:#}"
+                                );
+                                tracing::warn!(%reason, "worker handover failed after commitment; retiring predecessor");
+                                last_handover = Some(format!("failed after commitment: {reason}"));
+                                drain_and_reap_worker(&mut worker, false).await?;
+                                let respawn_binary = worker.binary.clone();
+                                let Some(replacement) = retry_worker_spawn(
+                                    &mut storm,
+                                    &mut generation,
+                                    |attempt_generation| spawn_ready_worker(WorkerSpawnRequest {
+                                        endpoints: &endpoint_owner,
+                                        binary: &respawn_binary,
+                                        paths: &paths,
+                                        log: &log,
+                                        log_path: &log_path,
+                                        generation: attempt_generation,
+                                        opened_at_unix_ms,
+                                        no_sandbox,
+                                        resume_all_sessions,
+                                        hold_for_promotion: false,
+                                    }),
+                                ).await else {
+                                    bail!("{reason}; recovery worker readiness budget exhausted");
+                                };
+                                worker = replacement;
+                                publish_generation(
+                                    &paths,
+                                    &receipt,
+                                    worker.pid,
+                                    generation,
+                                    opened_at_unix_ms,
+                                )?;
+                                write_admin(&mut stream, &AdminResponse::Error {
+                                    version: ADMIN_PROTOCOL_VERSION,
+                                    message: reason,
+                                }).await?;
+                                continue;
+                            }
+                        };
                         let old_pid = worker.pid;
                         if let Err(error) = await_worker_exit(&mut worker).await {
                             // A committed predecessor must not share session
@@ -1038,6 +1137,12 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                         write_admin(&mut stream, &AdminResponse::Error {
                             version: ADMIN_PROTOCOL_VERSION,
                             message: "stale worker boundary report".to_string(),
+                        }).await?;
+                    }
+                    AdminCommand::WorkerHandoverReady { .. } => {
+                        write_admin(&mut stream, &AdminResponse::Error {
+                            version: ADMIN_PROTOCOL_VERSION,
+                            message: "stale worker handover-ready report".to_string(),
                         }).await?;
                     }
                     AdminCommand::Reexec => {
@@ -2025,6 +2130,87 @@ async fn wait_for_worker_boundary(
     })
     .await
     .map_err(|_| anyhow::anyhow!("T_drain + T_hard elapsed before predecessor boundary"))?
+}
+
+async fn wait_for_worker_handover_ready(
+    admin: &mut AdminListener,
+    expected_worker_pid: u32,
+    expected_generation: u64,
+    timeout: Duration,
+    opened_at_unix_ms: u64,
+    last_handover: Option<String>,
+) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let stream = accept_admin(admin).await?;
+            let (request, mut stream) = read_admin(stream).await?;
+            if request.version != ADMIN_PROTOCOL_VERSION {
+                write_admin(
+                    &mut stream,
+                    &AdminResponse::Error {
+                        version: ADMIN_PROTOCOL_VERSION,
+                        message: "unsupported supervisor admin protocol".to_string(),
+                    },
+                )
+                .await?;
+                continue;
+            }
+            match request.command {
+                AdminCommand::Status => {
+                    write_admin(
+                        &mut stream,
+                        &status_response(
+                            expected_worker_pid,
+                            expected_generation,
+                            opened_at_unix_ms,
+                            last_handover.clone(),
+                        ),
+                    )
+                    .await?;
+                }
+                AdminCommand::Stop => {
+                    write_admin(
+                        &mut stream,
+                        &AdminResponse::Stopping {
+                            version: ADMIN_PROTOCOL_VERSION,
+                        },
+                    )
+                    .await?;
+                    bail!("administrative stop requested during worker handover");
+                }
+                AdminCommand::WorkerHandoverReady {
+                    worker_pid,
+                    generation,
+                } if worker_pid == expected_worker_pid && generation == expected_generation => {
+                    write_admin(
+                        &mut stream,
+                        &status_response(
+                            expected_worker_pid,
+                            expected_generation,
+                            opened_at_unix_ms,
+                            last_handover,
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                _ => {
+                    write_admin(
+                        &mut stream,
+                        &AdminResponse::Error {
+                            version: ADMIN_PROTOCOL_VERSION,
+                            message: "worker handover is in progress".to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("T_drain elapsed before predecessor handover-ready acknowledgement")
+    })?
 }
 
 #[cfg(unix)]

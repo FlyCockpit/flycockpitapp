@@ -1,0 +1,40 @@
+ ‹ Back                                                                                                                 
+                 Choose the agent's models · step 6/8                                                                   
+                 Tick every model this agent may use. Star one as the default.                                          
+                 ────────────────────────────                                                                           
+                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ╭ Models  ·  1 of 2 ─────────────────────────────────────────────────────────────────╮                 
+                 │ ▣ ★ vendor/exact-a                                                                 │                 
+                 │ ▢   vendor/exact-b                                                                 │                 
+                 │                                                                                    │                 
+                 │ Space toggles grants; disabling the default selects another enabled route.         │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 ↑↓ move   space toggle   d default   enter continue   esc back            [ Continue ]                 
+                                                                                                                        

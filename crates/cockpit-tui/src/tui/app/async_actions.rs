@@ -1255,6 +1255,7 @@ impl App {
                     .remove(&result.id);
                 match result.payload {
                     Ok(AsyncActionPayload::StartupOnboardingBootstrap {
+                        lifetime_client,
                         generation,
                         request_id,
                         receipt,
@@ -1277,6 +1278,11 @@ impl App {
                         self.startup_background.retry = None;
                         if self.mark_startup_trace_milestone("onboarding-ready") {
                             tracing::info!(target: cockpit_core::startup::TARGET, event = "onboarding-ready", "startup");
+                        }
+                        if let (Some(selected), Some(client)) =
+                            (self.startup_lifecycle.as_mut(), lifetime_client)
+                        {
+                            selected.lifetime_client = Some(client);
                         }
                         self.apply_onboarding_bootstrap_snapshot(snapshot);
                     }
@@ -1303,7 +1309,10 @@ impl App {
             // generation fence or pending-operation correlation: a stale
             // read is inert by construction.
             AsyncActionKind::DaemonRpc("onboarding.bootstrap_refresh") => match result.payload {
-                Ok(AsyncActionPayload::OnboardingBootstrap(snapshot)) => {
+                Ok(AsyncActionPayload::OnboardingBootstrap(snapshot, client)) => {
+                    if let Some(selected) = self.startup_lifecycle.as_mut() {
+                        selected.lifetime_client = Some(client);
+                    }
                     self.apply_onboarding_bootstrap_snapshot(snapshot);
                 }
                 Err(error) => {
@@ -1320,12 +1329,6 @@ impl App {
             AsyncActionKind::DaemonRpc("onboarding.provider.verify") => match result.payload {
                 Ok(AsyncActionPayload::StartupProviderVerification(completion)) => {
                     if let Some(shell) = self.onboarding_shell.as_mut() {
-                        if let Some(config_generation) = completion.config_generation {
-                            shell.update_provider_settlement_generation(
-                                &completion.provider_id,
-                                config_generation,
-                            );
-                        }
                         match completion.outcome {
                             Ok(outcome) => shell.apply_provider_verification(
                                 &completion.provider_id,
@@ -1381,6 +1384,11 @@ impl App {
                         );
                         match verdict {
                             OnboardingTransitionCorrelation::Apply => {
+                                if let (Some(selected), Some(client)) =
+                                    (self.startup_lifecycle.as_mut(), completion.lifetime_client)
+                                {
+                                    selected.lifetime_client = Some(client);
+                                }
                                 if label == "onboarding.model" {
                                     self.refresh_bootstrap_config_snapshot();
                                 }
@@ -1455,6 +1463,7 @@ impl App {
                         }
                     }
                     Err(error) if !self.exit_requested && pending_request_id.is_some() => {
+                        tracing::warn!(label, %error, "onboarding transition request failed");
                         self.startup_background.retry = Some(StartupRetry::Onboarding);
                         if self.mark_startup_trace_milestone("onboarding-error") {
                             tracing::warn!(target: cockpit_core::startup::TARGET, event = "onboarding-error", "startup");

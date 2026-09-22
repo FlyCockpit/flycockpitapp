@@ -112,8 +112,9 @@ pub struct OnboardingStageSettlement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation_intent_hash: Option<String>,
     /// Config authority recorded by the terminal provider mutation receipt.
-    /// Verification may subsequently publish a fetched model catalog at the
-    /// settlement's final `config_generation`.
+    /// Provider advance echoes this receipt even after its catalog fetch.
+    /// The daemon verifies catalog lineage; clients must not rebind this
+    /// generation to a later publication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_mutation_config_generation: Option<u64>,
     /// Setup-wizard identity for model or agent settlement correlation.

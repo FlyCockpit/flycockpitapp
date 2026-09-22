@@ -1,5 +1,8 @@
 #![allow(deprecated)]
 
+#[path = "provider_onboarding_settlement_tests.rs"]
+mod provider_onboarding_settlement_tests;
+
 use super::{attachments::*, authz::*, dispatch::*, sessions::*, *};
 use crate::{
     daemon::{

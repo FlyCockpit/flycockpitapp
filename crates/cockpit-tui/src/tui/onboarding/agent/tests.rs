@@ -1117,11 +1117,8 @@ fn golden_tool_catalog() -> Vec<ToolSurfaceItem> {
         .collect()
 }
 
-#[test]
-fn golden_agent_authoring_screens() {
-    let _pins = crate::tui::golden::GoldenPins::install();
-    assert_eq!(golden_tool_catalog().len(), 53);
-    let states = [
+fn golden_states() -> [(&'static str, Phase); 22] {
+    [
         ("name", Phase::SourceIdentity),
         ("third-party-locator", Phase::ThirdPartyLocator),
         ("third-party-trust", Phase::ThirdPartyTrust),
@@ -1159,7 +1156,14 @@ fn golden_agent_authoring_screens() {
         ("conflict", Phase::Conflict),
         ("unknown", Phase::Unknown),
         ("success", Phase::Success),
-    ];
+    ]
+}
+
+#[test]
+fn golden_agent_authoring_screens() {
+    let _pins = crate::tui::golden::GoldenPins::install();
+    assert_eq!(golden_tool_catalog().len(), 53);
+    let states = golden_states();
     assert_eq!(states.len(), 22);
     for (name, phase) in states {
         let mut screen = golden_screen(phase);
@@ -1173,5 +1177,41 @@ fn golden_agent_authoring_screens() {
         crate::tui::golden::assert_golden_sizes("onboarding-agent", name, |width, height| {
             render_buffer(&mut screen, width, height)
         });
+    }
+}
+
+#[test]
+fn golden_agent_authoring_live_shell_screens() {
+    let _pins = crate::tui::golden::GoldenPins::install();
+    for (name, phase) in golden_states() {
+        crate::tui::golden::assert_golden_sizes(
+            "onboarding",
+            &format!("agent-authoring-{name}"),
+            |width, height| {
+                let snapshot = cockpit_proto::OnboardingBootstrapSnapshot {
+                    run_id: uuid::Uuid::from_u128(1),
+                    attempt_id: uuid::Uuid::from_u128(2),
+                    revision: 3,
+                    stage: cockpit_proto::OnboardingStage::Agent,
+                    bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
+                    limited_mode: false,
+                    lifetime_selection: None,
+                    host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+                    last_receipt: None,
+                };
+                let mut shell = super::super::OnboardingShell::new(&snapshot, false);
+                // #432 composition seam: inject a deterministic inner phase
+                // so the live shell owns title, help, actions, and content
+                // layout. These goldens cover composition, not navigation;
+                // the cold first-run PTYs cover the production present path.
+                shell.screen =
+                    super::super::OnboardingScreen::AgentAuthoring(Box::new(golden_screen(phase)));
+                let engine = crate::tui::settings::Dialog::None;
+                let mut links = crate::tui::links::LinkRegistry::default();
+                crate::tui::golden::render_frame(width, height, |frame| {
+                    shell.render(frame, frame.area(), &engine, &mut links);
+                })
+            },
+        );
     }
 }

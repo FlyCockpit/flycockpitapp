@@ -2570,6 +2570,7 @@ pub enum Dialog {
         root: cockpit_config::trust::TrustRoot,
         cursor: usize,
         chosen: Option<cockpit_config::WorkspaceTrustMode>,
+        choice_rects: std::cell::Cell<[Rect; 3]>,
     },
     PickConfig {
         dirs: Vec<ConfigDir>,
@@ -6002,6 +6003,36 @@ impl Dialog {
             root,
             cursor: 0,
             chosen: None,
+            choice_rects: std::cell::Cell::new([Rect::default(); 3]),
+        }
+    }
+
+    pub(crate) fn handle_workspace_trust_pointer(&mut self, mouse: MouseEvent) {
+        let Self::WorkspaceTrust {
+            cursor,
+            chosen,
+            choice_rects,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+        if let Some(index) = choice_rects
+            .get()
+            .iter()
+            .position(|rect| rect.contains(point))
+        {
+            *cursor = index;
+            if let WorkspaceTrustAction::Choose(mode) = workspace_trust_key_action(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                cursor,
+            ) {
+                *chosen = Some(mode);
+            }
         }
     }
 
@@ -6843,8 +6874,13 @@ impl Dialog {
     ) {
         match self {
             Dialog::None => {}
-            Dialog::WorkspaceTrust { root, cursor, .. } => {
-                render_workspace_trust(frame, area, root, *cursor)
+            Dialog::WorkspaceTrust {
+                root,
+                cursor,
+                choice_rects,
+                ..
+            } => {
+                choice_rects.set(render_workspace_trust(frame, area, root, *cursor));
             }
             Dialog::PickConfig {
                 dirs,
@@ -10277,7 +10313,7 @@ fn render_workspace_trust(
     area: Rect,
     root: &cockpit_config::trust::TrustRoot,
     cursor: usize,
-) {
+) -> [Rect; 3] {
     let block = product_dialog_block(" Workspace trust ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -10326,8 +10362,30 @@ fn render_workspace_trust(
                 ])
             }),
     );
+    // Use the same wrapping as the painted paragraph, including long roots.
+    // Clipped choices have no hit target: a hidden row cannot grant trust.
+    let mut choice_rects = [Rect::default(); 3];
+    if layout[0].width > 0 {
+        for (index, rect) in choice_rects.iter_mut().enumerate() {
+            let before = Paragraph::new(lines[..4 + index].to_vec())
+                .wrap(Wrap { trim: false })
+                .line_count(layout[0].width);
+            let through = Paragraph::new(lines[..5 + index].to_vec())
+                .wrap(Wrap { trim: false })
+                .line_count(layout[0].width);
+            if through <= usize::from(layout[0].height) {
+                *rect = Rect::new(
+                    layout[0].x,
+                    layout[0].y + before as u16,
+                    layout[0].width,
+                    (through - before) as u16,
+                );
+            }
+        }
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
     frame.render_widget(help_line("↑/↓  enter: choose  esc: untrusted"), layout[1]);
+    choice_rects
 }
 
 fn render_picker(

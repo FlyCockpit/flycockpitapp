@@ -1,0 +1,24 @@
+ ‹ Back                                                                         
+  Secure your secrets · step 3/8                                                
+  Choose how Cockpit protects your API keys and sealed values.                  
+  ────────────────────────────                                                  
+  ●Welcome ●Name ◐Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready         
+  ╭ Password ────────────────────────────────────────────────────────────────╮  
+  │ enter a password                                                         │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  ╭ Confirm ─────────────────────────────────────────────────────────────────╮  
+  │ enter a password                                                         │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  This password isn't recoverable — losing it means re-adding every secret.     
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+  type password   tab switch   ctrl-r reveal   enter save  [ Reveal ] [ Save ]  
+                                                                                

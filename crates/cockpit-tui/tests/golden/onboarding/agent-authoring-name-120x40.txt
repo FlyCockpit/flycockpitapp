@@ -1,0 +1,40 @@
+ ‹ Back                                                                                                                 
+                 Create your first agent · step 6/8                                                                     
+                 An agent is a saved configuration you can fly again and again.                                         
+                 ────────────────────────────                                                                           
+                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ╭ Name ──────────────────────────────────────────────────────────────────────────────╮                 
+                 │ navigator                                                                          │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 ╭ Agent ─────────────────────────────────────────────────────────────────────────────╮                 
+                 │                                                                                    │                 
+                 │ ◉ Navigator                                                                        │                 
+                 │ ○ Custom authored agent                                                            │                 
+                 │ ○ Third-party pinned source                                                        │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 │                                                                                    │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 type name   enter continue   esc back   ^c quit                           [ Continue ]                 
+                                                                                                                        

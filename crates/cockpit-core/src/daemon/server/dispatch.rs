@@ -183,11 +183,6 @@ async fn validate_settlement_operation_fence(
             "onboarding settlement config generation does not advance the stage checkpoint",
         ));
     }
-    if config_generation != inventory::current_config_generation() {
-        return Err(bad_request(
-            "onboarding settlement config generation does not match the current authority",
-        ));
-    }
     let started_at = ctx
         .db
         .local_operation_started_at_unix_ms(owner.to_owned(), operation_id.to_owned())
@@ -263,15 +258,6 @@ async fn validate_onboarding_stage_settlement(
     let (stage_entered_at_unix_ms, stage_entry_config_generation) =
         onboarding_stage_fence(ctx).await?;
     let operation_id = settlement.settlement_operation_id.clone();
-    validate_settlement_operation_fence(
-        ctx,
-        owner,
-        &operation_id,
-        stage_entered_at_unix_ms,
-        stage_entry_config_generation,
-        settlement.config_generation,
-    )
-    .await?;
     match stage {
         proto::OnboardingStage::Provider => {
             let provider_id = settlement
@@ -312,6 +298,7 @@ async fn validate_onboarding_stage_settlement(
                     ..
                 } if client_operation_id == operation_id
                     && config_generation == mutation_config_generation
+                    && config_generation == settlement.config_generation
                     && committed_intent_hash == mutation_intent_hash
                     && upserted_provider_ids.iter().any(|id| id == provider_id) =>
                 {
@@ -389,7 +376,8 @@ async fn validate_onboarding_stage_settlement(
                 ) if receipt.client_operation_id == operation_id
                     && receipt.status == cockpit_proto::AuthoredAgentReceiptStatus::Committed
                     && receipt.default_selected
-                    && receipt.installation_id.is_some() =>
+                    && receipt.installation_id.is_some()
+                    && receipt.result_config_generation == settlement.config_generation =>
                 {
                     Ok(())
                 }
@@ -401,7 +389,38 @@ async fn validate_onboarding_stage_settlement(
         _ => Err(bad_request(
             "onboarding settlement correlation is only valid for provider, model, or agent advance",
         )),
+    }?;
+    // Verify the receipt, authority lineage, and operation timing before
+    // restoring any process-local authority. Catalog verification may extend
+    // this Provider mutation, but never changes the generation the client
+    // must echo from its terminal receipt.
+    if inventory::current_config_generation() > settlement.config_generation
+        && !(stage == proto::OnboardingStage::Provider
+            && settlement
+                .provider_id
+                .as_deref()
+                .is_some_and(|provider_id| {
+                    inventory::provider_catalog_extends_receipt(
+                        provider_id,
+                        settlement.config_generation,
+                    )
+                }))
+    {
+        return Err(bad_request(
+            "onboarding settlement config generation does not match the current authority",
+        ));
     }
+    validate_settlement_operation_fence(
+        ctx,
+        owner,
+        &operation_id,
+        stage_entered_at_unix_ms,
+        stage_entry_config_generation,
+        settlement.config_generation,
+    )
+    .await?;
+    inventory::publish_committed_config_generation_at_least(settlement.config_generation);
+    Ok(())
 }
 
 /// Recover the catalog `(provider_id, model_id)` whose identity digests match
@@ -6485,6 +6504,7 @@ async fn handle_serialized_request_impl(
             "onboarding profile apply is only valid during locked bootstrap",
         )),
         Request::ApplyOnboardingTransition(request) => {
+            let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
             let capabilities = ctx
                 .host_capabilities
                 .current()
@@ -6496,6 +6516,14 @@ async fn handle_serialized_request_impl(
                 .await
                 .map_err(onboarding_error)?
                 .ok_or_else(|| bad_request("no onboarding run exists"))?;
+            if request.run_id != snapshot.run_id
+                || request.attempt_id != snapshot.attempt_id
+                || request.expected_revision != snapshot.revision
+            {
+                return Err(onboarding_error(anyhow::anyhow!(
+                    "onboarding revision conflict"
+                )));
+            }
             let (snapshot, receipt) = if request.transition
                 == proto::OnboardingTransitionKind::Advance
                 && matches!(
@@ -23743,6 +23771,7 @@ pub(super) async fn provider_models_fetch(
     // owns a layer entry.  A crash after the file replacement must not turn a
     // later delete into an early no-op that forgets its vault cleanup.
     recover_provider_config_journals(ctx, project_root, provider_id).await?;
+    let consumed_config_generation = inventory::current_config_generation();
     let (cwd, trust_policy, mut config) = daemon_provider_config(ctx, project_root).await?;
     // An all-provider probe is one user-visible operation.  Keep its original
     // catalog until every selected provider has yielded a durable-safe result:
@@ -24055,7 +24084,17 @@ pub(super) async fn provider_models_fetch(
         )?;
     }
     let config_generation = if config_changed {
-        inventory::publish_committed_config_generation()
+        if let Some(provider_id) = provider_id.filter(|_| {
+            !deep
+                && matches!(
+                    on_unlisted,
+                    None | Some(crate::config::providers::OnUnlistedModelsFetch::Keep)
+                )
+        }) {
+            inventory::publish_provider_catalog_generation(provider_id, consumed_config_generation)
+        } else {
+            inventory::publish_committed_config_generation()
+        }
     } else {
         inventory::current_config_generation()
     };

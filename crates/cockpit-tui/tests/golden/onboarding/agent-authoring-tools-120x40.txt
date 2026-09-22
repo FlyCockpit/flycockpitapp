@@ -1,0 +1,40 @@
+ ‹ Back                                                                                                                 
+                 Grant tools · step 6/8                                                                                 
+                 Required tools are always on. Toggle the rest.                                                         
+                 ────────────────────────────                                                                           
+                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ╭ Tools  ·  15 of 53 enabled ────────────────────────────────────────────────────────╮                 
+                 │ Required                                                                         █ │                 
+                 │ ▣ read  —  required                                                              █ │                 
+                 │ ▣ shell  —  required                                                             █ │                 
+                 │ ▣ write  —  required                                                             █ │                 
+                 │ Suggested                                                                        █ │                 
+                 │ ▢ context_pack  —  disabled                                                      █ │                 
+                 │ ▢ code  —  disabled                                                              █ │                 
+                 │ ▢ graph  —  disabled                                                             █ │                 
+                 │ ▢ search  —  disabled                                                            █ │                 
+                 │ ▢ change_impact  —  disabled                                                     █ │                 
+                 │ ▣ task  —  enabled                                                               █ │                 
+                 │ ▢ skill  —  disabled                                                             █ │                 
+                 │ ▢ skill_manage  —  disabled                                                      █ │                 
+                 │ ▣ question  —  enabled                                                           █ │                 
+                 │ ▣ raise  —  enabled                                                              █ │                 
+                 │ ▣ schedule  —  enabled                                                           █ │                 
+                 │ ▣ spawn  —  enabled                                                              █ │                 
+                 │ ▢ worktree_orchestrate  —  disabled                                              │ │                 
+                 │ ▣ mcp  —  enabled                                                                │ │                 
+                 │ ▢ webfetch  —  disabled                                                          │ │                 
+                 │ ▢ websearch  —  disabled                                                         │ │                 
+                 │ ▢ lsp  —  disabled                                                               │ │                 
+                 │ ▣ start_build  —  enabled                                                        │ │                 
+                 │ ▣ defer_to_orchestrator  —  enabled                                              │ │                 
+                 │ ▣ return  —  enabled                                                             │ │                 
+                 │ ▢ harness_list  —  disabled                                                      │ │                 
+                 │ ▢ harness_invoke  —  disabled                                                    │ │                 
+                 │ ▢ history_search  —  disabled                                                    │ │                 
+                 │ ▢ thread_start  —  disabled                                                      │ │                 
+                 │ ▢ semantic_search  —  disabled                                                   │ │                 
+                 │ ▢ structured_search  —  disabled                                                 │ │                 
+                 ╰────────────────────────────────────────────────────────────────────────────────────╯                 
+                 ↑↓ move   space cycle grant   m set model   enter continue   esc back     [ Continue ]                 
+                                                                                                                        

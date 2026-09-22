@@ -1,0 +1,24 @@
+ ‹ Back                                                                         
+  Trust this publisher? · step 6/8                                              
+  Confirm who published this pinned definition before it can run.               
+  ────────────────────────────                                                  
+  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ╭ Trust ───────────────────────────────────────────────────────────────────╮  
+  │ ○ I trust this publisher and pinned source                               │  
+  │ Click once to select; click the selected row again to confirm.           │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  │                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────╯  
+  ↑↓ choose   space confirm   enter continue   esc back           [ Continue ]  
+                                                                                

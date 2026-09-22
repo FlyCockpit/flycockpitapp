@@ -2,7 +2,7 @@
 80x24
 0	8:Rgb(224,177,86)/Reset/- 72:Reset/Reset/-
 1	2:Reset/Reset/- 35:Rgb(217,106,106)/Reset/BOLD 43:Reset/Reset/-
-2	2:Reset/Reset/- 62:Rgb(138,155,176)/Reset/- 16:Reset/Reset/-
+2	2:Reset/Reset/- 59:Rgb(138,155,176)/Reset/- 19:Reset/Reset/-
 3	2:Reset/Reset/- 28:Rgb(224,177,86)/Reset/- 50:Reset/Reset/-
 4	2:Reset/Reset/- 8:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 5:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 13:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 9:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 6:Rgb(224,177,86)/Reset/- 1:Reset/Reset/- 6:Rgb(224,177,86)/Reset/BOLD 1:Reset/Reset/- 9:Rgb(74,90,106)/Reset/- 1:Reset/Reset/- 6:Rgb(74,90,106)/Reset/- 9:Reset/Reset/-
 5	2:Reset/Reset/- 1:Rgb(74,90,106)/Reset/- 8:Rgb(244,239,230)/Reset/- 67:Rgb(74,90,106)/Reset/- 2:Reset/Reset/-

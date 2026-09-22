@@ -571,7 +571,10 @@ pub enum AsyncActionPayload {
     GoalSettings(crate::tui::goal_settings_pane::GoalSettingsCompletion),
     Tools(crate::tui::tools_pane::ToolsCompletion),
     WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
-    OnboardingBootstrap(Option<cockpit_proto::OnboardingBootstrapSnapshot>),
+    OnboardingBootstrap(
+        Option<cockpit_proto::OnboardingBootstrapSnapshot>,
+        cockpit_client::DaemonClient,
+    ),
     StartupOnboardingTransition(crate::tui::app::StartupOnboardingCompletion),
     StartupProviderVerification(crate::tui::onboarding::ProviderVerificationCompletion),
     /// The initial post-paint bootstrap carries the already-selected daemon
@@ -579,6 +582,7 @@ pub enum AsyncActionPayload {
     /// startup to one lifecycle request rather than accidentally resolving a
     /// second owner while asking for workspace trust.
     StartupOnboardingBootstrap {
+        lifetime_client: Option<cockpit_client::DaemonClient>,
         generation: u64,
         request_id: String,
         receipt: Option<cockpit_proto::OnboardingTransitionReceipt>,

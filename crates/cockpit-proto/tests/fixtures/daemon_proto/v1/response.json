@@ -1609,7 +1609,7 @@
   "leak_reveal_capability": {
     "data": {
       "capability": {
-        "capability": "cap-token",
+        "capability": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "expires_at_ms": 1700000300,
         "report_id": "leak-1"
       }
@@ -2804,7 +2804,6 @@
       "snapshot": null,
       "consumed_config_generation": 7,
       "result_config_generation": 8,
-      "config_generation": 8,
       "inventory_revision": "2222222222222222222222222222222222222222222222222222222222222222",
       "consumed_revision": "1111111111111111111111111111111111111111111111111111111111111111",
       "result_revision": "2222222222222222222222222222222222222222222222222222222222222222",
@@ -2880,13 +2879,6 @@
           "config_generation": 8
         }
       }
-    }
-  },
-  "extended_config_written": {
-    "response": "extended_config_written",
-    "data": {
-      "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "config_generation": 7
     }
   },
   "agent_tree_page": {

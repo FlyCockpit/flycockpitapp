@@ -1401,23 +1401,6 @@ impl Default for DaemonRestartPrompt {
     }
 }
 
-/// Legacy `/compact` handoff state from the old review-then-commit path.
-/// New compactions are queued and applied in place by the driver.
-#[allow(dead_code)]
-#[derive(Clone)]
-pub(super) struct PendingCompact {
-    pub(super) new_session_id: uuid::Uuid,
-    pub(super) seed_tool_count: usize,
-    /// Approx wire tokens the seed-tools cost on the fresh session's
-    /// first turn (from `CompactReady`). Surfaced in the boundary marker.
-    pub(super) seed_tool_tokens: u64,
-    /// The predecessor (current) session's short id, captured at
-    /// `CompactReady` time so the fresh session can draw a `compacted
-    /// from <short-id>` boundary marker once committed. Empty when the
-    /// runner had no short id.
-    pub(super) predecessor_short_id: String,
-}
-
 /// A `/init` whose target file already exists, awaiting the user's
 /// update/overwrite/cancel choice in the (locally-driven) question
 /// dialog. The dialog carries `interrupt_id`; the close handler matches
@@ -2776,9 +2759,6 @@ pub struct App {
     /// prune state, replaced wholesale on each `Pruned`, not a persisted
     /// flag. Cleared on a fresh thread (`/compact` commit, `/clear`).
     pub(super) elided_event_ids: std::collections::HashSet<String>,
-    /// A `/compact` handoff awaiting review-then-commit (T6.e). `Some`
-    /// while the assembled handoff sits in the composer for editing.
-    pub(super) pending_compact: Option<PendingCompact>,
     /// `/prune` confirm armed: the user ran `/prune`, saw the before→after
     /// numbers + cache warning, and the next `y`/Enter commits (anything
     /// else cancels). `Some` holds nothing meaningful — its presence is
@@ -4310,7 +4290,6 @@ impl App {
             submit_after_model_selection: false,
             next_control_request_seq: 0,
             elided_event_ids: std::collections::HashSet::new(),
-            pending_compact: None,
             pending_prune_confirm: false,
             pending_resume_compaction_confirm: false,
             pending_stop_confirm: None,

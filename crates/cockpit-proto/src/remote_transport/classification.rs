@@ -429,11 +429,6 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "create_sealed_action",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
         "revise_sealed_action_description",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1071,11 +1066,6 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "apply_setup_wizard",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
-        "save_extended_config",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -2729,11 +2719,6 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "extended_config_written",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
         "extended_config_snapshot",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::TruncatedByCap,
@@ -3532,13 +3517,13 @@ mod tests {
 
         // Exact table sizes, so a silent shrink is caught.
         #[cfg(feature = "extended")]
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 293);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 291);
         #[cfg(not(feature = "extended"))]
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 270);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 268);
         #[cfg(feature = "extended")]
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 206);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 205);
         #[cfg(not(feature = "extended"))]
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 198);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 197);
         #[cfg(feature = "extended")]
         assert_eq!(EVENT_CLASSIFICATION.len(), 88);
         #[cfg(not(feature = "extended"))]

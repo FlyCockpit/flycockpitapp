@@ -5489,13 +5489,7 @@ fn wrap_ghost_line_chunks(
 /// True for tools that take an `old_string` / `new_string` pair we can render
 /// as a diff. Writes use their separate applied-result path.
 pub(super) fn is_edit_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "edit"
-            // Historical display only: pre-rename persisted sessions used this
-            // retired verb name in tool-call rows.
-            | "editunlock"
-    )
+    tool == "edit"
 }
 
 /// Approximate row count for a `Diff` entry, used by the chat-pane

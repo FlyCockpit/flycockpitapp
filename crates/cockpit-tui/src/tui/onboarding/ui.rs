@@ -9,10 +9,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::theme::{BRASS, FOG, INK, NIGHT};
 pub(super) use crate::tui::chrome::{
     RADIO_OFF, RADIO_ON, check_mark, radio_mark, render_field, render_field_masked,
 };
+use crate::tui::theme::{BRASS, FOG, INK, NIGHT};
 #[allow(dead_code)] // starred default-model rows land in #430.
 pub(super) const STAR: &str = "\u{2605}"; // ★
 pub(super) const SCROLL_TRACK: &str = "\u{2502}"; // │

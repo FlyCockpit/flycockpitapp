@@ -1762,8 +1762,14 @@ impl RedactionTable {
             serde_json::from_str(json).context("deserializing redaction table")?;
         let mut entries: Vec<RedactionEntry> = Vec::with_capacity(snapshot.entries.len());
         for persisted in snapshot.entries {
-            if origin_is_disk_derived(&persisted.origin_display()) {
-                continue;
+            // The writer persists disk-derived coverage only as origin-only
+            // markers; a value-bearing disk-derived entry is not a snapshot
+            // this build wrote, so refuse it instead of trusting it.
+            let origin = persisted.origin_display();
+            if origin_is_disk_derived(&origin) {
+                anyhow::bail!(
+                    "persisted redaction table carries a value for disk-derived origin {origin}"
+                );
             }
             entries.push(persisted.into_entry()?);
         }
@@ -1780,20 +1786,11 @@ impl RedactionTable {
         )
     }
 
-    /// Return disk-origin markers without exposing any value. For snapshots
-    /// written before origin-only markers existed, recover them from the
-    /// legacy disk-derived entries so they are purged on the next persist.
+    /// Return disk-origin markers without exposing any value.
     pub fn persisted_disk_derived_origins(json: &str) -> Result<Vec<String>> {
         let snapshot: PersistedRedactionTable =
             serde_json::from_str(json).context("deserializing redaction table")?;
         let mut origins: Vec<String> = snapshot.disk_derived_origins;
-        origins.extend(
-            snapshot
-                .entries
-                .into_iter()
-                .map(|entry| entry.origin_display())
-                .filter(|origin| origin_is_disk_derived(origin)),
-        );
         origins.sort();
         origins.dedup();
         Ok(origins)

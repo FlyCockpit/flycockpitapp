@@ -167,8 +167,6 @@ pub struct AgentMutationResult {
     pub consumed_config_generation: u64,
     /// Configuration generation published for this terminal mutation.
     pub result_config_generation: u64,
-    /// Backward-compatible alias for `result_config_generation` within v17.
-    pub config_generation: u64,
     /// Present for inventory-wide mutations such as reset-all and bound to the
     /// post-commit inventory returned by a subsequent refresh.
     #[serde(deserialize_with = "deserialize_present_option")]
@@ -452,9 +450,6 @@ pub fn validate_agent_mutation_envelope(
     }
     if result.owner_scope != format!("project:{}", result.project_root) {
         return Err("agent mutation receipt contains an invalid owner scope");
-    }
-    if result.result_config_generation != result.config_generation {
-        return Err("agent mutation receipt contains an invalid generation transition");
     }
     // Generations are process-local publication counters. A boot-recovered
     // committed receipt may legitimately carry a consumed generation from the
@@ -758,7 +753,6 @@ mod tests {
             snapshot: None,
             consumed_config_generation: 1,
             result_config_generation: 2,
-            config_generation: 2,
             inventory_revision: Some(result_revision.clone()),
             consumed_revision: Some(revision.clone()),
             result_revision,

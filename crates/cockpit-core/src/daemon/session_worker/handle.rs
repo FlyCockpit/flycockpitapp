@@ -3022,21 +3022,19 @@ pub(crate) fn spawn(
     // uses a lowercase durable identity key and must still open as `Assistant`.
     // Computer mode, conversely, owns a dedicated root regardless of any
     // identity attached to the session.
-    let initial_agent = if session.session_entry_mode()
-        == crate::daemon::proto::SessionEntryMode::Computer
-    {
-        "Computer".to_string()
-    } else {
-        let active = session.active_agent();
-        if crate::agents::is_builtin_primary(&active) || crate::agents::is_removed_primary(&active)
-        {
-            crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
-        } else if !active.trim().is_empty() {
-            active
+    let initial_agent =
+        if session.session_entry_mode() == crate::daemon::proto::SessionEntryMode::Computer {
+            "Computer".to_string()
         } else {
-            initial_active_agent(extended_cfg).to_string()
-        }
-    };
+            let active = session.active_agent();
+            if crate::agents::is_builtin_primary(&active) {
+                crate::agents::resolve_primary(Some(&active), initial_active_agent(extended_cfg))
+            } else if !active.trim().is_empty() {
+                active
+            } else {
+                initial_active_agent(extended_cfg).to_string()
+            }
+        };
     // Resolve the new-session sandbox default (highest wins):
     //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.
     //   (b) else this client passed `--no-sandbox` → OFF for the

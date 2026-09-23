@@ -181,16 +181,6 @@ impl App {
         }
     }
 
-    /// Legacy reviewed `/compact` handoff path. New compactions are applied
-    /// in place by the driver, so this only clears stale pending state.
-    pub(super) fn commit_compact(&mut self, _handoff: String) -> bool {
-        self.pending_compact = None;
-        self.push_plain(
-            "/compact: stale reviewed handoff discarded; run `/compact` again".to_string(),
-        );
-        false
-    }
-
     /// Resume `session_id` from the `/sessions` browser. Reuses the
     /// existing session-switch path — the runner's
     /// event stream + input channel move onto the resumed session, and the

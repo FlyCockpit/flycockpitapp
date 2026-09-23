@@ -837,12 +837,6 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "create_sealed_action"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
         "tag": "revise_sealed_action_description"
       },
       {
@@ -1588,12 +1582,6 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "apply_setup_wizard"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "save_extended_config"
       },
       {
         "class": "bounded_request_response",
@@ -3510,12 +3498,6 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "agent_session_override_outcome"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "extended_config_written"
       },
       {
         "class": "bounded_request_response",

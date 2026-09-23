@@ -5,8 +5,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::theme::{BRASS, FOG, INK};
 use super::ui::{RADIO_OFF, RADIO_ON};
+use crate::tui::theme::{BRASS, FOG, INK};
 
 const ROWS: [&str; 2] = [
     "Keep agents running in the background",

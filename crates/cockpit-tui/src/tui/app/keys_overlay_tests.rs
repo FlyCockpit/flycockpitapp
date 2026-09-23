@@ -500,10 +500,9 @@ async fn side_end_restores_main_session_snapshot_and_discards_side_state() {
     assert_eq!(app.async_actions.pending_count(), 1);
 }
 
-/// `/keys` opens the overlay; `/keys` and the hidden `/keybindings` alias
-/// both resolve to the same registered command.
+/// `/keys` opens the overlay.
 #[test]
-fn keys_slash_command_opens_overlay_and_alias_resolves() {
+fn keys_slash_command_opens_overlay() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
 
@@ -511,12 +510,6 @@ fn keys_slash_command_opens_overlay_and_alias_resolves() {
     app.composer.set("/keys");
     app.execute_slash(*keys);
     assert!(app.keys_overlay.is_some(), "/keys opens the overlay");
-
-    // The hidden /keybindings alias resolves to the visible /keys command.
-    assert_eq!(
-        super::hidden_slash_alias("keybindings").unwrap().name,
-        "keys"
-    );
 }
 
 #[test]
@@ -558,13 +551,13 @@ fn slash_goal_settings_opens_dialog() {
     }
 }
 
-/// `/keys` is registered (visible); `/keybindings` is a hidden alias and is
-/// NOT a separate menu entry.
+/// `/keys` is registered (visible); there is no `/keybindings` command.
 #[test]
-fn keys_registered_keybindings_is_a_hidden_alias() {
+fn keys_registered_keybindings_is_not_a_command() {
     assert!(SLASH_COMMANDS.iter().any(|c| c.name == "keys"));
     assert!(
         !SLASH_COMMANDS.iter().any(|c| c.name == "keybindings"),
-        "/keybindings is a hidden alias, not a visible command"
+        "/keybindings is not a command"
     );
+    assert!(super::hidden_slash_alias("keybindings").is_none());
 }

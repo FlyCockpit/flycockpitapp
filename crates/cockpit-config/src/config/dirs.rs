@@ -11,7 +11,6 @@
 //!      stopping at the `{$HOME, /srv, /opt, /tmp, /var/tmp, /}` stop set.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use anyhow::Context;
 use sha2::{Digest, Sha256};
@@ -28,47 +27,6 @@ pub const MCP_FILE: &str = "mcp.json";
 /// layered `config.json` discovery for runtime loading. It intentionally does
 /// not affect sibling files such as `mcp.json`.
 pub const COCKPIT_CONFIG_ENV: &str = "COCKPIT_CONFIG";
-
-/// The retired per-layer file. Read by no code path; its presence in a
-/// discovered layer triggers a one-time warning via
-/// [`warn_if_stray_extended_config`].
-pub const LEGACY_EXTENDED_CONFIG_FILE: &str = "extended-config.json";
-
-/// Process-global set of layer directories already warned about, so the
-/// stray-`extended-config.json` warning fires at most once per offending
-/// layer per process (config is resolved many times per session — a
-/// per-resolve warning would spam).
-static WARNED_STRAY_EXTENDED: Mutex<Option<std::collections::HashSet<PathBuf>>> = Mutex::new(None);
-
-/// If `layer_dir` still contains an `extended-config.json`, log a single
-/// one-time warning (per layer, per process) that the file is no longer
-/// read and its keys must be merged into `config.json`. The file itself is
-/// never read, renamed, or migrated.
-pub fn warn_if_stray_extended_config(layer_dir: &Path) {
-    let stray = layer_dir.join(LEGACY_EXTENDED_CONFIG_FILE);
-    if !stray.exists() {
-        return;
-    }
-    if mark_stray_warned(&stray) {
-        tracing::warn!(
-            path = %stray.display(),
-            "`extended-config.json` is no longer read; merge its keys into `config.json`"
-        );
-    }
-}
-
-/// Record `stray` in the process-global warned-set, returning `true` only
-/// the first time a given path is seen — the dedup decision behind
-/// [`warn_if_stray_extended_config`]'s "warn exactly once per layer per
-/// process" guarantee. Split out so the dedup is unit-testable without
-/// asserting on log output.
-fn mark_stray_warned(stray: &Path) -> bool {
-    let mut guard = WARNED_STRAY_EXTENDED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
-    seen.insert(stray.to_path_buf())
-}
 
 /// Where a cockpit config directory was discovered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,13 +199,6 @@ pub fn discover_config_dirs(cwd: &Path) -> Vec<ConfigDir> {
                 path: candidate,
             });
         }
-    }
-
-    // Single chokepoint: every layered resolver walks through here, so a
-    // stray retired `extended-config.json` in any discovered layer warns
-    // exactly once per layer per process (deduped in the helper).
-    for dir in &out {
-        warn_if_stray_extended_config(&dir.path);
     }
 
     out
@@ -615,44 +566,6 @@ pub mod test_support {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    /// The stray-`extended-config.json` warning dedups per layer per
-    /// process: the first sighting of a given path returns `true` (warn),
-    /// every later sighting returns `false` (already warned) — so the
-    /// frequently-called config resolve never spams. A distinct layer path
-    /// still warns once on its own.
-    #[test]
-    fn stray_extended_config_warning_dedups_per_path() {
-        let tmp = TempDir::new().unwrap();
-        let a = tmp.path().join("layer-a").join(LEGACY_EXTENDED_CONFIG_FILE);
-        let b = tmp.path().join("layer-b").join(LEGACY_EXTENDED_CONFIG_FILE);
-
-        // First sighting of each distinct path warns exactly once.
-        assert!(mark_stray_warned(&a), "first sighting of a warns");
-        assert!(
-            !mark_stray_warned(&a),
-            "second sighting of a is deduped (no spam)"
-        );
-        assert!(
-            !mark_stray_warned(&a),
-            "every further sighting of a stays deduped"
-        );
-        assert!(mark_stray_warned(&b), "a distinct layer still warns once");
-        assert!(!mark_stray_warned(&b), "and then dedups too");
-    }
-
-    /// A layer with no leftover `extended-config.json` is a silent no-op.
-    #[test]
-    fn no_stray_file_is_a_no_op() {
-        let tmp = TempDir::new().unwrap();
-        // No file written → helper returns without recording anything.
-        warn_if_stray_extended_config(tmp.path());
-        let stray = tmp.path().join(LEGACY_EXTENDED_CONFIG_FILE);
-        // The first real sighting (after creating the file) still warns,
-        // proving the no-op path didn't pre-mark it.
-        std::fs::write(&stray, "{}").unwrap();
-        assert!(mark_stray_warned(&stray));
-    }
 
     #[test]
     fn global_config_dir_is_created_writable_and_ignores_workspace_trust() {

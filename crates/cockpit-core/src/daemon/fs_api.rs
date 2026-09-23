@@ -278,28 +278,6 @@ pub async fn fs_write(
     .await
 }
 
-/// Persist a rendered extended config layer through the daemon-owned config
-/// mutation boundary. Unlike generic FsWrite this reloads and hashes the
-/// config while holding the cross-process config lock, then commits atomically.
-pub async fn save_extended_config(
-    ctx: &crate::daemon::server::DaemonContext,
-    project_root: String,
-    path: String,
-    content: String,
-    base_hash: Option<String>,
-) -> Result<Response, ErrorPayload> {
-    // Runtime lifetime, not the boot-time path marker: in-place promotion
-    // never rewrites `ctx.paths.ephemeral`.
-    let ephemeral = ctx.is_ephemeral_lifetime();
-    join_fs_handler(
-        "save_extended_config",
-        tokio::task::spawn_blocking(move || {
-            save_extended_config_sync(ephemeral, &project_root, &path, &content, base_hash)
-        }),
-    )
-    .await
-}
-
 /// Return every daemon-discovered settings layer. A request rooted at the
 /// canonical global config directory is deliberately a global-only snapshot;
 /// it never consults workspace trust or workspace-selected layers. Every
@@ -353,18 +331,8 @@ pub async fn get_extended_config_snapshot(
                 }
                 let raw_revision = content_hash(&raw);
                 let revision = settings_revision(kind, &target, &raw_revision);
-                let mut raw_document: serde_json::Value =
+                let raw_document: serde_json::Value =
                     serde_json::from_slice(&raw).map_err(bad_request_config)?;
-                // A registered alias/canonical pair is ONE setting
-                // (`EXTENDED_CONFIG_KEY_ALIASES`): normalize before the typed
-                // decode and the authorship walk so a document carrying the
-                // legacy spelling decodes once under the canonical key
-                // (instead of failing the whole snapshot with serde
-                // `duplicate field`) and reports its authorship under the
-                // canonical key the client must patch.
-                cockpit_config::config::extended::canonicalize_extended_config_document_aliases(
-                    &mut raw_document,
-                );
                 let authored_paths = authored_typed_paths(&raw_document);
                 let mut config: cockpit_config::config::extended::ExtendedConfig =
                     serde_json::from_value(raw_document).map_err(bad_request_config)?;
@@ -770,16 +738,6 @@ pub async fn apply_extended_config_patch(
             }
             let mut document: serde_json::Value =
                 serde_json::from_slice(&raw).map_err(bad_request_config)?;
-            // A registered alias/canonical pair is ONE setting: normalize the
-            // on-disk document before applying client operations so a
-            // canonical-path Set never lands beside a still-live legacy
-            // spelling (serde `duplicate field`) and a canonical-path Unset
-            // removes the one setting instead of leaving the legacy spelling
-            // in effect. Persistence is canonical-only, matching
-            // `ExtendedConfigDoc::merge_config_raw`'s re-seat.
-            cockpit_config::config::extended::canonicalize_extended_config_document_aliases(
-                &mut document,
-            );
             let mut operations = patch.operations;
             let mut selected_paths = std::collections::HashSet::new();
             for operation in &operations {
@@ -841,9 +799,6 @@ pub async fn apply_extended_config_patch(
             let object = document.as_object_mut().ok_or_else(|| {
                 bad_request("extended config root must be a JSON object")
             })?;
-            // Removed pre-launch configuration is garbage-collected by every
-            // settings save path, not only ExtendedConfigDoc::write.
-            object.remove("llm_mode");
             apply_redacted_occurrence_mutations(
                 object,
                 patch.redacted_mutations,
@@ -1495,85 +1450,6 @@ fn validate_new_denylist_literal(value: &str) -> Result<(), ErrorPayload> {
         ));
     }
     Ok(())
-}
-
-fn save_extended_config_sync(
-    ephemeral: bool,
-    project_root: &str,
-    path: &str,
-    content: &str,
-    base_hash: Option<String>,
-) -> Result<Response, ErrorPayload> {
-    let root = canonical_project_root(project_root)?;
-    let target = resolve_for_write(&root, path)?;
-    if target.file_name().and_then(|name| name.to_str()) != Some("config.json") {
-        return Err(bad_request("extended config target must be config.json"));
-    }
-    crate::daemon::server::refuse_ephemeral_missing_global_layer(ephemeral, &target)?;
-    crate::daemon::server::ensure_authorized_global_layer(&target)?;
-    let _guard = cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-    // Only a genuinely-absent file is an empty config. A non-NotFound read error
-    // (EACCES/EIO/EMFILE/…, over-cap, non-regular) must NOT be coerced to empty:
-    // the merge would then find no on-disk `image_generation` to preserve and
-    // the atomic write would WIPE the registry — the exact data loss this path
-    // exists to prevent. Fail closed instead, writing nothing. The body is
-    // required for the registry-preserving merge, so this lane cannot swap in
-    // a streamed digest.
-    let current =
-        crate::resource_limits::read_existing_or_empty(&target).map_err(resource_limit)?;
-    let current_hash = content_hash(&current);
-    if let Some(expected) = base_hash.as_deref()
-        && expected != current_hash
-    {
-        return Err(ErrorPayload {
-            code: ErrorCode::HashMismatch,
-            message: format!("configuration changed before write; current hash is {current_hash}"),
-        });
-    }
-    // `SaveExtendedConfig` is never the authoritative writer of
-    // `image_generation`: the daemon redacts the registry to the empty default
-    // before the snapshot ever reaches a client, so a verbatim write of the
-    // round-tripped doc would WIPE the on-disk endpoints/targets/workflows/
-    // allowlist. Route the write through the merge that strips the incoming
-    // (client-authored) `image_generation` and preserves the on-disk registry;
-    // every other config section is taken verbatim from the incoming doc.
-    let merged =
-        cockpit_config::config::extended::render_saved_extended_config_preserving_image_generation(
-            content.as_bytes(),
-            &current,
-        )
-        .map_err(bad_request_config)?;
-    // Reject an invalid KB trust policy before the atomic write. In
-    // particular, a trust-required KB cannot persist an untrusted dream model
-    // and remote KBs cannot claim a client-side-only trust guarantee.
-    let merged_value: serde_json::Value =
-        serde_json::from_slice(&merged).map_err(bad_request_config)?;
-    let extended: cockpit_config::config::extended::ExtendedConfig =
-        serde_json::from_value(merged_value).map_err(bad_request_config)?;
-    // Provider bodies are layered separately from config.json. Resolve the
-    // actual effective catalog instead of treating a project-only settings
-    // write as if it had no trusted providers from an ambient layer.
-    let provider_paths = cockpit_config::config::dirs::config_file_paths_for_load(&root);
-    let providers = cockpit_config::config::providers::ConfigDoc::try_load_effective_from_paths(
-        &provider_paths,
-    )
-    .map_err(bad_request_config)?;
-    cockpit_config::config::extended::validate_knowledge_base_registry(
-        &extended.knowledge_bases,
-        &providers,
-    )
-    .map_err(|_| invalid_knowledge_base_trust_config())?;
-    let desired_hash = content_hash(&merged);
-    let config_generation = if desired_hash != current_hash {
-        cockpit_config::config::write_config_bytes_atomic(&target, &merged).map_err(internal)?;
-        crate::daemon::server::inventory::publish_committed_config_generation()
-    } else {
-        crate::daemon::server::inventory::current_config_generation()
-    };
-    Ok(Response::ExtendedConfigWritten {
-        hash: desired_hash,
-        config_generation,
-    })
 }
 
 pub async fn fs_write_staged_remote(
@@ -2322,7 +2198,7 @@ fn conflict(message: impl Into<String>) -> ErrorPayload {
     }
 }
 
-/// Fail-closed mapping for a `SaveExtendedConfig` merge failure. The underlying
+/// Fail-closed mapping for an extended config merge/parse failure. The underlying
 /// serde/anyhow error is DELIBERATELY discarded: a config.json parse error can
 /// echo attacker/legacy-supplied bytes (`invalid type: string "…"`) and
 /// config.json can carry literal secrets in pre-redaction legacy layers, so the
@@ -2331,17 +2207,6 @@ fn bad_request_config<E>(_error: E) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "configuration payload is not valid config.json".into(),
-    }
-}
-
-/// Stable, non-secret policy feedback for settings clients. Unlike a generic
-/// serde failure, this is an intentional user-facing rejection of a valid JSON
-/// shape whose requested trust relationship cannot be honored.
-fn invalid_knowledge_base_trust_config() -> ErrorPayload {
-    ErrorPayload {
-        code: ErrorCode::BadRequest,
-        message: "knowledge-base trust configuration is invalid: trustRequired is local-only and dreamModel must be trusted"
-            .into(),
     }
 }
 
@@ -2789,27 +2654,6 @@ mod tests {
     }
 
     #[test]
-    fn save_extended_config_refuses_an_oversized_existing_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let file = root.join("config.json");
-        let handle = std::fs::File::create(&file).unwrap();
-        handle
-            .set_len(crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1)
-            .unwrap();
-        drop(handle);
-        let err =
-            save_extended_config_sync(false, root.to_str().unwrap(), "config.json", "{}", None)
-                .expect_err("oversized config.json must fail closed rather than merge from empty");
-        assert_eq!(err.code, ErrorCode::BadRequest);
-        assert!(err.message.contains("existing file"), "{}", err.message);
-        assert_eq!(
-            std::fs::metadata(&file).unwrap().len(),
-            crate::resource_limits::ResourceLimits::defaults().fs_mutation_read_bytes + 1
-        );
-    }
-
-    #[test]
     fn fs_read_truncates_text_without_loading_the_whole_file() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2838,162 +2682,6 @@ mod tests {
         let content = content.expect("text content");
         assert!(content.len() <= limits.fs_read_text_bytes);
         assert_eq!(hash, crate::resource_limits::sha256_hex(body.as_bytes()));
-    }
-
-    /// A valid, non-empty registry: one hosted OpenAI-images endpoint plus an
-    /// enabled default target referencing it. Built through the single
-    /// `ImageGenerationConfig::new` validation funnel.
-    fn sample_image_registry() -> cockpit_config::config::image_generation::ImageGenerationConfig {
-        use cockpit_config::config::image_generation::{
-            IMAGE_GENERATION_ROUTE_PROFILE_VERSION, ImageAdapterKind, ImageCapabilityEvidence,
-            ImageDimensionDescriptor, ImageDimensionRequestPolicy, ImageEndpoint, ImageFormat,
-            ImageGenerationConfig, ImageGenerationTarget, ImageLocationClass, ImagePrice,
-            ImageTargetIdentity, ReferenceImageSupport,
-        };
-        use cockpit_config::config::providers::CapabilityStatus;
-
-        let endpoint = ImageEndpoint {
-            id: "openai-main".into(),
-            adapter: ImageAdapterKind::OpenaiImages,
-            origin: "https://api.openai.com/".into(),
-            path_prefix: None,
-            credential_ref: Some("openai-key".into()),
-            headers: Vec::new(),
-            allow_insecure_transport: false,
-            location: ImageLocationClass::PublicCloud,
-            enabled: true,
-            route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
-            exclusive_server: false,
-        };
-        let target = ImageGenerationTarget {
-            id: "gpt-image".into(),
-            display_name: None,
-            endpoint_id: "openai-main".into(),
-            identity: ImageTargetIdentity::HostedModel {
-                model: "gpt-image-1".into(),
-            },
-            enabled: true,
-            is_default: true,
-            formats: vec![ImageFormat::Png],
-            reference_support: ReferenceImageSupport::Unsupported,
-            max_reference_images: 0,
-            max_samples: 1,
-            max_outputs: 1,
-            dimensions: ImageDimensionDescriptor::ProviderDefault,
-            dimension_policy: ImageDimensionRequestPolicy::ProviderDefault,
-            parameters: Vec::new(),
-            openrouter_routing: None,
-            generation_capability: ImageCapabilityEvidence::new(CapabilityStatus::Unknown, None)
-                .unwrap(),
-            price: ImagePrice::Unknown,
-        };
-        ImageGenerationConfig::new(vec![endpoint], vec![target], Vec::new(), Vec::new())
-            .expect("valid sample registry")
-    }
-
-    /// Regression: a generic `SaveExtendedConfig` whose incoming
-    /// `image_generation` is the redacted EMPTY default (exactly what a client
-    /// round-trips from the snapshot, where the daemon replaced the registry via
-    /// `redacted_for_snapshot`) must NOT wipe the non-empty on-disk registry.
-    /// Before the fix this wrote the incoming doc verbatim and destroyed the
-    /// endpoints/targets/workflows/allowlist.
-    #[test]
-    fn save_extended_config_preserves_on_disk_image_generation_registry() {
-        use cockpit_config::config::image_generation::ImageGenerationConfig;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let root_text = root.to_str().unwrap();
-
-        // Seed a non-empty registry on disk (NOT via SaveExtendedConfig, which
-        // strips it — that is the whole point).
-        let registry = sample_image_registry();
-        let on_disk_value = serde_json::json!({
-            "redact": { "enabled": true, "denylist": ["SEED-KEEP"] },
-            "image_generation": serde_json::to_value(&registry).unwrap(),
-        });
-        let on_disk_str = format!(
-            "{}\n",
-            serde_json::to_string_pretty(&on_disk_value).unwrap()
-        );
-        std::fs::write(root.join("config.json"), &on_disk_str).unwrap();
-
-        // Precondition / non-vacuity: the registry really is on disk.
-        assert!(
-            on_disk_str.contains("openai-main"),
-            "seed must persist the endpoint"
-        );
-        let seeded: ImageGenerationConfig =
-            serde_json::from_value(on_disk_value.get("image_generation").unwrap().clone()).unwrap();
-        assert_eq!(seeded.endpoints().len(), 1);
-
-        // Incoming = faithful redacted round-trip: same doc, but with an EMPTY
-        // image_generation (the redacted value) and one OTHER field changed.
-        let mut incoming = on_disk_value.clone();
-        incoming["image_generation"] =
-            serde_json::to_value(ImageGenerationConfig::default()).unwrap();
-        incoming["name"] = serde_json::json!("Renamed Project");
-        let incoming_str = serde_json::to_string(&incoming).unwrap();
-        // Precondition: a VERBATIM write of this payload would wipe the registry.
-        assert!(
-            !incoming_str.contains("openai-main"),
-            "the redacted incoming payload must not carry the registry"
-        );
-
-        let resp = save_extended_config_sync(false, root_text, "config.json", &incoming_str, None)
-            .unwrap();
-        assert!(matches!(resp, Response::ExtendedConfigWritten { .. }));
-
-        // The registry is preserved AND the other change landed.
-        let after = std::fs::read_to_string(root.join("config.json")).unwrap();
-        assert!(
-            after.contains("Renamed Project"),
-            "other config sections must still be saved verbatim"
-        );
-        let after_value: serde_json::Value = serde_json::from_str(&after).unwrap();
-        let preserved: ImageGenerationConfig = serde_json::from_value(
-            after_value
-                .get("image_generation")
-                .expect("image_generation must be preserved on disk")
-                .clone(),
-        )
-        .expect("preserved image_generation is a valid registry");
-        assert_eq!(
-            preserved.endpoints().len(),
-            1,
-            "the on-disk endpoint registry must survive a generic settings save"
-        );
-        assert_eq!(preserved.endpoints()[0].id, "openai-main");
-        assert_eq!(preserved.targets().len(), 1);
-    }
-
-    /// A `SaveExtendedConfig` that actually changes config.json advances the
-    /// daemon config generation (so the image-control-plane generation CAS
-    /// observes the write); a no-op save writes nothing and does NOT bump.
-    #[test]
-    fn save_extended_config_bumps_generation_only_on_a_real_write() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let root_text = root.to_str().unwrap();
-        std::fs::write(root.join("config.json"), "{}\n").unwrap();
-
-        let content = serde_json::json!({ "name": "Alpha" }).to_string();
-        let before = crate::daemon::server::inventory::current_config_generation();
-        save_extended_config_sync(false, root_text, "config.json", &content, None).unwrap();
-        let after_write = crate::daemon::server::inventory::current_config_generation();
-        assert_eq!(
-            after_write,
-            before + 1,
-            "a config.json write must advance the config generation"
-        );
-
-        // Identical content renders to identical merged bytes -> no write.
-        save_extended_config_sync(false, root_text, "config.json", &content, None).unwrap();
-        let after_noop = crate::daemon::server::inventory::current_config_generation();
-        assert_eq!(
-            after_noop, after_write,
-            "an unchanged save must not bump the generation (no bump-without-write)"
-        );
     }
 
     #[test]
@@ -3082,242 +2770,5 @@ mod tests {
             .find("settle_interrupted_local_operations")
             .expect("generic interrupted settlement");
         assert!(recovery < generic);
-    }
-
-    /// Issue #299 companion: a registered alias/canonical pair is ONE setting
-    /// at the snapshot/patch boundary, not two JSON keys. A hand-edited
-    /// alias-only (or both-spellings) document must decode under the
-    /// canonical key and stay patchable through the canonical path.
-    fn write_project_settings(root: &Path, document: &str) -> PathBuf {
-        std::fs::create_dir_all(root.join(".cockpit")).unwrap();
-        let target = root.join(".cockpit").join("config.json");
-        std::fs::write(&target, document).unwrap();
-        target
-    }
-
-    async fn snapshot_project_layer(
-        ctx: &crate::daemon::server::DaemonContext,
-        root_text: &str,
-        owner: &str,
-        session: &str,
-        target: &Path,
-    ) -> cockpit_proto::ExtendedConfigLayerSnapshot {
-        let Ok(Response::ExtendedConfigSnapshot { layers, .. }) = get_extended_config_snapshot(
-            ctx,
-            root_text.to_string(),
-            owner.to_string(),
-            session.to_string(),
-        )
-        .await
-        else {
-            panic!("expected an extended config snapshot");
-        };
-        layers
-            .into_iter()
-            .find(|layer| layer.display_path == target.display().to_string())
-            .expect("the project settings layer is discovered")
-    }
-
-    #[tokio::test]
-    async fn settings_snapshot_decodes_the_alias_pair_as_one_setting() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("app");
-        // Both spellings: the snapshot must not fail the whole RPC with serde
-        // `duplicate field`; the canonical spelling wins, and authorship is
-        // reported under the canonical key the client patches.
-        let target = write_project_settings(
-            &root,
-            r#"{"sandboxEscalationEnabled": true, "sandbox_escalation_enabled": false}"#,
-        );
-        let ctx = test_ctx(&root);
-        let root_text = root.canonicalize().unwrap().to_string_lossy().into_owned();
-        let layer = snapshot_project_layer(
-            &ctx,
-            &root_text,
-            "settings-owner",
-            "snapshot-session",
-            &target,
-        )
-        .await;
-        assert!(
-            !layer.config.sandbox_escalation_enabled,
-            "the canonical spelling wins when a document carries both"
-        );
-        assert_eq!(
-            layer.authored_paths,
-            vec![vec!["sandbox_escalation_enabled".to_string()]],
-            "the alias pair is one setting authored under its canonical key"
-        );
-    }
-
-    #[tokio::test]
-    async fn settings_patch_sets_alias_only_setting_through_its_canonical_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("app");
-        let target = write_project_settings(&root, r#"{"sandboxEscalationEnabled": false}"#);
-        let ctx = test_ctx(&root);
-        let root_text = root.canonicalize().unwrap().to_string_lossy().into_owned();
-        let layer = snapshot_project_layer(
-            &ctx,
-            &root_text,
-            "settings-owner",
-            "snapshot-session",
-            &target,
-        )
-        .await;
-        assert!(!layer.config.sandbox_escalation_enabled);
-        assert_eq!(
-            layer.authored_paths,
-            vec![vec!["sandbox_escalation_enabled".to_string()]],
-            "an alias-only document authors its setting under the canonical key"
-        );
-
-        let client_operation_id = Uuid::new_v4().to_string();
-        let request_hash = [3u8; 32];
-        let Ok(crate::db::local_operation_receipts::LocalOperationBegin::Dispatch {
-            fencing_generation,
-        }) = ctx
-            .db
-            .begin_local_operation(
-                "settings-owner".to_string(),
-                client_operation_id.clone(),
-                "apply_extended_config_patch".to_string(),
-                request_hash,
-            )
-            .await
-        else {
-            panic!("expected the local operation to dispatch");
-        };
-        let patch = cockpit_proto::ExtendedConfigPatch {
-            operations: vec![cockpit_proto::ExtendedConfigPathMutation::Set {
-                path: vec!["sandbox_escalation_enabled".to_string()],
-                value: serde_json::json!(true),
-            }],
-            materialize: false,
-            denylist: Vec::new(),
-            redacted_mutations: Vec::new(),
-        };
-        let response = apply_extended_config_patch(
-            &ctx,
-            client_operation_id,
-            request_hash,
-            fencing_generation,
-            root_text,
-            layer.layer_id.clone(),
-            patch,
-            layer.revision.clone(),
-            "settings-owner".to_string(),
-            "snapshot-session".to_string(),
-        )
-        .await
-        .expect("a canonical Set against an alias-only document commits");
-        assert!(matches!(
-            response,
-            Response::ExtendedConfigSaved {
-                status: cockpit_proto::ConfigCommitStatus::Committed,
-                ..
-            }
-        ));
-        let written: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
-        assert_eq!(
-            written.get("sandbox_escalation_enabled"),
-            Some(&serde_json::json!(true)),
-            "the one setting is persisted under its canonical key: {written}"
-        );
-        assert!(
-            written.get("sandboxEscalationEnabled").is_none(),
-            "the pair must not persist as two independent keys: {written}"
-        );
-    }
-
-    #[tokio::test]
-    async fn settings_patch_unset_removes_the_alias_only_setting() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("app");
-        let target = write_project_settings(&root, r#"{"sandboxEscalationEnabled": false}"#);
-        let ctx = test_ctx(&root);
-        let root_text = root.canonicalize().unwrap().to_string_lossy().into_owned();
-        let layer = snapshot_project_layer(
-            &ctx,
-            &root_text,
-            "settings-owner",
-            "snapshot-session",
-            &target,
-        )
-        .await;
-
-        let client_operation_id = Uuid::new_v4().to_string();
-        let request_hash = [5u8; 32];
-        let Ok(crate::db::local_operation_receipts::LocalOperationBegin::Dispatch {
-            fencing_generation,
-        }) = ctx
-            .db
-            .begin_local_operation(
-                "settings-owner".to_string(),
-                client_operation_id.clone(),
-                "apply_extended_config_patch".to_string(),
-                request_hash,
-            )
-            .await
-        else {
-            panic!("expected the local operation to dispatch");
-        };
-        let patch = cockpit_proto::ExtendedConfigPatch {
-            operations: vec![cockpit_proto::ExtendedConfigPathMutation::Unset {
-                path: vec!["sandbox_escalation_enabled".to_string()],
-            }],
-            materialize: false,
-            denylist: Vec::new(),
-            redacted_mutations: Vec::new(),
-        };
-        let response = apply_extended_config_patch(
-            &ctx,
-            client_operation_id,
-            request_hash,
-            fencing_generation,
-            root_text.clone(),
-            layer.layer_id.clone(),
-            patch,
-            layer.revision.clone(),
-            "settings-owner".to_string(),
-            "snapshot-session".to_string(),
-        )
-        .await
-        .expect("a canonical Unset against an alias-only document commits");
-        assert!(matches!(
-            response,
-            Response::ExtendedConfigSaved {
-                status: cockpit_proto::ConfigCommitStatus::Committed,
-                ..
-            }
-        ));
-        let written: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
-        assert!(
-            written.get("sandbox_escalation_enabled").is_none()
-                && written.get("sandboxEscalationEnabled").is_none(),
-            "Unset removes the ONE setting, not just one spelling: {written}"
-        );
-
-        // The post-commit snapshot reports the setting at its default with no
-        // authored path, so the client's own authored-paths validator agrees.
-        let refreshed = snapshot_project_layer(
-            &ctx,
-            &root_text,
-            "settings-owner",
-            "snapshot-session-2",
-            &target,
-        )
-        .await;
-        assert!(refreshed.config.sandbox_escalation_enabled);
-        assert!(
-            !refreshed
-                .authored_paths
-                .iter()
-                .any(|path| path.first().map(String::as_str) == Some("sandbox_escalation_enabled")),
-            "the unset setting no longer authors any path: {:?}",
-            refreshed.authored_paths
-        );
     }
 }

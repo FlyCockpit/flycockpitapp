@@ -1714,12 +1714,11 @@ mod tests {
     }
 
     // Gap 2: a credential RECORD owned for workspace A must NOT resolve for an
-    // owner-scoped store built for workspace B — the MCP resolver's record
-    // fallback (`store.get`) can no longer reach a foreign-owned `mcp:` blob.
+    // owner-scoped store built for workspace B.
     #[test]
     fn owner_scoped_store_drops_foreign_owned_record() {
         let (db, vault) = vault_backed();
-        // A legacy MCP OAuth blob stored as a credential record and owned by A.
+        // An `mcp:` credential record owned by A.
         {
             let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
             store.set(

@@ -253,8 +253,7 @@ pub enum Response {
         session_entry_mode: crate::SessionEntryMode,
         /// 6-char display id (GOALS §17b). Used by the TUI as the
         /// predecessor short-id when this session later spawns a
-        /// `/compact` handoff. Empty for pre-§17 rows not yet backfilled.
-        #[serde(default)]
+        /// `/compact` handoff.
         short_id: String,
         project_root: String,
         project_id: String,
@@ -651,12 +650,10 @@ pub enum Response {
     McpConfigCommitted {
         client_operation_id: String,
         /// Daemon-keyed digest binding the terminal receipt to the exact
-        /// request body. Older archived fixtures predate this field.
-        #[serde(default)]
+        /// request body. Required: a receipt without it cannot be bound.
         request_hash: String,
         /// Public SHA-256 over the project/config/cleanup intent with staged
         /// secret values excluded.
-        #[serde(default)]
         mutation_intent_hash: String,
         project_root: String,
         owner_root: String,
@@ -679,8 +676,6 @@ pub enum Response {
         results: Vec<ProviderModelFetchResult>,
         config: ProviderConfigView,
         /// Config authority after any fetched catalog was durably published.
-        /// Older archived fixtures predate this field.
-        #[serde(default)]
         config_generation: u64,
     },
     ProviderUsageSnapshot {
@@ -1021,13 +1016,6 @@ pub enum Response {
         /// Exact safe post-commit order. New occurrence nonces bind assigned
         /// IDs to this request; no value-derived digest or literal is exposed.
         denylist: Vec<crate::CommittedDenylistEntry>,
-    },
-
-    /// Legacy whole-document writer receipt. Daemon-connected settings UI
-    /// never uses this unscoped path.
-    ExtendedConfigWritten {
-        hash: String,
-        config_generation: u64,
     },
 
     ExtendedConfigSnapshot {
@@ -1833,7 +1821,6 @@ macro_rules! response_variants {
             (Response::FsRead { .. }, "fs_read");
             (Response::FsWrite { .. }, "fs_write");
             (Response::ExtendedConfigSaved { .. }, "extended_config_saved");
-            (Response::ExtendedConfigWritten { .. }, "extended_config_written");
             (Response::ExtendedConfigSnapshot { .. }, "extended_config_snapshot");
             (Response::ImageSidecarAuthoritySnapshot(..), "image_sidecar_authority_snapshot");
             (Response::ImageSidecarGrantMutated(..), "image_sidecar_grant_mutated");
@@ -2442,6 +2429,34 @@ mod tests {
 
         serde_json::from_value::<ActiveModelState>(missing_generation)
             .expect_err("protocol v6 active-model state must include generation");
+    }
+
+    #[test]
+    fn mcp_config_committed_requires_its_receipt_hashes() {
+        let complete = json!({
+            "response": "mcp_config_committed",
+            "data": {
+                "client_operation_id": "11111111-1111-4111-8111-111111111111",
+                "request_hash": "c".repeat(64),
+                "mutation_intent_hash": "d".repeat(64),
+                "project_root": "/tmp/project",
+                "owner_root": "/tmp/project",
+                "config_path": "/tmp/project/.cockpit/mcp.json",
+                "consumed_revision": "b".repeat(64),
+                "result_revision": "a".repeat(64),
+                "config_generation": 3,
+                "credential_count": 0
+            }
+        });
+        serde_json::from_value::<Response>(complete.clone()).expect("complete receipt decodes");
+        for field in ["request_hash", "mutation_intent_hash"] {
+            let mut missing = complete.clone();
+            missing["data"].as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<Response>(missing).is_err(),
+                "an MCP commit receipt without {field} must be rejected"
+            );
+        }
     }
 }
 

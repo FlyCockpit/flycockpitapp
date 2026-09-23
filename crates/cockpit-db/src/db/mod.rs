@@ -1275,9 +1275,8 @@ impl Db {
         self.read(sqlite_schema_version).await
     }
 
-    /// Return the latest migration recorded by the legacy squashed-schema
-    /// runner. This remains useful to read-only diagnostics until the
-    /// checksum-backed migration ledger replaces `schema_version`.
+    /// Return the latest migration recorded in the checksum-backed
+    /// `schema_version` ledger (read-only diagnostics).
     pub async fn applied_migration_version(&self) -> Result<i64> {
         self.read(current_schema_version).await
     }
@@ -1834,7 +1833,6 @@ fn verify_user_version(conn: &Connection, ledger_version: i64) -> Result<()> {
 }
 
 fn verify_existing_database(conn: &Connection, migrations: &[Migration]) -> Result<()> {
-    verify_supported_ledger_shape(conn)?;
     verify_ledger(conn, migrations)?;
     let current = current_schema_version(conn)?;
     if current == 0 {
@@ -1867,7 +1865,6 @@ fn database_has_application_objects(conn: &Connection) -> Result<bool> {
 /// migrations; migration SQL must not emit `PRAGMA foreign_keys` itself
 /// because that pragma is a no-op inside a transaction.
 fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
-    verify_supported_ledger_shape(conn)?;
     if !table_exists(conn, "schema_version")? && database_has_application_objects(conn)? {
         anyhow::bail!(
             "unledgered prerelease database contains application schema objects; refusing to bootstrap over unproven data"
@@ -1977,53 +1974,6 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
         )
         .with_context(|| format!("checking table `{name}`"))?;
     Ok(exists != 0)
-}
-
-fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let quoted = table.replace('"', "\"\"");
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info(\"{quoted}\");"))
-        .with_context(|| format!("inspecting `{table}` columns"))?;
-    stmt.query_map([], |row| row.get(1))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("decoding `{table}` columns"))
-}
-
-fn legacy_schema_version(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-        [],
-        |row| row.get(0),
-    )
-    .context("reading legacy prerelease schema version")
-}
-
-fn verify_supported_ledger_shape(conn: &Connection) -> Result<()> {
-    if !table_exists(conn, "schema_version")? {
-        return Ok(());
-    }
-    let columns = table_columns(conn, "schema_version")?;
-    const REQUIRED: &[&str] = &[
-        "version",
-        "name",
-        "sha256",
-        "schema_fingerprint",
-        "schema_profile",
-        "applied_at",
-    ];
-    let missing = REQUIRED
-        .iter()
-        .copied()
-        .filter(|required| !columns.iter().any(|column| column == required))
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        let version = legacy_schema_version(conn)?;
-        anyhow::bail!(
-            "incompatible legacy prerelease database schema v{version}: schema_version ledger is missing {}; move the database aside and restart to create the local v0.1 schema",
-            missing.join(", ")
-        );
-    }
-    Ok(())
 }
 
 fn current_schema_version(conn: &Connection) -> Result<i64> {
@@ -2482,30 +2432,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(trigger, "media_reservation_state_graph");
-    }
-
-    #[test]
-    fn legacy_schema_ledger_without_checksum_columns_fails_closed() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
-             INSERT INTO schema_version (version) VALUES (1);",
-        )
-        .unwrap();
-
-        let error = migrate_with(&conn, MIGRATIONS).unwrap_err().to_string();
-        assert!(
-            error.contains("no such column") || error.contains("schema_version"),
-            "legacy schema must be rejected without ALTER/checksum repair: {error}"
-        );
-        let columns = conn
-            .prepare("PRAGMA table_info(schema_version)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(columns, vec!["version"]);
     }
 
     #[test]

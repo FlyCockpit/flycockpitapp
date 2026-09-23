@@ -476,80 +476,10 @@ fn resolve_harnesses_unions_distinct_names_and_skips_garbage() {
 }
 
 #[test]
-fn sealed_child_injection_is_absent_from_harness_config() {
-    // AC1: harness config schemas reject retired sealed-binding fields/aliases
-    // rather than silently accepting and ignoring them.
-    for field in ["sealed_values", "sealedValues", "sealed_env", "sealedEnv"] {
-        let raw = serde_json::json!({
-            "command": "codex",
-            field: ["prod-token"],
-        });
-        let err = parse_harness_config(raw).expect_err(field);
-        assert!(
-            err.contains("sealed") || err.contains(field),
-            "field `{field}` must be rejected, got: {err}"
-        );
-    }
-    // Clean entry still parses.
-    parse_harness_config(serde_json::json!({"command": "codex"})).unwrap();
-
-    // resolve_harnesses drops entries that carry retired sealed bindings.
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(
-        &path,
-        r#"{"harnesses":{
-          "clean":{"command":"codex"},
-          "sealed":{"command":"codex","sealed_values":["prod-token"]}
-        }}"#,
-    )
-    .unwrap();
-    let merged = resolve_harnesses_from_paths(&[path]);
-    assert!(merged.contains_key("clean"));
-    assert!(
-        !merged.contains_key("sealed"),
-        "harness with sealed_values must not be accepted for dispatch"
-    );
-}
-
-#[test]
 fn external_harness_has_no_secret_environment_configuration() {
-    // AC2: `auth_env_vars` and every auth-env code path are removed from
-    // `HarnessConfig`, config parsing, presets, and child launch. Legacy
-    // auth-env configuration is rejected rather than ignored or migrated.
-    for field in ["auth_env_vars", "authEnvVars"] {
-        let raw = serde_json::json!({
-            "command": "codex",
-            field: ["OPENAI_API_KEY"],
-        });
-        let err = parse_harness_config(raw).expect_err(field);
-        assert!(
-            err.contains("auth_env_vars")
-                || err.contains(field)
-                || err.contains("secret-environment"),
-            "field `{field}` must be rejected, got: {err}"
-        );
-    }
-    // Clean entry still parses.
+    // AC2: `HarnessConfig`, presets, and child launch carry no auth-env
+    // field; a harness authenticates without a Cockpit-provided secret.
     parse_harness_config(serde_json::json!({"command": "codex"})).unwrap();
-
-    // resolve_harnesses drops entries that carry retired auth-env fields.
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(
-        &path,
-        r#"{"harnesses":{
-          "clean":{"command":"codex"},
-          "auth":{"command":"codex","auth_env_vars":["OPENAI_API_KEY"]}
-        }}"#,
-    )
-    .unwrap();
-    let merged = resolve_harnesses_from_paths(&[path]);
-    assert!(merged.contains_key("clean"));
-    assert!(
-        !merged.contains_key("auth"),
-        "harness with auth_env_vars must not be accepted for dispatch"
-    );
 
     // No builtin preset carries auth_env_vars (the field no longer exists).
     for (name, preset) in builtin_harness_presets() {

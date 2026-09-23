@@ -382,8 +382,6 @@ pub fn classify_subagent_status(child: &str, report: &str, failed: bool) -> Opti
         "changed",
         "created",
         "updated",
-        "writeunlock", // Historical report text from pre-rename sessions.
-        "editunlock",  // Historical report text from pre-rename sessions.
         "files changed",
         "files modified",
     ]
@@ -2966,20 +2964,7 @@ fn format_tool_glyph_label(
     file_icon: Option<&'static str>,
 ) -> (String, String) {
     let glyph = file_icon.unwrap_or(presentation.glyph.unwrap_or(""));
-    let label = if emojis {
-        if presentation.label == "unlock" {
-            &presentation.label
-        } else {
-            presentation
-                .label
-                .strip_suffix("unlock")
-                .or_else(|| presentation.label.strip_suffix("lock"))
-                .filter(|label| !label.is_empty())
-                .unwrap_or(&presentation.label)
-        }
-    } else {
-        &presentation.label
-    };
+    let label = &presentation.label;
     let show_glyph = file_icon.is_some() || (emojis && !glyph.is_empty());
     let glyph = if show_glyph && !glyph.is_empty() {
         // Pad to a fixed display width so every label lines up at the
@@ -3018,13 +3003,7 @@ pub fn tool_shows_output(tool: &str) -> bool {
 }
 
 fn tool_uses_read_output_renderer(tool: &str) -> bool {
-    matches!(
-        tool,
-        "read"
-            // Historical display only: pre-rename persisted sessions used this
-            // retired verb name in tool-call rows.
-            | "readlock"
-    )
+    tool == "read"
 }
 
 /// Spans for one tool-call line: `[glyph] label: summary`, the label

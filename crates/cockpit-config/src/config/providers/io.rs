@@ -750,7 +750,6 @@ impl ConfigDoc {
             let Some(mut provider) = value.as_object().cloned() else {
                 anyhow::bail!("workspace provider `{id}` must be a JSON object");
             };
-            reject_legacy_redact_fields(id, &provider)?;
             if !matches!(
                 snapshot.origin,
                 Some(crate::config::dirs::ConfigDirKind::HomeXdg)
@@ -953,7 +952,6 @@ impl ConfigDoc {
                 Ok(doc) => {
                     let mut layer = doc.raw;
                     layers.push((path.clone(), layer.clone()));
-                    warn_inline_providers_ignored(path, &layer);
                     warn_malformed_provider_layer_metadata(path, &layer);
                     if let Some(obj) = layer.as_object_mut() {
                         obj.remove("providers");
@@ -1036,7 +1034,6 @@ impl ConfigDoc {
             match Self::load_with_mask(path, mask) {
                 Ok(doc) => {
                     let mut layer = doc.raw.clone();
-                    warn_inline_providers_ignored(path, &layer);
                     warn_malformed_provider_layer_metadata(path, &layer);
                     if let Some(obj) = layer.as_object_mut() {
                         obj.remove("providers");
@@ -1098,7 +1095,6 @@ impl ConfigDoc {
     /// files from this document's sibling `providers/` directory.
     pub fn providers(&self) -> ProvidersConfig {
         let mut cfg = ProvidersConfig::default();
-        warn_inline_providers_ignored(&self.path, &self.raw);
         if let Some(v) = self.raw.get("on_unlisted_models_fetch")
             && let Some(parsed) = parse_provider_metadata_field::<OnUnlistedModelsFetch>(
                 &self.path,
@@ -1127,12 +1123,6 @@ impl ConfigDoc {
             cfg.providers.clone_from(&self.originally_loaded_providers);
         } else if let Some(map) = self.raw.get("providers").and_then(Value::as_object) {
             for (id, v) in map {
-                if let Some(obj) = v.as_object()
-                    && let Err(e) = reject_legacy_redact_fields(id, obj)
-                {
-                    tracing::warn!(provider = %id, error = %e, "skipping malformed provider entry");
-                    continue;
-                }
                 match serde_json::from_value::<ProviderEntry>(v.clone()) {
                     Ok(entry) => {
                         cfg.providers.insert(id.clone(), entry);
@@ -1654,25 +1644,6 @@ fn warn_malformed_provider_layer_metadata(path: &Path, layer: &Value) {
     }
 }
 
-fn warn_inline_providers_ignored(path: &Path, raw: &Value) {
-    if path.as_os_str().is_empty() || raw.get("providers").is_none() {
-        return;
-    }
-    static WARNED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
-    if !warned
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(path.to_path_buf())
-    {
-        return;
-    }
-    tracing::warn!(
-        path = %path.display(),
-        "inline providers in config.json are no longer read; move providers to providers/<provider-id>.json"
-    );
-}
-
 fn merge_provider_files_for_layer(
     merged: &mut Value,
     config_path: &Path,
@@ -1803,12 +1774,6 @@ fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig
     merge_provider_files_for_layer(&mut merged, config_path, &mut Vec::new());
     if let Some(map) = merged.get("providers").and_then(Value::as_object) {
         for (id, v) in map {
-            if let Some(obj) = v.as_object()
-                && let Err(e) = reject_legacy_redact_fields(id, obj)
-            {
-                tracing::warn!(provider = %id, error = %e, "skipping malformed provider entry");
-                continue;
-            }
             match serde_json::from_value::<ProviderEntry>(v.clone()) {
                 Ok(entry) => {
                     cfg.providers.insert(id.clone(), entry);
@@ -1838,42 +1803,12 @@ pub fn load_provider_raw_file(path: &Path) -> Result<Map<String, Value>> {
             .with_context(|| format!("parsing provider config at {}", path.display()))?
     };
     match value {
-        Value::Object(map) => {
-            if let Some(id) = provider_id_from_file_name(path) {
-                reject_legacy_redact_fields(&id, &map)?;
-            }
-            Ok(map)
-        }
+        Value::Object(map) => Ok(map),
         other => anyhow::bail!(
             "expected provider config root to be an object at {}, found {other:?}",
             path.display()
         ),
     }
-}
-
-fn reject_legacy_redact_fields(provider_id: &str, provider: &Map<String, Value>) -> Result<()> {
-    if provider.contains_key("redact") {
-        anyhow::bail!(
-            "provider `{provider_id}` uses legacy `redact`; use `trust: \"trusted\"` for host-mediated capture or `trust: \"untrusted\"` to disable capture (sealed inference remains reference-only for every trust level)"
-        );
-    }
-    if let Some(models) = provider.get("models").and_then(Value::as_array) {
-        for model in models {
-            let Some(model) = model.as_object() else {
-                continue;
-            };
-            if model.contains_key("redact") {
-                let model_id = model
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown>");
-                anyhow::bail!(
-                    "model `{provider_id}:{model_id}` uses legacy `redact`; use `trust: \"trusted\"` for host-mediated capture or `trust: \"untrusted\"` to disable capture (sealed inference remains reference-only for every trust level)"
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

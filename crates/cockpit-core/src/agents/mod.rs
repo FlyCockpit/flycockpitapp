@@ -48,7 +48,7 @@ mod vnext;
 pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
     BUILTIN_AGENT_NAMES, FALLBACK_PRIMARY, embedded_default, is_builtin_agent, is_builtin_primary,
-    is_feature_primary, is_hidden_primary, is_removed_primary, resolve_primary,
+    is_feature_primary, is_hidden_primary, resolve_primary,
 };
 pub use invariants::validate_invariants;
 pub use profile::{
@@ -2725,15 +2725,6 @@ pub(crate) async fn resolve_with_assistant_db(
 }
 
 fn resolve_inner(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
-    if is_removed_primary(name) {
-        if find_override(cwd, name).is_some() {
-            tracing::warn!(
-                agent = name,
-                "ignoring override for removed builtin primary"
-            );
-        }
-        return Ok(None);
-    }
     if let Some(candidate) = find_override(cwd, name) {
         if candidate.is_dir() {
             let dir = candidate
@@ -2811,15 +2802,6 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
                 continue;
             }
             if seen.contains(&name) {
-                continue;
-            }
-            if is_removed_primary(&name) {
-                tracing::warn!(
-                    agent = name,
-                    path = %path.display(),
-                    "ignoring override for removed builtin primary"
-                );
-                seen.insert(name);
                 continue;
             }
             if agent_markdown_oversized(&path, &dir, &name) {

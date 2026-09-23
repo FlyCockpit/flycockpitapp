@@ -32,15 +32,12 @@ pub struct Record {
     pub socket_path: PathBuf,
     pub protocol_version: u32,
     pub daemon_version: String,
-    /// Current serving worker. Absent only in rendezvous records written by a
-    /// pre-supervisor binary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Current serving worker. `None` when the record is published by an
+    /// unsupervised (single-process) daemon owner.
     pub worker_pid: Option<u32>,
     /// Monotonic worker generation owned by the supervisor.
-    #[serde(default)]
     pub generation: u64,
     /// Supervisor-owned start clock, preserved across worker generations.
-    #[serde(default)]
     pub opened_at_unix_ms: u64,
     // These retain the generation binding and lifetime policy used by the
     // existing lifecycle code while the public rendezvous fields stay simple.

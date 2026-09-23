@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use super::config::{Auth, OauthAuth, ServerConfig};
 #[cfg(test)]
 use super::config::DEFAULT_PROFILE;
+use super::config::{Auth, OauthAuth, ServerConfig};
 
 const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -300,22 +300,9 @@ fn credential_value(
     credential_ref: &str,
 ) -> Option<String> {
     // MCP header and env values are written by the daemon's named-secret
-    // owner RPCs. Keep the older credential-record lookup as a read-only
-    // compatibility path for existing installations, but never make a new
-    // MCP setup depend on that separate compartment.
-    if let Some(value) = store.named_secret(credential_ref) {
-        return Some(value.to_string());
-    }
-    let value = store.get(credential_ref)?;
-    if let Some(s) = value.as_str() {
-        return Some(s.to_string());
-    }
-    for key in ["secret", "api_key", "value"] {
-        if let Some(s) = value.get(key).and_then(|v| v.as_str()) {
-            return Some(s.to_string());
-        }
-    }
-    None
+    // owner RPCs; they never live in the provider credential-record
+    // compartment.
+    store.named_secret(credential_ref).map(str::to_string)
 }
 
 /// Fetch a valid OAuth bearer header value (`Bearer <token>`) for a
@@ -391,17 +378,13 @@ fn stored_tokens_from_store(
     store: &crate::credentials::CredentialStore,
     key: &str,
 ) -> Result<Option<StoredTokens>> {
-    if let Some(raw) = store.named_secret(key) {
-        return serde_json::from_str(raw)
-            .with_context(|| format!("parsing stored MCP OAuth tokens for {key}"))
-            .map(Some);
-    }
     store
-        .get(key)
-        .cloned()
-        .map(serde_json::from_value)
+        .named_secret(key)
+        .map(|raw| {
+            serde_json::from_str(raw)
+                .with_context(|| format!("parsing stored MCP OAuth tokens for {key}"))
+        })
         .transpose()
-        .with_context(|| format!("parsing legacy MCP OAuth credential record for {key}"))
 }
 
 fn now_unix() -> i64 {
@@ -770,7 +753,6 @@ mod tests {
             env: BTreeMap::new(),
             env_credential_refs: BTreeMap::new(),
             auth: Auth::None,
-            mode: Default::default(),
             enabled: true,
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,

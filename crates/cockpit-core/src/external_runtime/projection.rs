@@ -103,8 +103,19 @@ pub fn project_dependencies(
     snapshot: Option<&ExternalRuntimeSnapshot>,
     descriptors: &[ExternalRuntimeDescriptor],
 ) -> DependencyProjection {
-    let generation = snapshot.map_or(0, |value| value.generation);
     let platform = snapshot.map_or_else(super::detect_host_platform, |value| value.platform);
+    project_dependencies_for_platform(snapshot, descriptors, platform)
+}
+
+/// [`project_dependencies`] with remedy recipes rendered for an explicit
+/// host platform instead of the snapshot's (or the detected) one, so a
+/// rendering can be reproduced independent of the machine it runs on.
+pub fn project_dependencies_for_platform(
+    snapshot: Option<&ExternalRuntimeSnapshot>,
+    descriptors: &[ExternalRuntimeDescriptor],
+    platform: HostPlatform,
+) -> DependencyProjection {
+    let generation = snapshot.map_or(0, |value| value.generation);
     let descriptor_by_id: BTreeMap<_, _> = descriptors
         .iter()
         .map(|descriptor| (descriptor.id.as_str(), descriptor))
@@ -378,8 +389,27 @@ impl DependenciesPageState {
         current: Option<&ExternalRuntimeSnapshot>,
         descriptors: &[ExternalRuntimeDescriptor],
     ) -> Self {
+        Self::from_projection(current, project_dependencies(current, descriptors))
+    }
+
+    /// [`Self::first_paint`] rendering remedies for an explicit platform.
+    pub fn first_paint_for_platform(
+        current: Option<&ExternalRuntimeSnapshot>,
+        descriptors: &[ExternalRuntimeDescriptor],
+        platform: HostPlatform,
+    ) -> Self {
+        Self::from_projection(
+            current,
+            project_dependencies_for_platform(current, descriptors, platform),
+        )
+    }
+
+    fn from_projection(
+        current: Option<&ExternalRuntimeSnapshot>,
+        displayed: DependencyProjection,
+    ) -> Self {
         Self {
-            displayed: project_dependencies(current, descriptors),
+            displayed,
             refresh_failure: None,
             generation: current.map_or(0, |snapshot| snapshot.generation),
             open: true,

@@ -43,15 +43,30 @@ pub(super) fn page_after_first_paint(cwd: PathBuf, sandbox_enabled: bool) -> Pag
     })
 }
 
+/// First paint from the current snapshot, with remedies rendered for the
+/// golden-pinned host platform when golden pins are installed.
+fn first_paint_state(
+    current: Option<&cockpit_core::external_runtime::ExternalRuntimeSnapshot>,
+    descriptors: &[cockpit_core::external_runtime::ExternalRuntimeDescriptor],
+) -> cockpit_core::external_runtime::DependenciesPageState {
+    match crate::tui::golden::pinned_host_platform() {
+        Some(platform) => {
+            cockpit_core::external_runtime::DependenciesPageState::first_paint_for_platform(
+                current,
+                descriptors,
+                platform,
+            )
+        }
+        None => {
+            cockpit_core::external_runtime::DependenciesPageState::first_paint(current, descriptors)
+        }
+    }
+}
+
 pub(super) fn page(cwd: PathBuf, sandbox_enabled: bool) -> PageBox {
     let store = cockpit_core::external_runtime::global_health_store();
     let state = match store.current_complete_bundle() {
-        Some((snapshot, descriptors)) => {
-            cockpit_core::external_runtime::DependenciesPageState::first_paint(
-                Some(snapshot.as_ref()),
-                &descriptors,
-            )
-        }
+        Some((snapshot, descriptors)) => first_paint_state(Some(snapshot.as_ref()), &descriptors),
         None => {
             let partial = store.current_bundle();
             let mut descriptors = cockpit_core::external_runtime::global_registry().descriptors();
@@ -67,7 +82,7 @@ pub(super) fn page(cwd: PathBuf, sandbox_enabled: bool) -> PageBox {
                     }
                 }
             }
-            cockpit_core::external_runtime::DependenciesPageState::first_paint(
+            first_paint_state(
                 partial.as_ref().map(|(snapshot, _)| snapshot.as_ref()),
                 &descriptors,
             )

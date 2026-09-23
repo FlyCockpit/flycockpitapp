@@ -28,6 +28,19 @@ predecessor has exited. After promotion it boots and writes a second fd-4
 report at the normal publication barrier. Cockpit's required sensitive/reveal sibling is also
 inherited on the internal fd 5.
 
+A supervised worker never outlives its supervisor. Every Unix worker inherits
+the read end of a supervisor-liveness pipe on fd 7; the supervisor holds the
+only write end for its whole lifetime (preserved across an in-place `reexec`),
+so the kernel closes it when the supervisor dies for any reason, SIGKILL
+included. A worker thread blocked on fd 7 observes EOF and the worker exits at
+once, exactly like a daemon crash, without a graceful park: otherwise the
+orphan would keep accepting on its inherited public listener and holding the
+database while a replacement supervisor takes over the home, and the next
+generation's durable recovery owns reconciliation anyway. A pipe is used rather
+than `PR_SET_PDEATHSIG` because it is portable across Unix and tracks the
+supervisor process, not the short-lived blocking-pool thread that forked the
+worker. Windows workers are not yet bound to their supervisor's lifetime.
+
 On Windows each worker creates a fresh random named pipe using the existing
 owner-only DACL, remote-client rejection, finite instance pool, and
 `FILE_FLAG_FIRST_PIPE_INSTANCE`. Readiness is the atomic owner-only identity
@@ -71,7 +84,14 @@ SQLite-committed safe marker for each session. A tool result advances the
 marker in the same transaction as `tool_call_completed`; a completed turn does
 the same with `assistant_message`. `(session_id, marker)` is the stable intent
 key reserved for #441. Work observed after a marker without a committed result
-is pending and is never replayed by the handover implementation. The event is
+is pending and is never replayed by the handover implementation. A write-ahead tool intent
+whose call is parked on a live durable interrupt (`open`, `parked`, or
+`executing`) belongs to that park rather than to #441 crash recovery: the park's
+rehydration replays the call once on approval (its durable `executing` claim
+lets the replaying generation claim the earlier generation's intent), a crash
+during that replay reconciles the park to `interrupted` without re-execution,
+and that transition closes the intent in the same transaction. No
+rerun/skip/inspect decision is queued for a park-owned call. The event is
 unrelated to `Reconnecting`, which describes a model-provider network retry.
 
 ## Boundary-aware worker handover

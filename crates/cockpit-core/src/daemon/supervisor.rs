@@ -46,6 +46,21 @@ const REVEAL_FD: libc::c_int = 5;
 const PROMOTION_FD: libc::c_int = 6;
 #[cfg(unix)]
 const HANDOVER_STANDBY_ENV: &str = "COCKPIT_WORKER_HANDOVER_STANDBY";
+/// Read end of the supervisor-liveness pipe. The supervisor retains the only
+/// write end for its whole lifetime (including across an in-place `reexec`);
+/// the kernel closes it when the supervisor dies for any reason, SIGKILL
+/// included, and the worker observes EOF here. Portable across Unix, and
+/// unlike `PR_SET_PDEATHSIG` it is tied to the supervisor process rather than
+/// to the (short-lived, blocking-pool) thread that happened to fork the worker.
+#[cfg(unix)]
+const LIVENESS_FD: libc::c_int = 7;
+#[cfg(unix)]
+const SUPERVISOR_LIVENESS_ENV: &str = "COCKPIT_SUPERVISOR_LIVENESS";
+/// Exit status of a worker that outlived its supervisor. The worker exits
+/// without a graceful park: a lost supervisor is a daemon crash, and durable
+/// crash recovery (#441) in the next generation owns reconciliation.
+#[cfg(unix)]
+const SUPERVISOR_LOST_EXIT: libc::c_int = 70;
 // Boundary reports carry one compact `(session, marker)` pair per active
 // session. Keep the same-user admin protocol bounded while leaving room for a
 // large live-session set.
@@ -332,6 +347,11 @@ struct ReexecState {
     control_fd: std::os::fd::RawFd,
     reveal_fd: std::os::fd::RawFd,
     admin_fd: std::os::fd::RawFd,
+    /// Supervisor-liveness pipe `(read, write)`. Absent when reexecuted from a
+    /// supervisor that predates the liveness pipe; the resumed supervisor then
+    /// creates a fresh one for the workers it spawns.
+    #[serde(default)]
+    liveness_fds: Option<(std::os::fd::RawFd, std::os::fd::RawFd)>,
     worker_pid: u32,
     worker_binary: PathBuf,
     generation: u64,
@@ -351,6 +371,11 @@ struct ReexecState {
 static EARLY_REEXEC_STATE: OnceLock<ReexecState> = OnceLock::new();
 #[cfg(any(unix, windows))]
 static EARLY_WORKER_PROCESS: OnceLock<bool> = OnceLock::new();
+/// The inherited supervisor-liveness read end, captured at process entry and
+/// consumed once by [`watch_supervisor_liveness`].
+#[cfg(unix)]
+static EARLY_SUPERVISOR_LIVENESS_FD: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
 
 pub fn is_worker_process() -> bool {
     #[cfg(any(unix, windows))]
@@ -408,6 +433,15 @@ pub fn prepare_process_entry_environment() -> Result<()> {
             set_close_on_exec(READY_FD)?;
             set_close_on_exec(REVEAL_FD)?;
         }
+        if std::env::var_os(SUPERVISOR_LIVENESS_ENV).is_some() {
+            if worker_process {
+                set_close_on_exec(LIVENESS_FD)?;
+                EARLY_SUPERVISOR_LIVENESS_FD
+                    .store(LIVENESS_FD, std::sync::atomic::Ordering::SeqCst);
+            }
+            // SAFETY: this entry hook runs before the runtime or helper threads.
+            unsafe { std::env::remove_var(SUPERVISOR_LIVENESS_ENV) };
+        }
         if let Some(raw) = std::env::var_os(REEXEC_STATE_ENV) {
             let state: ReexecState = serde_json::from_str(&raw.to_string_lossy())
                 .context("decoding early supervisor reexec state")?;
@@ -418,7 +452,14 @@ pub fn prepare_process_entry_environment() -> Result<()> {
                 state.control_fd,
                 state.reveal_fd,
                 state.admin_fd,
-            ] {
+            ]
+            .into_iter()
+            .chain(
+                state
+                    .liveness_fds
+                    .into_iter()
+                    .flat_map(|(read, write)| [read, write]),
+            ) {
                 set_close_on_exec(fd)?;
             }
             EARLY_REEXEC_STATE
@@ -482,6 +523,54 @@ pub(crate) fn published_uptime_secs(worker_uptime: Duration) -> u64 {
 
 pub(crate) type WorkerListeners = (DaemonListener, super::leak_reveal_socket::BoundRevealSocket);
 
+/// A supervised worker must not outlive its supervisor. The supervisor owns
+/// the pid receipt, lifetime lock, and restart budget; an orphaned worker would
+/// keep serving the inherited public listener and holding the database after a
+/// replacement supervisor has taken over the home, so clients would reach a
+/// generation nobody supervises and the replacement worker would stall behind
+/// the orphan's database ownership. Once the liveness pipe reports EOF the
+/// worker terminates immediately, exactly as if the whole daemon had crashed;
+/// the next generation's durable recovery reconciles any in-flight work.
+///
+/// Level-triggered: if the supervisor is already gone when this starts, the
+/// first read returns EOF at once.
+fn watch_supervisor_liveness() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd as _;
+        let fd = EARLY_SUPERVISOR_LIVENESS_FD.swap(-1, std::sync::atomic::Ordering::SeqCst);
+        if fd < 0 {
+            return Ok(());
+        }
+        // SAFETY: the supervisor installed the liveness read end at this fd and
+        // the atomic swap above hands it out exactly once.
+        let mut liveness = unsafe { std::fs::File::from_raw_fd(fd) };
+        std::thread::Builder::new()
+            .name("supervisor-liveness".to_owned())
+            .spawn(move || {
+                let mut byte = [0_u8; 1];
+                loop {
+                    match liveness.read(&mut byte) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+                eprintln!(
+                    "supervised worker pid {}: supervisor exited; terminating with it",
+                    std::process::id()
+                );
+                // SAFETY: _exit is async-signal-safe and skips Rust teardown,
+                // matching the crash the lost supervisor represents.
+                unsafe { libc::_exit(SUPERVISOR_LOST_EXIT) }
+            })
+            .context("starting supervisor liveness watch")?;
+    }
+    Ok(())
+}
+
 /// Consume the supervisor-owned Unix listeners inherited at fd 3 and fd 5.
 /// Windows workers deliberately return `None`: each generation prepares a new
 /// hardened random pipe and publishes its identity only at readiness.
@@ -489,6 +578,7 @@ pub(crate) fn take_worker_listeners(paths: &DaemonPaths) -> Result<Option<Worker
     if !is_worker_process() {
         return Ok(None);
     }
+    watch_supervisor_liveness()?;
     #[cfg(unix)]
     {
         use std::os::fd::FromRawFd as _;
@@ -694,7 +784,12 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             }?;
             // SAFETY: same inherited-descriptor contract as metadata above.
             let endpoint_owner = unsafe {
-                UnixEndpointOwner::resume(&paths, inherited.control_fd, inherited.reveal_fd)?
+                UnixEndpointOwner::resume(
+                    &paths,
+                    inherited.control_fd,
+                    inherited.reveal_fd,
+                    inherited.liveness_fds,
+                )?
             };
             // SAFETY: the inherited descriptor uniquely owns the admin listener.
             let admin = unsafe { resume_admin(inherited.admin_fd)? };
@@ -1451,33 +1546,71 @@ struct Worker {
 struct UnixEndpointOwner {
     control: tokio::net::UnixListener,
     reveal: super::leak_reveal_socket::BoundRevealSocket,
+    /// Supervisor-liveness pipe. Workers inherit a duplicate of `read` at
+    /// [`LIVENESS_FD`]; `write` never leaves this process (close-on-exec,
+    /// preserved only across this supervisor's own `reexec`).
+    liveness_read: std::os::fd::OwnedFd,
+    liveness_write: std::os::fd::OwnedFd,
 }
 
 #[cfg(unix)]
 impl UnixEndpointOwner {
     fn bind(paths: &DaemonPaths) -> Result<Self> {
+        let (liveness_read, liveness_write) = create_ready_pipe()?;
         Ok(Self {
             reveal: super::leak_reveal_socket::bind_reveal_socket(paths)?,
             control: super::bind_private_socket(&paths.socket)?,
+            liveness_read,
+            liveness_write,
         })
     }
 
-    fn prepare_for_reexec(&self) -> Result<(std::os::fd::RawFd, std::os::fd::RawFd)> {
+    #[allow(clippy::type_complexity)]
+    fn prepare_for_reexec(
+        &self,
+    ) -> Result<(
+        std::os::fd::RawFd,
+        std::os::fd::RawFd,
+        (std::os::fd::RawFd, std::os::fd::RawFd),
+    )> {
         use std::os::fd::AsRawFd as _;
         let control = self.control.as_raw_fd();
         let reveal = self.reveal.raw_fd();
+        let liveness = (
+            self.liveness_read.as_raw_fd(),
+            self.liveness_write.as_raw_fd(),
+        );
         clear_close_on_exec(control)?;
         clear_close_on_exec(reveal)?;
-        Ok((control, reveal))
+        // Keeping the write end open across exec is what lets live workers
+        // survive an in-place supervisor reexec.
+        clear_close_on_exec(liveness.0)?;
+        clear_close_on_exec(liveness.1)?;
+        Ok((control, reveal, liveness))
     }
 
-    // SAFETY: callers transfer unique ownership of both inherited descriptors.
+    // SAFETY: callers transfer unique ownership of every inherited descriptor.
     unsafe fn resume(
         paths: &DaemonPaths,
         control_fd: std::os::fd::RawFd,
         reveal_fd: std::os::fd::RawFd,
+        liveness_fds: Option<(std::os::fd::RawFd, std::os::fd::RawFd)>,
     ) -> Result<Self> {
         use std::os::fd::FromRawFd as _;
+        let (liveness_read, liveness_write) = match liveness_fds {
+            Some((read, write)) => {
+                set_close_on_exec(read)?;
+                set_close_on_exec(write)?;
+                // SAFETY: upheld by this function's caller contract.
+                unsafe {
+                    (
+                        std::os::fd::OwnedFd::from_raw_fd(read),
+                        std::os::fd::OwnedFd::from_raw_fd(write),
+                    )
+                }
+            }
+            None => create_ready_pipe()?,
+        };
         // SAFETY: upheld by this function's caller contract.
         let control = unsafe { std::os::unix::net::UnixListener::from_raw_fd(control_fd) };
         // SAFETY: upheld by this function's caller contract.
@@ -1492,6 +1625,8 @@ impl UnixEndpointOwner {
                 tokio::net::UnixListener::from_std(reveal)?,
                 paths.leak_reveal_socket(),
             ),
+            liveness_read,
+            liveness_write,
         })
     }
 }
@@ -1531,6 +1666,8 @@ struct OwnedWorkerSpawnRequest {
     control_fd: std::os::fd::RawFd,
     #[cfg(unix)]
     reveal_fd: std::os::fd::RawFd,
+    #[cfg(unix)]
+    liveness_fd: std::os::fd::RawFd,
 }
 
 async fn spawn_ready_worker(request: WorkerSpawnRequest<'_>) -> Result<Worker> {
@@ -1541,6 +1678,11 @@ async fn spawn_ready_worker(request: WorkerSpawnRequest<'_>) -> Result<Worker> {
     };
     #[cfg(unix)]
     let reveal_fd = request.endpoints.reveal.raw_fd();
+    #[cfg(unix)]
+    let liveness_fd = {
+        use std::os::fd::AsRawFd as _;
+        request.endpoints.liveness_read.as_raw_fd()
+    };
     let request = OwnedWorkerSpawnRequest {
         binary: request.binary.to_path_buf(),
         paths: request.paths.clone(),
@@ -1555,6 +1697,8 @@ async fn spawn_ready_worker(request: WorkerSpawnRequest<'_>) -> Result<Worker> {
         control_fd,
         #[cfg(unix)]
         reveal_fd,
+        #[cfg(unix)]
+        liveness_fd,
     };
     tokio::task::spawn_blocking(move || spawn_ready_worker_blocking(request))
         .await
@@ -1623,12 +1767,14 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
                 let safe_control = libc::fcntl(request.control_fd, libc::F_DUPFD, 16);
                 let safe_ready = libc::fcntl(ready_write_fd, libc::F_DUPFD, 16);
                 let safe_reveal = libc::fcntl(request.reveal_fd, libc::F_DUPFD, 16);
+                let safe_liveness = libc::fcntl(request.liveness_fd, libc::F_DUPFD, 16);
                 let safe_promotion = promotion_read_fd
                     .map(|fd| libc::fcntl(fd, libc::F_DUPFD, 16))
                     .unwrap_or(-1);
                 if safe_control < 0
                     || safe_ready < 0
                     || safe_reveal < 0
+                    || safe_liveness < 0
                     || (promotion_read_fd.is_some() && safe_promotion < 0)
                 {
                     return Err(std::io::Error::last_os_error());
@@ -1636,18 +1782,20 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
                 let installed = libc::dup2(safe_control, CONTROL_FD) >= 0
                     && libc::dup2(safe_ready, READY_FD) >= 0
                     && libc::dup2(safe_reveal, REVEAL_FD) >= 0
+                    && libc::dup2(safe_liveness, LIVENESS_FD) >= 0
                     && (promotion_read_fd.is_none()
                         || libc::dup2(safe_promotion, PROMOTION_FD) >= 0);
                 libc::close(safe_control);
                 libc::close(safe_ready);
                 libc::close(safe_reveal);
+                libc::close(safe_liveness);
                 if safe_promotion >= 0 {
                     libc::close(safe_promotion);
                 }
                 if !installed {
                     return Err(std::io::Error::last_os_error());
                 }
-                for fd in [CONTROL_FD, READY_FD, REVEAL_FD] {
+                for fd in [CONTROL_FD, READY_FD, REVEAL_FD, LIVENESS_FD] {
                     if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -1656,6 +1804,7 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
             });
         }
         command.env("LISTEN_FDS", "1");
+        command.env(SUPERVISOR_LIVENESS_ENV, "1");
         if request.hold_for_promotion {
             command.env(HANDOVER_STANDBY_ENV, "1");
         }
@@ -2767,7 +2916,7 @@ struct ReexecRequest<'a> {
 fn reexec_supervisor(request: ReexecRequest<'_>) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     let (lifetime_fd, pid_lock_fd) = request.metadata.prepare_for_reexec()?;
-    let (control_fd, reveal_fd) = request.endpoints.prepare_for_reexec()?;
+    let (control_fd, reveal_fd, liveness_fds) = request.endpoints.prepare_for_reexec()?;
     let admin_fd = prepare_admin_for_reexec(request.admin)?;
     let database_lock_fd = request.database_owner.raw_fd();
     clear_close_on_exec(database_lock_fd)?;
@@ -2778,6 +2927,7 @@ fn reexec_supervisor(request: ReexecRequest<'_>) -> Result<()> {
         control_fd,
         reveal_fd,
         admin_fd,
+        liveness_fds: Some(liveness_fds),
         worker_pid: request.worker.pid,
         worker_binary: request.worker.binary.clone(),
         generation: request.generation,

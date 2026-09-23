@@ -683,7 +683,7 @@ impl Db {
     }
 
     pub async fn mark_interrupt_interrupted(&self, interrupt_id: Uuid) -> Result<bool> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -694,6 +694,12 @@ impl Db {
                     params![interrupt_id.to_string()],
                 )
                 .context("marking needs_attention interrupted")?;
+            if affected > 0 {
+                crate::db::tool_recovery::close_parked_call_intent_for_interrupt_conn(
+                    conn,
+                    interrupt_id,
+                )?;
+            }
             Ok(affected > 0)
         })
         .await
@@ -755,6 +761,10 @@ impl Db {
                 )
                 .context("marking linked executing interrupt interrupted")?;
             if affected == 1 {
+                crate::db::tool_recovery::close_parked_call_intent_for_interrupt_conn(
+                    conn,
+                    interrupt_id,
+                )?;
                 crate::db::agent_tree_decisions::insert_control_event(
                     conn,
                     session_id,

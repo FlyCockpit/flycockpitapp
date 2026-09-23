@@ -254,6 +254,17 @@ fn session_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
     .collect()
 }
 
+/// The persisted rows a client's `HistoryReplay` represents. The #490
+/// `tool_call_completed` row only advances the durable handover marker in the
+/// result transaction; the tool result itself is replayed through its
+/// `tool_call` entry, so the replay deliberately omits that internal row.
+fn history_replay_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
+    session_event_rows(db_path, session_id)
+        .into_iter()
+        .filter(|(_, kind)| kind != "tool_call_completed")
+        .collect()
+}
+
 fn has_handover_interrupt_decision(db_path: &Path, session_id: Uuid) -> bool {
     let conn = open_db(db_path);
     conn.query_row(
@@ -1053,13 +1064,25 @@ async fn lifecycle_deny_round_trip_resolves_without_broadened_rerun() {
 #[tokio::test(flavor = "multi_thread")]
 async fn lifecycle_restart_command_preserves_parked_session_and_starts_when_absent() {
     let (_provider, daemon, attached, interrupt_id) = create_parked_session().await;
-    let old_pid = daemon.pid();
+    // Since #482 `daemon restart` rolls the worker under the stable
+    // supervisor, whose PID (the published receipt) deliberately survives.
+    // The generation identity is the supervisor's worker generation.
+    let before = supervisor_status_json(&daemon);
 
     restart_daemon_gracefully(&daemon).await;
-    assert_ne!(
-        daemon.pid(),
-        old_pid,
-        "restart must publish a new generation"
+    let after = supervisor_status_json(&daemon);
+    assert_eq!(
+        after["pid"], before["pid"],
+        "restart must retain the stable supervisor"
+    );
+    assert!(
+        after["generation"]
+            .as_u64()
+            .expect("restarted worker generation")
+            > before["generation"]
+                .as_u64()
+                .expect("initial worker generation"),
+        "restart must publish a new worker generation: before={before} after={after}"
     );
 
     let client = daemon.client().await;
@@ -1221,7 +1244,7 @@ async fn lifecycle_attach_replay_across_restart_delivers_persisted_events_once_i
 
     daemon.sigkill().await;
     daemon.restart_same_home().await;
-    let expected_rows = session_event_rows(&daemon.db_path(), attached.session_id);
+    let expected_rows = history_replay_event_rows(&daemon.db_path(), attached.session_id);
     let expected_seqs: Vec<_> = expected_rows.iter().map(|(seq, _)| *seq).collect();
     let expected_max = *expected_seqs.last().expect("persisted session events");
     let replay_client = daemon.client().await;

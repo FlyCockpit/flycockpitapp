@@ -30,6 +30,10 @@ const WAIT_POLL: Duration = Duration::from_millis(10);
 const REAP_GRACE: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 const PER_CONNECTION_READ_CAP: Duration = Duration::from_secs(1);
+/// How long a reporter keeps its notify connection open waiting for the
+/// parent to verify it and read the report before giving up.
+#[cfg(unix)]
+const REPORTER_LINGER_CAP: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const MIN_NOTIFY_READ_TIMEOUT: Duration = Duration::from_millis(1);
 #[cfg(unix)]
@@ -157,11 +161,31 @@ fn write_report(endpoint: &str, line: &str) -> Result<()> {
     let payload = format!("{line}\n");
     #[cfg(unix)]
     {
+        use std::io::Read as _;
         let mut stream = std::os::unix::net::UnixStream::connect(Path::new(endpoint))
             .with_context(|| format!("connecting spawn notify socket {endpoint}"))?;
         stream
             .write_all(payload.as_bytes())
             .context("writing spawn notify report")?;
+        // Keep the connection open until the parent has verified us and read
+        // the line (it closes its end afterwards). macOS answers
+        // `LOCAL_PEERPID` with ENOTCONN once the peer has closed, so closing
+        // right after the write lets the parent's PID-bound peer check fail
+        // and silently drop the one-shot report. Bounded so a vanished parent
+        // cannot stall the daemon.
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        stream
+            .set_read_timeout(Some(REPORTER_LINGER_CAP))
+            .context("setting spawn notify linger timeout")?;
+        let mut sink = [0u8; 64];
+        loop {
+            match stream.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
         Ok(())
     }
     #[cfg(windows)]
@@ -787,28 +811,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fake_child_err_report_becomes_the_user_facing_error() {
+        if let Ok(endpoint) = std::env::var(REPORTER_ENDPOINT_ENV) {
+            write_report(&endpoint, "Err{bind failed: test reason}")
+                .expect("child writes spawn report");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         cockpit_host::private_fs::ensure_private_dir(dir.path()).unwrap();
         let log_path = dir.path().join(DAEMON_LOG_FILE);
         std::fs::write(&log_path, "ignored\n").unwrap();
         let server = SpawnNotifyServer::bind().unwrap();
-        let notify = PathBuf::from(server.endpoint());
-        // SAFETY: `pre_exec` runs in the forked child before exec of `true`.
-        let mut child = unsafe {
-            use std::io::Write as _;
-            use std::os::unix::process::CommandExt;
-            let notify = notify.clone();
-            Command::new("true")
-                .pre_exec(move || {
-                    let mut stream = std::os::unix::net::UnixStream::connect(&notify)?;
-                    stream.write_all(b"Err{bind failed: test reason}\n")?;
-                    Ok(())
-                })
-                .spawn()
-                .unwrap()
-        };
+        let mut child = spawn_reporter_child(
+            "daemon::spawn_notify::tests::fake_child_err_report_becomes_the_user_facing_error",
+            &server,
+        );
         let report = server
-            .wait(&mut child, &log_path, Duration::from_secs(2))
+            .wait(&mut child, &log_path, Duration::from_secs(10))
             .expect("notify report");
         let error = report_to_error(report, &log_path);
         let text = format!("{error:#}");
@@ -817,6 +835,59 @@ mod tests {
             "user-facing error must carry the child's Err payload: {text}"
         );
         let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    const REPORTER_ENDPOINT_ENV: &str = "COCKPIT_TEST_SPAWN_NOTIFY_REPORTER_ENDPOINT";
+
+    /// Re-execute this test binary as the spawned child so the reporter's PID
+    /// is the one the parent verifies; the child role runs `write_report`.
+    #[cfg(unix)]
+    fn spawn_reporter_child(test_name: &str, server: &SpawnNotifyServer) -> Child {
+        Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(REPORTER_ENDPOINT_ENV, server.endpoint())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn reporter child")
+    }
+
+    /// Regression (macOS): a report written before the parent accepts must
+    /// still be verified and delivered. macOS `LOCAL_PEERPID` fails with
+    /// ENOTCONN once the peer has closed, so the production reporter lingers
+    /// until the parent has read the line. The reporter is this test binary
+    /// re-executed as the spawned child, so the PID-bound check is real.
+    #[cfg(unix)]
+    #[test]
+    fn report_written_before_the_parent_accepts_is_verified_and_delivered() {
+        if let Ok(endpoint) = std::env::var(REPORTER_ENDPOINT_ENV) {
+            // Child role: report through the production writer, then exit.
+            write_report(&endpoint, "Ok{/tmp/cockpit-late-accept.sock}")
+                .expect("child writes spawn report");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        cockpit_host::private_fs::ensure_private_dir(dir.path()).unwrap();
+        let log_path = dir.path().join(DAEMON_LOG_FILE);
+        std::fs::write(&log_path, "ignored\n").unwrap();
+        let server = SpawnNotifyServer::bind().unwrap();
+        let mut child = spawn_reporter_child(
+            "daemon::spawn_notify::tests::report_written_before_the_parent_accepts_is_verified_and_delivered",
+            &server,
+        );
+        // Give the reporter time to connect and write before accepting.
+        std::thread::sleep(Duration::from_millis(500));
+        let report = server
+            .wait(&mut child, &log_path, Duration::from_secs(10))
+            .expect("late-accepted report must be verified and delivered");
+        match report {
+            SpawnReport::Ready { socket } => {
+                assert_eq!(socket, PathBuf::from("/tmp/cockpit-late-accept.sock"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(child.wait().expect("reap reporter").success());
     }
 
     #[cfg(unix)]

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::extended::{DeepthinkConfig, ExtendedConfig, ExtendedConfigDoc};
 use crate::config::providers::{ConfigDoc, ProviderEntry, ProvidersConfig, ThinkingParams};
 
-const POLICY_BUNDLE_VERSION: u32 = 1;
+pub(crate) const POLICY_BUNDLE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PolicyBundle {

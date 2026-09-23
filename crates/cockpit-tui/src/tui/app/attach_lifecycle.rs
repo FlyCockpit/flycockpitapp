@@ -426,7 +426,6 @@ impl App {
             merge_counts(&mut self.usage_tags, &r.usage.tags);
             self.project_id = Some(r.project_id.clone());
             self.foreground_input_target = r.foreground_target.clone();
-            self.maybe_show_daemon_version_chip(&r.daemon_version, r.daemon_compatible);
             let endpoint_changed = match (
                 self.startup_background.daemon_socket.as_ref(),
                 Some(&r.socket),

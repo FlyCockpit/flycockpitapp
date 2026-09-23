@@ -2184,7 +2184,7 @@ mod tests {
             .cloned()
             .expect("simple command");
         assert_eq!(info.key.as_policy_str(), "deploy prod");
-        assert!(info.key.as_storage_str().starts_with("v2:"));
+        assert!(info.key.as_storage_str().starts_with("v1:"));
         assert_eq!(info.risk.tier, RiskTier::Ordinary);
 
         let mut cfg = crate::config::extended::ApprovalPolicyConfig::default();

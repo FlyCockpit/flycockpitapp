@@ -491,7 +491,7 @@ pub struct LeakCursorPayload {
     pub last_report_id: String,
 }
 
-const LEAK_CURSOR_VERSION: u8 = 1;
+pub(crate) const LEAK_CURSOR_VERSION: u8 = 1;
 const LEAK_CURSOR_OWNER_TAG: u8 = 1;
 
 fn rotation_wire(r: LeakRotation) -> u8 {

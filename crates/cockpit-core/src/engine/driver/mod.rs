@@ -85,6 +85,10 @@ use crate::{
 };
 
 const AUTO_COMPACT_DEFAULT_PCT: u8 = 80;
+/// Version of the persisted interactive (answering) task snapshot.
+pub(crate) const INTERACTIVE_TASK_SNAPSHOT_VERSION: u8 = 1;
+/// Version of the persisted root late-steer continuation snapshot.
+pub(crate) const ROOT_CONTINUATION_SNAPSHOT_VERSION: u8 = 1;
 use crate::session::{InferenceSendIdentity, Session};
 
 /// An interval whose selectable future is authoritative for whether it is
@@ -4590,7 +4594,8 @@ impl Driver {
         let snapshot: serde_json::Value = serde_json::from_str(snapshot_json)
             .context("parsing recovered root late-steer continuation snapshot")?;
         anyhow::ensure!(
-            snapshot.get("version").and_then(serde_json::Value::as_u64) == Some(1),
+            snapshot.get("version").and_then(serde_json::Value::as_u64)
+                == Some(u64::from(ROOT_CONTINUATION_SNAPSHOT_VERSION)),
             "recovered root late-steer snapshot version is unsupported"
         );
         anyhow::ensure!(
@@ -4729,7 +4734,8 @@ impl Driver {
         let snapshot: serde_json::Value = serde_json::from_str(&recovery.snapshot_json)
             .context("parsing recovered interactive task snapshot")?;
         anyhow::ensure!(
-            snapshot.get("version").and_then(serde_json::Value::as_u64) == Some(2),
+            snapshot.get("version").and_then(serde_json::Value::as_u64)
+                == Some(u64::from(INTERACTIVE_TASK_SNAPSHOT_VERSION)),
             "recovered interactive task snapshot version is unsupported"
         );
         let recovered_late_user_steer_continuation_id = snapshot
@@ -4954,7 +4960,7 @@ impl Driver {
                 return Ok(());
             };
             let snapshot = serde_json::to_string(&serde_json::json!({
-                "version": 1,
+                "version": ROOT_CONTINUATION_SNAPSHOT_VERSION,
                 "agent_instance_id": agent_instance_id,
                 "history": &frame.history,
                 "next_prompt": next_prompt,
@@ -4984,7 +4990,7 @@ impl Driver {
             return Ok(());
         };
         let snapshot = serde_json::to_string(&serde_json::json!({
-            "version": 2,
+            "version": INTERACTIVE_TASK_SNAPSHOT_VERSION,
             "agent_instance_id": agent_instance_id,
             "history": &frame.history,
             "next_prompt": next_prompt,
@@ -9749,10 +9755,9 @@ impl Driver {
         else {
             return Ok(None);
         };
-        let canonical =
-            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
-                &stored.canonical_message,
-            )?;
+        let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(
+            &stored.canonical_message,
+        )?;
         anyhow::ensure!(
             canonical.session_id == self.session.live_id(),
             "FCM2 session mismatch"
@@ -9768,7 +9773,7 @@ impl Driver {
         anyhow::ensure!(
             canonical.request.text.len() > 1024
                 && canonical.request.text.len()
-                    <= crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES,
+                    <= crate::proto_crate::send_user_message::MAX_MESSAGE_TEXT_BYTES,
             "oversized source violates FCM2 bounds"
         );
         anyhow::ensure!(
@@ -15575,7 +15580,7 @@ impl Driver {
                         });
                     }
                     let snapshot_json = match serde_json::to_string(&serde_json::json!({
-                        "version": 2,
+                        "version": 1,
                         "history": &snapshot_history,
                         // This is also the recovery continuation when no
                         // seed was selected. When declarations are present,

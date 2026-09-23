@@ -512,7 +512,7 @@ fn policy_revision_digest(
     provider_config_fingerprint: &str,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"cockpit-agent-policy-snapshot-v2\0");
+    digest.update(b"cockpit-agent-policy-snapshot-v1\0");
     digest.update(catalog_revision.as_bytes());
     digest.update([0]);
     digest.update(provider_config_fingerprint.as_bytes());

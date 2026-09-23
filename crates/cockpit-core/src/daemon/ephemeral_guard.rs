@@ -13,8 +13,7 @@ use std::sync::Arc;
 use crate::daemon::proto::Envelope;
 use anyhow::Context as _;
 use cockpit_host::daemon_lifecycle::{
-    DaemonPidReceipt, DaemonPidRecord, PidIdentity, read_daemon_pid_record,
-    verify_cockpit_daemon_receipt_identity,
+    DaemonPidReceipt, PidIdentity, read_daemon_pid_record, verify_cockpit_daemon_receipt_identity,
 };
 
 use crate::daemon::proto::Request;
@@ -296,13 +295,12 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
             retire_late_exact_metadata(cleanup, expected_pid, bound.as_ref())?;
             if bound.is_none() {
                 anyhow::bail!(
-                    "ephemeral child never published an exact v2 PID receipt; terminated exact child"
+                    "ephemeral child never published an exact PID receipt; terminated exact child"
                 );
             }
             return Ok(());
         }
-        if let Some(DaemonPidRecord::Receipt(receipt)) =
-            read_daemon_pid_record(&cleanup.paths.pid_file)
+        if let Some(receipt) = read_daemon_pid_record(&cleanup.paths.pid_file)
             && receipt_matches_owned_launch(cleanup, expected_pid, &receipt)
         {
             *cleanup
@@ -317,9 +315,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
     }
     let bound_expected = expected.clone();
     let result = if let Some(expected) = expected {
-        if read_daemon_pid_record(&cleanup.paths.pid_file)
-            != Some(DaemonPidRecord::Receipt(expected.clone()))
-        {
+        if read_daemon_pid_record(&cleanup.paths.pid_file) != Some(expected.clone()) {
             kill_and_wait_exact_child(child)?;
             anyhow::bail!(
                 "ephemeral daemon receipt changed before teardown; exact child was terminated without touching replacement metadata"
@@ -330,7 +326,7 @@ fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
         kill_and_wait_exact_child(child)?;
         retire_late_exact_metadata(cleanup, expected_pid, None)?;
         anyhow::bail!(
-            "ephemeral child never published an exact v2 PID receipt; terminated exact child"
+            "ephemeral child never published an exact PID receipt; terminated exact child"
         )
     };
     if result.is_err() {
@@ -394,9 +390,7 @@ fn request_owned_graceful_stop(
     cleanup: &ProcessCleanup,
     expected: &DaemonPidReceipt,
 ) -> anyhow::Result<()> {
-    if read_daemon_pid_record(&cleanup.paths.pid_file)
-        != Some(DaemonPidRecord::Receipt(expected.clone()))
-    {
+    if read_daemon_pid_record(&cleanup.paths.pid_file) != Some(expected.clone()) {
         anyhow::bail!("daemon receipt changed before owner graceful-stop request");
     }
     #[cfg(any(unix, windows))]
@@ -438,9 +432,7 @@ async fn request_owned_graceful_stop_async(
         .await
         .context("connecting exact owned daemon")?;
     after_connect();
-    if read_daemon_pid_record(&cleanup.paths.pid_file)
-        != Some(DaemonPidRecord::Receipt(expected.clone()))
-    {
+    if read_daemon_pid_record(&cleanup.paths.pid_file) != Some(expected.clone()) {
         anyhow::bail!(
             "daemon receipt changed during owner graceful-stop handshake; shutdown request was not sent"
         );
@@ -462,7 +454,7 @@ async fn request_owned_graceful_stop_async(
     }
     after_ack();
     match read_daemon_pid_record(&cleanup.paths.pid_file) {
-        Some(DaemonPidRecord::Receipt(receipt)) if receipt == *expected => {}
+        Some(receipt) if receipt == *expected => {}
         None if matches!(
             std::fs::symlink_metadata(&cleanup.paths.pid_file),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -516,8 +508,7 @@ fn retire_late_exact_metadata(
     expected_pid: u32,
     bound_expected: Option<&DaemonPidReceipt>,
 ) -> anyhow::Result<()> {
-    let Some(DaemonPidRecord::Receipt(receipt)) = read_daemon_pid_record(&cleanup.paths.pid_file)
-    else {
+    let Some(receipt) = read_daemon_pid_record(&cleanup.paths.pid_file) else {
         return Ok(());
     };
     let exact = bound_expected.map_or_else(
@@ -609,16 +600,12 @@ impl EphemeralDaemonGuard {
             .context("ephemeral child already reaped")?
             .id();
         let receipt = match read_daemon_pid_record(&process.paths.pid_file) {
-            Some(DaemonPidRecord::Receipt(receipt))
-                if receipt_matches_owned_launch(process, pid, &receipt) =>
-            {
-                receipt
-            }
+            Some(receipt) if receipt_matches_owned_launch(process, pid, &receipt) => receipt,
             Some(_) => anyhow::bail!("ephemeral daemon published a mismatching PID receipt"),
-            None => anyhow::bail!("ephemeral daemon did not publish its v2 PID receipt"),
+            None => anyhow::bail!("ephemeral daemon did not publish its PID receipt"),
         };
         if verify_cockpit_daemon_receipt_identity(&receipt) != PidIdentity::VerifiedDaemon {
-            anyhow::bail!("ephemeral daemon v2 receipt did not verify its exact process identity");
+            anyhow::bail!("ephemeral daemon receipt did not verify its exact process identity");
         }
         *process
             .receipt
@@ -914,7 +901,7 @@ fn pid_record_still_names(expected: Option<(&Path, &DaemonPidReceipt)>) -> bool 
     let Some((pid_file, expected)) = expected else {
         return true;
     };
-    read_daemon_pid_record(pid_file) == Some(DaemonPidRecord::Receipt(expected.clone()))
+    read_daemon_pid_record(pid_file) == Some(expected.clone())
 }
 
 #[cfg(test)]
@@ -1258,10 +1245,7 @@ mod tests {
                 .unwrap();
 
         assert!(guard.shutdown().is_err());
-        assert_eq!(
-            read_daemon_pid_record(&paths.pid_file),
-            Some(DaemonPidRecord::Receipt(replacement))
-        );
+        assert_eq!(read_daemon_pid_record(&paths.pid_file), Some(replacement));
     }
 
     #[test]
@@ -1475,10 +1459,7 @@ mod tests {
             .shutdown()
             .expect_err("identity-less cleanup reports forced unpublished-child teardown");
 
-        assert_eq!(
-            read_daemon_pid_record(&paths.pid_file),
-            Some(DaemonPidRecord::Receipt(replacement))
-        );
+        assert_eq!(read_daemon_pid_record(&paths.pid_file), Some(replacement));
         assert!(paths.socket.exists());
     }
 
@@ -1752,10 +1733,7 @@ mod tests {
             .unwrap_err();
         let replacement = server.await.unwrap();
         assert!(error.to_string().contains("after owner graceful-stop"));
-        assert_eq!(
-            read_daemon_pid_record(&paths.pid_file),
-            Some(DaemonPidRecord::Receipt(replacement))
-        );
+        assert_eq!(read_daemon_pid_record(&paths.pid_file), Some(replacement));
         guard.disarm();
         reap_fixture_child(&guard);
     }

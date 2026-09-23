@@ -157,7 +157,6 @@ fn switch_outcome_with_epoch(
         resume_compaction_offer: None,
         btw_fork: None,
         daemon_version: "test".to_string(),
-        daemon_compatible: true,
         attachment_epoch,
         transition_guard: None,
     }))

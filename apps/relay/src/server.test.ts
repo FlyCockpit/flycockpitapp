@@ -158,7 +158,7 @@ it("pairs a daemon and client, stamps principals, and routes daemon replies by c
 
   client.send(JSON.stringify(clientFrame));
   await expect(nextMessage(daemon)).resolves.toMatchObject({
-    v: 2,
+    v: 1,
     channelId: clientFrame.channelId,
     from: "client",
     principal: {

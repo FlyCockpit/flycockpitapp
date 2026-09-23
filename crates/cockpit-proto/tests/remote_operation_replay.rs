@@ -3,7 +3,7 @@ use cockpit_proto::{Body, Envelope};
 #[test]
 fn shared_remote_replay_vectors_are_strict_and_exact() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../packages/cockpit-protocol/fixtures/remote-operation-replay-v2.json"
+        "../../../packages/cockpit-protocol/fixtures/remote-operation-replay.json"
     ))
     .unwrap();
     for key in ["request", "response", "ack", "ackResponse"] {

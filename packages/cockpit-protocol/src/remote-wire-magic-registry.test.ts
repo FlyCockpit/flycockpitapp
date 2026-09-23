@@ -30,6 +30,8 @@ describe("remote_wire_magic_registry_cross_language_vectors", () => {
       { magic: "FCWN", symbolicType: "RemoteWebRtcAnswerV1" },
       { magic: "FCWC", symbolicType: "RemoteWebRtcCandidateV1" },
       { magic: "FCWE", symbolicType: "RemoteWebRtcIceCompleteV1" },
+      { magic: "FCM2", symbolicType: "RemoteMessageV1" },
+      { magic: "FCNP", symbolicType: "RemoteNoisePrologueV1" },
     ]);
     expect(() => parseRemoteWireMagicRegistry([])).toThrow();
     expect(() => parseRemoteWireMagicRegistry([...registry, registry[0]])).toThrow();

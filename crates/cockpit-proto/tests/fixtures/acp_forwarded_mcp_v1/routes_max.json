@@ -20,7 +20,6 @@
             },
             "no_sandbox": true,
             "interactive": true,
-            "client_protocol_version": 21,
             "env_snapshot": {
               "source": "explicit_cli",
               "digest": "fixture-digest",
@@ -2579,7 +2578,6 @@
             },
             "no_sandbox": true,
             "interactive": true,
-            "client_protocol_version": 21,
             "env_snapshot": {
               "source": "explicit_cli",
               "digest": "fixture-digest",

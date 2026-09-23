@@ -3,18 +3,16 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-/// Current relay envelope version.
+/// The single relay envelope version.
 ///
-/// Additive changes such as new frame variants or new optional fields with
-/// `#[serde(default)]` bump only this value; peers in the supported version
-/// window must keep parsing known data and ignoring unknown additive fields.
-/// Breaking changes such as removals, renames, or type changes bump
-/// `RELAY_MIN_SUPPORTED_ENVELOPE_VERSION`.
-pub const RELAY_ENVELOPE_VERSION: u32 = 2;
-pub const RELAY_MIN_SUPPORTED_ENVELOPE_VERSION: u32 = 1;
+/// Peers accept exactly this version. Additive changes (new frame variants or
+/// new optional fields with `#[serde(default)]`) keep it; known data keeps
+/// parsing and unknown additive fields are ignored. A frame carrying any other
+/// version routes to `Unknown` (or is rejected by the typed decoders).
+pub const RELAY_ENVELOPE_VERSION: u32 = 1;
 
 pub fn is_relay_envelope_version_supported(version: u32) -> bool {
-    (RELAY_MIN_SUPPORTED_ENVELOPE_VERSION..=RELAY_ENVELOPE_VERSION).contains(&version)
+    version == RELAY_ENVELOPE_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,11 +257,6 @@ impl<'de> Deserialize<'de> for StampedClientRelayFrame {
             payload: Value,
         }
         let wire = Wire::deserialize(deserializer)?;
-        if wire.v == 1 && wire.principal.actor_binding.is_some() {
-            return Err(serde::de::Error::custom(
-                "relay envelope v1 must be actorless",
-            ));
-        }
         Ok(Self {
             v: wire.v,
             channel_id: wire.channel_id,
@@ -739,7 +732,7 @@ mod tests {
         let value = serde_json::to_value(frame).unwrap();
         assert_eq!(
             value,
-            json!({ "v": 2, "channelId": "ch-1", "payload": { "text": "world" } })
+            json!({ "v": 1, "channelId": "ch-1", "payload": { "text": "world" } })
         );
     }
 
@@ -756,7 +749,7 @@ mod tests {
             let raw = fs::read_to_string(&path).unwrap();
             match name.as_ref() {
                 "client-relay-frame.json" => assert_roundtrip::<ClientRelayFrame>(&raw),
-                "stamped-client-relay-frame.json" | "stamped-client-relay-frame-v1.json" => {
+                "stamped-client-relay-frame.json" => {
                     assert_roundtrip::<StampedClientRelayFrame>(&raw)
                 }
                 "client-actor-binding-v1.json" => {
@@ -807,7 +800,7 @@ mod tests {
 
         let frame = serde_json::from_str::<ClientRelayFrame>(&raw).unwrap();
 
-        assert_eq!(frame.v, RELAY_MIN_SUPPORTED_ENVELOPE_VERSION);
+        assert_eq!(frame.v, RELAY_ENVELOPE_VERSION);
         assert_eq!(frame.channel_id, "ch-forward");
         assert_eq!(frame.payload, json!({"kind": "req"}));
     }
@@ -848,7 +841,7 @@ mod tests {
         assert_eq!(
             frame,
             IncomingRelayFrame::Unknown {
-                v: RELAY_MIN_SUPPORTED_ENVELOPE_VERSION,
+                v: RELAY_ENVELOPE_VERSION,
                 kind: "mystery".to_string()
             }
         );
@@ -935,20 +928,20 @@ mod tests {
     }
 
     #[test]
-    fn forward_compat_version_within_window_is_accepted() {
+    fn current_version_is_accepted() {
         let raw = json!({
-            "v": RELAY_MIN_SUPPORTED_ENVELOPE_VERSION,
+            "v": RELAY_ENVELOPE_VERSION,
             "channelId": "ch-1",
             "payload": { "kind": "req" }
         });
 
         let frame = serde_json::from_value::<ClientRelayFrame>(raw).unwrap();
 
-        assert_eq!(frame.v, RELAY_MIN_SUPPORTED_ENVELOPE_VERSION);
+        assert_eq!(frame.v, RELAY_ENVELOPE_VERSION);
     }
 
     #[test]
-    fn forward_compat_version_outside_window_is_rejected() {
+    fn non_current_version_is_rejected() {
         let raw = json!({
             "v": RELAY_ENVELOPE_VERSION + 1,
             "channelId": "ch-1",

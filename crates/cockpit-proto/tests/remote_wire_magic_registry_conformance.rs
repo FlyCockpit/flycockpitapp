@@ -18,6 +18,11 @@ fn remote_wire_magic_registry_cross_language_vectors() {
             // The FCRC control-event magic is registered to the real symbolic
             // type, replacing the phantom `RemoteRelationshipConsentV1`.
             ("FCRC", "RemoteControlEventV1"),
+            // FCM2 is the canonical user-message codec (`send_user_message`).
+            ("FCM2", "RemoteMessageV1"),
+            // FCNP is the Noise prologue magic (`cockpit_noise::prologue::MAGIC`),
+            // not a network-policy codec.
+            ("FCNP", "RemoteNoisePrologueV1"),
         ],
     )
     .unwrap();
@@ -29,6 +34,10 @@ fn remote_wire_magic_registry_cross_language_vectors() {
     assert!(
         !registry_json.contains("RemoteRelationshipConsentV1"),
         "phantom RemoteRelationshipConsentV1 must not be registered"
+    );
+    assert!(
+        !registry_json.contains("RemoteNetworkPolicyV1"),
+        "FCNP belongs to the Noise prologue, not a phantom network-policy type"
     );
     assert!(parse_registry("[]").is_err());
 }

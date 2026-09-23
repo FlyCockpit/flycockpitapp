@@ -324,7 +324,7 @@ fn successor_preserves_accepted_v2_queue_until_tool_recovery_resolves() {
         AcceptMessageInput, AcceptMessageResult, MessageAcceptanceJoin, MessageActor,
         MessageSafeOutcome,
     };
-    use crate::proto_crate::send_user_message_v2::{CanonicalSendUserMessageV2, SendUserMessageV2};
+    use crate::proto_crate::send_user_message::{CanonicalSendUserMessage, SendUserMessage};
     use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
 
     struct InlineReceiptJoin;
@@ -418,12 +418,12 @@ fn successor_preserves_accepted_v2_queue_until_tool_recovery_resolves() {
                 } else {
                     "accepted follow-up source".to_string()
                 };
-                let canonical = CanonicalSendUserMessageV2 {
+                let canonical = CanonicalSendUserMessage {
                     session_id: session.id,
                     canonical_project_digest: [1; 32],
                     model_config_generation: 0,
                     canonical_model_digest: [2; 32],
-                    request: SendUserMessageV2 {
+                    request: SendUserMessage {
                         client_submission_id: submission_id,
                         origin: Default::default(),
                         text: text.clone(),

@@ -4343,7 +4343,7 @@ mod tests {
         let typed =
             UserContent::image_base64("YWJj", Some(rig::message::ImageMediaType::PNG), None);
         let envelope = json!({
-            "version": 3,
+            "version": 1,
             "prelude": [{
                 "type": "forced_skill",
                 "call_id": "forced-1",
@@ -4461,7 +4461,7 @@ mod tests {
         };
         let secret = "post-audit-forced-secret";
         let envelope = json!({
-            "version": 3,
+            "version": 1,
             "prelude": [{
                 "type": "forced_skill",
                 "call_id": "forced-redaction",
@@ -8521,7 +8521,7 @@ mod tests {
             other => panic!("expected reservation, got {other:?}"),
         };
         let envelope = json!({
-            "version": 3,
+            "version": 1,
             "prelude": [],
             "parts": [{"type":"authored_text_slot"}]
         });

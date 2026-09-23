@@ -218,7 +218,7 @@ const KB_MACHINE_STATE_GITIGNORE: &[&str] = &[
     "schedule-state/",
     "sealed-material/",
 ];
-pub(crate) const INDEX_LOGIC_VERSION: i64 = 3;
+pub(crate) const INDEX_LOGIC_VERSION: i64 = 1;
 const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
@@ -252,9 +252,9 @@ const MAX_STRUCTURED_SEARCH_FILTERS: usize = 16;
 const SEALED_KNOWLEDGE_BASE_ID_FILE: &str = ".flycockpit-sealed-kb-id";
 const SEALED_KNOWLEDGE_BASE_MARKER_ID_LEAF: &str = "id";
 const SEALED_KNOWLEDGE_BASE_MARKER_BINDING_LEAF: &str = "binding";
-const SEALED_KNOWLEDGE_BASE_MARKER_VERSION: &str = "v2";
+pub(crate) const SEALED_KNOWLEDGE_BASE_MARKER_VERSION: &str = "v1";
 const SEALED_KNOWLEDGE_BASE_MARKER_BINDING_DOMAIN: &[u8] =
-    b"flycockpit/knowledge-base-sealed-marker/v2";
+    b"flycockpit/knowledge-base-sealed-marker/v1";
 
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
@@ -5289,7 +5289,7 @@ fn sealed_knowledge_base_marker_binding(
     marker_change_identity: &[u8],
     id: uuid::Uuid,
 ) -> Result<Vec<u8>> {
-    let mut binding = b"flycockpit/knowledge-base-sealed-marker-binding/v2\0".to_vec();
+    let mut binding = b"flycockpit/knowledge-base-sealed-marker-binding/v1\0".to_vec();
     append_attachment_identity_component(&mut binding, root.to_string_lossy().as_bytes());
     append_attachment_identity_component(&mut binding, id.as_bytes());
     append_sealed_marker_object_identity(&mut binding, sealed_marker_object_identity(source)?);
@@ -5924,7 +5924,7 @@ fn local_source_attachment_identity(
         );
     }
 
-    let mut name = b"flycockpit/knowledge-local-attachment/v3\0".to_vec();
+    let mut name = b"flycockpit/knowledge-local-attachment/v1\0".to_vec();
     append_attachment_identity_component(&mut name, root.to_string_lossy().as_bytes());
     // A registry entry is an explicit attachment authorization boundary. Two
     // entries may intentionally expose the same local source under different

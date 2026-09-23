@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// String form (`as_str`) is `"image"|"audio"|"video"` (serde `snake_case`,
 /// matching TypeScript). Wire-byte form (`code`/`from_code`) is the exact FCM2
 /// code set `image=1, audio=2, video=3`, shared with
-/// [`crate::send_user_message_v2`] attachment identities.
+/// [`crate::send_user_message`] attachment identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {

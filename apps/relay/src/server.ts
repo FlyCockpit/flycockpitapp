@@ -205,7 +205,7 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
     };
     const previous = daemonsByInstance.get(connection.instanceId);
     if (previous) {
-      sendJson(previous.ws, { v: 1, type: "system", code: "daemon_replaced" });
+      sendJson(previous.ws, { v: RELAY_ENVELOPE_VERSION, type: "system", code: "daemon_replaced" });
       previous.ws.close(CLOSE_REPLACED);
       await unregisterDaemon(previous);
     }
@@ -247,7 +247,7 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
     const lease = await presenceStore.getDaemonLease(payload.instanceId);
     const daemon = daemonsByInstance.get(payload.instanceId);
     if (!lease || lease.relayId !== config.relayId || !daemon) {
-      sendJson(ws, { v: 1, type: "system", code: "instance_offline" });
+      sendJson(ws, { v: RELAY_ENVELOPE_VERSION, type: "system", code: "instance_offline" });
       ws.close(CLOSE_OFFLINE);
       return;
     }
@@ -255,7 +255,7 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
       (client) => client.instanceId === payload.instanceId,
     ).length;
     if (activeForInstance >= config.maxConnectionsPerInstance) {
-      sendJson(ws, { v: 1, type: "system", code: "rate_limited" });
+      sendJson(ws, { v: RELAY_ENVELOPE_VERSION, type: "system", code: "rate_limited" });
       ws.close(CLOSE_RATE_LIMITED);
       return;
     }
@@ -323,7 +323,7 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
     try {
       frame = userRelayFrameSchema.parse(parseJson(data));
     } catch {
-      sendJson(connection.ws, { v: 1, type: "system", code: "bad_frame" });
+      sendJson(connection.ws, { v: RELAY_ENVELOPE_VERSION, type: "system", code: "bad_frame" });
       connection.ws.close(CLOSE_BAD_FRAME);
       return;
     }
@@ -367,13 +367,17 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
     totalFrames += 1;
     totalBytes += bytes;
     if (overRateLimit(connection)) {
-      sendJson(connection.ws, { v: 1, type: "system", code: "rate_limited" });
+      sendJson(connection.ws, { v: RELAY_ENVELOPE_VERSION, type: "system", code: "rate_limited" });
       connection.ws.close(CLOSE_RATE_LIMITED);
       return;
     }
     const daemon = daemonsByInstance.get(connection.instanceId);
     if (!daemon || daemon.ws.readyState !== WebSocket.OPEN) {
-      sendJson(connection.ws, { v: 1, type: "system", code: "instance_offline" });
+      sendJson(connection.ws, {
+        v: RELAY_ENVELOPE_VERSION,
+        type: "system",
+        code: "instance_offline",
+      });
       connection.ws.close(CLOSE_OFFLINE);
       return;
     }
@@ -381,20 +385,24 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
     try {
       frame = clientRelayFrameSchema.parse(parseJson(data));
     } catch {
-      sendJson(connection.ws, { v: 1, type: "system", code: "bad_frame" });
+      sendJson(connection.ws, { v: RELAY_ENVELOPE_VERSION, type: "system", code: "bad_frame" });
       connection.ws.close(CLOSE_BAD_FRAME);
       return;
     }
     const ownerKey = channelKey(connection.instanceId, frame.channelId);
     const existingOwner = channelOwners.get(ownerKey);
     if (existingOwner && existingOwner.connectionId !== connection.connectionId) {
-      sendJson(connection.ws, { v: 1, type: "system", code: "channel_owned" });
+      sendJson(connection.ws, { v: RELAY_ENVELOPE_VERSION, type: "system", code: "channel_owned" });
       connection.ws.close(CLOSE_BAD_FRAME);
       return;
     }
     if (!connection.channels.has(frame.channelId)) {
       if (connection.channels.size >= config.maxChannelsPerClient) {
-        sendJson(connection.ws, { v: 1, type: "system", code: "channel_limit" });
+        sendJson(connection.ws, {
+          v: RELAY_ENVELOPE_VERSION,
+          type: "system",
+          code: "channel_limit",
+        });
         return;
       }
       connection.channels.add(frame.channelId);
@@ -465,7 +473,11 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
     if (message.type === "notify_user") {
       for (const user of usersByConnection.values()) {
         if (user.userId === message.userId) {
-          sendJson(user.ws, { v: 1, type: "notification", notification: message.notification });
+          sendJson(user.ws, {
+            v: RELAY_ENVELOPE_VERSION,
+            type: "notification",
+            notification: message.notification,
+          });
         }
       }
       return;
@@ -473,12 +485,20 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
     if (message.type === "disconnect_instance") {
       const daemon = daemonsByInstance.get(message.instanceId);
       if (daemon) {
-        sendJson(daemon.ws, { v: 1, type: "system", code: "forced_disconnect" });
+        sendJson(daemon.ws, {
+          v: RELAY_ENVELOPE_VERSION,
+          type: "system",
+          code: "forced_disconnect",
+        });
         daemon.ws.close(CLOSE_FORCED);
       }
       for (const client of clientsByConnection.values()) {
         if (client.instanceId === message.instanceId) {
-          sendJson(client.ws, { v: 1, type: "system", code: "forced_disconnect" });
+          sendJson(client.ws, {
+            v: RELAY_ENVELOPE_VERSION,
+            type: "system",
+            code: "forced_disconnect",
+          });
           client.ws.close(CLOSE_FORCED);
         }
       }
@@ -489,13 +509,17 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
         client.userId === message.userId &&
         (!message.instanceId || client.instanceId === message.instanceId)
       ) {
-        sendJson(client.ws, { v: 1, type: "system", code: "forced_disconnect" });
+        sendJson(client.ws, {
+          v: RELAY_ENVELOPE_VERSION,
+          type: "system",
+          code: "forced_disconnect",
+        });
         client.ws.close(CLOSE_FORCED);
       }
     }
     for (const user of usersByConnection.values()) {
       if (user.userId === message.userId) {
-        sendJson(user.ws, { v: 1, type: "system", code: "forced_disconnect" });
+        sendJson(user.ws, { v: RELAY_ENVELOPE_VERSION, type: "system", code: "forced_disconnect" });
         user.ws.close(CLOSE_FORCED);
       }
     }

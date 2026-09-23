@@ -48,7 +48,6 @@ const attachFixture = {
   active_agent: "Build",
   paused_work: [],
   daemon_version: "0.1.0",
-  compatible: true,
   env_policy_applied: "daemon" as const,
   history: [
     { role: "assistant" as const, seq: 2, agent: "Build", text: "I will inspect." },

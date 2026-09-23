@@ -872,7 +872,6 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
                 resume_compaction_offer: None,
                 btw_fork: None,
                 daemon_version: "test".to_string(),
-                daemon_compatible: true,
                 attachment_epoch: 0,
                 transition_guard: None,
             });

@@ -772,8 +772,6 @@ impl App {
         let repair_required = outcome.repair_required.clone();
         let resume_compaction_offer = outcome.resume_compaction_offer.clone();
         let btw_fork = outcome.btw_fork.clone();
-        let daemon_version = outcome.daemon_version.clone();
-        let daemon_compatible = outcome.daemon_compatible;
         if let Some(restored) = resume_history {
             let staged_history = self
                 .pending_session_switch_submissions
@@ -828,7 +826,6 @@ impl App {
                         self.arm_resume_compaction_confirm(offer);
                     }
                     self.maybe_prompt_paused_work(session_id, paused_work);
-                    self.maybe_show_daemon_version_chip(&daemon_version, daemon_compatible);
                 }
             }
         }

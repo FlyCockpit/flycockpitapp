@@ -32,7 +32,7 @@ export * from "./remote-tenant-authority-protocol";
 export * from "./remote-transport-selection";
 export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
-export * from "./send-user-message-v2";
+export * from "./send-user-message";
 
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -131,7 +131,7 @@ export const remoteOperationIdentityV1Schema = z
   })
   .strict();
 export type RemoteOperationIdentityV1 = z.infer<typeof remoteOperationIdentityV1Schema>;
-export const remoteReplayRequestV2Schema = z
+export const remoteReplayRequestSchema = z
   .object({
     v: z.literal(PROTOCOL_VERSION),
     kind: z.literal("replay_req"),
@@ -150,7 +150,7 @@ export const remoteOutboxDeliveryV1Schema = z
     leaseExpiresAtMs: safeI64NumberSchema,
   })
   .strict();
-export const remoteReplayResponseV2Schema = z
+export const remoteReplayResponseSchema = z
   .object({
     v: z.literal(PROTOCOL_VERSION),
     kind: z.literal("replay_res"),
@@ -159,7 +159,7 @@ export const remoteReplayResponseV2Schema = z
     highWaterMark: canonicalU64DecimalStringSchema,
   })
   .strict();
-export const remoteReplayAckV2Schema = z
+export const remoteReplayAckSchema = z
   .object({
     v: z.literal(PROTOCOL_VERSION),
     kind: z.literal("replay_ack"),
@@ -168,7 +168,7 @@ export const remoteReplayAckV2Schema = z
     leaseToken: canonicalRfcUuidSchema,
   })
   .strict();
-export const remoteReplayAckResponseV2Schema = z
+export const remoteReplayAckResponseSchema = z
   .object({
     v: z.literal(PROTOCOL_VERSION),
     kind: z.literal("replay_ack_res"),
@@ -456,7 +456,6 @@ export const codeRootAttachOptionsV1Schema = z
     model_override: activeModelRefSchema.optional(),
     no_sandbox: z.boolean().optional(),
     interactive: z.boolean().optional(),
-    client_protocol_version: u32Schema.optional(),
     env_snapshot: z.unknown().optional(),
     env_policy: envDriftPolicySchema.optional(),
   })
@@ -872,7 +871,7 @@ const messageTagExpansionSchema = z
   })
   .strict();
 
-const sendUserMessageV2Schema = z
+const sendUserMessageSchema = z
   .object({
     client_submission_id: clientSubmissionIdSchema,
     origin: z.literal("external_root"),
@@ -1060,7 +1059,6 @@ const requestParamSchemas = {
         session_entry_mode: sessionEntryModeSchema,
         initial_model: activeModelRefSchema.optional(),
         model_override: activeModelRefSchema.optional(),
-        client_protocol_version: z.number().int().nonnegative().optional(),
         env_snapshot: z.unknown().optional(),
         env_policy: envDriftPolicySchema.optional(),
       })
@@ -1077,7 +1075,6 @@ const requestParamSchemas = {
         session_entry_mode: sessionEntryModeSchema,
         initial_model: activeModelRefSchema.optional(),
         model_override: activeModelRefSchema.optional(),
-        client_protocol_version: z.number().int().nonnegative().optional(),
         env_snapshot: z.unknown().optional(),
         env_policy: envDriftPolicySchema.optional(),
       })
@@ -1235,7 +1232,7 @@ const requestParamSchemas = {
               })
               .strict()
               .optional(),
-            request: sendUserMessageV2Schema,
+            request: sendUserMessageSchema,
           })
           .strict(),
         z
@@ -1244,7 +1241,7 @@ const requestParamSchemas = {
             session_locator: z.string().min(1),
             expected_model_state_generation: safeU64NumberSchema.optional(),
             expected_model: activeModelRefSchema.optional(),
-            request: sendUserMessageV2Schema,
+            request: sendUserMessageSchema,
           })
           .strict(),
       ]),
@@ -2084,7 +2081,6 @@ export const attachedDataSchema = z
     repair_required: resumeRepairStateSchema.optional(),
     resume_compaction_offer: resumeCompactionOfferSchema.optional(),
     daemon_version: z.string(),
-    compatible: z.boolean(),
     env_baseline: envSnapshotMetaSchema.optional(),
     env_session: envSnapshotMetaSchema.optional(),
     env_drift: envDiffSummarySchema.optional(),

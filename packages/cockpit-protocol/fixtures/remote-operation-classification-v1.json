@@ -3,7 +3,7 @@
     {
       "class": "idempotent_adapter_mutation",
       "evidence": "domain_result_tuple",
-      "fcorCanonicalSchema": "session_id:option<uuid>|since_seq:option<i64>|project_root:option<string>|initial_model:option<struct:ActiveModelRef:v1>|no_sandbox:bool|interactive:bool|model_override:option<struct:ActiveModelRef:v1>|client_protocol_version:u32|env_snapshot:option<struct:EnvSnapshotWire:v1>|env_policy:enum16:EnvDriftPolicy",
+      "fcorCanonicalSchema": "session_id:option<uuid>|since_seq:option<i64>|project_root:option<string>|initial_model:option<struct:ActiveModelRef:v1>|no_sandbox:bool|interactive:bool|model_override:option<struct:ActiveModelRef:v1>|env_snapshot:option<struct:EnvSnapshotWire:v1>|env_policy:enum16:EnvDriftPolicy",
       "fcorRoles": [
         {
           "field": "session_id",
@@ -41,11 +41,6 @@
           "type": "Option<cockpit_config::config::providers::ActiveModelRef>"
         },
         {
-          "field": "client_protocol_version",
-          "role": "param",
-          "type": "u32"
-        },
-        {
           "field": "env_snapshot",
           "role": "param",
           "type": "Option<EnvSnapshotWire>"
@@ -56,7 +51,7 @@
           "type": "EnvDriftPolicy"
         }
       ],
-      "fcorSchema": "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy",
+      "fcorSchema": "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy",
       "strategy": "domain_transaction",
       "tag": "attach"
     },
@@ -93,10 +88,10 @@
         {
           "field": "ingress",
           "role": "opaque_fcm2",
-          "type": "MessageIngressV2"
+          "type": "MessageIngress"
         }
       ],
-      "fcorSchema": "ingress:MessageIngressV2",
+      "fcorSchema": "ingress:MessageIngress",
       "strategy": "sql_transaction",
       "tag": "send_user_message"
     },

@@ -907,7 +907,6 @@ mod tests {
                 model_override: None,
                 no_sandbox: false,
                 interactive: false,
-                client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
                 env_policy: proto::EnvDriftPolicy::Daemon,
             },
@@ -928,7 +927,6 @@ mod tests {
                 "active_agent_path": ["agent"],
                 "history": [],
                 "daemon_version": "test",
-                "compatible": true,
                 "attention": []
             }
         }))

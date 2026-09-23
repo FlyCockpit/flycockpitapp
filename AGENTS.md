@@ -59,7 +59,7 @@ Rules that follow from the graph:
 
 ### Wire protocol (prerelease)
 
-- Live connections require an exact `PROTOCOL_VERSION` match. `MIN_SUPPORTED_PROTOCOL_VERSION` stays equal to `PROTOCOL_VERSION` until a compacted v1 ships. Historical `daemon_proto/vN/` fixtures are migration archaeology and do not expand compatibility.
+- Live connections require an exact `PROTOCOL_VERSION` match. `PROTOCOL_VERSION` is `1` and there is no minimum-supported version or compatibility window (no `MIN_SUPPORTED_*` constant). Change the wire in place and regenerate `crates/cockpit-proto/tests/fixtures/daemon_proto/v1/`; never add another `vN/` fixture directory (`scripts/check-single-daemon-proto-fixture-version.sh` enforces this). Every other internal format/label version is also `1`, pinned in one place by `crates/cockpit-core/src/internal_version_pins.rs`.
 - Handshake fails closed: missing, malformed, or timed-out daemon hello is a protocol error (`cockpit daemon restart`), never a silent fallback to the current version.
 - Rust wire types that cross the Rust/TypeScript boundary (or already have a `packages/cockpit-protocol` mirror) stay in lockstep with that package. A new or renamed mirrored event, request, or response updates both, plus fixtures.
 

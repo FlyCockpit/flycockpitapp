@@ -251,7 +251,7 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
     for required in [
         "struct DaemonPidReceipt",
         "fn read_daemon_pid_record",
-        "cockpit-daemon-pid-v2",
+        "cockpit-daemon-pid-v1",
         "unix-bytes:",
         "windows-utf16le:",
         "struct ProcessStartIdentity",
@@ -299,7 +299,7 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
     for required in [
         "fn read_bound_endpoint_record_from",
         "reclaim_stale_and_reserve(",
-        "DaemonPidRecord::Receipt(receipt)",
+        "let receipt = read_daemon_pid_record(&canonical.pid_file)?;",
         "preserving metadata and refusing numeric signaling",
     ] {
         assert!(

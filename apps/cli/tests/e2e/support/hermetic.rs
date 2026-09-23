@@ -955,19 +955,12 @@ impl HermeticCockpit {
     ))]
     fn capture_current_daemon_generation(&self) -> Result<DaemonGeneration, String> {
         use cockpit_host::daemon_lifecycle::{
-            DaemonPidRecord, VerifiedProcessOutcome, acquire_verified_daemon_process,
-            read_daemon_pid_record,
+            VerifiedProcessOutcome, acquire_verified_daemon_process, read_daemon_pid_record,
         };
 
         let pid_file = self.home.pid_file();
-        let receipt = match read_daemon_pid_record(&pid_file) {
-            Some(DaemonPidRecord::Receipt(receipt)) => receipt,
-            Some(DaemonPidRecord::LegacyNumeric(pid)) => {
-                return Err(format!(
-                    "refusing unverified legacy daemon PID {pid} for hermetic ownership"
-                ));
-            }
-            None => return Err("daemon receipt missing during ownership capture".into()),
+        let Some(receipt) = read_daemon_pid_record(&pid_file) else {
+            return Err("daemon receipt missing during ownership capture".into());
         };
         let process = match acquire_verified_daemon_process(&receipt) {
             VerifiedProcessOutcome::Verified(process) => process,
@@ -977,7 +970,7 @@ impl HermeticCockpit {
                 ));
             }
         };
-        if read_daemon_pid_record(&pid_file) != Some(DaemonPidRecord::Receipt(receipt.clone())) {
+        if read_daemon_pid_record(&pid_file) != Some(receipt.clone()) {
             return Err("daemon receipt changed during verified process acquisition".into());
         }
         if !socket_answers_receipt_hello(&self.socket_path(), &pid_file, &receipt) {
@@ -986,7 +979,7 @@ impl HermeticCockpit {
                 receipt.pid
             ));
         }
-        if read_daemon_pid_record(&pid_file) != Some(DaemonPidRecord::Receipt(receipt.clone())) {
+        if read_daemon_pid_record(&pid_file) != Some(receipt.clone()) {
             return Err("daemon receipt changed during exact hello verification".into());
         }
         Ok(DaemonGeneration { receipt, process })
@@ -1478,7 +1471,7 @@ impl HermeticCockpit {
             windows
         ))]
         {
-            use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record};
+            use cockpit_host::daemon_lifecycle::read_daemon_pid_record;
             let generation = self
                 .daemon_generation
                 .as_ref()
@@ -1486,9 +1479,7 @@ impl HermeticCockpit {
             if generation.receipt.pid != daemon_pid {
                 return Err("cached daemon PID diverged from its generation receipt".into());
             }
-            if read_daemon_pid_record(&self.home.pid_file())
-                != Some(DaemonPidRecord::Receipt(generation.receipt.clone()))
-            {
+            if read_daemon_pid_record(&self.home.pid_file()) != Some(generation.receipt.clone()) {
                 return Err(format!(
                     "current daemon receipt replaced before stop; preserving all metadata for PID {daemon_pid}"
                 ));
@@ -1646,7 +1637,7 @@ pub fn find_close_settings(session: &HermeticCockpit) -> CellPos {
 ))]
 mod generation_tests {
     use super::*;
-    use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record};
+    use cockpit_host::daemon_lifecycle::read_daemon_pid_record;
 
     #[test]
     fn product_restart_refreshes_verified_generation_and_reaps_repeatedly() {
@@ -1718,10 +1709,7 @@ mod generation_tests {
             .try_reap_daemon_with(|| Err("forced stop launch failure".into()))
             .expect_err("stop failure must fail closed");
         assert!(stop_error.contains("forced stop launch failure"));
-        assert_eq!(
-            read_daemon_pid_record(&pid_file),
-            Some(DaemonPidRecord::Receipt(original.clone()))
-        );
+        assert_eq!(read_daemon_pid_record(&pid_file), Some(original.clone()));
         assert!(
             socket.exists(),
             "failed stop must not unlink control metadata"
@@ -1737,10 +1725,7 @@ mod generation_tests {
             })
             .expect_err("nonzero stop result must fail closed");
         assert!(nonzero_error.contains("did not complete successfully"));
-        assert_eq!(
-            read_daemon_pid_record(&pid_file),
-            Some(DaemonPidRecord::Receipt(original.clone()))
-        );
+        assert_eq!(read_daemon_pid_record(&pid_file), Some(original.clone()));
         assert!(
             socket.exists(),
             "nonzero stop must preserve control metadata"

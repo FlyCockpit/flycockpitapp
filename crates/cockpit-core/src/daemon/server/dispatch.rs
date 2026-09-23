@@ -3425,7 +3425,7 @@ pub(super) fn oversized_text_artifact_admission(
     if text.len() <= INLINE_USER_TEXT_BYTES {
         return Ok(None);
     }
-    if text.len() > crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES {
+    if text.len() > crate::proto_crate::send_user_message::MAX_MESSAGE_TEXT_BYTES {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
             message: "message text exceeds the 8 MiB FCM2 limit".to_owned(),
@@ -3458,21 +3458,21 @@ pub(super) fn oversized_text_artifact_admission(
     let (model_config_generation, canonical_model_digest) = match &model_fence {
         None => (
             0,
-            Sha256::digest(b"flycockpit-fcm2-v2-model-digest\0").into(),
+            Sha256::digest(b"flycockpit-fcm2-model-digest-v1\0").into(),
         ),
         Some((generation, model)) => {
             let model_json = serde_json::to_vec(model).map_err(internal)?;
-            let mut digest_input = b"flycockpit-fcm2-v2-model-digest\0".to_vec();
+            let mut digest_input = b"flycockpit-fcm2-model-digest-v1\0".to_vec();
             digest_input.extend_from_slice(&model_json);
             (*generation, Sha256::digest(digest_input).into())
         }
     };
-    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+    let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage {
         session_id,
         canonical_project_digest,
         model_config_generation,
         canonical_model_digest,
-        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+        request: crate::proto_crate::send_user_message::SendUserMessage {
             client_submission_id,
             origin,
             text: text.to_owned(),
@@ -3579,12 +3579,12 @@ pub(super) async fn handle_request(
     result
 }
 
-/// Fingerprint probe for an existing V2 terminal receipt. Must mirror the
+/// Fingerprint probe for an existing terminal message receipt. Must mirror the
 /// `UserSubmission` built in [`handle_send_user_message`] for this ingress:
 /// adapter CAS fields are checked at acceptance time, but the worker queue
 /// seam intentionally clears them so durable replays stay payload-neutral.
-fn v2_terminal_client_submission_probe(
-    request: &crate::proto_crate::send_user_message_v2::SendUserMessageV2,
+fn terminal_client_submission_probe(
+    request: &crate::proto_crate::send_user_message::SendUserMessage,
     origin_principal: Option<String>,
     run_invocation_options: Option<&proto::RunInvocationOptions>,
 ) -> crate::engine::message::UserSubmission {
@@ -3610,8 +3610,8 @@ fn v2_terminal_client_submission_probe(
     }
 }
 
-fn v2_terminal_client_submission_wire_fingerprint(
-    request: &crate::proto_crate::send_user_message_v2::SendUserMessageV2,
+fn terminal_client_submission_wire_fingerprint(
+    request: &crate::proto_crate::send_user_message::SendUserMessage,
     run_invocation_options: Option<&proto::RunInvocationOptions>,
 ) -> String {
     let tag_expansions = request
@@ -3645,11 +3645,11 @@ fn v2_terminal_client_submission_wire_fingerprint(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_send_user_message_v2(
+async fn handle_message_ingress(
     request_id: Uuid,
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
-    ingress: crate::proto_crate::send_user_message_v2::MessageIngressV2,
+    ingress: crate::proto_crate::send_user_message::MessageIngress,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     if ctx.shutdown.is_draining() || crate::daemon::supervisor::worker_handover_active() {
@@ -3663,9 +3663,7 @@ async fn handle_send_user_message_v2(
     // verified remote principal and the transactional remote-operation ledger.
     // That is out of the local CLI/TUI launch scope and stubbed fail-closed.
     let local = match ingress {
-        crate::proto_crate::send_user_message_v2::MessageIngressV2::LocalOwnerDirect(inner) => {
-            inner
-        }
+        crate::proto_crate::send_user_message::MessageIngress::LocalOwnerDirect(inner) => inner,
         _ => {
             return Err(ErrorPayload {
                 code: ErrorCode::BadRequest,
@@ -3802,7 +3800,7 @@ async fn handle_send_user_message_v2(
         .map_err(internal)?
     {
         let stored =
-            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(&stored)
+            crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(&stored)
                 .map_err(internal)?;
         if stored.session_id != session_id || stored.request != request {
             return Err(ErrorPayload {
@@ -3815,17 +3813,17 @@ async fn handle_send_user_message_v2(
         let (model_config_generation, canonical_model_digest) = match authoritative_model.as_ref() {
             None => (
                 0,
-                Sha256::digest(b"flycockpit-fcm2-v2-model-digest\0").into(),
+                Sha256::digest(b"flycockpit-fcm2-model-digest-v1\0").into(),
             ),
             Some(model) => {
                 let model_json = serde_json::to_vec(&model.selection).map_err(internal)?;
-                let mut digest_input = b"flycockpit-fcm2-v2-model-digest\0".to_vec();
+                let mut digest_input = b"flycockpit-fcm2-model-digest-v1\0".to_vec();
                 digest_input.extend_from_slice(&model_json);
                 (model.generation, Sha256::digest(digest_input).into())
             }
         };
         (
-            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+            crate::proto_crate::send_user_message::CanonicalSendUserMessage {
                 session_id,
                 canonical_project_digest: project_digest_bytes,
                 model_config_generation,
@@ -3888,12 +3886,12 @@ async fn handle_send_user_message_v2(
         // A terminal worker has already drained the queue item. The durable
         // operation receipt loaded above is the surviving exact payload
         // binding, and its decoded request was compared field-for-field.
-        let probe = v2_terminal_client_submission_probe(
+        let probe = terminal_client_submission_probe(
             &request,
             origin_principal,
             validated.run_invocation_options.as_ref(),
         );
-        let wire_fingerprint = v2_terminal_client_submission_wire_fingerprint(
+        let wire_fingerprint = terminal_client_submission_wire_fingerprint(
             &request,
             validated.run_invocation_options.as_ref(),
         );
@@ -4198,7 +4196,7 @@ struct LocalMessageAttachmentAcceptanceJoin {
     session_id: Uuid,
     project_digest: String,
     client_submission_id: Uuid,
-    attachments: Vec<crate::proto_crate::send_user_message_v2::MessageAttachmentIdentity>,
+    attachments: Vec<crate::proto_crate::send_user_message::MessageAttachmentIdentity>,
     attachment_capabilities: Vec<cockpit_config::config::providers::CapabilityStatus>,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
@@ -4360,7 +4358,7 @@ fn user_message_wire_fingerprint_bytes(
         }
     }
     let mut hasher = Sha256::new();
-    part(&mut hasher, b"user-v2");
+    part(&mut hasher, b"user-v1");
     part(
         &mut hasher,
         match origin {
@@ -4426,14 +4424,14 @@ async fn handle_send_user_message(
     // artifact threshold. Check it before any receipt, run-invocation, media,
     // or remote-operation side effect so an image-backed/direct request cannot
     // bypass the 8 MiB source or display-text limit.
-    if text.len() > crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES {
+    if text.len() > crate::proto_crate::send_user_message::MAX_MESSAGE_TEXT_BYTES {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
             message: "message text exceeds the 8 MiB FCM2 limit".to_owned(),
         });
     }
     if display_text.as_ref().is_some_and(|value| {
-        value.len() > crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES
+        value.len() > crate::proto_crate::send_user_message::MAX_MESSAGE_TEXT_BYTES
     }) {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
@@ -4824,7 +4822,7 @@ pub(super) async fn resolve_bulk_user_message_payload(
                                    minimum_length: u64| {
         reference.mime_class == RemoteBulkMimeClass::Opaque
             && (minimum_length
-                ..=crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64)
+                ..=crate::proto_crate::send_user_message::MAX_MESSAGE_TEXT_BYTES as u64)
                 .contains(&reference.total_length_value())
     };
     let source_minimum_length = if display_transfer.is_some() {
@@ -4905,13 +4903,11 @@ pub(super) async fn resolve_bulk_user_message_payload(
                 .map_err(internal)?
                 .ok_or_else(unavailable_bulk_user_message_transfer)?;
             let canonical =
-                crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
-                    &canonical,
-                )
-                .map_err(|_| ErrorPayload {
-                    code: ErrorCode::BadRequest,
-                    message: "durable bulk user-message replay is malformed".to_owned(),
-                })?;
+                crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(&canonical)
+                    .map_err(|_| ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: "durable bulk user-message replay is malformed".to_owned(),
+                    })?;
             let source = canonical.request.text;
             let canonical_display_text = canonical.request.display_text;
             let source_digest: [u8; 32] = Sha256::digest(source.as_bytes()).into();
@@ -7093,7 +7089,6 @@ async fn handle_serialized_request_impl(
                             options.interactive,
                             Some(proto::SessionEntryMode::Code),
                             options.model_override,
-                            options.client_protocol_version,
                             options.env_snapshot,
                             options.env_policy,
                             &principal,
@@ -7167,7 +7162,6 @@ async fn handle_serialized_request_impl(
                 options.interactive,
                 Some(proto::SessionEntryMode::Code),
                 options.model_override,
-                options.client_protocol_version,
                 options.env_snapshot,
                 options.env_policy,
                 &principal,
@@ -7274,7 +7268,6 @@ async fn handle_serialized_request_impl(
                             options.interactive,
                             Some(proto::SessionEntryMode::Code),
                             options.model_override,
-                            options.client_protocol_version,
                             options.env_snapshot,
                             options.env_policy,
                             &principal,
@@ -7350,7 +7343,6 @@ async fn handle_serialized_request_impl(
                 options.interactive,
                 Some(proto::SessionEntryMode::Code),
                 options.model_override,
-                options.client_protocol_version,
                 options.env_snapshot,
                 options.env_policy,
                 &principal,
@@ -7849,7 +7841,6 @@ async fn handle_serialized_request_impl(
             interactive,
             session_entry_mode,
             model_override,
-            client_protocol_version,
             env_snapshot,
             env_policy,
         } => {
@@ -7866,7 +7857,6 @@ async fn handle_serialized_request_impl(
                 interactive,
                 Some(session_entry_mode.into()),
                 model_override,
-                client_protocol_version,
                 env_snapshot,
                 env_policy,
                 &principal,
@@ -7944,8 +7934,8 @@ async fn handle_serialized_request_impl(
             })
         }
 
-        Request::SendUserMessageV2 { ingress } => {
-            Box::pin(handle_send_user_message_v2(
+        Request::SendUserMessage { ingress } => {
+            Box::pin(handle_message_ingress(
                 request_id,
                 state,
                 ctx,
@@ -11836,7 +11826,7 @@ async fn handle_serialized_request_impl(
                     .map_err(internal)?,
             );
             let request_hash = ctx.secret_vault.keyed_request_identity(
-                b"flycockpit.agent-mutation.request.v2",
+                b"flycockpit.agent-mutation.update-request.v1",
                 request_material.as_slice(),
             );
             let fencing_generation = match begin_local_operation(
@@ -16345,7 +16335,7 @@ async fn handle_serialized_request_impl(
             // `request_hash`; the wire receipt is bound by the caller nonce and
             // exact flow while owner binding is enforced by the receipt row.
             let receipt_request_hash = local_operation_request_hash(&(
-                "complete_provider_oauth_receipt_v2",
+                "complete_provider_oauth_receipt_v1",
                 &client_operation_id,
                 &flow_id,
             ))?;
@@ -17515,7 +17505,7 @@ async fn handle_serialized_request_impl(
                 &("complete_mcp_oauth", &flow_id, &input),
             )?;
             let receipt_request_hash = local_operation_request_hash(&(
-                "complete_mcp_oauth_receipt_v2",
+                "complete_mcp_oauth_receipt_v1",
                 &client_operation_id,
                 &flow_id,
             ))?;
@@ -22204,7 +22194,7 @@ fn assistant_mutation_request_identity(
         .map_err(internal)?,
     );
     Ok(ctx.secret_vault.keyed_request_identity(
-        b"flycockpit.assistant-mutation.request.v2",
+        b"flycockpit.assistant-mutation.request.v1",
         encoded.as_slice(),
     ))
 }
@@ -30076,7 +30066,6 @@ async fn code_root_read_from_attached_response(
         // attach response that issued it.
         resume_compaction_offer: _,
         daemon_version,
-        compatible,
         env_baseline,
         env_session,
         env_drift,
@@ -30128,7 +30117,6 @@ async fn code_root_read_from_attached_response(
         paused_work,
         repair_required,
         daemon_version,
-        compatible,
         env_baseline,
         env_session,
         env_drift,
@@ -30218,7 +30206,6 @@ async fn code_root_read_snapshot(
         paused_work,
         repair_required: handle.repair_required().map(Box::new),
         daemon_version: proto::DAEMON_VERSION.to_string(),
-        compatible: true,
         env_baseline: None,
         env_session: None,
         env_drift: None,
@@ -30281,7 +30268,6 @@ pub(super) async fn attach(
     interactive: bool,
     requested_session_entry_mode: Option<proto::SessionEntryMode>,
     model_override: Option<crate::config::providers::ActiveModelRef>,
-    client_protocol_version: u32,
     env_snapshot: Option<EnvSnapshotWire>,
     env_policy: EnvDriftPolicy,
     principal: &ClientPrincipal,
@@ -30825,7 +30811,6 @@ pub(super) async fn attach(
         // one-shot interactive authority by replaying this response.
         resume_compaction_offer: None,
         daemon_version: proto::DAEMON_VERSION.to_string(),
-        compatible: proto::is_protocol_compatible(client_protocol_version),
         env_baseline: Some(env_baseline_meta),
         env_session: Some(env_session_meta),
         env_drift: env_drift.map(Box::new),

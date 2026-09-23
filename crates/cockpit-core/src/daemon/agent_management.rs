@@ -132,7 +132,7 @@ fn load_editor_completion_sync(
         .map_err(internal)?,
     );
     let identity = vault.keyed_identity(
-        b"flycockpit.agent-editor.completion.v2",
+        b"flycockpit.agent-editor.completion.v1",
         identity_plaintext.as_slice(),
     );
     if row.completion_identity != Some(identity) {
@@ -2150,7 +2150,7 @@ async fn complete_editor_lease_inner(
         .map_err(internal)?,
     );
     let completion_identity = ctx.secret_vault.keyed_identity(
-        b"flycockpit.agent-editor.completion.v2",
+        b"flycockpit.agent-editor.completion.v1",
         completion_plaintext.as_slice(),
     );
     if known_lease.state == "open" {

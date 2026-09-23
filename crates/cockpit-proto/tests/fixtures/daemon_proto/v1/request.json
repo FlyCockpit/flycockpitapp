@@ -92,7 +92,6 @@
   },
   "attach": {
     "params": {
-      "client_protocol_version": 7,
       "env_policy": "update-daemon",
       "env_snapshot": {
         "digest": "digest-fixture",
@@ -2308,7 +2307,6 @@
       "options": {
         "no_sandbox": false,
         "interactive": true,
-        "client_protocol_version": 21,
         "env_policy": "daemon"
       }
     }
@@ -2323,7 +2321,6 @@
       "options": {
         "no_sandbox": false,
         "interactive": true,
-        "client_protocol_version": 21,
         "env_policy": "daemon"
       }
     }
@@ -2339,7 +2336,6 @@
         "options": {
           "no_sandbox": false,
           "interactive": true,
-          "client_protocol_version": 21,
           "env_policy": "daemon"
         }
       },
@@ -2370,7 +2366,6 @@
         "options": {
           "no_sandbox": false,
           "interactive": true,
-          "client_protocol_version": 21,
           "env_policy": "daemon"
         }
       },

@@ -475,19 +475,19 @@ impl Peer {
             .collect();
         for (session_id, client) in attachments {
             loop {
-                let event = self.handle.block_on(async {
-                    tokio::time::timeout(Duration::from_millis(0), client.next_event()).await
-                });
-                let event = match event {
-                    Ok(Some(event)) => event,
+                // Poll without a timer: a zero-duration `timeout` only
+                // elapses once the runtime's time driver advances, which a
+                // `Handle::block_on` caller cannot guarantee.
+                let event = match client.try_next_event() {
+                    std::task::Poll::Ready(Some(event)) => event,
                     // A closed attachment stream is a daemon-terminal path,
                     // not an idle poll. It must settle this root's deferred
                     // prompt and issued permission request(s).
-                    Ok(None) => {
+                    std::task::Poll::Ready(None) => {
                         self.terminate_session(&session_id)?;
                         break;
                     }
-                    Err(_) => break,
+                    std::task::Poll::Pending => break,
                 };
                 match event {
                     cockpit_proto::Event::AgentIdle {

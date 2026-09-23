@@ -2576,10 +2576,7 @@ pub fn debug_fixture_daemon_service(
         workspace.is_dir(),
         "debug fixture workspace is not a directory"
     );
-    let state = daemon_paths
-        .pid_file
-        .parent()
-        .context("daemon pid file has no state directory")?;
+    let agents_dir = daemon_paths.owned_agents_dir(&db)?;
     let providers = ProvidersConfig {
         providers: fixture
             .providers
@@ -2610,7 +2607,7 @@ pub fn debug_fixture_daemon_service(
     };
     Ok(Some(AgentInstallationService::new(
         db,
-        state.join("agents"),
+        agents_dir,
         Arc::new(DebugFixtureFetcher {
             source: FetchedAgentSource {
                 commit_sha: fixture.commit_sha,
@@ -5023,13 +5020,10 @@ pub fn default_daemon_service_with_captured_workspace_roots(
     providers: ProvidersConfig,
     authorized_workspace_roots: Vec<AuthorizedWorkspaceRoot>,
 ) -> Result<AgentInstallationService> {
-    let state = daemon_paths
-        .pid_file
-        .parent()
-        .context("daemon pid file has no state directory")?;
+    let agents_dir = daemon_paths.owned_agents_dir(&db)?;
     Ok(AgentInstallationService::new(
         db,
-        state.join("agents"),
+        agents_dir,
         Arc::new(GithubHttpsAgentFetcher::new(secret_vault)?),
         Arc::new(LocalDaemonWorkspaceAuthorizer::from_captured_roots(
             authorized_workspace_roots,

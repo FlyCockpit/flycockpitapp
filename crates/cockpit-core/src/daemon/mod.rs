@@ -481,6 +481,30 @@ impl DaemonPaths {
         self
     }
 
+    /// The single derivation of the directory holding daemon-owned agent
+    /// package copies (installed and authored `agents/*.md`).
+    ///
+    /// Owned copies are durable, ledger-bound content: installation rows in
+    /// the database refer to them, so they live beside the database file the
+    /// daemon serves (`$XDG_DATA_HOME/cockpit/agents` for the canonical
+    /// ledger). They must never follow the pid file, which since the fixed
+    /// rendezvous directory (#473) sits under `$XDG_RUNTIME_DIR` or a per-user
+    /// temp root and is wiped at logout/reboot. Only an in-memory ledger (no
+    /// backing file) falls back to this daemon instance's private state
+    /// directory.
+    pub fn owned_agents_dir(&self, db: &crate::db::Db) -> Result<PathBuf> {
+        let root = match db.path() {
+            Some(database) => database
+                .parent()
+                .context("daemon database path has no parent directory")?,
+            None => self
+                .pid_file
+                .parent()
+                .context("daemon pid file has no state directory")?,
+        };
+        Ok(root.join("agents"))
+    }
+
     #[cfg(test)]
     fn resolve_canonical_in(state_home: &Path, runtime_dir: Option<&Path>) -> Result<Self> {
         let state = state_home.join("cockpit");
@@ -3895,6 +3919,30 @@ mod tests {
         CleanupReport, DaemonTestHarness, TEST_OWNER_ENV, TestDaemonManifest,
         TestDaemonManifestEntry, cleanup_manifest, write_manifest,
     };
+
+    #[test]
+    fn owned_agents_dir_is_ledger_adjacent_not_runtime_pid_dir() {
+        let data = tempfile::tempdir().expect("ledger dir");
+        let runtime = tempfile::tempdir().expect("runtime rendezvous dir");
+        let paths = DaemonPaths {
+            pid_file: runtime.path().join("daemon.pid"),
+            socket: runtime.path().join("cockpit.sock"),
+            ephemeral: false,
+        };
+        let db = crate::db::Db::open(&data.path().join("cockpit.db")).expect("file ledger");
+        assert_eq!(
+            paths.owned_agents_dir(&db).expect("durable agents dir"),
+            data.path().join("agents"),
+            "owned agent copies must survive runtime-dir teardown beside the ledger"
+        );
+        let memory = crate::db::Db::open_in_memory().expect("in-memory ledger");
+        assert_eq!(
+            paths
+                .owned_agents_dir(&memory)
+                .expect("instance agents dir"),
+            runtime.path().join("agents")
+        );
+    }
 
     #[tokio::test]
     async fn maintenance_timeout_preserves_interrupt_park_fence() {

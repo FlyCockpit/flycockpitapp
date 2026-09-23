@@ -11,9 +11,11 @@ const CHOOSE_DEFAULT: &str = "[Choose default model]";
 const DEFAULT_MODEL_ROW: &str = "Default model for new sessions";
 // #476 deleted the fullscreen `/model` overlay: `[Choose default model]` now
 // closes settings (`DefaultModelPage` Enter -> `Nav::Close`) and
-// `App::open_default_model_from_settings` opens the composer Model pill picker,
-// announcing the mode with this transcript line.
-const DEFAULT_MODEL_PICKER_MARKER: &str = "Choose the default model for new sessions";
+// `App::open_default_model_from_settings` opens the composer Model pill picker.
+// Its transcript announcement sits beneath the picker popup (occluded), so the
+// observable hand-off is the Model picker's own hint row
+// (`ComposerControlKind::Model` in `composer_controls.rs`).
+const DEFAULT_MODEL_PICKER_MARKER: &str = "enter choose · ctrl+enter default";
 // Mirrors `cockpit_tui::tui::theme::HOVER_BG` (= `BUTTON_HOVER_BG`, #464's
 // single hover rule) and its 256-color fallback `theme::HOVER_BG_INDEX`.
 const HOVER_BG_RGB: (u8, u8, u8) = (0x2C, 0x38, 0x46);
@@ -83,29 +85,42 @@ fn hover_cells(screen: &ScreenSnapshot) -> Vec<(u16, u16)> {
         .collect()
 }
 
+/// #464 made `ROW_SELECTION_BG` the same token as `HOVER_BG` (one hover
+/// rule), so the keyboard-selected list row is painted with the hover
+/// background independent of the pointer. Exactness is therefore judged
+/// against the pre-motion `baseline`: the motion must add hover paint to
+/// exactly the button span and nowhere else.
 fn wait_for_hover_on_span(
     session: &mut HermeticCockpit,
+    baseline: &[(u16, u16)],
     start: CellPos,
     end: CellPos,
     label: &str,
 ) {
+    let in_span = |row: u16, col: u16| row == start.row && col >= start.col && col <= end.col;
+    assert!(
+        !baseline.iter().any(|(row, col)| in_span(*row, *col)),
+        "{label}: span hovered before pointer motion; baseline={baseline:?}"
+    );
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut delay = Duration::from_millis(2);
     loop {
         let snapshot = session.snapshot();
         let hovers = hover_cells(&snapshot);
-        let covers = (start.col..=end.col)
-            .all(|col| hovers.iter().any(|(row, c)| *row == start.row && *c == col));
-        let only = hovers
+        let added: Vec<_> = hovers
             .iter()
-            .all(|(row, col)| *row == start.row && *col >= start.col && *col <= end.col);
+            .filter(|cell| !baseline.contains(cell))
+            .copied()
+            .collect();
+        let covers = (start.col..=end.col).all(|col| added.contains(&(start.row, col)));
+        let only = added.iter().all(|(row, col)| in_span(*row, *col));
         if covers && only {
             return;
         }
         if Instant::now() >= deadline {
             panic!(
-                "timed out waiting for exact hover ({label}); span=({},{}-{}) hover={:?}",
-                start.row, start.col, end.col, hovers
+                "timed out waiting for exact hover ({label}); span=({},{}-{}) added={added:?} baseline={baseline:?}",
+                start.row, start.col, end.col
             );
         }
         std::thread::sleep(delay);
@@ -149,8 +164,15 @@ fn tui_pty_settings_button_hover_is_exact() {
         .snapshot()
         .find_text_span(CLOSE_SETTINGS)
         .expect("observed [Close settings]");
+    let baseline = hover_cells(&session.snapshot());
     specified_motion(&mut session, close_start, "hover close settings");
-    wait_for_hover_on_span(&mut session, close_start, close_end, "close settings");
+    wait_for_hover_on_span(
+        &mut session,
+        &baseline,
+        close_start,
+        close_end,
+        "close settings",
+    );
     let after_close = session.snapshot();
     for pos in adjacent_cells(&after_close, close_start, close_end) {
         let cell = after_close
@@ -159,7 +181,7 @@ fn tui_pty_settings_button_hover_is_exact() {
             .find(|cell| cell.row == pos.row && cell.col == pos.col)
             .expect("adjacent cell");
         assert!(
-            !cell_hover(cell),
+            !cell_hover(cell) || baseline.contains(&(pos.row, pos.col)),
             "adjacent cell hovered at ({},{})",
             pos.row,
             pos.col
@@ -171,9 +193,11 @@ fn tui_pty_settings_button_hover_is_exact() {
         .snapshot()
         .find_text_span(CHOOSE_DEFAULT)
         .expect("observed [Choose default model]");
+    let baseline = hover_cells(&session.snapshot());
     specified_motion(&mut session, choose_start, "hover choose default");
     wait_for_hover_on_span(
         &mut session,
+        &baseline,
         choose_start,
         choose_end,
         "choose default model",
@@ -186,7 +210,7 @@ fn tui_pty_settings_button_hover_is_exact() {
             .find(|cell| cell.row == pos.row && cell.col == pos.col)
             .expect("adjacent cell");
         assert!(
-            !cell_hover(cell),
+            !cell_hover(cell) || baseline.contains(&(pos.row, pos.col)),
             "adjacent cell hovered at ({},{})",
             pos.row,
             pos.col

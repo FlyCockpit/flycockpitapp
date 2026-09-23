@@ -1659,16 +1659,41 @@ mod generation_tests {
             .receipt
             .clone();
 
-        let output = session.restart_daemon();
-        assert_success("receipt-bound restart", &output, session.home());
-        let replacement = session
-            .daemon_generation
-            .as_ref()
-            .expect("replacement generation")
-            .receipt
-            .clone();
-        assert_ne!(initial, replacement, "restart must replace the receipt");
-        assert_eq!(session.daemon_pid(), Some(replacement.pid));
+        // Since #482 the PID receipt names the stable supervisor, which owns
+        // the endpoint across `daemon restart`; restart only rolls the worker.
+        // The verified generation is therefore the supervisor receipt plus the
+        // worker generation reported by `daemon status --json`.
+        let mut generation = session.daemon_status_json()["generation"]
+            .as_u64()
+            .expect("initial worker generation");
+        for round in 0..2 {
+            let output = session.restart_daemon();
+            assert_success("receipt-bound restart", &output, session.home());
+            let current = session
+                .daemon_generation
+                .as_ref()
+                .expect("supervisor generation after restart");
+            assert_eq!(
+                initial, current.receipt,
+                "restart {round} must retain the stable supervisor receipt"
+            );
+            assert!(
+                !current
+                    .process
+                    .has_exited()
+                    .expect("observe stable supervisor after restart"),
+                "restart {round} must not exit the stable supervisor"
+            );
+            assert_eq!(session.daemon_pid(), Some(initial.pid));
+            let next = session.daemon_status_json()["generation"]
+                .as_u64()
+                .expect("worker generation after restart");
+            assert!(
+                next > generation,
+                "restart {round} must advance the worker generation ({generation} -> {next})"
+            );
+            generation = next;
+        }
 
         session.reap();
         session.reap();

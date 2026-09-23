@@ -1038,6 +1038,24 @@ impl DaemonClient {
         events.recv().await
     }
 
+    /// Non-blocking event poll for synchronous drain loops.
+    ///
+    /// `Ready(Some(event))` yields a queued event, `Ready(None)` reports the
+    /// terminal close of the event stream, and `Pending` means nothing is
+    /// queued right now (or another reader currently owns the stream). Unlike
+    /// a zero-duration `tokio::time::timeout` around [`Self::next_event`],
+    /// this never depends on a runtime timer driver making progress.
+    pub fn try_next_event(&self) -> std::task::Poll<Option<proto::Event>> {
+        let Ok(mut events) = self.events.try_lock() else {
+            return std::task::Poll::Pending;
+        };
+        match events.try_recv() {
+            Ok(event) => std::task::Poll::Ready(Some(event)),
+            Err(mpsc::error::TryRecvError::Disconnected) => std::task::Poll::Ready(None),
+            Err(mpsc::error::TryRecvError::Empty) => std::task::Poll::Pending,
+        }
+    }
+
     pub fn is_socket_backed(&self) -> bool {
         #[cfg(any(unix, windows))]
         {

@@ -362,11 +362,13 @@ impl IsolatedHome {
         self.socket_path().with_file_name("daemon.pid")
     }
 
-    /// Global authored-agent packages staged by the daemon during onboarding apply.
+    /// Daemon-owned agent packages (installed and authored). They are durable
+    /// ledger-bound content and live beside the database, never beside the
+    /// runtime-dir pid file.
     pub fn daemon_agents_dir(&self) -> PathBuf {
-        self.pid_file()
+        self.db_path()
             .parent()
-            .expect("daemon pid file parent")
+            .expect("daemon database parent")
             .join("agents")
     }
 

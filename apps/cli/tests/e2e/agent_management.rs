@@ -486,11 +486,7 @@ async fn agent_cli_management_socket_invalid_manifest_is_typed_and_has_zero_muta
         "invalid source must create neither installation nor operation"
     );
     assert!(
-        !daemon
-            .home()
-            .xdg_state_home()
-            .join("cockpit/agents/helper.md")
-            .exists(),
+        !daemon.home().daemon_agents_dir().join("helper.md").exists(),
         "invalid source must not create an owned file"
     );
 }
@@ -1009,10 +1005,7 @@ async fn agent_cli_management_socket_update_targets_exact_installation_and_never
     assert!(after_update.contains(&"c".repeat(40)));
     assert_ne!(after_update, before);
 
-    let owned_copy = daemon
-        .home()
-        .xdg_state_home()
-        .join("cockpit/agents/helper.md");
+    let owned_copy = daemon.home().daemon_agents_dir().join("helper.md");
     let dirty_copy = format!(
         "{}\nLocally edited prompt body.\n",
         second_fixture["markdown"]

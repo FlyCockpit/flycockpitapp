@@ -12,6 +12,7 @@ use crate::tui::settings::{
     OAuthBeginResult, OAuthFlowRequest, OAuthFlowState, OAuthPresentationResult, OAuthProvider,
 };
 use crate::tui::textfield::TextField;
+use cockpit_config::providers::AuthKind;
 use cockpit_core::providers::ProviderTemplate;
 
 pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -90,10 +91,7 @@ pub(crate) struct AuthScreen {
 
 impl AuthScreen {
     pub(crate) fn new(template: &'static ProviderTemplate) -> Self {
-        let uses_oauth = matches!(
-            template.auth,
-            cockpit_config::config::providers::AuthKind::OAuth
-        );
+        let uses_oauth = matches!(template.auth, AuthKind::OAuth);
         let oauth = uses_oauth.then(|| {
             OAuthFlowState::new(if template.id == "codex-oauth" {
                 OAuthProvider::Codex

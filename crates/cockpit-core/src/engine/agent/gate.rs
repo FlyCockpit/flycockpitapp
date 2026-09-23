@@ -1069,6 +1069,7 @@ mod safety_gate_tests {
                 recheck_result: true,
             }),
             verification: None,
+            call_session_id: None,
         };
 
         reset_safety_gate_evaluate_calls();
@@ -1567,6 +1568,7 @@ mod safety_gate_tests {
                 recheck_result: true,
             }),
             verification: None,
+            call_session_id: None,
         };
 
         let outcome = crate::engine::interrupt::with_interrupt_park_payload(payload, async {
@@ -1601,6 +1603,7 @@ mod safety_gate_tests {
                 },
                 gate: None,
                 verification: None,
+                call_session_id: None,
             };
             let first_ctx = ctx.clone_for_dispatch();
             let first_tx = tx.clone();

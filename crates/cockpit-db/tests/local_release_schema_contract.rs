@@ -776,6 +776,13 @@ fn semantic_transition_guard_tables(sql: &str) -> BTreeSet<String> {
             if !header.contains(" UPDATE ") && !header.contains("UPDATE ON ") {
                 return None;
             }
+            // A transition guard aborts an illegal edge. An effect trigger
+            // that reacts to a legal transition (for example closing a parked
+            // call's intent when its park settles) never raises and guards
+            // nothing, however it reads the old and new state.
+            if !body.contains("RAISE(") {
+                return None;
+            }
             let field = ["state", "phase"].into_iter().find(|field| {
                 let old = format!("OLD.{field}");
                 let new = format!("NEW.{field}");

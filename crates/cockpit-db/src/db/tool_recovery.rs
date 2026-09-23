@@ -10,8 +10,162 @@ use uuid::Uuid;
 use super::{Db, WriterGenerationFenced};
 use crate::db::wire::{InterruptOption, InterruptQuestion};
 
+/// A write-ahead intent whose call is parked on a live durable interrupt is
+/// owned by that park, not by crash recovery.
+///
+/// A tool that raises a durable interrupt inside its call (for example a host
+/// path approval) parks the call's replay payload on the `needs_attention`
+/// row. While that row is `open` or `parked` the effect is still gated behind
+/// the interrupt, and the park's rehydration re-raises it and replays the
+/// call once on approval. While it is `executing` the park owns the ambiguous
+/// outcome and reconciles it to `interrupted` without re-executing. Queuing a
+/// second, rerun/skip/inspect decision for the same call would double-own it:
+/// it gates the session's turns on a question the park already answers, and
+/// its generation claim rule would refuse the park's own replay.
+///
+/// Interrupt rows are raised under the hub's owned session, while the call's
+/// intent is opened under the session its tool ran in — a fork task or loop
+/// session of that owner. The park records that exact session
+/// (`needs_attention.parked_call_session_id`; NULL means the park's own
+/// session), and `(call session, call id)` is the intent's unique key, so a
+/// park owns exactly one intent. Provider call ids are not unique across a
+/// fork lineage (index-style ids such as `call_0` recur in every session), so
+/// ownership never matches a call id across sessions. The schema trigger
+/// `needs_attention_parked_call_settled` closes that same intent when the
+/// park settles terminally.
+///
+/// `intent` is the SQL alias (or table name) of the `tool_execution_intents`
+/// row being tested.
+fn park_owned_intent_sql(intent: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM needs_attention park
+                  WHERE park.parked_call_id = {intent}.call_id
+                    AND {call_session} = {intent}.session_id
+                    AND park.recovery_intent_id IS NULL
+                    AND park.state IN ('open', 'parked', 'executing'))",
+        call_session = PARK_CALL_SESSION_SQL,
+    )
+}
+
+/// The session a park's call (and so its write-ahead intent) ran in, for a
+/// `needs_attention` row aliased `park`.
+const PARK_CALL_SESSION_SQL: &str = "COALESCE(park.parked_call_session_id, park.session_id)";
+
 /// A user decision, never a claim that the interrupted effect was undone.
 pub const SKIPPED_TOOL_RECOVERY_BODY: &str = "Skipped by the user after a crash. This command may have partially run; its effects are unknown. Do not rerun it without explicit user authorization.";
+
+/// Queue the one durable user decision for an ambiguous host effect inside
+/// the caller's write. The intent id is also the interrupt id, so a retry or
+/// a second queuing path (boot reconciliation and a park that settled around
+/// a dispatched replay) converges on the same row.
+pub(crate) fn queue_tool_recovery_decision_conn(
+    conn: &Connection,
+    intent: &ToolExecutionIntent,
+) -> Result<Uuid> {
+    ensure!(
+        intent.idempotency == ToolIdempotency::NotIdempotent,
+        "only non-idempotent tool intents require a user decision"
+    );
+    let interrupt_id = intent.intent_id;
+    let question = InterruptQuestion::Single {
+        prompt: "This command may have partially run: rerun / skip / inspect".to_string(),
+        options: vec![
+            InterruptOption {
+                id: "rerun".to_string(),
+                label: "Rerun".to_string(),
+                description: Some(
+                    "Run the command again despite the ambiguous prior effect.".to_string(),
+                ),
+                secondary: false,
+            },
+            InterruptOption {
+                id: "skip".to_string(),
+                label: "Skip".to_string(),
+                description: Some(
+                    "Treat the interrupted command as complete without rerunning it.".to_string(),
+                ),
+                secondary: false,
+            },
+            InterruptOption {
+                id: "inspect".to_string(),
+                label: "Inspect".to_string(),
+                description: Some(
+                    "Inspect the session before choosing whether to rerun.".to_string(),
+                ),
+                secondary: true,
+            },
+        ],
+        allow_freetext: false,
+        command_detail: None,
+        permission: true,
+        approval_class: None,
+        sandbox_escalation: None,
+    };
+    let question_json = serde_json::to_string(&question)?;
+    conn.execute(
+        "INSERT INTO needs_attention
+         (interrupt_id, session_id, recovery_intent_id, agent_id, description,
+          state, question_json, raised_at)
+        VALUES (?1, ?2, ?3, 'recovery', ?4, 'open', ?5, ?6)
+         ON CONFLICT(recovery_intent_id) DO UPDATE SET
+            state='open', resolved_at=NULL, response_json=NULL
+          WHERE needs_attention.state IN ('executing', 'interrupted', 'resolved')",
+        params![
+            interrupt_id.to_string(),
+            intent.session_id.to_string(),
+            interrupt_id.to_string(),
+            format!("Recovery decision for `{}`", intent.tool),
+            question_json,
+            Utc::now().timestamp(),
+        ],
+    )
+    .context("queuing tool recovery decision")?;
+    Ok(interrupt_id)
+}
+
+/// A parked call whose park just settled `executing -> interrupted` after its
+/// claimed replay reached dispatch keeps its write-ahead intent (see the
+/// schema trigger `needs_attention_parked_call_settled`): the replayed effect
+/// may have partially run. Once no live park owns that intent it is an
+/// ordinary crash-interrupted call, so a non-idempotent one gets its
+/// rerun/skip/inspect decision in the same transaction instead of waiting
+/// for the next boot's reconciliation. Idempotent intents stay open for the
+/// session driver's replay, exactly like boot reconciliation leaves them.
+pub(crate) fn queue_recovery_for_interrupted_park_conn(
+    conn: &Connection,
+    interrupt_id: Uuid,
+) -> Result<()> {
+    let intent = conn
+        .query_row(
+            &format!(
+                "SELECT intent.intent_id, intent.session_id, intent.marker, intent.call_id,
+                        intent.tool, intent.args_hash, intent.args_json, intent.generation,
+                        intent.idempotency, intent.idempotency_key
+                   FROM needs_attention park
+                   JOIN tool_execution_intents intent
+                     ON intent.session_id = {call_session}
+                    AND intent.call_id = park.parked_call_id
+                  WHERE park.interrupt_id = ?1
+                    AND park.state = 'interrupted'
+                    AND park.recovery_intent_id IS NULL
+                    AND NOT {owned}",
+                call_session = PARK_CALL_SESSION_SQL,
+                owned = park_owned_intent_sql("intent"),
+            ),
+            [interrupt_id.to_string()],
+            decode_intent,
+        )
+        .optional()
+        .context("reading the intent an interrupted park left open")?
+        .map(ToolExecutionIntent::try_from)
+        .transpose()?;
+    if let Some(intent) = intent
+        && intent.idempotency == ToolIdempotency::NotIdempotent
+    {
+        queue_tool_recovery_decision_conn(conn, &intent)?;
+    }
+    Ok(())
+}
 
 pub(crate) fn advance_writer_generation(conn: &Connection, generation: u64) -> Result<()> {
     ensure!(
@@ -40,6 +194,22 @@ pub(crate) fn advance_writer_generation(conn: &Connection, generation: u64) -> R
         current: u64::try_from(current).context("negative durable writer generation")?,
     }
     .into())
+}
+
+/// The durable fence, or 0 before any supervised writer has advanced it.
+pub(crate) fn durable_writer_generation(conn: &Connection) -> Result<u64> {
+    if !super::table_exists(conn, "worker_generation_fence")? {
+        return Ok(0);
+    }
+    let current: Option<i64> = conn
+        .query_row(
+            "SELECT generation FROM worker_generation_fence WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("reading durable worker generation fence")?;
+    u64::try_from(current.unwrap_or(0)).context("negative durable writer generation")
 }
 
 pub(crate) fn verify_writer_generation(conn: &Connection, attempted: u64) -> Result<()> {
@@ -189,8 +359,35 @@ impl Db {
                     && intent.idempotency_key == input.idempotency_key,
                 "tool call id was reused with different recovery proof"
             );
+            // A parked replay may claim a non-idempotent intent from an
+            // earlier generation: the park's durable `executing` claim (taken
+            // before this dispatch) is the proof that exactly this generation
+            // owns the one replayed effect. The claim records the generation
+            // that took it, so any other generation — a stale predecessor
+            // still finishing, or a later one that has not re-claimed — is
+            // refused.
+            let park_replay_claimed: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM needs_attention park
+                                         WHERE {call_session} = ?1
+                                           AND park.parked_call_id = ?2
+                                           AND park.recovery_intent_id IS NULL
+                                           AND park.state = 'executing'
+                                           AND park.parked_claim_generation = ?3)",
+                        call_session = PARK_CALL_SESSION_SQL,
+                    ),
+                    params![
+                        input.session_id.to_string(),
+                        &input.call_id,
+                        i64::try_from(input.generation)
+                            .context("tool intent generation overflow")?,
+                    ],
+                    |row| row.get(0),
+                )
+                .context("reading parked replay claim for tool intent")?;
             if intent.generation < input.generation
-                && intent.idempotency != ToolIdempotency::NotIdempotent
+                && (intent.idempotency != ToolIdempotency::NotIdempotent || park_replay_claimed)
             {
                 let changed = conn.execute(
                     "UPDATE tool_execution_intents SET generation=?3
@@ -216,12 +413,14 @@ impl Db {
 
     pub async fn list_open_tool_execution_intents(&self) -> Result<Vec<ToolExecutionIntent>> {
         self.read(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare(&format!(
                 "SELECT intent_id, session_id, marker, call_id, tool, args_hash, args_json,
                         generation, idempotency, idempotency_key
                    FROM tool_execution_intents
+                  WHERE NOT {}
                   ORDER BY session_id, marker, intent_id",
-            )?;
+                park_owned_intent_sql("tool_execution_intents"),
+            ))?;
             let rows = statement.query_map([], decode_intent)?;
             rows.map(|row| row?.try_into()).collect()
         })
@@ -233,8 +432,10 @@ impl Db {
         conn: &Connection,
         session_id: Uuid,
     ) -> Result<std::collections::HashSet<String>> {
-        let mut statement =
-            conn.prepare("SELECT call_id FROM tool_execution_intents WHERE session_id=?1")?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT call_id FROM tool_execution_intents WHERE session_id=?1 AND NOT {}",
+            park_owned_intent_sql("tool_execution_intents"),
+        ))?;
         let rows = statement.query_map([session_id.to_string()], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
@@ -251,71 +452,9 @@ impl Db {
     /// Queue the one durable user decision for an ambiguous host effect. The
     /// intent id is also the interrupt id, making retries naturally idempotent.
     pub async fn queue_tool_recovery_decision(&self, intent: &ToolExecutionIntent) -> Result<Uuid> {
-        ensure!(
-            intent.idempotency == ToolIdempotency::NotIdempotent,
-            "only non-idempotent tool intents require a user decision"
-        );
-        let interrupt_id = intent.intent_id;
-        let question = InterruptQuestion::Single {
-            prompt: "This command may have partially run: rerun / skip / inspect".to_string(),
-            options: vec![
-                InterruptOption {
-                    id: "rerun".to_string(),
-                    label: "Rerun".to_string(),
-                    description: Some(
-                        "Run the command again despite the ambiguous prior effect.".to_string(),
-                    ),
-                    secondary: false,
-                },
-                InterruptOption {
-                    id: "skip".to_string(),
-                    label: "Skip".to_string(),
-                    description: Some(
-                        "Treat the interrupted command as complete without rerunning it."
-                            .to_string(),
-                    ),
-                    secondary: false,
-                },
-                InterruptOption {
-                    id: "inspect".to_string(),
-                    label: "Inspect".to_string(),
-                    description: Some(
-                        "Inspect the session before choosing whether to rerun.".to_string(),
-                    ),
-                    secondary: true,
-                },
-            ],
-            allow_freetext: false,
-            command_detail: None,
-            permission: true,
-            approval_class: None,
-            sandbox_escalation: None,
-        };
-        let question_json = serde_json::to_string(&question)?;
-        let session_id = intent.session_id;
-        let tool = intent.tool.clone();
-        self.write(move |conn| {
-            conn.execute(
-                "INSERT INTO needs_attention
-                 (interrupt_id, session_id, recovery_intent_id, agent_id, description,
-                  state, question_json, raised_at)
-                VALUES (?1, ?2, ?3, 'recovery', ?4, 'open', ?5, ?6)
-                 ON CONFLICT(recovery_intent_id) DO UPDATE SET
-                    state='open', resolved_at=NULL, response_json=NULL
-                  WHERE needs_attention.state IN ('executing', 'interrupted', 'resolved')",
-                params![
-                    interrupt_id.to_string(),
-                    session_id.to_string(),
-                    interrupt_id.to_string(),
-                    format!("Recovery decision for `{tool}`"),
-                    question_json,
-                    Utc::now().timestamp(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await?;
-        Ok(interrupt_id)
+        let intent = intent.clone();
+        self.write(move |conn| queue_tool_recovery_decision_conn(conn, &intent))
+            .await
     }
 
     /// Apply a recovery answer at the durable intent/interrupt authority.
@@ -1405,6 +1544,456 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn parked_call_intent_is_owned_by_its_park_until_the_park_settles() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = session(&db).await;
+        let call_id = "parked-call";
+        db.begin_tool_execution_intent(begin(session_id, call_id, ToolIdempotency::NotIdempotent))
+            .await
+            .unwrap();
+        // An unrelated ambiguous intent stays with crash recovery.
+        let unparked = db
+            .begin_tool_execution_intent(begin(
+                session_id,
+                "unparked-call",
+                ToolIdempotency::NotIdempotent,
+            ))
+            .await
+            .unwrap();
+        let interrupt_id = Uuid::new_v4();
+        let park_state = |state: &'static str, claim_generation: Option<i64>| {
+            let interrupt_id = interrupt_id.to_string();
+            move |conn: &Connection| -> Result<()> {
+                conn.execute(
+                    "UPDATE needs_attention
+                        SET state=?2,
+                            response_json=CASE WHEN ?2='executing' THEN '{}' END,
+                            parked_claim_generation=?3
+                      WHERE interrupt_id=?1",
+                    params![interrupt_id, state, claim_generation],
+                )?;
+                Ok(())
+            }
+        };
+        {
+            let interrupt_id = interrupt_id.to_string();
+            db.write(move |conn| {
+                conn.execute(
+                    "INSERT INTO needs_attention
+                     (interrupt_id, session_id, agent_id, description, state, raised_at,
+                      parked_tool, parked_args_json, parked_call_id, parked_resume_json)
+                     VALUES (?1, ?2, 'pilot', 'host path approval', 'open', 1,
+                             'fake_side_effect', '{\"value\":1}', ?3, '{}')",
+                    params![interrupt_id, session_id.to_string(), call_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        // Crash recovery neither classifies nor pairs the parked call.
+        assert_eq!(
+            db.list_open_tool_execution_intents().await.unwrap(),
+            vec![unparked.clone()]
+        );
+        let pairing = db
+            .read(move |conn| Db::open_tool_execution_call_ids_conn(conn, session_id))
+            .await
+            .unwrap();
+        assert_eq!(pairing, HashSet::from(["unparked-call".to_string()]));
+
+        // A successor generation cannot claim the ambiguous intent before the
+        // park's durable executing claim...
+        db.write(park_state("parked", None)).await.unwrap();
+        let mut successor = begin(session_id, call_id, ToolIdempotency::NotIdempotent);
+        successor.generation = 2;
+        let error = db
+            .begin_tool_execution_intent(successor.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("different worker generation"),
+            "{error:#}"
+        );
+        // ...nor through an executing claim another generation took: the
+        // claim authorizes only the generation that recorded it...
+        db.write(park_state("executing", Some(3))).await.unwrap();
+        let error = db
+            .begin_tool_execution_intent(successor.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("different worker generation"),
+            "a foreign-generation claim must be refused: {error:#}"
+        );
+        assert_eq!(
+            db.tool_execution_intent_for_call(session_id, call_id.to_string())
+                .await
+                .unwrap()
+                .expect("refused claim leaves the intent")
+                .generation,
+            1
+        );
+        // ...and the parked replay claims it once its own claim is durable.
+        db.write(park_state("executing", Some(2))).await.unwrap();
+        let claimed = db.begin_tool_execution_intent(successor).await.unwrap();
+        assert_eq!(claimed.generation, 2);
+        assert_eq!(
+            db.list_open_tool_execution_intents().await.unwrap().len(),
+            1
+        );
+
+        // The claimed replay reached dispatch (it adopted the intent), so the
+        // park's crash reconciliation must not erase it: the effect may have
+        // partially run. The intent stays, no park owns it any more, and it
+        // surfaces as the one ambiguous crash-recovery decision atomically.
+        assert!(db.mark_interrupt_interrupted(interrupt_id).await.unwrap());
+        let kept = db
+            .tool_execution_intent_for_call(session_id, call_id.to_string())
+            .await
+            .unwrap()
+            .expect("a dispatched replay keeps its intent");
+        assert_eq!(kept.generation, 2);
+        let open = db.list_open_tool_execution_intents().await.unwrap();
+        assert_eq!(open.len(), 2);
+        assert!(open.contains(&kept) && open.contains(&unparked));
+        assert_eq!(
+            db.sessions_with_pending_tool_recovery().await.unwrap(),
+            vec![session_id]
+        );
+        let decision_state: String = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT state FROM needs_attention WHERE recovery_intent_id=?1",
+                    [kept.intent_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(decision_state, "open");
+    }
+
+    /// A claimed replay that never reached dispatch (its intent still belongs
+    /// to the predecessor generation) has no ambiguous effect: settling the
+    /// park `executing -> interrupted` closes the intent and queues nothing.
+    #[tokio::test]
+    async fn interrupted_park_whose_replay_never_dispatched_closes_the_intent() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = session(&db).await;
+        db.begin_tool_execution_intent(begin(
+            session_id,
+            "undispatched",
+            ToolIdempotency::NotIdempotent,
+        ))
+        .await
+        .unwrap();
+        let interrupt_id =
+            insert_parked_call_interrupt(&db, session_id, None, "undispatched", "parked").await;
+        {
+            let interrupt_id = interrupt_id.to_string();
+            db.write(move |conn| {
+                conn.execute(
+                    "UPDATE needs_attention
+                        SET state='executing', response_json='{}', parked_claim_generation=2
+                      WHERE interrupt_id=?1",
+                    [interrupt_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        assert!(db.mark_interrupt_interrupted(interrupt_id).await.unwrap());
+        assert!(
+            db.tool_execution_intent_for_call(session_id, "undispatched".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.sessions_with_pending_tool_recovery()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Raise a parked tool-call interrupt under `session_id` (the hub's owned
+    /// session) for a call that ran in `call_session` (`None`: the same
+    /// session).
+    async fn insert_parked_call_interrupt(
+        db: &Db,
+        session_id: Uuid,
+        call_session: Option<Uuid>,
+        call_id: &str,
+        state: &'static str,
+    ) -> Uuid {
+        let interrupt_id = Uuid::new_v4();
+        let (id, session, call, call_session) = (
+            interrupt_id.to_string(),
+            session_id.to_string(),
+            call_id.to_string(),
+            call_session.map(|session| session.to_string()),
+        );
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO needs_attention
+                 (interrupt_id, session_id, agent_id, description, state, raised_at,
+                  parked_tool, parked_args_json, parked_call_id, parked_resume_json,
+                  parked_call_session_id)
+                 VALUES (?1, ?2, 'pilot', 'host path approval', ?4, 1,
+                         'fake_side_effect', '{\"value\":1}', ?3, '{}', ?5)",
+                params![id, session, call, state, call_session],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        interrupt_id
+    }
+
+    /// The executing claim taken through the production API records the
+    /// claiming writer's generation, and only that generation adopts the
+    /// parked call's intent from its predecessor.
+    #[tokio::test]
+    async fn parked_replay_claim_records_the_claiming_writer_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("cockpit.db");
+        let (session_id, interrupt_id) = {
+            let predecessor = Db::open_supervised_worker_for_test(&path, 1).unwrap();
+            let session_id = session(&predecessor).await;
+            predecessor
+                .begin_tool_execution_intent(begin(
+                    session_id,
+                    "gated",
+                    ToolIdempotency::NotIdempotent,
+                ))
+                .await
+                .unwrap();
+            let interrupt_id =
+                insert_parked_call_interrupt(&predecessor, session_id, None, "gated", "open").await;
+            assert!(predecessor.park_interrupt(interrupt_id).await.unwrap());
+            (session_id, interrupt_id)
+        };
+        let successor = Db::open_supervised_worker_for_test(&path, 2).unwrap();
+        assert_eq!(successor.writer_generation(), 2);
+        assert!(
+            successor
+                .begin_parked_interrupt_execution(
+                    interrupt_id,
+                    &crate::db::wire::ResolveResponse::Cancel,
+                )
+                .await
+                .unwrap()
+        );
+        let claim: Option<i64> = successor
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT parked_claim_generation FROM needs_attention WHERE interrupt_id=?1",
+                    [interrupt_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(claim, Some(2));
+        let mut replay = begin(session_id, "gated", ToolIdempotency::NotIdempotent);
+        replay.generation = 2;
+        assert_eq!(
+            successor
+                .begin_tool_execution_intent(replay)
+                .await
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    /// Every terminal settlement of a parked call closes its intent, not only
+    /// `interrupted`, including an intent a fork task opened under a park
+    /// raised on the owner's hub; a live waiter's `open -> resolved` answer leaves its running
+    /// tool's intent alone.
+    #[tokio::test]
+    async fn parked_call_intent_closes_on_every_terminal_park_settlement() {
+        let db = Db::open_in_memory().unwrap();
+        let owner = session(&db).await;
+        let fork = db.create_fork(owner, None).await.unwrap().session_id;
+        let intent_open = |session_id: Uuid, call_id: &'static str| {
+            let db = db.clone();
+            async move {
+                db.tool_execution_intent_for_call(session_id, call_id.to_string())
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        };
+
+        // A fork task's call parked on the owner's hub is owned by the park.
+        db.begin_tool_execution_intent(begin(fork, "fork-call", ToolIdempotency::NotIdempotent))
+            .await
+            .unwrap();
+        let fork_park =
+            insert_parked_call_interrupt(&db, owner, Some(fork), "fork-call", "open").await;
+        assert!(db.park_interrupt(fork_park).await.unwrap());
+        assert!(
+            db.list_open_tool_execution_intents()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the owner's park owns the fork call's intent"
+        );
+        // The denied replay settles the park without a tool result.
+        assert!(
+            db.begin_parked_interrupt_execution(
+                fork_park,
+                &crate::db::wire::ResolveResponse::Cancel,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(db.complete_executing_interrupt(fork_park).await.unwrap());
+        assert!(
+            !intent_open(fork, "fork-call").await,
+            "executing -> resolved must close the parked call's intent"
+        );
+
+        // A live waiter answered `open -> resolved` keeps its running tool's
+        // intent, which the tool closes with its own result.
+        db.begin_tool_execution_intent(begin(owner, "live-call", ToolIdempotency::NotIdempotent))
+            .await
+            .unwrap();
+        let live = insert_parked_call_interrupt(&db, owner, None, "live-call", "open").await;
+        db.resolve_interrupt(live, &crate::db::wire::ResolveResponse::Cancel)
+            .await
+            .unwrap();
+        assert!(intent_open(owner, "live-call").await);
+
+        // A replay that parked again on a later prompt keeps the intent for
+        // the new park when the first park's row settles.
+        db.begin_tool_execution_intent(begin(owner, "reparked", ToolIdempotency::NotIdempotent))
+            .await
+            .unwrap();
+        let first = insert_parked_call_interrupt(&db, owner, None, "reparked", "parked").await;
+        assert!(
+            db.begin_parked_interrupt_execution(first, &crate::db::wire::ResolveResponse::Cancel)
+                .await
+                .unwrap()
+        );
+        let second = insert_parked_call_interrupt(&db, owner, None, "reparked", "open").await;
+        assert!(db.complete_executing_interrupt(first).await.unwrap());
+        assert!(intent_open(owner, "reparked").await);
+        assert!(db.mark_interrupt_interrupted(second).await.unwrap());
+        assert!(!intent_open(owner, "reparked").await);
+    }
+
+    /// Provider call ids recur across a fork lineage (`call_0` in every
+    /// session). A park owns only the intent of the exact session its call ran
+    /// in: it neither hides, nor authorizes a claim of, nor deletes another
+    /// session's intent that shares the call id.
+    #[tokio::test]
+    async fn park_ownership_is_exact_across_fork_call_id_collisions() {
+        let db = Db::open_in_memory().unwrap();
+        let owner = session(&db).await;
+        let fork = db.create_fork(owner, None).await.unwrap().session_id;
+        let owner_intent = db
+            .begin_tool_execution_intent(begin(owner, "call_0", ToolIdempotency::NotIdempotent))
+            .await
+            .unwrap();
+        let fork_intent = db
+            .begin_tool_execution_intent(begin(fork, "call_0", ToolIdempotency::NotIdempotent))
+            .await
+            .unwrap();
+
+        // The owner's own call parks on the owner's hub: only the owner's
+        // intent is park-owned; the fork's same-id intent stays with crash
+        // recovery and in the fork's recovery pairing.
+        let owner_park = insert_parked_call_interrupt(&db, owner, None, "call_0", "parked").await;
+        assert_eq!(
+            db.list_open_tool_execution_intents().await.unwrap(),
+            vec![fork_intent.clone()]
+        );
+        let fork_pairing = db
+            .read(move |conn| Db::open_tool_execution_call_ids_conn(conn, fork))
+            .await
+            .unwrap();
+        assert_eq!(fork_pairing, HashSet::from(["call_0".to_string()]));
+
+        // The owner park's executing claim authorizes only the owner's call:
+        // a fork replay of its own `call_0` at the claiming generation is
+        // still refused.
+        {
+            let owner_park = owner_park.to_string();
+            db.write(move |conn| {
+                conn.execute(
+                    "UPDATE needs_attention
+                        SET state='executing', response_json='{}', parked_claim_generation=2
+                      WHERE interrupt_id=?1",
+                    [owner_park],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        let mut fork_replay = begin(fork, "call_0", ToolIdempotency::NotIdempotent);
+        fork_replay.generation = 2;
+        let error = db
+            .begin_tool_execution_intent(fork_replay)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("different worker generation"),
+            "{error:#}"
+        );
+
+        // Settling the owner's park closes the owner's intent only.
+        assert!(db.complete_executing_interrupt(owner_park).await.unwrap());
+        assert!(
+            db.tool_execution_intent_for_call(owner, "call_0".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.tool_execution_intent_for_call(fork, "call_0".to_string())
+                .await
+                .unwrap(),
+            Some(fork_intent.clone())
+        );
+
+        // Conversely, a park of the fork's call raised on the owner's hub
+        // owns and settles the fork's intent, never a fresh owner `call_0`.
+        let owner_again = db
+            .begin_tool_execution_intent(begin(owner, "call_0", ToolIdempotency::NotIdempotent))
+            .await
+            .unwrap();
+        assert_ne!(owner_again.intent_id, owner_intent.intent_id);
+        let fork_park =
+            insert_parked_call_interrupt(&db, owner, Some(fork), "call_0", "open").await;
+        assert_eq!(
+            db.list_open_tool_execution_intents().await.unwrap(),
+            vec![owner_again.clone()]
+        );
+        assert!(db.mark_interrupt_interrupted(fork_park).await.unwrap());
+        assert!(
+            db.tool_execution_intent_for_call(fork, "call_0".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.tool_execution_intent_for_call(owner, "call_0".to_string())
+                .await
+                .unwrap(),
+            Some(owner_again)
+        );
     }
 
     #[tokio::test]

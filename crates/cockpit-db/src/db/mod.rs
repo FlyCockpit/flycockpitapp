@@ -686,6 +686,17 @@ impl SupervisorDatabaseOwner {
         })
     }
 
+    /// Read the durable worker generation fence (0 before any supervised
+    /// worker has opened the canonical database).
+    ///
+    /// Every worker generation must be allocated strictly above this value: a
+    /// restarted supervisor that reused a previous run's generation would be
+    /// fenced by that run's durable row. The owner witness excludes any other
+    /// supervisor that could allocate generations concurrently.
+    pub fn durable_worker_generation(&self) -> Result<u64> {
+        read_durable_writer_generation(&Db::default_path()?)
+    }
+
     #[cfg(unix)]
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
         self.lock.raw_fd()
@@ -704,6 +715,18 @@ impl SupervisorDatabaseOwner {
             lock: unsafe { files::DatabaseOwnerLock::from_raw_fd(fd) },
         }
     }
+}
+
+/// Read-only fence probe: never creates, migrates, or writes the database.
+fn read_durable_writer_generation(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening existing SQLite read-only at {}", path.display()))?;
+    apply_connection_pragmas(&conn, false)
+        .with_context(|| format!("setting pragmas on {}", path.display()))?;
+    tool_recovery::durable_writer_generation(&conn).map_err(annotate_database_storage_failure)
 }
 
 /// Shared side of the history-scope revocation fence.
@@ -834,6 +857,17 @@ impl std::fmt::Debug for Db {
         f.debug_struct("Db")
             .field("path", &self.path)
             .finish_non_exhaustive()
+    }
+}
+
+impl Db {
+    /// Worker generation this handle writes as: the supervised writer fence
+    /// generation, or 0 for an unsupervised database (which matches the 0
+    /// generation an unsupervised worker stamps on its tool intents).
+    pub fn writer_generation(&self) -> u64 {
+        self.supervised_fence
+            .as_ref()
+            .map_or(0, |fence| fence.generation)
     }
 }
 
@@ -2806,6 +2840,32 @@ mod tests {
         drop(worker);
         drop(owner);
         Db::open_default().expect("ordinary daemon ownership resumes after supervisor exit");
+    }
+
+    #[test]
+    fn durable_writer_generation_bounds_the_next_supervised_generation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("cockpit.db");
+        assert_eq!(read_durable_writer_generation(&path).unwrap(), 0);
+        assert!(
+            !path.exists(),
+            "the fence probe must not create the database"
+        );
+        drop(Db::open(&path).unwrap());
+        assert_eq!(read_durable_writer_generation(&path).unwrap(), 0);
+
+        drop(Db::open_supervised_worker_for_test(&path, 1).unwrap());
+        assert_eq!(read_durable_writer_generation(&path).unwrap(), 1);
+        // A restarted supervisor that reused the previous run's generation
+        // is fenced by that run's durable row; the strict fence is correct.
+        let error = Db::open_supervised_worker_for_test(&path, 1)
+            .expect_err("a reused generation must stay fenced");
+        let fenced = error
+            .downcast_ref::<WriterGenerationFenced>()
+            .expect("typed writer fence error");
+        assert_eq!((fenced.attempted, fenced.current), (1, 1));
+        drop(Db::open_supervised_worker_for_test(&path, 2).unwrap());
+        assert_eq!(read_durable_writer_generation(&path).unwrap(), 2);
     }
 
     #[tokio::test]

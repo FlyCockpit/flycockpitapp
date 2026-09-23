@@ -205,7 +205,9 @@ fn obscured_authority_findings(source: &str) -> Vec<String> {
                 "cockpit_core::daemon::OwnedDaemonGuard",
                 "cockpit_client::DaemonClient",
                 "cockpit_config::extended::ExtendedConfigDoc",
+                "cockpit_config::config::extended::ExtendedConfigDoc",
                 "cockpit_config::providers::ConfigDoc",
+                "cockpit_config::config::providers::ConfigDoc",
                 "cockpit_config::dirs::scaffold_config_dir",
             ];
             let paths = flattened_use_paths(&item.tree);

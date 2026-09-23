@@ -421,6 +421,15 @@ fn complete_real_first_run_lifetime(app: &mut App, persistent_background_agents:
     );
 }
 
+/// #428 gates Welcome input on the landed fly-in, and the pump never ticks
+/// the animation; land it the way the tick would.
+fn land_welcome(app: &mut App) {
+    app.onboarding_shell
+        .as_mut()
+        .expect("welcome shell")
+        .set_frame_for_golden(crate::tui::onboarding::WELCOME_ANIMATION_FRAMES);
+}
+
 /// Drive the real first run from the bootstrap fetch to the searchable
 /// provider catalog: Welcome key → real locked advance → the profile stage
 /// (its wizard save is admitted by the locked bootstrap's one scoped config
@@ -434,6 +443,7 @@ fn advance_real_first_run_to_provider(app: &mut App) {
         "the locked bootstrap snapshot to open the Welcome shell",
     );
 
+    land_welcome(app);
     shell_key(app, KeyCode::Char(' '));
     pump_onboarding(
         app,
@@ -744,6 +754,7 @@ fn real_daemon_profile_continue_advances_to_secure_store_and_persists_name() {
                 },
                 "the locked bootstrap snapshot to open Welcome",
             );
+            land_welcome(&mut app);
             shell_key(&mut app, KeyCode::Enter);
             pump_onboarding(
                 &mut app,

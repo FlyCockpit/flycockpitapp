@@ -38,7 +38,9 @@ fn tui_pty_fixture_launches_and_reaps() {
             Duration::from_secs(5),
             |screen| {
                 !screen.has_unwrapped_text(COMPOSER_PLACEHOLDER)
-                    && screen.contains("Message FlyCockpit")
+                    // #480 idle placeholder: the narrow composer shows only
+                    // its leading chunk, so match a stable prefix.
+                    && screen.contains("Ask anything,")
                     && screen.has_box_top_width(40)
             },
         )

@@ -602,6 +602,7 @@ mod tests {
             },
             gate: None,
             verification: None,
+            call_session_id: None,
         };
         let mut raised = ctx.interrupts.subscribe_raised();
         let task_ctx = ctx.clone_for_dispatch();
@@ -1452,6 +1453,7 @@ mod tests {
                 },
                 gate: None,
                 verification: None,
+                call_session_id: None,
             };
             let mut raised = ctx.interrupts.subscribe_raised();
             let task_ctx = ctx.clone_for_dispatch();

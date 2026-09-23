@@ -3387,8 +3387,8 @@ impl DaemonContext {
             config_source.clone(),
             coverage_authority.clone(),
         );
-        if let Some(state) = paths.pid_file.parent() {
-            registry.set_daemon_agents_dir(state.join("agents"));
+        if let Ok(agents_dir) = paths.owned_agents_dir(&db) {
+            registry.set_daemon_agents_dir(agents_dir);
         }
         let redaction_key_resolver: Option<
             Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,

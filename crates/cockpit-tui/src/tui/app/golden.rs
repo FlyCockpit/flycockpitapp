@@ -32,11 +32,11 @@ fn golden_model_config() -> cockpit_config::config::providers::ProvidersConfig {
         "openai".to_string(),
         cockpit_config::config::providers::ProviderEntry {
             models: vec![
-                cockpit_config::config::providers::ModelEntry {
+                ModelEntry {
                     id: "gpt-5.2-codex".to_string(),
                     ..Default::default()
                 },
-                cockpit_config::config::providers::ModelEntry {
+                ModelEntry {
                     id: "gpt-5.2".to_string(),
                     ..Default::default()
                 },

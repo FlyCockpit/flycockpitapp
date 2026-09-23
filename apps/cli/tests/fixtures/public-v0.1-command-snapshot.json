@@ -25,6 +25,7 @@
     "skill",
     "trust",
     "update",
+    "self-update",
     "export",
     "import",
     "stats",

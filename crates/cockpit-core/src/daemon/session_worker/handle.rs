@@ -1814,6 +1814,7 @@ impl SessionWorkerHandle {
                 | SessionWork::Cancel { .. }
                 | SessionWork::CancelAll
                 | SessionWork::Shutdown { .. }
+                | SessionWork::HandoverPark { .. }
         );
         // Reserve capacity before taking the publication read fence. Holding
         // that fence while a full queue drains would indefinitely postpone a
@@ -2145,6 +2146,24 @@ impl SessionWorkerHandle {
             self.live.processing(),
             self.live.tool_running(),
         )
+    }
+
+    /// Whether this worker's only live activity is a turn blocked on durable
+    /// interrupt waiters (approval / question): no schedule is running and
+    /// every in-flight tool call is accounted for by a registered waiter.
+    /// Such a turn has not dispatched the gated effect, so the resumable
+    /// shutdown park is a safe handover boundary for it. Conservative by
+    /// construction: any tool running beside the waiters (including a
+    /// delegate whose nested call is the one waiting) keeps it `false`.
+    pub(crate) fn blocked_only_on_durable_interrupts(&self) -> bool {
+        let waiters = self.park_commit.registered_waiters();
+        waiters > 0
+            && !self.live.has_active_schedules()
+            && self
+                .live
+                .tool_running
+                .load(std::sync::atomic::Ordering::Relaxed)
+                <= waiters
     }
 
     pub fn tool_surface_override_json(&self) -> Option<String> {
@@ -2823,6 +2842,77 @@ pub enum SessionWork {
     Shutdown {
         pause_for_resume: bool,
     },
+    /// Worker handover `T_hard` for a turn the registry observed blocked on
+    /// durable interrupt waiters. The worker makes the authoritative
+    /// park-versus-cancel decision when it processes this item: interrupt
+    /// resolutions are serialized through this same loop, so the decision is
+    /// atomic with respect to an answer arriving between the registry's
+    /// snapshot and delivery. If the turn is then still blocked only on
+    /// unresolved registered waiters it parks through the resumable
+    /// `Shutdown { pause_for_resume: true }` drain; otherwise it is cancelled
+    /// exactly as `Cancel { origin: Handover }`. While parking, the drain keeps
+    /// honoring `hard_interrupt` so the registry can still force the turn to a
+    /// boundary before `T_hard` if a tool it could not observe keeps running.
+    HandoverPark {
+        hard_interrupt: HandoverHardInterrupt,
+        respond_to: oneshot::Sender<HandoverParkDisposition>,
+    },
+}
+
+/// The worker's answer to [`SessionWork::HandoverPark`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoverParkDisposition {
+    /// The turn was blocked only on unresolved durable interrupt waiters and
+    /// is being parked; its park-commit terminal reports the outcome.
+    Parking,
+    /// The turn was doing live work at decision time and was cancelled
+    /// through the `Cancel { origin: Handover }` path.
+    Cancelled,
+}
+
+/// Registry-to-worker fallback for a handover park that has not committed in
+/// time: requesting it makes the parking worker's drain cancel the turn and
+/// session work exactly as the `Cancel { origin: Handover }` path, and the
+/// worker records whether it actually applied (the driver was still running).
+#[derive(Debug, Clone, Default)]
+pub struct HandoverHardInterrupt {
+    inner: Arc<HandoverHardInterruptInner>,
+}
+
+#[derive(Debug, Default)]
+struct HandoverHardInterruptInner {
+    requested: tokio_util::sync::CancellationToken,
+    applied: AtomicBool,
+}
+
+impl HandoverHardInterrupt {
+    /// Ask the parking worker to hard-interrupt its turn.
+    pub fn request(&self) {
+        self.inner.requested.cancel();
+    }
+
+    pub(crate) fn requested(&self) -> bool {
+        self.inner.requested.is_cancelled()
+    }
+
+    pub(crate) async fn wait_requested(&self) {
+        self.inner.requested.cancelled().await;
+    }
+
+    /// Worker side: claim the one application of the hard interrupt.
+    pub(crate) fn claim_application(&self) -> bool {
+        !self
+            .inner
+            .applied
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Whether the worker cancelled a still-running turn for this request.
+    pub fn applied(&self) -> bool {
+        self.inner
+            .applied
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

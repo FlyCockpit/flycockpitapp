@@ -557,6 +557,8 @@ fn startup_guidance_backfill_discards_stale_session_or_model() {
 #[tokio::test]
 async fn startup_background_tasks_are_explicitly_started_after_construction() {
     let tmp = tempfile::tempdir().unwrap();
+    let home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    home.set_var("COCKPIT_UPDATES", "off");
     let mut app = App::new(Some(tmp.path()), false);
     assert!(!app.startup_background.started);
     assert_eq!(app.async_actions.pending_count(), 0);
@@ -629,6 +631,9 @@ async fn stale_clipboard_reconciliation_completion_is_ui_inert() {
 
 #[test]
 fn blocked_export_recovery_cannot_block_first_draw_or_input_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    home.set_var("COCKPIT_UPDATES", "off");
     let mut app = App::new(None, false);
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();

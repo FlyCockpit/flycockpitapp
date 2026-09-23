@@ -335,11 +335,6 @@ fn tui_button_inventory_is_complete() {
             .any(|item| item.surface == "model_setup_choice")
     );
     assert!(inventory.iter().any(|item| item.surface == "setup_wizard"));
-    assert!(
-        inventory
-            .iter()
-            .any(|item| item.surface == "first_run_complete")
-    );
     assert!(inventory.iter().any(|item| item.surface == "question"));
     assert!(inventory.iter().any(|item| item.surface == "context_menu"));
     assert!(
@@ -648,6 +643,9 @@ fn classify_highlight_role(rel: &str, line: &str) -> String {
     }
     if rel.contains("oauth_flow.rs") && line.contains("UNDERLINED") {
         return "oauth wizard noninteractive emphasis".into();
+    }
+    if rel == "onboarding/auth.rs" && line.contains("UNDERLINED") {
+        return "onboarding auth URL noninteractive emphasis".into();
     }
     if rel.contains("rules_overlay.rs") && line.contains("REVERSED") {
         return "rules overlay REVERSED row → row selection".into();

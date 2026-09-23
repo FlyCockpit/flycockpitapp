@@ -102,18 +102,21 @@ fn mouse_confirm_runner_subagent_trust(session: &mut HermeticCockpit) {
         })
         .expect("runner identity advance reaches model grants");
 
+    // #486: grants advance to trust only while an enabled route is unset;
+    // either way the nested editor then shows the subagent Optimizations
+    // step ("Tune the subagent") before tool tiers.
     click_text(session, "[ Continue ]");
     session
         .wait_until_screen(
-            "runner model trust or tools",
+            "runner model trust or optimizations",
             TRANSITION_TIMEOUT,
             |screen| {
                 screen.contains("How much does this subagent see?")
-                    || screen.contains("Subagent tools")
+                    || screen.contains("Tune the subagent")
             },
         )
         .expect(
-            "runner grants advance reaches trust or skips its pre-confirmed safe route to tools",
+            "runner grants advance reaches trust or skips its pre-confirmed safe route to optimizations",
         );
     if session
         .snapshot()
@@ -123,11 +126,18 @@ fn mouse_confirm_runner_subagent_trust(session: &mut HermeticCockpit) {
         click_text_twice(session, &trust_row);
         click_text(session, "[ Continue ]");
         session
-            .wait_until_screen("runner tool tiers", TRANSITION_TIMEOUT, |screen| {
-                screen.contains("Subagent tools")
+            .wait_until_screen("runner optimizations", TRANSITION_TIMEOUT, |screen| {
+                screen.contains("Tune the subagent")
             })
-            .expect("runner trust advance reaches tools");
+            .expect("runner trust advance reaches optimizations");
     }
+
+    click_text(session, "[ Continue ]");
+    session
+        .wait_until_screen("runner tool tiers", TRANSITION_TIMEOUT, |screen| {
+            screen.contains("Subagent tools")
+        })
+        .expect("runner optimizations advance reaches tools");
 
     click_text(session, "[ Continue ]");
     session

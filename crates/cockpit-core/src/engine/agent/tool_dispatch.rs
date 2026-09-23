@@ -1234,6 +1234,7 @@ async fn execute_ordinary_call_unscoped(
         },
         gate: replay_gate_memo,
         verification: None,
+        call_session_id: Some(env.session.live_id()),
     };
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
@@ -1575,6 +1576,7 @@ async fn execute_ordinary_call_unscoped(
             },
             gate: gate_memo,
             verification: None,
+            call_session_id: Some(env.session.live_id()),
         };
         // Pre-tool hook gate: runs after name/argument/path repair and after
         // existing loop/safety/review/btw decisions permit dispatch, but

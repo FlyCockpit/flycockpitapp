@@ -272,6 +272,7 @@ mod parked_call_tests {
             },
             gate: None,
             verification: None,
+            call_session_id: None,
         };
 
         assert!(
@@ -304,6 +305,7 @@ mod parked_call_tests {
             },
             gate: None,
             verification: None,
+            call_session_id: None,
         };
         let encoded = serde_json::to_string(&payload).unwrap();
         let restored: InterruptParkPayload = serde_json::from_str(&encoded).unwrap();
@@ -355,6 +357,7 @@ mod parked_call_tests {
             },
             gate: None,
             verification: None,
+            call_session_id: None,
         };
         let mut history = Vec::new();
         ensure_or_restore_parked_tool_call(&mut history, &payload).unwrap();

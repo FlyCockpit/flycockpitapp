@@ -481,6 +481,30 @@ impl DaemonPaths {
         self
     }
 
+    /// The single derivation of the directory holding daemon-owned agent
+    /// package copies (installed and authored `agents/*.md`).
+    ///
+    /// Owned copies are durable, ledger-bound content: installation rows in
+    /// the database refer to them, so they live beside the database file the
+    /// daemon serves (`$XDG_DATA_HOME/cockpit/agents` for the canonical
+    /// ledger). They must never follow the pid file, which since the fixed
+    /// rendezvous directory (#473) sits under `$XDG_RUNTIME_DIR` or a per-user
+    /// temp root and is wiped at logout/reboot. Only an in-memory ledger (no
+    /// backing file) falls back to this daemon instance's private state
+    /// directory.
+    pub fn owned_agents_dir(&self, db: &crate::db::Db) -> Result<PathBuf> {
+        let root = match db.path() {
+            Some(database) => database
+                .parent()
+                .context("daemon database path has no parent directory")?,
+            None => self
+                .pid_file
+                .parent()
+                .context("daemon pid file has no state directory")?,
+        };
+        Ok(root.join("agents"))
+    }
+
     #[cfg(test)]
     fn resolve_canonical_in(state_home: &Path, runtime_dir: Option<&Path>) -> Result<Self> {
         let state = state_home.join("cockpit");
@@ -690,9 +714,97 @@ pub fn owner_capability_path_for_socket(control_socket: &Path) -> PathBuf {
     }
 }
 
-fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
+/// Keep a deny list minimal: skip a path already covered by a denied ancestor
+/// and drop entries the new path covers. bwrap masks a denied directory with a
+/// read-only tmpfs, so a nested deny would need a mkdir inside that mask and
+/// fail every sandboxed command with EROFS; the ancestor already denies it.
+///
+/// Every absolute deny is recorded both as spelled and in canonical form (when
+/// the two differ). The spelled entry keeps the mask where the caller named
+/// it; the canonical entry masks the real target even if a symlink on the
+/// spelled path resolves differently inside the sandbox. A path counts as
+/// covered only lexically or through such a canonical entry (see
+/// [`deny_path_covers`]), so collapsing never relies on a symlinked spelling
+/// alone. The two spellings of one directory are aliases of the same mount
+/// point, not a nesting, and both stay.
+///
+/// Only absolute paths take part in collapsing: a relative entry is kept
+/// verbatim, deduplicated exactly, and neither covers nor is covered by
+/// anything. An empty path names nothing and is dropped (as a prefix it would
+/// otherwise swallow every other deny).
+pub(crate) fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if !path.is_absolute() {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        return;
+    }
+    let canonical = canonical_deny_form(&path);
+    let alias = (canonical != path).then_some(canonical);
+    push_collapsed_deny_path(paths, path);
+    if let Some(canonical) = alias {
+        push_collapsed_deny_path(paths, canonical);
+    }
+}
+
+fn push_collapsed_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if paths
+        .iter()
+        .any(|existing| deny_path_covers(existing, &path))
+    {
+        return;
+    }
+    paths.retain(|existing| !deny_path_covers(&path, existing));
+    paths.push(path);
+}
+
+/// Whether denying `ancestor` (an entry of a deny list built by
+/// [`push_unique_deny_path`]) already denies `path`: both are absolute and
+/// `path` lies at or under `ancestor` as spelled, or `path`'s canonical form
+/// lies strictly under `ancestor`.
+///
+/// The canonical comparison is made against `ancestor` as spelled, never
+/// against its canonical form: a canonical path contains no symlinks, so it
+/// can only lie under an ancestor that is itself a canonical (symlink-free)
+/// spelling, whose mask covers the real target however any symlink resolves
+/// inside the sandbox. Coverage through a symlinked ancestor spelling alone
+/// does not count; [`push_unique_deny_path`] records that ancestor's canonical
+/// form beside it, which then covers the path. A path whose canonical form
+/// equals `ancestor` is an alias of that directory (the same mount point), not
+/// a nested deny.
+pub(crate) fn deny_path_covers(ancestor: &Path, path: &Path) -> bool {
+    if !ancestor.is_absolute() || !path.is_absolute() {
+        return false;
+    }
+    if path.starts_with(ancestor) {
+        return true;
+    }
+    let canonical = canonical_deny_form(path);
+    canonical != ancestor && canonical.starts_with(ancestor)
+}
+
+/// Canonical spelling of an absolute deny path: its deepest existing ancestor
+/// canonicalized, with the not-yet-existing remainder appended verbatim.
+fn canonical_deny_form(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut remainder = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            return remainder
+                .iter()
+                .rev()
+                .fold(canonical, |joined, part| joined.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                remainder.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -2936,6 +3048,16 @@ async fn run_foreground_inner_with_boot_db_impl(
                 Some(listeners) => listeners,
                 None => prepare_and_publish_socket_pair(&paths)?,
             };
+            // A first-run worker serves the locked bootstrap on the inherited
+            // listeners, so it must report readiness here exactly as the ready
+            // branch does; otherwise the supervisor times out and the spawner
+            // never observes a ready daemon on a fresh install.
+            if standby_promoted_before_recovery {
+                supervisor::report_promoted_worker_serving()?;
+            } else {
+                supervisor::report_worker_ready()?;
+                supervisor::wait_for_worker_promotion()?;
+            }
             let locked_outcome = tokio::select! {
                 result = server::run_locked_until_ready(
                     std::sync::Arc::new(locked),
@@ -3003,7 +3125,11 @@ async fn run_foreground_inner_with_boot_db_impl(
                 Some(listeners) => listeners,
                 None => prepare_and_publish_socket_pair(&paths)?,
             };
-            if !standby_promoted_before_recovery {
+            // A promoted standby reported only its identity before boot; the
+            // supervisor completes the roll on this second report.
+            if standby_promoted_before_recovery {
+                supervisor::report_promoted_worker_serving()?;
+            } else {
                 supervisor::report_worker_ready()?;
                 supervisor::wait_for_worker_promotion()?;
             }
@@ -3876,6 +4002,140 @@ mod tests {
         TestDaemonManifestEntry, cleanup_manifest, write_manifest,
     };
 
+    #[test]
+    fn deny_collapse_ignores_relative_and_empty_paths() {
+        let mut paths = Vec::new();
+        push_unique_deny_path(&mut paths, PathBuf::from("/deny/root"));
+        push_unique_deny_path(&mut paths, PathBuf::new());
+        push_unique_deny_path(&mut paths, PathBuf::from("relative"));
+        push_unique_deny_path(&mut paths, PathBuf::from("relative/nested"));
+        push_unique_deny_path(&mut paths, PathBuf::from("relative"));
+        push_unique_deny_path(&mut paths, PathBuf::from("/deny/root/nested"));
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/deny/root"),
+                PathBuf::from("relative"),
+                PathBuf::from("relative/nested"),
+            ],
+            "only absolute paths collapse; an empty path is dropped, not a universal prefix"
+        );
+        push_unique_deny_path(&mut paths, PathBuf::from("/deny"));
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("relative"),
+                PathBuf::from("relative/nested"),
+                PathBuf::from("/deny"),
+            ],
+            "an absolute ancestor replaces only the absolute entries it covers"
+        );
+        assert!(!deny_path_covers(
+            Path::new("relative"),
+            Path::new("relative/nested")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_collapse_sees_through_a_symlinked_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("cockpit")).unwrap();
+        let canonical_real = std::fs::canonicalize(&real).unwrap();
+        let link = root.path().join("runtime");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let expected = vec![link.join("cockpit"), canonical_real.join("cockpit")];
+
+        // The runtime root is denied through its symlink (recorded with its
+        // canonical alias); the rendezvous dir resolves through the target
+        // (and need not exist yet) and is covered by that canonical alias.
+        let mut paths = Vec::new();
+        push_unique_deny_path(&mut paths, link.join("cockpit"));
+        push_unique_deny_path(&mut paths, real.join("cockpit").join("rendezvous"));
+        assert_eq!(paths, expected);
+
+        // Either order yields the same covering denies.
+        let mut paths = Vec::new();
+        push_unique_deny_path(&mut paths, real.join("cockpit").join("rendezvous"));
+        push_unique_deny_path(&mut paths, link.join("cockpit"));
+        assert_eq!(paths, expected);
+    }
+
+    /// A deny covered only canonically — through an ancestor spelled via a
+    /// symlink — must not lose protection: the symlinked spelling alone never
+    /// counts as coverage (inside the sandbox the link may resolve
+    /// elsewhere), and the ancestor's canonical form is denied beside it so
+    /// the real target stays masked. The result still never nests.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_only_deny_coverage_keeps_the_real_target_denied() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("cockpit")).unwrap();
+        let canonical_real = std::fs::canonicalize(&real).unwrap();
+        let link = root.path().join("runtime");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let symlinked_ancestor = link.join("cockpit");
+        let nested_target = canonical_real.join("cockpit").join("rendezvous");
+
+        // The symlinked spelling alone does not cover the real target.
+        assert!(!deny_path_covers(&symlinked_ancestor, &nested_target));
+
+        let mut paths = Vec::new();
+        push_unique_deny_path(&mut paths, symlinked_ancestor.clone());
+        push_unique_deny_path(&mut paths, nested_target.clone());
+        assert!(
+            paths.contains(&symlinked_ancestor),
+            "the caller's spelling stays denied: {paths:?}"
+        );
+        assert!(
+            paths.contains(&canonical_real.join("cockpit")),
+            "the symlinked ancestor's real target must be denied too: {paths:?}"
+        );
+        // The nested target is protected by a canonical (symlink-free)
+        // covering entry, not merely through the symlinked spelling.
+        let covering = paths
+            .iter()
+            .filter(|denied| deny_path_covers(denied, &nested_target))
+            .collect::<Vec<_>>();
+        assert_eq!(covering, vec![&canonical_real.join("cockpit")]);
+        // No entry nests under another (the two spellings of one directory are
+        // aliases of the same mount point).
+        for (i, outer) in paths.iter().enumerate() {
+            for (j, inner) in paths.iter().enumerate() {
+                assert!(
+                    i == j || !deny_path_covers(outer, inner),
+                    "deny list must not nest {inner:?} under {outer:?}: {paths:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_agents_dir_is_ledger_adjacent_not_runtime_pid_dir() {
+        let data = tempfile::tempdir().expect("ledger dir");
+        let runtime = tempfile::tempdir().expect("runtime rendezvous dir");
+        let paths = DaemonPaths {
+            pid_file: runtime.path().join("daemon.pid"),
+            socket: runtime.path().join("cockpit.sock"),
+            ephemeral: false,
+        };
+        let db = crate::db::Db::open(&data.path().join("cockpit.db")).expect("file ledger");
+        assert_eq!(
+            paths.owned_agents_dir(&db).expect("durable agents dir"),
+            data.path().join("agents"),
+            "owned agent copies must survive runtime-dir teardown beside the ledger"
+        );
+        let memory = crate::db::Db::open_in_memory().expect("in-memory ledger");
+        assert_eq!(
+            paths
+                .owned_agents_dir(&memory)
+                .expect("instance agents dir"),
+            runtime.path().join("agents")
+        );
+    }
+
     #[tokio::test]
     async fn maintenance_timeout_preserves_interrupt_park_fence() {
         let ctx = server::test_ctx();
@@ -4479,10 +4739,19 @@ mod tests {
             paths.owner_capability_path(),
             PathBuf::from("/run/user/1000/cockpit/cockpit.owner-capability")
         );
+        // The deny list is minimal: the socket directory's deny covers every
+        // control-plane file inside it.
         let denied = paths.sandbox_deny_paths();
-        assert!(denied.contains(&paths.socket));
-        assert!(denied.contains(&paths.leak_reveal_socket()));
-        assert!(denied.contains(&paths.owner_capability_path()));
+        for path in [
+            paths.socket.clone(),
+            paths.leak_reveal_socket(),
+            paths.owner_capability_path(),
+        ] {
+            assert!(
+                denied.iter().any(|deny| path.starts_with(deny)),
+                "{path:?} must be covered by {denied:?}"
+            );
+        }
     }
 
     /// Two ephemeral daemons (distinct control stems) in one runtime dir get
@@ -4659,9 +4928,12 @@ mod tests {
 
         release_tx.send(()).expect("release promotion");
         promotion.await.expect("promotion task joins");
+        // Persistent now waits for further presence changes (#426); closing
+        // the channel lets the reaper exit.
+        drop(presence_tx);
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
-            .expect("reaper observes the promoted lifetime")
+            .expect("reaper observes the promoted lifetime and exits on channel close")
             .expect("reaper task joins");
         assert!(
             !reaped.load(std::sync::atomic::Ordering::Acquire),

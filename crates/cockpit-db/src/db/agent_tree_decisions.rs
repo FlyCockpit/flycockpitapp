@@ -7375,6 +7375,9 @@ impl Db {
                 "only trusted host approval may bind a selected response"
             );
         }
+        // A parked continuation claimed by this transition is bound to the
+        // generation that will replay it.
+        let claim_generation = self.writer_generation();
         self.transaction(move |conn| {
             let Some(current) = load_decision(conn, session_id, decision_request_id)? else {
                 return Ok(DecisionTransitionOutcome::RevisionConflict);
@@ -7655,6 +7658,7 @@ impl Db {
                     decision_request_id,
                     &receipt_json,
                     resume_payload_json.as_deref(),
+                    Some(claim_generation),
                     now_unix_ms,
                 )?;
                 // A terminal decision is the sole durable resume gate for a
@@ -9069,11 +9073,14 @@ fn cancel_owned_decisions_for_subtree(
              WHERE decision_request_id = ?2 AND session_id = ?3 AND state = 'pending'",
             params![now_unix_ms, decision_id.to_string(), session_id.to_string()],
         )?;
+        // A cancelled continuation never dispatches its parked effect, so its
+        // claim authorizes no generation to adopt the call's intent.
         resolve_owned_decision_attention(
             conn,
             session_id,
             decision_id,
             &redacted_marker("agent tree cancellation"),
+            None,
             None,
             now_unix_ms,
         )?;
@@ -9092,8 +9099,13 @@ fn resolve_owned_decision_attention(
     decision_request_id: Uuid,
     receipt_json: &str,
     resume_payload_json: Option<&str>,
+    claim_generation: Option<u64>,
     now_unix_ms: i64,
 ) -> Result<()> {
+    let claim_generation = claim_generation
+        .map(i64::try_from)
+        .transpose()
+        .context("parked replay claim generation overflow")?;
     let attention: Option<(i64, String, bool)> = conn
         .query_row(
             "SELECT revision, state,
@@ -9130,7 +9142,9 @@ fn resolve_owned_decision_attention(
     )?;
     let changed = conn.execute(
         "UPDATE needs_attention
-         SET state = ?1, resolved_at = ?2, response_json = ?3, revision = ?4
+         SET state = ?1, resolved_at = ?2, response_json = ?3, revision = ?4,
+             parked_claim_generation = CASE WHEN ?1 = 'executing' THEN ?7
+                                            ELSE parked_claim_generation END
          WHERE decision_request_id = ?5 AND revision = ?6
            AND state <> 'resolved'",
         params![
@@ -9140,6 +9154,7 @@ fn resolve_owned_decision_attention(
             current_revision + 1,
             decision_request_id.to_string(),
             current_revision,
+            claim_generation,
         ],
     )?;
     ensure!(changed == 1, "decision-owned attention CAS lost");

@@ -299,7 +299,6 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
     for required in [
         "fn read_bound_endpoint_record_from",
         "reclaim_stale_and_reserve(",
-        "record.socket == canonical.socket",
         "DaemonPidRecord::Receipt(receipt)",
         "preserving metadata and refusing numeric signaling",
     ] {
@@ -308,4 +307,15 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
             "daemon endpoint/stop fail-closed contract is missing: {required}"
         );
     }
+    let bound_endpoint_reader = daemon
+        .split("fn read_bound_endpoint_record_from")
+        .nth(1)
+        .expect("daemon must define read_bound_endpoint_record_from")
+        .split("\nfn ")
+        .next()
+        .expect("read_bound_endpoint_record_from body");
+    assert!(
+        bound_endpoint_reader.contains("record.socket_path == canonical.socket"),
+        "read_bound_endpoint_record_from must bind the published endpoint to the canonical socket path"
+    );
 }

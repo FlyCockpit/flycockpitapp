@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::support::{IsolatedHome, ReplayLaunchBarrier, SpawnedDaemon, log_tail, output_text};
 use cockpit_cli::integration::{AttachedSession, DaemonEvent};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 const TOOL_CALL_ID: &str = "call_lifecycle_bash";
@@ -252,6 +252,17 @@ fn session_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
     .expect("query session event rows")
     .map(|row| row.expect("session event row"))
     .collect()
+}
+
+/// The persisted rows a client's `HistoryReplay` represents. The #490
+/// `tool_call_completed` row only advances the durable handover marker in the
+/// result transaction; the tool result itself is replayed through its
+/// `tool_call` entry, so the replay deliberately omits that internal row.
+fn history_replay_event_rows(db_path: &Path, session_id: Uuid) -> Vec<(i64, String)> {
+    session_event_rows(db_path, session_id)
+        .into_iter()
+        .filter(|(_, kind)| kind != "tool_call_completed")
+        .collect()
 }
 
 fn has_handover_interrupt_decision(db_path: &Path, session_id: Uuid) -> bool {
@@ -1053,13 +1064,25 @@ async fn lifecycle_deny_round_trip_resolves_without_broadened_rerun() {
 #[tokio::test(flavor = "multi_thread")]
 async fn lifecycle_restart_command_preserves_parked_session_and_starts_when_absent() {
     let (_provider, daemon, attached, interrupt_id) = create_parked_session().await;
-    let old_pid = daemon.pid();
+    // Since #482 `daemon restart` rolls the worker under the stable
+    // supervisor, whose PID (the published receipt) deliberately survives.
+    // The generation identity is the supervisor's worker generation.
+    let before = supervisor_status_json(&daemon);
 
     restart_daemon_gracefully(&daemon).await;
-    assert_ne!(
-        daemon.pid(),
-        old_pid,
-        "restart must publish a new generation"
+    let after = supervisor_status_json(&daemon);
+    assert_eq!(
+        after["pid"], before["pid"],
+        "restart must retain the stable supervisor"
+    );
+    assert!(
+        after["generation"]
+            .as_u64()
+            .expect("restarted worker generation")
+            > before["generation"]
+                .as_u64()
+                .expect("initial worker generation"),
+        "restart must publish a new worker generation: before={before} after={after}"
     );
 
     let client = daemon.client().await;
@@ -1177,6 +1200,15 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         interrupt_row(&daemon.db_path(), interrupt_id).state,
         "interrupted"
     );
+    // The replay crossed its host-effect boundary before the crash, so it may
+    // have partially run: #492 proof-gated recovery asks the user instead of
+    // settling silently. Skipping settles it without re-execution.
+    let recovery = open_tool_recovery_decision(&daemon.db_path(), attached.session_id)
+        .expect("a dispatched replay killed mid-run must queue a recovery decision");
+    client
+        .answer_interrupt_option(recovery, "skip".to_string())
+        .await
+        .expect("skip the crash-interrupted replay");
 
     client
         .approve_interrupt_once(interrupt_id)
@@ -1187,6 +1219,23 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         tool_call_count(&daemon.db_path(), attached.session_id) <= 1,
         "executing crash must not re-execute parked replay"
     );
+    assert!(
+        open_tool_recovery_decision(&daemon.db_path(), attached.session_id).is_none(),
+        "skip must settle the recovery decision"
+    );
+}
+
+fn open_tool_recovery_decision(db_path: &Path, session_id: Uuid) -> Option<Uuid> {
+    let conn = open_db(db_path);
+    conn.query_row(
+        "SELECT interrupt_id FROM needs_attention
+          WHERE session_id = ?1 AND recovery_intent_id IS NOT NULL AND state = 'open'",
+        params![session_id.to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .expect("query open tool recovery decision")
+    .map(|id| Uuid::parse_str(&id).expect("recovery interrupt id"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1221,7 +1270,7 @@ async fn lifecycle_attach_replay_across_restart_delivers_persisted_events_once_i
 
     daemon.sigkill().await;
     daemon.restart_same_home().await;
-    let expected_rows = session_event_rows(&daemon.db_path(), attached.session_id);
+    let expected_rows = history_replay_event_rows(&daemon.db_path(), attached.session_id);
     let expected_seqs: Vec<_> = expected_rows.iter().map(|(seq, _)| *seq).collect();
     let expected_max = *expected_seqs.last().expect("persisted session events");
     let replay_client = daemon.client().await;

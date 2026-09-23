@@ -10,6 +10,12 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
+/// Typed compare-and-swap loss on the onboarding revision. Callers branch on
+/// this type (via `anyhow::Error::downcast_ref`), never on message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("onboarding revision conflict")]
+pub struct OnboardingRevisionConflict;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingStage {
     Welcome,
@@ -457,12 +463,12 @@ fn begin_or_reopen_conn(
         }
         let expected = expected_revision.context("onboarding revision is required for reopen")?;
         if existing.revision != expected {
-            bail!("onboarding revision conflict");
+            return Err(OnboardingRevisionConflict.into());
         }
         return reopen_conn(conn, &existing, client_operation_id, reentry);
     }
     if expected_revision.is_some() {
-        bail!("onboarding revision conflict");
+        return Err(OnboardingRevisionConflict.into());
     }
     if client_operation_id.is_empty() || client_operation_id.len() > 128 {
         bail!("invalid onboarding client operation id");
@@ -585,7 +591,7 @@ fn transition_conn(
         ],
     )?;
     if changed != 1 {
-        bail!("onboarding revision conflict");
+        return Err(OnboardingRevisionConflict.into());
     }
     let receipt_id = Uuid::new_v4();
     conn.execute(
@@ -742,7 +748,7 @@ fn reopen_conn(
         ],
     )?;
     if changed != 1 {
-        bail!("onboarding revision conflict");
+        return Err(OnboardingRevisionConflict.into());
     }
     conn.execute("UPDATE onboarding_attempts SET status = 'superseded', closed_revision = ?1 WHERE attempt_id = ?2 AND status = 'active'", params![i64::try_from(next_revision)?, current.attempt_id.to_string()])?;
     conn.execute("INSERT INTO onboarding_attempts (attempt_id, run_id, opened_revision, status, created_at_unix_ms) VALUES (?1, ?2, ?3, 'active', ?4)", params![next_attempt_id.to_string(), current.run_id.to_string(), i64::try_from(next_revision)?, now])?;

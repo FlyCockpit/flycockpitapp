@@ -274,15 +274,116 @@ impl std::fmt::Debug for SensitiveOnboardingIntentFrame {
 
 /// Fixed, schema-bounded failures permitted while the ready redactor does not
 /// yet exist. No dynamic error, path, environment value, or secret crosses
-/// this preparation-time boundary.
+/// this preparation-time boundary: placement and materialization failures
+/// carry only a fixed [`SecurePlacementFailureReason`] code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensitiveOnboardingIntentError {
     Unauthorized,
     InvalidRequest,
     RevisionConflict,
-    PlacementUnavailable,
-    MaterializationFailed,
+    PlacementUnavailable(SecurePlacementFailureReason),
+    MaterializationFailed(SecurePlacementFailureReason),
     ReadyConstructionFailed,
+}
+
+/// Fixed, nonsecret class of why a selected secure placement could not be
+/// used. The daemon derives it from typed errors (never message text) and
+/// logs the full cause locally; only this code crosses the wire, so the
+/// client can explain the real cause without leaking paths or secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurePlacementFailureReason {
+    /// No typed cause was available; the daemon log has the detail.
+    Unclassified,
+    /// The host capability snapshot marks the selected store unavailable.
+    CapabilityUnavailable,
+    /// The platform keyring is missing, unsupported, or unreachable.
+    KeyringUnavailable,
+    /// The platform keyring is locked.
+    KeyringLocked,
+    /// The platform keyring refused access.
+    KeyringAccessDenied,
+    /// File-backed vaults are not supported by this build or platform.
+    FileVaultUnsupported,
+    /// The private vault directory or key file could not be created,
+    /// secured, read, or written.
+    VaultStorageInaccessible,
+    /// The passphrase could not derive or unlock the vault key.
+    PassphraseRejected,
+    /// Local database or installation identity state was unavailable.
+    LocalStateUnavailable,
+    /// Durable vault state is corrupt or inconsistent.
+    VaultCorrupt,
+}
+
+impl SecurePlacementFailureReason {
+    pub const ALL: [Self; 10] = [
+        Self::Unclassified,
+        Self::CapabilityUnavailable,
+        Self::KeyringUnavailable,
+        Self::KeyringLocked,
+        Self::KeyringAccessDenied,
+        Self::FileVaultUnsupported,
+        Self::VaultStorageInaccessible,
+        Self::PassphraseRejected,
+        Self::LocalStateUnavailable,
+        Self::VaultCorrupt,
+    ];
+
+    const fn wire_code(self) -> u8 {
+        match self {
+            Self::Unclassified => 0,
+            Self::CapabilityUnavailable => 1,
+            Self::KeyringUnavailable => 2,
+            Self::KeyringLocked => 3,
+            Self::KeyringAccessDenied => 4,
+            Self::FileVaultUnsupported => 5,
+            Self::VaultStorageInaccessible => 6,
+            Self::PassphraseRejected => 7,
+            Self::LocalStateUnavailable => 8,
+            Self::VaultCorrupt => 9,
+        }
+    }
+
+    fn from_wire_code(code: u8) -> Result<Self, &'static str> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.wire_code() == code)
+            .ok_or("invalid secure placement failure reason")
+    }
+
+    /// Fixed user-facing explanation, including the remedy where one exists.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Unclassified => {
+                "the daemon could not classify the failure; run `cockpit doctor` and check the daemon log"
+            }
+            Self::CapabilityUnavailable => {
+                "this host reports the selected store as unavailable; pick another store or apply the fix shown on the secure-store screen"
+            }
+            Self::KeyringUnavailable => {
+                "the platform keyring (Keychain, Secret Service, or Credential Manager) could not be reached; start or install it, or choose a file vault"
+            }
+            Self::KeyringLocked => "the platform keyring is locked; unlock it and try again",
+            Self::KeyringAccessDenied => {
+                "the platform keyring denied access; allow Cockpit in the keyring prompt or settings, or choose a file vault"
+            }
+            Self::FileVaultUnsupported => {
+                "file vaults are not supported by this build on this platform; choose the platform keyring"
+            }
+            Self::VaultStorageInaccessible => {
+                "the private vault directory or key file could not be created, secured, or written; check ownership and permissions of the Cockpit data directory"
+            }
+            Self::PassphraseRejected => {
+                "the passphrase could not derive the vault key; re-enter the passphrase"
+            }
+            Self::LocalStateUnavailable => {
+                "Cockpit's local database could not be read or written; check free disk space and data-directory permissions"
+            }
+            Self::VaultCorrupt => {
+                "existing vault state is inconsistent; run `cockpit doctor` for recovery steps"
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -465,10 +566,20 @@ pub fn encode_sensitive_onboarding_response(
                 SensitiveOnboardingIntentError::Unauthorized => 1,
                 SensitiveOnboardingIntentError::InvalidRequest => 2,
                 SensitiveOnboardingIntentError::RevisionConflict => 3,
-                SensitiveOnboardingIntentError::PlacementUnavailable => 4,
-                SensitiveOnboardingIntentError::MaterializationFailed => 5,
+                SensitiveOnboardingIntentError::PlacementUnavailable(_) => 4,
+                SensitiveOnboardingIntentError::MaterializationFailed(_) => 5,
                 SensitiveOnboardingIntentError::ReadyConstructionFailed => 6,
             });
+            match error {
+                SensitiveOnboardingIntentError::PlacementUnavailable(reason)
+                | SensitiveOnboardingIntentError::MaterializationFailed(reason) => {
+                    encoded.push(reason.wire_code());
+                }
+                SensitiveOnboardingIntentError::Unauthorized
+                | SensitiveOnboardingIntentError::InvalidRequest
+                | SensitiveOnboardingIntentError::RevisionConflict
+                | SensitiveOnboardingIntentError::ReadyConstructionFailed => {}
+            }
         }
     }
     Ok(encoded)
@@ -505,10 +616,14 @@ pub fn decode_sensitive_onboarding_response(
             SensitiveOnboardingIntentError::RevisionConflict,
         ),
         4 => SensitiveOnboardingIntentResponse::Rejected(
-            SensitiveOnboardingIntentError::PlacementUnavailable,
+            SensitiveOnboardingIntentError::PlacementUnavailable(
+                SecurePlacementFailureReason::from_wire_code(cursor.take(1)?[0])?,
+            ),
         ),
         5 => SensitiveOnboardingIntentResponse::Rejected(
-            SensitiveOnboardingIntentError::MaterializationFailed,
+            SensitiveOnboardingIntentError::MaterializationFailed(
+                SecurePlacementFailureReason::from_wire_code(cursor.take(1)?[0])?,
+            ),
         ),
         6 => SensitiveOnboardingIntentResponse::Rejected(
             SensitiveOnboardingIntentError::ReadyConstructionFailed,
@@ -614,6 +729,63 @@ mod tests {
                 "projection leaked {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn sensitive_response_round_trips_every_rejection_with_its_reason() {
+        let mut rejections = vec![
+            SensitiveOnboardingIntentError::Unauthorized,
+            SensitiveOnboardingIntentError::InvalidRequest,
+            SensitiveOnboardingIntentError::RevisionConflict,
+            SensitiveOnboardingIntentError::ReadyConstructionFailed,
+        ];
+        for reason in SecurePlacementFailureReason::ALL {
+            rejections.push(SensitiveOnboardingIntentError::PlacementUnavailable(reason));
+            rejections.push(SensitiveOnboardingIntentError::MaterializationFailed(
+                reason,
+            ));
+        }
+        for rejection in rejections {
+            let response = SensitiveOnboardingIntentResponse::Rejected(rejection);
+            let encoded = encode_sensitive_onboarding_response(&response).unwrap();
+            assert_eq!(
+                decode_sensitive_onboarding_response(&encoded).unwrap(),
+                response,
+                "{rejection:?} must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn secure_placement_failure_reason_codes_are_unique_and_strictly_decoded() {
+        let mut codes = SecurePlacementFailureReason::ALL
+            .iter()
+            .map(|reason| reason.wire_code())
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), SecurePlacementFailureReason::ALL.len());
+        for reason in SecurePlacementFailureReason::ALL {
+            assert!(!reason.description().is_empty());
+        }
+
+        let mut truncated =
+            encode_sensitive_onboarding_response(&SensitiveOnboardingIntentResponse::Rejected(
+                SensitiveOnboardingIntentError::PlacementUnavailable(
+                    SecurePlacementFailureReason::KeyringLocked,
+                ),
+            ))
+            .unwrap()
+            .to_vec();
+        truncated.pop();
+        assert!(decode_sensitive_onboarding_response(&truncated).is_err());
+
+        let mut unknown = truncated.clone();
+        unknown.push(u8::MAX);
+        assert_eq!(
+            decode_sensitive_onboarding_response(&unknown).unwrap_err(),
+            "invalid secure placement failure reason"
+        );
     }
 
     #[test]

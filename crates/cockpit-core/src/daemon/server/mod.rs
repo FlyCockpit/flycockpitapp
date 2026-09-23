@@ -4915,6 +4915,21 @@ async fn locked_bootstrap_hello_for_any_platform(
     }
 }
 
+/// Classify a secure-intent failure by type and log its full cause locally.
+/// Only the fixed wire code leaves the daemon; the log keeps the detail an
+/// operator needs (KEK reasons are nonsecret by construction).
+fn classify_and_log_secure_intent_error(
+    error: &anyhow::Error,
+) -> cockpit_proto::SensitiveOnboardingIntentError {
+    let rejection = crate::onboarding::classify_secure_intent_error(error);
+    tracing::warn!(
+        error = %format!("{error:#}"),
+        ?rejection,
+        "onboarding secure intent rejected"
+    );
+    rejection
+}
+
 pub(crate) async fn handle_ready_onboarding_secure_intent(
     ctx: &DaemonContext,
     payload: &[u8],
@@ -4973,22 +4988,9 @@ pub(crate) async fn handle_ready_onboarding_secure_intent(
         Ok((snapshot, receipt)) => cockpit_proto::SensitiveOnboardingIntentResponse::Applied(
             cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
         ),
-        Err(error) => {
-            let message = error.to_string();
-            let kind = if message.contains("revision conflict") {
-                cockpit_proto::SensitiveOnboardingIntentError::RevisionConflict
-            } else if message.contains("unavailable") {
-                cockpit_proto::SensitiveOnboardingIntentError::PlacementUnavailable
-            } else if message.contains("requires")
-                || message.contains("only valid")
-                || message.contains("already committed")
-            {
-                cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest
-            } else {
-                cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed
-            };
-            cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(kind)
-        }
+        Err(error) => cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+            classify_and_log_secure_intent_error(&error),
+        ),
     }
 }
 
@@ -5595,21 +5597,7 @@ impl LockedServices {
                     receipt,
                 },
             )
-            .map_err(|error| {
-                let message = error.to_string();
-                if message.contains("revision conflict") {
-                    cockpit_proto::SensitiveOnboardingIntentError::RevisionConflict
-                } else if message.contains("unavailable") {
-                    cockpit_proto::SensitiveOnboardingIntentError::PlacementUnavailable
-                } else if message.contains("requires")
-                    || message.contains("only valid")
-                    || message.contains("already committed")
-                {
-                    cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest
-                } else {
-                    cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed
-                }
-            })
+            .map_err(|error| classify_and_log_secure_intent_error(&error))
     }
 
     pub(crate) async fn into_ready(&self) -> Result<ReadyServices> {
@@ -6197,6 +6185,7 @@ pub(crate) async fn boot_ready_with_db(
                     crate::secure_key::SecureKeyError::KekUnavailable {
                         reason,
                         fix_command,
+                        ..
                     } => cockpit_proto::SecretStoreSnapshot {
                         intent: cockpit_proto::SecretStoreIntent::Keyring,
                         effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,

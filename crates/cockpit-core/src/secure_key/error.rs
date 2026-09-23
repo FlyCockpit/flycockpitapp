@@ -40,11 +40,64 @@ pub enum SecureKeyError {
     /// Internal coordination failure (safe message only).
     Internal(String),
     /// KEK placement cannot be established. No file-KEK fallback when
-    /// `active_placement` is keyring. Messages are nonsecret.
+    /// `active_placement` is keyring. Messages are nonsecret. `cause` is the
+    /// typed class callers branch on; never classify by `reason` text.
     KekUnavailable {
+        cause: KekFailureCause,
         reason: String,
         fix_command: Option<String>,
     },
+}
+
+/// Typed, nonsecret class of a KEK-placement failure. It is carried beside
+/// the human-readable reason so boundaries (onboarding, doctor, the wire)
+/// classify failures by type rather than by substring matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KekFailureCause {
+    /// The platform keyring is missing, unsupported, or could not be reached.
+    KeyringUnavailable,
+    /// The platform keyring is present but locked.
+    KeyringLocked,
+    /// The platform keyring refused access.
+    KeyringDenied,
+    /// File-backed vaults are not supported by this build or platform.
+    FileVaultUnsupported,
+    /// The private vault directory or key file could not be created, secured,
+    /// read, or written.
+    VaultStorage,
+    /// The passphrase could not derive or unlock the vault key, or a
+    /// passphrase vault was opened without one.
+    Passphrase,
+    /// The requested options contradict each other or the durable vault.
+    InvalidRequest,
+    /// Local database or installation identity state could not be read or
+    /// written.
+    LocalState,
+    /// Durable vault state is corrupt or inconsistent.
+    Corrupt,
+    /// Unclassified internal failure.
+    Internal,
+}
+
+impl KekFailureCause {
+    /// Typed classification of any secure-key failure. Only the platform
+    /// keyring adapter produces `Locked`/`Denied`/`Unavailable`.
+    pub fn of(error: &SecureKeyError) -> Self {
+        match error {
+            SecureKeyError::KekUnavailable { cause, .. } => *cause,
+            SecureKeyError::Locked(_) => Self::KeyringLocked,
+            SecureKeyError::Denied(_) => Self::KeyringDenied,
+            SecureKeyError::Unavailable(_) => Self::KeyringUnavailable,
+            SecureKeyError::Corrupt(_) | SecureKeyError::Conflict { .. } => Self::Corrupt,
+            SecureKeyError::Invalid(_) => Self::InvalidRequest,
+            SecureKeyError::NotFound(_)
+            | SecureKeyError::Busy
+            | SecureKeyError::InUse(_)
+            | SecureKeyError::Retiring { .. }
+            | SecureKeyError::ActiveVersion { .. }
+            | SecureKeyError::Internal(_) => Self::Internal,
+        }
+    }
 }
 
 impl SecureKeyError {
@@ -116,10 +169,12 @@ impl fmt::Debug for SecureKeyError {
                 .finish(),
             Self::Internal(m) => f.debug_tuple("Internal").field(m).finish(),
             Self::KekUnavailable {
+                cause,
                 reason,
                 fix_command,
             } => f
                 .debug_struct("KekUnavailable")
+                .field("cause", cause)
                 .field("reason", reason)
                 .field("fix_command", fix_command)
                 .finish(),
@@ -164,6 +219,7 @@ impl fmt::Display for SecureKeyError {
             Self::KekUnavailable {
                 reason,
                 fix_command,
+                ..
             } => match fix_command {
                 Some(fix) => write!(f, "KEK unavailable: {reason} ({fix})"),
                 None => write!(f, "KEK unavailable: {reason}"),

@@ -44,7 +44,7 @@ pub use consumer::{
     CompositeConsumerReconciler, ConsumerReconciler, FailClosedReconciler, MapReconciler,
     ToolMediaSubjectBindingDbProbe, activate_ref_in_tx, begin_release_in_tx,
 };
-pub use error::SecureKeyError;
+pub use error::{KekFailureCause, SecureKeyError};
 pub use kek_store::{
     FileKekStore, KekStore, KeyringKekStore, MemoryKekStore, Passphrase, PassphraseKdfParams,
     PassphraseKekStore, file_kek_supported, kek_file_path,

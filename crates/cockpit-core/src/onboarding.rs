@@ -19,6 +19,75 @@ use crate::db::onboarding::{
     OnboardingReceiptStatus as DbReceiptStatus, OnboardingSnapshotRow, OnboardingStage as DbStage,
 };
 
+/// Typed rejection raised by the secure-intent authority before any vault
+/// materialization. Boundaries classify it with `anyhow::Error::downcast_ref`
+/// (together with `cockpit_db::onboarding::OnboardingRevisionConflict` and
+/// `SecureKeyError`); they never match message text.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SecureIntentRejection {
+    #[error("secure-store choice is already committed")]
+    AlreadyCommitted,
+    #[error("passphrase placement requires a confirmed passphrase")]
+    PassphraseRequired,
+    #[error("passphrase is only valid for passphrase placement")]
+    PassphraseNotAllowed,
+    #[error("no onboarding run exists")]
+    NoActiveRun,
+    #[error("secure-store intent is only valid at the secure-store stage")]
+    WrongStage,
+    #[error("secure-store capability has not been published")]
+    CapabilityUnpublished,
+    #[error("selected secure-store placement is unavailable: {guidance}")]
+    CapabilityUnavailable { guidance: String },
+}
+
+/// Classify a secure-intent failure into the fixed wire rejection by type.
+///
+/// The full error is logged by the caller; only a fixed reason code crosses
+/// the preparation-time boundary.
+pub fn classify_secure_intent_error(
+    error: &anyhow::Error,
+) -> cockpit_proto::SensitiveOnboardingIntentError {
+    use cockpit_proto::SecurePlacementFailureReason as Reason;
+    use cockpit_proto::SensitiveOnboardingIntentError as Wire;
+
+    if error
+        .downcast_ref::<crate::db::onboarding::OnboardingRevisionConflict>()
+        .is_some()
+    {
+        return Wire::RevisionConflict;
+    }
+    if let Some(rejection) = error.downcast_ref::<SecureIntentRejection>() {
+        return match rejection {
+            SecureIntentRejection::AlreadyCommitted
+            | SecureIntentRejection::PassphraseRequired
+            | SecureIntentRejection::PassphraseNotAllowed
+            | SecureIntentRejection::NoActiveRun
+            | SecureIntentRejection::WrongStage => Wire::InvalidRequest,
+            SecureIntentRejection::CapabilityUnpublished
+            | SecureIntentRejection::CapabilityUnavailable { .. } => {
+                Wire::PlacementUnavailable(Reason::CapabilityUnavailable)
+            }
+        };
+    }
+    if let Some(secure_key) = error.downcast_ref::<crate::secure_key::SecureKeyError>() {
+        use crate::secure_key::KekFailureCause as Cause;
+        return match Cause::of(secure_key) {
+            Cause::KeyringUnavailable => Wire::PlacementUnavailable(Reason::KeyringUnavailable),
+            Cause::KeyringLocked => Wire::PlacementUnavailable(Reason::KeyringLocked),
+            Cause::KeyringDenied => Wire::PlacementUnavailable(Reason::KeyringAccessDenied),
+            Cause::FileVaultUnsupported => Wire::PlacementUnavailable(Reason::FileVaultUnsupported),
+            Cause::InvalidRequest => Wire::InvalidRequest,
+            Cause::VaultStorage => Wire::MaterializationFailed(Reason::VaultStorageInaccessible),
+            Cause::Passphrase => Wire::MaterializationFailed(Reason::PassphraseRejected),
+            Cause::LocalState => Wire::MaterializationFailed(Reason::LocalStateUnavailable),
+            Cause::Corrupt => Wire::MaterializationFailed(Reason::VaultCorrupt),
+            Cause::Internal => Wire::MaterializationFailed(Reason::Unclassified),
+        };
+    }
+    Wire::MaterializationFailed(Reason::Unclassified)
+}
+
 fn stage_entry_config_generation() -> u64 {
     crate::daemon::server::inventory::current_config_generation()
 }
@@ -125,7 +194,7 @@ impl OnboardingAuthority {
         F: FnOnce(OnboardingSecurePlacement, Option<Zeroizing<String>>) -> Result<()>,
     {
         if vault_authority_exists {
-            bail!("secure-store choice is already committed");
+            return Err(SecureIntentRejection::AlreadyCommitted.into());
         }
         let client_operation_id = request.client_operation_id.clone();
         let placement = request.placement;
@@ -202,10 +271,12 @@ impl OnboardingAuthority {
     ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)> {
         match placement {
             OnboardingSecurePlacement::PassphraseFile if !passphrase_present => {
-                bail!("passphrase placement requires a confirmed passphrase")
+                return Err(SecureIntentRejection::PassphraseRequired.into());
             }
             OnboardingSecurePlacement::PassphraseFile => {}
-            _ if passphrase_present => bail!("passphrase is only valid for passphrase placement"),
+            _ if passphrase_present => {
+                return Err(SecureIntentRejection::PassphraseNotAllowed.into());
+            }
             _ => {}
         }
         let capability_id = match placement {
@@ -217,28 +288,31 @@ impl OnboardingAuthority {
         };
         let capability = host_capabilities
             .feature(capability_id)
-            .context("secure-store capability has not been published")?;
+            .ok_or(SecureIntentRejection::CapabilityUnpublished)?;
         if !capability.state.is_available() {
             let guidance = capability
                 .fix_command
                 .as_deref()
                 .or(capability.remedy_text.as_deref())
                 .unwrap_or(capability.reason.as_str());
-            bail!("selected secure-store placement is unavailable: {guidance}");
+            return Err(SecureIntentRejection::CapabilityUnavailable {
+                guidance: guidance.to_string(),
+            }
+            .into());
         }
         let current = self
             .db
             .onboarding_snapshot()
             .await?
-            .context("no onboarding run exists")?;
+            .ok_or(SecureIntentRejection::NoActiveRun)?;
         if current.run_id != run_id
             || current.attempt_id != attempt_id
             || current.revision != expected_revision
         {
-            bail!("onboarding revision conflict");
+            return Err(crate::db::onboarding::OnboardingRevisionConflict.into());
         }
         if current.stage != DbStage::SecureStore {
-            bail!("secure-store intent is only valid at the secure-store stage");
+            return Err(SecureIntentRejection::WrongStage.into());
         }
         let (row, receipt_row) = self
             .db
@@ -909,6 +983,151 @@ mod tests {
         );
     }
 
+    #[test]
+    fn secure_intent_errors_are_classified_by_type_not_message_text() {
+        use crate::secure_key::{KekFailureCause, SecureKeyError};
+        use cockpit_proto::SecurePlacementFailureReason as Reason;
+        use cockpit_proto::SensitiveOnboardingIntentError as Wire;
+
+        // Every KEK failure's text says "KEK unavailable"; only its typed
+        // cause may decide the class (the macOS onboarding misreport).
+        let kek = |cause| {
+            anyhow::Error::from(SecureKeyError::KekUnavailable {
+                cause,
+                reason: "unavailable revision conflict requires already committed".into(),
+                fix_command: None,
+            })
+            .context("materializing onboarding vault")
+        };
+        for (cause, expected) in [
+            (
+                KekFailureCause::KeyringUnavailable,
+                Wire::PlacementUnavailable(Reason::KeyringUnavailable),
+            ),
+            (
+                KekFailureCause::KeyringLocked,
+                Wire::PlacementUnavailable(Reason::KeyringLocked),
+            ),
+            (
+                KekFailureCause::KeyringDenied,
+                Wire::PlacementUnavailable(Reason::KeyringAccessDenied),
+            ),
+            (
+                KekFailureCause::FileVaultUnsupported,
+                Wire::PlacementUnavailable(Reason::FileVaultUnsupported),
+            ),
+            (
+                KekFailureCause::VaultStorage,
+                Wire::MaterializationFailed(Reason::VaultStorageInaccessible),
+            ),
+            (
+                KekFailureCause::Passphrase,
+                Wire::MaterializationFailed(Reason::PassphraseRejected),
+            ),
+            (
+                KekFailureCause::LocalState,
+                Wire::MaterializationFailed(Reason::LocalStateUnavailable),
+            ),
+            (
+                KekFailureCause::Corrupt,
+                Wire::MaterializationFailed(Reason::VaultCorrupt),
+            ),
+            (
+                KekFailureCause::Internal,
+                Wire::MaterializationFailed(Reason::Unclassified),
+            ),
+            (KekFailureCause::InvalidRequest, Wire::InvalidRequest),
+        ] {
+            assert_eq!(
+                classify_secure_intent_error(&kek(cause)),
+                expected,
+                "{cause:?}"
+            );
+        }
+
+        // Raw keyring adapter errors classify without a KEK wrapper.
+        assert_eq!(
+            classify_secure_intent_error(&anyhow::Error::from(SecureKeyError::Locked(
+                "keychain".into()
+            ))),
+            Wire::PlacementUnavailable(Reason::KeyringLocked)
+        );
+        assert_eq!(
+            classify_secure_intent_error(
+                &anyhow::Error::from(crate::db::onboarding::OnboardingRevisionConflict)
+                    .context("recording secure intent")
+            ),
+            Wire::RevisionConflict
+        );
+        assert_eq!(
+            classify_secure_intent_error(&SecureIntentRejection::AlreadyCommitted.into()),
+            Wire::InvalidRequest
+        );
+        assert_eq!(
+            classify_secure_intent_error(&SecureIntentRejection::WrongStage.into()),
+            Wire::InvalidRequest
+        );
+        // Untyped text never classifies, whatever words it contains.
+        assert_eq!(
+            classify_secure_intent_error(&anyhow::anyhow!(
+                "store unavailable: revision conflict requires only valid already committed"
+            )),
+            Wire::MaterializationFailed(Reason::Unclassified)
+        );
+    }
+
+    #[tokio::test]
+    async fn materializer_keyring_failure_reaches_the_wire_as_its_typed_reason() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db);
+        let secure = secure_stage(&authority).await;
+        let error = authority
+            .apply_secure_intent_with(
+                ApplyOnboardingSecureIntent {
+                    run_id: secure.run_id,
+                    attempt_id: secure.attempt_id,
+                    expected_revision: secure.revision,
+                    client_operation_id: "locked-keyring".into(),
+                    placement: OnboardingSecurePlacement::Keyring,
+                    passphrase: None,
+                },
+                capabilities(),
+                false,
+                |_, _| {
+                    Err(crate::secure_key::SecureKeyError::Denied("keychain refused".into()).into())
+                },
+            )
+            .await
+            .expect_err("a refused keyring write must reject the secure intent");
+        assert_eq!(
+            classify_secure_intent_error(&error),
+            cockpit_proto::SensitiveOnboardingIntentError::PlacementUnavailable(
+                cockpit_proto::SecurePlacementFailureReason::KeyringAccessDenied,
+            )
+        );
+
+        let stale = authority
+            .apply_secure_intent_with(
+                ApplyOnboardingSecureIntent {
+                    run_id: secure.run_id,
+                    attempt_id: secure.attempt_id,
+                    expected_revision: secure.revision,
+                    client_operation_id: "stale-revision".into(),
+                    placement: OnboardingSecurePlacement::MachineBoundFile,
+                    passphrase: None,
+                },
+                capabilities(),
+                false,
+                |_, _| Ok(()),
+            )
+            .await
+            .expect_err("the consumed revision must conflict");
+        assert_eq!(
+            classify_secure_intent_error(&stale),
+            cockpit_proto::SensitiveOnboardingIntentError::RevisionConflict
+        );
+    }
+
     #[tokio::test]
     async fn unavailable_keyring_requires_a_new_explicit_file_choice() {
         let db = Db::open_in_memory_async().await.unwrap();
@@ -944,6 +1163,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("unlock-keyring"));
+        assert_eq!(
+            classify_secure_intent_error(&error),
+            cockpit_proto::SensitiveOnboardingIntentError::PlacementUnavailable(
+                cockpit_proto::SecurePlacementFailureReason::CapabilityUnavailable,
+            )
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let (ready, _) = authority
             .apply_secure_intent_with(

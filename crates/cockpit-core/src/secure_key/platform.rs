@@ -226,8 +226,9 @@ fn run_keyring_construct(
     // Refresh can run after the secure-key actor has registered the live
     // process-global store. Capture it first, then restore so a dry probe
     // never leaves the actor pointing at an unset or probe-owned default.
-    // Linux `Store::new` runs on `cockpit-keyring-construct` and registers an
-    // Arc-backed process-global store, then that helper thread exits. That is
+    // Linux `Store::new` runs on `cockpit-keyring-construct` under a bounded
+    // wait; the caller registers the Arc-backed process-global store, then
+    // that helper thread exits. That is
     // fine: keyring-core owns the Store, and later I/O uses `cockpit-keyring-io`
     // via `Entry` against this default. Unsetting after a successful first-run
     // probe leaves `KeyringKekStore` with no default and hard-fails boot.
@@ -378,24 +379,60 @@ pub(crate) fn set_default_platform_store() -> Result<(), SecureKeyError> {
     }
 }
 
+/// Upper bound on the Secret Service `OpenSession` round trip. A session bus
+/// whose secrets service is wedged (stalled activation, SSH sessions with a
+/// user systemd instance) must not block the capability probe or onboarding.
+#[cfg(target_os = "linux")]
+const LINUX_SECRET_SERVICE_CONSTRUCT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 #[cfg(target_os = "linux")]
 fn construct_linux_secret_service_store() -> Result<(), SecureKeyError> {
-    fn construct() -> Result<(), SecureKeyError> {
-        let store = zbus_secret_service_keyring_store::Store::new()
-            .map_err(|e| SecureKeyError::Unavailable(format!("secret service store: {e}")))?;
-        keyring_core::set_default_store(store);
-        Ok(())
-    }
+    construct_linux_secret_service_store_within(
+        LINUX_SECRET_SERVICE_CONSTRUCT_TIMEOUT,
+        zbus_secret_service_keyring_store::Store::new,
+    )
+}
+
+/// Construct the store on a helper thread and wait at most `timeout`. The
+/// helper only *builds* the store; registration happens here, on the caller,
+/// and only for an in-time success. A construct that finishes after the
+/// deadline drops its store (its reply channel is gone), so a late success
+/// can never register a default behind a probe that already reported failure.
+#[cfg(target_os = "linux")]
+fn construct_linux_secret_service_store_within<S, E>(
+    timeout: std::time::Duration,
+    construct: impl FnOnce() -> Result<std::sync::Arc<S>, E> + Send + 'static,
+) -> Result<(), SecureKeyError>
+where
+    S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let (reply, outcome) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("cockpit-keyring-construct".into())
-        .spawn(construct)
-        .map_err(|e| SecureKeyError::Unavailable(format!("keyring construct thread: {e}")))?
-        .join()
-        .unwrap_or_else(|_| {
-            Err(SecureKeyError::Unavailable(
-                "keyring construct thread panicked".into(),
-            ))
+        .spawn(move || {
+            let store = construct()
+                .map_err(|e| SecureKeyError::Unavailable(format!("secret service store: {e}")));
+            let _ = reply.send(store);
         })
+        .map_err(|e| SecureKeyError::Unavailable(format!("keyring construct thread: {e}")))?;
+    match outcome.recv_timeout(timeout) {
+        Ok(Ok(store)) => {
+            keyring_core::set_default_store(store);
+            Ok(())
+        }
+        Ok(Err(error)) => Err(error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(SecureKeyError::Unavailable(format!(
+                "keyring construct thread timed out after {}s waiting for the Secret Service; check that gnome-keyring or another secrets service is running and unlocked",
+                timeout.as_secs()
+            )))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(SecureKeyError::Unavailable(
+            "keyring construct thread panicked".into(),
+        )),
+    }
 }
 
 pub(crate) fn unset_default_platform_store() {
@@ -415,5 +452,52 @@ pub fn production_native_store() -> Box<dyn NativeKeyStore> {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         Box::new(UnsupportedNativeStore)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_construct_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[test]
+    fn linux_secret_service_construct_is_time_bounded_and_classified_failed() {
+        let started = Instant::now();
+        let error = construct_linux_secret_service_store_within::<
+            zbus_secret_service_keyring_store::Store,
+            _,
+        >(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(2));
+            Err(keyring_core::Error::NoDefaultStore)
+        })
+        .expect_err("a wedged Secret Service must not be reported available");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the probe must return at its deadline, not when the construct finishes"
+        );
+        assert!(
+            matches!(&error, SecureKeyError::Unavailable(message) if message.contains("timed out")),
+            "{error:?}"
+        );
+        assert_eq!(
+            classify_keyring_error(&error).state,
+            cockpit_proto::FeatureCapabilityState::Failed
+        );
+    }
+
+    #[test]
+    fn linux_secret_service_construct_error_is_returned_in_time() {
+        let error = construct_linux_secret_service_store_within::<
+            zbus_secret_service_keyring_store::Store,
+            _,
+        >(Duration::from_secs(5), || {
+            Err(keyring_core::Error::NoDefaultStore)
+        })
+        .expect_err("a failed construct must surface its error");
+        assert!(
+            matches!(&error, SecureKeyError::Unavailable(message) if message.starts_with("secret service store:")),
+            "{error:?}"
+        );
     }
 }

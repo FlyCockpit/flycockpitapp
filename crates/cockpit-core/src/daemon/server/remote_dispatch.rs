@@ -68,6 +68,10 @@ pub(super) async fn admit(
     let ClientPrincipal::Remote(remote) = principal else {
         unreachable!("owner principal returned above")
     };
+    // Actorless remote principals are the live relay-client mode: the server
+    // mints web/native client tokens without an actor binding, so they carry
+    // no operation identity and get no durable-replay/operation-status rights.
+    // Scope authorization still gates every request downstream.
     if remote.actor_binding.is_none() {
         return Ok(None);
     }

@@ -2400,7 +2400,9 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
             if id == denied_id && error.code == ErrorCode::Authorization
     ));
 
-    // Legacy actorless v1 reads remain accepted and execute concurrently.
+    // Actorless remote reads (relay client tokens minted without an actor
+    // binding, the production web/native path) are accepted and execute
+    // concurrently.
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote(None),
@@ -2426,7 +2428,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     .unwrap();
     concurrent.join_next().await.unwrap().unwrap();
     assert!(matches!(
-        recv_writer_body(&mut writer_rx, "legacy read response").await,
+        recv_writer_body(&mut writer_rx, "actorless read response").await,
         Body::Response { id, response }
             if id == read_id && matches!(*response, Response::DaemonStatus { .. })
     ));

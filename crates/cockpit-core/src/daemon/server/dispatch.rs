@@ -11529,7 +11529,7 @@ async fn handle_serialized_request_impl(
             let Some(actor) = remote.actor_binding.as_ref() else {
                 return Err(ErrorPayload {
                     code: ErrorCode::Authorization,
-                    message: "legacy actorless transport cannot query operation status".into(),
+                    message: "operation status requires a device-bound remote actor".into(),
                 });
             };
             let row = ctx

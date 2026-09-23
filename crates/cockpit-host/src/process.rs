@@ -1802,6 +1802,91 @@ fn capture_leader_pin(
     Some((pgid, start))
 }
 
+/// Last-resort containment for a process about to `_exit` without draining
+/// (a supervised worker that lost its supervisor): SIGKILL every direct
+/// child together with the process group it leads.
+///
+/// Every Cockpit spawn site that runs tool, hook, server, or shell code puts
+/// the child in a fresh process group (`process_group(0)`, directly or via
+/// [`ProcessTreeGuard`]), so the direct children's groups cover their
+/// in-group descendants whichever site spawned them — including tool calls
+/// that are not tracked by a containment lease. Signal authority follows the
+/// [`ProcessTreeGuard`] rule: a child is signaled only while the unreaped
+/// child pin (`waitid` `WNOWAIT`) and the start identity captured here still
+/// hold, so a recycled PID or process group is never a target. A child that
+/// shares this process's group is killed alone, never by group.
+///
+/// Returns how many children were signaled.
+#[cfg(unix)]
+pub fn kill_direct_child_process_groups() -> usize {
+    // SAFETY: getpgrp has no preconditions.
+    let own_group = unsafe { libc::getpgrp() };
+    let mut signaled = 0;
+    for pid in direct_child_pids() {
+        let Some((pid, start)) = capture_leader_pin(pid) else {
+            continue;
+        };
+        // SAFETY: getpgid only queries the process group of `pid`.
+        let group = unsafe { libc::getpgid(pid) };
+        let result = if group == pid && group != own_group {
+            signal_pinned_group(pid, start, libc::SIGKILL)
+        } else if leader_pin_holds(pid, start) {
+            // SAFETY: the pin proves `pid` is still this process's child.
+            if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        } else {
+            continue;
+        };
+        if result.is_ok() {
+            signaled += 1;
+        }
+    }
+    signaled
+}
+
+/// PIDs of this process's direct children, or empty where the platform
+/// offers no enumeration.
+#[cfg(unix)]
+fn direct_child_pids() -> Vec<libc::pid_t> {
+    let mut pids: Vec<libc::pid_t> = Vec::new();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // Each thread lists the children it forked.
+        if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+            for task in tasks.flatten() {
+                if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
+                    pids.extend(
+                        children
+                            .split_ascii_whitespace()
+                            .filter_map(|pid| pid.parse::<libc::pid_t>().ok()),
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut buffer = vec![0 as libc::pid_t; 4096];
+        let bytes = libc::c_int::try_from(std::mem::size_of_val(buffer.as_slice()))
+            .unwrap_or(libc::c_int::MAX);
+        // SAFETY: the buffer is writable for `bytes` bytes; the kernel writes
+        // at most that many.
+        let count =
+            unsafe { libc::proc_listchildpids(libc::getpid(), buffer.as_mut_ptr().cast(), bytes) };
+        // Callers disagree whether the result counts PIDs or bytes; the
+        // zero-initialized tail makes either reading safe.
+        let count = usize::try_from(count).unwrap_or(0).min(buffer.len());
+        pids.extend(buffer[..count].iter().copied());
+    }
+    pids.retain(|pid| *pid > 0);
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 /// Signal a process group only while the unreaped assigned-leader pin holds.
 #[cfg(unix)]
 fn signal_pinned_group(

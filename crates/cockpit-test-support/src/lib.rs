@@ -581,6 +581,39 @@ mod tests {
         ]
         .iter()
         .any(|needle| line.contains(needle))
+            || contains_bare_set_current_dir_call(line)
+    }
+
+    /// A `set_current_dir(` call reached through an import
+    /// (`use std::env::set_current_dir;`) mutates process state exactly like
+    /// the qualified form. Method calls (`guard.set_current_dir(`) go through
+    /// a serialized test guard and definitions (`fn set_current_dir(`) are
+    /// not calls, so neither is flagged.
+    fn contains_bare_set_current_dir_call(line: &str) -> bool {
+        const NEEDLE: &str = "set_current_dir(";
+        line.match_indices(NEEDLE).any(|(at, _)| {
+            let before = line[..at].trim_end();
+            !before.ends_with('.') && !before.ends_with("fn")
+        })
+    }
+
+    #[test]
+    fn env_mutation_scan_flags_bare_set_current_dir_but_not_guard_methods() {
+        assert!(line_contains_env_mutation(
+            "    set_current_dir(&dir).unwrap();"
+        ));
+        assert!(line_contains_env_mutation(
+            "let _ = (set_current_dir(dir), 1);"
+        ));
+        assert!(line_contains_env_mutation(
+            "std::env::set_current_dir(dir)?;"
+        ));
+        assert!(line_contains_env_mutation("env::set_current_dir(dir)?;"));
+        assert!(!line_contains_env_mutation("guard.set_current_dir(&dir);"));
+        assert!(!line_contains_env_mutation("        .set_current_dir(dir)"));
+        assert!(!line_contains_env_mutation(
+            "    pub fn set_current_dir(&self, dir: &Path) {"
+        ));
     }
 
     fn parse_rust_fn_symbol(line: &str) -> Option<&str> {

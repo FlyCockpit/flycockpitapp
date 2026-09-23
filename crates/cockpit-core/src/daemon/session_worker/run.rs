@@ -5802,7 +5802,10 @@ impl StartupWorkInbox {
         self.pending.iter().any(|work| {
             !matches!(
                 work,
-                SessionWork::Cancel { .. } | SessionWork::CancelAll | SessionWork::Shutdown { .. }
+                SessionWork::Cancel { .. }
+                    | SessionWork::CancelAll
+                    | SessionWork::Shutdown { .. }
+                    | SessionWork::HandoverPark { .. }
             )
         })
     }
@@ -5928,6 +5931,10 @@ fn reject_unstarted_startup_work(work: SessionWork) {
                     stale: false,
                 },
             ));
+        }
+        SessionWork::HandoverPark { respond_to, .. } => {
+            // No turn ever started, so there is nothing to park or cancel.
+            let _ = respond_to.send(HandoverParkDisposition::Cancelled);
         }
         SessionWork::Cancel { .. }
         | SessionWork::Shutdown { .. }
@@ -9682,6 +9689,9 @@ pub(super) async fn run_worker(
     // Seeded by the initial snapshot's sweep and refined by the post-drain
     // park-drain loop; reported once after the driver quiesces (finding 2).
     let mut shutdown_park_committed = true;
+    // Set only when a handover park (`SessionWork::HandoverPark`) chose to
+    // park: the drain then honors the registry's hard-interrupt fallback.
+    let mut handover_hard_interrupt: Option<HandoverHardInterrupt> = None;
     let mut text_artifact_reservation_reaper =
         tokio::time::interval(TEXT_ARTIFACT_RESERVATION_REAP_INTERVAL);
     text_artifact_reservation_reaper
@@ -11895,15 +11905,7 @@ pub(super) async fn run_worker(
                         }
                     }
                     if let Some(through_generation) = session_work_stop_generation {
-                        if job_cmd_tx
-                            .send(crate::engine::schedule::ScheduleCommand::CancelAll {
-                                through_generation,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!(session_id = %session_id, "job command channel closed");
-                        }
+                        cancel_schedules_through(&job_cmd_tx, through_generation, session_id).await;
                     }
                 }
                 SessionWork::ResolveAgentDecision {
@@ -14282,6 +14284,46 @@ pub(super) async fn run_worker(
                         pending_tool_count,
                     };
                 }
+                SessionWork::HandoverPark {
+                    hard_interrupt,
+                    respond_to,
+                } => {
+                    // Every interrupt answer is applied by this loop, so no
+                    // resolution can interleave with this decision: a turn
+                    // answered before this item arrived shows a registration
+                    // without an unresolved waiter and is cancelled below.
+                    if handover_park_boundary(&interrupts, &live) {
+                        let (active, pending_tool_count, initial_committed) =
+                            shutdown_activity_snapshot(
+                                &session,
+                                session_id,
+                                &root_agent_name,
+                                &project_root,
+                                &interrupts,
+                                &live,
+                            )
+                            .await;
+                        shutdown_park_committed = initial_committed;
+                        handover_hard_interrupt = Some(hard_interrupt);
+                        let _ = respond_to.send(HandoverParkDisposition::Parking);
+                        break WorkerStop::Shutdown {
+                            pause_for_resume: true,
+                            active,
+                            pending_tool_count,
+                        };
+                    }
+                    tracing::info!(
+                        session_id = %session_id,
+                        "handover park declined: turn is doing live work; cancelling"
+                    );
+                    // Exactly `Cancel { origin: Handover }`: cancel the
+                    // token before the adopted-process fence, and keep the
+                    // durable queued user messages for the successor.
+                    let through_generation = cancel_handle.cancel_all_session_work();
+                    adopted_processes.cancel_all(&driver_input_queue).await;
+                    cancel_schedules_through(&job_cmd_tx, through_generation, session_id).await;
+                    let _ = respond_to.send(HandoverParkDisposition::Cancelled);
+                }
             },
         }
     };
@@ -14327,17 +14369,48 @@ pub(super) async fn run_worker(
                 )
                 .await;
                 shutdown_park_committed = shutdown_park_committed && committed;
-                match tokio::time::timeout(PARK_DRAIN_POLL_INTERVAL, &mut driver_handle).await {
-                    Ok(join_result) => {
-                        let outcome = driver_join_outcome(join_result);
-                        if let Some(error) = outcome.failure_error() {
-                            tracing::warn!(session_id = %session_id, error = %error, "driver ended during worker drain");
-                        }
-                        break;
+                let hard_interrupt_requested = async {
+                    match &handover_hard_interrupt {
+                        Some(hard) if !hard.applied() => hard.wait_requested().await,
+                        _ => std::future::pending().await,
                     }
-                    // Driver still running/blocked: re-park (catch a fresh
-                    // registration) and keep waiting for it to exit.
-                    Err(_) => continue,
+                };
+                tokio::select! {
+                    join_result = tokio::time::timeout(PARK_DRAIN_POLL_INTERVAL, &mut driver_handle) => {
+                        match join_result {
+                            Ok(join_result) => {
+                                let outcome = driver_join_outcome(join_result);
+                                if let Some(error) = outcome.failure_error() {
+                                    tracing::warn!(session_id = %session_id, error = %error, "driver ended during worker drain");
+                                }
+                                break;
+                            }
+                            // Driver still running/blocked: re-park (catch a
+                            // fresh registration) and keep waiting for it to
+                            // exit.
+                            Err(_) => continue,
+                        }
+                    }
+                    () = hard_interrupt_requested => {
+                        // The handover park did not reach its boundary in the
+                        // registry's park budget: some live work (for example a
+                        // parallel tool whose start had not been observed) kept
+                        // the driver running. Cancel it exactly as the
+                        // `Cancel { origin: Handover }` path so the park still
+                        // commits before `T_hard`.
+                        if let Some(hard) = &handover_hard_interrupt
+                            && hard.requested()
+                            && hard.claim_application()
+                        {
+                            tracing::warn!(session_id = %session_id, "handover park hard-interrupting live work before T_hard");
+                            // Adopted processes were already cancelled by
+                            // `begin_shutdown`.
+                            let through_generation = cancel_handle.cancel_all_session_work();
+                            cancel_schedules_through(&job_cmd_tx, through_generation, session_id)
+                                .await;
+                        }
+                        continue;
+                    }
                 }
             }
         } else {
@@ -14680,6 +14753,34 @@ pub(super) async fn persist_paused_session_work(
         )
         .await
         .context("persisting paused session work")
+}
+
+/// Whether this worker's only live activity, observed from the worker loop, is
+/// a turn blocked on unresolved durable interrupt waiters: no schedule is
+/// running and every tool call the forwarder has seen start is accounted for
+/// by one of those waiters. See [`SessionWork::HandoverPark`].
+pub(super) fn handover_park_boundary(
+    interrupts: &crate::engine::interrupt::InterruptHub,
+    live: &LiveState,
+) -> bool {
+    interrupts
+        .unresolved_waiters_if_all_blocked()
+        .is_some_and(|waiters| !live.has_active_schedules() && live.tool_running_count() <= waiters)
+}
+
+/// Stop scheduled session work admitted up to `through_generation`.
+async fn cancel_schedules_through(
+    job_cmd_tx: &tokio::sync::mpsc::Sender<crate::engine::schedule::ScheduleCommand>,
+    through_generation: u64,
+    session_id: Uuid,
+) {
+    if job_cmd_tx
+        .send(crate::engine::schedule::ScheduleCommand::CancelAll { through_generation })
+        .await
+        .is_err()
+    {
+        tracing::warn!(session_id = %session_id, "job command channel closed");
+    }
 }
 
 pub(super) async fn shutdown_activity_snapshot(

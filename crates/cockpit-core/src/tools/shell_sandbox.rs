@@ -503,7 +503,10 @@ pub async fn build_sandboxed_command_with_visibility_root(
     // A write deny under a fully denied ancestor is already covered, and would
     // need a mount point inside the ancestor's read-only mask.
     for path in write_denied_paths {
-        if !control_denies.iter().any(|denied| path.starts_with(denied)) {
+        if !control_denies
+            .iter()
+            .any(|denied| crate::daemon::deny_path_covers(denied, path))
+        {
             sandbox = sandbox.deny_write(path.clone());
         }
     }

@@ -718,12 +718,64 @@ pub fn owner_capability_path_for_socket(control_socket: &Path) -> PathBuf {
 /// and drop entries the new path covers. bwrap masks a denied directory with a
 /// read-only tmpfs, so a nested deny would need a mkdir inside that mask and
 /// fail every sandboxed command with EROFS; the ancestor already denies it.
+///
+/// Only absolute paths take part in collapsing (see [`deny_path_covers`]): a
+/// relative entry is kept verbatim, deduplicated exactly, and neither covers
+/// nor is covered by anything. An empty path names nothing and is dropped
+/// (as a prefix it would otherwise swallow every other deny).
 pub(crate) fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if paths.iter().any(|existing| path.starts_with(existing)) {
+    if path.as_os_str().is_empty() {
         return;
     }
-    paths.retain(|existing| !existing.starts_with(&path));
+    if !path.is_absolute() {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        return;
+    }
+    if paths
+        .iter()
+        .any(|existing| existing == &path || deny_path_covers(existing, &path))
+    {
+        return;
+    }
+    paths.retain(|existing| !deny_path_covers(&path, existing));
     paths.push(path);
+}
+
+/// Whether denying `ancestor` already denies `path`: both are absolute and
+/// `path` lies at or under `ancestor`, compared both as spelled and in
+/// canonical form, so a symlinked ancestor (for example an
+/// `XDG_RUNTIME_DIR` reached through a symlink) still covers a path spelled
+/// through its target.
+pub(crate) fn deny_path_covers(ancestor: &Path, path: &Path) -> bool {
+    if !ancestor.is_absolute() || !path.is_absolute() {
+        return false;
+    }
+    path.starts_with(ancestor)
+        || canonical_deny_form(path).starts_with(canonical_deny_form(ancestor))
+}
+
+/// Canonical spelling of an absolute deny path: its deepest existing ancestor
+/// canonicalized, with the not-yet-existing remainder appended verbatim.
+fn canonical_deny_form(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut remainder = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            return remainder
+                .iter()
+                .rev()
+                .fold(canonical, |joined, part| joined.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                remainder.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 fn state_dir() -> Option<PathBuf> {
@@ -3919,6 +3971,63 @@ mod tests {
         CleanupReport, DaemonTestHarness, TEST_OWNER_ENV, TestDaemonManifest,
         TestDaemonManifestEntry, cleanup_manifest, write_manifest,
     };
+
+    #[test]
+    fn deny_collapse_ignores_relative_and_empty_paths() {
+        let mut paths = Vec::new();
+        push_unique_deny_path(&mut paths, PathBuf::from("/deny/root"));
+        push_unique_deny_path(&mut paths, PathBuf::new());
+        push_unique_deny_path(&mut paths, PathBuf::from("relative"));
+        push_unique_deny_path(&mut paths, PathBuf::from("relative/nested"));
+        push_unique_deny_path(&mut paths, PathBuf::from("relative"));
+        push_unique_deny_path(&mut paths, PathBuf::from("/deny/root/nested"));
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/deny/root"),
+                PathBuf::from("relative"),
+                PathBuf::from("relative/nested"),
+            ],
+            "only absolute paths collapse; an empty path is dropped, not a universal prefix"
+        );
+        push_unique_deny_path(&mut paths, PathBuf::from("/deny"));
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("relative"),
+                PathBuf::from("relative/nested"),
+                PathBuf::from("/deny"),
+            ],
+            "an absolute ancestor replaces only the absolute entries it covers"
+        );
+        assert!(!deny_path_covers(
+            Path::new("relative"),
+            Path::new("relative/nested")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_collapse_sees_through_a_symlinked_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("cockpit")).unwrap();
+        let link = root.path().join("runtime");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The runtime root is denied through its symlink; the rendezvous dir
+        // resolves through the target (and need not exist yet).
+        let mut paths = Vec::new();
+        push_unique_deny_path(&mut paths, link.join("cockpit"));
+        push_unique_deny_path(&mut paths, real.join("cockpit").join("rendezvous"));
+        assert_eq!(paths, vec![link.join("cockpit")]);
+
+        // Either order yields the single covering deny.
+        let mut paths = Vec::new();
+        push_unique_deny_path(&mut paths, real.join("cockpit").join("rendezvous"));
+        push_unique_deny_path(&mut paths, link.join("cockpit"));
+        assert_eq!(paths, vec![link.join("cockpit")]);
+    }
 
     #[test]
     fn owned_agents_dir_is_ledger_adjacent_not_runtime_pid_dir() {

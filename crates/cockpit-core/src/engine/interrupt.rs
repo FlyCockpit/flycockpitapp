@@ -1317,6 +1317,13 @@ impl ParkCommit {
         matches!(*self.inner.shutdown.borrow(), ShutdownParkState::Committed)
     }
 
+    /// Whether this worker's resumable shutdown has published any terminal
+    /// (`Committed` or `FailedWrite`). Either is published only after the
+    /// driver task has exited, so the worker has no live turn left.
+    pub fn shutdown_resolved(&self) -> bool {
+        !matches!(*self.inner.shutdown.borrow(), ShutdownParkState::Pending)
+    }
+
     /// Producer (worker `SessionWork::Shutdown` arm): every registered park
     /// landed durably (or there were none). `send_replace` always updates the
     /// stored value (even if the drain path has not subscribed yet — the worker
@@ -1423,6 +1430,11 @@ impl ParkCommit {
     #[cfg(test)]
     pub(crate) fn test_add_registered(&self) {
         self.on_register();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drop_registered(&self) {
+        self.on_unregister();
     }
 
     #[cfg(test)]
@@ -2039,6 +2051,26 @@ impl InterruptHub {
             return false;
         };
         tx.send(InterruptOutcome::Resolved(response)).is_ok()
+    }
+
+    /// The number of registered interrupt waiters when every one of them is
+    /// still unresolved, else `None`.
+    ///
+    /// A resolved waiter leaves this map at [`Self::resolve`] but keeps its
+    /// registration until its tool drops the [`PendingInterrupt`], so a
+    /// registration count above the unresolved count means a tool is already
+    /// continuing past its answer. A registration in flight (inserted here
+    /// before its count is bumped) also reports `None`. Callers that
+    /// serialize every resolution (the session worker loop) therefore observe
+    /// "blocked only on unanswered waiters" atomically with respect to answers.
+    pub(crate) fn unresolved_waiters_if_all_blocked(&self) -> Option<usize> {
+        let waiters = lock_or_recover(&self.waiters);
+        let unresolved = waiters.len();
+        let registered = self
+            .park_commit
+            .as_ref()
+            .map_or(unresolved, ParkCommit::registered_waiters);
+        (unresolved > 0 && registered == unresolved).then_some(unresolved)
     }
 
     #[cfg(test)]

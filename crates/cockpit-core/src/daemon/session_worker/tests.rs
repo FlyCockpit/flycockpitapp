@@ -7245,3 +7245,48 @@ fn session_end_matcher_maps_worker_stop() {
         WorkerStop::DriverFailed.session_ended_reason()
     );
 }
+
+/// The worker's handover park decision is made against the waiter map at the
+/// instant the worker processes `HandoverPark`. An answer applied before that
+/// (the race between the registry's snapshot and delivery) removes the waiter
+/// while its tool still holds the registration, so the worker cancels the
+/// now-running turn instead of parking a turn that is executing its gated
+/// effect. A parallel tool the forwarder has seen start also keeps it live.
+#[test]
+fn handover_park_boundary_rejects_answered_waiter_and_parallel_tool() {
+    let park_commit = crate::engine::interrupt::ParkCommit::new();
+    let hub = crate::engine::interrupt::InterruptHub::detached().with_park_commit(park_commit);
+    let live = LiveState::default();
+    assert!(
+        !handover_park_boundary(&hub, &live),
+        "no waiter: nothing to park"
+    );
+
+    let interrupt_id = Uuid::new_v4();
+    let pending = hub.register(interrupt_id);
+    live.tool_running
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        handover_park_boundary(&hub, &live),
+        "a tool blocked on its unanswered approval is a park boundary"
+    );
+
+    live.tool_running
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        !handover_park_boundary(&hub, &live),
+        "a parallel running tool beside the waiter is live work"
+    );
+    live.tool_running
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+
+    // The approval is answered through the worker loop before HandoverPark
+    // is processed: the waiter leaves the map but the tool keeps running.
+    assert!(hub.resolve(interrupt_id, proto::ResolveResponse::Cancel));
+    assert!(
+        !handover_park_boundary(&hub, &live),
+        "an answered waiter's tool is running; the turn must be cancelled, not parked"
+    );
+    drop(pending);
+    assert!(!handover_park_boundary(&hub, &live));
+}

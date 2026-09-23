@@ -694,6 +694,12 @@ impl LiveState {
         self.tool_running.load(Ordering::Relaxed) > 0
     }
 
+    /// Count of tool calls the forwarder has observed between `ToolStart` and
+    /// `ToolEnd`.
+    pub(crate) fn tool_running_count(&self) -> usize {
+        self.tool_running.load(Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_processing_for_test(&self, processing: bool) {
         self.processing.store(processing, Ordering::Relaxed);
@@ -757,10 +763,11 @@ pub use effective_sandbox::{
 };
 pub(crate) use handle::spawn;
 pub use handle::{
-    CancelOrigin, FIRST_PUBLISHED_CONFIG_GENERATION, InteractiveClientGuard,
-    OversizedRunInvocationAdmission, OversizedTextArtifactAdmission, ReplaceConfigSnapshotAck,
-    ReplaceConfigSnapshotResult, SessionConfigHandle, SessionConfigSnapshot, SessionWork,
-    SessionWorkTrustReconciling, SessionWorkerHandle, TurnOutcome, UserMessageProbeResult,
+    CancelOrigin, FIRST_PUBLISHED_CONFIG_GENERATION, HandoverHardInterrupt,
+    HandoverParkDisposition, InteractiveClientGuard, OversizedRunInvocationAdmission,
+    OversizedTextArtifactAdmission, ReplaceConfigSnapshotAck, ReplaceConfigSnapshotResult,
+    SessionConfigHandle, SessionConfigSnapshot, SessionWork, SessionWorkTrustReconciling,
+    SessionWorkerHandle, TurnOutcome, UserMessageProbeResult,
 };
 pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRuntime};
 pub use helpers::DAEMON_NO_SANDBOX_ENV;

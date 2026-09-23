@@ -355,6 +355,11 @@ struct ReexecState {
     worker_pid: u32,
     worker_binary: PathBuf,
     generation: u64,
+    /// Highest worker generation the pre-reexec supervisor attempted
+    /// (including burned, never-ready attempts). Absent from an older
+    /// supervisor's state; the durable fence and `generation` then bound it.
+    #[serde(default)]
+    highest_attempted_generation: u64,
     opened_at_unix_ms: u64,
 }
 
@@ -364,6 +369,11 @@ struct ReexecState {
     worker_pid: u32,
     worker_binary: PathBuf,
     generation: u64,
+    /// Highest worker generation the pre-reexec supervisor attempted
+    /// (including burned, never-ready attempts). Absent from an older
+    /// supervisor's state; the durable fence and `generation` then bound it.
+    #[serde(default)]
+    highest_attempted_generation: u64,
     opened_at_unix_ms: u64,
 }
 
@@ -558,8 +568,13 @@ fn watch_supervisor_liveness() -> Result<()> {
                         Err(_) => break,
                     }
                 }
+                // A replacement generation may replay idempotent intents of
+                // calls still running here; kill every tool, hook, server,
+                // and shell process group first so none outlives this
+                // worker's exit.
+                let killed = cockpit_host::process::kill_direct_child_process_groups();
                 eprintln!(
-                    "supervised worker pid {}: supervisor exited; terminating with it",
+                    "supervised worker pid {}: supervisor exited; killed {killed} child process group(s); terminating with it",
                     std::process::id()
                 );
                 // SAFETY: _exit is async-signal-safe and skips Rust teardown,
@@ -799,7 +814,11 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             let database_owner = unsafe {
                 crate::db::SupervisorDatabaseOwner::from_raw_fd(inherited.database_lock_fd)
             };
-            let generations = WorkerGenerations::resume(&database_owner, inherited.generation)?;
+            let generations = WorkerGenerations::resume_after_reexec(
+                &database_owner,
+                inherited.generation,
+                inherited.highest_attempted_generation,
+            );
             (
                 receipt,
                 metadata,
@@ -846,7 +865,11 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             let admin = bind_admin(&admin_path)?;
             let worker = resume_worker(inherited.worker_pid, &inherited.worker_binary)?;
             let database_owner = acquire_database_owner_until(deadline)?;
-            let generations = WorkerGenerations::resume(&database_owner, inherited.generation)?;
+            let generations = WorkerGenerations::resume_after_reexec(
+                &database_owner,
+                inherited.generation,
+                inherited.highest_attempted_generation,
+            );
             publish_generation(
                 &paths,
                 &receipt,
@@ -987,18 +1010,18 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                     }
                 };
                 if request.version != ADMIN_PROTOCOL_VERSION {
-                    write_admin(&mut stream, &AdminResponse::Error {
+                    reply_admin(&mut stream, &AdminResponse::Error {
                         version: ADMIN_PROTOCOL_VERSION,
                         message: format!("unsupported supervisor admin protocol {}", request.version),
-                    }).await?;
+                    }).await;
                     continue;
                 }
                 match request.command {
                     AdminCommand::Status => {
-                        write_admin(&mut stream, &status_response(worker.pid, generation, opened_at_unix_ms, last_handover.clone())).await?;
+                        reply_admin(&mut stream, &status_response(worker.pid, generation, opened_at_unix_ms, last_handover.clone())).await;
                     }
                     AdminCommand::Stop => {
-                        write_admin(&mut stream, &AdminResponse::Stopping { version: ADMIN_PROTOCOL_VERSION }).await?;
+                        reply_admin(&mut stream, &AdminResponse::Stopping { version: ADMIN_PROTOCOL_VERSION }).await;
                         drain_and_reap_worker(&mut worker, false).await?;
                         break;
                     }
@@ -1013,14 +1036,14 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                     match std::fs::canonicalize(&binary) {
                                         Ok(binary) => binary,
                                         Err(error) => {
-                                            write_admin(&mut stream, &AdminResponse::Error {
+                                            reply_admin(&mut stream, &AdminResponse::Error {
                                                 version: ADMIN_PROTOCOL_VERSION,
                                                 message: format!(
                                                     "resolving upgrade binary {}: {error}",
                                                     binary.display()
                                                 ),
                                             })
-                                            .await?;
+                                            .await;
                                             continue;
                                         }
                                     }
@@ -1031,11 +1054,11 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             let next_generation = match generations.allocate() {
                                 Ok(next_generation) => next_generation,
                                 Err(error) => {
-                                    write_admin(&mut stream, &AdminResponse::Error {
+                                    reply_admin(&mut stream, &AdminResponse::Error {
                                         version: ADMIN_PROTOCOL_VERSION,
                                         message: format!("{error:#}"),
                                     })
-                                    .await?;
+                                    .await;
                                     continue;
                                 }
                             };
@@ -1055,11 +1078,11 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             {
                                 Ok(successor) => successor,
                                 Err(error) => {
-                                    write_admin(&mut stream, &AdminResponse::Error {
+                                    reply_admin(&mut stream, &AdminResponse::Error {
                                         version: ADMIN_PROTOCOL_VERSION,
                                         message: format!("{error:#}"),
                                     })
-                                    .await?;
+                                    .await;
                                     continue;
                                 }
                             };
@@ -1077,13 +1100,13 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             last_handover = Some(format!(
                                 "completed without boundary handover: generation {generation}"
                             ));
-                            write_admin(&mut stream, &AdminResponse::Rolled {
+                            reply_admin(&mut stream, &AdminResponse::Rolled {
                                 version: ADMIN_PROTOCOL_VERSION,
                                 old_worker_pid,
                                 worker_pid: worker.pid,
                                 generation,
                                 uptime_ms: now_unix_ms().saturating_sub(opened_at_unix_ms),
-                            }).await?;
+                            }).await;
                             continue;
                         }
                         let handover_timers = match crate::config::config::extended::load_installation_handover_timers() {
@@ -1092,10 +1115,10 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 let reason = format!("loading worker handover timers: {error:#}");
                                 tracing::warn!(%reason, "worker handover aborted before readiness");
                                 last_handover = Some(format!("aborted: {reason}"));
-                                write_admin(&mut stream, &AdminResponse::Error {
+                                reply_admin(&mut stream, &AdminResponse::Error {
                                     version: ADMIN_PROTOCOL_VERSION,
                                     message: reason,
-                                }).await?;
+                                }).await;
                                 continue;
                             }
                         };
@@ -1106,10 +1129,10 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                     let reason = format!("resolving upgrade binary {}: {error}", binary.display());
                                     tracing::warn!(%reason, "worker handover aborted before readiness");
                                     last_handover = Some(format!("aborted: {reason}"));
-                                    write_admin(&mut stream, &AdminResponse::Error {
+                                    reply_admin(&mut stream, &AdminResponse::Error {
                                         version: ADMIN_PROTOCOL_VERSION,
                                         message: reason,
-                                    }).await?;
+                                    }).await;
                                     continue;
                                 }
                             },
@@ -1124,10 +1147,10 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 let reason = format!("allocating successor generation: {error:#}");
                                 tracing::warn!(%reason, "worker handover aborted before readiness");
                                 last_handover = Some(format!("aborted: {reason}"));
-                                write_admin(&mut stream, &AdminResponse::Error {
+                                reply_admin(&mut stream, &AdminResponse::Error {
                                     version: ADMIN_PROTOCOL_VERSION,
                                     message: reason,
-                                }).await?;
+                                }).await;
                                 continue;
                             }
                         };
@@ -1153,10 +1176,10 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 let reason = format!("staging successor readiness: {error:#}");
                                 tracing::warn!(%reason, "worker handover aborted; predecessor remains serving");
                                 last_handover = Some(format!("aborted: {reason}"));
-                                write_admin(&mut stream, &AdminResponse::Error {
+                                reply_admin(&mut stream, &AdminResponse::Error {
                                     version: ADMIN_PROTOCOL_VERSION,
                                     message: reason,
-                                }).await?;
+                                }).await;
                                 continue;
                             }
                         };
@@ -1166,10 +1189,10 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             let reason = format!("starting predecessor boundary: {error:#}");
                             tracing::warn!(%reason, "worker handover aborted; predecessor remains serving");
                             last_handover = Some(format!("aborted: {reason}"));
-                            write_admin(&mut stream, &AdminResponse::Error {
+                            reply_admin(&mut stream, &AdminResponse::Error {
                                 version: ADMIN_PROTOCOL_VERSION,
                                 message: reason,
-                            }).await?;
+                            }).await;
                             continue;
                         }
                         let ready = wait_for_worker_handover_ready(
@@ -1205,10 +1228,10 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 let reason = format!("waiting for predecessor boundary: {error:#}");
                                 tracing::warn!(%reason, "worker handover aborted before commit; predecessor remains serving");
                                 last_handover = Some(format!("aborted: {reason}"));
-                                write_admin(&mut stream, &AdminResponse::Error {
+                                reply_admin(&mut stream, &AdminResponse::Error {
                                     version: ADMIN_PROTOCOL_VERSION,
                                     message: reason,
-                                }).await?;
+                                }).await;
                                 continue;
                             }
                         }
@@ -1221,10 +1244,10 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             );
                             tracing::warn!(%reason, "worker handover aborted; predecessor remains serving");
                             last_handover = Some(format!("aborted: {reason}"));
-                            write_admin(&mut stream, &AdminResponse::Error {
+                            reply_admin(&mut stream, &AdminResponse::Error {
                                 version: ADMIN_PROTOCOL_VERSION,
                                 message: reason,
-                            }).await?;
+                            }).await;
                             continue;
                         }
                         if let Err(error) = signal_worker_handover_decision(&worker, true) {
@@ -1233,10 +1256,10 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             reap_worker_after_exit(successor);
                             let reason = format!("committing worker handover: {error:#}");
                             last_handover = Some(format!("aborted: {reason}"));
-                            write_admin(&mut stream, &AdminResponse::Error {
+                            reply_admin(&mut stream, &AdminResponse::Error {
                                 version: ADMIN_PROTOCOL_VERSION,
                                 message: reason,
-                            }).await?;
+                            }).await;
                             continue;
                         }
                         let boundary = wait_for_worker_boundary(
@@ -1300,10 +1323,10 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                     generation,
                                     opened_at_unix_ms,
                                 )?;
-                                write_admin(&mut stream, &AdminResponse::Error {
+                                reply_admin(&mut stream, &AdminResponse::Error {
                                     version: ADMIN_PROTOCOL_VERSION,
                                     message: reason,
-                                }).await?;
+                                }).await;
                                 continue;
                             }
                         };
@@ -1369,13 +1392,13 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 "completed after successor release recovery: generation {generation}; {} session boundaries",
                                 boundary.len()
                             ));
-                            write_admin(&mut stream, &AdminResponse::Rolled {
+                            reply_admin(&mut stream, &AdminResponse::Rolled {
                                 version: ADMIN_PROTOCOL_VERSION,
                                 old_worker_pid: old_pid,
                                 worker_pid: worker.pid,
                                 generation,
                                 uptime_ms: now_unix_ms().saturating_sub(opened_at_unix_ms),
-                            }).await?;
+                            }).await;
                             continue;
                         }
                         publish_generation(
@@ -1387,32 +1410,32 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             "completed: generation {generation}; {} session boundaries",
                             boundary.len()
                         ));
-                        write_admin(&mut stream, &AdminResponse::Rolled {
+                        reply_admin(&mut stream, &AdminResponse::Rolled {
                             version: ADMIN_PROTOCOL_VERSION,
                             old_worker_pid: old_pid,
                             worker_pid: worker.pid,
                             generation,
                             uptime_ms: now_unix_ms().saturating_sub(opened_at_unix_ms),
-                        }).await?;
+                        }).await;
                     }
                     AdminCommand::WorkerBoundary { .. } => {
                         // Boundary reports are accepted only by the dedicated
                         // handover wait loop, where the predecessor PID and
                         // generation are exact. Accepting one here lets a
                         // stale predecessor overwrite the committed result.
-                        write_admin(&mut stream, &AdminResponse::Error {
+                        reply_admin(&mut stream, &AdminResponse::Error {
                             version: ADMIN_PROTOCOL_VERSION,
                             message: "stale worker boundary report".to_string(),
-                        }).await?;
+                        }).await;
                     }
                     AdminCommand::WorkerHandoverReady { .. } => {
-                        write_admin(&mut stream, &AdminResponse::Error {
+                        reply_admin(&mut stream, &AdminResponse::Error {
                             version: ADMIN_PROTOCOL_VERSION,
                             message: "stale worker handover-ready report".to_string(),
-                        }).await?;
+                        }).await;
                     }
                     AdminCommand::Reexec => {
-                        write_admin(&mut stream, &AdminResponse::Reexecing { version: ADMIN_PROTOCOL_VERSION }).await?;
+                        reply_admin(&mut stream, &AdminResponse::Reexecing { version: ADMIN_PROTOCOL_VERSION }).await;
                         reexec_supervisor(ReexecRequest {
                             executable: &executable,
                             #[cfg(unix)]
@@ -1425,6 +1448,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             database_owner: &_database_owner,
                             worker: &worker,
                             generation,
+                            highest_attempted_generation: generations.highest_attempted(),
                             opened_at_unix_ms,
                             no_sandbox,
                             resume_all_sessions,
@@ -1468,8 +1492,40 @@ impl WorkerGenerations {
         Ok(Self::above(durable.max(current)))
     }
 
+    /// Resume allocation in a reexecuted supervisor, which already owns a
+    /// live worker. The durable fence read is best-effort here: failing the
+    /// reexec on a transient SQLite error would exit the supervisor and take
+    /// that healthy worker down with it. The pre-reexec supervisor's
+    /// `inherited_highest` (every attempted generation, ready or burned) and
+    /// the live worker's `current` generation still bound allocation.
+    #[cfg(any(unix, windows))]
+    fn resume_after_reexec(
+        owner: &crate::db::SupervisorDatabaseOwner,
+        current: u64,
+        inherited_highest: u64,
+    ) -> Self {
+        let durable = match owner.durable_worker_generation() {
+            Ok(durable) => durable,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    current,
+                    inherited_highest,
+                    "reexecuted supervisor could not read the durable worker generation fence; allocating above its inherited generations"
+                );
+                0
+            }
+        };
+        Self::above(durable.max(current).max(inherited_highest))
+    }
+
     fn above(highest_attempted: u64) -> Self {
         Self { highest_attempted }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn highest_attempted(&self) -> u64 {
+        self.highest_attempted
     }
 
     fn allocate(&mut self) -> Result<u64> {
@@ -1990,23 +2046,61 @@ async fn await_drained_worker_exit_with_timeout(
 fn create_ready_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     use std::os::fd::FromRawFd as _;
     let mut fds = [-1; 2];
-    // SAFETY: fds has room for the two descriptors returned by pipe.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("creating worker readiness pipe");
-    }
-    for fd in fds {
-        // SAFETY: successful pipe returned both live descriptors.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            let error = std::io::Error::last_os_error();
-            // SAFETY: both descriptors remain owned locally on this failure.
-            unsafe {
-                libc::close(fds[0]);
-                libc::close(fds[1]);
-            }
-            return Err(error).context("setting readiness pipe close-on-exec");
+    // Create both ends close-on-exec atomically where the platform can: with
+    // a separate `fcntl`, a worker spawned from another thread between
+    // `pipe` and `fcntl` would inherit the supervisor-only write end (for the
+    // liveness pipe, that child would keep every worker alive past the
+    // supervisor's death).
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))]
+    {
+        // SAFETY: fds has room for the two descriptors returned by pipe2.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("creating worker readiness pipe");
         }
     }
-    // SAFETY: successful pipe2 returned two newly owned descriptors.
+    // macOS (and other targets without `pipe2`) fall back to `pipe` plus
+    // `fcntl`. The supervisor forks only workers, each from
+    // `spawn_ready_worker_blocking`, which dup2s exactly the descriptors a
+    // worker may inherit onto fixed slots and relies on close-on-exec for
+    // everything else, so the window is limited to a concurrent worker spawn.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "illumos",
+        target_os = "solaris"
+    )))]
+    {
+        // SAFETY: fds has room for the two descriptors returned by pipe.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("creating worker readiness pipe");
+        }
+        for fd in fds {
+            // SAFETY: successful pipe returned both live descriptors.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: both descriptors remain owned locally on this failure.
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                }
+                return Err(error).context("setting readiness pipe close-on-exec");
+            }
+        }
+    }
+    // SAFETY: a successful pipe/pipe2 returned two newly owned descriptors.
     Ok(unsafe {
         (
             std::os::fd::OwnedFd::from_raw_fd(fds[0]),
@@ -2417,15 +2511,21 @@ async fn release_ready_successor(
             .take()
             .context("rolling successor is not a supervised child")?;
         let log_path = log_path.to_path_buf();
+        // The wait owns the `Child` only for its duration and always hands it
+        // back, a panic included, so the caller can still signal and reap the
+        // exact child on any failure.
         let (child, serving) = tokio::task::spawn_blocking(move || {
-            let serving = enforce_unix_worker_readiness(
-                &serving,
-                &mut child,
-                super::DAEMON_SPAWN_TIMEOUT,
-                &log_path,
-                generation,
-                opened_at_unix_ms,
-            );
+            let serving = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                enforce_unix_worker_readiness(
+                    &serving,
+                    &mut child,
+                    super::DAEMON_SPAWN_TIMEOUT,
+                    &log_path,
+                    generation,
+                    opened_at_unix_ms,
+                )
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("released successor serving wait panicked")));
             (child, serving)
         })
         .await
@@ -2511,21 +2611,29 @@ async fn wait_for_worker_boundary(
     tokio::time::timeout(timeout, async {
         loop {
             let stream = accept_admin(admin).await?;
-            let (request, mut stream) = read_admin(stream).await?;
+            // A malformed or vanished admin client is that connection's
+            // failure, never the handover's.
+            let (request, mut stream) = match read_admin(stream).await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, "rejecting malformed supervisor admin request during handover");
+                    continue;
+                }
+            };
             if request.version != ADMIN_PROTOCOL_VERSION {
-                write_admin(
+                reply_admin(
                     &mut stream,
                     &AdminResponse::Error {
                         version: ADMIN_PROTOCOL_VERSION,
                         message: "unsupported supervisor admin protocol".to_string(),
                     },
                 )
-                .await?;
+                .await;
                 continue;
             }
             match request.command {
                 AdminCommand::Status => {
-                    write_admin(
+                    reply_admin(
                         &mut stream,
                         &status_response(
                             expected_worker_pid,
@@ -2534,16 +2642,16 @@ async fn wait_for_worker_boundary(
                             last_handover.clone(),
                         ),
                     )
-                    .await?;
+                    .await;
                 }
                 AdminCommand::Stop => {
-                    write_admin(
+                    reply_admin(
                         &mut stream,
                         &AdminResponse::Stopping {
                             version: ADMIN_PROTOCOL_VERSION,
                         },
                     )
-                    .await?;
+                    .await;
                     bail!("administrative stop requested during worker handover");
                 }
                 AdminCommand::WorkerBoundary {
@@ -2551,7 +2659,7 @@ async fn wait_for_worker_boundary(
                     generation,
                     last_boundary,
                 } if worker_pid == expected_worker_pid && generation == expected_generation => {
-                    write_admin(
+                    reply_admin(
                         &mut stream,
                         &status_response(
                             expected_worker_pid,
@@ -2560,18 +2668,18 @@ async fn wait_for_worker_boundary(
                             last_handover,
                         ),
                     )
-                    .await?;
+                    .await;
                     return Ok(last_boundary);
                 }
                 _ => {
-                    write_admin(
+                    reply_admin(
                         &mut stream,
                         &AdminResponse::Error {
                             version: ADMIN_PROTOCOL_VERSION,
                             message: "worker handover is in progress".to_string(),
                         },
                     )
-                    .await?;
+                    .await;
                 }
             }
         }
@@ -2599,21 +2707,29 @@ async fn wait_for_worker_handover_ready(
                 },
                 stream = accept_admin(admin) => stream?,
             };
-            let (request, mut stream) = read_admin(stream).await?;
+            // A malformed or vanished admin client is that connection's
+            // failure, never the handover's.
+            let (request, mut stream) = match read_admin(stream).await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, "rejecting malformed supervisor admin request during handover");
+                    continue;
+                }
+            };
             if request.version != ADMIN_PROTOCOL_VERSION {
-                write_admin(
+                reply_admin(
                     &mut stream,
                     &AdminResponse::Error {
                         version: ADMIN_PROTOCOL_VERSION,
                         message: "unsupported supervisor admin protocol".to_string(),
                     },
                 )
-                .await?;
+                .await;
                 continue;
             }
             match request.command {
                 AdminCommand::Status => {
-                    write_admin(
+                    reply_admin(
                         &mut stream,
                         &status_response(
                             expected_worker_pid,
@@ -2622,16 +2738,16 @@ async fn wait_for_worker_handover_ready(
                             last_handover.clone(),
                         ),
                     )
-                    .await?;
+                    .await;
                 }
                 AdminCommand::Stop => {
-                    write_admin(
+                    reply_admin(
                         &mut stream,
                         &AdminResponse::Stopping {
                             version: ADMIN_PROTOCOL_VERSION,
                         },
                     )
-                    .await?;
+                    .await;
                     bail!("administrative stop requested during worker handover");
                 }
                 AdminCommand::WorkerHandoverReady {
@@ -2639,7 +2755,7 @@ async fn wait_for_worker_handover_ready(
                     generation,
                 } if worker_pid == expected_worker_pid && generation == expected_generation => {
                     ensure_staged_successor_live(successor)?;
-                    write_admin(
+                    reply_admin(
                         &mut stream,
                         &status_response(
                             expected_worker_pid,
@@ -2648,18 +2764,18 @@ async fn wait_for_worker_handover_ready(
                             last_handover,
                         ),
                     )
-                    .await?;
+                    .await;
                     return Ok(());
                 }
                 _ => {
-                    write_admin(
+                    reply_admin(
                         &mut stream,
                         &AdminResponse::Error {
                             version: ADMIN_PROTOCOL_VERSION,
                             message: "worker handover is in progress".to_string(),
                         },
                     )
-                    .await?;
+                    .await;
                 }
             }
         }
@@ -2763,6 +2879,19 @@ where
         bail!("invalid supervisor admin frame length");
     }
     serde_json::from_str(line.trim_end()).context("decoding supervisor admin frame")
+}
+
+/// Reply on one admin connection. A reply failure (typically `EPIPE` from a
+/// client that disconnected before reading) belongs to that connection alone:
+/// it must never exit the supervisor, whose death would take the healthy
+/// worker down with it through the liveness pipe.
+async fn reply_admin<W>(stream: &mut W, response: &AdminResponse)
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Err(error) = write_admin(stream, response).await {
+        tracing::warn!(%error, "supervisor admin client went away before its reply");
+    }
 }
 
 async fn write_admin<W>(stream: &mut W, response: &AdminResponse) -> Result<()>
@@ -2907,6 +3036,7 @@ struct ReexecRequest<'a> {
     database_owner: &'a crate::db::SupervisorDatabaseOwner,
     worker: &'a Worker,
     generation: u64,
+    highest_attempted_generation: u64,
     opened_at_unix_ms: u64,
     no_sandbox: bool,
     resume_all_sessions: bool,
@@ -2931,6 +3061,7 @@ fn reexec_supervisor(request: ReexecRequest<'_>) -> Result<()> {
         worker_pid: request.worker.pid,
         worker_binary: request.worker.binary.clone(),
         generation: request.generation,
+        highest_attempted_generation: request.highest_attempted_generation,
         opened_at_unix_ms: request.opened_at_unix_ms,
     })?;
     let mut command = std::process::Command::new(request.executable);
@@ -2955,6 +3086,7 @@ fn reexec_supervisor(request: ReexecRequest<'_>) -> Result<()> {
         worker_pid: request.worker.pid,
         worker_binary: request.worker.binary.clone(),
         generation: request.generation,
+        highest_attempted_generation: request.highest_attempted_generation,
         opened_at_unix_ms: request.opened_at_unix_ms,
     })?;
     let mut command = std::process::Command::new(request.executable);
@@ -3159,6 +3291,35 @@ mod tests {
         assert_eq!(worker, None);
         assert_eq!(generation, 14);
         assert_eq!(attempts, vec![12, 13, 14]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reexec_state_carries_highest_attempted_and_accepts_older_state() {
+        let older: ReexecState = serde_json::from_value(serde_json::json!({
+            "database_lock_fd": 3,
+            "lifetime_fd": 4,
+            "pid_lock_fd": 5,
+            "control_fd": 6,
+            "reveal_fd": 7,
+            "admin_fd": 8,
+            "worker_pid": 42,
+            "worker_binary": "/usr/bin/cockpit",
+            "generation": 9,
+            "opened_at_unix_ms": 1,
+        }))
+        .expect("a pre-upgrade supervisor's reexec state still decodes");
+        assert_eq!(older.highest_attempted_generation, 0);
+        assert!(older.liveness_fds.is_none());
+
+        let mut current = older.clone();
+        current.highest_attempted_generation = 12;
+        let decoded: ReexecState =
+            serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(
+            decoded.highest_attempted_generation, 12,
+            "burned attempts survive reexec so a retry never reuses one"
+        );
     }
 
     #[test]

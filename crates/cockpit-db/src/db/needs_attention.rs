@@ -683,7 +683,7 @@ impl Db {
     }
 
     pub async fn mark_interrupt_interrupted(&self, interrupt_id: Uuid) -> Result<bool> {
-        self.transaction(move |conn| {
+        self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -694,12 +694,6 @@ impl Db {
                     params![interrupt_id.to_string()],
                 )
                 .context("marking needs_attention interrupted")?;
-            if affected > 0 {
-                crate::db::tool_recovery::close_parked_call_intent_for_interrupt_conn(
-                    conn,
-                    interrupt_id,
-                )?;
-            }
             Ok(affected > 0)
         })
         .await
@@ -761,10 +755,6 @@ impl Db {
                 )
                 .context("marking linked executing interrupt interrupted")?;
             if affected == 1 {
-                crate::db::tool_recovery::close_parked_call_intent_for_interrupt_conn(
-                    conn,
-                    interrupt_id,
-                )?;
                 crate::db::agent_tree_decisions::insert_control_event(
                     conn,
                     session_id,
@@ -844,14 +834,19 @@ impl Db {
     ) -> Result<bool> {
         let response_json =
             serde_json::to_string(response).context("serializing parked interrupt response")?;
+        // The claim is bound to the generation taking it: only this worker
+        // generation may adopt the parked call's write-ahead intent.
+        let claim_generation = i64::try_from(self.writer_generation())
+            .context("parked replay claim generation overflow")?;
         self.write(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
-                        SET state = 'executing', response_json = ?1
+                        SET state = 'executing', response_json = ?1,
+                            parked_claim_generation = ?3
                       WHERE interrupt_id = ?2 AND state = 'parked'
                         AND decision_request_id IS NULL",
-                    params![response_json, interrupt_id.to_string()],
+                    params![response_json, interrupt_id.to_string(), claim_generation],
                 )
                 .context("marking parked interrupt executing")?;
             Ok(affected > 0)

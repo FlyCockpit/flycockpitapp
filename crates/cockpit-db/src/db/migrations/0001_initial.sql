@@ -2766,6 +2766,14 @@ CREATE TABLE needs_attention (
             AND length(CAST(parked_verification_json AS BLOB)) <= 65536
         )
     ),                  -- serialized verification replay memo, or NULL
+    -- Worker generation that took the durable `executing` claim of this
+    -- parked tool-call replay. The claim authorizes exactly that generation
+    -- to adopt the call's write-ahead intent; a replay from any other
+    -- generation (including a stale predecessor) is refused. NULL for rows
+    -- that were never claimed or were claimed without an executable replay.
+    parked_claim_generation INTEGER CHECK (
+        parked_claim_generation IS NULL OR parked_claim_generation >= 0
+    ),
     -- Recursive-agent decisions use this typed ownership edge. A linked real
     -- QuestionTool interrupt retains its immutable question and parked-call
     -- continuation; synthetic attention rows carry neither.
@@ -2918,6 +2926,46 @@ WHEN OLD.decision_request_id IS NOT NULL
  )
 BEGIN
     SELECT RAISE(ABORT, 'decision-owned needs-attention is managed by decision state machine');
+END;
+
+-- A tool call parked on a durable interrupt owns its write-ahead intent for
+-- as long as the park is live (see `tool_recovery::park_owned_intent_sql`).
+-- When the park settles terminally, close that intent in the same statement,
+-- whichever path settled it: the park's outcome is the durable answer for the
+-- call, and a surviving intent would resurface the same call as an unowned
+-- crash-recovery decision. The intent may belong to the park's session or a
+-- fork descendant whose tool raised the interrupt through the owner's hub.
+-- `open -> resolved` is excluded: a live waiter's tool continues after its
+-- answer and closes its own intent with its result. A sibling live park of
+-- the same call (a replay that parked again) keeps the intent.
+CREATE TRIGGER needs_attention_parked_call_settled
+AFTER UPDATE OF state ON needs_attention
+WHEN NEW.parked_call_id IS NOT NULL
+ AND NEW.recovery_intent_id IS NULL
+ AND NEW.state IN ('resolved', 'interrupted')
+ AND OLD.state IN ('open', 'parked', 'executing')
+ AND NOT (OLD.state = 'open' AND NEW.state = 'resolved')
+BEGIN
+    DELETE FROM tool_execution_intents
+     WHERE call_id = NEW.parked_call_id
+       AND session_id IN (
+           WITH RECURSIVE owned(session_id) AS (
+               SELECT NEW.session_id
+               UNION
+               SELECT s.session_id
+                 FROM sessions s
+                 JOIN owned o ON s.parent_session_id = o.session_id
+           )
+           SELECT session_id FROM owned
+       )
+       AND NOT EXISTS (
+           SELECT 1 FROM needs_attention other
+            WHERE other.parked_call_id = NEW.parked_call_id
+              AND other.session_id = NEW.session_id
+              AND other.interrupt_id <> NEW.interrupt_id
+              AND other.recovery_intent_id IS NULL
+              AND other.state IN ('open', 'parked', 'executing')
+       );
 END;
 
 -- ---- tool_call_stats view ----------------------------------------------------

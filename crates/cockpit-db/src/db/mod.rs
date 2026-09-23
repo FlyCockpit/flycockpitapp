@@ -861,6 +861,17 @@ impl std::fmt::Debug for Db {
 }
 
 impl Db {
+    /// Worker generation this handle writes as: the supervised writer fence
+    /// generation, or 0 for an unsupervised database (which matches the 0
+    /// generation an unsupervised worker stamps on its tool intents).
+    pub fn writer_generation(&self) -> u64 {
+        self.supervised_fence
+            .as_ref()
+            .map_or(0, |fence| fence.generation)
+    }
+}
+
+impl Db {
     /// Resolve the canonical database path without creating or opening it.
     pub fn default_path() -> Result<PathBuf> {
         Ok(files::cockpit_data_dir()?.join("cockpit.db"))

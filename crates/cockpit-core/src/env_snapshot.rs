@@ -10,11 +10,23 @@ pub use crate::daemon::proto::{
     EnvDiffSummary, EnvDriftPolicy, EnvSnapshotMeta, EnvSnapshotSource, EnvSnapshotWire,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EnvSnapshot {
     source: EnvSnapshotSource,
     vars: HashMap<String, String>,
     digest: String,
+}
+
+impl std::fmt::Debug for EnvSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Environment values routinely carry credentials: never print them.
+        formatter
+            .debug_struct("EnvSnapshot")
+            .field("source", &self.source)
+            .field("digest", &self.digest)
+            .field("key_count", &self.vars.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl EnvSnapshot {
@@ -315,6 +327,28 @@ fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn debug_never_prints_env_values() {
+        const SENTINEL: &str = "ghp_debugSentinelValue0123456789abcdef";
+        let snapshot = EnvSnapshot::new(
+            EnvSnapshotSource::TuiShell,
+            HashMap::from([
+                ("GITHUB_TOKEN".into(), SENTINEL.into()),
+                (
+                    "DATABASE_URL".into(),
+                    format!("postgres://u:{SENTINEL}@db/x"),
+                ),
+            ]),
+        );
+        for rendered in [format!("{snapshot:?}"), format!("{snapshot:#?}")] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+            assert!(rendered.contains("key_count"), "{rendered}");
+        }
+        let wire = snapshot.to_wire();
+        let rendered = format!("{wire:?}");
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+    }
 
     #[test]
     fn digest_is_stable_regardless_of_map_order() {

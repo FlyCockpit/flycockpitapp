@@ -55,7 +55,7 @@ pub struct BackgroundHandle {
     pgid: Arc<Mutex<Option<u32>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BackgroundLaunch {
     pub confine: bool,
     pub tmp_dir: Option<PathBuf>,
@@ -70,6 +70,25 @@ pub struct BackgroundLaunch {
     write_denied_knowledge_paths: Vec<PathBuf>,
     #[cfg(test)]
     test_sandbox_build: Option<TestSandboxBuild>,
+}
+
+impl std::fmt::Debug for BackgroundLaunch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The session env carries credentials: print a key count, not values.
+        formatter
+            .debug_struct("BackgroundLaunch")
+            .field("confine", &self.confine)
+            .field("tmp_dir", &self.tmp_dir)
+            .field("workspace_scratch_dir", &self.workspace_scratch_dir)
+            .field("session_env_key_count", &self.session_env.len())
+            .field("attached_knowledge_paths", &self.attached_knowledge_paths)
+            .field("denied_knowledge_paths", &self.denied_knowledge_paths)
+            .field(
+                "write_denied_knowledge_paths",
+                &self.write_denied_knowledge_paths,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl BackgroundLaunch {
@@ -1139,6 +1158,19 @@ fn scrub_overrides(session_env: &HashMap<String, String>) -> Vec<(String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_launch_debug_never_prints_session_env_values() {
+        const SENTINEL: &str = "AKIAdebugSentinelValue77";
+        let launch = BackgroundLaunch::unconfined(HashMap::from([(
+            "AWS_ACCESS_KEY_ID".to_string(),
+            SENTINEL.to_string(),
+        )]));
+        for rendered in [format!("{launch:?}"), format!("{launch:#?}")] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+            assert!(rendered.contains("session_env_key_count"), "{rendered}");
+        }
+    }
 
     fn spawn_test_job(
         label: &str,

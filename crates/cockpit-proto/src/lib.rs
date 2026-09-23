@@ -411,11 +411,24 @@ pub enum AgentInterruptResponse {
     Cancel,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSnapshotWire {
     pub source: EnvSnapshotSource,
     pub digest: String,
     pub vars: HashMap<String, String>,
+}
+
+impl fmt::Debug for EnvSnapshotWire {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Environment values routinely carry credentials. Diagnostics get the
+        // source, digest and a key count, never names-to-values.
+        formatter
+            .debug_struct("EnvSnapshotWire")
+            .field("source", &self.source)
+            .field("digest", &self.digest)
+            .field("key_count", &self.vars.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5857,6 +5870,50 @@ mod proto_fixture_files {
 mod tests {
     use super::*;
     use crate::send_user_message::MessageIngress;
+
+    #[test]
+    fn env_snapshot_wire_debug_never_prints_values() {
+        const SENTINEL: &str = "sk-live-debug-sentinel-7f3a9c";
+        let wire = EnvSnapshotWire {
+            source: EnvSnapshotSource::TuiShell,
+            digest: "digest".to_string(),
+            vars: HashMap::from([
+                ("OPENAI_API_KEY".to_string(), SENTINEL.to_string()),
+                ("PLAIN".to_string(), format!("prefix-{SENTINEL}")),
+            ]),
+        };
+        let rendered = format!("{wire:?}");
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+        assert!(rendered.contains("key_count: 2"), "{rendered}");
+        let pretty = format!("{wire:#?}");
+        assert!(!pretty.contains(SENTINEL), "{pretty}");
+
+        let request = crate::Request::Attach {
+            session_id: None,
+            since_seq: None,
+            project_root: None,
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            session_entry_mode: NonCodeSessionEntryMode::Assistant,
+            model_override: None,
+            env_snapshot: Some(wire.clone()),
+            env_policy: EnvDriftPolicy::Client,
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+
+        let options = crate::acp::CodeRootAttachOptionsV1 {
+            initial_model: None,
+            model_override: None,
+            no_sandbox: false,
+            interactive: true,
+            env_snapshot: Some(wire),
+            env_policy: EnvDriftPolicy::Client,
+        };
+        let rendered = format!("{options:?}");
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+    }
 
     #[cfg(feature = "remote")]
     #[test]

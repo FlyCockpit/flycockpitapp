@@ -41,6 +41,9 @@ pub use tui_pty::*;
 
 pub struct IsolatedHome {
     _root: Option<tempfile::TempDir>,
+    // A separate short root so the daemon socket fits `sun_path` on every
+    // platform (see `cockpit_test_support::short_socket_tempdir`).
+    _runtime_root: Option<tempfile::TempDir>,
     config_home: PathBuf,
     data_home: PathBuf,
     state_home: PathBuf,
@@ -67,7 +70,8 @@ impl IsolatedHome {
         let config_home = root.path().join("config");
         let data_home = root.path().join("data");
         let state_home = root.path().join("state");
-        let runtime_dir = root.path().join("runtime");
+        let runtime_root = cockpit_test_support::short_socket_tempdir();
+        let runtime_dir = runtime_root.path().to_path_buf();
         let cache_home = root.path().join("cache");
         let project = root.path().join("project");
         for dir in [
@@ -97,6 +101,7 @@ impl IsolatedHome {
         }
         Self {
             _root: Some(root),
+            _runtime_root: Some(runtime_root),
             config_home,
             data_home,
             state_home,
@@ -349,17 +354,26 @@ impl IsolatedHome {
         cmd
     }
 
+    /// The daemon's rendezvous files, derived by the product's own layout
+    /// function for this home's pinned `XDG_RUNTIME_DIR`.
+    pub fn rendezvous_files(&self) -> cockpit_core::daemon::rendezvous::Files {
+        cockpit_core::daemon::rendezvous::runtime_root_files(&self.runtime_dir, &self.db_path())
+            .expect("derive isolated daemon rendezvous layout")
+            .unwrap_or_else(|| {
+                panic!(
+                    "isolated XDG_RUNTIME_DIR {} exceeds the platform socket budget; the daemon \
+                     would fall back to a shared per-user root",
+                    self.runtime_dir.display()
+                )
+            })
+    }
+
     pub fn socket_path(&self) -> PathBuf {
-        self.runtime_dir
-            .join("cockpit")
-            .join(cockpit_core::daemon::rendezvous::identity_hash(
-                &self.db_path(),
-            ))
-            .join("cockpit.sock")
+        self.rendezvous_files().socket
     }
 
     pub fn pid_file(&self) -> PathBuf {
-        self.socket_path().with_file_name("daemon.pid")
+        self.rendezvous_files().pid
     }
 
     /// Daemon-owned agent packages (installed and authored). They are durable
@@ -396,6 +410,10 @@ impl IsolatedHome {
     /// Removing its receipt/socket while the owned daemon may still be alive
     /// would hide an escaped generation from the test runner.
     pub fn preserve_after_cleanup_failure(&mut self) -> PathBuf {
+        if let Some(runtime_root) = self._runtime_root.take() {
+            let runtime = runtime_root.keep();
+            eprintln!("preserved isolated runtime root {}", runtime.display());
+        }
         self._root
             .take()
             .expect("isolated home root already preserved")
@@ -655,7 +673,7 @@ impl SpawnedDaemon {
 
     async fn start_in(home: IsolatedHome) -> Self {
         let child = spawn_foreground_daemon(&home);
-        let process = EphemeralDaemonGuard::new(child, home.socket_path(), home.pid_file());
+        let process = EphemeralDaemonGuard::new(child, home.rendezvous_files());
         wait_for_status_handshake(&home, DAEMON_START_HANDSHAKE_TIMEOUT).await;
         Self { process, home }
     }
@@ -1333,16 +1351,12 @@ pub struct EphemeralDaemonGuard {
 }
 
 impl EphemeralDaemonGuard {
-    pub fn new(child: std::process::Child, socket: PathBuf, pid_file: PathBuf) -> Self {
-        let endpoint = pid_file
-            .parent()
-            .expect("isolated daemon pid file has a state directory")
-            .join("daemon.json");
+    pub fn new(child: std::process::Child, files: cockpit_core::daemon::rendezvous::Files) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
-            socket,
-            endpoint,
-            pid_file,
+            socket: files.socket,
+            endpoint: files.rendezvous,
+            pid_file: files.pid,
         }
     }
 

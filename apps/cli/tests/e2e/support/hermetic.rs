@@ -914,7 +914,7 @@ impl HermeticCockpit {
     /// live and must publish a higher generation without client action.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub fn sigkill_worker(&self) -> u32 {
-        let rendezvous = self.home.pid_file().with_file_name("daemon.json");
+        let rendezvous = self.home.rendezvous_files().rendezvous;
         let value: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&rendezvous).expect("read supervised daemon rendezvous"),
         )

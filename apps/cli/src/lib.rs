@@ -1221,7 +1221,7 @@ fn init_tracing(
         return None;
     }
 
-    match dirs::cache_dir().map(|dir| dir.join("cockpit")) {
+    match cockpit_config::config::resolve::cockpit_cache_dir().ok() {
         Some(log_dir) => {
             // Directory validation, file open/metadata, rotation, and all
             // subsequent writes belong to the log worker. In particular, a
@@ -1327,8 +1327,8 @@ impl DeferredInteractiveLog {
     }
 
     fn open_and_flush_file_sink(&self) {
-        let sink = dirs::cache_dir()
-            .map(|dir| dir.join("cockpit"))
+        let sink = cockpit_config::config::resolve::cockpit_cache_dir()
+            .ok()
             .and_then(open_log_file_at);
         let mut state = self
             .records

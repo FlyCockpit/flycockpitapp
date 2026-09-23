@@ -73,7 +73,9 @@ pub fn cache_dir() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(over));
     }
-    dirs::cache_dir().map(|d| d.join("cockpit/mcp"))
+    cockpit_config::config::resolve::cockpit_cache_dir()
+        .ok()
+        .map(|dir| dir.join("mcp"))
 }
 
 fn now_unix() -> u64 {

@@ -64,36 +64,64 @@ pub fn resolve(database_path: &Path) -> Result<Files> {
         let xdg = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .map(|root| root.join("cockpit").join(&hash));
+            .and_then(|root| runtime_root_files_for_hash(&root, &hash));
         match xdg {
-            Some(candidate) if socket_path_fits(&candidate.join("cockpit.sock")) => candidate,
-            _ => per_user_tmp_root(&hash)?.join("cockpit").join(&hash),
+            Some(files) => files.directory,
+            None => per_user_tmp_root(&hash)?.join("cockpit").join(&hash),
         }
     };
 
-    let socket = directory.join("cockpit.sock");
-    if !socket_path_fits(&socket) {
+    let files = files_in(directory);
+    if !socket_path_fits(&files.socket) {
         if std::env::var_os(SOCKET_DIR_ENV).is_some() {
             anyhow::bail!(
                 "{SOCKET_DIR_ENV} produces a daemon socket path longer than the platform limit: {}",
-                socket.display()
+                files.socket.display()
             );
         }
         anyhow::bail!(
             "computed daemon socket path is longer than the platform limit: {}; set \
              {SOCKET_DIR_ENV} to a shorter existing directory",
-            socket.display()
+            files.socket.display()
         );
     }
-    cockpit_host::private_fs::ensure_private_dir(&directory)
-        .with_context(|| format!("securing socket directory {}", directory.display()))?;
-    Ok(Files {
-        socket,
+    cockpit_host::private_fs::ensure_private_dir(&files.directory)
+        .with_context(|| format!("securing socket directory {}", files.directory.display()))?;
+    Ok(files)
+}
+
+/// The rendezvous layout [`resolve`] selects for the ledger at
+/// `database_path` when `XDG_RUNTIME_DIR` names `runtime_root`, or `None`
+/// when that socket would exceed the platform's `sun_path` budget (the
+/// daemon then falls back to a short per-user temp root instead).
+///
+/// Pure: it creates nothing and reads no environment (a relative
+/// `database_path` is anchored at the current directory, as in
+/// [`resolve`]). Harnesses that pin an explicit runtime root derive the
+/// daemon's socket and pid paths through this instead of re-deriving the
+/// layout, so the two cannot drift.
+pub fn runtime_root_files(runtime_root: &Path, database_path: &Path) -> Result<Option<Files>> {
+    let identity = absolute_identity(database_path)?;
+    Ok(runtime_root_files_for_hash(
+        runtime_root,
+        &identity_hash(&identity),
+    ))
+}
+
+fn runtime_root_files_for_hash(runtime_root: &Path, hash: &str) -> Option<Files> {
+    let files = files_in(runtime_root.join("cockpit").join(hash));
+    socket_path_fits(&files.socket).then_some(files)
+}
+
+/// The single naming authority for the files inside a rendezvous directory.
+fn files_in(directory: PathBuf) -> Files {
+    Files {
+        socket: directory.join("cockpit.sock"),
         pid: directory.join("daemon.pid"),
         rendezvous: directory.join("daemon.json"),
         start_lock: directory.join("start.lock"),
         directory,
-    })
+    }
 }
 
 /// Stable directory component used by test harnesses and the later daemon

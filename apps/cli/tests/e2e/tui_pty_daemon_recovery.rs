@@ -96,7 +96,7 @@ fn wait_for_replacement_rendezvous(
     session: &HermeticCockpit,
     old_worker_pid: u32,
 ) -> serde_json::Value {
-    let path = session.home().pid_file().with_file_name("daemon.json");
+    let path = session.home().rendezvous_files().rendezvous;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(bytes) = std::fs::read(&path)
@@ -114,7 +114,7 @@ fn wait_for_replacement_rendezvous(
 }
 
 fn daemon_rendezvous(session: &HermeticCockpit) -> serde_json::Value {
-    let path = session.home().pid_file().with_file_name("daemon.json");
+    let path = session.home().rendezvous_files().rendezvous;
     serde_json::from_slice(&std::fs::read(path).expect("read supervised daemon rendezvous"))
         .expect("decode supervised daemon rendezvous")
 }

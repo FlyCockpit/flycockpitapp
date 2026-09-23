@@ -134,6 +134,44 @@ pub fn isolated_tempdir() -> tempfile::TempDir {
     }
 }
 
+/// A private directory short enough to root Unix-domain sockets.
+///
+/// `sockaddr_un.sun_path` is 104 bytes on macOS and 108 on Linux, and the
+/// daemon keeps a reserve below that, so a runtime root nested inside an
+/// ordinary temp home (`/private/tmp/.tmpXXXXXX/runtime`, or a default macOS
+/// `$TMPDIR` under `/var/folders/…`) pushes its socket over budget and the
+/// daemon correctly falls back to a shared per-user root. Harnesses that pin
+/// `XDG_RUNTIME_DIR` use this instead, rooted directly under the canonical
+/// system temp directory (`/tmp` resolves to `/private/tmp` on macOS; the
+/// canonical spelling keeps symlink-aware path checks exact).
+pub fn short_socket_tempdir() -> tempfile::TempDir {
+    #[cfg(unix)]
+    {
+        let root = std::fs::canonicalize("/tmp").expect("resolve the system temp directory");
+        tempfile::Builder::new()
+            .prefix("c")
+            .tempdir_in(root)
+            .expect("create short socket tempdir")
+    }
+    #[cfg(not(unix))]
+    {
+        tempfile::tempdir().expect("create socket tempdir")
+    }
+}
+
+/// The system `true` utility, resolved from the system binary directories
+/// only (a developer `PATH` must not choose a fixture's pinned executable).
+/// macOS ships it only as `/usr/bin/true`; many Linux distributions have
+/// both `/usr/bin/true` and `/bin/true`.
+#[cfg(unix)]
+pub fn system_true_executable() -> PathBuf {
+    ["/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|candidate| candidate.is_file())
+        .expect("the system `true` utility exists in /usr/bin or /bin")
+}
+
 #[must_use]
 pub struct TestEnvGuard {
     _guard: MutexGuard<'static, ()>,

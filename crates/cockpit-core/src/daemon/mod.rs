@@ -2962,7 +2962,14 @@ async fn run_foreground_inner_with_boot_db_impl(
                 paths.pid_file == canonical.pid_file && paths.socket == canonical.socket
             })
     {
-        let discovered = discover().await;
+        let mut discovered = discover().await;
+        if discovered.status == DaemonStatus::UnrecognizedPidMetadata {
+            // A concurrent starter publishes its PID file with an exclusive
+            // create followed by a write, so a reader can briefly observe a
+            // partial body. Look once more before treating it as foreign.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            discovered = discover().await;
+        }
         if discovered.status == DaemonStatus::UnrecognizedPidMetadata {
             // Fail before contending for the lifetime lock an older build's
             // daemon may still hold, so the user gets the cleanup steps.

@@ -1326,6 +1326,26 @@ impl App {
                     crate::tui::app::ToastKind::Error,
                 ),
             },
+            // Settled host-capability poll for the probing secure-store
+            // screen. Read-only like the refresh above; a failed poll leaves
+            // the probing rows in place and the next authoritative snapshot
+            // (any refresh or transition) restarts it.
+            AsyncActionKind::Refresh("onboarding.capabilities") => match result.payload {
+                Ok(AsyncActionPayload::OnboardingBootstrap(snapshot, client)) => {
+                    if let Some(selected) = self.startup_lifecycle.as_mut() {
+                        selected.lifetime_client = Some(client);
+                    }
+                    self.apply_onboarding_bootstrap_snapshot(snapshot);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "onboarding host capability poll failed");
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "onboarding host capability poll returned an invalid projection"
+                    );
+                }
+            },
             AsyncActionKind::DaemonRpc("onboarding.provider.verify") => match result.payload {
                 Ok(AsyncActionPayload::StartupProviderVerification(completion)) => {
                     if let Some(shell) = self.onboarding_shell.as_mut() {

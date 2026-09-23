@@ -810,7 +810,78 @@ impl App {
         } else {
             self.onboarding_shell = None;
         }
+        if self
+            .onboarding_shell
+            .as_ref()
+            .is_some_and(|shell| shell.secure_store_capabilities_probing())
+        {
+            self.start_onboarding_capability_probe_wait();
+        }
         self.maybe_open_pending_setup_wizard();
+    }
+
+    /// The locked daemon answers onboarding before its host probes settle,
+    /// and a locked connection carries no push events. While the mounted
+    /// secure-store screen shows the probing placeholder, re-read the
+    /// authoritative bootstrap snapshot on one connection until the settled
+    /// capability snapshot (generation > 0) lands, then apply it through the
+    /// ordinary snapshot path. Read-only and deduplicated; the daemon settles
+    /// its probes (fail-closed on timeout) well within the poll budget.
+    fn start_onboarding_capability_probe_wait(&mut self) {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        const POLL_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+        if self.onboarding_skip || self.onboarding_dismissed {
+            return;
+        }
+        // Poll only the daemon that served this snapshot: never resolve (and
+        // possibly spawn) a default owner merely to watch probes settle.
+        let Some(endpoint) = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone())
+        else {
+            return;
+        };
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Refresh("onboarding.capabilities"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("onboarding.capabilities"),
+            ),
+            async move {
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let budget = tokio::time::Instant::now() + POLL_BUDGET;
+                loop {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    let current = match client
+                        .request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot)) => {
+                            snapshot
+                        }
+                        Ok(other) => {
+                            return Err(format!("unexpected onboarding response: {other:?}"));
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    let settled = current.as_ref().is_none_or(|snapshot| {
+                        snapshot.stage != cockpit_proto::OnboardingStage::SecureStore
+                            || snapshot.host_capabilities.generation > 0
+                            || !snapshot.host_capabilities.features.is_empty()
+                    });
+                    if settled || tokio::time::Instant::now() >= budget {
+                        return Ok(
+                            crate::tui::async_action::AsyncActionPayload::OnboardingBootstrap(
+                                current, client,
+                            ),
+                        );
+                    }
+                }
+            },
+        );
     }
 
     /// Activate, update, or retire the full-screen onboarding shell so it

@@ -5,9 +5,20 @@ use cockpit_proto::{
     OnboardingTransitionKind, Request, Response,
 };
 
-use super::{BootServices, LockedServices, boot_with_db, handle_locked_in_process_request};
+use super::{
+    BootServices, LockedProbeFuture, LockedProbePlan, LockedServices, boot_with_db_and_probe_plan,
+    handle_locked_in_process_request,
+};
+
+type ProbeInputs = crate::host_capabilities::HostCapabilityProbeInputs;
 
 async fn fresh_locked_services() -> (tempfile::TempDir, super::LockedServices) {
+    locked_services_with_probe_plan(LockedProbePlan::production()).await
+}
+
+async fn locked_services_with_probe_plan(
+    probe_plan: LockedProbePlan,
+) -> (tempfile::TempDir, super::LockedServices) {
     let tmp = tempfile::tempdir().expect("temporary daemon installation");
     let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).expect("fresh database");
     let mut extended = crate::config::extended::ExtendedConfig::default();
@@ -21,7 +32,7 @@ async fn fresh_locked_services() -> (tempfile::TempDir, super::LockedServices) {
         crate::config::extended::DaemonSecretStoreBackend::File;
     extended.daemon.boot.secret_store_path = Some(tmp.path().join("secret-vault"));
     let mut timer = crate::startup::PhaseTimer::start("locked_onboarding_test");
-    let services = boot_with_db(
+    let services = boot_with_db_and_probe_plan(
         crate::daemon::DaemonPaths {
             socket: tmp.path().join("cockpit.sock"),
             pid_file: tmp.path().join("cockpit.pid"),
@@ -34,6 +45,7 @@ async fn fresh_locked_services() -> (tempfile::TempDir, super::LockedServices) {
             crate::config::providers::ProvidersConfig::default(),
             extended,
         ),
+        probe_plan,
     )
     .await
     .expect("vault-free boot");
@@ -54,7 +66,7 @@ async fn advance_to_secure_store(
                 client_operation_id: "begin-locked".into(),
                 reentry: false,
             },
-            locked.host_capabilities.clone(),
+            locked.host_capabilities(),
         )
         .await
         .expect("begin onboarding");
@@ -69,7 +81,7 @@ async fn advance_to_secure_store(
                 transition: OnboardingTransitionKind::Advance,
                 settlement: None,
             },
-            locked.host_capabilities.clone(),
+            locked.host_capabilities(),
         )
         .await
         .expect("commit welcome");
@@ -84,7 +96,7 @@ async fn advance_to_secure_store(
                 transition: OnboardingTransitionKind::Advance,
                 settlement: None,
             },
-            locked.host_capabilities.clone(),
+            locked.host_capabilities(),
         )
         .await
         .expect("commit profile")
@@ -213,7 +225,7 @@ async fn locked_dispatch_carries_the_handler_cause_in_the_message() {
                 client_operation_id: "begin-cause".into(),
                 reentry: false,
             },
-            locked.host_capabilities.clone(),
+            locked.host_capabilities(),
         )
         .await
         .expect("begin onboarding");
@@ -339,7 +351,7 @@ async fn locked_bootstrap_settles_only_the_onboarding_profile_apply() {
                 client_operation_id: "begin-profile-settlement".into(),
                 reentry: false,
             },
-            locked.host_capabilities.clone(),
+            locked.host_capabilities(),
         )
         .await
         .expect("begin onboarding");
@@ -370,7 +382,7 @@ async fn locked_bootstrap_settles_only_the_onboarding_profile_apply() {
                 transition: OnboardingTransitionKind::Advance,
                 settlement: None,
             },
-            locked.host_capabilities.clone(),
+            locked.host_capabilities(),
         )
         .await
         .expect("advance to the Profile stage");
@@ -458,7 +470,7 @@ async fn locked_bootstrap_settles_only_the_onboarding_profile_apply() {
                 transition: OnboardingTransitionKind::Advance,
                 settlement: None,
             },
-            locked.host_capabilities.clone(),
+            locked.host_capabilities(),
         )
         .await
         .expect("advance past the Profile stage");
@@ -665,4 +677,187 @@ async fn sensitive_wire_disconnect_retains_permit_through_rollback() {
         "wire-delivery rollback must retain exclusive transition ownership"
     );
     assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+}
+
+/// A locked probe plan whose run blocks on `gate`, then returns hermetic
+/// (injected) probes that keep the configured keyring source. Dropping the
+/// sender also releases the gate.
+fn gated_probe_plan(gate: tokio::sync::oneshot::Receiver<()>) -> LockedProbePlan {
+    let runner = move |inputs: ProbeInputs| -> LockedProbeFuture {
+        Box::pin(async move {
+            let _ = gate.await;
+            let mut hermetic = ProbeInputs::for_unit_tests(inputs.cwd.clone());
+            hermetic.keyring = inputs.keyring.clone();
+            crate::host_capabilities::collect_shared_host_probes(&hermetic, false).await
+        })
+    };
+    LockedProbePlan::injected(Box::new(runner), std::time::Duration::from_secs(30))
+}
+
+fn hello_capabilities(response: Response) -> cockpit_proto::HostCapabilitySnapshot {
+    match response {
+        Response::LockedBootstrapHello(hello) => hello.host_capabilities,
+        other => panic!("expected a locked bootstrap hello, got {other:?}"),
+    }
+}
+
+/// Onboarding is shown first: the locked hello is served while the host
+/// probes are still running (the probing placeholder, generation 0), and the
+/// settled snapshot is published at a strictly newer generation afterwards.
+#[tokio::test]
+async fn locked_hello_is_served_before_slow_probes_and_generation_bumps_after() {
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (_tmp, locked) = locked_services_with_probe_plan(gated_probe_plan(gate)).await;
+
+    let probing = hello_capabilities(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_locked_in_process_request(&locked, Request::DaemonStatus),
+        )
+        .await
+        .expect("the locked hello must not wait for host probes")
+        .expect("locked hello"),
+    );
+    assert_eq!(probing.generation, 0, "probing placeholder is generation 0");
+    assert!(
+        probing.features.is_empty(),
+        "no capability row may be reported before the probes settle"
+    );
+    assert!(
+        locked.host_capabilities().features.is_empty(),
+        "the gated probe run must still be pending"
+    );
+
+    release.send(()).expect("release the gated probe run");
+    let settled = locked
+        .host_probes
+        .settled()
+        .await
+        .expect("released probes settle");
+    assert!(settled.snapshot.generation > probing.generation);
+    assert!(
+        settled
+            .snapshot
+            .feature(crate::host_capabilities::FEATURE_SECRET_STORE_FILE)
+            .is_some(),
+        "the settled snapshot carries the secure-store rows"
+    );
+
+    let published = hello_capabilities(
+        handle_locked_in_process_request(&locked, Request::DaemonStatus)
+            .await
+            .expect("locked hello after settle"),
+    );
+    assert_eq!(published, settled.snapshot);
+    let bootstrap =
+        match handle_locked_in_process_request(&locked, Request::GetOnboardingBootstrapSnapshot)
+            .await
+            .expect("bootstrap snapshot")
+        {
+            Response::OnboardingBootstrapSnapshot(snapshot) => snapshot,
+            other => panic!("unexpected bootstrap response: {other:?}"),
+        };
+    assert!(
+        bootstrap.is_none_or(|snapshot| snapshot.host_capabilities == settled.snapshot),
+        "the onboarding projection refreshes to the settled snapshot"
+    );
+}
+
+/// A secure-store choice made while the probes are still running waits for
+/// them (bounded) instead of reporting the placement unavailable.
+#[tokio::test]
+async fn apply_secure_intent_awaits_a_pending_probe() {
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (_tmp, locked) = locked_services_with_probe_plan(gated_probe_plan(gate)).await;
+    let locked = std::sync::Arc::new(locked);
+    let secure = advance_to_secure_store(&locked).await;
+    assert_eq!(secure.stage, OnboardingStage::SecureStore);
+    assert_eq!(secure.host_capabilities.generation, 0);
+
+    let applying = tokio::spawn({
+        let locked = locked.clone();
+        async move {
+            locked
+                .apply_secure_intent(ApplyOnboardingSecureIntent {
+                    run_id: secure.run_id,
+                    attempt_id: secure.attempt_id,
+                    expected_revision: secure.revision,
+                    client_operation_id: "choose-while-probing".into(),
+                    placement: OnboardingSecurePlacement::MachineBoundFile,
+                    passphrase: None,
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !applying.is_finished(),
+        "the intent must wait for the pending probe, not reject it as unpublished"
+    );
+    assert!(!locked.vault_authority_exists().expect("authority query"));
+
+    release.send(()).expect("release the gated probe run");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), applying)
+        .await
+        .expect("the intent settles once the probes land")
+        .expect("apply task joined")
+        .expect("machine-bound placement materializes after the probe settles");
+    assert_eq!(result.snapshot.stage, OnboardingStage::Provider);
+    assert!(locked.vault_authority_exists().expect("authority query"));
+}
+
+/// A probe run that cannot finish settles fail-closed at its deadline: the
+/// rows are failed, never available on faith, and a keyring placement is
+/// refused as unavailable.
+#[tokio::test]
+async fn probe_timeout_settles_fail_closed() {
+    let never = |_inputs: ProbeInputs| -> LockedProbeFuture { Box::pin(std::future::pending()) };
+    let plan = LockedProbePlan::injected(Box::new(never), std::time::Duration::from_millis(50));
+    let (_tmp, locked) = locked_services_with_probe_plan(plan).await;
+    let secure = advance_to_secure_store(&locked).await;
+
+    let settled = locked
+        .host_probes
+        .settled()
+        .await
+        .expect("a timed-out probe run still settles");
+    assert!(settled.snapshot.generation > 0);
+    let keyring = settled
+        .snapshot
+        .feature(crate::host_capabilities::FEATURE_SECRET_STORE_KEYRING)
+        .expect("keyring row");
+    assert_eq!(keyring.state, cockpit_proto::FeatureCapabilityState::Failed);
+    assert!(
+        keyring.reason.contains("did not finish"),
+        "{}",
+        keyring.reason
+    );
+    let sandbox = settled
+        .snapshot
+        .feature(crate::host_capabilities::FEATURE_SANDBOX_HOST)
+        .expect("sandbox row");
+    assert!(!sandbox.state.is_available());
+    assert_eq!(
+        settled.keyring.state,
+        cockpit_proto::FeatureCapabilityState::Failed
+    );
+
+    let rejected = locked
+        .apply_secure_intent(ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: "keyring-after-timeout".into(),
+            placement: OnboardingSecurePlacement::Automatic,
+            passphrase: None,
+        })
+        .await
+        .expect_err("a timed-out keyring probe must fail the keyring placement closed");
+    assert_eq!(
+        rejected,
+        cockpit_proto::SensitiveOnboardingIntentError::PlacementUnavailable(
+            cockpit_proto::SecurePlacementFailureReason::CapabilityUnavailable,
+        )
+    );
+    assert!(!locked.vault_authority_exists().expect("authority query"));
 }

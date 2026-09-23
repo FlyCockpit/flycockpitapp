@@ -479,52 +479,28 @@ pub struct SharedHostProbes {
     pub av_runtime_capabilities: crate::tool_media_authority::AvRuntimeCapabilities,
 }
 
+/// Upper bound on one platform keyring probe. The keyring store constructor
+/// can block on an OS credential service (D-Bus secret service, keychain);
+/// a stalled service must fail the keyring row closed, not hold the whole
+/// capability snapshot hostage.
+pub const KEYRING_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Collect every shared host probe.
+///
+/// The probes are independent, so they run concurrently: the platform keyring
+/// on its own OS thread (its store constructor may build a nested runtime),
+/// the external-runtime catalog and the FFmpeg functional probes on the
+/// blocking pool, the sandbox probe on this task, and container detection
+/// inline (its test overrides are thread-local to the caller). Each process
+/// probe is already deadline-bounded by the catalog executor; the keyring
+/// probe gets its own [`KEYRING_PROBE_DEADLINE`] and fails closed on expiry.
 pub async fn collect_shared_host_probes(
     inputs: &HostCapabilityProbeInputs,
     refresh_keyring: bool,
 ) -> SharedHostProbes {
-    let keyring = match &inputs.keyring {
-        KeyringProbeSource::Production => {
-            // zbus Store::new builds a nested Tokio runtime. Never probe on a
-            // worker that is already inside `block_on` (daemon boot / refresh).
-            let refresh = refresh_keyring;
-            std::thread::Builder::new()
-                .name("cockpit-keyring-probe".into())
-                .spawn(move || {
-                    if refresh {
-                        probe_platform_keyring_refresh()
-                    } else {
-                        probe_platform_keyring()
-                    }
-                })
-                .and_then(|handle| {
-                    handle.join().map_err(|_| {
-                        std::io::Error::other("platform keyring probe thread panicked")
-                    })
-                })
-                .unwrap_or_else(|error| {
-                    let panicked = error.to_string().contains("panicked");
-                    KeyringProbeResult {
-                        state: FeatureCapabilityState::Failed,
-                        reason: format!("platform keyring probe failed: {error}"),
-                        fix_command: None,
-                        remedy_text: Some(if panicked {
-                            "The OS keyring probe panicked while a Tokio runtime was active.".into()
-                        } else {
-                            format!("The OS keyring probe could not be started: {error}")
-                        }),
-                    }
-                })
-        }
-        KeyringProbeSource::Injected { result, calls } => {
-            calls.fetch_add(1, Ordering::SeqCst);
-            result.clone()
-        }
-    };
-    let sandbox = match &inputs.sandbox {
-        SandboxProbeSource::Production => probe_host_sandbox(&inputs.cwd).await,
-        SandboxProbeSource::Injected(availability) => availability.clone(),
-    };
+    // Start the off-task probes first so they overlap the inline ones.
+    let keyring = start_keyring_probe(&inputs.keyring, refresh_keyring);
+    let catalog = start_catalog_probes(&inputs.catalog, &inputs.cwd, inputs.platform);
     let container = match &inputs.container {
         ContainerProbeSource::ReuseSnapshot(availability) => availability.clone(),
         ContainerProbeSource::DetectOnce => {
@@ -538,26 +514,14 @@ pub async fn collect_shared_host_probes(
             availability.clone()
         }
     };
-    let (catalog, catalog_descriptors) = match &inputs.catalog {
-        CatalogProbeSource::Production => {
-            evaluate_daemon_catalog(&inputs.cwd, &SystemProbeExecutor, inputs.platform)
-        }
-        CatalogProbeSource::Injected(snapshot) => (snapshot.clone(), daemon_catalog_descriptors()),
-    };
-    let av_runtime_capabilities = match &inputs.catalog {
-        CatalogProbeSource::Production => {
-            probe_av_runtime_capabilities(&catalog, &SystemProbeExecutor)
-        }
-        CatalogProbeSource::Injected(_) => {
-            let compatible = media_runtime_pair_is_compatible(&catalog);
-            crate::tool_media_authority::AvRuntimeCapabilities {
-                ffprobe_compatible: crate::external_runtime::select_media_ffprobe(&catalog).is_ok(),
-                ffmpeg_decode: compatible,
-                audio_encoder: false,
-                clip_encoders: false,
-            }
+    let sandbox = async {
+        match &inputs.sandbox {
+            SandboxProbeSource::Production => probe_host_sandbox(&inputs.cwd).await,
+            SandboxProbeSource::Injected(availability) => availability.clone(),
         }
     };
+    let (keyring, sandbox, (catalog, catalog_descriptors, av_runtime_capabilities)) =
+        tokio::join!(keyring, sandbox, catalog);
     SharedHostProbes {
         keyring,
         sandbox,
@@ -566,6 +530,150 @@ pub async fn collect_shared_host_probes(
         catalog_descriptors,
         platform: inputs.platform,
         av_runtime_capabilities,
+    }
+}
+
+fn failed_keyring_probe(reason: String, remedy: String) -> KeyringProbeResult {
+    KeyringProbeResult {
+        state: FeatureCapabilityState::Failed,
+        reason,
+        fix_command: None,
+        remedy_text: Some(remedy),
+    }
+}
+
+/// Spawn the keyring probe eagerly and return a future for its result.
+fn start_keyring_probe(
+    source: &KeyringProbeSource,
+    refresh: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = KeyringProbeResult> + Send>> {
+    match source {
+        KeyringProbeSource::Production => {
+            // zbus Store::new builds a nested Tokio runtime. Never probe on a
+            // worker that is already inside `block_on` (daemon boot /
+            // refresh), and never park an async worker joining the thread.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let spawned = std::thread::Builder::new()
+                .name("cockpit-keyring-probe".into())
+                .spawn(move || {
+                    let result = if refresh {
+                        probe_platform_keyring_refresh()
+                    } else {
+                        probe_platform_keyring()
+                    };
+                    let _ = tx.send(result);
+                });
+            Box::pin(async move {
+                if let Err(error) = spawned {
+                    return failed_keyring_probe(
+                        format!("platform keyring probe failed: {error}"),
+                        format!("The OS keyring probe could not be started: {error}"),
+                    );
+                }
+                match tokio::time::timeout(KEYRING_PROBE_DEADLINE, rx).await {
+                    Ok(Ok(result)) => result,
+                    // The sender drops without a value only when the probe
+                    // thread unwound.
+                    Ok(Err(_)) => failed_keyring_probe(
+                        "platform keyring probe failed: platform keyring probe thread panicked"
+                            .into(),
+                        "The OS keyring probe panicked while a Tokio runtime was active.".into(),
+                    ),
+                    Err(_) => failed_keyring_probe(
+                        format!(
+                            "platform keyring probe timed out after {}s",
+                            KEYRING_PROBE_DEADLINE.as_secs()
+                        ),
+                        "The OS credential service did not answer; unlock or restart it, then refresh host capabilities.".into(),
+                    ),
+                }
+            })
+        }
+        KeyringProbeSource::Injected { result, calls } => {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let result = result.clone();
+            Box::pin(async move { result })
+        }
+    }
+}
+
+type CatalogProbeOutput = (
+    ExternalRuntimeSnapshot,
+    Vec<ExternalRuntimeDescriptor>,
+    crate::tool_media_authority::AvRuntimeCapabilities,
+);
+
+/// Spawn the external-runtime catalog (version probes) and the dependent
+/// FFmpeg functional probes on the blocking pool.
+fn start_catalog_probes(
+    source: &CatalogProbeSource,
+    cwd: &std::path::Path,
+    platform: HostPlatform,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = CatalogProbeOutput> + Send>> {
+    match source {
+        CatalogProbeSource::Production => {
+            let cwd = cwd.to_path_buf();
+            let task = tokio::task::spawn_blocking(move || {
+                let (catalog, descriptors) =
+                    evaluate_daemon_catalog(&cwd, &SystemProbeExecutor, platform);
+                let av = probe_av_runtime_capabilities(&catalog, &SystemProbeExecutor);
+                (catalog, descriptors, av)
+            });
+            Box::pin(async move {
+                match task.await {
+                    Ok(output) => output,
+                    Err(error) => {
+                        // A panicked catalog probe must not publish optimistic
+                        // rows: an empty catalog projects every runtime as
+                        // missing and every media stage as unavailable.
+                        tracing::warn!(%error, "host catalog probe task failed");
+                        (
+                            ExternalRuntimeSnapshot::empty(1, platform),
+                            daemon_catalog_descriptors(),
+                            crate::tool_media_authority::AvRuntimeCapabilities::default(),
+                        )
+                    }
+                }
+            })
+        }
+        CatalogProbeSource::Injected(snapshot) => {
+            let catalog = snapshot.clone();
+            let compatible = media_runtime_pair_is_compatible(&catalog);
+            let av = crate::tool_media_authority::AvRuntimeCapabilities {
+                ffprobe_compatible: crate::external_runtime::select_media_ffprobe(&catalog).is_ok(),
+                ffmpeg_decode: compatible,
+                audio_encoder: false,
+                clip_encoders: false,
+            };
+            let descriptors = daemon_catalog_descriptors();
+            Box::pin(async move { (catalog, descriptors, av) })
+        }
+    }
+}
+
+/// Fail-closed probe set used when a deferred probe run cannot produce a
+/// result (deadline expired or the probe task died). Every host-derived row
+/// projects as failed/missing; nothing is reported available on faith.
+pub fn failed_shared_host_probes(platform: HostPlatform, reason: &str) -> SharedHostProbes {
+    SharedHostProbes {
+        keyring: failed_keyring_probe(
+            reason.to_string(),
+            "Host capability probing did not complete; refresh host capabilities to retry.".into(),
+        ),
+        sandbox: SandboxAvailability::Unavailable {
+            reason: reason.to_string(),
+            fix_command: None,
+        },
+        container: ContainerAvailability {
+            runtime: None,
+            harness_in_container: false,
+            available: false,
+            reason: None,
+        },
+        catalog: ExternalRuntimeSnapshot::empty(1, platform),
+        catalog_descriptors: daemon_catalog_descriptors(),
+        platform,
+        av_runtime_capabilities: crate::tool_media_authority::AvRuntimeCapabilities::default(),
     }
 }
 

@@ -679,6 +679,11 @@ impl OnboardingShell {
             self.pending_transition = None;
         }
         if !stage_changed && !authority_changed {
+            // Host capabilities advance independently of the onboarding
+            // revision: the daemon serves the locked bootstrap with a probing
+            // snapshot and publishes the settled one later at the same
+            // revision. Feed it to the mounted screen (generation-monotonic).
+            self.apply_host_capabilities(&snapshot.host_capabilities);
             return false;
         }
         self.run_id = snapshot.run_id;
@@ -1012,6 +1017,12 @@ impl OnboardingShell {
     /// gated on these rows; a bootstrap snapshot fetched while capabilities
     /// were unpublished must not strand a stale view. Generation-monotonic:
     /// an unpublished placeholder never clobbers published rows.
+    /// Whether the mounted secure-store screen is still showing the daemon's
+    /// probing placeholder (host probes not yet settled).
+    pub(crate) fn secure_store_capabilities_probing(&self) -> bool {
+        matches!(&self.screen, OnboardingScreen::SecureStore(screen) if screen.probing())
+    }
+
     pub(crate) fn apply_host_capabilities(
         &mut self,
         capabilities: &cockpit_proto::HostCapabilitySnapshot,

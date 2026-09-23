@@ -143,7 +143,13 @@ async fn one_shot_run_dispatches() {
     home.trust_project();
 
     let mut command = home.cockpit();
-    command.args(["--no-sandbox", "run", "--json", "message argument wins"]);
+    command.args([
+        "--no-sandbox",
+        "run",
+        "--format",
+        "json",
+        "message argument wins",
+    ]);
     let output = spawn_run(command);
     assert!(output.status.success(), "{}", output_text(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -206,7 +212,7 @@ async fn org_logging_indicator_does_not_corrupt_ndjson() {
     .unwrap();
 
     let mut command = home.cockpit();
-    command.args(["--no-sandbox", "run", "--json", "message"]);
+    command.args(["--no-sandbox", "run", "--format", "json", "message"]);
     let output = spawn_run(command);
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(
@@ -251,7 +257,7 @@ async fn inference_failure_is_loud() {
     );
 
     let mut json_command = home.cockpit();
-    json_command.args(["run", "--json", "cause inference failure"]);
+    json_command.args(["run", "--format", "json", "cause inference failure"]);
     let json_output = spawn_run(json_command);
     assert_eq!(
         json_output.status.code(),
@@ -342,7 +348,8 @@ async fn cwd_flag_sets_workspace_root() {
         "--project",
         target.to_str().expect("utf-8 target"),
         "run",
-        "--json",
+        "--format",
+        "json",
         "message",
     ]);
     let output = spawn_run(aliased);
@@ -463,7 +470,7 @@ async fn run_approval_auto_denied() {
     stop_ephemeral_daemon(&home).await;
 
     let mut json_command = home.cockpit();
-    json_command.args(["run", "--json", "trigger sandbox approval"]);
+    json_command.args(["run", "--format", "json", "trigger sandbox approval"]);
     let json_output = spawn_run(json_command);
     assert!(
         json_output.status.success(),
@@ -484,7 +491,7 @@ async fn run_approval_auto_denied() {
     stop_ephemeral_daemon(&home).await;
 
     let mut question_command = home.cockpit();
-    question_command.args(["run", "--json", "trigger question decision"]);
+    question_command.args(["run", "--format", "json", "trigger question decision"]);
     let question_output = spawn_run(question_command);
     assert!(
         question_output.status.success(),
@@ -517,7 +524,8 @@ async fn run_approve_class_grants() {
     let mut command = home.cockpit();
     command.args([
         "run",
-        "--json",
+        "--format",
+        "json",
         "--approve",
         "path",
         "--approve",

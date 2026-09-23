@@ -6693,26 +6693,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn builtin_agent_prompts_contain_no_retired_lock_verbs() {
-        // Deliberate retired-name coverage for the lock tool collapse.
-        const RETIRED_LOCK_VERBS: &[&str] = &["readlock", "writeunlock", "editunlock"];
-        let prompts = [
-            ("builder", BUILDER_PROMPT),
-            ("bee", BEE_PROMPT),
-            ("build", BUILD_PROMPT),
-        ];
-
-        for (name, prompt) in prompts {
-            for retired in RETIRED_LOCK_VERBS {
-                assert!(
-                    !prompt.contains(retired),
-                    "{name} prompt still names retired lock verb `{retired}`"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn shared_tool_materialization_handles_grants_and_errors_loudly() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());

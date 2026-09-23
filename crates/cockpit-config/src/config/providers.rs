@@ -45,9 +45,8 @@
 //! ```
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -1490,9 +1489,9 @@ pub struct ModelEntry {
     /// [`merge_fetched_models`]).
     #[serde(default, skip_serializing_if = "WireApi::is_auto")]
     pub wire_api: WireApi,
-    /// Who selected [`Self::wire_api`].  Missing values deliberately mean a
-    /// user pin for backward compatibility: before this field existed, every
-    /// concrete `wire_api` in a config was user-authored.  Endpoint recovery
+    /// Who selected [`Self::wire_api`].  A missing value means a user pin:
+    /// hand-authored configs write only `wire_api`, and the user-configured
+    /// default is skipped on serialize.  Endpoint recovery
     /// and probing instead record `recovered`, which is a durable hint rather
     /// than an authority over a fresh live catalog.
     #[serde(default, skip_serializing_if = "WireApiProvenance::is_user_configured")]
@@ -1528,9 +1527,7 @@ pub enum CapabilitySource {
     Manual,
     Probed,
     Fallback,
-    Legacy,
     ProviderRule,
-    LegacySynthesized,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2000,8 +1997,8 @@ pub enum WireApi {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WireApiProvenance {
-    /// An endpoint configured by the user, or a legacy concrete `wire_api`
-    /// which predated provenance metadata.
+    /// An endpoint configured by the user (the default when a config carries
+    /// a concrete `wire_api` without provenance).
     #[default]
     UserConfigured,
     /// An endpoint learned from an approved endpoint fallback or deep probe.
@@ -2485,32 +2482,6 @@ fn looks_like_secret(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-}
-
-#[allow(dead_code)]
-pub fn project_reasoning_effort_to_thinking_modes(
-    capability: &ReasoningEffortCapability,
-) -> Vec<ThinkingMode> {
-    let mut out = Vec::new();
-    for value in capability.values.iter().map(|v| v.value.as_str()) {
-        let Some(mode) = legacy_thinking_mode_for_effort(value) else {
-            continue;
-        };
-        if !out.contains(&mode) {
-            out.push(mode);
-        }
-    }
-    out
-}
-
-fn legacy_thinking_mode_for_effort(value: &str) -> Option<ThinkingMode> {
-    match value.to_ascii_lowercase().as_str() {
-        "off" | "none" | "disabled" => Some(ThinkingMode::Off),
-        "low" => Some(ThinkingMode::Low),
-        "medium" => Some(ThinkingMode::Medium),
-        "high" => Some(ThinkingMode::High),
-        _ => None,
-    }
 }
 
 fn reasoning_effort_supports_value(capability: &ReasoningEffortCapability, value: &str) -> bool {

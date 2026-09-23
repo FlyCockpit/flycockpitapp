@@ -59,36 +59,8 @@ pub(super) fn resolve_harnesses_from_paths(paths: &[PathBuf]) -> HashMap<String,
     out
 }
 
-/// Retired sealed child-environment binding field names. Config must reject
-/// these before harness dispatch (no silent ignore).
-const RETIRED_SEALED_BINDING_FIELDS: &[&str] =
-    &["sealed_values", "sealedValues", "sealed_env", "sealedEnv"];
-
-/// Retired harness auth-env field names. Config must reject these before
-/// harness dispatch (no silent ignore, no migration): external harnesses
-/// receive no Cockpit-provided secret environment value, including a
-/// dedicated harness authentication token.
-const RETIRED_AUTH_ENV_FIELDS: &[&str] = &["auth_env_vars", "authEnvVars"];
-
-/// Parse one harness entry, rejecting retired sealed-binding and auth-env
-/// fields first.
+/// Parse one harness entry.
 pub(super) fn parse_harness_config(val: Value) -> Result<HarnessConfig, String> {
-    if let Some(obj) = val.as_object() {
-        for key in RETIRED_SEALED_BINDING_FIELDS {
-            if obj.contains_key(*key) {
-                return Err(format!(
-                    "sealed child-environment injection is retired; `{key}` is not accepted on harness config"
-                ));
-            }
-        }
-        for key in RETIRED_AUTH_ENV_FIELDS {
-            if obj.contains_key(*key) {
-                return Err(format!(
-                    "harness secret-environment delivery is retired; `{key}` is not accepted on harness config — a harness must authenticate independently without a Cockpit-provided secret"
-                ));
-            }
-        }
-    }
     serde_json::from_value(val).map_err(|e| e.to_string())
 }
 

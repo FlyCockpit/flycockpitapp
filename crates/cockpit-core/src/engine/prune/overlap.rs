@@ -102,30 +102,17 @@ pub fn line_range_of_read(body: &str) -> Option<LineRange> {
 }
 
 /// The 1-indexed line number a numbered body line carries, or `None` for a
-/// header/prelude/truncation line. The current numberer emits `"{n}|{text}"`,
-/// i.e. ASCII digits then `'|'` (no leading padding). We require that exact
-/// shape so a content line that merely happens to start with a number is not
-/// mistaken for a line-number prefix. As a resume-compat fallback we also
-/// accept the legacy `"{:>5}: {text}"` form (optional leading spaces, digits,
-/// then `": "` / bare `":"`) so old-format read bodies persisted in a resumed
-/// session still overlap-dedup. The `'|'` branch takes precedence.
+/// header/prelude/truncation line. The numberer emits `"{n}|{text}"`, i.e.
+/// ASCII digits then `'|'` (no leading padding). We require that exact shape
+/// so a content line that merely happens to start with a number is not
+/// mistaken for a line-number prefix.
 fn numbered_line_no(line: &str) -> Option<usize> {
-    // Primary form: no leading padding, digits, then `'|'`.
     let digits_end = line.find(|c: char| !c.is_ascii_digit())?;
-    if digits_end > 0 {
-        let (digits, rest) = line.split_at(digits_end);
-        if rest.starts_with('|') {
-            return digits.parse::<usize>().ok();
-        }
-    }
-    // Legacy fallback: optional leading spaces, digits, then `": "` / `":"`.
-    let trimmed = line.trim_start_matches(' ');
-    let digits_end = trimmed.find(|c: char| !c.is_ascii_digit())?;
     if digits_end == 0 {
         return None;
     }
-    let (digits, rest) = trimmed.split_at(digits_end);
-    if !rest.starts_with(": ") && rest != ":" {
+    let (digits, rest) = line.split_at(digits_end);
+    if !rest.starts_with('|') {
         return None;
     }
     digits.parse::<usize>().ok()
@@ -395,15 +382,6 @@ mod tests {
         assert!(is_read_tool(read.name()));
         assert!(!is_read_tool("write"));
         assert!(!is_read_tool("edit"));
-    }
-
-    #[test]
-    fn parses_legacy_numbered_line_numbers() {
-        // Resume-compat fallback: the old `{:>5}: {content}` form.
-        assert_eq!(numbered_line_no("    1: hello"), Some(1));
-        assert_eq!(numbered_line_no("  123: x"), Some(123));
-        // A bare colon (empty content) still counts.
-        assert_eq!(numbered_line_no("    5:"), Some(5));
     }
 
     #[test]

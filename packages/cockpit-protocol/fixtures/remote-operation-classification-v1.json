@@ -812,41 +812,6 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "kind_id:string|project_id:string|description:string|origin_id:string|projection_id:string",
-      "fcorRoles": [
-        {
-          "field": "kind_id",
-          "role": "param",
-          "type": "String"
-        },
-        {
-          "field": "project_id",
-          "role": "param",
-          "type": "String"
-        },
-        {
-          "field": "description",
-          "role": "param",
-          "type": "String"
-        },
-        {
-          "field": "origin_id",
-          "role": "param",
-          "type": "String"
-        },
-        {
-          "field": "projection_id",
-          "role": "param",
-          "type": "String"
-        }
-      ],
-      "fcorSchema": "kind_id:String|project_id:String|description:String|origin_id:String|projection_id:String",
-      "strategy": "nonrepeatable_dispatch",
-      "tag": "create_sealed_action"
-    },
-    {
-      "class": "nonrepeatable_mutation",
-      "evidence": null,
       "fcorCanonicalSchema": "action_id:string|description:string",
       "fcorRoles": [
         {
@@ -3590,36 +3555,6 @@
       "fcorSchema": "project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String|snapshot_session_id:String",
       "strategy": "none",
       "tag": "apply_extended_config_patch"
-    },
-    {
-      "class": "nonrepeatable_mutation",
-      "evidence": null,
-      "fcorCanonicalSchema": "project_root:string|path:string|content:string|base_hash:option<string>",
-      "fcorRoles": [
-        {
-          "field": "project_root",
-          "role": "project_root",
-          "type": "String"
-        },
-        {
-          "field": "path",
-          "role": "param",
-          "type": "String"
-        },
-        {
-          "field": "content",
-          "role": "param",
-          "type": "String"
-        },
-        {
-          "field": "base_hash",
-          "role": "param",
-          "type": "Option<String>"
-        }
-      ],
-      "fcorSchema": "project_root:String|path:String|content:String|base_hash:Option<String>",
-      "strategy": "nonrepeatable_dispatch",
-      "tag": "save_extended_config"
     },
     {
       "class": "local_only",

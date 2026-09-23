@@ -9608,9 +9608,6 @@ async fn handle_serialized_request_impl(
                 .collect();
             Ok(Response::sealed_actions(actions))
         }
-        Request::CreateSealedAction { .. } => Err(bad_request(
-            "catalog sealed-action creation is retired; submit an owner-declared sink".to_string(),
-        )),
         Request::CreateDeclaredSealedAction {
             project_id,
             description,
@@ -11532,7 +11529,7 @@ async fn handle_serialized_request_impl(
             let Some(actor) = remote.actor_binding.as_ref() else {
                 return Err(ErrorPayload {
                     code: ErrorCode::Authorization,
-                    message: "legacy actorless transport cannot query operation status".into(),
+                    message: "operation status requires a device-bound remote actor".into(),
                 });
             };
             let row = ctx
@@ -12078,67 +12075,6 @@ async fn handle_serialized_request_impl(
                 operation,
             )
             .await
-        }
-
-        Request::SaveExtendedConfig {
-            project_root,
-            path,
-            content,
-            base_hash,
-        } => {
-            #[cfg(feature = "remote")]
-            let request = Request::SaveExtendedConfig {
-                project_root: project_root.clone(),
-                path: path.clone(),
-                content: content.clone(),
-                base_hash: base_hash.clone(),
-            };
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
-            {
-                return Ok(response);
-            }
-            // A durable config write. It touches the filesystem, so it cannot
-            // share the SQLite transaction that commits the remote replay
-            // record; `finish_remote_provider_mutation` closes the reserved
-            // operation as unknown on any error (an atomic replacement may have
-            // reached disk) so a retry never rewrites the config a second time.
-            let mutation = async {
-                let response = crate::daemon::fs_api::save_extended_config(
-                    ctx,
-                    project_root,
-                    path,
-                    content,
-                    base_hash,
-                )
-                .await?;
-                // The saved config can change `redact.denylist`. The committed
-                // global redaction table is otherwise rebuilt only when the
-                // vault inventory generation advances (see `broadcast_global`),
-                // so a config-only denylist change would leave the next global
-                // broadcast scrubbing against a STALE table and disclose a newly
-                // denylisted secret. Rebuild the table now — mirroring how
-                // owner-vault mutations publish theirs — so every subsequent
-                // broadcast uses the fresh denylist. This runs once per (rare)
-                // config mutation, never per broadcast, so it does not
-                // reintroduce the per-event fork/scan storm. A rebuild failure
-                // must not be swallowed: retaining the stale table could
-                // disclose the secret, so poison the daemon.
-                if let Err(error) = ctx.refresh_redaction_table().await {
-                    ctx.poison_redaction_publication(&error);
-                    return Err(internal(error));
-                }
-                Ok(response)
-            };
-            finish_provider_mutation_future!(
-                remote_operation,
-                ctx,
-                "save_extended_config",
-                mutation
-            )
         }
 
         Request::ExportPolicy { project_root } => {

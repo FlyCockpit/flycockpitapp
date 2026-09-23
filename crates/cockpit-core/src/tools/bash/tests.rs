@@ -3941,9 +3941,8 @@ fn retirement_structural_inventory() {
 
     let mcp_config = include_str!("../../mcp/config.rs");
     assert!(
-        mcp_config.contains("reject_retired_sealed_bindings_in_mcp_value")
-            || mcp_config.contains("RETIRED_SEALED_BINDING_FIELDS"),
-        "MCP config parse must reject retired sealed binding fields"
+        mcp_config.contains("reject_sealed_env_keys_in_mcp_value"),
+        "MCP config parse must reject SEALED_* env keys"
     );
 
     // No injection construction or resolver on production child-env paths.

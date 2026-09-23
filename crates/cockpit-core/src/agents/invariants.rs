@@ -152,17 +152,6 @@ pub(crate) fn validate_read_image_tier_override(def: &AgentDef) -> Result<()> {
     );
 }
 
-fn retired_lock_verb_replacement(tool: &str) -> Option<&'static str> {
-    // Deliberate retired-name diagnostics for pre-collapse configs; keep in
-    // sync with the lock-protocol-collapse-to-edit-write prompt.
-    match tool {
-        "readlock" => Some("read"),
-        "writeunlock" => Some("write"),
-        "editunlock" => Some("edit"),
-        _ => None,
-    }
-}
-
 /// Validate a per-delegation **tool grant** (prompt `parent-granted-tools.md`):
 /// a parent attaching extra tools to a single `task` delegation. Each granted
 /// name is checked against the **same** core invariants a user-authored
@@ -187,11 +176,6 @@ pub fn validate_grant(
 ) -> Result<()> {
     let known = known_tool_names();
     for tool in grant {
-        if let Some(replacement) = retired_lock_verb_replacement(tool) {
-            bail!(
-                "delegation to `{target_name}` granted retired lock tool `{tool}`; use `{replacement}` instead"
-            );
-        }
         if !known.contains(&tool.as_str()) {
             bail!("delegation to `{target_name}` granted unknown tool `{tool}`");
         }
@@ -340,12 +324,6 @@ fn validate_tool_tier_overrides(def: &AgentDef) -> Result<()> {
             // cannot arrange illegal placements.
             continue;
         }
-        if let Some(replacement) = retired_lock_verb_replacement(tool) {
-            bail!(
-                "agent `{}` tiers retired lock tool `{tool}`; use `{replacement}` instead",
-                def.name
-            );
-        }
         if !known.contains(&tool.as_str()) && *tier != ToolTier::Disabled {
             bail!("agent `{}` tiers unknown tool `{tool}`", def.name);
         }
@@ -474,12 +452,6 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
     // the name is known; an inert key there is harmless (it lands on the box
     // only if a matching tool is present at construction).
     for tool in def.tool_descriptions.keys() {
-        if let Some(replacement) = retired_lock_verb_replacement(tool) {
-            bail!(
-                "agent `{}` overrides retired lock tool `{tool}`; use `{replacement}` instead",
-                def.name
-            );
-        }
         if !known.contains(&tool.as_str()) {
             bail!(
                 "agent `{}` overrides the description of unknown tool `{tool}`",
@@ -510,12 +482,6 @@ pub fn validate_invariants(def: &AgentDef) -> Result<()> {
 
     for tool in tools {
         // Unknown tool name.
-        if let Some(replacement) = retired_lock_verb_replacement(tool) {
-            bail!(
-                "agent `{}` requests retired lock tool `{tool}`; use `{replacement}` instead",
-                def.name
-            );
-        }
         if !known.contains(&tool.as_str()) {
             bail!("agent `{}` requests unknown tool `{tool}`", def.name);
         }
@@ -788,25 +754,6 @@ mod grant_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("nope"), "{err}");
-    }
-
-    #[test]
-    fn agent_def_naming_retired_lock_verb_names_replacement() {
-        // Deliberate retired-name coverage for the tool collapse diagnostics.
-        for (retired, replacement) in [
-            ("readlock", "read"),
-            ("writeunlock", "write"),
-            ("editunlock", "edit"),
-        ] {
-            let def = tiered_def("legacy-writer", &[retired], retired, ToolTier::Enabled);
-            let err = validate_invariants(&def)
-                .expect_err("retired lock tool name must be rejected")
-                .to_string();
-
-            assert!(err.contains(retired), "{err}");
-            assert!(err.contains(replacement), "{err}");
-            assert!(err.contains("retired lock tool"), "{err}");
-        }
     }
 
     #[test]

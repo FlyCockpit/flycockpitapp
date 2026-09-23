@@ -479,7 +479,6 @@ pub async fn invoke(
         "endpoint": &server_cfg.endpoint,
         "command": &server_cfg.command,
         "args": &server_cfg.args,
-        "mode": format!("{:?}", server_cfg.mode),
         "auth_kind": server_cfg.auth.kind_str(),
         "oauth_scopes": oauth_scopes,
         "profile": entry.profile,
@@ -734,7 +733,7 @@ mod tests {
         ExtendedConfig, KnowledgeBaseEmbeddingOwnership, KnowledgeBaseMergePolicy,
         KnowledgeBaseRegistryEntry, KnowledgeBaseSource,
     };
-    use crate::mcp::config::{DisclosureMode, ServerConfig, Transport};
+    use crate::mcp::config::{ServerConfig, Transport};
     use std::collections::BTreeMap;
     use std::io::Write;
     #[cfg(unix)]
@@ -742,7 +741,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn server(mode: DisclosureMode) -> ServerConfig {
+    fn server() -> ServerConfig {
         ServerConfig {
             transport: Transport::Streamable,
             endpoint: Some("https://x/mcp".into()),
@@ -751,7 +750,6 @@ mod tests {
             env: BTreeMap::new(),
             env_credential_refs: BTreeMap::new(),
             auth: Default::default(),
-            mode,
             enabled: true,
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,
@@ -833,7 +831,6 @@ for line in sys.stdin:
             env: BTreeMap::new(),
             env_credential_refs: BTreeMap::new(),
             auth: Default::default(),
-            mode: DisclosureMode::Monty,
             enabled: true,
             cache_ttl_secs: 0,
             connect_timeout_secs: None,
@@ -928,7 +925,7 @@ for line in sys.stdin:
             .unwrap_err();
         assert!(err.to_string().contains("unknown MCP server"), "{err}");
 
-        let mut s = server(DisclosureMode::Monty);
+        let mut s = server();
         s.enabled = false;
         cfg.servers.insert("off".into(), s);
         let tmp = tempfile::tempdir().unwrap();
@@ -1150,8 +1147,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn invoke_unknown_server_rejected_before_approval() {
         let mut cfg = McpConfig::default();
-        cfg.servers
-            .insert("github".into(), server(DisclosureMode::Monty));
+        cfg.servers.insert("github".into(), server());
         let tmp = tempfile::tempdir().unwrap();
         let approvals = Arc::new(AtomicUsize::new(0));
         let host = host_with_mcp_grant(tmp.path(), "githb", "count")
@@ -1185,12 +1181,12 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn legacy_always_disclose_config_is_searchable_through_monty() {
+    async fn stdio_server_is_searchable_through_monty() {
         let tmp = fake_stdio_server();
         let script = tmp.path().join("fake-mcp.py");
         let mut cfg = McpConfig::default();
         cfg.servers.insert(
-            "legacy".into(),
+            "stdio".into(),
             ServerConfig {
                 transport: Transport::Stdio,
                 endpoint: None,
@@ -1199,7 +1195,6 @@ for line in sys.stdin:
                 env: BTreeMap::new(),
                 env_credential_refs: BTreeMap::new(),
                 auth: Default::default(),
-                mode: serde_json::from_str("\"always-disclose\"").unwrap(),
                 enabled: true,
                 cache_ttl_secs: 0,
                 connect_timeout_secs: None,
@@ -1211,7 +1206,7 @@ for line in sys.stdin:
         let host = HostContext::empty_for_tests();
         let hits = search(&cfg, &host, "count").await;
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].server, "legacy");
+        assert_eq!(hits[0].server, "stdio");
         assert_eq!(hits[0].tool, "count");
     }
 
@@ -1373,7 +1368,6 @@ for line in sys.stdin:
                 env: BTreeMap::new(),
                 env_credential_refs: BTreeMap::new(),
                 auth: Default::default(),
-                mode: DisclosureMode::Monty,
                 enabled: true,
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,

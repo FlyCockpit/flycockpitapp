@@ -4668,22 +4668,11 @@ async fn roster_trim_initial_active_agent_uses_build_or_plan() {
 async fn plan_default_stale_session_keeps_plan() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
-    // A session persisted on Plan loads on Plan. Removed primaries fall back to
-    // Build through the shared predicate.
+    // A session persisted on Plan loads on Plan, not the configured default.
     let row = db.create_session("proj", "/proj", "Plan").await.unwrap();
     assert_eq!(
         resolve_root_agent(row.session_id, &db, &cfg_with(D::Build),).await,
         "Plan"
-    );
-    let swarm = db.create_session("proj", "/proj", "Swarm").await.unwrap();
-    assert_eq!(
-        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Build),).await,
-        "Build"
-    );
-    assert_eq!(
-        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Plan),).await,
-        "Build",
-        "removed stored primaries force Build, not the configured default"
     );
 }
 
@@ -4716,118 +4705,6 @@ async fn resumed_default_named_session_is_not_auto_swapped_in_defensive_mode() {
         resolve_root_agent(row.session_id, &db, &cfg_with(D::Build)).await,
         "Build",
         "stored Build is an explicit resume choice and must not auto-select Careful"
-    );
-}
-
-#[tokio::test]
-async fn roster_trim_removed_primary_notice_is_one_time() {
-    use crate::config::extended::DefaultPrimaryAgent as D;
-
-    let db = crate::db::Db::open_in_memory().unwrap();
-    let row = db.create_session("proj", "/proj", "Swarm").await.unwrap();
-
-    assert_eq!(
-        resolve_root_agent(row.session_id, &db, &cfg_with(D::Build),).await,
-        "Build"
-    );
-    let notice = removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan))
-        .await
-        .expect("first notice");
-    assert_eq!(
-        notice,
-        "Primary agent `Swarm` was removed; continuing with `Build`."
-    );
-
-    db.insert_session_event(
-        row.session_id,
-        crate::db::session_log::SessionEventKind::Notice,
-        None,
-        None,
-        &serde_json::json!({
-            "text": notice,
-            "severity": "info",
-            "source": NoticeSource::DaemonDirect.as_str(),
-        }),
-    )
-    .await
-    .unwrap();
-    assert!(
-        removed_primary_notice(row.session_id, &db, &cfg_with(D::Plan))
-            .await
-            .is_none(),
-        "notice is de-duped once recorded"
-    );
-}
-
-#[tokio::test]
-async fn roster_trim_removed_default_primary_notice_is_one_time() {
-    let db = crate::db::Db::open_in_memory().unwrap();
-    let row = db.create_session("proj", "/proj", "Build").await.unwrap();
-    let mut cfg = cfg_with(crate::config::extended::DefaultPrimaryAgent::Build);
-    cfg.removed_default_primary_agent = Some("auto".to_string());
-
-    let notice = removed_primary_notice(row.session_id, &db, &cfg)
-        .await
-        .expect("first notice");
-    assert_eq!(
-        notice,
-        "Default primary agent `auto` was removed; continuing with `Build`."
-    );
-
-    db.insert_session_event(
-        row.session_id,
-        crate::db::session_log::SessionEventKind::Notice,
-        None,
-        None,
-        &serde_json::json!({
-            "text": notice,
-            "severity": "info",
-            "source": NoticeSource::DaemonDirect.as_str(),
-        }),
-    )
-    .await
-    .unwrap();
-    assert!(
-        removed_primary_notice(row.session_id, &db, &cfg)
-            .await
-            .is_none(),
-        "config-default notice is de-duped once recorded"
-    );
-}
-
-#[tokio::test]
-async fn removed_llm_mode_notice_is_one_time() {
-    let db = crate::db::Db::open_in_memory().unwrap();
-    let row = db.create_session("proj", "/proj", "Build").await.unwrap();
-    let mut cfg = cfg_with(crate::config::extended::DefaultPrimaryAgent::Build);
-    cfg.removed_llm_mode = Some("defensive".to_string());
-
-    let notice = removed_primary_notice(row.session_id, &db, &cfg)
-        .await
-        .expect("first notice");
-    assert_eq!(
-        notice,
-        "llm_mode is no longer used; posture now comes from agent definitions"
-    );
-
-    db.insert_session_event(
-        row.session_id,
-        crate::db::session_log::SessionEventKind::Notice,
-        None,
-        None,
-        &serde_json::json!({
-            "text": notice,
-            "severity": "info",
-            "source": NoticeSource::DaemonDirect.as_str(),
-        }),
-    )
-    .await
-    .unwrap();
-    assert!(
-        removed_primary_notice(row.session_id, &db, &cfg)
-            .await
-            .is_none(),
-        "removed-mode notice is de-duped once recorded"
     );
 }
 

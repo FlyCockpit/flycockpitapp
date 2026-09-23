@@ -422,6 +422,7 @@ where
     deserialize_bounded_optional_string::<MAX_OWNER_PROVIDER_MODEL_ID_BYTES, D>(deserializer)
 }
 
+#[cfg(any(feature = "extended", feature = "remote"))]
 fn deserialize_owner_provider_metadata_json<'de, D>(
     deserializer: D,
 ) -> std::result::Result<String, D::Error>
@@ -913,21 +914,9 @@ pub enum Request {
     /// List sealed action instances as safe summaries. No origins, templates,
     /// or credentials.
     ListSealedActions,
-    /// Create a sealed action instance. The three ids (`kind_id`, `origin_id`,
-    /// `projection_id`) are closed server-side lookups the daemon resolves to a
-    /// compiled action kind; an unknown id is rejected before any persist. The
-    /// wire carries no origin URL, path template, or projection blob. The daemon
-    /// mints the `action_id`.
-    CreateSealedAction {
-        kind_id: String,
-        project_id: String,
-        description: String,
-        origin_id: String,
-        projection_id: String,
-    },
-    /// Create an owner-declared real sealed-action sink. Unlike the legacy
-    /// catalog selector request this carries the fixed command/origin/path/file
-    /// declaration that the daemon pins into the immutable snapshot.
+    /// Create an owner-declared real sealed-action sink. The request carries
+    /// the fixed command/origin/path/file declaration that the daemon pins into
+    /// the immutable snapshot.
     CreateDeclaredSealedAction {
         project_id: String,
         description: String,
@@ -2387,20 +2376,6 @@ pub enum Request {
         patch: crate::ExtendedConfigPatch,
         expected_revision: String,
         snapshot_session_id: String,
-    },
-
-    /// Atomically persist a rendered extended settings layer. The daemon
-    /// validates the target as a config.json layer, reloads it under the
-    /// config mutation lock, and rejects stale `base_hash` writes.
-    SaveExtendedConfig {
-        #[serde(deserialize_with = "deserialize_owner_project_root")]
-        project_root: String,
-        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
-        path: String,
-        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
-        content: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        base_hash: Option<String>,
     },
 
     /// Export the daemon-owned portable policy bundle for a project.
@@ -4116,28 +4091,6 @@ impl Request {
                     return Err("extended config revision is invalid".to_string());
                 }
             }
-            Self::SaveExtendedConfig {
-                project_root,
-                path,
-                content,
-                base_hash,
-            } => {
-                validate_owner_project_root(project_root)?;
-                if path.is_empty()
-                    || path.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES
-                    || path.starts_with('/')
-                    || path.contains("..")
-                    || path.contains('\0')
-                {
-                    return Err("extended config path must name a config.json layer".to_string());
-                }
-                if content.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
-                    return Err("extended config content exceeds maximum length".to_string());
-                }
-                if base_hash.as_ref().is_some_and(|hash| hash.len() > 128) {
-                    return Err("extended config base hash exceeds maximum length".to_string());
-                }
-            }
             Self::ExportPolicy { project_root } => validate_owner_project_root(project_root)?,
             Self::ImportPolicy {
                 project_root,
@@ -4595,7 +4548,6 @@ macro_rules! request_variants {
             (Request::SealedOwnerInventory { .. }, "sealed_owner_inventory");
             (Request::EditSealedOwnerDescription { .. }, "edit_sealed_owner_description");
             (Request::ListSealedActions, "list_sealed_actions");
-            (Request::CreateSealedAction { .. }, "create_sealed_action");
             (Request::CreateDeclaredSealedAction { .. }, "create_declared_sealed_action");
             (Request::ReviseSealedActionDescription { .. }, "revise_sealed_action_description");
             (Request::ReviseSealedActionEnabled { .. }, "revise_sealed_action_enabled");
@@ -4773,7 +4725,6 @@ macro_rules! request_variants {
             (Request::CreateImageSidecarGrant { .. }, "create_image_sidecar_grant");
             (Request::RevokeImageSidecarGrant { .. }, "revoke_image_sidecar_grant");
             (Request::ApplyExtendedConfigPatch { .. }, "apply_extended_config_patch");
-            (Request::SaveExtendedConfig { .. }, "save_extended_config");
             (Request::ExportPolicy { .. }, "export_policy");
             (Request::ImportPolicy { .. }, "import_policy");
             #[cfg(feature = "extended")]
@@ -4974,7 +4925,6 @@ macro_rules! command {
             (Request::SealedOwnerInventory { scope_kind, scope_key }, "sealed_owner_inventory", owner_only, none, false, read_only, none, concurrent, none, "scope_kind:Option<String>|scope_key:Option<String>", [scope_kind: Option<String> => param, scope_key: Option<String> => param]);
             (Request::EditSealedOwnerDescription { record_id, description }, "edit_sealed_owner_description", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "record_id:String|description:String", [record_id: String => param, description: String => param]);
             (Request::ListSealedActions, "list_sealed_actions", owner_only, none, false, read_only, none, concurrent, none, "-", []);
-            (Request::CreateSealedAction { kind_id, project_id, description, origin_id, projection_id }, "create_sealed_action", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "kind_id:String|project_id:String|description:String|origin_id:String|projection_id:String", [kind_id: String => param, project_id: String => param, description: String => param, origin_id: String => param, projection_id: String => param]);
             (Request::CreateDeclaredSealedAction { project_id, description, declaration }, "create_declared_sealed_action", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_id:String|description:String|declaration:SealedActionDeclaration", [project_id: String => param, description: String => param, declaration: SealedActionDeclaration => param]);
             (Request::ReviseSealedActionDescription { action_id, description }, "revise_sealed_action_description", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|description:String", [action_id: String => param, description: String => param]);
             (Request::ReviseSealedActionEnabled { action_id, enabled }, "revise_sealed_action_enabled", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|enabled:bool", [action_id: String => param, enabled: bool => param]);
@@ -5162,7 +5112,6 @@ macro_rules! command {
             (Request::CreateImageSidecarGrant { project_root, config_generation, selection_id, expected_daemon_instance_id, expected_session_id, grant_candidate_id, purpose, scope, session_id, invocation_id }, "create_image_sidecar_grant", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|config_generation:u64|selection_id:String|expected_daemon_instance_id:Option<String>|expected_session_id:Option<String>|grant_candidate_id:String|purpose:String|scope:crate::image_sidecar_authority::ImageSidecarGrantScopeV1|session_id:Option<String>|invocation_id:Option<String>", [project_root: String => project_root, config_generation: u64 => param, selection_id: String => param, expected_daemon_instance_id: Option<String> => param, expected_session_id: Option<String> => param, grant_candidate_id: String => param, purpose: String => param, scope: crate::image_sidecar_authority::ImageSidecarGrantScopeV1 => param, session_id: Option<String> => param, invocation_id: Option<String> => param]);
             (Request::RevokeImageSidecarGrant { project_root, config_generation, selection_id, expected_daemon_instance_id, expected_session_id, grant_id, expected_version }, "revoke_image_sidecar_grant", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|config_generation:u64|selection_id:String|expected_daemon_instance_id:Option<String>|expected_session_id:Option<String>|grant_id:String|expected_version:u64", [project_root: String => project_root, config_generation: u64 => param, selection_id: String => param, expected_daemon_instance_id: Option<String> => param, expected_session_id: Option<String> => param, grant_id: String => param, expected_version: u64 => param]);
             (Request::ApplyExtendedConfigPatch { client_operation_id, project_root, layer_id, patch, expected_revision, snapshot_session_id }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String|snapshot_session_id:String", [client_operation_id: String => param, project_root: String => project_root, layer_id: String => param, patch: crate::ExtendedConfigPatch => param, expected_revision: String => param, snapshot_session_id: String => param]);
-            (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);
             #[cfg(feature = "extended")]
@@ -6535,7 +6484,6 @@ mod tests {
                         // `read_only` remote class (they return only the public
                         // authorize URL), and `complete_*` reserves the durable
                         // token-exchange operation.
-                        | "save_extended_config"
                         | "save_image_spend_policy"
                         | "import_policy"
                         | "apply_setup_wizard"
@@ -6582,7 +6530,6 @@ mod tests {
                         | "sealed_owner_inventory"
                         | "edit_sealed_owner_description"
                         | "list_sealed_actions"
-                        | "create_sealed_action"
                         | "revise_sealed_action_description"
                         | "revise_sealed_action_enabled"
                         | "retire_sealed_action"
@@ -7248,13 +7195,6 @@ mod tests {
                 description: "desc".into(),
             },
             Request::ListSealedActions,
-            Request::CreateSealedAction {
-                kind_id: "k".into(),
-                project_id: "p".into(),
-                description: "d".into(),
-                origin_id: "0".into(),
-                projection_id: "none".into(),
-            },
             Request::ReviseSealedActionDescription {
                 action_id: "a".into(),
                 description: "d".into(),
@@ -7278,7 +7218,6 @@ mod tests {
                 "sealed_owner_inventory",
                 "edit_sealed_owner_description",
                 "list_sealed_actions",
-                "create_sealed_action",
                 "revise_sealed_action_description",
                 "revise_sealed_action_enabled",
                 "retire_sealed_action",
@@ -7308,7 +7247,6 @@ mod tests {
             "apply_sealed_owner_operation",
             "cancel_sealed_owner_operation",
             "edit_sealed_owner_description",
-            "create_sealed_action",
             "revise_sealed_action_description",
             "revise_sealed_action_enabled",
             "retire_sealed_action",

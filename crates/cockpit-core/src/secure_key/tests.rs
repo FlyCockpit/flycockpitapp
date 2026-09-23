@@ -1426,7 +1426,6 @@ fn secure_key_platform_compile_and_fake_injection() {
         super::SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap();

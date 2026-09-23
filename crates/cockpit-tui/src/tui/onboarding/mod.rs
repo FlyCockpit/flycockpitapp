@@ -30,7 +30,6 @@ mod model;
 mod profile;
 mod search;
 mod secure_store;
-mod theme;
 mod ui;
 mod verify;
 pub(crate) mod welcome;
@@ -48,6 +47,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 
 use crate::tui::settings::Dialog;
+use crate::tui::theme::{BAD, BRASS, FOG, GOOD, HOVER_BG, INK, NIGHT};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use auth::AuthPhase;
 pub(crate) use auth::AuthScreen;
@@ -65,7 +65,6 @@ use model::ModelScreen;
 use profile::ProfileScreen;
 use search::{ProviderSearchScreen, onboarding_catalog};
 use secure_store::SecureStoreScreen;
-use theme::{BAD, BRASS, FOG, GOOD, HOVER_BG, INK, NIGHT};
 pub(crate) use verify::VerifyOutcome;
 pub(crate) use verify::VerifyPhase;
 pub(crate) use verify::VerifyScreen;

@@ -13,7 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
-use super::theme::{BAD, BRASS, DISABLED, FOG, INK, NIGHT, PLACEHOLDER};
+use crate::tui::theme::{BAD, BRASS, DISABLED, FOG, INK, NIGHT, PLACEHOLDER};
 
 /// The sensitive ingress rejects passphrases past this byte length; enforce
 /// the same cap *before* buffering so an oversized paste is rejected at

@@ -7,9 +7,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 
-use super::theme::{BAD, BRASS, FOG, INK, NIGHT};
 use super::ui::{self, ListNav, STAR};
 use crate::tui::textfield::TextField;
+use crate::tui::theme::{BAD, BRASS, FOG, INK, NIGHT};
 use cockpit_config::config::providers::{CapabilityStatus, ModelTrust, ProvidersConfig};
 
 const CAPABILITIES: [(&str, &str, &str); 4] = [

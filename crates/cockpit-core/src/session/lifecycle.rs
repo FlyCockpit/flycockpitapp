@@ -1234,7 +1234,6 @@ impl Session {
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
-    /// Backfills `short_id` if missing (lazy migration from pre-§17 rows).
     pub fn resume(
         db: Db,
         session_id: Uuid,
@@ -1356,16 +1355,10 @@ impl Session {
                 &row.knowledge_base_prompt_snapshot_json,
             ),
         ));
-        let short_id = match row.short_id.clone() {
-            Some(s) => s,
-            None => {
-                let session_id = row.session_id;
-                db.blocking_write_for_sync_maintenance(move |conn| {
-                    crate::db::Db::ensure_short_id_conn(conn, session_id)
-                })
-                .context("backfilling short_id")?
-            }
-        };
+        let short_id = row
+            .short_id
+            .clone()
+            .context("persisted session has no short_id")?;
         let model_selection = match row.model_selection_json.as_deref() {
             Some(raw) => {
                 let selection =
@@ -1712,7 +1705,7 @@ impl Session {
             .context("loading persisted target-session redaction table")
     }
 
-    /// Legacy file-origin markers are used only to warn when a resumed
+    /// File-origin markers are used only to warn when a resumed
     /// session cannot rebuild coverage. They never reveal a secret value.
     pub fn persisted_disk_redaction_origins(&self) -> Result<Vec<String>> {
         let json = match self.redaction_table_json.lock().unwrap().clone() {

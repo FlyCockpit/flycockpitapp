@@ -3071,13 +3071,7 @@ fn backup_failure_reason(error_class: &cockpit_proto::InferenceErrorClass) -> St
 
 /// True for write tools whose successful applied results render as diffs.
 fn is_write_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "write"
-            // Historical display only: pre-rename persisted sessions used this
-            // retired verb name in tool-call rows.
-            | "writeunlock"
-    )
+    tool == "write"
 }
 
 #[cfg(test)]

@@ -2051,78 +2051,6 @@ fn tool_glyph_label_keeps_collapsed_lock_tool_names() {
     assert!(!tool_glyph_label("bash", true).0.is_empty());
 }
 
-#[test]
-fn historical_lock_verb_tool_calls_still_render() {
-    // Historical display only: pre-rename persisted sessions used retired verb
-    // names in tool-call rows. This does not make those names dispatchable.
-    assert_eq!(tool_glyph_label("readlock", true).1, "read");
-    assert_eq!(tool_glyph_label("writeunlock", true).1, "write");
-    assert_eq!(tool_glyph_label("editunlock", true).1, "edit");
-    assert_eq!(tool_glyph_label("readlock", false).1, "readlock");
-    assert_eq!(tool_glyph_label("writeunlock", false).1, "writeunlock");
-    assert_eq!(tool_glyph_label("editunlock", false).1, "editunlock");
-
-    let mut historical_read = mk_call("readlock", "g.ts", ToolCallState::Success);
-    historical_read.expanded = true;
-    historical_read.output = "1|const value = 1;".into();
-    let toolbox = render_toolbox(&[historical_read], 0, true, 80, false, false, &no_elided());
-    let toolbox_text = rendered_text(&toolbox).join("\n");
-    assert!(toolbox_text.contains("readlock  g.ts"), "{toolbox_text}");
-    assert!(
-        toolbox_text.contains("1|const value = 1;"),
-        "{toolbox_text}"
-    );
-
-    let write_line = HistoryEntry::ToolLine {
-        call_id: "w".to_string(),
-        tool: "writeunlock".to_string(),
-        summary: "src/lib.rs".to_string(),
-        icon_path: None,
-        state: ToolCallState::Success,
-    };
-    let rendered_write = render_entry(
-        &write_line,
-        80,
-        ThinkingDisplay::Condensed,
-        MarkdownOpts::default(),
-        cockpit_config::extended::DiffStyle::default(),
-        true,
-        false,
-        &no_elided(),
-        0,
-        None,
-    );
-    assert!(
-        line_text(&rendered_write.lines[0]).contains("write  src/lib.rs"),
-        "{:?}",
-        rendered_text(&rendered_write)
-    );
-
-    let edit_diff = HistoryEntry::Diff {
-        tool: "editunlock".to_string(),
-        path: "src/lib.rs".to_string(),
-        old: "old\n".to_string(),
-        new: "new\n".to_string(),
-        verb: DiffVerb::Edited,
-    };
-    let rendered_edit = render_entry(
-        &edit_diff,
-        80,
-        ThinkingDisplay::Condensed,
-        MarkdownOpts::default(),
-        cockpit_config::extended::DiffStyle::Inline,
-        true,
-        false,
-        &no_elided(),
-        0,
-        None,
-    );
-    let edit_text = rendered_text(&rendered_edit).join("\n");
-    assert!(edit_text.contains("◇ Edited src/lib.rs"), "{edit_text}");
-    assert!(edit_text.contains("- old"), "{edit_text}");
-    assert!(edit_text.contains("+ new"), "{edit_text}");
-}
-
 /// Every emoji glyph in the tool-glyph path must be a reliably-wide,
 /// single-codepoint emoji: no VS16 (U+FE0F) variation selector and a
 /// `unicode_width` display width of exactly 2. A future glyph that
@@ -2545,7 +2473,7 @@ fn write_edit_rows_keep_file_icons_out_of_transcript_chrome() {
     assert!(!bash_emoji.contains(rust_icon), "{bash_emoji:?}");
     assert!(!bash_emoji.is_empty(), "bash still shows its emoji glyph");
 
-    for tool in ["edit", "writeunlock", "editunlock"] {
+    for tool in ["edit", "write"] {
         let call = mk_call(tool, "src/main.rs", ToolCallState::Success);
         let (glyph, _) = tool_call_glyph_label(&call, false, true);
         assert!(

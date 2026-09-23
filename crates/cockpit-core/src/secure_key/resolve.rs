@@ -17,15 +17,8 @@ use super::kek_store::{
     FileKekStore, KekStore, KeyringKekStore, Passphrase, PassphraseKdfParams, PassphraseKekStore,
     file_kek_supported,
 };
-use super::namespace::{
-    LEAK_REPORT_V1_NAMESPACE, Namespace, REDACTION_HISTORY_V1_NAMESPACE, SECURE_KEY_SERVICE,
-    manifest_account, version_account,
-};
-use super::native_store::{KeyringNativeStore, NativeKeyStore};
 use super::platform::KeyringProbeResult;
-use super::sealed_state::{SealedSlot, sealed_state_account};
 use super::vault::SecretVault;
-use super::vault_store::classify_account;
 
 pub const DEFAULT_FIX_COMMAND: &str = "Install and unlock a platform keyring (Linux Secret Service, macOS Keychain, or Windows Credential Manager).";
 pub const MACHINE_BOUND_FILE_VAULT_WARNING: &str =
@@ -116,7 +109,6 @@ pub fn first_run_secret_store_capabilities(
 pub struct SecretStoreInjected {
     pub file_kek: Option<Arc<dyn KekStore>>,
     pub keyring_kek: Option<Arc<dyn KekStore>>,
-    pub legacy_keyring: Option<Arc<dyn NativeKeyStore>>,
 }
 
 pub struct EffectiveSecretStore {
@@ -221,7 +213,6 @@ pub fn migrate_installation_kek_at(
         SecretStoreInjected {
             file_kek: injected.file_kek.clone(),
             keyring_kek: injected.keyring_kek.clone(),
-            legacy_keyring: None,
         },
     )
     .map_err(SecureKeyError::from)?;
@@ -527,15 +518,6 @@ pub fn ensure_secret_vault_with_options(
         })?
     };
 
-    if first_run {
-        import_legacy_secure_key_roots(&vault, keyring_probe, injected.legacy_keyring.as_deref())
-            .map_err(|e| KekUnavailable {
-            reason: format!("importing legacy secure-key roots: {e}"),
-            fix_command: None,
-            intent: placement_intent(placement),
-        })?;
-    }
-
     let authority = db
         .blocking_write_for_sync_maintenance(load_authority_conn)
         .map_err(|e| KekUnavailable {
@@ -749,59 +731,6 @@ fn kek_store_for_vault(
     }
 }
 
-pub fn import_legacy_secure_key_roots(
-    vault: &SecretVault,
-    keyring_probe: &KeyringProbeResult,
-    injected_legacy: Option<&dyn NativeKeyStore>,
-) -> Result<(), SecureKeyError> {
-    let store: Box<dyn NativeKeyStore> = match injected_legacy {
-        Some(legacy) => {
-            // Use a thin wrapper that forwards to the borrowed store via clone
-            // of FakeNativeStore / injected Arc at the caller.
-            return import_from_store(vault, legacy);
-        }
-        None if keyring_available(keyring_probe) && keyring_core::get_default_store().is_some() => {
-            Box::new(KeyringNativeStore)
-        }
-        None => return Ok(()),
-    };
-    import_from_store(vault, store.as_ref())
-}
-
-fn import_from_store(
-    vault: &SecretVault,
-    store: &dyn NativeKeyStore,
-) -> Result<(), SecureKeyError> {
-    let installation = vault.installation_hex();
-    let mut accounts = store.list_accounts(SECURE_KEY_SERVICE)?;
-    if accounts.is_empty() {
-        accounts.extend(known_legacy_accounts(installation)?);
-    }
-    for account in accounts {
-        if !account.starts_with(installation) {
-            continue;
-        }
-        if account.contains("/kek/") {
-            continue;
-        }
-        let secret = match store.get_secret(SECURE_KEY_SERVICE, &account) {
-            Ok(s) => s,
-            Err(SecureKeyError::NotFound(_)) => continue,
-            Err(e) => return Err(e),
-        };
-        let kind = classify_account(&account);
-        vault.put_item(kind, &account, secret.as_slice())?;
-        let read_back = vault.get_item(kind, &account)?;
-        if read_back.as_slice() != secret.as_slice() {
-            return Err(SecureKeyError::Corrupt(
-                "legacy import verify mismatch".into(),
-            ));
-        }
-        store.delete_secret(SECURE_KEY_SERVICE, &account)?;
-    }
-    Ok(())
-}
-
 /// Open or initialize the wrap-key vault for this database.
 ///
 /// File-backed DBs use the installation KEK directory. In-memory DBs use a
@@ -866,30 +795,6 @@ pub fn vault_for_db(db: &Db) -> Result<Arc<SecretVault>, SecureKeyError> {
     open_for_db(db)
 }
 
-fn known_legacy_accounts(installation: &str) -> Result<Vec<String>, SecureKeyError> {
-    let mut out = Vec::new();
-    for ns in [
-        REDACTION_HISTORY_V1_NAMESPACE,
-        crate::db::external_journal::EXTERNAL_JOURNAL_SPOOL_NAMESPACE,
-        LEAK_REPORT_V1_NAMESPACE,
-    ] {
-        let namespace = Namespace::parse(ns)?;
-        out.push(manifest_account(installation, &namespace)?);
-        out.push(version_account(installation, &namespace, 1)?);
-        out.push(sealed_state_account(
-            installation,
-            &namespace,
-            SealedSlot::A,
-        )?);
-        out.push(sealed_state_account(
-            installation,
-            &namespace,
-            SealedSlot::B,
-        )?);
-    }
-    Ok(out)
-}
-
 #[cfg(feature = "test-support")]
 pub fn test_open_db(path: &std::path::Path) -> Db {
     Db::open(path).expect("test db")
@@ -938,7 +843,6 @@ impl TestInjectedVault {
             SecretStoreInjected {
                 file_kek: Some(file_kek.clone()),
                 keyring_kek: Some(keyring_kek.clone()),
-                legacy_keyring: None,
             },
         )
         .expect("first-run database vault");
@@ -972,7 +876,6 @@ impl TestInjectedVault {
         SecretStoreInjected {
             file_kek: Some(self.file_kek.clone()),
             keyring_kek: Some(self.keyring_kek.clone()),
-            legacy_keyring: None,
         }
     }
 

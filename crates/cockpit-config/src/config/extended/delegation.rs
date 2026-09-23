@@ -12,17 +12,9 @@ default_const!(
 pub struct DelegationConfig {
     #[serde(rename = "maxParallel", default = "default_delegation_max_parallel")]
     pub max_parallel: usize,
-    #[serde(
-        rename = "recursionEnabled",
-        alias = "recursion_enabled",
-        default = "default_true"
-    )]
+    #[serde(rename = "recursionEnabled", default = "default_true")]
     pub recursion_enabled: bool,
-    #[serde(
-        rename = "defaultRecursionDepth",
-        alias = "default_recursion_depth",
-        default
-    )]
+    #[serde(rename = "defaultRecursionDepth", default)]
     pub default_recursion_depth: u32,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub recursion: std::collections::BTreeMap<String, DelegationRecursionPolicy>,
@@ -43,24 +35,17 @@ impl Default for DelegationConfig {
 pub struct DelegationRecursionPolicy {
     #[serde(
         rename = "allowedTargets",
-        alias = "allowed_targets",
         default,
         skip_serializing_if = "Vec::is_empty"
     )]
     pub allowed_targets: Vec<String>,
     #[serde(
         rename = "defaultDepth",
-        alias = "default_depth",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub default_depth: Option<u32>,
-    #[serde(
-        rename = "maxDepth",
-        alias = "max_depth",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "maxDepth", default, skip_serializing_if = "Option::is_none")]
     pub max_depth: Option<u32>,
 }
 

@@ -7855,7 +7855,7 @@ impl SettingsDialog {
         settings.cx.queue_typed_document_edit(
             config_path,
             cwd,
-            serde_json::json!({ "agents": {}, "tools": {} }),
+            serde_json::json!({ "tools": {} }),
             TypedDocumentEditAction::Scaffold,
         );
         settings.cx.extended_warnings = vec!["creating settings layer…".into()];

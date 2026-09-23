@@ -10,13 +10,7 @@ use crate::daemon::proto::{ProviderModelFetchOutcome, Request, Response};
 
 pub async fn run(args: FetchModelsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
-    let provider_id = match (args.provider_arg, args.provider) {
-        (Some(_), Some(_)) => {
-            bail!("pass provider id once, either positionally or with --provider")
-        }
-        (Some(provider), None) | (None, Some(provider)) => Some(provider),
-        (None, None) => None,
-    };
+    let provider_id = args.provider;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // An omitted flag is meaningful: let the daemon preserve the configured
     // policy instead of replacing it with a client-side Keep default.

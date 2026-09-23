@@ -491,7 +491,7 @@ fn fully_populated_config_json_round_trips_byte_identically() {
     cfg.name = Some("Config Roundtrip".into());
     cfg.packages_directory = Some(PathBuf::from("packages-cache"));
     cfg.tools.insert(
-        "webfetch".into(),
+        "fetchurl".into(),
         ToolCommandTemplate {
             enabled: true,
             command: "curl -sSL {url}".into(),
@@ -690,32 +690,6 @@ fn command_resource_profiles_round_trip_generic_shape_and_unknowns() {
     assert_eq!(
         reloaded.command_resource_profiles.wrappers["just infra-plan"],
         vec!["terraform_toolchain".to_string()]
-    );
-}
-
-#[test]
-fn command_resource_profiles_reject_legacy_rust_toolchain_key() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(
-        &path,
-        r#"{
-                "commandResourceProfiles": {
-                    "rustToolchain": ["just test"]
-                }
-            }"#,
-    )
-    .unwrap();
-
-    let (_cfg, warnings) = ExtendedConfigDoc::load(&path)
-        .unwrap()
-        .config_with_warnings();
-
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.contains("commandResourceProfiles")),
-        "{warnings:?}"
     );
 }
 
@@ -1105,17 +1079,14 @@ fn session_rail_visibility_round_trips_through_tui_config() {
 fn unknown_root_keys_survive_write() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
-    let retired_key = ["trusted", "Only"].concat();
     let mut raw = serde_json::Map::new();
     raw.insert("future_feature".into(), serde_json::json!({"a": 1}));
-    raw.insert(retired_key.clone(), serde_json::Value::Bool(true));
     std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
     let mut doc = ExtendedConfigDoc::load(&path).unwrap();
     let cfg = doc.config();
     doc.write(&cfg).unwrap();
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(on_disk.contains("\"future_feature\""));
-    assert!(!on_disk.contains(&retired_key));
 }
 
 #[test]
@@ -1472,22 +1443,24 @@ fn default_primary_agent_round_trips() {
 }
 
 #[test]
-fn roster_trim_removed_default_primary_degrades_to_build() {
+fn default_primary_agent_rejects_unknown_spellings() {
     for value in ["auto", "swarm", "unknown"] {
-        let parsed: ExtendedConfig =
-            serde_json::from_str(&format!(r#"{{"defaultPrimaryAgent":"{value}"}}"#)).unwrap();
-        assert_eq!(
-            parsed.default_primary_agent,
-            DefaultPrimaryAgent::Build,
+        assert!(
+            serde_json::from_str::<ExtendedConfig>(&format!(
+                r#"{{"defaultPrimaryAgent":"{value}"}}"#
+            ))
+            .is_err(),
             "{value}"
         );
-
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.json");
-        std::fs::write(&path, format!(r#"{{"defaultPrimaryAgent":"{value}"}}"#)).unwrap();
-        let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+        let doc = doc_from_raw(serde_json::json!({ "defaultPrimaryAgent": value }));
+        let (cfg, warnings) = doc.config_with_warnings();
         assert_eq!(cfg.default_primary_agent, DefaultPrimaryAgent::Build);
-        assert_eq!(cfg.removed_default_primary_agent(), Some(value));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("defaultPrimaryAgent")),
+            "{value}: {warnings:?}"
+        );
     }
 }
 
@@ -1566,112 +1539,21 @@ fn sandbox_escalation_defaults_enabled_and_round_trips() {
     assert!(parsed.sandbox_escalation_enabled);
 
     let parsed: ExtendedConfig =
-        serde_json::from_str(r#"{"sandboxEscalationEnabled":false}"#).unwrap();
-    assert!(!parsed.sandbox_escalation_enabled);
-    let parsed: ExtendedConfig =
         serde_json::from_str(r#"{"sandbox_escalation_enabled":false}"#).unwrap();
     assert!(!parsed.sandbox_escalation_enabled);
 
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
-    std::fs::write(
-        &path,
-        r#"{"sandboxEscalationEnabled":true,"sandbox_escalation_enabled":false}"#,
-    )
-    .unwrap();
+    std::fs::write(&path, r#"{"sandbox_escalation_enabled":false}"#).unwrap();
     let mut doc = ExtendedConfigDoc::load(&path).unwrap();
     let cfg = doc.config();
-    assert!(
-        !cfg.sandbox_escalation_enabled,
-        "legacy alias is still accepted on read"
-    );
+    assert!(!cfg.sandbox_escalation_enabled);
     doc.write(&cfg).unwrap();
     let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(
         raw.get("sandbox_escalation_enabled"),
         Some(&Value::Bool(false))
     );
-    assert!(raw.get("sandboxEscalationEnabled").is_none());
-}
-
-#[test]
-fn write_preserves_alias_only_setting_under_canonical_key() {
-    // Persist is canonical-only, but discarding the alternate spelling must
-    // never drop the setting it carries. An alias-only document whose typed
-    // value this caller did not change would otherwise lose the setting
-    // outright: `apply_object_delta` no-ops for unchanged values, the alias
-    // removal deletes the only copy, and the next load reverts
-    // `sandbox_escalation_enabled` to its default-true fail-open.
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(&path, r#"{"sandboxEscalationEnabled":false}"#).unwrap();
-    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
-    assert!(!doc.config().sandbox_escalation_enabled);
-
-    // Unrelated persist: only `gitignore_allow` changes.
-    let mut cfg = doc.config();
-    cfg.gitignore_allow.push("target/".to_string());
-    doc.write(&cfg).unwrap();
-
-    let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(
-        raw.get("sandbox_escalation_enabled"),
-        Some(&Value::Bool(false)),
-        "the alias-only setting must survive the write under the canonical key: {raw}"
-    );
-    assert!(raw.get("sandboxEscalationEnabled").is_none(), "{raw}");
-    assert_eq!(
-        raw.get("gitignore_allow"),
-        Some(&serde_json::json!(["target/"])),
-        "{raw}"
-    );
-
-    let doc = ExtendedConfigDoc::load(&path).unwrap();
-    assert!(!doc.config().sandbox_escalation_enabled);
-}
-
-#[test]
-fn canonicalize_document_aliases_gives_daemon_boundaries_one_setting() {
-    // The daemon's snapshot/patch RPCs decode and mutate raw config documents
-    // without passing through `ExtendedConfigDoc`'s funnels; they normalize via
-    // `canonicalize_extended_config_document_aliases` so a registered pair is
-    // ONE setting at those boundaries.
-
-    // Both spellings: the canonical one wins and the alias is dropped, so the
-    // typed decode never fails with serde `duplicate field`.
-    let mut both = serde_json::json!({
-        "sandboxEscalationEnabled": true,
-        "sandbox_escalation_enabled": false,
-    });
-    canonicalize_extended_config_document_aliases(&mut both);
-    assert_eq!(
-        both.get("sandbox_escalation_enabled"),
-        Some(&Value::Bool(false))
-    );
-    assert!(both.get("sandboxEscalationEnabled").is_none());
-
-    // Alias-only: the value is re-seated under the canonical key (persist is
-    // canonical-only and must not drop the setting), and a canonical-path
-    // Unset can remove the one setting instead of leaving the alias in effect.
-    let mut alias_only = serde_json::json!({"sandboxEscalationEnabled": false});
-    canonicalize_extended_config_document_aliases(&mut alias_only);
-    assert_eq!(
-        alias_only.get("sandbox_escalation_enabled"),
-        Some(&Value::Bool(false))
-    );
-    assert!(alias_only.get("sandboxEscalationEnabled").is_none());
-
-    // Untouched documents pass through unchanged, and a non-object root is a
-    // inert no-op (the daemon's own malformed-root rejection still applies).
-    let mut untouched =
-        serde_json::json!({"tui": {"mouse_capture": true}, "sandbox_escalation_enabled": true});
-    let expected = untouched.clone();
-    canonicalize_extended_config_document_aliases(&mut untouched);
-    assert_eq!(untouched, expected);
-
-    let mut not_object = serde_json::json!([1, 2, 3]);
-    canonicalize_extended_config_document_aliases(&mut not_object);
-    assert_eq!(not_object, serde_json::json!([1, 2, 3]));
 }
 
 #[test]
@@ -1932,30 +1814,6 @@ fn load_for_cwd_keeps_valid_name_when_unrelated_known_field_is_malformed() {
 }
 
 #[test]
-fn load_for_cwd_legacy_jobs_cannot_override_canonical_schedule_or_drop_name() {
-    let tmp = TempDir::new().unwrap();
-    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
-    let cfg_path = tmp.path().join("home/.config/cockpit/config.json");
-    std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &cfg_path,
-        r#"{
-                "name": "Christopher",
-                "jobs": { "max_concurrent": 99 },
-                "schedule": { "max_concurrent": 3 }
-            }"#,
-    )
-    .unwrap();
-    let cwd = tmp.path().join("repo");
-    std::fs::create_dir_all(&cwd).unwrap();
-
-    let cfg = trusted_load_for_cwd(&cwd);
-
-    assert_eq!(cfg.name.as_deref(), Some("Christopher"));
-    assert_eq!(cfg.schedule.max_concurrent, 3);
-}
-
-#[test]
 fn load_for_cwd_more_specific_name_null_clears_broader_name() {
     let tmp = TempDir::new().unwrap();
     let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
@@ -2182,95 +2040,6 @@ fn config_resolution_result_unchanged_after_single_pass_rewrite() {
         cfg.gitignore_allow,
         vec!["home.log".to_string(), "project.log".to_string()]
     );
-}
-
-#[test]
-fn web_custom_migrates_legacy_webfetch_tool_command() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(
-        &path,
-        r#"{
-            "tools": {
-                "webfetch": {
-                    "enabled": false,
-                    "command": "curl {url}",
-                    "description": "Legacy fetch description"
-                },
-                "my_tool": {
-                    "enabled": true,
-                    "command": "echo {value}"
-                }
-            }
-        }"#,
-    )
-    .unwrap();
-
-    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
-
-    assert_eq!(cfg.web.custom.fetch_command.as_deref(), Some("curl {url}"));
-    assert!(!cfg.tools.contains_key("webfetch"));
-    assert!(cfg.tools.contains_key("my_tool"));
-}
-
-#[test]
-fn web_custom_migration_preserves_existing_typed_value() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(
-        &path,
-        r#"{
-            "web": {
-                "provider": "custom",
-                "custom": {
-                    "fetch_command": "existing {url}"
-                }
-            },
-            "tools": {
-                "webfetch": {
-                    "enabled": true,
-                    "command": "legacy {url}"
-                }
-            }
-        }"#,
-    )
-    .unwrap();
-
-    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
-
-    assert_eq!(
-        cfg.web.custom.fetch_command.as_deref(),
-        Some("existing {url}")
-    );
-    assert!(!cfg.tools.contains_key("webfetch"));
-}
-
-#[test]
-fn web_custom_migration_drops_legacy_descriptions() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("config.json");
-    std::fs::write(
-        &path,
-        r#"{
-            "tools": {
-                "webfetch": {
-                    "enabled": true,
-                    "command": "curl {url}",
-                    "description": "do not preserve this"
-                }
-            }
-        }"#,
-    )
-    .unwrap();
-
-    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
-
-    assert_eq!(cfg.web.custom.fetch_command.as_deref(), Some("curl {url}"));
-    assert!(cfg.tools.values().all(|tool| {
-        tool.description
-            .as_deref()
-            .is_none_or(|description| !description.contains("do not preserve this"))
-    }));
 }
 
 #[test]
@@ -3690,6 +3459,103 @@ mod image_generation {
             "merge log leaked the path: {logs:?}"
         );
     }
+
+    // Coverage for the generic settings writer's registry merge
+    // (`render_saved_extended_config_preserving_image_generation`, used by the
+    // daemon's typed settings patch and the TUI disk fake). The client-facing
+    // snapshot always carries the redacted EMPTY registry, so a verbatim write
+    // of the incoming document would wipe the on-disk registry.
+    #[test]
+    fn saved_settings_render_preserves_on_disk_registry_and_lands_other_changes() {
+        let on_disk = serde_json::json!({
+            "name": "Before",
+            "redact": { "enabled": true, "denylist": ["SEED-KEEP"] },
+            "image_generation": serde_json::to_value(registry_a()).unwrap(),
+        });
+        let on_disk_bytes = serde_json::to_vec_pretty(&on_disk).unwrap();
+
+        // Faithful redacted round trip: the empty registry plus one other
+        // changed field and one key the typed schema does not own.
+        let mut incoming = on_disk.clone();
+        incoming["image_generation"] =
+            serde_json::to_value(ImageGenerationConfig::default()).unwrap();
+        incoming["name"] = serde_json::json!("Renamed Project");
+        incoming["hooks"] = serde_json::json!({ "sessionStart": [] });
+        let incoming_bytes = serde_json::to_vec(&incoming).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&incoming_bytes).contains("local-comfy"),
+            "precondition: the incoming payload must not carry the registry"
+        );
+
+        let rendered = render_saved_extended_config_preserving_image_generation(
+            &incoming_bytes,
+            &on_disk_bytes,
+        )
+        .expect("render merged settings");
+        let rendered: Value = serde_json::from_slice(&rendered).unwrap();
+        let preserved: ImageGenerationConfig =
+            serde_json::from_value(rendered["image_generation"].clone())
+                .expect("the preserved registry stays valid");
+        assert_eq!(preserved, registry_a(), "the on-disk registry must survive");
+        assert_eq!(
+            rendered["name"], "Renamed Project",
+            "other changes must land"
+        );
+        assert_eq!(rendered["redact"]["denylist"][0], "SEED-KEEP");
+        assert_eq!(
+            rendered["hooks"],
+            serde_json::json!({ "sessionStart": [] }),
+            "keys outside the typed schema are written through"
+        );
+    }
+
+    #[test]
+    fn saved_settings_render_never_lets_the_client_author_the_registry() {
+        // On disk: registry A. Incoming: a client-authored registry B.
+        let on_disk = serde_json::json!({
+            "image_generation": serde_json::to_value(registry_a()).unwrap(),
+        });
+        let incoming = serde_json::json!({
+            "name": "x",
+            "image_generation": serde_json::to_value(registry_b()).unwrap(),
+        });
+        let rendered = render_saved_extended_config_preserving_image_generation(
+            &serde_json::to_vec(&incoming).unwrap(),
+            &serde_json::to_vec(&on_disk).unwrap(),
+        )
+        .unwrap();
+        let rendered: Value = serde_json::from_slice(&rendered).unwrap();
+        let registry: ImageGenerationConfig =
+            serde_json::from_value(rendered["image_generation"].clone()).unwrap();
+        assert_eq!(
+            registry,
+            registry_a(),
+            "only the dedicated RPCs author the registry"
+        );
+
+        // No registry on disk: a client-supplied registry is dropped, not
+        // materialized.
+        let rendered = render_saved_extended_config_preserving_image_generation(
+            &serde_json::to_vec(&incoming).unwrap(),
+            b"{}",
+        )
+        .unwrap();
+        let rendered: Value = serde_json::from_slice(&rendered).unwrap();
+        assert!(rendered.get("image_generation").is_none(), "{rendered}");
+        assert_eq!(rendered["name"], "x");
+    }
+
+    #[test]
+    fn saved_settings_render_fails_closed_on_non_object_documents() {
+        assert!(
+            render_saved_extended_config_preserving_image_generation(b"[]", b"{}").is_err(),
+            "a non-object incoming payload is rejected, not written"
+        );
+        assert!(
+            render_saved_extended_config_preserving_image_generation(b"{}", b"\"x\"").is_err(),
+            "an unreadable on-disk document must not silently drop its registry"
+        );
+    }
 }
 
 #[test]
@@ -4050,8 +3916,7 @@ fn typed_decode_path_recognizes_every_serialized_section() {
     // section — a section the parse path silently drops produces no warning
     // and fails here. One of the two sentinels is malformed for every real
     // section shape: struct/bool/number/string/enum sections reject arrays,
-    // list sections reject strings, and the lenient string-decoding sections
-    // (`defaultPrimaryAgent`) reject arrays.
+    // and list sections reject strings.
     let default_doc = serde_json::to_value(ExtendedConfig::default()).unwrap();
     let sections = default_doc.as_object().expect("serialized default config");
     assert!(!sections.is_empty());
@@ -4179,75 +4044,6 @@ fn recovery_keeps_valid_sections_alongside_a_malformed_one() {
 }
 
 #[test]
-fn sandbox_alias_pair_is_one_setting_with_canonical_spelling_winning() {
-    // A rename/alias pair is ONE setting, not two sections: when a document
-    // carries both spellings, the canonical one wins and the typed decode
-    // still succeeds in one shot — the recovery path must never commit the
-    // alias first (it sorts before the canonical key) and drop the
-    // canonical value as a duplicate.
-    let doc = doc_from_raw(serde_json::json!({
-        "sandboxEscalationEnabled": true,
-        "sandbox_escalation_enabled": false
-    }));
-    let (cfg, warnings) = doc.config_with_warnings();
-    assert!(!cfg.sandbox_escalation_enabled);
-    assert!(warnings.is_empty(), "{warnings:?}");
-
-    // The legacy spelling alone is still honored.
-    let doc = doc_from_raw(serde_json::json!({ "sandboxEscalationEnabled": false }));
-    let (cfg, warnings) = doc.config_with_warnings();
-    assert!(!cfg.sandbox_escalation_enabled);
-    assert!(warnings.is_empty(), "{warnings:?}");
-}
-
-#[test]
-fn layered_sandbox_spelling_does_not_affect_last_layer_wins() {
-    // Layered last-layer-wins must not depend on which spelling each layer
-    // used. Each layer is normalized to the canonical key before merge, so
-    // deep merge never sees two spellings of one setting and layer order
-    // alone decides. Before per-layer normalization, the lower layer's
-    // alias sorted first in recovery and silently beat the upper layer's
-    // canonical spelling.
-    let lower_alias = doc_from_raw(serde_json::json!({ "sandboxEscalationEnabled": false }));
-    let upper_canonical = doc_from_raw(serde_json::json!({ "sandbox_escalation_enabled": true }));
-    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[lower_alias, upper_canonical]);
-    assert!(cfg.sandbox_escalation_enabled);
-    assert!(warnings.is_empty(), "{warnings:?}");
-
-    let lower_canonical = doc_from_raw(serde_json::json!({ "sandbox_escalation_enabled": false }));
-    let upper_alias = doc_from_raw(serde_json::json!({ "sandboxEscalationEnabled": true }));
-    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[lower_canonical, upper_alias]);
-    assert!(cfg.sandbox_escalation_enabled);
-    assert!(warnings.is_empty(), "{warnings:?}");
-}
-
-#[test]
-fn extended_config_key_alias_table_matches_serde() {
-    // Staleness guard for `EXTENDED_CONFIG_KEY_ALIASES`: the canonical key
-    // must be a key the type actually serializes, and the alias must be a
-    // real serde alias of it — carrying both spellings in one raw document
-    // must collide in the typed decode as a duplicate field. A stale table
-    // entry (alias removed from the struct, or pointing at a non-field)
-    // fails here instead of silently rewriting keys.
-    for (alias, canonical) in EXTENDED_CONFIG_KEY_ALIASES {
-        let default_doc = serde_json::to_value(ExtendedConfig::default()).unwrap();
-        assert!(
-            default_doc.as_object().unwrap().contains_key(*canonical),
-            "`{canonical}` is not a serialized canonical config key"
-        );
-        let mut raw = serde_json::Map::new();
-        raw.insert(alias.to_string(), Value::Bool(true));
-        raw.insert(canonical.to_string(), Value::Bool(false));
-        let error = serde_json::from_value::<ExtendedConfig>(Value::Object(raw))
-            .expect_err("two spellings of one field must collide in the raw typed decode");
-        assert!(
-            error.to_string().contains("duplicate field"),
-            "unexpected error for `{alias}` vs `{canonical}`: {error}"
-        );
-    }
-}
-
-#[test]
 fn daemon_lifetime_policy_is_narrow_default_true_and_fail_closed() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("config.json");
@@ -4267,4 +4063,133 @@ fn daemon_lifetime_policy_is_narrow_default_true_and_fail_closed() {
     std::fs::write(&path, r#"{"daemon":false}"#).unwrap();
     let error = load_daemon_lifetime_policy_at(&path).unwrap_err();
     assert!(error.to_string().contains("daemon must be an object"));
+}
+
+// ---------------------------------------------------------------------------
+// Unknown top-level keys. Removed spellings are no longer translated, so a
+// key no reader owns is inert; the layered load must say so instead of
+// silently leaving the setting at its default.
+// ---------------------------------------------------------------------------
+
+fn layer_doc(path: &str, raw: Value) -> ExtendedConfigDoc {
+    ExtendedConfigDoc {
+        path: PathBuf::from(path),
+        raw,
+        origin: ConfigLayerOrigin::LocalTrusted,
+    }
+}
+
+#[test]
+fn known_top_level_config_keys_cover_every_owner() {
+    let known = known_top_level_config_keys()
+        .expect("ExtendedConfig and ProvidersConfig must deserialize as plain structs");
+    // Every key the typed owners serialize is one they accept.
+    let extended = serde_json::to_value(ExtendedConfig::default()).unwrap();
+    for key in extended.as_object().unwrap().keys() {
+        assert!(known.contains(key.as_str()), "ExtendedConfig key `{key}`");
+    }
+    for key in [
+        // ExtendedConfig renames and snake_case fields.
+        "knowledgeBases",
+        "sandbox_escalation_enabled",
+        "defaultPrimaryAgent",
+        "maxPrimaryRounds",
+        // ProvidersConfig metadata shares the file.
+        "providers",
+        "active_model",
+        "category_defaults",
+        "on_unlisted_models_fetch",
+        // Owned by other readers of the same layer bytes.
+        "hooks",
+        "secretStore",
+        "secret_store",
+        "$schema",
+    ] {
+        assert!(known.contains(key), "`{key}` must be a known config key");
+    }
+    for removed in ["sandboxEscalationEnabled", "llm_mode", "agents"] {
+        assert!(
+            !known.contains(removed),
+            "`{removed}` is not owned by any reader"
+        );
+    }
+}
+
+#[test]
+fn unknown_top_level_key_warns_with_key_and_layer_and_stays_inert() {
+    let project = layer_doc(
+        "/work/repo/.cockpit/config.json",
+        serde_json::json!({
+            "name": "n",
+            "sandboxEscalationEnabled": false,
+            "hooks": { "sessionStart": [] },
+            "active_model": { "provider": "openai", "model": "gpt-5" },
+            "$schema": "https://example.invalid/schema.json"
+        }),
+    );
+    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[project]);
+    // The removed spelling has no effect: the canonical key keeps its default.
+    assert!(cfg.sandbox_escalation_enabled);
+    assert_eq!(cfg.name.as_deref(), Some("n"));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`sandboxEscalationEnabled`"),
+        "{warnings:?}"
+    );
+    assert!(warnings[0].contains(".cockpit/config.json"), "{warnings:?}");
+    assert!(!warnings[0].contains("/work/repo"), "{warnings:?}");
+}
+
+#[test]
+fn unknown_top_level_key_warning_never_echoes_a_nonstandard_path() {
+    const PATH_SECRET: &str = "tok-UNKNOWN-KEY-PATH-SECRET";
+    let doc = layer_doc(
+        &format!("/secrets/{PATH_SECRET}/custom.json"),
+        serde_json::json!({ "notARealSetting": true }),
+    );
+    let (_cfg, warnings) = load_merged_from_docs_with_warnings(&[doc]);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("`notARealSetting`"), "{warnings:?}");
+    assert!(!warnings[0].contains(PATH_SECRET), "{warnings:?}");
+
+    // Synthetic sources are already labels.
+    let attached = layer_doc(
+        "<attached workspace config>",
+        serde_json::json!({ "notARealSetting": true }),
+    );
+    let (_cfg, warnings) = load_merged_from_docs_with_warnings(&[attached]);
+    assert!(
+        warnings[0].contains("<attached workspace config>"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn unknown_top_level_key_warning_bounds_and_escapes_the_key() {
+    let long_key = format!("{}\n", "k".repeat(200));
+    let mut raw = Map::new();
+    raw.insert(long_key, Value::Bool(true));
+    let doc = layer_doc("/x/.cockpit/config.json", Value::Object(raw));
+    let (_cfg, warnings) = load_merged_from_docs_with_warnings(&[doc]);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(!warnings[0].contains('\n'), "{warnings:?}");
+    assert!(!warnings[0].contains(&"k".repeat(65)), "{warnings:?}");
+    assert!(warnings[0].contains('…'), "{warnings:?}");
+}
+
+#[test]
+fn unknown_top_level_keys_survive_a_typed_write() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, r#"{"sandboxEscalationEnabled":false,"name":"a"}"#).unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = doc.config();
+    cfg.name = Some("b".into());
+    doc.write(&cfg).unwrap();
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(written["name"], "b");
+    assert_eq!(
+        written["sandboxEscalationEnabled"], false,
+        "unknown keys are preserved on write, not deleted"
+    );
 }

@@ -204,7 +204,7 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
 
     let secret = "release-acceptance-secret-7f31";
     let prompt = format!("durable release prompt {secret}");
-    let turn = run(&session, &["run", "--json", &prompt]);
+    let turn = run(&session, &["run", "--format", "json", &prompt]);
     assert!(turn.status.success(), "{}", output_text(&turn));
     let events = String::from_utf8_lossy(&turn.stdout)
         .lines()
@@ -291,7 +291,8 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
             "run",
             "--session",
             &session_id,
-            "--json",
+            "--format",
+            "json",
             "resume exact session",
         ],
     );
@@ -314,7 +315,8 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
             "run",
             "--session",
             &imported_id_text,
-            "--json",
+            "--format",
+            "json",
             "resume imported session",
         ],
     );

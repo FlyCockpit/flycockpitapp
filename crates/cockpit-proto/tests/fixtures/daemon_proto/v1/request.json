@@ -314,16 +314,6 @@
     },
     "request": "cancel_sealed_owner_operation"
   },
-  "create_sealed_action": {
-    "params": {
-      "kind_id": "github_issue_comment",
-      "project_id": "22222222-2222-4222-8222-222222222222",
-      "description": "Comment on GitHub issues",
-      "origin_id": "origin_github_api",
-      "projection_id": "projection_issue_comment"
-    },
-    "request": "create_sealed_action"
-  },
   "docs_ask": {
     "params": {
       "question": "How do I configure the sandbox?",
@@ -1726,14 +1716,6 @@
       "answers_json": "{}"
     },
     "request": "apply_setup_wizard"
-  },
-  "save_extended_config": {
-    "params": {
-      "project_root": "/tmp/project",
-      "path": "config.json",
-      "content": "{}"
-    },
-    "request": "save_extended_config"
   },
   "export_policy": {
     "params": {

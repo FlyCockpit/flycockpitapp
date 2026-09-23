@@ -471,7 +471,6 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         | proto::Response::FsWrite { hash: _ }
         | proto::Response::ExtendedConfigSaved { .. }
-        | proto::Response::ExtendedConfigWritten { .. }
         | proto::Response::SetupWizardApplied { .. }
         | proto::Response::UsageCounts {
             models: _,
@@ -9086,7 +9085,7 @@ async fn handle_envelope(
                         Some(id),
                         ErrorPayload {
                             code: ErrorCode::Authorization,
-                            message: "legacy actorless transport cannot replay mutations".into(),
+                            message: "remote replay requires a device-bound remote actor".into(),
                         },
                     ),
                 )
@@ -9170,7 +9169,9 @@ async fn handle_envelope(
                         Some(id),
                         ErrorPayload {
                             code: ErrorCode::Authorization,
-                            message: "legacy actorless transport cannot acknowledge replay".into(),
+                            message:
+                                "remote replay acknowledgement requires a device-bound remote actor"
+                                    .into(),
                         },
                     ),
                 )

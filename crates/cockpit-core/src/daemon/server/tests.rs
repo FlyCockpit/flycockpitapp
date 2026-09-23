@@ -363,13 +363,6 @@ fn sealed_owner_channel_requests() -> Vec<Request> {
             description: "new safe description".into(),
         },
         Request::ListSealedActions,
-        Request::CreateSealedAction {
-            kind_id: "https.notify".into(),
-            project_id: "proj".into(),
-            description: "notify".into(),
-            origin_id: "0".into(),
-            projection_id: "http_status_and_ok".into(),
-        },
         Request::ReviseSealedActionDescription {
             action_id: "act-1".into(),
             description: "revised".into(),
@@ -442,42 +435,12 @@ async fn sealed_owner_rpcs_are_owner_remoted_and_never_leak() {
 }
 
 #[tokio::test]
-async fn action_admin_unknown_ids_reject_before_persist() {
-    // The retired catalog selector is rejected before touching persistence. The
-    // owner-declared request is now the only create surface, and its declaration
-    // is parsed before a durable action can be minted.
+async fn owner_declared_sealed_action_create_persists() {
     let ctx = test_ctx();
 
-    let unknown_cases = [
-        ("bogus.kind", "0", "none"),
-        ("https.notify", "99", "none"), // origin index out of range
-        ("https.notify", "0", "bogus_projection"),
-    ];
-    for (kind_id, origin_id, projection_id) in unknown_cases {
-        let mut state = owner_state();
-        let error = handle_request(
-            Request::CreateSealedAction {
-                kind_id: kind_id.into(),
-                project_id: "proj".into(),
-                description: "notify".into(),
-                origin_id: origin_id.into(),
-                projection_id: projection_id.into(),
-            },
-            &mut state,
-            &ctx,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.code,
-            ErrorCode::BadRequest,
-            "unknown ids ({kind_id}/{origin_id}/{projection_id}) must reject before persist"
-        );
-    }
-
-    // Positive control: an owner-declared fixed sink persists a daemon-minted
-    // action instance. Sealed local executors pin an absolute executable path
-    // (canonicalized and identity-hashed), so the fixture must provide one.
+    // An owner-declared fixed sink persists a daemon-minted action instance.
+    // Sealed local executors pin an absolute executable path (canonicalized
+    // and identity-hashed), so the fixture must provide one.
     let exe_dir = tempfile::tempdir().unwrap();
     let exe = exe_dir.path().join("notify");
     std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
@@ -2437,7 +2400,9 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
             if id == denied_id && error.code == ErrorCode::Authorization
     ));
 
-    // Legacy actorless v1 reads remain accepted and execute concurrently.
+    // Actorless remote reads (relay client tokens minted without an actor
+    // binding, the production web/native path) are accepted and execute
+    // concurrently.
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote(None),
@@ -2463,7 +2428,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     .unwrap();
     concurrent.join_next().await.unwrap().unwrap();
     assert!(matches!(
-        recv_writer_body(&mut writer_rx, "legacy read response").await,
+        recv_writer_body(&mut writer_rx, "actorless read response").await,
         Body::Response { id, response }
             if id == read_id && matches!(*response, Response::DaemonStatus { .. })
     ));
@@ -13794,107 +13759,14 @@ async fn remote_owner_save_image_spend_policy_commits_and_replays() {
     assert!(status.safe_response.is_some());
 }
 
-/// `SaveExtendedConfig` is owner-remoted: a remote owner's dispatch writes the
-/// config to disk once, commits the durable replay record, and a same-operation
-/// replay returns the cached response without rewriting the file.
-#[tokio::test]
-#[cfg(feature = "remote")]
-async fn remote_owner_save_extended_config_commits_and_replays() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config_path = tmp.path().join("config.json");
-    std::fs::write(&config_path, "{}\n").unwrap();
-    // File-backed config source so the post-save `refresh_redaction_table`
-    // re-reads exactly what the dispatch wrote, as the on-disk daemon source
-    // does; it ignores the process cwd.
-    let config_path_for_source = config_path.clone();
-    let source = crate::daemon::config_source::ConfigSource::new(
-        move |_cwd| {
-            let extended =
-                crate::config::extended::ExtendedConfigDoc::load(&config_path_for_source)
-                    .map(|doc| doc.config())
-                    .unwrap_or_default();
-            Ok((
-                crate::config::providers::ProvidersConfig::default(),
-                extended,
-            ))
-        },
-        |_cwd, _provider_id| None,
-        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
-    );
-    let ctx = test_ctx_with_config_source(source);
-    let operation = remote_owner_operation().await;
-
-    let marker = "REMOTE-SAVE-MARKER-4d5e6f70";
-    let mut extended = crate::config::extended::ExtendedConfig::default();
-    extended.redact.enabled = true;
-    extended.redact.denylist = vec![marker.to_string()];
-    let content = serde_json::to_string(&extended).unwrap();
-    // Precondition / non-vacuity: the marker is not on disk before the save.
-    assert!(
-        !std::fs::read_to_string(&config_path)
-            .unwrap()
-            .contains(marker)
-    );
-    let request = Request::SaveExtendedConfig {
-        project_root: tmp.path().to_string_lossy().into_owned(),
-        path: "config.json".into(),
-        content,
-        base_hash: None,
-    };
-    let mut state = owner_state();
-    let shared = state.shared_snapshot();
-    let mut effects = ClientRequestEffects::default();
-    let first = handle_serialized_request_with_remote_operation(
-        request.clone(),
-        &mut state,
-        &shared,
-        &ctx,
-        &mut effects,
-        Some(&operation),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(first, Response::ExtendedConfigWritten { .. }));
-    assert!(
-        std::fs::read_to_string(&config_path)
-            .unwrap()
-            .contains(marker),
-        "the remote dispatch must write the config to disk"
-    );
-    let replay = handle_serialized_request_with_remote_operation(
-        request,
-        &mut state,
-        &shared,
-        &ctx,
-        &mut effects,
-        Some(&operation),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        serde_json::to_vec(&first).unwrap(),
-        serde_json::to_vec(&replay).unwrap(),
-    );
-    let status = ctx
-        .db
-        .remote_operation_status(
-            &operation.logical_attachment_id.to_string(),
-            &operation.operation_id.to_string(),
-        )
-        .await
-        .unwrap()
-        .expect("committed save_extended_config operation");
-    assert_eq!(status.state, "committed");
-}
-
 /// The `image_generation` registry is authored ONLY by the dedicated
-/// `image_endpoint_*` RPCs; a generic `SaveExtendedConfig` (whose incoming
-/// registry is always the redacted EMPTY default) must PRESERVE it, and the
-/// dedicated RPCs must remain fully mutable afterwards — none of that path is
-/// affected by the SaveExtendedConfig merge.
+/// `image_endpoint_*` RPCs. A generic typed settings patch
+/// (`ApplyExtendedConfigPatch`, whose snapshot always carries the redacted
+/// EMPTY registry) must PRESERVE it while landing its own change, and the
+/// dedicated RPCs must remain fully mutable afterwards.
 #[cfg(feature = "extended")]
 #[tokio::test]
-async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() {
+async fn image_generation_survives_settings_patch_and_stays_rpc_mutable() {
     use cockpit_config::config::image_generation::{
         IMAGE_GENERATION_ROUTE_PROFILE_VERSION, ImageAdapterKind, ImageEndpoint,
         ImageGenerationConfig, ImageLocationClass,
@@ -13904,7 +13776,7 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     // never resolves the developer's real `~/.config/cockpit/config.json`; the
     // empty temp home means the project `.cockpit/config.json` is the only
     // existing config layer, and the RPC write, the production config source,
-    // and the SaveExtendedConfig target all agree on that one file.
+    // and the settings-patch target all agree on that one file.
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
@@ -13912,10 +13784,14 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     let config_path = cockpit_dir.join("config.json");
     std::fs::write(&config_path, "{}\n").unwrap();
+    // The test daemon has an ephemeral lifetime, and an ephemeral owner's
+    // settings snapshot refuses a missing global layer directory. Create the
+    // (empty) isolated global directory so the snapshot can enumerate it.
+    std::fs::create_dir_all(cockpit_config::config::dirs::global_config_dir().unwrap()).unwrap();
 
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
-    // The dedicated image-config RPC (and the trust-gated `.cockpit` config
-    // layer) resolve workspace trust from the db.
+    // The dedicated image-config RPC, the settings snapshot, and the
+    // trust-gated `.cockpit` config layer resolve workspace trust from the db.
     trust_workspace_root(&ctx, project.path()).await;
     let project_root = project.path().to_string_lossy().into_owned();
 
@@ -14007,31 +13883,67 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
         "the RPC must persist the registry to disk"
     );
 
-    // 2) A generic settings save carrying the redacted EMPTY registry.
-    let incoming = serde_json::json!({
-        "name": "Renamed Project",
-        "image_generation": serde_json::to_value(ImageGenerationConfig::default()).unwrap(),
-    })
-    .to_string();
-    assert!(!incoming.contains("openai-main"));
-    let saved = crate::daemon::fs_api::save_extended_config(
+    // 2) A generic typed settings patch authored against the redacted
+    // snapshot, whose registry is the EMPTY default.
+    let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+    let snapshot = dispatch_sealed_owner(
         &ctx,
-        project_root.clone(),
-        ".cockpit/config.json".into(),
-        incoming,
-        None,
+        &mut state,
+        Request::GetExtendedConfigSnapshot {
+            project_root: project_root.clone(),
+            snapshot_session_id: snapshot_session_id.clone(),
+        },
     )
     .await
-    .expect("save extended config succeeds");
-    assert!(matches!(saved, Response::ExtendedConfigWritten { .. }));
+    .expect("settings snapshot succeeds");
+    let layers = match snapshot {
+        Response::ExtendedConfigSnapshot { layers, .. } => layers,
+        other => panic!("expected an extended config snapshot, got {other:?}"),
+    };
+    let project_layer = layers
+        .into_iter()
+        .find(|layer| layer.kind == cockpit_proto::CockpitConfigLayer::Project)
+        .expect("the project layer is part of the settings snapshot");
+    assert!(
+        !serde_json::to_string(&project_layer.config.image_generation)
+            .unwrap()
+            .contains("openai-main"),
+        "precondition: the snapshot never carries the registry to the client"
+    );
+    let saved = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ApplyExtendedConfigPatch {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
+            project_root: project_root.clone(),
+            layer_id: project_layer.layer_id.clone(),
+            patch: cockpit_proto::ExtendedConfigPatch {
+                operations: vec![cockpit_proto::ExtendedConfigPathMutation::Set {
+                    path: vec!["name".to_string()],
+                    value: serde_json::json!("Renamed Project"),
+                }],
+                materialize: false,
+                denylist: Vec::new(),
+                redacted_mutations: Vec::new(),
+            },
+            expected_revision: project_layer.revision.clone(),
+            snapshot_session_id,
+        },
+    )
+    .await
+    .expect("typed settings patch succeeds");
+    assert!(matches!(saved, Response::ExtendedConfigSaved { .. }));
     let after_save = std::fs::read_to_string(&config_path).unwrap();
     assert!(
         after_save.contains("openai-main"),
-        "SaveExtendedConfig must preserve the RPC-authored registry"
+        "a typed settings patch must preserve the RPC-authored registry"
     );
-    assert!(after_save.contains("Renamed Project"));
+    assert!(
+        after_save.contains("Renamed Project"),
+        "the patched field must land"
+    );
 
-    // 3) The dedicated RPC still mutates the registry after the settings save.
+    // 3) The dedicated RPC still mutates the registry after the settings patch.
     let layer = crate::daemon::server::image_control_mutations::authoritative_image_layer(
         &ctx,
         project.path(),
@@ -14058,7 +13970,7 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
         ),
     )
     .await
-    .expect("second endpoint create succeeds after SaveExtendedConfig");
+    .expect("second endpoint create succeeds after the settings patch");
     assert!(matches!(second, Response::ImageControlMutated(_)));
     let final_config = std::fs::read_to_string(&config_path).unwrap();
     let final_value: serde_json::Value = serde_json::from_str(&final_config).unwrap();
@@ -14067,8 +13979,9 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     let ids: Vec<&str> = registry.endpoints().iter().map(|e| e.id.as_str()).collect();
     assert!(
         ids.contains(&"openai-main") && ids.contains(&"backup-openai"),
-        "both the pre-save and post-save endpoints must be present: {ids:?}"
+        "both the pre-patch and post-patch endpoints must be present: {ids:?}"
     );
+    assert_eq!(final_value["name"], "Renamed Project");
 }
 
 /// The deeper payload validation the authz matrix cannot reach (its probes die
@@ -20073,10 +19986,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "apply_sealed_owner_operation" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
-        // Catalog sealed-action creation is retired (#236): the request is
-        // an unconditional post-auth `BadRequest` steering owners to the
-        // owner-declared sink path.
-        "create_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "cancel_sealed_owner_operation" => AuthzAllowedOutcome::Response,
         "sealed_owner_inventory"
         | "list_sealed_actions"
@@ -20286,10 +20195,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // just like the sibling secret/provider owner mutations above. The
         // ephemeral-daemon owner mutations (`setup_copilot_auth` and the
         // flycockpit ones) reject via the ephemeral guard;
-        // `save_extended_config` rejects the non-`config.json` target;
         // `save_image_spend_policy` rejects the malformed settings JSON.
         "setup_copilot_auth"
-        | "save_extended_config"
         | "save_image_spend_policy"
         | "set_flycockpit_connector_enabled"
         | "sync_flycockpit_org_policy"
@@ -20298,10 +20205,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // intent therefore reaches the post-owner-gate capability CAS and
         // returns the precise stale/missing-authority conflict.
         "save_mcp_config" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
-        // The legacy catalog constructor remains on the wire for an explicit,
-        // typed retirement error. Authorization succeeds for the owner before
-        // dispatch directs callers to the owner-declared sink replacement.
-        "create_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // `import_policy` and `apply_setup_wizard` validate their caller-supplied
         // payload inside the owner handler, which maps every parse /
         // unsupported-descriptor failure through `internal` (not `bad_request`),
@@ -20478,7 +20381,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("sealed_owner_inventory"),
         authz_owner_only("edit_sealed_owner_description"),
         authz_owner_only("list_sealed_actions"),
-        authz_owner_only("create_sealed_action"),
         authz_owner_only("create_declared_sealed_action"),
         authz_owner_only("revise_sealed_action_description"),
         authz_owner_only("revise_sealed_action_enabled"),
@@ -20656,7 +20558,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("setup_copilot_auth"),
         authz_owner_only("apply_setup_wizard"),
         authz_owner_only("save_mcp_config"),
-        authz_owner_only("save_extended_config"),
         authz_owner_only("apply_extended_config_patch"),
         authz_owner_only("get_extended_config_snapshot"),
         authz_owner_only("get_image_sidecar_authority_snapshot"),
@@ -22159,13 +22060,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             description: "safe description".into(),
         },
         "list_sealed_actions" => Request::ListSealedActions,
-        "create_sealed_action" => Request::CreateSealedAction {
-            kind_id: "https.notify".into(),
-            project_id: "proj".into(),
-            description: "notify".into(),
-            origin_id: "0".into(),
-            projection_id: "http_status_and_ok".into(),
-        },
         "create_declared_sealed_action" => Request::CreateDeclaredSealedAction {
             project_id: "proj".into(),
             description: "notify".into(),
@@ -23092,12 +22986,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_key: root.clone(),
             settings_json: "not json".into(),
             expected_policy_version: None,
-        },
-        "save_extended_config" => Request::SaveExtendedConfig {
-            project_root: root.clone(),
-            path: "not-config.json".into(),
-            content: "{}".into(),
-            base_hash: None,
         },
         "setup_copilot_auth" => Request::SetupCopilotAuth {
             client_operation_id: "matrix-operation".into(),
@@ -30666,19 +30554,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
-            request: Request::CreateSealedAction {
-                kind_id: "k".into(),
-                project_id: "p".into(),
-                description: "d".into(),
-                origin_id: "0".into(),
-                projection_id: "none".into(),
-            },
-            kind: "create_sealed_action",
-            session_id: None,
-            audit_path: None,
-            mutating: true,
-        },
-        CommandMetadataCase {
             request: Request::CreateDeclaredSealedAction {
                 project_id: "p".into(),
                 description: "d".into(),
@@ -31193,7 +31068,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ApplyOnboardingTransition(proto::ApplyOnboardingTransition { run_id: Uuid::now_v7(), attempt_id: Uuid::now_v7(), expected_revision: 0, client_operation_id: "fixture-onboarding-transition".into(), transition: proto::OnboardingTransitionKind::Advance, settlement: None }), kind: "apply_onboarding_transition", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ApplyOnboardingProfile(proto::ApplyOnboardingProfile { client_operation_id: "fixture-onboarding-profile".into(), display_name: "Ada".into() }), kind: "apply_onboarding_profile", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetOnboardingTransitionReceipt(proto::OnboardingReceiptQuery { run_id: Uuid::now_v7(), attempt_id: Uuid::now_v7(), client_operation_id: "fixture-onboarding-receipt".into() }), kind: "get_onboarding_transition_receipt", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::SaveExtendedConfig { project_root: "/tmp/project".into(), path: "AGENTS.md".into(), content: String::new(), base_hash: None }, kind: "save_extended_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ExportPolicy { project_root: "/tmp/project".into() }, kind: "export_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         #[cfg(feature = "extended")]
@@ -31390,7 +31264,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SealedOwnerInventory,
         EditSealedOwnerDescription,
         ListSealedActions,
-        CreateSealedAction,
         ReviseSealedActionDescription,
         ReviseSealedActionEnabled,
         RetireSealedAction,
@@ -31547,7 +31420,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ApplyOnboardingProfile,
         ApplyOnboardingTransition,
         GetOnboardingTransitionReceipt,
-        SaveExtendedConfig,
         ExportPolicy,
         ImportPolicy,
         #[cfg(feature = "extended")]
@@ -37779,119 +37651,6 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         }
     }
     assert!(saw_lag, "in-process broadcast lag should emit typed event");
-}
-
-/// A `SaveExtendedConfig` that adds a `redact.denylist` entry must refresh the
-/// committed global redaction table, so the very next global broadcast scrubs
-/// the newly denylisted secret for non-owner clients. Without the post-save
-/// refresh, `broadcast_global` rebuilds only when the vault inventory
-/// generation advances (which a config-only change does not), so it would pin a
-/// STALE table and disclose the secret. This drives the real
-/// `Request::SaveExtendedConfig` dispatch over a file-backed config source.
-#[tokio::test]
-#[cfg(feature = "remote")]
-async fn save_extended_config_denylist_refreshes_broadcast_redaction() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config_path = tmp.path().join("config.json");
-    std::fs::write(&config_path, "{}\n").unwrap();
-
-    // File-backed config source: `refresh_redaction_table` re-reads whatever
-    // `SaveExtendedConfig` last wrote to `config.json`, exactly as the on-disk
-    // daemon source does. It ignores the process cwd so the test does not depend
-    // on `std::env::current_dir()`.
-    let config_path_for_source = config_path.clone();
-    let source = crate::daemon::config_source::ConfigSource::new(
-        move |_cwd| {
-            let extended =
-                crate::config::extended::ExtendedConfigDoc::load(&config_path_for_source)
-                    .map(|doc| doc.config())
-                    .unwrap_or_default();
-            Ok((
-                crate::config::providers::ProvidersConfig::default(),
-                extended,
-            ))
-        },
-        |_cwd, _provider_id| None,
-        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
-    );
-    let ctx = test_ctx_with_config_source(source);
-
-    let secret = "DENYLIST-SECRET-b7c1e2f3a4d5";
-    let mut events = ctx.subscribe_global();
-
-    // Precondition / non-vacuity: before the save, the committed table does NOT
-    // redact the secret, so any later redaction is caused by the save's refresh.
-    ctx.broadcast_global(proto::Event::LspNotice {
-        text: secret.to_string(),
-    });
-    let pre = recv_lsp_notice(&mut events).await;
-    assert_eq!(
-        pre.redact.scrub(secret),
-        secret,
-        "secret must not be redacted before it is denylisted"
-    );
-
-    // Write a complete extended config carrying the denylist entry through the
-    // real dispatch path.
-    let mut extended = crate::config::extended::ExtendedConfig::default();
-    extended.redact.enabled = true;
-    extended.redact.denylist = vec![secret.to_string()];
-    let content = serde_json::to_string(&extended).unwrap();
-    let mut state = owner_state();
-    handle_request(
-        Request::SaveExtendedConfig {
-            project_root: tmp.path().to_string_lossy().into_owned(),
-            path: "config.json".into(),
-            content,
-            base_hash: None,
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .expect("save extended config with denylist");
-
-    // The next global broadcast must pin a table that redacts the secret.
-    ctx.broadcast_global(proto::Event::LspNotice {
-        text: secret.to_string(),
-    });
-    let post = recv_lsp_notice(&mut events).await;
-    // The placeholder the committed table substitutes for the denylisted
-    // secret. Derived from the table itself, so the test does not hardcode the
-    // daemon's placeholder string.
-    let placeholder = post.redact.scrub(secret);
-    assert_ne!(
-        placeholder, secret,
-        "committed table must redact the denylisted secret after SaveExtendedConfig"
-    );
-
-    // The event a non-owner client would observe is scrubbed identically.
-    let scrubbed = scrub_event_for_principal(&remote_principal(), post)
-        .expect("non-owner receives the scrubbed event");
-    let proto::Event::LspNotice { text } = scrubbed else {
-        panic!("expected LspNotice");
-    };
-    assert!(
-        !text.contains(secret),
-        "broadcast event leaked the denylisted secret: {text}"
-    );
-    assert_eq!(
-        text, placeholder,
-        "broadcast event text must be scrubbed exactly as the pinned table dictates"
-    );
-}
-
-/// Drain global-bus envelopes until an `LspNotice` arrives, tolerating any
-/// unrelated startup/state events on the shared bus.
-async fn recv_lsp_notice(
-    events: &mut crate::daemon::EventReceiver,
-) -> crate::daemon::EventEnvelope {
-    loop {
-        let envelope = events.recv().await.expect("global event bus open");
-        if matches!(envelope.event, proto::Event::LspNotice { .. }) {
-            return envelope;
-        }
-    }
 }
 
 // Real time (no `start_paused`): this test drives `request_ok(DaemonStatus)`,

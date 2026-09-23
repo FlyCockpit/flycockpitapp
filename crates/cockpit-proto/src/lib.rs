@@ -436,7 +436,8 @@ pub struct ProviderConfigView {
     pub on_unlisted_models_fetch: Option<cockpit_config::config::providers::OnUnlistedModelsFetch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
-    /// Stable, secret-free warnings raised while loading provider layers.
+    /// Stable, secret-free warnings raised while loading provider and
+    /// config layers (including unknown top-level `config.json` keys).
     /// Clients display these rather than relying on daemon tracing output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub configuration_warnings: Vec<String>,
@@ -3225,17 +3226,19 @@ impl<'de> Deserialize<'de> for LeakRevealToken {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        // Historical response fixtures used an empty placeholder before the
-        // live v16 contract required canonical tokens. Keep deserialization
-        // bounded and zeroizing; live request semantics and the reveal frame
-        // enforce the exact 64-byte lowercase-hex shape.
-        if value.len() > 64 {
+        let value = zeroize::Zeroizing::new(String::deserialize(deserializer)?);
+        // Fail closed on anything but the canonical 64-byte lowercase-hex
+        // token the daemon mints; the value is zeroized on every path.
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             return Err(serde::de::Error::custom(
-                "leak reveal token exceeds 64 bytes",
+                "leak reveal token must be 64 lowercase hex characters",
             ));
         }
-        Ok(Self(zeroize::Zeroizing::new(value)))
+        Ok(Self(value))
     }
 }
 
@@ -3562,6 +3565,29 @@ mod sensitive_wire_literal_tests {
         assert!(debug.contains("REDACTED"));
         let owned = token.into_zeroizing();
         assert_eq!(owned.as_str(), marker);
+    }
+
+    #[test]
+    fn leak_reveal_token_deserialize_accepts_only_canonical_lowercase_hex() {
+        let canonical = "0123456789abcdef".repeat(4);
+        let parsed: LeakRevealToken =
+            serde_json::from_value(serde_json::Value::String(canonical.clone())).unwrap();
+        assert_eq!(parsed.as_str(), canonical);
+        for invalid in [
+            String::new(),
+            "cap-token".to_string(),
+            "0".repeat(63),
+            "0".repeat(65),
+            "0123456789ABCDEF".repeat(4),
+            "g".repeat(64),
+        ] {
+            let parsed: std::result::Result<LeakRevealToken, _> =
+                serde_json::from_value(serde_json::Value::String(invalid.clone()));
+            assert!(
+                parsed.is_err(),
+                "non-canonical token {invalid:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -7425,7 +7451,7 @@ mod tests {
         assert!(agent["result_revision"].is_string());
         assert_eq!(agent["consumed_config_generation"], 7);
         assert_eq!(agent["result_config_generation"], 8);
-        assert_eq!(agent["config_generation"], 8);
+        assert!(agent.get("config_generation").is_none());
         assert_eq!(
             fixture["agent_editor_lease_completed"]["data"]["status"]["outcome"]["status"],
             "reconciled"

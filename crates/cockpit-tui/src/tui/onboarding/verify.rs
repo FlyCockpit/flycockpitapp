@@ -7,7 +7,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use super::{ProviderSettlementEvidence, auth::SPINNER, chrome, theme, ui};
+use super::{ProviderSettlementEvidence, auth::SPINNER, chrome, ui};
+use crate::tui::theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyOutcome {

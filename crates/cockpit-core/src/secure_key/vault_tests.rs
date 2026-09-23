@@ -1,4 +1,4 @@
-//! Wrap-key vault, first-run, migrate, and import tests.
+//! Wrap-key vault, first-run, and migrate tests.
 //!
 //! Injected KekStore / vault only. No real OS keyring. No process env mutation.
 
@@ -13,7 +13,6 @@ use cockpit_proto::{FeatureCapabilityState, SecretStoreIntent, SecretStorePlacem
 use crate::db::Db;
 use crate::db::installation_identity::ensure_installation_identity_conn;
 use crate::redact::start_standalone_redaction_key_resolver_with;
-use crate::secure_key::fake::FakeNativeStore;
 use crate::secure_key::{
     FileKekStore, FirstRunSecretStoreIntent, KekStore, KeyringProbeResult, MemoryKekStore,
     Passphrase, SecretStoreInjected, SecretVault, SecretVaultOpenOptions, VaultFault,
@@ -24,7 +23,7 @@ use crate::secure_key::{
 
 use super::error::SecureKeyError;
 use super::key_material::generate_key_bytes;
-use super::namespace::{REDACTION_HISTORY_V1_NAMESPACE, SECURE_KEY_SERVICE, version_account};
+use super::namespace::SECURE_KEY_SERVICE;
 use super::native_store::NativeKeyStore;
 use super::vault::{item_aad, substitute_item_ciphertext, tamper_item_ciphertext, wrap_aad};
 
@@ -482,7 +481,6 @@ fn first_run_persists_keyring_when_available() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap();
@@ -543,7 +541,6 @@ fn keyring_mode_fails_closed_when_keyring_drops() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap();
@@ -560,7 +557,6 @@ fn keyring_mode_fails_closed_when_keyring_drops() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     ) {
         Err(err) => err,
@@ -722,7 +718,6 @@ fn resume_activated_database_migrate_rejects_available_keyring() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap();
@@ -804,7 +799,6 @@ fn ensure_secret_vault_reloads_authority_after_resume() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap();
@@ -889,7 +883,6 @@ fn available_keyring_rejects_database_kek_placement() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap();
@@ -904,7 +897,6 @@ fn available_keyring_rejects_database_kek_placement() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap_err();
@@ -939,7 +931,6 @@ fn available_keyring_rejects_noop_database_kek_placement() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap();
@@ -955,7 +946,6 @@ fn available_keyring_rejects_noop_database_kek_placement() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap_err();
@@ -1012,46 +1002,6 @@ fn secret_store_migrate_to_database_rejected_when_keyring_available() {
 }
 
 #[test]
-fn import_legacy_secure_key_roots_then_drop_keyring_items() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
-    let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
-    let installation = db
-        .blocking_write_for_sync_maintenance(ensure_installation_identity_conn)
-        .unwrap();
-    let legacy = FakeNativeStore::new();
-    let ns = super::namespace::Namespace::parse(REDACTION_HISTORY_V1_NAMESPACE).unwrap();
-    let account = version_account(installation.as_hex(), &ns, 1).unwrap();
-    let root = generate_key_bytes();
-    legacy
-        .set_secret(SECURE_KEY_SERVICE, &account, root.as_ref())
-        .unwrap();
-    let keyring_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
-    let effective = ensure_secret_vault(
-        &db,
-        &available_probe(),
-        &tmp.path().join("secret-vault"),
-        SecretStoreInjected {
-            file_kek: Some(file_kek),
-            keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: Some(Arc::new(legacy.clone())),
-        },
-    )
-    .unwrap();
-    let got = effective
-        .vault
-        .get_item(SecretVaultKind::SecureKeyRoot, &account)
-        .unwrap();
-    assert_eq!(got.as_slice(), root.as_ref());
-    assert!(legacy.get_secret(SECURE_KEY_SERVICE, &account).is_err());
-    assert_eq!(keyring_kek.len(), 1);
-    assert_eq!(
-        effective.snapshot.effective_placement,
-        SecretStorePlacement::Keyring
-    );
-}
-
-#[test]
 fn ask_first_run_uses_keyring_when_available() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
@@ -1064,7 +1014,6 @@ fn ask_first_run_uses_keyring_when_available() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap();
@@ -1109,7 +1058,6 @@ fn ask_keyring_mode_fails_closed_without_file_kek() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek.clone()),
-            legacy_keyring: None,
         },
     )
     .unwrap();
@@ -1126,7 +1074,6 @@ fn ask_keyring_mode_fails_closed_without_file_kek() {
         SecretStoreInjected {
             file_kek: Some(file_kek.clone()),
             keyring_kek: Some(keyring_kek),
-            legacy_keyring: None,
         },
     ) {
         Err(err) => err,
@@ -1168,7 +1115,6 @@ fn persisted_database_never_opens_platform_store() {
         SecretStoreInjected {
             file_kek: Some(file_kek),
             keyring_kek: None,
-            legacy_keyring: None,
         },
     )
     .unwrap();
@@ -1208,7 +1154,6 @@ fn first_run_file_choice_persists_when_keyring_is_available() {
         SecretStoreInjected {
             file_kek: Some(file_kek),
             keyring_kek: Some(keyring_kek),
-            legacy_keyring: None,
         },
         SecretVaultOpenOptions {
             first_run_intent: FirstRunSecretStoreIntent::FileMachineBound,
@@ -1391,7 +1336,6 @@ fn prepared_passphrase_to_keyring_migration_recovers_with_the_passphrase() {
         SecretStoreInjected {
             file_kek: None,
             keyring_kek: Some(keyring.clone()),
-            legacy_keyring: None,
         },
         SecretVaultOpenOptions {
             first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
@@ -1416,7 +1360,6 @@ fn prepared_passphrase_to_keyring_migration_recovers_with_the_passphrase() {
         SecretStoreInjected {
             file_kek: None,
             keyring_kek: Some(keyring),
-            legacy_keyring: None,
         },
         SecretVaultOpenOptions {
             first_run_intent: FirstRunSecretStoreIntent::Automatic,
@@ -1451,7 +1394,6 @@ fn activated_passphrase_to_keyring_migration_recovers_without_retired_passphrase
         SecretStoreInjected {
             file_kek: None,
             keyring_kek: Some(keyring.clone()),
-            legacy_keyring: None,
         },
         SecretVaultOpenOptions {
             first_run_intent: FirstRunSecretStoreIntent::FilePassphrase,
@@ -1476,7 +1418,6 @@ fn activated_passphrase_to_keyring_migration_recovers_without_retired_passphrase
         SecretStoreInjected {
             file_kek: None,
             keyring_kek: Some(keyring),
-            legacy_keyring: None,
         },
         SecretVaultOpenOptions::default(),
     )
@@ -1583,7 +1524,6 @@ fn ensure_secret_vault_boots_on_folded_schema() {
         SecretStoreInjected {
             file_kek: Some(file_kek),
             keyring_kek: Some(keyring_kek),
-            legacy_keyring: None,
         },
     )
     .expect("fresh 0001-only DB must boot the vault");

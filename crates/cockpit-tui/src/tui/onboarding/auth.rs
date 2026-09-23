@@ -7,11 +7,12 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use super::{chrome, theme, ui};
+use super::{chrome, ui};
 use crate::tui::settings::{
     OAuthBeginResult, OAuthFlowRequest, OAuthFlowState, OAuthPresentationResult, OAuthProvider,
 };
 use crate::tui::textfield::TextField;
+use crate::tui::theme;
 use cockpit_config::providers::AuthKind;
 use cockpit_core::providers::ProviderTemplate;
 

@@ -1174,8 +1174,7 @@ impl ProvidersConfig {
         // Constructing the request is the type-enforced step: custody has no
         // default and no `Option`, and the payload must agree with it.
         let request = SensitiveModelPolicyRequest::new(criteria, custody, payload)?;
-        let policy =
-            self.resolved_policy(provider, model, Some(request.custody()));
+        let policy = self.resolved_policy(provider, model, Some(request.custody()));
         Ok(seal_custody_selection(policy, request.custody()))
     }
 

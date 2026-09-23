@@ -3369,20 +3369,23 @@ fn create_agent_session_conn(
         "model": primary.model_id,
     })
     .to_string();
-    conn.execute(
-        "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms,active_agent,provider,model,model_selection_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        params![
-            session_id.to_string(),
-            create.project_id,
-            create.project_root,
-            create.started_at_unix_ms,
-            create.last_active_at_unix_ms,
-            create.active_agent,
-            primary.provider_profile_handle,
-            primary.model_id,
-            selection_json,
-        ],
-    )
+    crate::db::sessions::insert_session_with_unique_short_id(conn, &create.project_id, |short_id| {
+        conn.execute(
+            "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms,active_agent,provider,model,model_selection_json,short_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                session_id.to_string(),
+                create.project_id,
+                create.project_root,
+                create.started_at_unix_ms,
+                create.last_active_at_unix_ms,
+                create.active_agent,
+                primary.provider_profile_handle,
+                primary.model_id,
+                selection_json,
+                short_id,
+            ],
+        )
+    })
     .context("atomically creating session for agent preparation")?;
     Ok(())
 }

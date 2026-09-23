@@ -565,10 +565,7 @@ async fn prepare_installed_root_snapshot_named(
     active_agent: &str,
 ) -> anyhow::Result<Option<crate::db::agent_installations::AgentProfileSnapshotRow>> {
     let active_agent = active_agent.trim();
-    if active_agent.is_empty()
-        || crate::agents::is_builtin_primary(active_agent)
-        || crate::agents::is_removed_primary(active_agent)
-    {
+    if active_agent.is_empty() || crate::agents::is_builtin_primary(active_agent) {
         return Ok(None);
     }
 
@@ -6315,7 +6312,6 @@ pub(super) async fn run_worker(
     // configured default when it's unset/unknown. `assistant_name` carries
     // identity/knowledge ownership only; it must not replace a built-in root
     // such as `Assistant`. Computer mode is the one explicit mode-owned root.
-    // Removed stored primaries force the release default (`Build`).
     let root_agent_name = if session.session_entry_mode() == proto::SessionEntryMode::Computer {
         "Computer".to_string()
     } else {
@@ -6324,16 +6320,6 @@ pub(super) async fn run_worker(
             None => resolve_root_agent(session_id, &session.db, &extended_cfg).await,
         }
     };
-    if let Some(text) = super::removed_primary_notice(session_id, &session.db, &extended_cfg).await
-    {
-        send_current_session_event(
-            &session,
-            &event_tx,
-            &redaction,
-            proto::Event::Notice { session_id, text },
-            NoticeSource::DaemonDirect,
-        );
-    }
     let assistant_row = if let Some(name) = session.assistant_name.as_deref() {
         match session.db.get_assistant(name).await {
             Ok(row) => row,

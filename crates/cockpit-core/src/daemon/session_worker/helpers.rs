@@ -173,53 +173,13 @@ pub(crate) fn resolve_root_agent_conn(
         return default_primary();
     }
     let active = row.active_agent;
-    if crate::agents::is_builtin_primary(&active) || crate::agents::is_removed_primary(&active) {
+    if crate::agents::is_builtin_primary(&active) {
         return crate::agents::resolve_primary(Some(&active), initial_active_agent(cfg));
     }
     if !active.trim().is_empty() {
         return active;
     }
     default_primary()
-}
-
-pub(crate) async fn removed_primary_notice(
-    session_id: Uuid,
-    db: &crate::db::Db,
-    cfg: &crate::config::extended::ExtendedConfig,
-) -> Option<String> {
-    let row = db.get_session(session_id).await.ok().flatten()?;
-    let mut notices = Vec::new();
-    if crate::agents::is_removed_primary(&row.active_agent) {
-        notices.push(format!(
-            "Primary agent `{}` was removed; continuing with `{}`.",
-            row.active_agent,
-            crate::agents::FALLBACK_PRIMARY
-        ));
-    } else if let Some(default_primary) = cfg.removed_default_primary_agent() {
-        notices.push(format!(
-            "Default primary agent `{default_primary}` was removed; continuing with `{}`.",
-            crate::agents::FALLBACK_PRIMARY
-        ));
-    }
-    if cfg.removed_llm_mode().is_some() {
-        notices.push(
-            "llm_mode is no longer used; posture now comes from agent definitions".to_string(),
-        );
-    }
-    let text = notices.join("\n");
-    if text.is_empty() {
-        return None;
-    }
-    let already_recorded = db
-        .list_session_events(session_id)
-        .await
-        .ok()?
-        .into_iter()
-        .any(|event| {
-            event.kind == "notice"
-                && event.data.get("text").and_then(|v| v.as_str()) == Some(text.as_str())
-        });
-    (!already_recorded).then_some(text)
 }
 
 /// Environment override for the daemon sandbox default.

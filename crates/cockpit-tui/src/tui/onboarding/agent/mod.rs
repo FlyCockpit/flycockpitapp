@@ -14,8 +14,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
-use super::{chrome, theme, ui};
+use super::{chrome, ui};
 use crate::tui::textfield::TextField;
+use crate::tui::theme;
 use cockpit_core::agents::{
     GoalSkepticsPolicy, ToolSteering, ToolSurfaceItem, ToolTier, tool_surface_catalog,
 };

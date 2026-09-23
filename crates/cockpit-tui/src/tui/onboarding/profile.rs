@@ -5,9 +5,9 @@ use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 
-use super::theme::BAD;
 use super::ui;
 use crate::tui::textfield::TextField;
+use crate::tui::theme::BAD;
 
 pub(crate) struct ProfileScreen {
     name: TextField,

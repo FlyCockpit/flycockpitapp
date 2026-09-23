@@ -9,11 +9,11 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::theme::{BRASS, DISABLED};
 use crate::tui::chrome::chip_style;
 pub(super) use crate::tui::chrome::{ActionBar, ActionButton as Button, action_bar_width};
 #[cfg(test)]
 use crate::tui::chrome::{action_button_at as button_at, render_action_bar};
+use crate::tui::theme::{BRASS, DISABLED};
 
 const BACK_LABEL: &str = " ‹ Back ";
 

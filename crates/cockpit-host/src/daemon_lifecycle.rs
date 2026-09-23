@@ -1329,13 +1329,86 @@ fn read_macos_proc_bsd_info(pid: u32) -> std::io::Result<MacosProcBsdInfo> {
     Ok(unsafe { info.assume_init() })
 }
 
+/// `sizeof(struct kinfo_proc)` on every 64-bit macOS ABI (x86_64, arm64).
+/// Its first member is `struct extern_proc` (`<sys/proc.h>`), whose leading
+/// `p_un` union holds `__p_starttime` (`struct timeval`: 8-byte `time_t`
+/// then 4-byte `suseconds_t`), followed by two pointers, `int p_flag`,
+/// `char p_stat`, and `pid_t p_pid` at byte 40.
+#[cfg(target_os = "macos")]
+const MACOS_KINFO_PROC_SIZE: usize = 648;
+#[cfg(target_os = "macos")]
+const MACOS_EXTERN_PROC_START_SEC: usize = 0;
+#[cfg(target_os = "macos")]
+const MACOS_EXTERN_PROC_START_USEC: usize = 8;
+#[cfg(target_os = "macos")]
+const MACOS_EXTERN_PROC_PID: usize = 40;
+
+/// Process start time from `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID)`.
+///
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` refuses a zombie (`ESRCH`), but an
+/// exited, not-yet-reaped child is exactly what a leader pin must still
+/// identify. The sysctl reports zombies too, and its `p_starttime` is the
+/// same kernel `p_start` that `pbi_start_tvsec`/`pbi_start_tvusec` expose,
+/// so every macOS start identity comes from this one source whether the
+/// process is live or exited.
 #[cfg(target_os = "macos")]
 pub fn read_process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
-    let info = read_macos_proc_bsd_info(pid)?;
-    Ok(ProcessStartIdentity {
-        primary: info.start_sec,
-        secondary: info.start_usec,
-    })
+    fn field<const N: usize>(record: &[u8], offset: usize) -> [u8; N] {
+        record[offset..offset + N]
+            .try_into()
+            .expect("kinfo_proc field lies inside the record")
+    }
+    let requested = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid exceeds pid_t"))?;
+    let mut record = [0_u8; MACOS_KINFO_PROC_SIZE];
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        requested,
+    ];
+    let mut size = MACOS_KINFO_PROC_SIZE;
+    // SAFETY: sysctl writes at most `size` bytes into `record`, which is
+    // `MACOS_KINFO_PROC_SIZE` bytes long.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            record.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A pid with no process is reported as success with no record.
+    if size == 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    if size != MACOS_KINFO_PROC_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("sysctl KERN_PROC_PID returned {size} bytes; expected {MACOS_KINFO_PROC_SIZE}"),
+        ));
+    }
+    let reported = libc::pid_t::from_ne_bytes(field(&record, MACOS_EXTERN_PROC_PID));
+    if reported != requested {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("sysctl KERN_PROC_PID returned pid {reported} for {requested}"),
+        ));
+    }
+    let start_sec = i64::from_ne_bytes(field(&record, MACOS_EXTERN_PROC_START_SEC));
+    let start_usec = i32::from_ne_bytes(field(&record, MACOS_EXTERN_PROC_START_USEC));
+    let (Ok(primary), Ok(secondary)) = (u64::try_from(start_sec), u64::try_from(start_usec)) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sysctl KERN_PROC_PID returned a negative process start time",
+        ));
+    };
+    Ok(ProcessStartIdentity { primary, secondary })
 }
 
 #[cfg(windows)]
@@ -2220,7 +2293,47 @@ impl Drop for ForegroundMetadataGuard {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     const LIFETIME_CHILD_PATH: &str = "COCKPIT_TEST_DAEMON_LIFETIME_CHILD_PATH";
+
+    /// An exited but unreaped child (a zombie) keeps the start identity it
+    /// had while running: leader pins re-read it after the leader exits.
+    /// macOS `proc_pidinfo(PROC_PIDTBSDINFO)` refuses zombies, so this pins
+    /// the zombie-capable source there.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn process_start_identity_survives_exit_until_reaped() {
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let pid = child.id();
+        let running = process_start_identity(pid).expect("start identity of a running child");
+        drop(child.stdin.take());
+        loop {
+            // SAFETY: zeroed siginfo_t is valid writable storage for waitid.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: P_PID names this test's own child; WNOWAIT leaves it
+            // unreaped, so its pid cannot be recycled during the check.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.raw_os_error(), Some(libc::EINTR), "waitid: {error}");
+        }
+        let exited = process_start_identity(pid).expect("start identity of an unreaped zombie");
+        assert_eq!(exited, running);
+        child.wait().expect("reap cat");
+    }
 
     /// Regression: registering the process-exit kqueue with Tokio's own
     /// kqueue reactor using write interest fails with EINVAL, which crashed
@@ -2626,13 +2739,46 @@ mod tests {
         assert!(endpoint.is_dir());
     }
 
+    /// Receipt encoding must carry any executable path bytes, including
+    /// non-UTF-8 and newline bytes, independent of which names the local
+    /// filesystem accepts (APFS refuses non-UTF-8 names).
+    #[cfg(unix)]
+    #[test]
+    fn pid_receipt_encoding_round_trips_non_utf8_and_newline_executable_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let receipt = DaemonPidReceipt {
+            pid: 4242,
+            executable: PathBuf::from(std::ffi::OsString::from_vec(
+                b"/opt/cockpit-\xff-\n-daemon".to_vec(),
+            )),
+            process_start: ProcessStartIdentity {
+                primary: 0x0123_4567_89ab_cdef,
+                secondary: 7,
+            },
+            publication_nonce: [0x5a; 32],
+        };
+        std::fs::write(&pid_file, render_daemon_pid_file(&receipt)).expect("write pid receipt");
+        assert_eq!(read_daemon_pid_record(&pid_file), Some(receipt));
+    }
+
+    /// The published receipt round-trips an unusual real executable name.
+    /// Non-UTF-8 bytes join the name where the filesystem can store them.
     #[cfg(unix)]
     #[test]
     fn pid_receipt_round_trips_non_utf8_and_newline_path_bytes() {
         use std::os::unix::ffi::OsStringExt as _;
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let name = std::ffi::OsString::from_vec(b"cockpit-\xff-\n-daemon".to_vec());
+        #[cfg(not(target_os = "macos"))]
+        let name_bytes = b"cockpit-\xff-\n-daemon".to_vec();
+        // APFS rejects non-UTF-8 names (EILSEQ); the encoding test above
+        // covers those bytes on macOS.
+        #[cfg(target_os = "macos")]
+        let name_bytes = b"cockpit-\n-daemon".to_vec();
+        let name = std::ffi::OsString::from_vec(name_bytes);
         let executable = temp.path().join(name);
         let pid_file = temp.path().join("daemon.pid");
         std::fs::write(&executable, b"executable fixture").expect("executable fixture");

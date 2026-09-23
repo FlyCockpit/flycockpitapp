@@ -13759,6 +13759,231 @@ async fn remote_owner_save_image_spend_policy_commits_and_replays() {
     assert!(status.safe_response.is_some());
 }
 
+/// The `image_generation` registry is authored ONLY by the dedicated
+/// `image_endpoint_*` RPCs. A generic typed settings patch
+/// (`ApplyExtendedConfigPatch`, whose snapshot always carries the redacted
+/// EMPTY registry) must PRESERVE it while landing its own change, and the
+/// dedicated RPCs must remain fully mutable afterwards.
+#[cfg(feature = "extended")]
+#[tokio::test]
+async fn image_generation_survives_settings_patch_and_stays_rpc_mutable() {
+    use cockpit_config::config::image_generation::{
+        IMAGE_GENERATION_ROUTE_PROFILE_VERSION, ImageAdapterKind, ImageEndpoint,
+        ImageGenerationConfig, ImageLocationClass,
+    };
+
+    // ISOLATE the cockpit home so `persist_registry`'s `discover_config_dirs`
+    // never resolves the developer's real `~/.config/cockpit/config.json`; the
+    // empty temp home means the project `.cockpit/config.json` is the only
+    // existing config layer, and the RPC write, the production config source,
+    // and the settings-patch target all agree on that one file.
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+    let cockpit_dir = project.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    let config_path = cockpit_dir.join("config.json");
+    std::fs::write(&config_path, "{}\n").unwrap();
+    // The test daemon has an ephemeral lifetime, and an ephemeral owner's
+    // settings snapshot refuses a missing global layer directory. Create the
+    // (empty) isolated global directory so the snapshot can enumerate it.
+    std::fs::create_dir_all(cockpit_config::config::dirs::global_config_dir().unwrap()).unwrap();
+
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
+    // The dedicated image-config RPC, the settings snapshot, and the
+    // trust-gated `.cockpit` config layer resolve workspace trust from the db.
+    trust_workspace_root(&ctx, project.path()).await;
+    let project_root = project.path().to_string_lossy().into_owned();
+
+    let make_endpoint = |id: &str| ImageEndpoint {
+        id: id.to_string(),
+        adapter: ImageAdapterKind::OpenaiImages,
+        origin: "https://api.openai.com/".to_string(),
+        path_prefix: None,
+        credential_ref: Some("openai-key".to_string()),
+        headers: Vec::new(),
+        allow_insecure_transport: false,
+        location: ImageLocationClass::PublicCloud,
+        enabled: true,
+        route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+        exclusive_server: false,
+    };
+    let make_request =
+        |endpoint: ImageEndpoint,
+         generation: u64,
+         revision: String,
+         capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1| {
+            let change = cockpit_proto::image_control::ImageConfigChangeV1::EndpointUpserted {
+                entity_id: endpoint.id.clone(),
+                entity_generation: "intent".into(),
+                item: cockpit_proto::image_control::ImageEndpointSafeV1::project(
+                    &endpoint,
+                    "intent".into(),
+                ),
+            };
+            let mutation_intent_hash = cockpit_proto::image_control::ImageConfigMutationIntentV1 {
+                project_id: project_root.clone(),
+                expected_config_generation: generation,
+                expected_config_revision: revision.clone(),
+                changes: vec![change],
+            }
+            .sha256()
+            .unwrap();
+            Request::ImageEndpointCreate {
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                mutation_intent_hash,
+                project_root: project_root.clone(),
+                endpoint_json: cockpit_proto::SensitiveWirePayload::new(
+                    serde_json::to_string(&endpoint).unwrap(),
+                ),
+                expected_config_generation: generation,
+                expected_config_revision: revision,
+                mutation_capability: capability,
+            }
+        };
+
+    // 1) Author a registry through the dedicated RPC.
+    let trust_policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, project.path())
+            .await
+            .unwrap();
+    let layer = crate::daemon::server::image_control_mutations::authoritative_image_layer(
+        &ctx,
+        project.path(),
+        &trust_policy,
+    )
+    .unwrap();
+    let generation = inventory::current_config_generation();
+    let capability = crate::daemon::server::image_control_mutations::mint_mutation_capability(
+        &ctx,
+        project.path(),
+        &layer.target,
+        &layer.revision,
+        generation,
+    )
+    .unwrap();
+    let mut state = owner_state();
+    let created = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        make_request(
+            make_endpoint("openai-main"),
+            generation,
+            layer.revision,
+            capability,
+        ),
+    )
+    .await
+    .expect("endpoint create succeeds");
+    assert!(matches!(created, Response::ImageControlMutated(_)));
+    assert!(
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("openai-main"),
+        "the RPC must persist the registry to disk"
+    );
+
+    // 2) A generic typed settings patch authored against the redacted
+    // snapshot, whose registry is the EMPTY default.
+    let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+    let snapshot = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::GetExtendedConfigSnapshot {
+            project_root: project_root.clone(),
+            snapshot_session_id: snapshot_session_id.clone(),
+        },
+    )
+    .await
+    .expect("settings snapshot succeeds");
+    let layers = match snapshot {
+        Response::ExtendedConfigSnapshot { layers, .. } => layers,
+        other => panic!("expected an extended config snapshot, got {other:?}"),
+    };
+    let project_layer = layers
+        .into_iter()
+        .find(|layer| layer.kind == cockpit_proto::CockpitConfigLayer::Project)
+        .expect("the project layer is part of the settings snapshot");
+    assert!(
+        !serde_json::to_string(&project_layer.config.image_generation)
+            .unwrap()
+            .contains("openai-main"),
+        "precondition: the snapshot never carries the registry to the client"
+    );
+    let saved = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ApplyExtendedConfigPatch {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
+            project_root: project_root.clone(),
+            layer_id: project_layer.layer_id.clone(),
+            patch: cockpit_proto::ExtendedConfigPatch {
+                operations: vec![cockpit_proto::ExtendedConfigPathMutation::Set {
+                    path: vec!["name".to_string()],
+                    value: serde_json::json!("Renamed Project"),
+                }],
+                materialize: false,
+                denylist: Vec::new(),
+                redacted_mutations: Vec::new(),
+            },
+            expected_revision: project_layer.revision.clone(),
+            snapshot_session_id,
+        },
+    )
+    .await
+    .expect("typed settings patch succeeds");
+    assert!(matches!(saved, Response::ExtendedConfigSaved { .. }));
+    let after_save = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        after_save.contains("openai-main"),
+        "a typed settings patch must preserve the RPC-authored registry"
+    );
+    assert!(
+        after_save.contains("Renamed Project"),
+        "the patched field must land"
+    );
+
+    // 3) The dedicated RPC still mutates the registry after the settings patch.
+    let layer = crate::daemon::server::image_control_mutations::authoritative_image_layer(
+        &ctx,
+        project.path(),
+        &trust_policy,
+    )
+    .unwrap();
+    let generation = inventory::current_config_generation();
+    let capability = crate::daemon::server::image_control_mutations::mint_mutation_capability(
+        &ctx,
+        project.path(),
+        &layer.target,
+        &layer.revision,
+        generation,
+    )
+    .unwrap();
+    let second = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        make_request(
+            make_endpoint("backup-openai"),
+            generation,
+            layer.revision,
+            capability,
+        ),
+    )
+    .await
+    .expect("second endpoint create succeeds after the settings patch");
+    assert!(matches!(second, Response::ImageControlMutated(_)));
+    let final_config = std::fs::read_to_string(&config_path).unwrap();
+    let final_value: serde_json::Value = serde_json::from_str(&final_config).unwrap();
+    let registry: ImageGenerationConfig =
+        serde_json::from_value(final_value.get("image_generation").unwrap().clone()).unwrap();
+    let ids: Vec<&str> = registry.endpoints().iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        ids.contains(&"openai-main") && ids.contains(&"backup-openai"),
+        "both the pre-patch and post-patch endpoints must be present: {ids:?}"
+    );
+    assert_eq!(final_value["name"], "Renamed Project");
+}
+
 /// The deeper payload validation the authz matrix cannot reach (its probes die
 /// at the generation CAS with `Conflict`): with a genuine generation, revision,
 /// and minted mutation capability, a malformed `endpoint_json` is rejected as

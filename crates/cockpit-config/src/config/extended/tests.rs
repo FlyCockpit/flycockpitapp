@@ -491,7 +491,7 @@ fn fully_populated_config_json_round_trips_byte_identically() {
     cfg.name = Some("Config Roundtrip".into());
     cfg.packages_directory = Some(PathBuf::from("packages-cache"));
     cfg.tools.insert(
-        "webfetch".into(),
+        "fetchurl".into(),
         ToolCommandTemplate {
             enabled: true,
             command: "curl -sSL {url}".into(),
@@ -3459,6 +3459,103 @@ mod image_generation {
             "merge log leaked the path: {logs:?}"
         );
     }
+
+    // Coverage for the generic settings writer's registry merge
+    // (`render_saved_extended_config_preserving_image_generation`, used by the
+    // daemon's typed settings patch and the TUI disk fake). The client-facing
+    // snapshot always carries the redacted EMPTY registry, so a verbatim write
+    // of the incoming document would wipe the on-disk registry.
+    #[test]
+    fn saved_settings_render_preserves_on_disk_registry_and_lands_other_changes() {
+        let on_disk = serde_json::json!({
+            "name": "Before",
+            "redact": { "enabled": true, "denylist": ["SEED-KEEP"] },
+            "image_generation": serde_json::to_value(registry_a()).unwrap(),
+        });
+        let on_disk_bytes = serde_json::to_vec_pretty(&on_disk).unwrap();
+
+        // Faithful redacted round trip: the empty registry plus one other
+        // changed field and one key the typed schema does not own.
+        let mut incoming = on_disk.clone();
+        incoming["image_generation"] =
+            serde_json::to_value(ImageGenerationConfig::default()).unwrap();
+        incoming["name"] = serde_json::json!("Renamed Project");
+        incoming["hooks"] = serde_json::json!({ "sessionStart": [] });
+        let incoming_bytes = serde_json::to_vec(&incoming).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&incoming_bytes).contains("local-comfy"),
+            "precondition: the incoming payload must not carry the registry"
+        );
+
+        let rendered = render_saved_extended_config_preserving_image_generation(
+            &incoming_bytes,
+            &on_disk_bytes,
+        )
+        .expect("render merged settings");
+        let rendered: Value = serde_json::from_slice(&rendered).unwrap();
+        let preserved: ImageGenerationConfig =
+            serde_json::from_value(rendered["image_generation"].clone())
+                .expect("the preserved registry stays valid");
+        assert_eq!(preserved, registry_a(), "the on-disk registry must survive");
+        assert_eq!(
+            rendered["name"], "Renamed Project",
+            "other changes must land"
+        );
+        assert_eq!(rendered["redact"]["denylist"][0], "SEED-KEEP");
+        assert_eq!(
+            rendered["hooks"],
+            serde_json::json!({ "sessionStart": [] }),
+            "keys outside the typed schema are written through"
+        );
+    }
+
+    #[test]
+    fn saved_settings_render_never_lets_the_client_author_the_registry() {
+        // On disk: registry A. Incoming: a client-authored registry B.
+        let on_disk = serde_json::json!({
+            "image_generation": serde_json::to_value(registry_a()).unwrap(),
+        });
+        let incoming = serde_json::json!({
+            "name": "x",
+            "image_generation": serde_json::to_value(registry_b()).unwrap(),
+        });
+        let rendered = render_saved_extended_config_preserving_image_generation(
+            &serde_json::to_vec(&incoming).unwrap(),
+            &serde_json::to_vec(&on_disk).unwrap(),
+        )
+        .unwrap();
+        let rendered: Value = serde_json::from_slice(&rendered).unwrap();
+        let registry: ImageGenerationConfig =
+            serde_json::from_value(rendered["image_generation"].clone()).unwrap();
+        assert_eq!(
+            registry,
+            registry_a(),
+            "only the dedicated RPCs author the registry"
+        );
+
+        // No registry on disk: a client-supplied registry is dropped, not
+        // materialized.
+        let rendered = render_saved_extended_config_preserving_image_generation(
+            &serde_json::to_vec(&incoming).unwrap(),
+            b"{}",
+        )
+        .unwrap();
+        let rendered: Value = serde_json::from_slice(&rendered).unwrap();
+        assert!(rendered.get("image_generation").is_none(), "{rendered}");
+        assert_eq!(rendered["name"], "x");
+    }
+
+    #[test]
+    fn saved_settings_render_fails_closed_on_non_object_documents() {
+        assert!(
+            render_saved_extended_config_preserving_image_generation(b"[]", b"{}").is_err(),
+            "a non-object incoming payload is rejected, not written"
+        );
+        assert!(
+            render_saved_extended_config_preserving_image_generation(b"{}", b"\"x\"").is_err(),
+            "an unreadable on-disk document must not silently drop its registry"
+        );
+    }
 }
 
 #[test]
@@ -3966,4 +4063,133 @@ fn daemon_lifetime_policy_is_narrow_default_true_and_fail_closed() {
     std::fs::write(&path, r#"{"daemon":false}"#).unwrap();
     let error = load_daemon_lifetime_policy_at(&path).unwrap_err();
     assert!(error.to_string().contains("daemon must be an object"));
+}
+
+// ---------------------------------------------------------------------------
+// Unknown top-level keys. Removed spellings are no longer translated, so a
+// key no reader owns is inert; the layered load must say so instead of
+// silently leaving the setting at its default.
+// ---------------------------------------------------------------------------
+
+fn layer_doc(path: &str, raw: Value) -> ExtendedConfigDoc {
+    ExtendedConfigDoc {
+        path: PathBuf::from(path),
+        raw,
+        origin: ConfigLayerOrigin::LocalTrusted,
+    }
+}
+
+#[test]
+fn known_top_level_config_keys_cover_every_owner() {
+    let known = known_top_level_config_keys()
+        .expect("ExtendedConfig and ProvidersConfig must deserialize as plain structs");
+    // Every key the typed owners serialize is one they accept.
+    let extended = serde_json::to_value(ExtendedConfig::default()).unwrap();
+    for key in extended.as_object().unwrap().keys() {
+        assert!(known.contains(key.as_str()), "ExtendedConfig key `{key}`");
+    }
+    for key in [
+        // ExtendedConfig renames and snake_case fields.
+        "knowledgeBases",
+        "sandbox_escalation_enabled",
+        "defaultPrimaryAgent",
+        "maxPrimaryRounds",
+        // ProvidersConfig metadata shares the file.
+        "providers",
+        "active_model",
+        "category_defaults",
+        "on_unlisted_models_fetch",
+        // Owned by other readers of the same layer bytes.
+        "hooks",
+        "secretStore",
+        "secret_store",
+        "$schema",
+    ] {
+        assert!(known.contains(key), "`{key}` must be a known config key");
+    }
+    for removed in ["sandboxEscalationEnabled", "llm_mode", "agents"] {
+        assert!(
+            !known.contains(removed),
+            "`{removed}` is not owned by any reader"
+        );
+    }
+}
+
+#[test]
+fn unknown_top_level_key_warns_with_key_and_layer_and_stays_inert() {
+    let project = layer_doc(
+        "/work/repo/.cockpit/config.json",
+        serde_json::json!({
+            "name": "n",
+            "sandboxEscalationEnabled": false,
+            "hooks": { "sessionStart": [] },
+            "active_model": { "provider": "openai", "model": "gpt-5" },
+            "$schema": "https://example.invalid/schema.json"
+        }),
+    );
+    let (cfg, warnings) = load_merged_from_docs_with_warnings(&[project]);
+    // The removed spelling has no effect: the canonical key keeps its default.
+    assert!(cfg.sandbox_escalation_enabled);
+    assert_eq!(cfg.name.as_deref(), Some("n"));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`sandboxEscalationEnabled`"),
+        "{warnings:?}"
+    );
+    assert!(warnings[0].contains(".cockpit/config.json"), "{warnings:?}");
+    assert!(!warnings[0].contains("/work/repo"), "{warnings:?}");
+}
+
+#[test]
+fn unknown_top_level_key_warning_never_echoes_a_nonstandard_path() {
+    const PATH_SECRET: &str = "tok-UNKNOWN-KEY-PATH-SECRET";
+    let doc = layer_doc(
+        &format!("/secrets/{PATH_SECRET}/custom.json"),
+        serde_json::json!({ "notARealSetting": true }),
+    );
+    let (_cfg, warnings) = load_merged_from_docs_with_warnings(&[doc]);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("`notARealSetting`"), "{warnings:?}");
+    assert!(!warnings[0].contains(PATH_SECRET), "{warnings:?}");
+
+    // Synthetic sources are already labels.
+    let attached = layer_doc(
+        "<attached workspace config>",
+        serde_json::json!({ "notARealSetting": true }),
+    );
+    let (_cfg, warnings) = load_merged_from_docs_with_warnings(&[attached]);
+    assert!(
+        warnings[0].contains("<attached workspace config>"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn unknown_top_level_key_warning_bounds_and_escapes_the_key() {
+    let long_key = format!("{}\n", "k".repeat(200));
+    let mut raw = Map::new();
+    raw.insert(long_key, Value::Bool(true));
+    let doc = layer_doc("/x/.cockpit/config.json", Value::Object(raw));
+    let (_cfg, warnings) = load_merged_from_docs_with_warnings(&[doc]);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(!warnings[0].contains('\n'), "{warnings:?}");
+    assert!(!warnings[0].contains(&"k".repeat(65)), "{warnings:?}");
+    assert!(warnings[0].contains('…'), "{warnings:?}");
+}
+
+#[test]
+fn unknown_top_level_keys_survive_a_typed_write() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, r#"{"sandboxEscalationEnabled":false,"name":"a"}"#).unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = doc.config();
+    cfg.name = Some("b".into());
+    doc.write(&cfg).unwrap();
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(written["name"], "b");
+    assert_eq!(
+        written["sandboxEscalationEnabled"], false,
+        "unknown keys are preserved on write, not deleted"
+    );
 }

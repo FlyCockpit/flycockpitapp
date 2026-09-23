@@ -2274,7 +2274,9 @@ fn resolve_loaded_docs_with_warnings(docs: &[ExtendedConfigDoc]) -> (ExtendedCon
 #[derive(Debug)]
 pub struct DaemonExtendedConfigLoad {
     pub providers: crate::config::providers::ProvidersConfig,
-    /// Stable, secret-free warnings from provider-layer enforcement.
+    /// Stable, secret-free configuration warnings: provider-layer enforcement
+    /// plus the extended-config layer merge (fail-closed sections and
+    /// unknown top-level keys). Clients surface these.
     pub provider_warnings: Vec<String>,
     pub config: ExtendedConfig,
     pub response_metrics_tokenizer_validation:
@@ -2341,7 +2343,8 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
         }
     }
     let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
-    let config = resolve_loaded_docs(&docs);
+    let (config, config_warnings) = resolve_loaded_docs_with_warnings(&docs);
+    provider_warnings.extend(config_warnings);
     validate_knowledge_base_registry(&config.knowledge_bases, &providers)
         .context("invalid knowledge-base trust configuration")?;
     validate_local_knowledge_root_overlaps(cwd, &config.knowledge_bases)
@@ -2375,7 +2378,7 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
     // capture every readable participating config layer once; providers,
     // extended settings, strict validation, and provenance are all projected
     // from that one trust-filtered snapshot.
-    let (providers, captured, provider_warnings) =
+    let (providers, captured, mut provider_warnings) =
         crate::config::providers::ConfigDoc::try_load_effective_with_layer_snapshot(&paths)?;
     let docs: Vec<_> = captured
         .into_iter()
@@ -2398,7 +2401,8 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
         }
     }
     let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
-    let config = resolve_loaded_docs(&docs);
+    let (config, config_warnings) = resolve_loaded_docs_with_warnings(&docs);
+    provider_warnings.extend(config_warnings);
     validate_knowledge_base_registry(&config.knowledge_bases, &providers)
         .context("invalid knowledge-base trust configuration")?;
     validate_local_knowledge_root_overlaps(cwd, &config.knowledge_bases)
@@ -2925,6 +2929,156 @@ pub(crate) fn strip_secret_store_key(raw: &mut Value) {
     }
 }
 
+/// Top-level `config.json` keys owned by a reader other than the two typed
+/// owners ([`ExtendedConfig`] and [`crate::config::providers::ProvidersConfig`]):
+/// `hooks` is parsed by [`hooks`] from the same layer bytes, `secretStore` /
+/// `secret_store` are installation-scoped and stripped from every layer, and
+/// `$schema` is an editor hint.
+const OTHER_OWNED_TOP_LEVEL_CONFIG_KEYS: &[&str] =
+    &["$schema", "hooks", "secretStore", "secret_store"];
+
+/// Longest unknown key echoed back verbatim in a warning.
+const MAX_UNKNOWN_CONFIG_KEY_ECHO_CHARS: usize = 64;
+
+/// Bound on the process-wide log de-duplication set.
+const MAX_LOGGED_UNKNOWN_CONFIG_KEYS: usize = 1024;
+
+/// The field names a derived, non-`flatten` serde struct accepts (including
+/// renames and aliases), read from the `fields` list serde's derive hands to
+/// `deserialize_struct`. `None` when `T` does not deserialize as a plain
+/// struct, so callers can fail quiet rather than flag every key.
+fn serde_struct_field_names<T: serde::de::DeserializeOwned>() -> Option<&'static [&'static str]> {
+    struct FieldNameCapture<'a>(&'a mut Option<&'static [&'static str]>);
+
+    impl<'de> serde::Deserializer<'de> for FieldNameCapture<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom(
+                "field-name capture expects a struct",
+            ))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            *self.0 = Some(fields);
+            Err(serde::de::Error::custom("field names captured"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    let mut fields = None;
+    let _ = T::deserialize(FieldNameCapture(&mut fields));
+    fields
+}
+
+/// Every top-level key some reader of a `config.json` layer owns. `None` only
+/// if a typed owner stops deserializing as a plain struct (for example it
+/// gains a top-level `flatten`); a structural test pins that it is `Some`.
+fn known_top_level_config_keys() -> Option<&'static HashSet<&'static str>> {
+    static KEYS: std::sync::OnceLock<Option<HashSet<&'static str>>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let extended = serde_struct_field_names::<ExtendedConfig>()?;
+        let providers = serde_struct_field_names::<crate::config::providers::ProvidersConfig>()?;
+        Some(
+            extended
+                .iter()
+                .chain(providers)
+                .chain(OTHER_OWNED_TOP_LEVEL_CONFIG_KEYS)
+                .copied()
+                .collect(),
+        )
+    })
+    .as_ref()
+}
+
+/// Top-level keys of one layer that no reader owns, in document order. Such
+/// a key has no effect: it is a typo, a removed spelling (for example the
+/// retired `sandboxEscalationEnabled` alias), or a setting from a newer build.
+pub(crate) fn unknown_top_level_config_keys(raw: &Map<String, Value>) -> Vec<&str> {
+    let Some(known) = known_top_level_config_keys() else {
+        return Vec::new();
+    };
+    raw.keys()
+        .map(String::as_str)
+        .filter(|key| !known.contains(key))
+        .collect()
+}
+
+/// A non-secret label for a config layer. Synthetic sources (`<...>`) are
+/// already labels. A file in a standard layer directory is named by that
+/// directory and file (`.cockpit/config.json`, `cockpit/config.json`). Any
+/// other location (an explicit `COCKPIT_CONFIG` override, a machine-local
+/// layer) is described generically: the full path can itself carry a secret
+/// (a token-named directory) and these warnings reach clients.
+fn config_layer_label(path: &Path) -> String {
+    let display = path.to_string_lossy();
+    if display.starts_with('<') {
+        return display.into_owned();
+    }
+    let file = path.file_name().and_then(OsStr::to_str);
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str);
+    match (parent, file) {
+        (Some(parent @ (".cockpit" | "cockpit")), Some(file)) => format!("{parent}/{file}"),
+        _ => "a machine-local or explicitly selected config file".to_string(),
+    }
+}
+
+/// Stable, client-safe warning for a top-level key no reader owns.
+fn unknown_config_key_warning(key: &str, path: &Path) -> String {
+    let mut echoed: String = key
+        .chars()
+        .take(MAX_UNKNOWN_CONFIG_KEY_ECHO_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if key.chars().count() > MAX_UNKNOWN_CONFIG_KEY_ECHO_CHARS {
+        echoed.push('…');
+    }
+    format!(
+        "ignored unknown config key `{echoed}` in {}; it has no effect",
+        config_layer_label(path)
+    )
+}
+
+/// Log each (layer, key) pair once per process: layers are re-read on every
+/// config refresh, and the returned warnings already reach clients each time.
+fn log_unknown_config_key_once(path: &Path, key: &str) {
+    static LOGGED: std::sync::OnceLock<std::sync::Mutex<HashSet<(PathBuf, String)>>> =
+        std::sync::OnceLock::new();
+    let first = {
+        let mut logged = LOGGED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = (path.to_path_buf(), key.to_string());
+        !logged.contains(&entry)
+            && logged.len() < MAX_LOGGED_UNKNOWN_CONFIG_KEYS
+            && logged.insert(entry)
+    };
+    if first {
+        tracing::warn!(
+            path = %path.display(),
+            key = %key,
+            "ignoring unknown top-level config key; it has no effect"
+        );
+    }
+}
+
 /// Stable, secret-free warning for a malformed `image_generation` value.
 /// Deliberately omits BOTH the deserialization/validation error (whose `{:?}`
 /// rendering can embed attacker-supplied credential-like strings) AND the
@@ -3194,6 +3348,14 @@ impl ExtendedConfigDoc {
         let Some(obj) = raw.as_object_mut() else {
             return raw;
         };
+
+        // A key no reader owns is inert. Say so instead of ignoring it
+        // silently: a removed spelling (for example `sandboxEscalationEnabled`)
+        // would otherwise leave its setting at the default without notice.
+        for key in unknown_top_level_config_keys(obj) {
+            log_unknown_config_key_once(&self.path, key);
+            warnings.push(unknown_config_key_warning(key, &self.path));
+        }
 
         // `image_spend` is deliberately not merged here: spend policy is never
         // a layered config value (its only authority is the ledger), so there

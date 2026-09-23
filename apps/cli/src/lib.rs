@@ -2074,6 +2074,7 @@ mod tests {
         assert_eq!(error_stderr_line(&err), "Error: boom");
     }
 
+    #[cfg(unix)]
     #[test]
     fn log_file_is_private() {
         use std::os::unix::fs::PermissionsExt;

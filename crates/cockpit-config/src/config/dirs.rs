@@ -468,7 +468,7 @@ pub fn scaffold_config_dir(dir: &Path) -> std::io::Result<PathBuf> {
     ensure_config_layer_dir(dir).map_err(|error| std::io::Error::other(error.to_string()))?;
     let config_path = dir.join(CONFIG_FILE);
     if !config_path.exists() {
-        let default = "{\n  \"agents\": {},\n  \"tools\": {}\n}\n";
+        let default = "{\n  \"tools\": {}\n}\n";
         std::fs::write(&config_path, default)?;
     }
     Ok(config_path)

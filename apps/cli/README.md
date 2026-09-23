@@ -649,6 +649,13 @@ Config is layered from:
 
 The main file is `config.json`. Provider entries live beside it in `providers/<provider-id>.json`, and MCP servers live in `mcp.json`.
 
+Cockpit ignores a top-level `config.json` key that it does not recognize, and
+reports it as a configuration warning (shown in `/settings`) naming the key
+and the layer. Such a key is usually a typo or a removed spelling, such as
+`sandboxEscalationEnabled` for `sandbox_escalation_enabled`. It has no
+effect, and the setting it was meant for keeps its default. Unknown keys are
+preserved when Cockpit rewrites the file.
+
 You can point runtime config loading at one concrete config file with:
 
 ```sh
@@ -900,7 +907,7 @@ model name, locality, command, or mode. Every harness receives a redacted,
 reference-only prompt (the mandatory sensitive baseline, unaffected by
 `redact.enabled = false`). No harness, trusted or untrusted, receives
 Cockpit-provided secret environment values — the former `auth_env_vars` field
-is retired. Harness trust is separate from provider/model `ModelTrust` and
+is retired and ignored. Harness trust is separate from provider/model `ModelTrust` and
 from agent-definition posture.
 
 The shell sandbox is filesystem-only and does not restrict network access. It

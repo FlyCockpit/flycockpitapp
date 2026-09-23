@@ -2051,6 +2051,10 @@ fn tool_glyph_label_keeps_collapsed_lock_tool_names() {
     assert!(!tool_glyph_label("bash", true).0.is_empty());
 }
 
+/// Every emoji glyph in the tool-glyph path must be a reliably-wide,
+/// single-codepoint emoji: no VS16 (U+FE0F) variation selector and a
+/// `unicode_width` display width of exactly 2. A future glyph that
+/// reintroduces the VS16 / width-mismatch bug fails here.
 #[test]
 fn tool_glyphs_are_vs16_free_and_width_two() {
     // Every tool whose row carries an emoji glyph.

@@ -436,7 +436,8 @@ pub struct ProviderConfigView {
     pub on_unlisted_models_fetch: Option<cockpit_config::config::providers::OnUnlistedModelsFetch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
-    /// Stable, secret-free warnings raised while loading provider layers.
+    /// Stable, secret-free warnings raised while loading provider and
+    /// config layers (including unknown top-level `config.json` keys).
     /// Clients display these rather than relying on daemon tracing output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub configuration_warnings: Vec<String>,

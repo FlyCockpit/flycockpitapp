@@ -47,7 +47,9 @@ pub struct ConfigWatchPaths {
 
 pub struct DaemonConfigLoad {
     pub providers: ProvidersConfig,
-    /// Stable, secret-free provider-layer enforcement warnings.
+    /// Stable, secret-free configuration warnings: provider-layer
+    /// enforcement plus extended-config layer-merge warnings (fail-closed
+    /// sections and unknown top-level keys).
     pub provider_warnings: Vec<String>,
     pub extended: ExtendedConfig,
     pub response_metrics_tokenizer_validation:

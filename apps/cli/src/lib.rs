@@ -155,6 +155,16 @@ pub mod integration {
         pub schema_version: i64,
     }
 
+    /// Stable subset of one daemon-published host capability row.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct HostCapability {
+        pub available: bool,
+        pub state: String,
+        pub reason: String,
+        pub fix_command: Option<String>,
+        pub remedy_text: Option<String>,
+    }
+
     /// Stable subset of the global caffeinate state broadcast.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct CaffeinateState {
@@ -478,6 +488,27 @@ pub mod integration {
                     schema_version,
                 }),
                 other => Err(anyhow!("unexpected daemon status response: {other:?}")),
+            }
+        }
+
+        /// One row of the daemon's published host capability snapshot, or
+        /// `None` while that feature has not been published.
+        pub async fn host_capability(&self, id: &str) -> Result<Option<HostCapability>> {
+            match self
+                .inner
+                .request_ok(crate::daemon::proto::Request::GetHostCapabilities)
+                .await?
+            {
+                crate::daemon::proto::Response::HostCapabilities { snapshot } => {
+                    Ok(snapshot.feature(id).map(|row| HostCapability {
+                        available: row.state.is_available(),
+                        state: format!("{:?}", row.state),
+                        reason: row.reason.clone(),
+                        fix_command: row.fix_command.clone(),
+                        remedy_text: row.remedy_text.clone(),
+                    }))
+                }
+                other => Err(anyhow!("unexpected host capabilities response: {other:?}")),
             }
         }
 

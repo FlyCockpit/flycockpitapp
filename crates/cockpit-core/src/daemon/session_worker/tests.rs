@@ -270,19 +270,43 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
         .parent()
         .and_then(std::path::Path::parent)
         .expect("workspace root");
-    let output = std::process::Command::new("rg")
-        .current_dir(repo)
-        .args([
-            "-n",
-            "RedactionTable::build(?:_[[:alnum:]_]+)?|build_daemon_redaction_table|refresh_global_redaction_table|RedactionTable::empty",
-            ".",
-            "--glob",
-            "*.rs",
-        ])
-        .output()
-        .expect("run the canonical redaction inventory query");
-    assert!(output.status.success(), "canonical redaction query failed");
-    let stdout = String::from_utf8(output.stdout).expect("UTF-8 rg output");
+    // The canonical inventory query, run in-process: the same regex, `*.rs`
+    // only, and the same ignore rules as ripgrep (`.gitignore`, `.ignore`,
+    // hidden entries skipped), so the test never depends on `rg` being
+    // installed. Rows keep ripgrep's `path:line:text` shape.
+    let query = regex::Regex::new(
+        r"RedactionTable::build(?:_[[:alnum:]_]+)?|build_daemon_redaction_table|refresh_global_redaction_table|RedactionTable::empty",
+    )
+    .expect("canonical redaction inventory regex");
+    let mut rows = Vec::new();
+    for entry in ignore::WalkBuilder::new(repo).build() {
+        let entry = entry.expect("walk the canonical redaction inventory");
+        if !entry.file_type().is_some_and(|kind| kind.is_file())
+            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("rs")
+        {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(repo)
+            .expect("inventory path under the workspace root")
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let bytes = std::fs::read(entry.path()).expect("read inventory source");
+        if bytes.contains(&0) {
+            // ripgrep's default binary detection skips files with NUL bytes.
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        for (index, line) in text.lines().enumerate() {
+            if query.is_match(line) {
+                rows.push(format!("{relative}:{}:{line}", index + 1));
+            }
+        }
+    }
+    let stdout = rows.join("\n");
     let mut authority_internal = 0usize;
     let mut raw_export = 0usize;
     let mut inert_empty = 0usize;

@@ -570,6 +570,16 @@ impl OnboardingShell {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_secure_store_cursor_placement(
+        &self,
+    ) -> Option<cockpit_proto::OnboardingSecurePlacement> {
+        match &self.screen {
+            OnboardingScreen::SecureStore(screen) => screen.cursor_placement(),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn model_phase(&self) -> Option<ModelPhase> {
         match &self.screen {
             OnboardingScreen::Model(screen) => Some(screen.phase()),

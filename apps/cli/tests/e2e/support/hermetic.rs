@@ -1371,19 +1371,30 @@ impl HermeticCockpit {
         }
     }
 
-    /// After injecting bytes, force a same-size SIGWINCH so the child must
-    /// redraw. Input bytes are written to the PTY before the resize, so the
-    /// kernel buffer contains them first. The redraw is the observable
-    /// render boundary used by no-op comparisons.
+    /// After injecting bytes, force two genuine size changes so the child
+    /// must redraw twice. A same-size `TIOCSWINSZ` is a no-op: Linux
+    /// (`tty_do_resize`) and the BSDs/macOS only raise SIGWINCH when the
+    /// window size actually changes, so the barrier toggles one column away
+    /// and back. Each leg waits for child output, which proves a render pass
+    /// ran after the resize. SIGWINCH is out of band, so this is a render
+    /// boundary, not a guarantee that earlier input bytes were consumed;
+    /// callers that need an input effect must still wait for its semantic
+    /// screen change. The bound is generous for loaded CI runners; the wait
+    /// returns as soon as output appears.
     pub fn checkpoint_input_with_redraw(&mut self) {
-        let prev = self.output_bytes();
+        const REDRAW_TIMEOUT: Duration = Duration::from_secs(30);
         let (cols, rows) = self.pty_size().expect("PTY size");
-        self.resize(cols, rows);
+        let toggled = if cols > 1 { cols - 1 } else { cols + 1 };
+        let prev = self.output_bytes();
+        self.resize(toggled, rows);
         self.wait_for_output_progress(
             prev,
-            "same-size resize redraw after injected input",
-            Duration::from_secs(2),
+            "redraw after toggling the PTY width away from its size",
+            REDRAW_TIMEOUT,
         );
+        let prev = self.output_bytes();
+        self.resize(cols, rows);
+        self.wait_for_output_progress(prev, "redraw after restoring the PTY width", REDRAW_TIMEOUT);
     }
 
     /// Attach and policy broadcasts can still land after the ready composer

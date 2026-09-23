@@ -117,11 +117,40 @@ fn wait_for_marker(
     }
 }
 
+/// Wait until the visible grid has stayed unchanged for a quiet interval.
+/// The head can first "appear" in a partially parsed frame, or in the first
+/// of several frames one wheel event produces; callers that derive several
+/// coordinates must read them from one snapshot after this settles. This
+/// deliberately polls the grid instead of forcing a resize redraw.
+fn wait_for_quiet_screen(session: &mut HermeticCockpit, label: &str) {
+    const QUIET: Duration = Duration::from_millis(300);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut previous = session.snapshot().visible_state();
+    let mut stable_since = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(25));
+        let now = session.snapshot().visible_state();
+        if now != previous {
+            previous = now;
+            stable_since = Instant::now();
+        } else if stable_since.elapsed() >= QUIET {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for the screen to settle: {label}");
+        }
+    }
+}
+
 fn scroll_until_head(session: &mut HermeticCockpit) {
     for event_n in 0..MAX_WHEEL_EVENTS {
         let snapshot = session.snapshot();
         if head_visible(&snapshot) {
-            return;
+            wait_for_quiet_screen(session, "scrolled head frame");
+            if head_visible(&session.snapshot()) {
+                return;
+            }
+            continue;
         }
         let Some(pos) = observed_chat_coord(&snapshot) else {
             panic!("wheel {event_n}: no observed chat-area coordinate for marker");
@@ -705,11 +734,14 @@ fn tui_mouse_drag_auto_copy_pty() {
 #[test]
 fn tui_mouse_multiclick_pty() {
     let (_provider, mut session) = launch_scrolled_gesture_session();
-    let head_row = observed_head_span(&session.snapshot())
+    // Derive the head row and the word from ONE settled snapshot: two
+    // snapshots can straddle a late scroll frame and disagree on the row.
+    wait_for_quiet_screen(&mut session, "multiclick head frame");
+    let settled = session.snapshot();
+    let head_row = observed_head_span(&settled)
         .map(|(start, _)| start.row)
         .expect("observed head row");
-    let alpha = session
-        .snapshot()
+    let alpha = settled
         .find_text_span(WORD_MARKER)
         .and_then(|(start, _)| (start.row == head_row).then_some(start))
         .expect("observed alpha");

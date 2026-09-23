@@ -188,6 +188,14 @@ jobs:
           --features no-self-update
           --test updater_no_self_update
 
+      # Always record runner headroom so a killed or failed Linux leg shows
+      # whether disk or memory ran out.
+      - name: Runner resource diagnostics
+        if: always() && runner.os == 'Linux'
+        run: |
+          df -h
+          free -h
+
       - name: Check feature-gated test coverage
         run: bash scripts/check-feature-gated-test-coverage.sh
 
@@ -324,6 +332,14 @@ jobs:
           -p cockpit-core -p cockpit-tui -p cockpit-cli
           --features grok-subscription
 
+      # Always record runner headroom so a killed or failed Linux leg shows
+      # whether disk or memory ran out.
+      - name: Runner resource diagnostics
+        if: always() && runner.os == 'Linux'
+        run: |
+          df -h
+          free -h
+
       - name: Clippy with SuperGrok subscription support
         run: >
           cargo clippy --locked
@@ -449,6 +465,14 @@ jobs:
           -p tenant-authority
           --features
           cockpit-proto/remote,cockpit-proto/extended,cockpit-core/remote,cockpit-core/extended,cockpit-db/remote,cockpit-db/extended,cockpit-tui/remote,cockpit-tui/extended,cockpit-cli/remote,cockpit-cli/extended,cockpit-config/extended,tenant-authority/remote
+
+      # Always record runner headroom so a killed or failed Linux leg shows
+      # whether disk or memory ran out.
+      - name: Runner resource diagnostics
+        if: always() && runner.os == 'Linux'
+        run: |
+          df -h
+          free -h
 
       - name: Clippy remote-gated test targets
         run: >

@@ -232,9 +232,7 @@ describe("send_user_message_canonical_vectors", () => {
       const bytes = fromHex(fixture.vectors[malformed.source].fcm2_hex);
       if (malformed.offset !== undefined) bytes.set(fromHex(malformed.bytes_hex), malformed.offset);
       const input = malformed.truncate === undefined ? bytes : bytes.slice(0, malformed.truncate);
-      expect(() => decodeCanonicalSendUserMessage(input), malformed.name).toThrow(
-        malformed.error,
-      );
+      expect(() => decodeCanonicalSendUserMessage(input), malformed.name).toThrow(malformed.error);
     }
   });
 

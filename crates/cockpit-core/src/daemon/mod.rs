@@ -4992,7 +4992,6 @@ mod tests {
                 false,
                 true,
                 None,
-                proto::PROTOCOL_VERSION,
                 None,
                 crate::env_snapshot::EnvDriftPolicy::Daemon,
             ))
@@ -5018,7 +5017,6 @@ mod tests {
                 false,
                 true,
                 None,
-                proto::PROTOCOL_VERSION,
                 None,
                 crate::env_snapshot::EnvDriftPolicy::Daemon,
             ))

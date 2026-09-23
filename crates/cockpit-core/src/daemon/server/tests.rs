@@ -21866,7 +21866,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             false,
             false,
             None,
-            proto::PROTOCOL_VERSION,
             None,
             Default::default(),
         ),
@@ -21877,7 +21876,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             false,
             false,
             None,
-            proto::PROTOCOL_VERSION,
             None,
             Default::default(),
         ),
@@ -21896,7 +21894,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 false,
                 false,
                 None,
-                proto::PROTOCOL_VERSION,
                 None,
                 Default::default(),
             ) else {
@@ -21916,7 +21913,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                     false,
                     false,
                     None,
-                    proto::PROTOCOL_VERSION,
                     None,
                     Default::default(),
                 )

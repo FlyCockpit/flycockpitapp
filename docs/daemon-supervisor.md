@@ -24,7 +24,8 @@ report after boot, recovery, and listener construction reach the normal
 publication barrier. A rolling standby writes the same identity-validated
 report before boot, then waits on an internal fd-6 promotion pipe; it therefore
 cannot touch durable recovery, accept, or resume a session until the
-predecessor has exited. Cockpit's required sensitive/reveal sibling is also
+predecessor has exited. After promotion it boots and writes a second fd-4
+report at the normal publication barrier. Cockpit's required sensitive/reveal sibling is also
 inherited on the internal fd 5.
 
 On Windows each worker creates a fresh random named pipe using the existing
@@ -95,7 +96,13 @@ means `T_hard` cancellation cannot occur on an abort-and-keep path. The
 predecessor records and reports its final durable boundary, closes admission
 before sending `Reconnect`, waits for its bounded frame flush and exit, and the
 supervisor finally releases the ready successor through fd 6; reconnect
-attempts queue on the supervisor-owned listener in between. A standby successor
+attempts queue on the supervisor-owned listener in between. The roll completes
+(the new generation is published and `roll`/`upgrade` answers) only when the
+promoted successor's second fd-4 report shows it has reached its publication
+barrier; the successor's boot after promotion outlasts a client's hello
+timeout, so answering on release would hand callers a listener that cannot yet
+greet them. A successor that exits or times out before that report is replaced
+through the ordinary readiness/restart budget. A standby successor
 does no durable recovery before fd-6 promotion. A missing payload,
 protocol/open-time mismatch, process-identity mismatch, staged-successor exit,
 or a pre-commit drain failure aborts while the predecessor remains serving.

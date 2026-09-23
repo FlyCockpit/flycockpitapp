@@ -9,9 +9,15 @@ use crate::support::{
 const CLOSE_SETTINGS: &str = "[Close settings]";
 const CHOOSE_DEFAULT: &str = "[Choose default model]";
 const DEFAULT_MODEL_ROW: &str = "Default model for new sessions";
-const MODEL_PICKER_MARKER: &str = "/model — pick the active model";
-const HOVER_BG_RGB: (u8, u8, u8) = (0x2D, 0x5D, 0x8C);
-const HOVER_BG_ANSI: u8 = 25;
+// #476 deleted the fullscreen `/model` overlay: `[Choose default model]` now
+// closes settings (`DefaultModelPage` Enter -> `Nav::Close`) and
+// `App::open_default_model_from_settings` opens the composer Model pill picker,
+// announcing the mode with this transcript line.
+const DEFAULT_MODEL_PICKER_MARKER: &str = "Choose the default model for new sessions";
+// Mirrors `cockpit_tui::tui::theme::HOVER_BG` (= `BUTTON_HOVER_BG`, #464's
+// single hover rule) and its 256-color fallback `theme::HOVER_BG_INDEX`.
+const HOVER_BG_RGB: (u8, u8, u8) = (0x2C, 0x38, 0x46);
+const HOVER_BG_ANSI: u8 = 236;
 
 fn launch_mouse_session(cols: u16, rows: u16) -> HermeticCockpit {
     let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
@@ -202,19 +208,27 @@ fn tui_pty_settings_button_activation_is_exact() {
     session.write_bytes(&sgr_left_down(choose_start.sgr_x(), choose_start.sgr_y()));
     session.write_bytes(&sgr_left_up(choose_start.sgr_x(), choose_start.sgr_y()));
     session.wait_for_output_progress(prev, "activate choose default", Duration::from_secs(2));
-    wait_for_text(&mut session, MODEL_PICKER_MARKER, Duration::from_secs(5));
-    session.write_bytes(b"\x1b");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut delay = Duration::from_millis(2);
-    while Instant::now() < deadline {
-        if session.snapshot().find_text(CHOOSE_DEFAULT).is_some()
-            || session.snapshot().contains("Choose default")
-        {
-            break;
-        }
-        std::thread::sleep(delay);
-        delay = (delay * 2).min(Duration::from_millis(50));
+    wait_for_text(
+        &mut session,
+        DEFAULT_MODEL_PICKER_MARKER,
+        Duration::from_secs(5),
+    );
+    assert!(
+        session.snapshot().find_text(CLOSE_SETTINGS).is_none(),
+        "activating [Choose default model] must hand off to the composer picker:\n{}",
+        session.snapshot().contents()
+    );
+    // Dismiss the pill picker, then reopen the default-model page so the
+    // clipped-suffix probe below runs against a live settings button. The
+    // Model picker opens drilled into the current provider (level 1): the
+    // first Esc backs out to the provider list, the second closes it and
+    // clears the pill selection (`handle_composer_control_key`). A spare Esc
+    // on the idle composer is inert.
+    for _ in 0..2 {
+        session.write_bytes(b"\x1b");
+        session.settle_visible_state(Duration::from_secs(3));
     }
+    open_default_model_page(&mut session);
     session.resize(23, 20);
     let prev = session.output_bytes();
     session.wait_for_output_progress(prev, "resize to 23x20", Duration::from_secs(2));
@@ -230,22 +244,27 @@ fn tui_pty_settings_button_activation_is_exact() {
         row: partial_start.row,
         col: 22,
     };
-    let before = narrow.snapshot();
     narrow.write_bytes(&sgr_left_down(absent_suffix.sgr_x(), absent_suffix.sgr_y()));
     narrow.write_bytes(&sgr_left_up(absent_suffix.sgr_x(), absent_suffix.sgr_y()));
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let mut delay = Duration::from_millis(2);
-    while Instant::now() < deadline {
-        assert!(
-            !narrow.snapshot().contains("pick the active model"),
-            "clipped suffix must not open the model picker; button={:?}-{:?}",
-            partial_start,
-            partial_end
-        );
-        std::thread::sleep(delay);
-        delay = (delay * 2).min(Duration::from_millis(50));
-    }
-    let _ = before;
+    narrow.settle_visible_state(Duration::from_secs(2));
+    // A clipped-suffix activation would close settings (`Nav::Close`) and
+    // open the composer picker; restoring the full width must still show the
+    // default-model page with its button.
+    narrow.resize(INITIAL_PTY_COLS, INITIAL_PTY_ROWS);
+    narrow
+        .wait_until_screen(
+            "default-model page survives clipped-suffix click",
+            Duration::from_secs(5),
+            |screen| screen.find_text(CHOOSE_DEFAULT).is_some(),
+        )
+        .unwrap_or_else(|_| {
+            panic!(
+                "clipped suffix must not activate [Choose default model]; button={:?}-{:?}\n{}",
+                partial_start,
+                partial_end,
+                narrow.snapshot().contents()
+            )
+        });
     narrow.reap();
     narrow.assert_reaped();
 }

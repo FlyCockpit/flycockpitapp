@@ -1304,6 +1304,19 @@ impl ParkCommit {
         self.inner.registered.load(Ordering::SeqCst) > 0
     }
 
+    /// Number of interrupt waiters currently blocked on a human decision.
+    pub fn registered_waiters(&self) -> usize {
+        self.inner.registered.load(Ordering::SeqCst)
+    }
+
+    /// Whether this worker's resumable (`pause_for_resume`) shutdown has
+    /// published `Committed`: its driver has quiesced and every registered
+    /// park plus the paused-work summary is durable. Only the graceful drain
+    /// publishes this terminal, so a still-serving worker is never `true`.
+    pub fn shutdown_committed(&self) -> bool {
+        matches!(*self.inner.shutdown.borrow(), ShutdownParkState::Committed)
+    }
+
     /// Producer (worker `SessionWork::Shutdown` arm): every registered park
     /// landed durably (or there were none). `send_replace` always updates the
     /// stored value (even if the drain path has not subscribed yet — the worker

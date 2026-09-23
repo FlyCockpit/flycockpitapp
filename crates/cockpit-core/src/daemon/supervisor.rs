@@ -523,8 +523,27 @@ pub(crate) fn take_worker_listeners(paths: &DaemonPaths) -> Result<Option<Worker
     }
 }
 
-/// Report the successor's boot barrier to the supervisor.
+/// Report the worker's readiness barrier to the supervisor.
+///
+/// An ordinary worker reports once, at its publication barrier. A rolling
+/// standby reports its identity before boot and keeps fd 4 open: after fd-6
+/// promotion it must report again through
+/// [`report_promoted_worker_serving`] once it has reached the same publication
+/// barrier, so the supervisor does not declare the roll complete while the
+/// successor is still opening the database and clients' hellos would time out
+/// in the inherited listener's backlog.
 pub(crate) fn report_worker_ready() -> Result<()> {
+    write_worker_ready_report(!worker_handover_standby())
+}
+
+/// Report that a promoted rolling successor has reached its publication
+/// barrier and is about to accept from the inherited listener.
+pub(crate) fn report_promoted_worker_serving() -> Result<()> {
+    debug_assert!(worker_handover_standby());
+    write_worker_ready_report(true)
+}
+
+fn write_worker_ready_report(close: bool) -> Result<()> {
     if !is_worker_process() {
         return Ok(());
     }
@@ -547,9 +566,13 @@ pub(crate) fn report_worker_ready() -> Result<()> {
         if written != isize::try_from(encoded.len()).unwrap_or(-1) {
             return Err(std::io::Error::last_os_error()).context("signaling worker readiness");
         }
-        // SAFETY: fd 4 belongs to this process and is no longer needed.
-        unsafe { libc::close(READY_FD) };
+        if close {
+            // SAFETY: fd 4 belongs to this process and is no longer needed.
+            unsafe { libc::close(READY_FD) };
+        }
     }
+    #[cfg(not(unix))]
+    let _ = close;
     Ok(())
 }
 
@@ -642,6 +665,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
         mut admin,
         opened_at_unix_ms,
         mut generation,
+        mut generations,
         mut worker,
         database_owner,
     ) = if let Some(inherited) = inherited {
@@ -680,6 +704,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             let database_owner = unsafe {
                 crate::db::SupervisorDatabaseOwner::from_raw_fd(inherited.database_lock_fd)
             };
+            let generations = WorkerGenerations::resume(&database_owner, inherited.generation)?;
             (
                 receipt,
                 metadata,
@@ -687,6 +712,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                 admin,
                 inherited.opened_at_unix_ms,
                 inherited.generation,
+                generations,
                 worker,
                 database_owner,
             )
@@ -725,6 +751,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             let admin = bind_admin(&admin_path)?;
             let worker = resume_worker(inherited.worker_pid, &inherited.worker_binary)?;
             let database_owner = acquire_database_owner_until(deadline)?;
+            let generations = WorkerGenerations::resume(&database_owner, inherited.generation)?;
             publish_generation(
                 &paths,
                 &receipt,
@@ -740,6 +767,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                 admin,
                 inherited.opened_at_unix_ms,
                 inherited.generation,
+                generations,
                 worker,
                 database_owner,
             )
@@ -775,7 +803,11 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
         let endpoint_owner = WindowsEndpointOwner;
         let admin = bind_admin(&admin_path)?;
         let opened_at_unix_ms = now_unix_ms();
-        let generation = 1_u64;
+        // A previous supervisor on this home (restart, or SIGKILL followed by
+        // a new client) left its last generation in the durable fence; the
+        // first worker of this run must start strictly above it.
+        let mut generations = WorkerGenerations::resume(&database_owner, 0)?;
+        let generation = generations.allocate()?;
         let worker = spawn_ready_worker(WorkerSpawnRequest {
             endpoints: &endpoint_owner,
             binary: &executable,
@@ -799,6 +831,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             admin,
             opened_at_unix_ms,
             generation,
+            generations,
             worker,
             database_owner,
         )
@@ -822,6 +855,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                 let respawn_binary = worker.binary.clone();
                 let Some(replacement) = retry_worker_spawn(
                     &mut storm,
+                    &mut generations,
                     &mut generation,
                     |attempt_generation| spawn_ready_worker(WorkerSpawnRequest {
                         endpoints: &endpoint_owner,
@@ -899,7 +933,17 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 AdminCommand::Roll => executable.clone(),
                                 _ => unreachable!("roll command was matched above"),
                             };
-                            let next_generation = generation.saturating_add(1);
+                            let next_generation = match generations.allocate() {
+                                Ok(next_generation) => next_generation,
+                                Err(error) => {
+                                    write_admin(&mut stream, &AdminResponse::Error {
+                                        version: ADMIN_PROTOCOL_VERSION,
+                                        message: format!("{error:#}"),
+                                    })
+                                    .await?;
+                                    continue;
+                                }
+                            };
                             let successor = match spawn_ready_worker(WorkerSpawnRequest {
                                 endpoints: &endpoint_owner,
                                 binary: &binary,
@@ -976,7 +1020,22 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             },
                             _ => executable.clone(),
                         };
-                        let next_generation = generation.saturating_add(1);
+                        // An aborted attempt burns its generation, so the
+                        // retry never shares a number with a process that
+                        // may still be exiting.
+                        let next_generation = match generations.allocate() {
+                            Ok(next_generation) => next_generation,
+                            Err(error) => {
+                                let reason = format!("allocating successor generation: {error:#}");
+                                tracing::warn!(%reason, "worker handover aborted before readiness");
+                                last_handover = Some(format!("aborted: {reason}"));
+                                write_admin(&mut stream, &AdminResponse::Error {
+                                    version: ADMIN_PROTOCOL_VERSION,
+                                    message: reason,
+                                }).await?;
+                                continue;
+                            }
+                        };
                         // Boot the successor to its readiness barrier first,
                         // but hold it before the accept loop.  This is the
                         // confirm-before-commit point: a bad binary, hello,
@@ -1121,6 +1180,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 let respawn_binary = worker.binary.clone();
                                 let Some(replacement) = retry_worker_spawn(
                                     &mut storm,
+                                    &mut generations,
                                     &mut generation,
                                     |attempt_generation| spawn_ready_worker(WorkerSpawnRequest {
                                         endpoints: &endpoint_owner,
@@ -1161,20 +1221,29 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             tracing::warn!(%error, pid = old_pid, "predecessor did not exit after handover commit; forcing it");
                             drain_and_reap_worker(&mut worker, false).await?;
                         }
-                        if let Err(error) = promote_ready_worker(&mut successor) {
-                            let reason = format!("releasing ready successor: {error:#}");
+                        if let Err(error) = release_ready_successor(
+                            &mut successor,
+                            next_generation,
+                            opened_at_unix_ms,
+                            &log_path,
+                        )
+                        .await
+                        {
+                            let reason = format!("{error:#}");
                             let recovery_binary = successor.binary.clone();
                             let _ = terminate_worker(&mut successor, false);
                             reap_worker_after_exit(successor);
                             // The predecessor has already exited, so failing
-                            // the one-byte release must not take the stable
-                            // supervisor (and its listener) down with it.
+                            // the release (or the successor's boot after it)
+                            // must not take the stable supervisor (and its
+                            // listener) down with it.
                             // Recover through the ordinary readiness/restart
                             // budget, now that the successor is the sole
                             // durable owner.
                             generation = next_generation;
                             let Some(replacement) = retry_worker_spawn(
                                 &mut storm,
+                                &mut generations,
                                 &mut generation,
                                 |attempt_generation| spawn_ready_worker(WorkerSpawnRequest {
                                     endpoints: &endpoint_owner,
@@ -1282,8 +1351,45 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
     Ok(())
 }
 
+/// Allocates supervised worker generations strictly above the durable writer
+/// fence and above every generation this supervisor has already attempted.
+///
+/// An attempt burns its generation whether or not it becomes ready: a worker
+/// that failed after opening the database has already advanced the durable
+/// fence, and the strict fence would reject a retry that reused its number.
+#[derive(Debug)]
+struct WorkerGenerations {
+    highest_attempted: u64,
+}
+
+impl WorkerGenerations {
+    /// Resume allocation above both the durable fence and `current`, the
+    /// generation of the worker this supervisor already owns (0 for none).
+    #[cfg(any(unix, windows))]
+    fn resume(owner: &crate::db::SupervisorDatabaseOwner, current: u64) -> Result<Self> {
+        let durable = owner
+            .durable_worker_generation()
+            .context("reading durable worker generation fence")?;
+        Ok(Self::above(durable.max(current)))
+    }
+
+    fn above(highest_attempted: u64) -> Self {
+        Self { highest_attempted }
+    }
+
+    fn allocate(&mut self) -> Result<u64> {
+        let next = self
+            .highest_attempted
+            .checked_add(1)
+            .context("supervised worker generations exhausted")?;
+        self.highest_attempted = next;
+        Ok(next)
+    }
+}
+
 async fn retry_worker_spawn<T, F, Fut>(
     storm: &mut cockpit_client::RestartStormGuard,
+    generations: &mut WorkerGenerations,
     generation: &mut u64,
     mut spawn: F,
 ) -> Option<T>
@@ -1299,7 +1405,13 @@ where
             );
             return None;
         }
-        *generation = generation.saturating_add(1);
+        *generation = match generations.allocate() {
+            Ok(next) => next,
+            Err(error) => {
+                tracing::error!(%error, "worker generation allocation failed; supervisor is exiting");
+                return None;
+            }
+        };
         match spawn(*generation).await {
             Ok(worker) => return Some(worker),
             Err(error) => {
@@ -1329,6 +1441,10 @@ struct Worker {
     exited: tokio::sync::mpsc::Receiver<std::result::Result<(), String>>,
     #[cfg(unix)]
     promotion: Option<std::fs::File>,
+    /// A staged successor's fd-4 read end, kept open for its second report
+    /// at the publication barrier after promotion.
+    #[cfg(unix)]
+    serving: Option<std::os::fd::OwnedFd>,
 }
 
 #[cfg(unix)]
@@ -1558,7 +1674,7 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
         drop(ready_write);
         drop(promotion_read);
         enforce_unix_worker_readiness(
-            ready_read,
+            &ready_read,
             &mut child,
             super::DAEMON_SPAWN_TIMEOUT,
             &request.log_path,
@@ -1601,6 +1717,8 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
         exited,
         #[cfg(unix)]
         promotion: promotion_write.map(std::fs::File::from),
+        #[cfg(unix)]
+        serving: request.hold_for_promotion.then_some(ready_read),
     })
 }
 
@@ -1619,6 +1737,8 @@ fn resume_worker(pid: u32, binary: &Path) -> Result<Worker> {
         exited: watch_worker(&receipt)?,
         #[cfg(unix)]
         promotion: None,
+        #[cfg(unix)]
+        serving: None,
     })
 }
 
@@ -1748,13 +1868,13 @@ fn create_ready_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
 
 #[cfg(unix)]
 fn wait_ready_report(
-    read: std::os::fd::OwnedFd,
+    read: impl std::os::fd::AsFd,
     child: &mut std::process::Child,
     timeout: Duration,
 ) -> Result<Option<WorkerReadyReport>> {
     use std::os::fd::AsRawFd as _;
     let deadline = Instant::now() + timeout;
-    let fd = read.as_raw_fd();
+    let fd = read.as_fd().as_raw_fd();
     // A readiness writer is untrusted until its whole hello has been
     // validated. Make the pipe nonblocking so a partial frame cannot park
     // the supervisor after poll has reported its first byte.
@@ -1825,7 +1945,7 @@ fn wait_ready_report(
 
 #[cfg(unix)]
 fn enforce_unix_worker_readiness(
-    read: std::os::fd::OwnedFd,
+    read: impl std::os::fd::AsFd,
     child: &mut std::process::Child,
     timeout: Duration,
     log_path: &Path,
@@ -2120,6 +2240,53 @@ fn signal_worker_handover_decision(worker: &Worker, commit: bool) -> Result<()> 
 #[cfg(windows)]
 fn signal_worker_handover_decision(_worker: &Worker, _commit: bool) -> Result<()> {
     bail!("boundary-aware worker handover is not available on Windows")
+}
+
+/// Release a staged successor and wait until it reaches its publication
+/// barrier.
+///
+/// A standby does no durable work before promotion, so it opens the database,
+/// recovers, and builds its services only now. Clients queued on the inherited
+/// listener get no hello until then, so the roll is not complete, and must not
+/// be reported or published as complete, before the successor's second fd-4
+/// report arrives.
+async fn release_ready_successor(
+    worker: &mut Worker,
+    generation: u64,
+    opened_at_unix_ms: u64,
+    log_path: &Path,
+) -> Result<()> {
+    promote_ready_worker(worker).context("releasing ready successor")?;
+    #[cfg(unix)]
+    {
+        let serving = worker
+            .serving
+            .take()
+            .context("rolling successor has no serving report channel")?;
+        let mut child = worker
+            .child
+            .take()
+            .context("rolling successor is not a supervised child")?;
+        let log_path = log_path.to_path_buf();
+        let (child, serving) = tokio::task::spawn_blocking(move || {
+            let serving = enforce_unix_worker_readiness(
+                &serving,
+                &mut child,
+                super::DAEMON_SPAWN_TIMEOUT,
+                &log_path,
+                generation,
+                opened_at_unix_ms,
+            );
+            (child, serving)
+        })
+        .await
+        .context("joining released successor serving wait")?;
+        worker.child = Some(child);
+        serving.context("waiting for released successor to serve")?;
+    }
+    #[cfg(not(unix))]
+    let _ = (generation, opened_at_unix_ms, log_path);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2795,17 +2962,23 @@ mod tests {
     #[tokio::test]
     async fn readiness_failures_retry_until_a_worker_is_ready() {
         let mut storm = cockpit_client::RestartStormGuard::default();
+        let mut generations = WorkerGenerations::above(7);
         let mut generation = 7;
         let mut attempts = Vec::new();
 
-        let worker = retry_worker_spawn(&mut storm, &mut generation, |attempt_generation| {
-            attempts.push(attempt_generation);
-            std::future::ready(if attempt_generation < 10 {
-                Err(anyhow::anyhow!("controlled readiness failure"))
-            } else {
-                Ok(101_u32)
-            })
-        })
+        let worker = retry_worker_spawn(
+            &mut storm,
+            &mut generations,
+            &mut generation,
+            |attempt_generation| {
+                attempts.push(attempt_generation);
+                std::future::ready(if attempt_generation < 10 {
+                    Err(anyhow::anyhow!("controlled readiness failure"))
+                } else {
+                    Ok(101_u32)
+                })
+            },
+        )
         .await;
 
         assert_eq!(worker, Some(101));
@@ -2816,20 +2989,42 @@ mod tests {
     #[tokio::test]
     async fn readiness_failures_exhaust_the_shared_restart_budget() {
         let mut storm = cockpit_client::RestartStormGuard::default();
+        let mut generations = WorkerGenerations::above(11);
         let mut generation = 11;
         let mut attempts = Vec::new();
 
-        let worker = retry_worker_spawn(&mut storm, &mut generation, |attempt_generation| {
-            attempts.push(attempt_generation);
-            std::future::ready(Err::<u32, _>(anyhow::anyhow!(
-                "controlled readiness failure"
-            )))
-        })
+        let worker = retry_worker_spawn(
+            &mut storm,
+            &mut generations,
+            &mut generation,
+            |attempt_generation| {
+                attempts.push(attempt_generation);
+                std::future::ready(Err::<u32, _>(anyhow::anyhow!(
+                    "controlled readiness failure"
+                )))
+            },
+        )
         .await;
 
         assert_eq!(worker, None);
         assert_eq!(generation, 14);
         assert_eq!(attempts, vec![12, 13, 14]);
+    }
+
+    #[test]
+    fn worker_generations_never_reuse_an_attempted_or_durable_generation() {
+        // A fresh supervisor on a home whose previous run reached durable
+        // generation 5 starts above it rather than at 1.
+        let mut generations = WorkerGenerations::above(5);
+        assert_eq!(generations.allocate().unwrap(), 6);
+        // An aborted handover attempt (7) is burned: the retry after it rolls
+        // from the still-serving generation 6 to 8, never back to 7.
+        assert_eq!(generations.allocate().unwrap(), 7);
+        assert_eq!(generations.allocate().unwrap(), 8);
+
+        let mut exhausted = WorkerGenerations::above(u64::MAX);
+        assert!(exhausted.allocate().is_err());
+        assert!(exhausted.allocate().is_err(), "exhaustion must not wrap");
     }
 
     #[cfg(unix)]
@@ -2845,6 +3040,7 @@ mod tests {
             child: None,
             exited,
             promotion: None,
+            serving: None,
         };
 
         let error = wait_for_worker_handover_ready(

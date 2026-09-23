@@ -2147,6 +2147,24 @@ impl SessionWorkerHandle {
         )
     }
 
+    /// Whether this worker's only live activity is a turn blocked on durable
+    /// interrupt waiters (approval / question): no schedule is running and
+    /// every in-flight tool call is accounted for by a registered waiter.
+    /// Such a turn has not dispatched the gated effect, so the resumable
+    /// shutdown park is a safe handover boundary for it. Conservative by
+    /// construction: any tool running beside the waiters (including a
+    /// delegate whose nested call is the one waiting) keeps it `false`.
+    pub(crate) fn blocked_only_on_durable_interrupts(&self) -> bool {
+        let waiters = self.park_commit.registered_waiters();
+        waiters > 0
+            && !self.live.has_active_schedules()
+            && self
+                .live
+                .tool_running
+                .load(std::sync::atomic::Ordering::Relaxed)
+                <= waiters
+    }
+
     pub fn tool_surface_override_json(&self) -> Option<String> {
         self.session.tool_surface_override_json()
     }

@@ -195,7 +195,12 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     session.start_trusted_daemon();
     session.spawn_pty(100, 30).unwrap();
     session.wait_until_ready(Duration::from_secs(30)).unwrap();
-    assert!(session.snapshot().contents().contains("Message"));
+    // #480 idle composer placeholder ("Ask anything, …").
+    assert!(
+        session.snapshot().contents().contains("Ask anything,"),
+        "ready composer placeholder missing:\n{}",
+        session.snapshot().contents()
+    );
 
     let secret = "release-acceptance-secret-7f31";
     let prompt = format!("durable release prompt {secret}");

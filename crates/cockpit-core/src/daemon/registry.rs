@@ -797,6 +797,24 @@ fn handover_activity(handle: &SessionWorkerHandle) -> bool {
     has_active_schedules || processing || tool_running
 }
 
+/// Whether `handle` still keeps a worker handover from its boundary.
+///
+/// A worker whose resumable shutdown park has committed is retiring with its
+/// open interrupts durably `Parked` and its paused-work summary written; it
+/// owes nothing further. A turn blocked only on durable interrupt waiters is
+/// a safe boundary that needs no drain window, but once the supervisor has
+/// committed the successor it still owes the park itself (`park_owed`), which
+/// [`SessionRegistry::interrupt_for_handover`] performs.
+fn handover_inflight(handle: &SessionWorkerHandle, park_owed: bool) -> bool {
+    if handle.park_commit().shutdown_committed() {
+        return false;
+    }
+    if handle.blocked_only_on_durable_interrupts() {
+        return park_owed;
+    }
+    handover_activity(handle)
+}
+
 impl SessionRegistry {
     pub fn new(
         db: Db,
@@ -3203,19 +3221,48 @@ impl SessionRegistry {
     /// Interrupt every still-running foreground turn through the same
     /// cancellation path used by daemon control requests. Durable accepted
     /// queue rows are intentionally retained for the successor.
+    ///
+    /// A turn blocked only on durable interrupt waiters is not cancelled: it
+    /// is parked through the same resumable `Shutdown { pause_for_resume }`
+    /// path the daemon drain uses, and this returns only after that worker's
+    /// park-commit is `Committed` (rows `Parked`, paused-work summary written,
+    /// driver quiesced). The successor then replays it exactly once through
+    /// paused-session recovery.
     pub async fn interrupt_for_handover(&self, hard_timeout: Duration) -> Result<usize> {
         super::supervisor::begin_worker_handover_hard_interrupt();
+        let deadline = tokio::time::Instant::now() + hard_timeout;
         let handles: Vec<SessionWorkerHandle> = {
             let workers = crate::sync::lock_or_recover(&self.inner.workers);
             workers
                 .live
                 .values()
                 .map(|entry| entry.handle.clone())
-                .filter(handover_activity)
+                .filter(|handle| handover_inflight(handle, true))
                 .collect()
         };
         let mut candidates = Vec::with_capacity(handles.len());
+        let mut parking = Vec::new();
         for handle in handles {
+            if handle.blocked_only_on_durable_interrupts() {
+                // Bounded like the drain dispatch: a wedged queue must fail
+                // this handover at T_hard rather than hang it.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::time::timeout(
+                    remaining,
+                    handle.send_work(crate::daemon::session_worker::SessionWork::Shutdown {
+                        pause_for_resume: true,
+                    }),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "worker handover could not deliver the interrupt park to session {} before T_hard",
+                        handle.session_id()
+                    )
+                })??;
+                parking.push(handle);
+                continue;
+            }
             let session_id = handle.session_id();
             let outcome = self.inner.db.handover_turn_outcome(session_id).await?;
             if outcome.hard_deadline_interrupted {
@@ -3229,7 +3276,19 @@ impl SessionRegistry {
             candidates.push((handle, outcome.turn_start_seq));
         }
 
-        let deadline = tokio::time::Instant::now() + hard_timeout;
+        // The park must be durable before this session counts as a
+        // boundary: a failed or unresolved park fails the handover instead of
+        // letting the predecessor retire with the interrupt still `Open`.
+        for handle in &parking {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let terminal = handle.park_commit().await_shutdown_commit(remaining).await;
+            anyhow::ensure!(
+                terminal.is_clean(),
+                "worker handover interrupt park for session {} did not commit before T_hard: {terminal:?}",
+                handle.session_id()
+            );
+        }
+
         while candidates
             .iter()
             .any(|(handle, _)| handover_activity(handle))
@@ -3288,11 +3347,17 @@ impl SessionRegistry {
         Ok(interrupted)
     }
 
+    /// Whether any live worker keeps the handover from its boundary. Before
+    /// the supervisor commits the successor, a turn blocked only on durable
+    /// interrupts is already a safe boundary (waiting out `T_drain` for a
+    /// human answer gains nothing); after the commit it still owes its park,
+    /// so the hard-deadline path runs and parks it.
     pub fn has_handover_inflight(&self) -> bool {
+        let park_owed = super::supervisor::worker_handover_committed();
         crate::sync::lock_or_recover(&self.inner.workers)
             .live
             .values()
-            .any(|entry| handover_activity(&entry.handle))
+            .any(|entry| handover_inflight(&entry.handle, park_owed))
     }
 
     /// Snapshot live handles belonging to the supplied durable trust root.
@@ -6149,6 +6214,105 @@ mod tests {
 
         handle.set_test_live_status(false, false, false);
         assert!(!reg.has_handover_inflight());
+    }
+
+    #[test]
+    fn handover_treats_durable_interrupt_wait_as_boundary_but_not_running_tools() {
+        let reg = test_registry();
+        let handle = test_handle(&reg, test_session(&reg));
+        // A turn whose gated tool started and is blocked on its approval.
+        handle.set_test_live_status(false, true, true);
+        assert!(
+            handover_inflight(&handle, false),
+            "a running tool with no registered waiter is live work"
+        );
+        handle.park_commit().test_add_registered();
+        assert!(
+            !handover_inflight(&handle, false),
+            "waiting on a durable interrupt needs no T_drain window"
+        );
+        assert!(
+            handover_inflight(&handle, true),
+            "after commitment the waiting turn still owes its durable park"
+        );
+        handle.set_test_live_status(true, true, true);
+        assert!(
+            handover_inflight(&handle, false),
+            "a schedule beside the waiter can still dispatch side effects"
+        );
+        handle.set_test_live_status(false, true, true);
+        handle.park_commit().report_shutdown_committed();
+        assert!(
+            !handover_inflight(&handle, true),
+            "a committed resumable park is a durable boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn handover_parks_durable_interrupt_wait_instead_of_cancelling() {
+        let reg = test_registry();
+        let session = persisted_test_session(&reg);
+        let session_id = session.id;
+        let (handle, mut work_rx) = test_handle_with_rx(&reg, session);
+        handle.set_test_live_status(false, true, true);
+        let park_commit = handle.park_commit();
+        park_commit.test_add_registered();
+        reg.insert_test_worker_without_join(handle.clone());
+
+        let worker = tokio::spawn(async move {
+            match work_rx.recv().await {
+                Some(session_worker::SessionWork::Shutdown { pause_for_resume }) => {
+                    assert!(pause_for_resume, "handover must park, not end, the session");
+                    park_commit.report_shutdown_committed();
+                }
+                other => panic!("expected a resumable shutdown park, got {other:?}"),
+            }
+        });
+        assert_eq!(
+            reg.interrupt_for_handover(Duration::from_secs(1))
+                .await
+                .unwrap(),
+            0,
+            "a parked turn is never counted as hard-deadline interrupted"
+        );
+        worker.await.unwrap();
+        assert!(!handover_inflight(&handle, true));
+        let events = reg.inner.db.list_session_events(session_id).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != "interrupt_decision"),
+            "a parked approval is replayed by the successor, not decided here"
+        );
+    }
+
+    #[tokio::test]
+    async fn handover_fails_closed_when_interrupt_park_does_not_commit() {
+        let reg = test_registry();
+        let (handle, mut work_rx) = test_handle_with_rx(&reg, persisted_test_session(&reg));
+        handle.set_test_live_status(false, true, true);
+        let park_commit = handle.park_commit();
+        park_commit.test_add_registered();
+        reg.insert_test_worker_without_join(handle.clone());
+
+        let worker = tokio::spawn(async move {
+            assert!(matches!(
+                work_rx.recv().await,
+                Some(session_worker::SessionWork::Shutdown {
+                    pause_for_resume: true
+                })
+            ));
+            park_commit.report_shutdown_failed_write();
+        });
+        let error = reg
+            .interrupt_for_handover(Duration::from_secs(1))
+            .await
+            .expect_err("an uncommitted park must not count as a boundary");
+        assert!(
+            error.to_string().contains("did not commit"),
+            "unexpected error: {error:#}"
+        );
+        worker.await.unwrap();
     }
 
     #[tokio::test]

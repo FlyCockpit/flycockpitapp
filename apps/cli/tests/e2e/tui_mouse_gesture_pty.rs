@@ -4,8 +4,8 @@ use cockpit_test_support::provider::{ScriptedProvider, Turn};
 
 use crate::support::{
     COMPOSER_PLACEHOLDER, CellPos, HermeticCockpit, HermeticProfile, INITIAL_PTY_COLS,
-    INITIAL_PTY_ROWS, Osc52Observer, ScreenSnapshot, sgr_left_click, sgr_left_down, sgr_left_drag,
-    sgr_left_up, sgr_motion, sgr_wheel_up, sha256_hex,
+    INITIAL_PTY_ROWS, Osc52Observer, ScreenSnapshot, SnapshotCell, sgr_left_click, sgr_left_down,
+    sgr_left_drag, sgr_left_up, sgr_motion, sgr_wheel_up, sha256_hex,
 };
 
 const USER_INPUT: &str = "PTY gesture input";
@@ -350,8 +350,60 @@ fn chat_pane_left(screen: &ScreenSnapshot) -> u16 {
     observed_chat_coord(screen).map(|pos| pos.col).unwrap_or(0)
 }
 
+/// Exclusive right edge of observed transcript text.
+///
+/// Since #471 the transcript viewport permanently reserves its rightmost
+/// column for the scrollbar track (`chrome::scrollbar`), which paints `│`
+/// (track) / `█` (thumb) on every viewport row while the transcript is
+/// scrollable — as it always is in this fixture. That column is chrome, not
+/// line content, so line and gap observations stop before it. Observed on
+/// the anchor row: the rightmost painted cell right of the transcript text.
+fn chat_pane_right(screen: &ScreenSnapshot) -> u16 {
+    let (_, cols) = screen.size();
+    let Some(anchor) = observed_chat_coord(screen) else {
+        return cols;
+    };
+    for col in (anchor.col..cols).rev() {
+        let Some(cell) = screen_cell(screen, anchor.row, col) else {
+            continue;
+        };
+        if cell.text.chars().all(char::is_whitespace) {
+            continue;
+        }
+        return if cell.text == "│" || cell.text == "█" {
+            col
+        } else {
+            cols
+        };
+    }
+    cols
+}
+
+fn screen_cell(screen: &ScreenSnapshot, row: u16, col: u16) -> Option<&SnapshotCell> {
+    let (_, cols) = screen.size();
+    screen
+        .cells()
+        .get(usize::from(row) * usize::from(cols) + usize::from(col))
+        .filter(|cell| cell.row == row && cell.col == col)
+}
+
 fn chat_row_content_span(screen: &ScreenSnapshot, row: u16) -> Option<(CellPos, CellPos)> {
-    screen.row_content_span_from(row, chat_pane_left(screen))
+    let left = chat_pane_left(screen);
+    let right = chat_pane_right(screen);
+    let mut first = None;
+    let mut last = None;
+    for col in left..right {
+        let Some(cell) = screen_cell(screen, row, col) else {
+            continue;
+        };
+        if cell.text.chars().all(char::is_whitespace) {
+            continue;
+        }
+        let pos = CellPos { row, col };
+        first.get_or_insert(pos);
+        last = Some(pos);
+    }
+    Some((first?, last?))
 }
 
 fn inverse_matches_span(screen: &ScreenSnapshot, start: CellPos, end: CellPos) -> bool {
@@ -506,6 +558,7 @@ fn find_muted_footer_separator(screen: &ScreenSnapshot) -> CellPos {
 fn find_blank_gap(screen: &ScreenSnapshot) -> CellPos {
     let (rows, _) = screen.size();
     let chat_left = chat_pane_left(screen);
+    let chat_right = chat_pane_right(screen);
     let composer_row = screen
         .find_text(COMPOSER_PLACEHOLDER)
         .map(|pos| pos.row)
@@ -518,11 +571,12 @@ fn find_blank_gap(screen: &ScreenSnapshot) -> CellPos {
     let (rows, _) = screen.size();
     let limit = composer_row.min(rows);
     for row in 0..limit {
-        if !row_chat_is_blank(screen, row, chat_left) {
+        if !row_chat_is_blank(screen, row, chat_left, chat_right) {
             continue;
         }
-        let above = row > 0 && !row_chat_is_blank(screen, row.saturating_sub(1), chat_left);
-        let below = row + 1 < limit && !row_chat_is_blank(screen, row + 1, chat_left);
+        let above =
+            row > 0 && !row_chat_is_blank(screen, row.saturating_sub(1), chat_left, chat_right);
+        let below = row + 1 < limit && !row_chat_is_blank(screen, row + 1, chat_left, chat_right);
         if above && below {
             let cell = screen
                 .cells()
@@ -530,6 +584,7 @@ fn find_blank_gap(screen: &ScreenSnapshot) -> CellPos {
                 .find(|cell| {
                     cell.row == row
                         && cell.col >= chat_left
+                        && cell.col < chat_right
                         && cell.text.chars().all(char::is_whitespace)
                 })
                 .expect("blank gap row has an observed empty chat cell");
@@ -540,7 +595,7 @@ fn find_blank_gap(screen: &ScreenSnapshot) -> CellPos {
         }
     }
     panic!(
-        "blank gap not observed; composer_row={composer_row} chat={:?}",
+        "blank gap not observed; composer_row={composer_row} chat={:?} chat_cols={chat_left}..{chat_right}",
         observed_chat_coord(screen)
     );
 }
@@ -557,13 +612,11 @@ fn observed_same_row_neighbor(screen: &ScreenSnapshot, origin: CellPos) -> CellP
         .expect("observed neighbor on the same row")
 }
 
-fn row_chat_is_blank(screen: &ScreenSnapshot, row: u16, chat_left: u16) -> bool {
-    screen
-        .row_text(row)
-        .chars()
-        .enumerate()
-        .skip(usize::from(chat_left))
-        .all(|(_, ch)| ch.is_whitespace() || ch == '\0')
+fn row_chat_is_blank(screen: &ScreenSnapshot, row: u16, chat_left: u16, chat_right: u16) -> bool {
+    (chat_left..chat_right).all(|col| {
+        screen_cell(screen, row, col)
+            .is_none_or(|cell| cell.text.chars().all(|ch| ch.is_whitespace() || ch == '\0'))
+    })
 }
 
 fn click_and_checkpoint(session: &mut HermeticCockpit, pos: CellPos) {

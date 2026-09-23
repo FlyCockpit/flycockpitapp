@@ -2940,7 +2940,9 @@ async fn run_foreground_inner_with_boot_db_impl(
             // listeners, so it must report readiness here exactly as the ready
             // branch does; otherwise the supervisor times out and the spawner
             // never observes a ready daemon on a fresh install.
-            if !standby_promoted_before_recovery {
+            if standby_promoted_before_recovery {
+                supervisor::report_promoted_worker_serving()?;
+            } else {
                 supervisor::report_worker_ready()?;
                 supervisor::wait_for_worker_promotion()?;
             }
@@ -3011,7 +3013,11 @@ async fn run_foreground_inner_with_boot_db_impl(
                 Some(listeners) => listeners,
                 None => prepare_and_publish_socket_pair(&paths)?,
             };
-            if !standby_promoted_before_recovery {
+            // A promoted standby reported only its identity before boot; the
+            // supervisor completes the roll on this second report.
+            if standby_promoted_before_recovery {
+                supervisor::report_promoted_worker_serving()?;
+            } else {
                 supervisor::report_worker_ready()?;
                 supervisor::wait_for_worker_promotion()?;
             }

@@ -30,9 +30,15 @@ impl App {
         let Some(command) = self.persistent_notice_fix_command().map(str::to_string) else {
             return;
         };
-        match crate::clipboard::copy_plain(&command, self.clipboard_recovery) {
+        self.copy_host_command(&command, "Copied fix command.");
+    }
+
+    /// Copy an exact host command (a diagnosed fix) as plain text, with the
+    /// shared delivered / unverified / failed feedback.
+    pub(super) fn copy_host_command(&mut self, command: &str, confirmed_message: &str) {
+        match crate::clipboard::copy_plain(command, self.clipboard_recovery) {
             Ok(result) => {
-                let (msg, kind) = describe_delivered(&result, "Copied fix command.".to_string());
+                let (msg, kind) = describe_delivered(&result, confirmed_message.to_string());
                 if matches!(kind, ToastKind::Success) {
                     self.show_copy_ok_or_tmux_hint(msg);
                 } else {

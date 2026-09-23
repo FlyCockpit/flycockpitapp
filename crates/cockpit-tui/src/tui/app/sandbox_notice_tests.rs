@@ -37,6 +37,7 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
     app.apply_event(TurnEvent::SandboxUnavailable {
         remedy: REMEDY.to_string(),
         fix_command: Some(FIX_COMMAND.to_string()),
+        persist_command: None,
     });
     assert_eq!(
         app.sandbox_down_notice
@@ -88,6 +89,7 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
     app.apply_event(TurnEvent::SandboxUnavailable {
         remedy: REMEDY.to_string(),
         fix_command: Some(FIX_COMMAND.to_string()),
+        persist_command: None,
     });
     assert_eq!(
         app.sandbox_down_notice
@@ -233,6 +235,23 @@ fn notice_text_names_sandbox_off_and_diagnosed_sysctl() {
     assert!(text.contains(remedy));
 }
 
+/// A diagnosed restriction's reboot-persistent fix rides along in the notice.
+#[test]
+fn notice_text_includes_the_persist_command_when_diagnosed() {
+    let persist = cockpit_core::tools::shell_sandbox::APPARMOR_USERNS_PERSIST_COMMAND;
+    let text = super::sandbox_down_notice_text_with_intent(
+        REMEDY,
+        Some(FIX_COMMAND),
+        Some(persist),
+        true,
+        None,
+    );
+    assert!(text.contains(persist), "{text}");
+    assert!(text.contains("/sandbox off"), "{text}");
+    let without = sandbox_down_notice_text(REMEDY, Some(FIX_COMMAND), true);
+    assert!(!without.contains("Persist across reboots"), "{without}");
+}
+
 /// A generic (non-diagnosed) remedy still surfaces the deterministic
 /// `/sandbox off` action — the actionable instruction is always present.
 #[test]
@@ -316,6 +335,7 @@ fn sandbox_down_notice_survives_off_transition_when_platform_has_no_backend() {
     app.apply_event(TurnEvent::SandboxUnavailable {
         remedy: "filesystem confinement is unavailable on this platform".to_string(),
         fix_command: None,
+        persist_command: None,
     });
 
     app.apply_sandbox_state(
@@ -342,6 +362,7 @@ fn sandbox_refuse_state_does_not_clear_unavailable_notice() {
     app.apply_event(TurnEvent::SandboxUnavailable {
         remedy: "sandbox.host probe failed".to_string(),
         fix_command: None,
+        persist_command: None,
     });
     assert!(app.sandbox_down_notice.is_some());
 

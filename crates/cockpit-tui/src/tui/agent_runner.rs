@@ -5404,10 +5404,12 @@ pub(crate) fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent
         SandboxUnavailable {
             remedy,
             fix_command,
+            persist_command,
             ..
         } => TurnEvent::SandboxUnavailable {
             remedy,
             fix_command,
+            persist_command,
         },
         CommandCapabilityUnavailable {
             text, fix_command, ..

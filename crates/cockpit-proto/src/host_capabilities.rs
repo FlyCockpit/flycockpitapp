@@ -28,8 +28,14 @@ pub struct FeatureCapabilityRow {
     pub id: String,
     pub state: FeatureCapabilityState,
     pub reason: String,
+    /// One-shot host command that may resolve the condition until reboot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_command: Option<String>,
+    /// Host command that makes [`Self::fix_command`] survive a reboot (for
+    /// example a `/etc/sysctl.d` drop-in). Only present alongside a
+    /// `fix_command` whose effect is otherwise transient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remedy_text: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

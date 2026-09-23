@@ -52,6 +52,23 @@ control-plane boundary.
   commands are not separately approval-prompted because the filesystem sandbox
   is their execution boundary; unconfined execution follows the grant-or-ask
   path.
+- The shell sandbox fails closed. When sandboxing is configured but the host
+  cannot start it (for example Ubuntu 23.10+'s
+  `kernel.apparmor_restrict_unprivileged_userns=1`,
+  `kernel.unprivileged_userns_clone=0`, or `user.max_user_namespaces=0`), the
+  effective mode is refused, never silently off: `bash` does not run. Cockpit
+  diagnoses the cause and shows the exact one-shot host fix, a
+  reboot-persistent `/etc/sysctl.d` variant, and (for AppArmor) a narrower
+  alternative that grants user namespaces only to the `bwrap` binary through
+  an AppArmor profile; it never runs these host commands itself. In an
+  interactive TUI session, the first such refusal opens a one-time dialog
+  whose **Run unsandboxed** button is the only automatic-looking path to
+  unconfined execution, and it requires that explicit click: it takes the same
+  `/sandbox off` path, which persists `sandbox=off` for the project. Headless
+  `cockpit run` and approval mode Yolo never show the dialog and stay refused
+  until the user passes `--no-sandbox` or runs `/sandbox off`. After a host
+  fix, a capability re-check (`/sandbox on`, Settings, or `cockpit doctor`)
+  re-probes the host without a daemon restart.
 - There is no native Windows filesystem sandbox backend. Every Windows shell command is
   unconfined and follows grant-or-ask: it requires approval unless a matching session,
   project, or global grant exists. The Windows PowerShell installer does not change that

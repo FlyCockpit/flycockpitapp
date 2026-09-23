@@ -237,6 +237,8 @@ pub(super) fn close_pending_turn_completions(completions: &Arc<Mutex<TurnComplet
 pub(super) struct SandboxUnavailableNotice {
     pub(super) remedy: String,
     pub(super) fix_command: Option<String>,
+    /// Reboot-persistent companion of `fix_command`, when diagnosed.
+    pub(super) persist_command: Option<String>,
 }
 
 /// Ordinary work was refused because this worker's admission gate is closed
@@ -384,6 +386,7 @@ pub(super) fn send_sandbox_unavailable_notice(
             session_id,
             remedy: notice.remedy.clone(),
             fix_command: notice.fix_command.clone(),
+            persist_command: notice.persist_command.clone(),
         },
     );
 }
@@ -1098,11 +1101,13 @@ pub(super) fn sandbox_unavailable_notice_from_availability(
             fix_command: fix_command
                 .clone()
                 .or_else(|| crate::tools::shell_sandbox::fix_command_for_reason(reason)),
+            persist_command: availability.persist_command().map(str::to_string),
         }),
         crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform { reason } => {
             Some(SandboxUnavailableNotice {
                 remedy: reason.clone(),
                 fix_command: None,
+                persist_command: None,
             })
         }
     }
@@ -1452,6 +1457,13 @@ impl SessionWorkerHandle {
             snapshot.host_capabilities = caps.clone();
         }
         let new = self.session.set_sandbox_mode(applied.effective);
+        if new.enabled() && !new.refuses() {
+            // An explicit re-enable (`/sandbox on`, Settings) is the user
+            // saying "I fixed the host": drop the shared cached probe so the
+            // eager probe below and the next `bash` re-check the host instead
+            // of refusing on a result from before the fix.
+            crate::tools::shell_sandbox::invalidate_sandbox_availability();
+        }
         self.sandbox_notice_armed.store(false, Ordering::SeqCst);
         if !new.enabled() {
             *self
@@ -2412,7 +2424,8 @@ impl SessionWorkerHandle {
     }
 
     /// Start the eager shell-sandbox availability probe for this session. The
-    /// probe is non-blocking and process-cached by `shell_sandbox`.
+    /// probe is non-blocking and served from `shell_sandbox`'s refreshable
+    /// process-wide cache.
     pub fn probe_sandbox_unavailable(&self) {
         self.schedule_sandbox_unavailable_probe(false);
     }
@@ -2458,9 +2471,7 @@ impl SessionWorkerHandle {
         let notice_store = self.sandbox_unavailable_notice.clone();
         let armed = self.sandbox_notice_armed.clone();
         handle.spawn(async move {
-            let availability = crate::tools::shell_sandbox::sandbox_available(&project_root)
-                .await
-                .clone();
+            let availability = crate::tools::shell_sandbox::sandbox_available(&project_root).await;
             let platform_unsupported = matches!(
                 availability,
                 crate::tools::shell_sandbox::SandboxAvailability::UnsupportedPlatform { .. }
@@ -2502,9 +2513,12 @@ impl SessionWorkerHandle {
                         None,
                     )
                 });
+        let persist_command =
+            super::sandbox_capability_persist_command(intent, &snapshot.host_capabilities);
         let notice = SandboxUnavailableNotice {
             remedy,
             fix_command,
+            persist_command,
         };
         *self
             .sandbox_unavailable_notice

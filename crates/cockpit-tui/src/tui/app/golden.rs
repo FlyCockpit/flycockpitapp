@@ -724,6 +724,7 @@ fn shell_chrome_app(scene: &str) -> App {
                 fix_command: Some(
                     "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".to_string(),
                 ),
+                persist_command: None,
             });
             app.open_composer_picker(ComposerControlKind::Sandbox);
         }
@@ -848,6 +849,7 @@ pub fn onboarding_secure_store_shell() -> OnboardingShell {
                     state: cockpit_proto::FeatureCapabilityState::Available,
                     reason: "keyring is available".into(),
                     fix_command: None,
+                    persist_command: None,
                     remedy_text: None,
                     dependency_ids: Vec::new(),
                 },
@@ -856,6 +858,7 @@ pub fn onboarding_secure_store_shell() -> OnboardingShell {
                     state: cockpit_proto::FeatureCapabilityState::Available,
                     reason: "encrypted file vault is available".into(),
                     fix_command: None,
+                    persist_command: None,
                     remedy_text: None,
                     dependency_ids: Vec::new(),
                 },

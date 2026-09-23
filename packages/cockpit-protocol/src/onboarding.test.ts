@@ -61,6 +61,28 @@ describe("daemon onboarding wire projection", () => {
     ).toBe(true);
   });
 
+  it("accepts a sandbox.host feature row carrying a persist_command", () => {
+    expect(
+      onboardingBootstrapSnapshotSchema.safeParse({
+        ...snapshot,
+        host_capabilities: {
+          ...snapshot.host_capabilities,
+          features: [
+            {
+              id: "sandbox.host",
+              state: "missing",
+              reason: "unprivileged user namespaces are restricted by AppArmor",
+              fix_command: "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+              persist_command:
+                "echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-cockpit-userns.conf",
+              dependency_ids: ["safety.bubblewrap"],
+            },
+          ],
+        },
+      }).success,
+    ).toBe(true);
+  });
+
   it.each([
     "passphrase",
     "credential",

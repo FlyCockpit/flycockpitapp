@@ -262,7 +262,8 @@ impl App {
         &mut self,
         snapshot: cockpit_proto::HostCapabilitySnapshot,
     ) {
-        self.host_capabilities = snapshot;
+        let previous = std::mem::replace(&mut self.host_capabilities, snapshot);
+        self.note_host_sandbox_recovery(&previous);
         if let crate::tui::settings::Dialog::Settings(_) = &self.dialog {
             self.dialog
                 .apply_host_capabilities(self.host_capabilities.clone(), true);
@@ -2477,6 +2478,7 @@ impl App {
             TurnEvent::SandboxUnavailable {
                 remedy,
                 fix_command,
+                persist_command,
             } => {
                 // The shell sandbox can't initialize (§6.5). Raise the
                 // persistent below-input notice — deterministic, model-
@@ -2487,7 +2489,11 @@ impl App {
                 self.sandbox_down_notice = Some(SandboxDownNotice {
                     remedy,
                     fix_command,
+                    persist_command,
                 });
+                // First refusal caused by a host user-namespace restriction in
+                // an interactive session: offer the one-time consent dialog.
+                self.maybe_offer_sandbox_fallback();
             }
             TurnEvent::CommandCapabilityUnavailable { text, fix_command } => {
                 self.command_capability_notice =

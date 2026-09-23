@@ -597,7 +597,12 @@ impl App {
                 crate::tui::onboarding::reduced_motion_enabled(),
             )));
         }
-        match Dialog::shell_setup_wizard_engine(wizard_id, preselected_model, None) {
+        match Dialog::shell_setup_wizard_engine(
+            wizard_id,
+            preselected_model,
+            None,
+            &self.host_capabilities,
+        ) {
             Ok(dialog) => {
                 self.dialog = dialog;
                 if let Some(shell) = self.onboarding_shell.as_mut() {
@@ -2753,6 +2758,7 @@ impl App {
             super::sandbox_down_notice_text_with_intent(
                 &notice.remedy,
                 notice.fix_command.as_deref(),
+                notice.persist_command.as_deref(),
                 notice.fix_command.is_some(),
                 intent,
             )

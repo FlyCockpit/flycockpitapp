@@ -807,6 +807,7 @@ pub fn build_host_capability_snapshot(
                 .file_vault_reason
                 .unwrap_or_else(|| "encrypted file-backed secret storage is available".to_string()),
             fix_command: file_vault.file_vault_fix_command,
+            persist_command: None,
             remedy_text: Some(file_vault.machine_bound_warning.to_string()),
             dependency_ids: Vec::new(),
         },
@@ -942,6 +943,7 @@ fn feature_from_keyring(probe: &KeyringProbeResult) -> FeatureCapabilityRow {
         state: probe.state,
         reason: probe.reason.clone(),
         fix_command: probe.fix_command.clone(),
+        persist_command: None,
         remedy_text: probe.remedy_text.clone(),
         dependency_ids: vec![ID_KEYRING.to_string()],
     }
@@ -959,25 +961,39 @@ fn feature_sandbox_host(
             state: FeatureCapabilityState::Available,
             reason: "host sandbox probe succeeded".into(),
             fix_command: None,
+            persist_command: None,
             remedy_text: None,
             dependency_ids: vec![ID_BUBBLEWRAP.to_string()],
         },
         SandboxAvailability::Unavailable {
             reason,
             fix_command,
-        } => FeatureCapabilityRow {
-            id: FEATURE_SANDBOX_HOST.to_string(),
-            state: FeatureCapabilityState::Missing,
-            reason: reason.clone(),
-            fix_command: fix_command.clone(),
-            remedy_text: Some(reason.clone()),
-            dependency_ids: vec![ID_BUBBLEWRAP.to_string()],
-        },
+        } => {
+            // A diagnosed user-namespace restriction also carries the
+            // reboot-persistent fix and, where one exists, the narrower
+            // alternative (an AppArmor profile for bwrap only).
+            let restriction = availability.userns_restriction();
+            let remedy_text = restriction
+                .and_then(|r| r.alternative())
+                .unwrap_or_else(|| reason.clone());
+            FeatureCapabilityRow {
+                id: FEATURE_SANDBOX_HOST.to_string(),
+                state: FeatureCapabilityState::Missing,
+                reason: reason.clone(),
+                fix_command: fix_command
+                    .clone()
+                    .or_else(|| restriction.map(|r| r.fix_command().to_string())),
+                persist_command: availability.persist_command().map(str::to_string),
+                remedy_text: Some(remedy_text),
+                dependency_ids: vec![ID_BUBBLEWRAP.to_string()],
+            }
+        }
         SandboxAvailability::UnsupportedPlatform { reason } => FeatureCapabilityRow {
             id: FEATURE_SANDBOX_HOST.to_string(),
             state: FeatureCapabilityState::Unsupported,
             reason: reason.clone(),
             fix_command: None,
+            persist_command: None,
             remedy_text: Some(reason.clone()),
             dependency_ids: vec![ID_BUBBLEWRAP.to_string()],
         },
@@ -989,6 +1005,7 @@ fn feature_sandbox_host(
             state: FeatureCapabilityState::Unsupported,
             reason: "host sandbox is unsupported on Windows".into(),
             fix_command: None,
+            persist_command: None,
             remedy_text: Some("Use container sandbox mode on Windows.".into()),
             dependency_ids: vec![ID_BUBBLEWRAP.to_string()],
         },
@@ -998,6 +1015,7 @@ fn feature_sandbox_host(
             state: FeatureCapabilityState::Unsupported,
             reason: "host sandbox is unsupported on this platform".into(),
             fix_command: None,
+            persist_command: None,
             remedy_text: None,
             dependency_ids: vec![ID_BUBBLEWRAP.to_string()],
         },
@@ -1034,6 +1052,7 @@ fn feature_sandbox_host(
                     state,
                     reason,
                     fix_command,
+                    persist_command: None,
                     remedy_text,
                     dependency_ids: vec![ID_BUBBLEWRAP.to_string()],
                 };
@@ -1053,6 +1072,7 @@ fn feature_sandbox_container(availability: &ContainerAvailability) -> FeatureCap
                 .map(|runtime| format!("{} engine is available", runtime.as_str()))
                 .unwrap_or_else(|| "container engine is available".into()),
             fix_command: None,
+            persist_command: None,
             remedy_text: None,
             dependency_ids: vec![ID_DOCKER.to_string(), ID_PODMAN.to_string()],
         };
@@ -1076,6 +1096,7 @@ fn feature_sandbox_container(availability: &ContainerAvailability) -> FeatureCap
         state,
         reason,
         fix_command: None,
+        persist_command: None,
         remedy_text: availability.unavailable_reason_text(),
         dependency_ids: vec![ID_DOCKER.to_string(), ID_PODMAN.to_string()],
     }
@@ -1102,6 +1123,7 @@ fn feature_media_decode(
             state: FeatureCapabilityState::Available,
             reason: "ffmpeg and ffprobe are a compatible pair".into(),
             fix_command: None,
+            persist_command: None,
             remedy_text: None,
             dependency_ids: vec![ID_MEDIA_FFMPEG.to_string(), ID_MEDIA_FFPROBE.to_string()],
         }
@@ -1111,6 +1133,7 @@ fn feature_media_decode(
             state: FeatureCapabilityState::Missing,
             reason: "FFmpeg storyboard/decode functional probe failed".into(),
             fix_command: None,
+            persist_command: None,
             remedy_text: Some(
                 "Install an FFmpeg build containing PNG storyboard/decode support.".into(),
             ),
@@ -1133,6 +1156,7 @@ fn feature_media_decode(
             state: FeatureCapabilityState::Failed,
             reason,
             fix_command: None,
+            persist_command: None,
             remedy_text: Some(
                 "Install a matching FFmpeg/FFprobe pair from https://ffmpeg.org/download.html."
                     .into(),
@@ -1145,6 +1169,7 @@ fn feature_media_decode(
             state: FeatureCapabilityState::Missing,
             reason: "ffmpeg/ffprobe compatible pair is not available".into(),
             fix_command: None,
+            persist_command: None,
             remedy_text: Some(
                 "Install a matching FFmpeg/FFprobe pair from https://ffmpeg.org/download.html."
                     .into(),
@@ -1164,6 +1189,7 @@ fn feature_media_runtime_stage(id: &str, available: bool, reason: &str) -> Featu
         },
         reason: reason.to_owned(),
         fix_command: None,
+        persist_command: None,
         remedy_text: (!available).then(|| {
             "Install an FFmpeg build containing the codecs required by this media stage.".to_owned()
         }),
@@ -1225,5 +1251,48 @@ fn catalog_row_from_projection(
             .remedy
             .and_then(|remedy| serde_json::to_value(remedy).ok()),
         reason: row.reason,
+    }
+}
+
+#[cfg(test)]
+mod sandbox_host_row_tests {
+    use super::*;
+    use crate::tools::shell_sandbox::{
+        APPARMOR_USERNS_FIX_COMMAND, APPARMOR_USERNS_PERSIST_COMMAND, UsernsRestriction,
+    };
+
+    #[test]
+    fn diagnosed_userns_restriction_row_carries_fix_persist_and_alternative() {
+        let availability = SandboxAvailability::Unavailable {
+            reason: UsernsRestriction::AppArmor.reason(),
+            fix_command: Some(APPARMOR_USERNS_FIX_COMMAND.to_string()),
+        };
+        let row = feature_sandbox_host(HostPlatform::MacOs, &availability, &[]);
+        assert_eq!(row.state, FeatureCapabilityState::Missing);
+        assert_eq!(
+            row.fix_command.as_deref(),
+            Some(APPARMOR_USERNS_FIX_COMMAND)
+        );
+        assert_eq!(
+            row.persist_command.as_deref(),
+            Some(APPARMOR_USERNS_PERSIST_COMMAND)
+        );
+        let remedy = row.remedy_text.expect("remedy text");
+        assert!(
+            remedy.contains("flags=(unconfined) { userns, }"),
+            "{remedy}"
+        );
+    }
+
+    #[test]
+    fn generic_unavailable_row_has_no_persist_command() {
+        let availability = SandboxAvailability::Unavailable {
+            reason: "bwrap: execvp true: No such file or directory".to_string(),
+            fix_command: None,
+        };
+        let row = feature_sandbox_host(HostPlatform::MacOs, &availability, &[]);
+        assert_eq!(row.fix_command, None);
+        assert_eq!(row.persist_command, None);
+        assert_eq!(row.remedy_text.as_deref(), Some(row.reason.as_str()));
     }
 }

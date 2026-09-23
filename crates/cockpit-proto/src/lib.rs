@@ -6561,6 +6561,10 @@ mod tests {
             fix_command: Some(
                 "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".to_string(),
             ),
+            persist_command: Some(
+                "echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-cockpit-userns.conf"
+                    .to_string(),
+            ),
         });
         let back: Envelope = serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
         match back.body {
@@ -6570,6 +6574,7 @@ mod tests {
                         session_id,
                         remedy: r,
                         fix_command,
+                        persist_command,
                     },
             } => {
                 assert_eq!(session_id, sid);
@@ -6578,7 +6583,37 @@ mod tests {
                     fix_command.as_deref(),
                     Some("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0")
                 );
+                assert_eq!(
+                    persist_command.as_deref(),
+                    Some(
+                        "echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-cockpit-userns.conf"
+                    )
+                );
             }
+            other => panic!("expected SandboxUnavailable event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_unavailable_event_without_persist_command_still_decodes() {
+        // Older daemons never send `persist_command`; the field defaults.
+        let sid = Uuid::new_v4();
+        let evt = Envelope::event(Event::SandboxUnavailable {
+            session_id: sid,
+            remedy: "bwrap missing".into(),
+            fix_command: None,
+            persist_command: None,
+        });
+        let wire = serde_json::to_string(&evt).unwrap();
+        assert!(!wire.contains("persist_command"), "{wire}");
+        let back: Envelope = serde_json::from_str(&wire).unwrap();
+        match back.body {
+            Body::Event {
+                event:
+                    Event::SandboxUnavailable {
+                        persist_command, ..
+                    },
+            } => assert_eq!(persist_command, None),
             other => panic!("expected SandboxUnavailable event, got {other:?}"),
         }
     }

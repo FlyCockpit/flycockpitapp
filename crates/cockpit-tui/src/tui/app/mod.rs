@@ -62,6 +62,7 @@ mod render;
 pub(crate) mod response_performance_e2e;
 mod resume;
 mod rules;
+mod sandbox_fallback;
 mod scrollback_page_in;
 mod session_rail;
 mod session_services;
@@ -1539,6 +1540,9 @@ pub(super) enum LocalChoice {
     RedactionToggle(uuid::Uuid),
     ModelComparison(uuid::Uuid),
     ExitGuard(uuid::Uuid),
+    /// The one-time "Sandbox can't start" consent dialog
+    /// ([`sandbox_fallback`]).
+    SandboxFallback(uuid::Uuid),
 }
 
 impl LocalChoice {
@@ -1550,7 +1554,7 @@ impl LocalChoice {
             Self::RedactionToggle(interrupt_id) | Self::ModelComparison(interrupt_id) => {
                 *interrupt_id
             }
-            Self::ExitGuard(interrupt_id) => *interrupt_id,
+            Self::ExitGuard(interrupt_id) | Self::SandboxFallback(interrupt_id) => *interrupt_id,
         }
     }
 
@@ -1772,6 +1776,8 @@ const MAX_SANDBOX_NOTICE_ROWS: u16 = 4;
 pub(super) struct SandboxDownNotice {
     pub remedy: String,
     pub fix_command: Option<String>,
+    /// Reboot-persistent companion of `fix_command`, when diagnosed.
+    pub persist_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1782,12 +1788,13 @@ pub(super) struct CommandCapabilityNotice {
 
 #[cfg(test)]
 fn sandbox_down_notice_text(remedy: &str, fix_command: Option<&str>, copy_chip: bool) -> String {
-    sandbox_down_notice_text_with_intent(remedy, fix_command, copy_chip, None)
+    sandbox_down_notice_text_with_intent(remedy, fix_command, None, copy_chip, None)
 }
 
 pub(super) fn sandbox_down_notice_text_with_intent(
     remedy: &str,
     fix_command: Option<&str>,
+    persist_command: Option<&str>,
     copy_chip: bool,
     intent: Option<cockpit_proto::SandboxMode>,
 ) -> String {
@@ -1816,6 +1823,13 @@ pub(super) fn sandbox_down_notice_text_with_intent(
     {
         text.push_str(" Fix: ");
         text.push_str(command);
+        text.push('.');
+    }
+    if let Some(persist) = persist_command
+        && !remedy.contains(persist)
+    {
+        text.push_str(" Persist across reboots: ");
+        text.push_str(persist);
         text.push('.');
     }
     text.push_str(" Run /sandbox off in the composer to continue.");
@@ -2950,6 +2964,13 @@ pub struct App {
     /// `SandboxState { enabled: false }` a `/sandbox off` triggers. Never
     /// enters history or any inference request — purely client-side chrome.
     pub(super) sandbox_down_notice: Option<SandboxDownNotice>,
+    /// Once-per-session state of the consented sandbox fallback dialog
+    /// ([`sandbox_fallback`]). Never persisted; a new TUI session may ask
+    /// again while the host is still restricted.
+    pub(super) sandbox_fallback_prompt: sandbox_fallback::SandboxFallbackPrompt,
+    /// Whether the one-time "host sandbox is available again — run
+    /// `/sandbox on`" notice already fired this session.
+    pub(super) sandbox_available_notice_shown: bool,
     pub(super) command_capability_notice: Option<CommandCapabilityNotice>,
     pub(super) update_available_version: Option<String>,
     /// Process-local, event-earned per-model auth failures. These deliberately
@@ -4374,6 +4395,8 @@ impl App {
             last_user_interaction: Instant::now(),
             waiting_for_lock: None,
             sandbox_down_notice: None,
+            sandbox_fallback_prompt: Default::default(),
+            sandbox_available_notice_shown: false,
             command_capability_notice: None,
             update_available_version: None,
             auth_failure_annotations: Default::default(),
@@ -5282,6 +5305,8 @@ mod preflight_in_progress_tests;
 mod reasoning_toggle_key_tests;
 #[cfg(test)]
 mod resume_history_conversion_tests;
+#[cfg(test)]
+mod sandbox_fallback_tests;
 #[cfg(test)]
 mod sandbox_notice_tests;
 #[cfg(test)]

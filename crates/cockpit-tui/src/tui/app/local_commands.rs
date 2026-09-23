@@ -516,8 +516,16 @@ impl App {
                 };
                 self.resolve_exit_guard_choice(selected.as_deref());
             }
+            Some(LocalChoice::SandboxFallback(_)) => {
+                let LocalChoiceSelection::Single(selected) = selection else {
+                    return;
+                };
+                self.resolve_sandbox_fallback_choice(selected.as_deref());
+            }
             None => {}
         }
+        // A sandbox fallback prompt deferred behind this dialog can show now.
+        self.retry_deferred_sandbox_fallback();
     }
 
     /// Send an `/init` turn to the agent: render `/init <target>` as the

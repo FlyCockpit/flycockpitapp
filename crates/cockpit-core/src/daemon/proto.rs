@@ -703,6 +703,9 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         } => vec![Event::SandboxUnavailable {
             session_id,
             remedy,
+            persist_command: fix_command
+                .as_deref()
+                .and_then(crate::tools::shell_sandbox::persist_command_for_fix_command),
             fix_command,
         }],
         // The engine never emits `RedactionState` — the daemon's

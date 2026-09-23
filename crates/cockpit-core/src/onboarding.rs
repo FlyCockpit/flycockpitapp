@@ -659,6 +659,7 @@ mod tests {
                 state: cockpit_proto::FeatureCapabilityState::Available,
                 reason: "test capability available".into(),
                 fix_command: None,
+                persist_command: None,
                 remedy_text: None,
                 dependency_ids: Vec::new(),
             })

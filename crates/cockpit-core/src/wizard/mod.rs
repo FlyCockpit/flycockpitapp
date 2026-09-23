@@ -1344,7 +1344,7 @@ pub fn security_descriptor_for_config_with_caps(
             StepDescriptor {
                 id: "sandbox",
                 prompt: "How should Cockpit confine shell commands by default?",
-                help: "Keep the host shell sandbox unless you specifically need container isolation or unconfined commands. `off` means commands the model runs are unconfined. Container rows are omitted when docker/podman is not available. Host sandbox is omitted when the host capability is down.",
+                help: "Keep the host shell sandbox unless you specifically need container isolation or unconfined commands. `off` means commands the model runs are unconfined. Container rows are omitted when docker/podman is not available. Host sandbox shows as unavailable (with its fix) when down.",
                 help_hook: None,
                 kind: StepKind::Select {
                     options: sandbox_options,
@@ -1461,6 +1461,12 @@ fn sandbox_select_options(
             label: "sandbox".into(),
             description: "Run commands inside the OS shell sandbox.".into(),
         });
+    } else if let Some(option) = unavailable_host_sandbox_option(caps) {
+        // Never hide the recommended default silently: show it disabled with
+        // the host's reason and the exact fix so the user can repair the host
+        // instead of assuming `off` is the only choice. Selecting it is
+        // rejected by `validate_sandbox_mode`.
+        options.push(option);
     }
     if container_on {
         if current != SandboxIntent::Container {
@@ -1494,6 +1500,37 @@ fn sandbox_select_options(
         "off".to_string()
     };
     (options, default_id)
+}
+
+/// Option id for the disabled host-sandbox row. Deliberately not a sandbox
+/// mode id, so it can never be persisted as an intent.
+pub(crate) const SANDBOX_UNAVAILABLE_OPTION_ID: &str = "sandbox-unavailable";
+
+/// The disabled "sandbox (unavailable)" row shown when the host capability
+/// row is published but not available. `None` while the snapshot is
+/// unpublished (nothing is known yet) or the host sandbox is available.
+fn unavailable_host_sandbox_option(
+    caps: &cockpit_proto::HostCapabilitySnapshot,
+) -> Option<SelectOption> {
+    let row = caps.feature(crate::host_capabilities::FEATURE_SANDBOX_HOST)?;
+    if row.state.is_available() {
+        return None;
+    }
+    let mut description = format!("Unavailable here: {}", row.reason.trim_end_matches('.'));
+    description.push('.');
+    if let Some(fix) = &row.fix_command
+        && !row.reason.contains(fix.as_str())
+    {
+        description.push_str(&format!(" Fix: {fix}."));
+    }
+    if let Some(persist) = &row.persist_command {
+        description.push_str(&format!(" Persist across reboots: {persist}."));
+    }
+    Some(SelectOption {
+        id: SANDBOX_UNAVAILABLE_OPTION_ID.into(),
+        label: "sandbox (unavailable)".into(),
+        description: description.into(),
+    })
 }
 
 pub(crate) fn sandbox_mode_id(mode: crate::tools::sandbox_mode::SandboxIntent) -> &'static str {
@@ -1891,6 +1928,9 @@ fn validate_model_ref_matches_provider(
 
 fn validate_sandbox_mode(_: &WizardRun, answer: &WizardAnswer) -> std::result::Result<(), String> {
     match answer {
+        WizardAnswer::Select(value) if value == SANDBOX_UNAVAILABLE_OPTION_ID => Err(
+            "the host sandbox is unavailable on this machine; run the fix shown on that row and re-run setup, or choose another mode".to_string(),
+        ),
         WizardAnswer::Select(value) if sandbox_mode_from_id(value).is_some() => Ok(()),
         _ => Err("choose sandbox, container, container-readonly, or off".to_string()),
     }
@@ -3106,6 +3146,68 @@ mod tests {
         let ids = sandbox_option_ids(&descriptor);
         assert!(!ids.iter().any(|id| id == "sandbox"));
         assert_eq!(sandbox_default_id(&descriptor), "off");
+    }
+
+    #[test]
+    fn security_wizard_shows_unavailable_host_sandbox_with_reason_and_fix() {
+        let fix = crate::tools::shell_sandbox::APPARMOR_USERNS_FIX_COMMAND;
+        let mut caps = crate::daemon::session_worker::sandbox_capability_snapshot_with_reasons(
+            cockpit_proto::FeatureCapabilityState::Missing,
+            cockpit_proto::FeatureCapabilityState::Missing,
+            "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+)",
+            "container engine is unavailable",
+            Some(fix.to_string()),
+            None,
+        );
+        caps.features[0].persist_command =
+            Some(crate::tools::shell_sandbox::APPARMOR_USERNS_PERSIST_COMMAND.to_string());
+        let descriptor = security_descriptor_for_config_with_caps(
+            &crate::config::extended::ExtendedConfig::default(),
+            &caps,
+        );
+        let sandbox = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "sandbox")
+            .expect("sandbox step");
+        let StepKind::Select { options } = &sandbox.kind else {
+            panic!("sandbox step must be a select")
+        };
+        let row = options
+            .iter()
+            .find(|option| option.id == SANDBOX_UNAVAILABLE_OPTION_ID)
+            .expect("unavailable host sandbox stays visible");
+        assert!(row.label.contains("unavailable"));
+        assert!(row.description.contains("AppArmor"), "{}", row.description);
+        assert!(row.description.contains(fix), "{}", row.description);
+        assert!(
+            row.description
+                .contains("/etc/sysctl.d/60-cockpit-userns.conf"),
+            "{}",
+            row.description
+        );
+        // The disabled row is never a persistable mode and never the default.
+        assert!(sandbox_mode_from_id(SANDBOX_UNAVAILABLE_OPTION_ID).is_none());
+        assert_eq!(sandbox_default_id(&descriptor), "off");
+
+        let mut run = WizardRun::new(descriptor).unwrap();
+        let error = run
+            .submit(WizardAnswer::Select(
+                SANDBOX_UNAVAILABLE_OPTION_ID.to_string(),
+            ))
+            .unwrap_err();
+        assert!(error.contains("unavailable"), "{error}");
+    }
+
+    #[test]
+    fn security_wizard_unpublished_snapshot_does_not_invent_unavailable_row() {
+        let caps = crate::daemon::session_worker::unpublished_host_capability_snapshot();
+        let descriptor = security_descriptor_for_config_with_caps(
+            &crate::config::extended::ExtendedConfig::default(),
+            &caps,
+        );
+        let ids = sandbox_option_ids(&descriptor);
+        assert!(!ids.iter().any(|id| id == SANDBOX_UNAVAILABLE_OPTION_ID));
     }
 
     #[test]

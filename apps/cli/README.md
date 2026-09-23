@@ -907,6 +907,30 @@ The shell sandbox is filesystem-only and does not restrict network access. It
 has no native Windows backend: Windows shell commands are unconfined and require
 explicit approval unless a matching session, project, or global grant exists.
 
+On Linux the sandbox needs unprivileged user namespaces. When the host blocks
+them, a sandboxed session fails closed (`bash` is refused, never silently run
+unconfined) and Cockpit reports the diagnosed cause with the exact fix:
+
+| Host setting | One-shot fix | Persist across reboots |
+| --- | --- | --- |
+| `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu 23.10+) | `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` | `echo 'kernel.apparmor_restrict_unprivileged_userns=0' \| sudo tee /etc/sysctl.d/60-cockpit-userns.conf` |
+| `kernel.unprivileged_userns_clone=0` | `sudo sysctl -w kernel.unprivileged_userns_clone=1` | `echo 'kernel.unprivileged_userns_clone=1' \| sudo tee /etc/sysctl.d/60-cockpit-userns.conf` |
+| `user.max_user_namespaces=0` | `sudo sysctl -w user.max_user_namespaces=15000` | `echo 'user.max_user_namespaces=15000' \| sudo tee /etc/sysctl.d/60-cockpit-userns.conf` |
+
+For the AppArmor case a narrower alternative keeps the restriction and grants
+user namespaces only to the `bwrap` binary Cockpit launches, with a profile such
+as `/etc/apparmor.d/bwrap` containing
+`abi <abi/4.0>, profile bwrap /usr/bin/bwrap flags=(unconfined) { userns, }`
+(then `sudo apparmor_parser -r /etc/apparmor.d/bwrap`). `cockpit doctor` shows
+the live host-sandbox state and these commands; `cockpit run --format json`
+emits a `sandbox_unavailable` event with `reason`, `fix_command`, and
+`persist_command`. In the TUI, the first such refusal offers a one-time dialog
+(copy the fix, **Run unsandboxed**, or keep refusing); **Run unsandboxed** is an
+explicit choice equivalent to `/sandbox off` and is saved as `sandbox=off` for
+the project. Headless runs and approval mode Yolo never offer it; use
+`--no-sandbox` or `/sandbox off` deliberately instead. After fixing the host,
+`/sandbox on` re-checks it without restarting the daemon.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

@@ -3,6 +3,9 @@
 //! Unavailable container never silently rewrites to host Sandbox. A configured
 //! sandbox/container intent whose capability is missing, Failed, Unsupported,
 //! or unpublished is effective [`SandboxMode::Refuse`], never silent Off.
+//! The only way from Refuse to Off is an explicit user choice: `/sandbox off`,
+//! `--no-sandbox`, or the interactive TUI's one-time consent dialog ("Run
+//! unsandboxed"), which issues that same `/sandbox off` request.
 
 use cockpit_proto::{
     FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot, SecretStoreSnapshot,
@@ -21,6 +24,8 @@ pub struct SandboxCapabilityMissing {
     pub effective: SandboxMode,
     pub reason: String,
     pub fix_command: Option<String>,
+    /// Reboot-persistent companion of `fix_command`, when the row has one.
+    pub persist_command: Option<String>,
 }
 
 impl std::fmt::Display for SandboxCapabilityMissing {
@@ -35,6 +40,9 @@ impl std::fmt::Display for SandboxCapabilityMissing {
         )?;
         if let Some(fix) = &self.fix_command {
             write!(f, "; fix: {fix}")?;
+        }
+        if let Some(persist) = &self.persist_command {
+            write!(f, "; persist across reboots: {persist}")?;
         }
         Ok(())
     }
@@ -105,6 +113,7 @@ pub fn sandbox_capability_snapshot_with_reasons(
                 state: host,
                 reason: host_reason.into(),
                 fix_command: host_fix,
+                persist_command: None,
                 remedy_text: None,
                 dependency_ids: vec!["safety.bubblewrap".to_string()],
             },
@@ -113,6 +122,7 @@ pub fn sandbox_capability_snapshot_with_reasons(
                 state: container,
                 reason: container_reason.into(),
                 fix_command: container_fix,
+                persist_command: None,
                 remedy_text: None,
                 dependency_ids: vec![
                     "container.docker".to_string(),
@@ -242,6 +252,27 @@ pub fn sandbox_capability_unavailable_notice(
     Some((reason, row.and_then(|row| row.fix_command.clone())))
 }
 
+/// Reboot-persistent companion of the fix command reported by
+/// [`sandbox_capability_unavailable_notice`], when the capability row carries
+/// one (or the row's fix is a diagnosed user-namespace sysctl).
+///
+/// `None` when `intent` is Off, the snapshot can honor it, or the row has no
+/// persistable fix.
+pub fn sandbox_capability_persist_command(
+    intent: SandboxMode,
+    caps: &HostCapabilitySnapshot,
+) -> Option<String> {
+    if matches!(intent, SandboxMode::Off) || sandbox_mode_available(intent, caps) {
+        return None;
+    }
+    let row = capability_row_for_mode(intent, caps)?;
+    row.persist_command.clone().or_else(|| {
+        row.fix_command
+            .as_deref()
+            .and_then(crate::tools::shell_sandbox::persist_command_for_fix_command)
+    })
+}
+
 /// User-facing capability reason for a fail-closed session.
 pub fn fail_closed_capability_reason(intent: SandboxMode, caps: &HostCapabilitySnapshot) -> String {
     sandbox_capability_unavailable_notice(intent, caps)
@@ -264,6 +295,7 @@ pub fn evaluate_set_sandbox(
             reason: "refuse is a runtime fail-closed state, not a selectable sandbox mode"
                 .to_string(),
             fix_command: None,
+            persist_command: None,
         });
     };
     if sandbox_mode_available(requested, caps) {
@@ -281,6 +313,7 @@ pub fn evaluate_set_sandbox(
             .map(|row| row.reason.clone())
             .unwrap_or_else(|| format!("{} is unavailable", sandbox_mode_label(requested))),
         fix_command: row.and_then(|row| row.fix_command.clone()),
+        persist_command: sandbox_capability_persist_command(requested, caps),
     })
 }
 
@@ -451,6 +484,43 @@ mod tests {
             notice.0.contains("unpublished"),
             "unpublished snapshot notice: {}",
             notice.0
+        );
+    }
+
+    #[test]
+    fn capability_persist_command_follows_the_host_row() {
+        let fix = crate::tools::shell_sandbox::APPARMOR_USERNS_FIX_COMMAND;
+        let persist = crate::tools::shell_sandbox::APPARMOR_USERNS_PERSIST_COMMAND;
+        let mut caps = sandbox_capability_snapshot_with_reasons(
+            FeatureCapabilityState::Missing,
+            FeatureCapabilityState::Missing,
+            "restricted by AppArmor",
+            "no engine",
+            Some(fix.to_string()),
+            None,
+        );
+        // Derived from a diagnosed fix even when the row predates the field.
+        assert_eq!(
+            sandbox_capability_persist_command(SandboxMode::Sandbox, &caps).as_deref(),
+            Some(persist)
+        );
+        caps.features[0].persist_command = Some("explicit persist".to_string());
+        assert_eq!(
+            sandbox_capability_persist_command(SandboxMode::Sandbox, &caps).as_deref(),
+            Some("explicit persist")
+        );
+        // Nothing to persist for Off or for an available host.
+        assert_eq!(
+            sandbox_capability_persist_command(SandboxMode::Off, &caps),
+            None
+        );
+        let up = sandbox_capability_snapshot(
+            FeatureCapabilityState::Available,
+            FeatureCapabilityState::Missing,
+        );
+        assert_eq!(
+            sandbox_capability_persist_command(SandboxMode::Sandbox, &up),
+            None
         );
     }
 

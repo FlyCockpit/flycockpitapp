@@ -1029,6 +1029,9 @@ impl App {
                         self.resolve_question_dialog(result);
                     }
                 }
+                // A sandbox fallback prompt deferred behind this dialog can
+                // show once it is gone.
+                self.retry_deferred_sandbox_fallback();
             }
             return false;
         }

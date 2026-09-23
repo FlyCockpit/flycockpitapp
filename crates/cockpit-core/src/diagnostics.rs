@@ -51,6 +51,10 @@ pub struct DiagnosticsSnapshot {
     pub project_root: String,
     pub workspace_trust: String,
     pub sandbox: String,
+    /// Live host shell-sandbox availability (probe result, reason, and the
+    /// exact fix / persist / alternative commands when diagnosed). Filled by
+    /// the `doctor` snapshot; empty (and not rendered) elsewhere.
+    pub host_sandbox: Vec<String>,
     pub container_runtime: String,
     pub container_harness: String,
     pub container_available: String,
@@ -198,6 +202,12 @@ pub async fn cli_snapshot(
     .await
     .context("dependency diagnostics worker join")??;
     snapshot.has_failures |= snapshot.dependencies.has_required_failures();
+    // Report what the host can actually do, not just the requested on/off: a
+    // fresh probe (which also refreshes the daemon's shared availability
+    // cache, so `doctor` doubles as a re-check after a host fix).
+    let host_sandbox =
+        crate::tools::shell_sandbox::probe_host_sandbox(Path::new(&snapshot.cwd)).await;
+    snapshot.host_sandbox = host_sandbox_lines(&host_sandbox);
     let providers = crate::config::providers::ConfigDoc::load_effective(Path::new(&snapshot.cwd));
     let (network, network_failed) = provider_network_lines(
         &providers,
@@ -218,6 +228,52 @@ pub async fn cli_snapshot(
     );
     snapshot.daemon = daemon;
     Ok(snapshot)
+}
+
+/// `doctor` lines for the live host shell-sandbox probe: availability, the
+/// reason, and — for a diagnosed host restriction — the exact one-shot fix,
+/// its reboot-persistent form, and the narrower alternative. Always names
+/// the explicit unconfined opt-outs; nothing is switched off automatically.
+pub fn host_sandbox_lines(
+    availability: &crate::tools::shell_sandbox::SandboxAvailability,
+) -> Vec<String> {
+    use crate::tools::shell_sandbox::SandboxAvailability;
+    match availability {
+        SandboxAvailability::Available => {
+            vec!["availability: available (confined shell commands can start)".to_string()]
+        }
+        SandboxAvailability::UnsupportedPlatform { reason } => vec![
+            "availability: unsupported on this platform".to_string(),
+            format!("reason: {reason}"),
+        ],
+        SandboxAvailability::Unavailable {
+            reason,
+            fix_command,
+        } => {
+            let restriction = availability.userns_restriction();
+            let mut lines = vec![
+                "availability: unavailable (bash is refused while the sandbox is on; it never falls back to unconfined on its own)".to_string(),
+                format!("reason: {reason}"),
+            ];
+            if let Some(fix) = fix_command
+                .clone()
+                .or_else(|| restriction.map(|r| r.fix_command().to_string()))
+            {
+                lines.push(format!("fix (until reboot): {fix}"));
+            }
+            if let Some(persist) = availability.persist_command() {
+                lines.push(format!("persist across reboots: {persist}"));
+            }
+            if let Some(alternative) = restriction.and_then(|r| r.alternative()) {
+                lines.push(alternative);
+            }
+            lines.push(
+                "or run unconfined explicitly: `/sandbox off` in the TUI, `--no-sandbox` on the CLI"
+                    .to_string(),
+            );
+            lines
+        }
+    }
 }
 
 pub fn tui_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
@@ -245,6 +301,9 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
     out.push_str(&format!("project root: {}\n", snapshot.project_root));
     out.push_str(&format!("workspace trust: {}\n", snapshot.workspace_trust));
     out.push_str(&format!("sandbox: {}\n", snapshot.sandbox));
+    if !snapshot.host_sandbox.is_empty() {
+        push_section(&mut out, "host sandbox", &snapshot.host_sandbox);
+    }
     push_section(
         &mut out,
         "container",
@@ -352,6 +411,7 @@ fn build_snapshot(
             .sandbox_enabled
             .map(|enabled| if enabled { "on" } else { "off" }.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
+        host_sandbox: Vec::new(),
         container_runtime: container
             .runtime
             .map(|runtime| runtime.as_str().to_string())
@@ -1823,6 +1883,57 @@ mod tests {
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
         crate::config::trust::with_workspace_trust_policy(policy, || tui_snapshot(input).unwrap())
+    }
+
+    #[test]
+    fn host_sandbox_lines_name_fix_persist_alternative_and_opt_out() {
+        use crate::tools::shell_sandbox::{
+            APPARMOR_USERNS_FIX_COMMAND, APPARMOR_USERNS_PERSIST_COMMAND, SandboxAvailability,
+            UsernsRestriction,
+        };
+        let lines = host_sandbox_lines(&SandboxAvailability::Unavailable {
+            reason: UsernsRestriction::AppArmor.reason(),
+            fix_command: Some(APPARMOR_USERNS_FIX_COMMAND.to_string()),
+        });
+        let text = lines.join("\n");
+        assert!(text.contains("availability: unavailable"), "{text}");
+        assert!(text.contains("reason: unprivileged user namespaces are restricted by AppArmor"));
+        assert!(text.contains(&format!(
+            "fix (until reboot): {APPARMOR_USERNS_FIX_COMMAND}"
+        )));
+        assert!(text.contains(&format!(
+            "persist across reboots: {APPARMOR_USERNS_PERSIST_COMMAND}"
+        )));
+        assert!(text.contains("flags=(unconfined) { userns, }"), "{text}");
+        assert!(text.contains("--no-sandbox") && text.contains("/sandbox off"));
+
+        let generic = host_sandbox_lines(&SandboxAvailability::Unavailable {
+            reason: "bwrap: execvp true: No such file or directory".to_string(),
+            fix_command: None,
+        })
+        .join("\n");
+        assert!(!generic.contains("fix (until reboot)"), "{generic}");
+        assert!(!generic.contains("persist across reboots"), "{generic}");
+
+        assert_eq!(
+            host_sandbox_lines(&SandboxAvailability::Available),
+            vec!["availability: available (confined shell commands can start)".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_shows_host_sandbox_section_only_when_probed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snapshot = trusted_snapshot(base_input(tmp.path()));
+        assert!(snapshot.host_sandbox.is_empty());
+        assert!(!render(&snapshot).contains("host sandbox:"));
+
+        snapshot.host_sandbox = vec!["availability: unavailable".to_string()];
+        let rendered = render(&snapshot);
+        assert!(
+            rendered.contains("host sandbox:\n  - availability: unavailable\n"),
+            "{rendered}"
+        );
     }
 
     fn provider_with_header(value: &str) -> ProviderEntry {

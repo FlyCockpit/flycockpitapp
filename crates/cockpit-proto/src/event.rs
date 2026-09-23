@@ -1558,7 +1558,8 @@ pub enum Event {
     /// **once per session** (the worker de-dupes) so attached clients raise a
     /// deterministic, persistent, user-facing indicator. `remedy` is the
     /// diagnosed reason; `fix_command` is the exact user-copyable host command
-    /// when the diagnosis has one. The TUI renders it as a persistent
+    /// when the diagnosis has one, and `persist_command` the matching command
+    /// that keeps the fix across reboots. The TUI renders it as a persistent
     /// below-input notice, cleared when a later `SandboxState { enabled: false }`
     /// arrives. Model-independent and never part of any inference request.
     SandboxUnavailable {
@@ -1566,6 +1567,8 @@ pub enum Event {
         remedy: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fix_command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persist_command: Option<String>,
     },
 
     /// Required command-line capabilities are unavailable for one or more

@@ -6174,16 +6174,25 @@ impl Dialog {
     }
 
     /// Setup wizard presented inside the full-screen onboarding shell (post-onboarding
-    /// `/setup security|model` detours at `Complete`).
+    /// `/setup security|model` detours at `Complete`). `host_capabilities` is
+    /// the live snapshot, so the security wizard offers the host sandbox when
+    /// it works and shows it as unavailable (with the host fix) when it does
+    /// not; an unpublished snapshot stays fail-closed (no host row at all).
     pub fn shell_setup_wizard_engine(
         wizard_id: &str,
         preselected_model: Option<(&str, &str)>,
         status: Option<String>,
+        host_capabilities: &cockpit_proto::HostCapabilitySnapshot,
     ) -> Result<Self, String> {
         let global_root = global_config_dir().map_err(|error| error.to_string())?;
         let descriptor = match wizard_id {
             cockpit_core::wizard::SECURITY_WIZARD_ID | cockpit_core::wizard::MODEL_WIZARD_ID => {
-                cockpit_core::wizard::descriptor_for_cwd(wizard_id, &global_root).or_else(|| {
+                cockpit_core::wizard::descriptor_for_cwd_with_caps(
+                    wizard_id,
+                    &global_root,
+                    Some(host_capabilities),
+                )
+                .or_else(|| {
                     (wizard_id == cockpit_core::wizard::MODEL_WIZARD_ID).then_some(
                         cockpit_core::wizard::model_descriptor_for_cwd(
                             &global_root,

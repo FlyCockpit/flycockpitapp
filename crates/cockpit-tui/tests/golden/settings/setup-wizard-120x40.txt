@@ -15,7 +15,7 @@
                                 Cache│Keep the host shell sandbox unless you specifically need container        │      █
                                 ▾ Tho│isolation or unconfined commands. `off` means commands the model runs are │      █
                                 Map e│unconfined. Container rows are omitted when docker/podman is not          │      █
-                                The o│available. Host sandbox is omitted when the host capability is down.      │      █
+                                The o│available. Host sandbox shows as unavailable (with its fix) when down.    │      █
                                      │                                                                          │      █
                                 ▸ rea│› off  Unconfined: commands the model runs are not sandboxed.             │      █
                                      │                                                                          │      █

@@ -664,13 +664,15 @@ pub enum TurnEvent {
     /// The shell sandbox cannot initialize (a confined `bash` hit the
     /// `SandboxGate::Refuse` path — Linux userns case; `implementation notes`
     /// §6.5). Emitted by [`turn`] on detection, carrying the diagnosed
-    /// `remedy` plus an optional exact host fix command. The worker fires the
+    /// `remedy` plus an optional exact host fix command and its
+    /// reboot-persistent companion. The worker fires the
     /// broadcast once per session (de-dupe); the TUI raises a persistent
     /// below-input notice. **Never** enters the model's context — purely
     /// client-side chrome state, deterministic and model-independent.
     SandboxUnavailable {
         remedy: String,
         fix_command: Option<String>,
+        persist_command: Option<String>,
     },
 
     /// Redaction sources were toggled for the session (`/toggle-redaction`).

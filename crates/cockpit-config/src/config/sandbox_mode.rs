@@ -110,7 +110,9 @@ pub enum SandboxMode {
     ContainerReadonly,
     /// Runtime fail-closed effective state. Not a persistable config intent:
     /// configured sandbox/container with an unavailable host capability maps
-    /// here so bash never silently runs unconfined.
+    /// here so bash never silently runs unconfined. Leaving it for [`Self::Off`]
+    /// always takes an explicit user choice (`/sandbox off`, `--no-sandbox`,
+    /// or the TUI consent dialog's "Run unsandboxed", which is `/sandbox off`).
     Refuse,
 }
 

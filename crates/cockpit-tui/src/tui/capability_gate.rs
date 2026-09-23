@@ -41,16 +41,26 @@ pub const SECRET_STORE_CANCEL_ID: &str = "cancel";
 pub struct CapabilityInstruct {
     pub message: String,
     pub fix_command: Option<String>,
+    /// Reboot-persistent companion of `fix_command` (a `/etc/sysctl.d`
+    /// drop-in for the diagnosed user-namespace restrictions).
+    pub persist_command: Option<String>,
 }
 
 impl CapabilityInstruct {
     pub fn display(&self) -> String {
-        match &self.fix_command {
+        let mut text = match &self.fix_command {
             Some(fix) if !self.message.contains(fix) => {
                 format!("{} Fix: {fix}", self.message)
             }
             _ => self.message.clone(),
+        };
+        if let Some(persist) = &self.persist_command
+            && !text.contains(persist)
+        {
+            text.push_str(" Persist across reboots: ");
+            text.push_str(persist);
         }
+        text
     }
 }
 
@@ -78,6 +88,7 @@ pub fn format_feature_remedy(row: &FeatureCapabilityRow) -> CapabilityInstruct {
     CapabilityInstruct {
         message,
         fix_command: row.fix_command.clone(),
+        persist_command: row.persist_command.clone(),
     }
 }
 
@@ -87,6 +98,7 @@ pub fn sandbox_instruct(mode: SandboxMode, caps: &HostCapabilitySnapshot) -> Cap
             return CapabilityInstruct {
                 message: "sandbox off is always available".into(),
                 fix_command: None,
+                persist_command: None,
             };
         }
         SandboxMode::Refuse => {
@@ -94,6 +106,7 @@ pub fn sandbox_instruct(mode: SandboxMode, caps: &HostCapabilitySnapshot) -> Cap
                 message: "configured sandbox cannot run until the host capability is available"
                     .into(),
                 fix_command: None,
+                persist_command: None,
             };
         }
         SandboxMode::Sandbox => FEATURE_SANDBOX_HOST,
@@ -104,6 +117,7 @@ pub fn sandbox_instruct(mode: SandboxMode, caps: &HostCapabilitySnapshot) -> Cap
         None => CapabilityInstruct {
             message: format!("{id} is unavailable"),
             fix_command: None,
+            persist_command: None,
         },
     }
 }
@@ -118,6 +132,7 @@ pub fn keyring_instruct(caps: &HostCapabilitySnapshot) -> CapabilityInstruct {
                 .fix_command
                 .clone()
                 .or_else(|| Some(cockpit_core::secure_key::DEFAULT_FIX_COMMAND.to_string())),
+            persist_command: None,
         },
     }
 }
@@ -151,6 +166,7 @@ pub fn media_decode_instruct(caps: &HostCapabilitySnapshot) -> CapabilityInstruc
         None => CapabilityInstruct {
             message: "media.ffmpeg / media.ffprobe are not available".into(),
             fix_command: None,
+            persist_command: None,
         },
     }
 }
@@ -382,6 +398,13 @@ pub fn sandbox_intent_effective_banner(
         text.push_str(fix);
         text.push('.');
     }
+    if let Some(persist) = &instruct.persist_command
+        && !text.contains(persist)
+    {
+        text.push_str(" Persist across reboots: ");
+        text.push_str(persist);
+        text.push('.');
+    }
     if effective == SandboxMode::Refuse {
         text.push_str(" Run /sandbox off to allow unconfined execution.");
     } else {
@@ -444,6 +467,7 @@ pub fn with_secret_store(
             state: keyring,
             reason: keyring_reason.to_string(),
             fix_command: keyring_fix.map(str::to_string),
+            persist_command: None,
             remedy_text: None,
             dependency_ids: vec!["security.keyring".to_string()],
         });
@@ -492,6 +516,29 @@ mod fail_closed_banner_tests {
                 .expect("unpublished snapshot Refuse must show a banner");
         assert!(text.contains("unavailable"), "{text}");
         assert!(text.contains("will not run unconfined"), "{text}");
+    }
+
+    #[test]
+    fn banner_and_instruct_carry_the_persist_command() {
+        let fix = cockpit_core::tools::shell_sandbox::APPARMOR_USERNS_FIX_COMMAND;
+        let persist = cockpit_core::tools::shell_sandbox::APPARMOR_USERNS_PERSIST_COMMAND;
+        let mut caps = snapshot_with_sandbox_reasons(
+            FeatureCapabilityState::Missing,
+            FeatureCapabilityState::Missing,
+            "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+)",
+            Some(fix),
+        );
+        caps.features[0].persist_command = Some(persist.to_string());
+        let instruct = sandbox_instruct(SandboxMode::Sandbox, &caps);
+        assert_eq!(instruct.persist_command.as_deref(), Some(persist));
+        let display = instruct.display();
+        assert!(display.contains(fix), "{display}");
+        assert!(display.contains(persist), "{display}");
+        let banner =
+            sandbox_intent_effective_banner(SandboxMode::Sandbox, SandboxMode::Refuse, &caps)
+                .expect("banner");
+        assert!(banner.contains(persist), "{banner}");
+        assert!(banner.contains("/sandbox off"), "{banner}");
     }
 
     #[test]

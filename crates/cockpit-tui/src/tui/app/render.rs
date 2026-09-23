@@ -6669,6 +6669,7 @@ mod render_history_spacing_tests {
         sandbox.sandbox_down_notice = Some(SandboxDownNotice {
             remedy: "enable unprivileged user namespaces".to_string(),
             fix_command: None,
+            persist_command: None,
         });
         assert_eq!(render_banner_top_row(&mut sandbox, WIDTH, HEIGHT), expected);
     }

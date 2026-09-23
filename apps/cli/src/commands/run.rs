@@ -1549,6 +1549,22 @@ fn handle_run_event(
             | proto::Event::CommandCapabilityUnavailable { text, .. } => {
                 let _ = writeln!(stderr, "[notice: {text}]");
             }
+            proto::Event::SandboxUnavailable {
+                remedy,
+                fix_command,
+                persist_command,
+                ..
+            } => {
+                let _ = writeln!(
+                    stderr,
+                    "{}",
+                    sandbox_unavailable_human_line(
+                        remedy,
+                        fix_command.as_deref(),
+                        persist_command.as_deref()
+                    )
+                );
+            }
             proto::Event::SessionEnded { reason, .. } => {
                 let _ = writeln!(stderr, "[session ended: {reason}]");
                 return RunEventAction::Break;
@@ -1574,6 +1590,31 @@ fn handle_run_event(
         return RunEventAction::Break;
     }
     RunEventAction::Continue
+}
+
+/// The explicit, user-owned way to run a headless session unconfined when the
+/// host sandbox cannot start. Never applied automatically.
+const SANDBOX_UNCONFINED_OPT_OUT: &str = "cockpit run --no-sandbox";
+
+/// Human (stderr) rendering of a headless sandbox-unavailable event.
+fn sandbox_unavailable_human_line(
+    remedy: &str,
+    fix_command: Option<&str>,
+    persist_command: Option<&str>,
+) -> String {
+    let mut line = format!("[sandbox unavailable: {remedy}");
+    if let Some(fix) = fix_command
+        && !remedy.contains(fix)
+    {
+        line.push_str(&format!("; fix: {fix}"));
+    }
+    if let Some(persist) = persist_command {
+        line.push_str(&format!("; persist across reboots: {persist}"));
+    }
+    line.push_str(&format!(
+        "; bash stays refused — re-run with `{SANDBOX_UNCONFINED_OPT_OUT}` to run unconfined]"
+    ));
+    line
 }
 
 fn sanitize_terminal_text(input: &str) -> String {
@@ -1960,6 +2001,22 @@ fn normalized_event(session_id: Uuid, event: &proto::Event, verbose: bool) -> Op
             "session_id": session_id,
             "text": text,
             "fix_command": fix_command,
+        }),
+        // Headless runs stay fail-closed: the sandbox is never switched off
+        // for the caller. The event names the diagnosed reason, the exact
+        // host fix (+ its reboot-persistent form), and the explicit opt-out.
+        proto::Event::SandboxUnavailable {
+            remedy,
+            fix_command,
+            persist_command,
+            ..
+        } => json!({
+            "event": "sandbox_unavailable",
+            "session_id": session_id,
+            "reason": remedy,
+            "fix_command": fix_command,
+            "persist_command": persist_command,
+            "unconfined_opt_out": SANDBOX_UNCONFINED_OPT_OUT,
         }),
         other if verbose => {
             json!({ "event": "raw_event", "session_id": session_id, "raw": proto::Envelope::event(other.clone()) })
@@ -2845,6 +2902,88 @@ mod tests {
         assert_eq!(value["session_id"], session_id.to_string());
         assert_eq!(value["raw"]["kind"], "evt");
         assert_eq!(value["raw"]["event"], "notice");
+    }
+
+    #[test]
+    fn json_sandbox_unavailable_is_mapped_not_dropped() {
+        let session_id = Uuid::new_v4();
+        let fix = "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0";
+        let persist = "echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-cockpit-userns.conf";
+        let value = normalized_event(
+            session_id,
+            &proto::Event::SandboxUnavailable {
+                session_id,
+                remedy: "unprivileged user namespaces are restricted by AppArmor".into(),
+                fix_command: Some(fix.into()),
+                persist_command: Some(persist.into()),
+            },
+            false,
+        )
+        .expect("sandbox_unavailable is part of the default JSON stream");
+
+        assert_eq!(value["event"], "sandbox_unavailable");
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(
+            value["reason"],
+            "unprivileged user namespaces are restricted by AppArmor"
+        );
+        assert_eq!(value["fix_command"], fix);
+        assert_eq!(value["persist_command"], persist);
+        assert_eq!(value["unconfined_opt_out"], "cockpit run --no-sandbox");
+        assert!(value.get("raw").is_none());
+    }
+
+    #[test]
+    fn json_sandbox_unavailable_without_diagnosis_keeps_null_commands() {
+        let session_id = Uuid::new_v4();
+        let value = normalized_event(
+            session_id,
+            &proto::Event::SandboxUnavailable {
+                session_id,
+                remedy: "bwrap: execvp true: No such file or directory".into(),
+                fix_command: None,
+                persist_command: None,
+            },
+            false,
+        )
+        .expect("normalized event");
+        assert_eq!(value["event"], "sandbox_unavailable");
+        assert!(value["fix_command"].is_null());
+        assert!(value["persist_command"].is_null());
+    }
+
+    #[test]
+    fn default_handler_surfaces_sandbox_unavailable_on_stderr() {
+        let session_id = Uuid::new_v4();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut outcome = RunOutcome::new(false);
+        let action = handle_run_event(
+            session_id,
+            &proto::Event::SandboxUnavailable {
+                session_id,
+                remedy: "user namespaces are disabled".into(),
+                fix_command: Some("sudo sysctl -w user.max_user_namespaces=15000".into()),
+                persist_command: Some(
+                    "echo 'user.max_user_namespaces=15000' | sudo tee /etc/sysctl.d/60-cockpit-userns.conf"
+                        .into(),
+                ),
+            },
+            OutputFormat::Default,
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+            &mut outcome,
+        );
+
+        assert_eq!(action, RunEventAction::Continue);
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("[sandbox unavailable: user namespaces are disabled"));
+        assert!(stderr.contains("fix: sudo sysctl -w user.max_user_namespaces=15000"));
+        assert!(stderr.contains("persist across reboots: echo 'user.max_user_namespaces=15000'"));
+        assert!(stderr.contains("--no-sandbox"));
     }
 
     #[test]

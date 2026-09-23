@@ -1679,9 +1679,11 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             remedy,
             fix_command,
+            persist_command,
         } => {
             scrub_string(remedy, redact);
             scrub_option_string(fix_command, redact);
+            scrub_option_string(persist_command, redact);
         }
         proto::Event::CommandCapabilityUnavailable {
             session_id: _,
@@ -1753,6 +1755,9 @@ fn scrub_host_capability_snapshot(
         scrub_string(&mut row.reason, redact);
         if let Some(fix) = &mut row.fix_command {
             scrub_string(fix, redact);
+        }
+        if let Some(persist) = &mut row.persist_command {
+            scrub_string(persist, redact);
         }
         if let Some(remedy) = &mut row.remedy_text {
             scrub_string(remedy, redact);

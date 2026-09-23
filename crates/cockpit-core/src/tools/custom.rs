@@ -224,7 +224,7 @@ impl Tool for CustomBashTool {
         let confine = match crate::tools::shell_sandbox::gate_decision_requiring_confinement(
             sandbox_on,
             !denied_knowledge_paths.is_empty() || !write_denied_knowledge_paths.is_empty(),
-            crate::tools::shell_sandbox::sandbox_available(&ctx.cwd).await,
+            &crate::tools::shell_sandbox::sandbox_available(&ctx.cwd).await,
         ) {
             crate::tools::shell_sandbox::SandboxGate::Confine => true,
             crate::tools::shell_sandbox::SandboxGate::Unconfined => false,

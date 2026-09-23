@@ -550,7 +550,7 @@ async fn call_bash_inner(
     //     unconfined; require explicit `/sandbox off` or `--no-sandbox`.
     //   - Sandboxing disabled for this session (`/sandbox off` /
     //     `--no-sandbox`): run unconfined.
-    //   - Otherwise consult the once-per-process environment probe: if the
+    //   - Otherwise consult the cached (refreshable) environment probe: if the
     //     sandbox can't initialize here (user namespaces blocked, WSL1,
     //     bwrap absent), refuse with an actionable `/sandbox off` error
     //     instead of failing into the escalation prompt.
@@ -670,7 +670,7 @@ async fn call_bash_inner(
     }
 
     // Resolve the gating decision. When confinement is on the table we
-    // consult the once-per-process environment probe even if an escalation
+    // consult the cached environment probe even if an escalation
     // grant exists: a grant must not skip the sandbox. If the sandbox cannot
     // initialize here, refuse with an actionable `/sandbox off` error rather
     // than letting every command fail into run-fail-escalate. The probe needs
@@ -692,9 +692,9 @@ async fn call_bash_inner(
         // Sandbox enabled but cannot initialize: record the accurate
         // diagnostic state (enabled, not confined, not run) out-of-band
         // and return a model-facing error (token economy §10). The
-        // message is addressed to the *model*, not a human: the probe is
-        // cached process-lifetime so this verdict is permanent for the
-        // session, and `/sandbox off` is a composer UI command, never a
+        // message is addressed to the *model*, not a human: the verdict holds
+        // until the user fixes the host and re-checks it (`/sandbox on`,
+        // Settings, `cockpit doctor`), and `/sandbox off` is a composer UI command, never a
         // shell command — saying so explicitly stops weaker models from
         // both retrying the dead sandbox and shell-executing `/sandbox
         // off` (the original phrasing read as a shell instruction).
@@ -1805,9 +1805,7 @@ async fn sandbox_availability_for_bash(
     if let Some(availability) = TEST_SANDBOX_AVAILABILITY.with(|slot| slot.borrow().clone()) {
         return availability;
     }
-    crate::tools::shell_sandbox::sandbox_available(cwd)
-        .await
-        .clone()
+    crate::tools::shell_sandbox::sandbox_available(cwd).await
 }
 
 fn availability_notice_reason(

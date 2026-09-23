@@ -1258,6 +1258,7 @@
   "sandbox_unavailable": {
     "data": {
       "fix_command": "fix_command-fixture",
+      "persist_command": "persist_command-fixture",
       "remedy": "remedy-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },

@@ -34,10 +34,12 @@
 //!
 //! Even with `FullAccess`, bwrap still enters fresh user + pid namespaces
 //! (`--unshare-user`/`--unshare-pid`). Where those are blocked entirely
-//! (some containers, WSL1, bwrap absent), sandbox setup still fails — so a
-//! one-shot environment probe ([`sandbox_available`]) detects that case and
-//! lets `bash.rs` refuse confined commands with an actionable error instead
-//! of failing each one into the run-fail-escalate prompt.
+//! (some containers, WSL1, AppArmor/sysctl userns restrictions, bwrap
+//! absent), sandbox setup still fails — so a cached, refreshable environment
+//! probe ([`sandbox_available`]) detects that case and lets `bash.rs` refuse
+//! confined commands with an actionable, diagnosed error (exact host fix plus
+//! its reboot-persistent form) instead of failing each one into the
+//! run-fail-escalate prompt. It never falls back to running unconfined.
 //!
 //! Linux re-entry: zerobox re-execs the current binary as
 //! `zerobox-linux-sandbox`. [`init`] must run once near process start
@@ -647,12 +649,138 @@ pub fn gate_decision_requiring_confinement(
     gate_decision(sandbox_on, availability)
 }
 
-/// Process-lifetime cache for the one-shot environment probe.
-static SANDBOX_AVAILABILITY: tokio::sync::OnceCell<SandboxAvailability> =
-    tokio::sync::OnceCell::const_new();
+impl SandboxAvailability {
+    /// The diagnosed host user-namespace restriction behind an `Unavailable`
+    /// result, when the probe identified one. Derived from the exact fix
+    /// command (or, for older in-memory values, the reason text) so every
+    /// surface maps a diagnosis to the same fix / persist / alternative trio.
+    pub fn userns_restriction(&self) -> Option<UsernsRestriction> {
+        match self {
+            Self::Unavailable {
+                fix_command: Some(fix),
+                ..
+            } => UsernsRestriction::from_fix_command(fix),
+            Self::Unavailable {
+                reason,
+                fix_command: None,
+            } => UsernsRestriction::from_reason(reason),
+            Self::Available | Self::UnsupportedPlatform { .. } => None,
+        }
+    }
 
-/// Probe — once per process — whether the sandbox can initialize in this
-/// environment, caching the result for the session/process lifetime.
+    /// Host command that keeps the `fix_command` effective across reboots,
+    /// when the diagnosis has one (the one-shot `sysctl -w` fix is lost on
+    /// reboot; this writes the matching `/etc/sysctl.d` drop-in).
+    pub fn persist_command(&self) -> Option<&'static str> {
+        self.userns_restriction()
+            .map(UsernsRestriction::persist_command)
+    }
+}
+
+/// Refreshable process-wide cache for the shell-sandbox environment probe.
+///
+/// The probe is comparatively expensive (it spawns the zerobox helper and
+/// bwrap), so its result is shared by every session, the `bash` gate, custom
+/// tools, and background jobs. Unlike a process-lifetime `OnceCell`, the
+/// cached value is replaced whenever a host-capability refresh re-probes
+/// ([`probe_host_sandbox`] records its result) and dropped by
+/// [`invalidate_sandbox_availability`] (for example when the user re-enables
+/// the sandbox), so fixing the host (`sysctl`) takes effect without a daemon
+/// restart.
+///
+/// Concurrent misses are single-flighted through `probe_gate`. Every
+/// `record`/`invalidate` bumps `epoch`; a probe that started before such a
+/// change never overwrites the newer value with its possibly stale result.
+pub struct SandboxAvailabilityCache {
+    state: std::sync::Mutex<SandboxAvailabilityCacheState>,
+    probe_gate: tokio::sync::Mutex<()>,
+}
+
+struct SandboxAvailabilityCacheState {
+    epoch: u64,
+    value: Option<SandboxAvailability>,
+}
+
+impl Default for SandboxAvailabilityCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SandboxAvailabilityCache {
+    pub const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(SandboxAvailabilityCacheState {
+                epoch: 0,
+                value: None,
+            }),
+            probe_gate: tokio::sync::Mutex::const_new(()),
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, SandboxAvailabilityCacheState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The currently cached availability, if any probe result is live.
+    pub fn cached(&self) -> Option<SandboxAvailability> {
+        self.lock_state().value.clone()
+    }
+
+    /// Drop the cached result so the next [`Self::get_or_probe`] re-probes.
+    pub fn invalidate(&self) {
+        let mut state = self.lock_state();
+        state.epoch = state.epoch.wrapping_add(1);
+        state.value = None;
+    }
+
+    /// Replace the cached result with a fresh authoritative probe (a host
+    /// capability boot/refresh probe).
+    pub fn record(&self, availability: SandboxAvailability) {
+        let mut state = self.lock_state();
+        state.epoch = state.epoch.wrapping_add(1);
+        state.value = Some(availability);
+    }
+
+    /// Return the cached availability, probing (single-flight) on a miss.
+    pub async fn get_or_probe<F, Fut>(&self, probe: F) -> SandboxAvailability
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = SandboxAvailability>,
+    {
+        if let Some(value) = self.cached() {
+            return value;
+        }
+        let _gate = self.probe_gate.lock().await;
+        let epoch = {
+            let state = self.lock_state();
+            if let Some(value) = &state.value {
+                return value.clone();
+            }
+            state.epoch
+        };
+        let fresh = probe().await;
+        let mut state = self.lock_state();
+        if state.epoch == epoch {
+            state.value = Some(fresh.clone());
+            fresh
+        } else {
+            // A refresh recorded (or invalidated) while this probe ran. A
+            // recorded value is newer truth; after an invalidation this
+            // probe's result is still returned but not cached.
+            state.value.clone().unwrap_or(fresh)
+        }
+    }
+}
+
+/// Process-wide cache for the environment probe (see
+/// [`SandboxAvailabilityCache`]).
+static SANDBOX_AVAILABILITY: SandboxAvailabilityCache = SandboxAvailabilityCache::new();
+
+/// Whether the sandbox can initialize in this environment, served from the
+/// refreshable process-wide cache and probed on a miss.
 ///
 /// The probe builds a confined `true` in a valid cwd (`probe_cwd`, the
 /// session cwd, falling back to a fresh temp dir) and spawns it. A
@@ -661,17 +789,27 @@ static SANDBOX_AVAILABILITY: tokio::sync::OnceCell<SandboxAvailability> =
 /// unavailable here. The probe's stderr is captured as the reason string
 /// (this avoids brittle stderr matching for the *decision* — the exit code
 /// alone gates — while still surfacing a human-readable cause).
-pub async fn sandbox_available(probe_cwd: &std::path::Path) -> &'static SandboxAvailability {
+pub async fn sandbox_available(probe_cwd: &std::path::Path) -> SandboxAvailability {
     SANDBOX_AVAILABILITY
-        .get_or_init(|| async { probe_sandbox(probe_cwd).await })
+        .get_or_probe(|| probe_sandbox(probe_cwd))
         .await
 }
 
+/// Forget the cached availability so the next [`sandbox_available`] call
+/// re-probes. Called when the user re-enables the sandbox (`/sandbox on`),
+/// so a host fix applied since the last probe is observed.
+pub fn invalidate_sandbox_availability() {
+    SANDBOX_AVAILABILITY.invalidate();
+}
+
 /// Uncached host-sandbox (zerobox) probe. The capability snapshot calls this
-/// on boot and refresh; [`sandbox_available`] keeps a process-lifetime cache
-/// for bash gating.
+/// on boot and refresh; the fresh result also replaces the shared cache that
+/// gates `bash`, custom tools, and background jobs, so a capability refresh
+/// that observes a fixed host immediately un-refuses them.
 pub async fn probe_host_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
-    probe_sandbox(probe_cwd).await
+    let availability = probe_sandbox(probe_cwd).await;
+    SANDBOX_AVAILABILITY.record(availability.clone());
+    availability
 }
 
 /// Run the actual probe (no caching). Split out so the cache wrapper stays
@@ -714,7 +852,7 @@ async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
     {
         Ok(c) => c,
         Err(e) => {
-            return unavailable_from_raw(&e.to_string());
+            return unavailable_from_raw(&e.to_string()).await;
         }
     };
     cmd.stdin(std::process::Stdio::null())
@@ -724,7 +862,7 @@ async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
     let output = match cmd.output().await {
         Ok(o) => o,
         Err(e) => {
-            return unavailable_from_raw(&e.to_string());
+            return unavailable_from_raw(&e.to_string()).await;
         }
     };
 
@@ -732,25 +870,22 @@ async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
         SandboxAvailability::Available
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.trim().is_empty() {
-            SandboxAvailability::Unavailable {
-                reason: "the sandbox helper exited non-zero".to_string(),
-                fix_command: None,
-            }
-        } else {
-            unavailable_from_raw(&stderr)
-        }
+        unavailable_from_raw(&stderr).await
     }
 }
 
 /// Build structured unavailability metadata from a probe failure: prefer the
-/// targeted AppArmor-userns diagnosis (Linux only — see
+/// targeted user-namespace diagnosis (Linux only — see
 /// [`diagnose_userns_restriction`]), falling back to the terse bwrap tail line.
-fn unavailable_from_raw(raw: &str) -> SandboxAvailability {
-    match diagnose_userns_restriction(raw) {
+async fn unavailable_from_raw(raw: &str) -> SandboxAvailability {
+    match diagnose_userns_restriction(raw).await {
         Some(diagnosis) => SandboxAvailability::Unavailable {
             reason: diagnosis.reason,
             fix_command: diagnosis.fix_command,
+        },
+        None if raw.trim().is_empty() => SandboxAvailability::Unavailable {
+            reason: "the sandbox helper exited non-zero".to_string(),
+            fix_command: None,
         },
         None => SandboxAvailability::Unavailable {
             reason: clean_reason(raw),
@@ -763,11 +898,14 @@ fn unavailable_from_raw(raw: &str) -> SandboxAvailability {
 /// sandbox-unavailable reason. This keeps older in-memory reasons usable while
 /// the wire event carries the command as structured data for new clients.
 pub fn fix_command_for_reason(reason: &str) -> Option<String> {
-    if reason.contains(APPARMOR_USERNS_FIX_COMMAND) {
-        Some(APPARMOR_USERNS_FIX_COMMAND.to_string())
-    } else {
-        None
-    }
+    UsernsRestriction::from_reason(reason).map(|restriction| restriction.fix_command().to_string())
+}
+
+/// The reboot-persistent companion of a diagnosed one-shot `fix_command`
+/// (`None` for any command cockpit did not itself diagnose).
+pub fn persist_command_for_fix_command(fix_command: &str) -> Option<String> {
+    UsernsRestriction::from_fix_command(fix_command)
+        .map(|restriction| restriction.persist_command().to_string())
 }
 
 /// `/proc` knob (Ubuntu 23.10+/24.04 default) that, when `1`, lets a process
@@ -776,9 +914,136 @@ pub fn fix_command_for_reason(reason: &str) -> Option<String> {
 /// `userns` — which the distro `bwrap` does not, so map setup EPERMs.
 #[cfg(target_os = "linux")]
 const APPARMOR_USERNS_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+/// Debian/older-Ubuntu knob: `0` forbids unprivileged `CLONE_NEWUSER`.
+#[cfg(target_os = "linux")]
+const USERNS_CLONE_SYSCTL: &str = "/proc/sys/kernel/unprivileged_userns_clone";
+/// Generic knob: `0` forbids creating any user namespace.
+#[cfg(target_os = "linux")]
+const MAX_USER_NAMESPACES_SYSCTL: &str = "/proc/sys/user/max_user_namespaces";
 
 pub const APPARMOR_USERNS_FIX_COMMAND: &str =
     "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0";
+pub const APPARMOR_USERNS_PERSIST_COMMAND: &str = "echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-cockpit-userns.conf";
+pub const USERNS_CLONE_FIX_COMMAND: &str = "sudo sysctl -w kernel.unprivileged_userns_clone=1";
+pub const USERNS_CLONE_PERSIST_COMMAND: &str =
+    "echo 'kernel.unprivileged_userns_clone=1' | sudo tee /etc/sysctl.d/60-cockpit-userns.conf";
+pub const MAX_USER_NAMESPACES_FIX_COMMAND: &str = "sudo sysctl -w user.max_user_namespaces=15000";
+pub const MAX_USER_NAMESPACES_PERSIST_COMMAND: &str =
+    "echo 'user.max_user_namespaces=15000' | sudo tee /etc/sysctl.d/60-cockpit-userns.conf";
+
+/// A diagnosed host policy that stops bwrap from entering its user
+/// namespace. Each variant owns its exact one-shot fix, its reboot-persistent
+/// companion, and (where one exists) a narrower alternative. cockpit only
+/// *diagnoses*: it never runs these commands or touches AppArmor itself
+/// (host-security mutation is the user's call, not the harness's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsernsRestriction {
+    /// `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu 23.10+).
+    AppArmor,
+    /// `kernel.unprivileged_userns_clone=0` (Debian / older Ubuntu).
+    UnprivilegedUsernsClone,
+    /// `user.max_user_namespaces=0`.
+    MaxUserNamespaces,
+}
+
+impl UsernsRestriction {
+    pub const ALL: [Self; 3] = [
+        Self::AppArmor,
+        Self::UnprivilegedUsernsClone,
+        Self::MaxUserNamespaces,
+    ];
+
+    /// One-shot host command that lifts the restriction until reboot.
+    pub const fn fix_command(self) -> &'static str {
+        match self {
+            Self::AppArmor => APPARMOR_USERNS_FIX_COMMAND,
+            Self::UnprivilegedUsernsClone => USERNS_CLONE_FIX_COMMAND,
+            Self::MaxUserNamespaces => MAX_USER_NAMESPACES_FIX_COMMAND,
+        }
+    }
+
+    /// Host command that keeps [`Self::fix_command`] across reboots.
+    pub const fn persist_command(self) -> &'static str {
+        match self {
+            Self::AppArmor => APPARMOR_USERNS_PERSIST_COMMAND,
+            Self::UnprivilegedUsernsClone => USERNS_CLONE_PERSIST_COMMAND,
+            Self::MaxUserNamespaces => MAX_USER_NAMESPACES_PERSIST_COMMAND,
+        }
+    }
+
+    /// Map an exact (diagnosed) fix command back to its restriction.
+    pub fn from_fix_command(command: &str) -> Option<Self> {
+        let command = command.trim();
+        Self::ALL
+            .into_iter()
+            .find(|restriction| restriction.fix_command() == command)
+    }
+
+    /// Map a diagnosed reason (which always embeds the fix command) back to
+    /// its restriction.
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|restriction| reason.contains(restriction.fix_command()))
+    }
+
+    /// Terse, model- and user-facing reason naming the policy and the fix.
+    pub fn reason(self) -> String {
+        match self {
+            Self::AppArmor => format!(
+                "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); `{}` re-enables confinement",
+                APPARMOR_USERNS_FIX_COMMAND
+            ),
+            Self::UnprivilegedUsernsClone => format!(
+                "unprivileged user namespaces are disabled (kernel.unprivileged_userns_clone=0); `{}` re-enables confinement",
+                USERNS_CLONE_FIX_COMMAND
+            ),
+            Self::MaxUserNamespaces => format!(
+                "user namespaces are disabled (user.max_user_namespaces=0); `{}` re-enables confinement",
+                MAX_USER_NAMESPACES_FIX_COMMAND
+            ),
+        }
+    }
+
+    /// A narrower remedy than the host-wide sysctl, when one exists. For the
+    /// AppArmor restriction that is a profile granting `userns` to the bwrap
+    /// binary zerobox actually launches — never to cockpit itself.
+    pub fn alternative(self) -> Option<String> {
+        match self {
+            Self::AppArmor => Some(apparmor_bwrap_profile_hint(&bwrap_path_for_hint())),
+            Self::UnprivilegedUsernsClone | Self::MaxUserNamespaces => None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn diagnosis(self) -> SandboxDiagnosis {
+        SandboxDiagnosis {
+            reason: self.reason(),
+            fix_command: Some(self.fix_command().to_string()),
+        }
+    }
+}
+
+/// The narrower AppArmor remedy text for the bwrap binary at `bwrap`.
+pub fn apparmor_bwrap_profile_hint(bwrap: &str) -> String {
+    format!(
+        "Narrower alternative: keep the restriction and grant user namespaces only to bwrap with an AppArmor profile, e.g. /etc/apparmor.d/bwrap containing `abi <abi/4.0>, profile bwrap {bwrap} flags=(unconfined) {{ userns, }}`, then run `sudo apparmor_parser -r /etc/apparmor.d/bwrap`."
+    )
+}
+
+/// The bwrap binary zerobox prefers: the first `bwrap` on `PATH`
+/// (canonicalized), else the distro default path.
+fn bwrap_path_for_hint() -> String {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("bwrap"))
+                .find(|candidate| candidate.is_file())
+        })
+        .map(|found| std::fs::canonicalize(&found).unwrap_or(found))
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "/usr/bin/bwrap".to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SandboxDiagnosis {
@@ -786,52 +1051,339 @@ struct SandboxDiagnosis {
     fix_command: Option<String>,
 }
 
-/// Linux only: when a probe failure is the kernel refusing to write the
-/// user-namespace uid/gid map *and* AppArmor's unprivileged-userns
-/// restriction is engaged, replace the opaque `bwrap: setting up uid map:
-/// Permission denied` tail with an actionable reason that names the policy
-/// and the one-shot sysctl that lifts it. `None` (caller keeps the generic
-/// reason) when the signature or the sysctl doesn't match. cockpit only
-/// *diagnoses* here — it never runs the sysctl or touches AppArmor itself
-/// (host-security mutation is the user's call, not the harness's).
+/// Linux only: diagnose *why* the sandbox cannot enter its user namespace.
+///
+/// The primary signal is stderr-independent: a forked child performs the
+/// exact kernel steps bwrap needs (`unshare(CLONE_NEWUSER)`, deny
+/// `setgroups`, write `uid_map`) and reports which step failed with which
+/// errno, classified against the userns sysctls
+/// ([`classify_userns_restriction`]). bwrap's stderr (`setting up uid map:
+/// Permission denied`, …) is kept as a secondary signal for hosts where the
+/// restriction applies to bwrap but not to cockpit's own probe. `None`
+/// (caller keeps the generic reason) when neither identifies a restriction.
 #[cfg(target_os = "linux")]
-fn diagnose_userns_restriction(raw: &str) -> Option<SandboxDiagnosis> {
-    let restricted = std::fs::read_to_string(APPARMOR_USERNS_SYSCTL)
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false);
-    userns_restriction_reason(raw, restricted)
+async fn diagnose_userns_restriction(raw: &str) -> Option<SandboxDiagnosis> {
+    let sysctls = UsernsSysctls::read();
+    let probe = probe_userns().await;
+    classify_userns_restriction(probe, sysctls)
+        .or_else(|| stderr_userns_restriction(raw, sysctls))
+        .map(UsernsRestriction::diagnosis)
 }
 
 /// No AppArmor / `/proc` on macOS or Windows — the probe keeps its generic
 /// reason there, byte-for-byte unchanged.
 #[cfg(not(target_os = "linux"))]
-fn diagnose_userns_restriction(_raw: &str) -> Option<SandboxDiagnosis> {
+async fn diagnose_userns_restriction(_raw: &str) -> Option<SandboxDiagnosis> {
     None
 }
 
-/// Pure core of the AppArmor-userns diagnosis, split out so the signature
-/// match is unit-testable without reading `/proc`: given the probe-failure
-/// text and whether the AppArmor sysctl is engaged, return the actionable
-/// reason when the failure is the uid/gid-map permission denial under that
-/// policy.
-#[cfg(target_os = "linux")]
+/// Pure core of the stderr-based AppArmor-userns diagnosis, split out so the
+/// signature match is unit-testable without reading `/proc`: given the
+/// probe-failure text and whether the AppArmor sysctl is engaged, return the
+/// actionable reason when the failure is the uid/gid-map permission denial
+/// under that policy.
+#[cfg(all(test, target_os = "linux"))]
 fn userns_restriction_reason(raw: &str, apparmor_restricted: bool) -> Option<SandboxDiagnosis> {
-    if !apparmor_restricted {
+    if !apparmor_restricted || !stderr_reports_map_denial(raw) {
         return None;
+    }
+    Some(UsernsRestriction::AppArmor.diagnosis())
+}
+
+#[cfg(target_os = "linux")]
+fn stderr_reports_map_denial(raw: &str) -> bool {
+    let lc = raw.to_ascii_lowercase();
+    (lc.contains("uid map") || lc.contains("gid map")) && lc.contains("permission denied")
+}
+
+/// Secondary (stderr) signal: bwrap's own wording, classified against the
+/// same sysctl readings as the primary probe.
+#[cfg(target_os = "linux")]
+fn stderr_userns_restriction(raw: &str, sysctls: UsernsSysctls) -> Option<UsernsRestriction> {
+    if sysctls.apparmor_restricted() && stderr_reports_map_denial(raw) {
+        return Some(UsernsRestriction::AppArmor);
     }
     let lc = raw.to_ascii_lowercase();
-    let uid_map_denied =
-        (lc.contains("uid map") || lc.contains("gid map")) && lc.contains("permission denied");
-    if !uid_map_denied {
+    let namespace_denied = lc.contains("namespace")
+        && (lc.contains("operation not permitted")
+            || lc.contains("no permission")
+            || lc.contains("no space left")
+            || lc.contains("permission denied"));
+    if !namespace_denied {
         return None;
     }
-    Some(SandboxDiagnosis {
-        reason: format!(
-            "unprivileged user namespaces are restricted by AppArmor (Ubuntu 23.10+); `{}` re-enables confinement",
-            APPARMOR_USERNS_FIX_COMMAND
-        ),
-        fix_command: Some(APPARMOR_USERNS_FIX_COMMAND.to_string()),
-    })
+    sysctls.disabled_restriction()
+}
+
+/// Which kernel step of the userns probe failed.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsernsProbeStage {
+    Unshare,
+    Setgroups,
+    UidMap,
+}
+
+/// The errno classes the classifier distinguishes (everything else is
+/// `Other`). Kept as a closed set so the child can report it in its exit
+/// status without allocating.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsernsProbeErrno {
+    Eperm,
+    Eacces,
+    Enospc,
+    Eusers,
+    Einval,
+    Other,
+}
+
+/// Outcome of the forked userns probe.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsernsProbeResult {
+    /// All three steps succeeded: user namespaces work for this process.
+    Created,
+    Failed {
+        stage: UsernsProbeStage,
+        errno: UsernsProbeErrno,
+    },
+    /// The probe itself could not run or reported something unexpected.
+    Inconclusive,
+}
+
+/// Userns-related sysctl readings (`None` when the knob does not exist on
+/// this kernel or cannot be read).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct UsernsSysctls {
+    apparmor_restrict_unprivileged_userns: Option<u64>,
+    unprivileged_userns_clone: Option<u64>,
+    max_user_namespaces: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl UsernsSysctls {
+    fn read() -> Self {
+        fn read_u64(path: &str) -> Option<u64> {
+            std::fs::read_to_string(path).ok()?.trim().parse().ok()
+        }
+        Self {
+            apparmor_restrict_unprivileged_userns: read_u64(APPARMOR_USERNS_SYSCTL),
+            unprivileged_userns_clone: read_u64(USERNS_CLONE_SYSCTL),
+            max_user_namespaces: read_u64(MAX_USER_NAMESPACES_SYSCTL),
+        }
+    }
+
+    fn apparmor_restricted(self) -> bool {
+        self.apparmor_restrict_unprivileged_userns == Some(1)
+    }
+
+    /// A knob that forbids creating the namespace outright.
+    fn disabled_restriction(self) -> Option<UsernsRestriction> {
+        if self.unprivileged_userns_clone == Some(0) {
+            Some(UsernsRestriction::UnprivilegedUsernsClone)
+        } else if self.max_user_namespaces == Some(0) {
+            Some(UsernsRestriction::MaxUserNamespaces)
+        } else {
+            None
+        }
+    }
+}
+
+/// Pure classifier over the forked probe result and the sysctl readings.
+///
+/// - `unshare` refused (EPERM/EACCES/ENOSPC/EUSERS) → whichever knob forbids
+///   namespace creation (`unprivileged_userns_clone=0`, then
+///   `max_user_namespaces=0`); with neither, an engaged AppArmor restriction
+///   explains an EPERM/EACCES.
+/// - `setgroups`/`uid_map` write refused (EPERM/EACCES) with the AppArmor
+///   sysctl engaged → the AppArmor restriction (the namespace is created but
+///   stripped of the capabilities needed to map ids).
+/// - Anything else (namespace works, unrelated errno, inconclusive) → `None`.
+#[cfg(target_os = "linux")]
+fn classify_userns_restriction(
+    probe: UsernsProbeResult,
+    sysctls: UsernsSysctls,
+) -> Option<UsernsRestriction> {
+    match probe {
+        UsernsProbeResult::Failed {
+            stage: UsernsProbeStage::Unshare,
+            errno,
+        } => {
+            if !matches!(
+                errno,
+                UsernsProbeErrno::Eperm
+                    | UsernsProbeErrno::Eacces
+                    | UsernsProbeErrno::Enospc
+                    | UsernsProbeErrno::Eusers
+            ) {
+                return None;
+            }
+            sysctls.disabled_restriction().or_else(|| {
+                (sysctls.apparmor_restricted()
+                    && matches!(errno, UsernsProbeErrno::Eperm | UsernsProbeErrno::Eacces))
+                .then_some(UsernsRestriction::AppArmor)
+            })
+        }
+        UsernsProbeResult::Failed {
+            stage: UsernsProbeStage::Setgroups | UsernsProbeStage::UidMap,
+            errno: UsernsProbeErrno::Eperm | UsernsProbeErrno::Eacces,
+        } if sysctls.apparmor_restricted() => Some(UsernsRestriction::AppArmor),
+        UsernsProbeResult::Created
+        | UsernsProbeResult::Failed { .. }
+        | UsernsProbeResult::Inconclusive => None,
+    }
+}
+
+/// Exit-status encoding for the forked probe: `0` = namespace created and
+/// mapped; `100 + stage * 10 + errno` = the step that failed.
+#[cfg(target_os = "linux")]
+const USERNS_PROBE_EXIT_BASE: i32 = 100;
+
+#[cfg(target_os = "linux")]
+const fn userns_probe_stage_code(stage: UsernsProbeStage) -> i32 {
+    match stage {
+        UsernsProbeStage::Unshare => 1,
+        UsernsProbeStage::Setgroups => 2,
+        UsernsProbeStage::UidMap => 3,
+    }
+}
+
+/// Raw errno → closed errno class code. Pure integer matching, so it is
+/// async-signal-safe inside the forked child.
+#[cfg(target_os = "linux")]
+const fn userns_probe_errno_code(raw: i32) -> i32 {
+    match raw {
+        libc::EPERM => 1,
+        libc::EACCES => 2,
+        libc::ENOSPC => 3,
+        libc::EUSERS => 4,
+        libc::EINVAL => 5,
+        _ => 9,
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn userns_probe_exit_code(stage: UsernsProbeStage, raw_errno: i32) -> i32 {
+    USERNS_PROBE_EXIT_BASE
+        + userns_probe_stage_code(stage) * 10
+        + userns_probe_errno_code(raw_errno)
+}
+
+/// Decode the child's exit code (`None` = killed by a signal).
+#[cfg(target_os = "linux")]
+fn decode_userns_probe_exit(code: Option<i32>) -> UsernsProbeResult {
+    let Some(code) = code else {
+        return UsernsProbeResult::Inconclusive;
+    };
+    if code == 0 {
+        return UsernsProbeResult::Created;
+    }
+    let offset = code - USERNS_PROBE_EXIT_BASE;
+    if !(10..40).contains(&offset) {
+        return UsernsProbeResult::Inconclusive;
+    }
+    let stage = match offset / 10 {
+        1 => UsernsProbeStage::Unshare,
+        2 => UsernsProbeStage::Setgroups,
+        3 => UsernsProbeStage::UidMap,
+        _ => return UsernsProbeResult::Inconclusive,
+    };
+    let errno = match offset % 10 {
+        1 => UsernsProbeErrno::Eperm,
+        2 => UsernsProbeErrno::Eacces,
+        3 => UsernsProbeErrno::Enospc,
+        4 => UsernsProbeErrno::Eusers,
+        5 => UsernsProbeErrno::Einval,
+        9 => UsernsProbeErrno::Other,
+        _ => return UsernsProbeResult::Inconclusive,
+    };
+    UsernsProbeResult::Failed { stage, errno }
+}
+
+/// Fork a child that performs bwrap's user-namespace steps and exits with the
+/// encoded outcome. The child never execs: it `_exit`s from `pre_exec`, so
+/// the `true` program name is never resolved or run.
+#[cfg(target_os = "linux")]
+async fn probe_userns() -> UsernsProbeResult {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let uid_map = format!("0 {uid} 1").into_bytes();
+    let mut command = tokio::process::Command::new("true");
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // SAFETY: the closure runs in the forked child before exec and performs
+    // only async-signal-safe syscalls (unshare/open/write/close/_exit) over
+    // memory captured before the fork; it never allocates or takes a lock.
+    unsafe {
+        command.pre_exec(move || -> std::io::Result<()> { userns_probe_child(&uid_map) });
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), command.status()).await {
+        Ok(Ok(status)) => decode_userns_probe_exit(status.code()),
+        Ok(Err(_)) | Err(_) => UsernsProbeResult::Inconclusive,
+    }
+}
+
+/// Child half of [`probe_userns`]. Never returns.
+#[cfg(target_os = "linux")]
+fn userns_probe_child(uid_map: &[u8]) -> ! {
+    // SAFETY: called only in the single-threaded forked child; every call is
+    // an async-signal-safe syscall and `_exit` skips all user-space cleanup.
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+            libc::_exit(userns_probe_exit_code(
+                UsernsProbeStage::Unshare,
+                last_errno(),
+            ));
+        }
+        // `setgroups` must be denied before an unprivileged gid map; kernels
+        // older than 3.19 lack the file, which is not a restriction.
+        if let Err(errno) = write_proc_self(c"/proc/self/setgroups", b"deny")
+            && errno != libc::ENOENT
+        {
+            libc::_exit(userns_probe_exit_code(UsernsProbeStage::Setgroups, errno));
+        }
+        if let Err(errno) = write_proc_self(c"/proc/self/uid_map", uid_map) {
+            libc::_exit(userns_probe_exit_code(UsernsProbeStage::UidMap, errno));
+        }
+        libc::_exit(0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// Write `contents` to a `/proc/self` file with raw syscalls, returning the
+/// errno of the failing step.
+///
+/// # Safety
+/// Must only be used where raw `open`/`write`/`close` are sound (it is
+/// called from the forked probe child).
+#[cfg(target_os = "linux")]
+unsafe fn write_proc_self(path: &std::ffi::CStr, contents: &[u8]) -> Result<(), i32> {
+    // SAFETY: `path` is a valid NUL-terminated string.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: `fd` is open and `contents` is a valid readable buffer.
+    let written = unsafe { libc::write(fd, contents.as_ptr().cast(), contents.len()) };
+    let result = if written < 0 {
+        Err(last_errno())
+    } else if written as usize != contents.len() {
+        Err(libc::EIO)
+    } else {
+        Ok(())
+    };
+    // SAFETY: `fd` was opened above and is closed exactly once.
+    unsafe { libc::close(fd) };
+    result
 }
 
 /// Condense a multi-line probe failure into a single terse reason fragment
@@ -1031,11 +1583,423 @@ mod tests {
     /// is never raised on those platforms (the `Refuse` path only fires when
     /// the probe actually reports the sandbox unavailable).
     #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn userns_diagnosis_is_noop_off_linux() {
+    #[tokio::test]
+    async fn userns_diagnosis_is_noop_off_linux() {
         assert_eq!(
-            diagnose_userns_restriction("bwrap: setting up uid map: Permission denied"),
+            diagnose_userns_restriction("bwrap: setting up uid map: Permission denied").await,
             None
+        );
+    }
+
+    // ---- stderr-independent userns classifier (Linux only) ---------------
+
+    #[cfg(target_os = "linux")]
+    fn sysctls(apparmor: Option<u64>, clone: Option<u64>, max: Option<u64>) -> UsernsSysctls {
+        UsernsSysctls {
+            apparmor_restrict_unprivileged_userns: apparmor,
+            unprivileged_userns_clone: clone,
+            max_user_namespaces: max,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn failed(stage: UsernsProbeStage, errno: UsernsProbeErrno) -> UsernsProbeResult {
+        UsernsProbeResult::Failed { stage, errno }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classifier_uid_map_eperm_under_apparmor_is_apparmor_restriction() {
+        for stage in [UsernsProbeStage::UidMap, UsernsProbeStage::Setgroups] {
+            for errno in [UsernsProbeErrno::Eperm, UsernsProbeErrno::Eacces] {
+                assert_eq!(
+                    classify_userns_restriction(
+                        failed(stage, errno),
+                        sysctls(Some(1), None, Some(15000))
+                    ),
+                    Some(UsernsRestriction::AppArmor),
+                    "{stage:?}/{errno:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classifier_uid_map_eperm_without_apparmor_is_not_diagnosed() {
+        assert_eq!(
+            classify_userns_restriction(
+                failed(UsernsProbeStage::UidMap, UsernsProbeErrno::Eperm),
+                sysctls(Some(0), None, Some(15000))
+            ),
+            None
+        );
+        assert_eq!(
+            classify_userns_restriction(
+                failed(UsernsProbeStage::UidMap, UsernsProbeErrno::Eperm),
+                sysctls(None, None, None)
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classifier_unshare_refused_names_the_disabling_knob() {
+        for errno in [
+            UsernsProbeErrno::Eperm,
+            UsernsProbeErrno::Eacces,
+            UsernsProbeErrno::Enospc,
+            UsernsProbeErrno::Eusers,
+        ] {
+            assert_eq!(
+                classify_userns_restriction(
+                    failed(UsernsProbeStage::Unshare, errno),
+                    sysctls(None, Some(0), Some(15000))
+                ),
+                Some(UsernsRestriction::UnprivilegedUsernsClone),
+                "{errno:?}"
+            );
+            assert_eq!(
+                classify_userns_restriction(
+                    failed(UsernsProbeStage::Unshare, errno),
+                    sysctls(None, Some(1), Some(0))
+                ),
+                Some(UsernsRestriction::MaxUserNamespaces),
+                "{errno:?}"
+            );
+        }
+        // Both knobs off: the clone knob is named first (it is checked first
+        // by the kernel for unprivileged callers).
+        assert_eq!(
+            classify_userns_restriction(
+                failed(UsernsProbeStage::Unshare, UsernsProbeErrno::Enospc),
+                sysctls(None, Some(0), Some(0))
+            ),
+            Some(UsernsRestriction::UnprivilegedUsernsClone)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classifier_unshare_eperm_with_only_apparmor_is_apparmor() {
+        assert_eq!(
+            classify_userns_restriction(
+                failed(UsernsProbeStage::Unshare, UsernsProbeErrno::Eperm),
+                sysctls(Some(1), None, Some(15000))
+            ),
+            Some(UsernsRestriction::AppArmor)
+        );
+        // ENOSPC is a namespace-count limit, not an AppArmor denial.
+        assert_eq!(
+            classify_userns_restriction(
+                failed(UsernsProbeStage::Unshare, UsernsProbeErrno::Enospc),
+                sysctls(Some(1), None, Some(15000))
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classifier_is_silent_when_userns_works_or_probe_inconclusive() {
+        let restricted = sysctls(Some(1), Some(0), Some(0));
+        assert_eq!(
+            classify_userns_restriction(UsernsProbeResult::Created, restricted),
+            None
+        );
+        assert_eq!(
+            classify_userns_restriction(UsernsProbeResult::Inconclusive, restricted),
+            None
+        );
+        assert_eq!(
+            classify_userns_restriction(
+                failed(UsernsProbeStage::Unshare, UsernsProbeErrno::Einval),
+                restricted
+            ),
+            None
+        );
+        assert_eq!(
+            classify_userns_restriction(
+                failed(UsernsProbeStage::UidMap, UsernsProbeErrno::Other),
+                restricted
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_exit_codes_round_trip() {
+        for (stage, raw, errno) in [
+            (
+                UsernsProbeStage::Unshare,
+                libc::EPERM,
+                UsernsProbeErrno::Eperm,
+            ),
+            (
+                UsernsProbeStage::Unshare,
+                libc::ENOSPC,
+                UsernsProbeErrno::Enospc,
+            ),
+            (
+                UsernsProbeStage::Unshare,
+                libc::EUSERS,
+                UsernsProbeErrno::Eusers,
+            ),
+            (
+                UsernsProbeStage::Setgroups,
+                libc::EACCES,
+                UsernsProbeErrno::Eacces,
+            ),
+            (
+                UsernsProbeStage::UidMap,
+                libc::EPERM,
+                UsernsProbeErrno::Eperm,
+            ),
+            (
+                UsernsProbeStage::UidMap,
+                libc::EINVAL,
+                UsernsProbeErrno::Einval,
+            ),
+            (UsernsProbeStage::UidMap, libc::EIO, UsernsProbeErrno::Other),
+        ] {
+            let code = userns_probe_exit_code(stage, raw);
+            assert!((0..=255).contains(&code), "exit code fits a status byte");
+            assert_eq!(
+                decode_userns_probe_exit(Some(code)),
+                UsernsProbeResult::Failed { stage, errno }
+            );
+        }
+        assert_eq!(
+            decode_userns_probe_exit(Some(0)),
+            UsernsProbeResult::Created
+        );
+        assert_eq!(
+            decode_userns_probe_exit(None),
+            UsernsProbeResult::Inconclusive
+        );
+        assert_eq!(
+            decode_userns_probe_exit(Some(1)),
+            UsernsProbeResult::Inconclusive
+        );
+        assert_eq!(
+            decode_userns_probe_exit(Some(127)),
+            UsernsProbeResult::Inconclusive
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stderr_signal_is_secondary_and_uses_the_same_sysctls() {
+        let apparmor = sysctls(Some(1), None, Some(15000));
+        assert_eq!(
+            stderr_userns_restriction("bwrap: setting up uid map: Permission denied", apparmor),
+            Some(UsernsRestriction::AppArmor)
+        );
+        assert_eq!(
+            stderr_userns_restriction(
+                "bwrap: No permission to create new namespace, likely because the kernel does not allow non-privileged user namespaces",
+                sysctls(None, Some(0), None)
+            ),
+            Some(UsernsRestriction::UnprivilegedUsernsClone)
+        );
+        assert_eq!(
+            stderr_userns_restriction(
+                "bwrap: Creating new namespace failed: No space left on device",
+                sysctls(None, None, Some(0))
+            ),
+            Some(UsernsRestriction::MaxUserNamespaces)
+        );
+        assert_eq!(
+            stderr_userns_restriction(
+                "bwrap: execvp true: No such file or directory",
+                sysctls(Some(1), Some(0), Some(0))
+            ),
+            None
+        );
+    }
+
+    /// Live smoke check of the forked probe: whatever this host allows, the
+    /// probe must terminate with a decodable result and never hang or panic.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn userns_probe_terminates_with_a_decodable_result() {
+        let result = probe_userns().await;
+        assert!(matches!(
+            result,
+            UsernsProbeResult::Created
+                | UsernsProbeResult::Failed { .. }
+                | UsernsProbeResult::Inconclusive
+        ));
+    }
+
+    // ---- remedy mapping ----------------------------------------------------
+
+    #[test]
+    fn every_restriction_has_a_matching_fix_and_persist_command() {
+        for restriction in UsernsRestriction::ALL {
+            let fix = restriction.fix_command();
+            assert_eq!(UsernsRestriction::from_fix_command(fix), Some(restriction));
+            assert_eq!(
+                UsernsRestriction::from_reason(&restriction.reason()),
+                Some(restriction)
+            );
+            assert_eq!(
+                persist_command_for_fix_command(fix).as_deref(),
+                Some(restriction.persist_command())
+            );
+            assert_eq!(
+                fix_command_for_reason(&restriction.reason()).as_deref(),
+                Some(fix)
+            );
+            // The persisted drop-in sets the same key=value as the one-shot fix.
+            let setting = fix.trim_start_matches("sudo sysctl -w ");
+            assert!(
+                restriction
+                    .persist_command()
+                    .contains(&format!("'{setting}'")),
+                "{restriction:?}: {}",
+                restriction.persist_command()
+            );
+            assert!(
+                restriction
+                    .persist_command()
+                    .contains("/etc/sysctl.d/60-cockpit-userns.conf")
+            );
+        }
+        assert_eq!(
+            persist_command_for_fix_command("sudo apt-get install demo"),
+            None
+        );
+    }
+
+    #[test]
+    fn availability_exposes_persist_command_only_for_diagnosed_restrictions() {
+        let diagnosed = SandboxAvailability::Unavailable {
+            reason: UsernsRestriction::AppArmor.reason(),
+            fix_command: Some(APPARMOR_USERNS_FIX_COMMAND.to_string()),
+        };
+        assert_eq!(
+            diagnosed.persist_command(),
+            Some(APPARMOR_USERNS_PERSIST_COMMAND)
+        );
+        let legacy = SandboxAvailability::Unavailable {
+            reason: UsernsRestriction::MaxUserNamespaces.reason(),
+            fix_command: None,
+        };
+        assert_eq!(
+            legacy.persist_command(),
+            Some(MAX_USER_NAMESPACES_PERSIST_COMMAND)
+        );
+        let generic = SandboxAvailability::Unavailable {
+            reason: "bwrap: execvp true: No such file or directory".to_string(),
+            fix_command: None,
+        };
+        assert_eq!(generic.persist_command(), None);
+        assert_eq!(SandboxAvailability::Available.persist_command(), None);
+    }
+
+    #[test]
+    fn apparmor_alternative_targets_bwrap_not_cockpit() {
+        let hint = apparmor_bwrap_profile_hint("/usr/bin/bwrap");
+        assert!(hint.contains("profile bwrap /usr/bin/bwrap flags=(unconfined) { userns, }"));
+        assert!(!hint.contains("cockpit"), "{hint}");
+        assert!(UsernsRestriction::AppArmor.alternative().is_some());
+        assert!(
+            UsernsRestriction::UnprivilegedUsernsClone
+                .alternative()
+                .is_none()
+        );
+    }
+
+    // ---- refreshable availability cache -----------------------------------
+
+    fn unavailable(reason: &str) -> SandboxAvailability {
+        SandboxAvailability::Unavailable {
+            reason: reason.to_string(),
+            fix_command: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_probes_once_until_invalidated() {
+        let cache = SandboxAvailabilityCache::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let calls = &calls;
+        let probe = move || async move {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            unavailable("restricted")
+        };
+        assert_eq!(cache.get_or_probe(probe).await, unavailable("restricted"));
+        assert_eq!(cache.get_or_probe(probe).await, unavailable("restricted"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // The user fixed the host and re-enabled the sandbox: the stale
+        // refusal is dropped and the next gate re-probes.
+        cache.invalidate();
+        assert_eq!(cache.cached(), None);
+        let fixed = cache
+            .get_or_probe(|| async { SandboxAvailability::Available })
+            .await;
+        assert_eq!(fixed, SandboxAvailability::Available);
+        assert_eq!(cache.cached(), Some(SandboxAvailability::Available));
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_record_replaces_a_stale_refusal_without_reprobe() {
+        let cache = SandboxAvailabilityCache::new();
+        cache
+            .get_or_probe(|| async { unavailable("restricted") })
+            .await;
+        // A host-capability refresh re-probed and found the host fixed.
+        cache.record(SandboxAvailability::Available);
+        let reprobes = std::sync::atomic::AtomicUsize::new(0);
+        let reprobes = &reprobes;
+        let served = cache
+            .get_or_probe(move || async move {
+                reprobes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                unavailable("stale")
+            })
+            .await;
+        assert_eq!(served, SandboxAvailability::Available);
+        assert_eq!(
+            reprobes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a recorded value must be served, not re-probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_probe_does_not_clobber_a_newer_recorded_value() {
+        let cache = SandboxAvailabilityCache::new();
+        let cache_ref = &cache;
+        let served = cache
+            .get_or_probe(move || async move {
+                // A capability refresh lands while this (stale) probe runs.
+                cache_ref.record(SandboxAvailability::Available);
+                unavailable("stale")
+            })
+            .await;
+        assert_eq!(served, SandboxAvailability::Available);
+        assert_eq!(cache.cached(), Some(SandboxAvailability::Available));
+    }
+
+    #[tokio::test]
+    async fn in_flight_probe_is_not_cached_after_an_invalidation() {
+        let cache = SandboxAvailabilityCache::new();
+        let cache_ref = &cache;
+        let served = cache
+            .get_or_probe(move || async move {
+                cache_ref.invalidate();
+                unavailable("started before the fix")
+            })
+            .await;
+        assert_eq!(served, unavailable("started before the fix"));
+        assert_eq!(
+            cache.cached(),
+            None,
+            "a pre-invalidation result is not cached"
         );
     }
 

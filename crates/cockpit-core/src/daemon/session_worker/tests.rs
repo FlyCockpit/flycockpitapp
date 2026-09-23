@@ -5461,11 +5461,17 @@ async fn sandbox_unavailable_maps_to_broadcast_with_remedy() {
                 session_id,
                 remedy: r,
                 fix_command: got_fix_command,
+                persist_command,
             },
         ] => {
             assert_eq!(*session_id, sid);
             assert_eq!(r, &remedy);
             assert_eq!(got_fix_command.as_deref(), Some(fix_command));
+            // The reboot-persistent companion rides along for a diagnosed fix.
+            assert_eq!(
+                persist_command.as_deref(),
+                Some(crate::tools::shell_sandbox::APPARMOR_USERNS_PERSIST_COMMAND)
+            );
             // The user-facing remedy names the exact host command.
             assert!(r.contains("sudo sysctl"));
         }
@@ -5526,6 +5532,9 @@ async fn sandbox_unavailable_hydration_rebroadcasts_remembered_notice() {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SandboxUnavailableNotice {
         remedy: remedy.clone(),
         fix_command: Some(fix_command.clone()),
+        persist_command: Some(
+            crate::tools::shell_sandbox::APPARMOR_USERNS_PERSIST_COMMAND.to_string(),
+        ),
     });
 
     let mut rx = handle.subscribe();
@@ -5540,10 +5549,15 @@ async fn sandbox_unavailable_hydration_rebroadcasts_remembered_notice() {
             session_id,
             remedy: got_remedy,
             fix_command: got_fix_command,
+            persist_command,
         } => {
             assert_eq!(session_id, handle.session_id());
             assert_eq!(got_remedy, remedy);
             assert_eq!(got_fix_command.as_deref(), Some(fix_command.as_str()));
+            assert_eq!(
+                persist_command.as_deref(),
+                Some(crate::tools::shell_sandbox::APPARMOR_USERNS_PERSIST_COMMAND)
+            );
         }
         other => panic!("expected SandboxUnavailable, got {other:?}"),
     }

@@ -698,9 +698,7 @@ fn background_knowledge_sandbox_unavailable_refusal(reason: &str) -> String {
 async fn background_sandbox_availability(
     cwd: &std::path::Path,
 ) -> crate::tools::shell_sandbox::SandboxAvailability {
-    crate::tools::shell_sandbox::sandbox_available(cwd)
-        .await
-        .clone()
+    crate::tools::shell_sandbox::sandbox_available(cwd).await
 }
 
 #[cfg(test)]
@@ -720,9 +718,7 @@ async fn background_sandbox_availability(
     {
         return availability;
     }
-    crate::tools::shell_sandbox::sandbox_available(cwd)
-        .await
-        .clone()
+    crate::tools::shell_sandbox::sandbox_available(cwd).await
 }
 
 #[cfg(test)]

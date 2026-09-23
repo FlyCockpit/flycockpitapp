@@ -55,6 +55,7 @@ const featureCapabilitySchema = z
     state: z.enum(["available", "missing", "unsupported", "failed"]),
     reason: z.string(),
     fix_command: z.string().optional(),
+    persist_command: z.string().optional(),
     remedy_text: z.string().optional(),
     dependency_ids: z.array(z.string()).optional(),
   })

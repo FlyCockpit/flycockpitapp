@@ -360,7 +360,7 @@ async fn an_uncertain_containment_never_restores_parent_authority() {
         .effective_authority(parent.lease_id())
         .await
         .unwrap();
-    assert!(!authority.allows_path(&h.root().join("a/x.txt")));
+    assert!(!authority.allows_path(&h.effective("a/x.txt")));
 
     // Rows are retained for recovery.
     let transfer =

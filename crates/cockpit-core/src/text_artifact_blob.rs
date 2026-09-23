@@ -13,14 +13,13 @@ const ROOT: &str = "text-artifacts";
 
 /// Allocate a daemon-relative identity before writing. Callers journal this
 /// value first so cancellation can never lose cleanup ownership.
+///
+/// The identity is a platform-neutral, `/`-separated relative path: it is
+/// journaled in SQLite (whose validators and triggers match
+/// `text-artifacts/%`) and must be byte-identical on every host, so it is never
+/// built with `PathBuf::join` (which inserts `\\` on Windows).
 pub fn new_path(session_id: Uuid) -> String {
-    let relative = PathBuf::from(ROOT)
-        .join(session_id.to_string())
-        .join(format!("{}.txt", Uuid::new_v4()))
-        .to_str()
-        .expect("UUID artifact paths are UTF-8")
-        .to_owned();
-    relative
+    format!("{ROOT}/{session_id}/{}.txt", Uuid::new_v4())
 }
 
 pub fn write_at(relative: &str, content: &str) -> Result<String> {
@@ -151,5 +150,11 @@ fn resolve(relative: &str) -> Result<PathBuf> {
             .all(|component| matches!(component, Component::Normal(_))),
         "artifact blob path is not normalized"
     );
-    Ok(state_root()?.join(path))
+    // Re-join component by component so the host path uses the native
+    // separator; a `/` inside a `\\?\` verbatim root is not a separator.
+    let mut resolved = state_root()?;
+    for component in path.components() {
+        resolved.push(component.as_os_str());
+    }
+    Ok(resolved)
 }

@@ -11,7 +11,11 @@ fn tree_filter_path(args: &Value, ctx: &ToolCtx) -> (Option<String>, Option<Valu
     let filter = match path.trim() {
         "" | "." | "./" | "/" => None,
         _ if Path::new(path).is_absolute()
-            && crate::tools::common::resolve(path, &ctx.cwd) == intel_root(ctx) =>
+            && strip_intel_root(
+                &crate::tools::common::resolve(path, &ctx.cwd),
+                intel_root(ctx),
+            )
+            .is_some_and(|rel| rel.as_os_str().is_empty()) =>
         {
             None
         }

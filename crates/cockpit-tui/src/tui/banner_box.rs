@@ -63,7 +63,7 @@ pub(crate) fn with_test_banner_visible<T>(f: impl FnOnce() -> T) -> T {
 /// The pure box construction, without the config/env suppression gate.
 /// Split out so the geometry is testable independent of process env.
 fn build_box(info: &LaunchInfo, pane_w: u16, pane_h: u16) -> Option<Vec<Line<'static>>> {
-    let content = content_lines(info);
+    let content = content_lines(info, pane_w);
     let content_w = content.iter().map(Line::width).max().unwrap_or(0);
     let box_inner = content_w + INNER_PAD * 2;
     let box_w = box_inner + 2; // + 2 vertical rails
@@ -109,8 +109,20 @@ fn build_box(info: &LaunchInfo, pane_w: u16, pane_h: u16) -> Option<Vec<Line<'st
 /// welcome-name line shifts the text rows down by one when a name is
 /// configured, leaving the two art-only rows as the art's natural
 /// bottom padding.
-fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
+///
+/// The cwd/branch row is the only unbounded one (Windows profile and temp
+/// paths routinely run 50+ columns), so it is elided to what the pane can
+/// hold beside the art instead of making the whole box refuse to fit.
+fn content_lines(info: &LaunchInfo, pane_w: u16) -> Vec<Line<'static>> {
     let art = banner::render_styled_lines();
+    let art_w = art
+        .iter()
+        .map(|row| row.iter().map(Span::width).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    // Rails + inner padding on both sides, the art, and the art/text gap.
+    let chrome_w = 2 + INNER_PAD * 2 + art_w + 3;
+    let path_budget = u16::try_from((pane_w as usize).saturating_sub(chrome_w)).unwrap_or(u16::MAX);
     let grey = resolve_color(FOG, FOG_INDEX);
     let mut title = vec![
         Span::styled(APP_NAME, Style::default().add_modifier(Modifier::BOLD)),
@@ -138,8 +150,11 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
         .repo_status
         .as_ref()
         .map(crate::tui::chat_header::launch_git_facts);
-    let path =
-        crate::tui::chat_header::launch_path_spans(&info.cwd_display, git_facts.as_ref(), u16::MAX);
+    let path = crate::tui::chat_header::launch_path_spans(
+        &info.cwd_display,
+        git_facts.as_ref(),
+        path_budget,
+    );
 
     let texts: Vec<Option<Vec<Span<'static>>>> = match info.user_name.as_deref() {
         Some(name) if !name.is_empty() => {

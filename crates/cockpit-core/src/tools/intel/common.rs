@@ -84,10 +84,25 @@ pub(super) fn index_of(ctx: &ToolCtx) -> Index {
 pub(super) fn rel_path(arg: &str, ctx: &ToolCtx) -> String {
     let root = intel_root(ctx);
     let abs = crate::tools::common::resolve(arg, &ctx.cwd);
-    match abs.strip_prefix(root) {
-        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
-        Err(_) => arg.trim_start_matches("./").replace('\\', "/"),
+    match strip_intel_root(&abs, root) {
+        Some(rel) => rel.to_string_lossy().replace('\\', "/"),
+        None => arg.trim_start_matches("./").replace('\\', "/"),
     }
+}
+
+/// `abs` relative to the intel `root`, comparing spellings first and then
+/// resolved identities. The root is often held in canonical form while a
+/// model-supplied absolute path is not: on Windows the canonical root is a
+/// `\\?\` verbatim path with 8.3 short names (`RUNNER~1`) expanded, and on
+/// macOS `/var` is `/private/var`, so a purely lexical strip turned a path
+/// inside the project into an unmatched filter.
+pub(super) fn strip_intel_root(abs: &Path, root: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = abs.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    let abs = cockpit_host::path_containment::effective_path(abs).ok()?;
+    let root = cockpit_host::path_containment::effective_path(root).ok()?;
+    abs.strip_prefix(&root).ok().map(Path::to_path_buf)
 }
 
 pub(super) fn finish(

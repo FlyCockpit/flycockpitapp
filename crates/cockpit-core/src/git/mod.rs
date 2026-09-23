@@ -313,6 +313,66 @@ pub fn resolve_git_path(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("git path `{}` does not resolve", path.display()))
 }
 
+/// Spell an already-resolved path as a git command-line argument.
+///
+/// [`resolve_git_path`] canonicalizes, which on Windows yields a `\\?\`
+/// verbatim path. Git for Windows (MSYS) does not understand the verbatim
+/// namespace: it rewrites `\\?\C:\x` to `//?/C:/x` and fails with "Invalid
+/// argument". The verbatim prefix is dropped only when the plain Win32
+/// spelling denotes the same object — every component is a normal name that
+/// Win32 normalization would leave untouched (no trailing `.`/space, no
+/// `.`/`..`, no `/`) — so the identity proven by canonicalization is kept.
+/// Any other path keeps its verbatim spelling and git fails closed.
+pub(crate) fn git_path_arg(path: &Path) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        if let Some(plain) = windows_plain_spelling(path) {
+            return std::borrow::Cow::Owned(plain);
+        }
+    }
+    path.to_string_lossy()
+}
+
+#[cfg(windows)]
+fn windows_plain_spelling(path: &Path) -> Option<String> {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return None;
+    };
+    let mut plain = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => format!("{}:", char::from(drive)),
+        Prefix::VerbatimUNC(server, share) => {
+            format!("\\\\{}\\{}", server.to_str()?, share.to_str()?)
+        }
+        _ => return None,
+    };
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let name = name.to_str()?;
+                if name.is_empty()
+                    || name == "."
+                    || name == ".."
+                    || name.ends_with('.')
+                    || name.ends_with(' ')
+                    || name.contains('/')
+                {
+                    return None;
+                }
+                plain.push('\\');
+                plain.push_str(name);
+            }
+            _ => return None,
+        }
+    }
+    if !plain.contains('\\') {
+        plain.push('\\');
+    }
+    Some(plain)
+}
+
 /// Reject a worktree destination whose syscall-effective path is not under
 /// `parent` (symlink and prefix escapes included).
 pub fn assert_worktree_destination_under(parent: &Path, path: &Path) -> Result<()> {
@@ -337,7 +397,7 @@ pub fn worktree_add(repo: &Path, path: &Path, branch: &str, base: &str) -> Resul
     reject_leading_dash("base", base)?;
     let repo = resolve_git_path(repo)?;
     let path = resolve_git_path(path)?;
-    let path = path.to_string_lossy();
+    let path = git_path_arg(&path);
     run_git_checked(&repo, &["worktree", "add", &path, "-b", branch, "--", base])?;
     Ok(())
 }
@@ -347,7 +407,7 @@ pub fn worktree_add(repo: &Path, path: &Path, branch: &str, base: &str) -> Resul
 /// use this; orchestration must never call it for a pinned or uncertain
 /// worktree — use [`worktree_remove_clean`] after those guards.
 pub fn worktree_remove(repo: &Path, path: &Path) -> Result<()> {
-    let path = path.to_string_lossy();
+    let path = git_path_arg(path);
     run_git_checked(repo, &["worktree", "remove", "--force", &path])?;
     Ok(())
 }
@@ -379,7 +439,7 @@ pub fn primary_worktree_root(linked_worktree: &Path) -> Result<PathBuf> {
 pub fn worktree_remove_clean(repo: &Path, path: &Path) -> Result<()> {
     let repo = resolve_git_path(repo)?;
     let path = resolve_git_path(path)?;
-    let path = path.to_string_lossy();
+    let path = git_path_arg(&path);
     run_git_checked(&repo, &["worktree", "remove", "--", &path])?;
     Ok(())
 }
@@ -390,7 +450,7 @@ pub fn worktree_add_detached(repo: &Path, path: &Path, base: &str) -> Result<()>
     reject_leading_dash("base", base)?;
     let repo = resolve_git_path(repo)?;
     let path = resolve_git_path(path)?;
-    let path = path.to_string_lossy();
+    let path = git_path_arg(&path);
     run_git_checked(&repo, &["worktree", "add", "--detach", &path, "--", base])?;
     Ok(())
 }

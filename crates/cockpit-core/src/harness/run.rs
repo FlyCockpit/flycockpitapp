@@ -845,7 +845,7 @@ mod tests {
             let received = tmp.path().join("received.txt");
             let mut cfg = sh_harness(&format!(
                 "cat > {}; printf '%s\\n' '{secret}'",
-                received.display()
+                sh_path(&received)
             ));
             cfg.trust = trust;
             let res = run_harness(RunContext {
@@ -972,7 +972,7 @@ mod tests {
     async fn external_harness_redaction_failure_fails_before_spawn() {
         let tmp = tempfile::tempdir().unwrap();
         let marker = tmp.path().join("spawned.txt");
-        let cfg = sh_harness(&format!("printf ran > {}", marker.display()));
+        let cfg = sh_harness(&format!("printf ran > {}", sh_path(&marker)));
         let providers = ProvidersConfig::default();
         let spawns = AtomicUsize::new(0);
 
@@ -1586,7 +1586,7 @@ mod tests {
     async fn build_mode_direct_writes_to_cwd_no_diff() {
         let tmp = tempfile::tempdir().unwrap();
         let marker = tmp.path().join("written.txt");
-        let cfg = sh_harness(&format!("printf done > {}", marker.display()));
+        let cfg = sh_harness(&format!("printf done > {}", sh_path(&marker)));
         let redact = std::sync::Arc::new(RedactionTable::empty());
         let providers = ProvidersConfig::default();
         let res = run_harness(RunContext {
@@ -1712,7 +1712,7 @@ mod tests {
     async fn plan_isolated_non_git_does_not_degrade_to_direct() {
         let tmp = tempfile::tempdir().unwrap();
         let marker = tmp.path().join("written.txt");
-        let cfg = sh_harness(&format!("printf done > {}", marker.display()));
+        let cfg = sh_harness(&format!("printf done > {}", sh_path(&marker)));
         let redact = std::sync::Arc::new(RedactionTable::empty());
         let providers = ProvidersConfig::default();
         let err = run_harness(RunContext {
@@ -1813,7 +1813,7 @@ mod tests {
                 .with_forced_literal(SECRET.to_string(), "$leak:test".to_string())
                 .unwrap(),
         );
-        let cfg = sh_harness(&format!("cat {}", payload_path.display()));
+        let cfg = sh_harness(&format!("cat {}", sh_path(&payload_path)));
         let providers = ProvidersConfig::default();
         let res = run_harness(RunContext {
             harness_name: "sh",
@@ -1872,7 +1872,7 @@ mod tests {
         // The replacement is the table's configured placeholder, not the origin
         // label passed to `with_forced_literal`. Capture it before `table` moves.
         let placeholder = table.placeholder().to_string();
-        let cfg = sh_harness(&format!("cat {}", payload_path.display()));
+        let cfg = sh_harness(&format!("cat {}", sh_path(&payload_path)));
         let providers = ProvidersConfig::default();
         let res = run_harness(RunContext {
             harness_name: "sh",
@@ -2160,7 +2160,7 @@ mod tests {
                 .with_forced_literal(secret.clone(), "$leak:test".to_string())
                 .unwrap(),
         );
-        let mut cfg = sh_harness(&format!("cat {}", payload_path.display()));
+        let mut cfg = sh_harness(&format!("cat {}", sh_path(&payload_path)));
         cfg.supports_json_output = true;
         cfg.trust = crate::config::extended::HarnessTrust::Trusted;
         let providers = ProvidersConfig::default();
@@ -2197,6 +2197,17 @@ mod tests {
             !res.text.contains(FRAG),
             "boundary fragment leaked via text"
         );
+    }
+
+    /// Spell a host path as a single-quoted POSIX `sh` word. `sh` treats `\`
+    /// as an escape, so a raw Windows path (`C:\Users\...`) would reach the
+    /// command as `C:Users...`; the MSYS/Git `sh` used on Windows accepts
+    /// `C:/Users/...`.
+    fn sh_path(path: &std::path::Path) -> String {
+        let spelled = path.display().to_string();
+        #[cfg(windows)]
+        let spelled = spelled.replace('\\', "/");
+        format!("'{}'", spelled.replace('\'', r"'\''"))
     }
 
     /// A `sh -c <script>` harness: prompt rides stdin (ignored by the

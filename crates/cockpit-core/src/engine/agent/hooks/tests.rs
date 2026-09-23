@@ -33,7 +33,12 @@ use crate::engine::agent::hooks::*;
 /// "not found" (the lookup returned nothing). Use
 /// `FakeProcessEnv::with_default_resolution` for the common case where a
 /// fake absolute path should be returned for any bare name.
-#[derive(Debug, Clone, Default)]
+///
+/// `system_root` models the parent process's `SystemRoot`. Every real Windows
+/// host has one (the hook runner fails open without it), so the default fake
+/// carries `C:\Windows` on Windows builds; the missing-`SystemRoot` fail-open
+/// path is exercised explicitly with `system_root: None`.
+#[derive(Debug, Clone)]
 struct FakeProcessEnv {
     resolved: Option<PathBuf>,
     system_root: Option<String>,
@@ -43,13 +48,35 @@ struct FakeProcessEnv {
     use_default_resolution: bool,
 }
 
+/// Spell a Unix-style absolute fixture path as an absolute path on the host.
+/// `/fake/bin/x` has no drive/UNC prefix, so it is only *drive-relative* on
+/// Windows (`Path::is_absolute` is false); the fixture must be rooted at a
+/// drive there to model a resolved executable.
+fn host_absolute(unix_path: &str) -> PathBuf {
+    debug_assert!(unix_path.starts_with('/'));
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{}", unix_path.replace('/', "\\")))
+    } else {
+        PathBuf::from(unix_path)
+    }
+}
+
+impl Default for FakeProcessEnv {
+    fn default() -> Self {
+        Self {
+            resolved: None,
+            system_root: cfg!(windows).then(|| "C:\\Windows".to_string()),
+            use_default_resolution: false,
+        }
+    }
+}
+
 impl FakeProcessEnv {
     /// A fake env that resolves any bare name to `/fake/bin/<name>`.
     fn with_default_resolution() -> Self {
         Self {
-            resolved: None,
-            system_root: None,
             use_default_resolution: true,
+            ..Self::default()
         }
     }
 }
@@ -57,7 +84,7 @@ impl FakeProcessEnv {
 impl ProcessEnv for FakeProcessEnv {
     fn resolve_executable(&self, name: &str) -> Option<PathBuf> {
         if self.use_default_resolution {
-            Some(PathBuf::from(format!("/fake/bin/{name}")))
+            Some(host_absolute(&format!("/fake/bin/{name}")))
         } else {
             self.resolved.clone()
         }
@@ -820,7 +847,7 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
     )
     .await;
     // Bare executable resolved to an ABSOLUTE path via the ProcessEnv seam.
-    assert_eq!(inv.executable, PathBuf::from("/fake/bin/obs"));
+    assert_eq!(inv.executable, host_absolute("/fake/bin/obs"));
     assert!(inv.executable.is_absolute());
     // CWD is the session workspace root.
     assert_eq!(inv.cwd, workspace());
@@ -1209,16 +1236,22 @@ async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
 
 #[test]
 fn resolve_hook_executable_absolute_path_passed_through() {
+    let absolute = host_absolute("/usr/bin/echo");
     let hook = test_hook(
         HookEvent::PreToolUse,
-        vec!["/usr/bin/echo".to_string()],
+        vec![
+            absolute
+                .to_str()
+                .expect("fixture path is UTF-8")
+                .to_string(),
+        ],
         None,
         BTreeMap::new(),
         5,
     );
     let process_env = FakeProcessEnv::default();
     let resolved = resolve_hook_executable(&hook, &process_env);
-    assert_eq!(resolved, Some(PathBuf::from("/usr/bin/echo")));
+    assert_eq!(resolved, Some(absolute));
 }
 
 #[test]

@@ -632,11 +632,14 @@ fn elide_path(path: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
+    // Windows display paths use `\` (and may mix in `/`); elide to the
+    // last component on either separator there.
+    let is_separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
     let tail = path
-        .rsplit('/')
+        .rsplit(is_separator)
         .find(|part| !part.is_empty())
         .unwrap_or(path);
-    let marker = "…/";
+    let marker = if cfg!(windows) { "…\\" } else { "…/" };
     if max <= display_width(marker) as usize {
         return truncate_to_width("…", max);
     }

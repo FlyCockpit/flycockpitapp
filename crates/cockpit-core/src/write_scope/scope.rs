@@ -304,7 +304,10 @@ mod tests {
 
         // Plain relative scope resolves.
         let ok = CanonicalScope::resolve_under(&root, "a").unwrap();
-        assert!(ok.contains_path(&root.join("a/new-file.txt")));
+        // Callers hand `contains_path` the syscall-effective target.
+        assert!(ok.contains_path(
+            &cockpit_host::path_containment::effective_path(&root.join("a/new-file.txt")).unwrap()
+        ));
 
         // A not-yet-created leaf is allowed (write scope may target a leaf the
         // child will create).

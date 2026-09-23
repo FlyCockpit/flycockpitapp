@@ -3864,15 +3864,19 @@ for line in sys.stdin:
         tmp
     }
 
-    fn monty_stdio_cfg(command: &str) -> McpConfig {
+    /// A stdio config launching the fake Python MCP server `script` (through
+    /// an interpreter on Windows, which has no shebang execution).
+    fn monty_stdio_cfg(script: &str) -> McpConfig {
+        let (command, args) =
+            cockpit_test_support::python_script_launch(std::path::Path::new(script));
         let mut cfg = McpConfig::default();
         cfg.servers.insert(
             "fake".into(),
             ServerConfig {
                 transport: Transport::Stdio,
                 endpoint: None,
-                command: Some(command.to_string()),
-                args: vec![],
+                command: Some(command),
+                args,
                 env: BTreeMap::new(),
                 env_credential_refs: BTreeMap::new(),
                 auth: Default::default(),

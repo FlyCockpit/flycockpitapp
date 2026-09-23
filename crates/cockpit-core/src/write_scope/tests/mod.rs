@@ -102,6 +102,16 @@ impl Harness {
         self.workspace.path()
     }
 
+    /// The syscall-effective spelling of a workspace-relative path — the form
+    /// the coordinator hands to `allows_path`/`contains_path` (it resolves
+    /// every requested target first). On Windows that is a `\\?\` verbatim
+    /// path in which `/` is no longer a separator, so a lexical
+    /// `root().join("a/x")` is not a comparable spelling.
+    pub fn effective(&self, relative: &str) -> std::path::PathBuf {
+        cockpit_host::path_containment::effective_path(&self.root().join(relative))
+            .unwrap_or_else(|e| panic!("`{relative}` should resolve: {e}"))
+    }
+
     /// Resolve a workspace-relative scope, failing the test on escape.
     pub fn scope(&self, relative: &str) -> CanonicalScope {
         CanonicalScope::resolve_under(self.root(), relative)

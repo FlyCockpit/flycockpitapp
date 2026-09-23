@@ -1721,6 +1721,48 @@ impl Drop for AsyncActionRunner {
     }
 }
 
+/// An owned export temp lives in the export directory, which production
+/// always prepares first (`prepare_export_directory`): on Windows that is
+/// a held, owner-only DirHandle, and the owned-temp cleanup verifies the
+/// temp against exactly that containment.
+#[cfg(test)]
+pub(crate) fn export_partial_path(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let exports = root.join("exports");
+    #[cfg(windows)]
+    crate::clipboard::recovery::windows::DirHandle::open_or_create(&exports)
+        .expect("prepare private export directory");
+    #[cfg(not(windows))]
+    std::fs::create_dir_all(&exports).expect("prepare export directory");
+    exports.join(name)
+}
+
+/// Create an export temp owned by the current user, as the export writer
+/// does. On Windows the file is born through the held export-directory
+/// handle with the user as explicit owner: a plain `fs::write` on an
+/// elevated runner is owned by `BUILTIN\Administrators`, which the
+/// ownership check (correctly) refuses to treat as ours.
+#[cfg(test)]
+pub(crate) fn write_owned_partial(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::io::Write as _;
+        let directory = crate::clipboard::recovery::windows::DirHandle::open_or_create(
+            path.parent().expect("export temp parent"),
+        )
+        .expect("open private export directory");
+        let mut file = directory
+            .create_file_exclusive(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("export temp name"),
+            )
+            .expect("create owned export temp");
+        file.write_all(b"partial").expect("write export temp");
+    }
+    #[cfg(not(windows))]
+    std::fs::write(path, b"partial").expect("write export temp");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2137,7 +2179,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_abort_reaps_temp_owned_outside_export_future() {
         let tmp = tempfile::tempdir().unwrap();
-        let partial = tmp.path().join(".export.partial");
+        let partial = super::export_partial_path(tmp.path(), ".export.partial");
         let worker_partial = partial.clone();
         let (owned_tx, owned_rx) = oneshot::channel();
         let mut runner = AsyncActionRunner::default();
@@ -2145,7 +2187,7 @@ mod tests {
             AsyncActionKind::Blocking("export.transcript"),
             AsyncActionPolicy::AllowConcurrent,
             move |shutdown| async move {
-                tokio::fs::write(&worker_partial, b"partial").await.unwrap();
+                super::write_owned_partial(&worker_partial);
                 shutdown.own_export_temp(worker_partial);
                 owned_tx.send(()).unwrap();
                 std::future::pending::<Result<AsyncActionPayload, String>>().await
@@ -2166,8 +2208,8 @@ mod tests {
     #[tokio::test]
     async fn export_cleanup_retry_eventually_removes_owned_partial() {
         let tmp = tempfile::tempdir().unwrap();
-        let partial = tmp.path().join(".retry.partial");
-        tokio::fs::write(&partial, b"partial").await.unwrap();
+        let partial = super::export_partial_path(tmp.path(), ".retry.partial");
+        super::write_owned_partial(&partial);
         let owner = AsyncActionCancellation::default();
         owner.own_export_temp(partial.clone());
         assert!(owner.schedule_export_temp_cleanup_retry());
@@ -2186,8 +2228,8 @@ mod tests {
     #[tokio::test]
     async fn dropping_temp_owner_enqueues_cleanup_before_any_await() {
         let tmp = tempfile::tempdir().unwrap();
-        let partial = tmp.path().join(".drop.partial");
-        std::fs::write(&partial, b"partial").unwrap();
+        let partial = super::export_partial_path(tmp.path(), ".drop.partial");
+        super::write_owned_partial(&partial);
         let owner = AsyncActionCancellation::default();
         owner.own_export_temp(partial.clone());
         drop(owner);
@@ -2210,7 +2252,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_runner_while_export_waits_eventually_reaps_partial() {
         let tmp = tempfile::tempdir().unwrap();
-        let partial = tmp.path().join(".runner-drop.partial");
+        let partial = super::export_partial_path(tmp.path(), ".runner-drop.partial");
         let worker_partial = partial.clone();
         let (owned_tx, owned_rx) = oneshot::channel();
         let mut runner = AsyncActionRunner::default();
@@ -2218,7 +2260,7 @@ mod tests {
             AsyncActionKind::Blocking("export.transcript"),
             AsyncActionPolicy::AllowConcurrent,
             move |owner| async move {
-                std::fs::write(&worker_partial, b"partial").unwrap();
+                super::write_owned_partial(&worker_partial);
                 owner.own_export_temp(worker_partial);
                 owned_tx.send(()).unwrap();
                 std::future::pending::<Result<AsyncActionPayload, String>>().await
@@ -2239,8 +2281,8 @@ mod tests {
     #[test]
     fn reaper_spawn_failure_fallback_removes_partial_synchronously() {
         let tmp = tempfile::tempdir().unwrap();
-        let partial = tmp.path().join(".spawn-failure.partial");
-        std::fs::write(&partial, b"partial").unwrap();
+        let partial = super::export_partial_path(tmp.path(), ".spawn-failure.partial");
+        super::write_owned_partial(&partial);
         enqueue_export_temp_reap_with(partial.clone(), None);
         assert!(!partial.exists());
     }
@@ -2248,8 +2290,8 @@ mod tests {
     #[test]
     fn reaper_closed_channel_fallback_removes_partial_synchronously() {
         let tmp = tempfile::tempdir().unwrap();
-        let partial = tmp.path().join(".closed-channel.partial");
-        std::fs::write(&partial, b"partial").unwrap();
+        let partial = super::export_partial_path(tmp.path(), ".closed-channel.partial");
+        super::write_owned_partial(&partial);
         let (tx, rx) = std::sync::mpsc::channel();
         drop(rx);
         enqueue_export_temp_reap_with(partial.clone(), Some(tx));
@@ -2259,8 +2301,8 @@ mod tests {
     #[test]
     fn reaper_guard_drop_drains_cleanup_on_cancelled_run_scope() {
         let tmp = tempfile::tempdir().unwrap();
-        let partial = tmp.path().join(".cancelled-run.partial");
-        std::fs::write(&partial, b"partial").unwrap();
+        let partial = super::export_partial_path(tmp.path(), ".cancelled-run.partial");
+        super::write_owned_partial(&partial);
         let guard = ExportTempReaperGuard::new();
         enqueue_export_temp_reap(partial.clone());
         drop(guard);

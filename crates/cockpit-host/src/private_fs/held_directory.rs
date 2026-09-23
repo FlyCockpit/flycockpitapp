@@ -2433,11 +2433,8 @@ mod imp {
         ) -> Result<HeldSealedArtifact> {
             self.verify_directory_security()?;
             let wide = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
-            let RelativeProbe::Present(mut file) = probe_relative(
-                &self.dir,
-                &wide,
-                RETAINED_ARTIFACT_ACCESS,
-            )?
+            let RelativeProbe::Present(mut file) =
+                probe_relative(&self.dir, &wide, RETAINED_ARTIFACT_ACCESS)?
             else {
                 anyhow::bail!("held artifact is absent")
             };
@@ -2486,18 +2483,15 @@ mod imp {
                         let source = std::ffi::OsStr::new(&recovery.source_name)
                             .encode_wide()
                             .collect::<Vec<_>>();
-                        let source_probe = match probe_relative(
-                            &self.dir,
-                            &source,
-                            RETAINED_ARTIFACT_ACCESS,
-                        ) {
-                            Ok(probe) => probe,
-                            Err(_) => {
-                                return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
-                                    recovery.clone(),
-                                ));
-                            }
-                        };
+                        let source_probe =
+                            match probe_relative(&self.dir, &source, RETAINED_ARTIFACT_ACCESS) {
+                                Ok(probe) => probe,
+                                Err(_) => {
+                                    return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                        recovery.clone(),
+                                    ));
+                                }
+                            };
                         match source_probe {
                             RelativeProbe::Present(mut file) => {
                                 if verify_expected_file(&file, &recovery.artifact).is_err()
@@ -2554,11 +2548,8 @@ mod imp {
                 let wide = std::ffi::OsStr::new(&recovery.source_name)
                     .encode_wide()
                     .collect::<Vec<_>>();
-                let source_probe = match probe_relative(
-                    &self.dir,
-                    &wide,
-                    RETAINED_ARTIFACT_ACCESS,
-                ) {
+                let source_probe = match probe_relative(&self.dir, &wide, RETAINED_ARTIFACT_ACCESS)
+                {
                     Ok(probe) => probe,
                     Err(_) => {
                         return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(

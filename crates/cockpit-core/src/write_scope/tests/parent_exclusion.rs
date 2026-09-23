@@ -29,7 +29,7 @@ async fn parent_writes_outside_the_subscope_under_the_replacement_token() {
         )
         .await
         .expect("outside the delegated sub-scope is allowed");
-    assert_eq!(permit.effective_target(), h.root().join("b/out.txt"));
+    assert_eq!(permit.effective_target(), h.effective("b/out.txt"));
     h.coordinator.release_mutation_permit(permit).await.unwrap();
 }
 

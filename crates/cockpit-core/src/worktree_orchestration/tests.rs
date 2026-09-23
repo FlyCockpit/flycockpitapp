@@ -142,6 +142,8 @@ fn init_repo(dir: &Path) {
     git::run_git_checked(dir, &["config", "user.email", "t@t"]).unwrap();
     git::run_git_checked(dir, &["config", "user.name", "t"]).unwrap();
     git::run_git_checked(dir, &["config", "commit.gpgsign", "false"]).unwrap();
+    // Byte-exact fixtures regardless of a host `core.autocrlf` default.
+    git::run_git_checked(dir, &["config", "core.autocrlf", "false"]).unwrap();
     for (name, body) in [
         ("a.txt", "a0\n"),
         ("b.txt", "b0\n"),

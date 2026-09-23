@@ -3376,10 +3376,8 @@ mod tests {
         } else {
             "/xdg-runtime"
         };
-        let resolved = private_runtime_root_from(
-            Some(OsStr::new(xdg)),
-            Some(PathBuf::from("/darwin-temp")),
-        );
+        let resolved =
+            private_runtime_root_from(Some(OsStr::new(xdg)), Some(PathBuf::from("/darwin-temp")));
         assert_eq!(resolved, Some(PathBuf::from(xdg)));
     }
 

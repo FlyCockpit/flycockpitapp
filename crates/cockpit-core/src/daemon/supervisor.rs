@@ -3771,6 +3771,14 @@ mod tests {
     #[test]
     fn windows_identity_promotion_replaces_only_at_readiness() {
         const CHILD_ENV: &str = "COCKPIT_WINDOWS_IDENTITY_READINESS_TEST_PATH";
+        // Tokio named-pipe servers register with the I/O driver at creation,
+        // so both the parent and the re-executed child need an entered
+        // runtime even though the test body itself is synchronous.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _runtime_guard = runtime.enter();
         if let Some(staged) = std::env::var_os(CHILD_ENV) {
             std::thread::sleep(Duration::from_millis(100));
             let successor = super::super::windows_pipe::NamedPipeListener::prepare().unwrap();

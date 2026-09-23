@@ -244,9 +244,7 @@ fn build_descriptor(sddl: &str) -> io::Result<OwnedSecurityDescriptor> {
         )
     };
     if converted == 0 {
-        return Err(last_error(
-            "building recovery security descriptor",
-        ));
+        return Err(last_error("building recovery security descriptor"));
     }
     Ok(OwnedSecurityDescriptor(descriptor))
 }

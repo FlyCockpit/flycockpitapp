@@ -775,13 +775,13 @@ impl GrantStore {
         path: &Path,
     ) -> Result<Option<SandboxPathAccess>> {
         let candidate = normalize_path(path, &self.cwd);
-        let matches = |stored: &str| path_covers(stored, &candidate);
+        let matches = |stored: &str| grant_covers(stored, &candidate);
         if self.path_reject_matches(matches).await? {
             return Ok(None);
         }
         let mut access: Option<SandboxPathAccess> = None;
         for (key, grant_access) in self.path_allow_entries().await? {
-            if path_covers(&key, &candidate) {
+            if grant_covers(&key, &candidate) {
                 access = Some(access.map_or(grant_access, |current| current.max(grant_access)));
             }
         }
@@ -829,7 +829,7 @@ impl GrantStore {
     /// closed on a corrupt/unreadable approvals store (issue #297).
     pub async fn is_path_rejected(&self, path: &Path) -> Result<bool> {
         let candidate = normalize_path(path, &self.cwd);
-        let matches = |stored: &str| path_covers(stored, &candidate);
+        let matches = |stored: &str| grant_covers(stored, &candidate);
         Ok(self.path_reject_matches(matches).await?)
     }
 
@@ -3477,6 +3477,35 @@ fn path_covers(stored: &str, candidate: &str) -> bool {
     candidate == stored || candidate.starts_with(stored)
 }
 
+/// Whether a stored path grant covers a (normalized) candidate for an
+/// access decision.
+///
+/// The lexical [`path_covers`] rule applies on every platform. On Windows a
+/// candidate from the native-access gate is the syscall-effective spelling —
+/// a `\\?\` verbatim path with 8.3 short names (`RUNNER~1`) expanded and
+/// on-disk casing — while a grant recorded from any other surface (delegated
+/// write scope, sandbox escalation offer, a hand-entered path) keeps the
+/// spelling it was given, so the lexical rule alone can never match it. Both
+/// sides are therefore also compared by their resolved identity. Unix keeps
+/// the lexical-only rule: resolving a stored symlink spelling there would
+/// widen a grant to wherever the link points at check time.
+fn grant_covers(stored: &str, candidate: &str) -> bool {
+    if path_covers(stored, candidate) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use cockpit_host::path_containment::effective_path;
+        if let (Ok(stored), Ok(candidate)) = (
+            effective_path(Path::new(stored)),
+            effective_path(Path::new(candidate)),
+        ) {
+            return candidate == stored || candidate.starts_with(&stored);
+        }
+    }
+    false
+}
+
 /// Parse a stored verdict string. An unrecognized value (corrupt row /
 /// hand-edited file) reads as `None` — no rule applies, so the guard
 /// falls back to prompting, the safe default.
@@ -4408,9 +4437,11 @@ mod tests {
         let session_cwd = Path::new("/session/project");
         let daemon_cwd = Path::new("/daemon/process");
 
+        // Stored keys are compared as paths (`path_covers`), so compare
+        // component-wise: the host separator is `\\` on Windows.
         assert_eq!(
-            normalize_path(Path::new("src/../Cargo.toml"), session_cwd),
-            "/session/project/Cargo.toml"
+            Path::new(&normalize_path(Path::new("src/../Cargo.toml"), session_cwd)),
+            Path::new("/session/project/Cargo.toml")
         );
         assert_ne!(
             normalize_path(Path::new("src/../Cargo.toml"), session_cwd),
@@ -4421,11 +4452,11 @@ mod tests {
     #[tokio::test]
     async fn normalize_path_keeps_absolute_paths_and_lexical_parent_resolution() {
         assert_eq!(
-            normalize_path(
+            Path::new(&normalize_path(
                 Path::new("/tmp/project/../file.txt"),
                 Path::new("/ignored/base")
-            ),
-            "/tmp/file.txt"
+            )),
+            Path::new("/tmp/file.txt")
         );
     }
 

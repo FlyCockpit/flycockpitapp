@@ -1399,9 +1399,29 @@ fn delete_windows_file_by_handle(file: &std::fs::File) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// An always-present absolute executable for owner-pinning fixtures:
+    /// `/bin/true` on Unix, the system `cmd.exe` on Windows (where `/bin/true`
+    /// is neither present nor an absolute path).
+    fn fixed_executable() -> String {
+        #[cfg(windows)]
+        {
+            let system_root =
+                std::env::var_os("SystemRoot").expect("Windows hosts define SystemRoot");
+            std::path::PathBuf::from(system_root)
+                .join("System32")
+                .join("cmd.exe")
+                .to_string_lossy()
+                .into_owned()
+        }
+        #[cfg(not(windows))]
+        {
+            "/bin/true".to_string()
+        }
+    }
+
     #[test]
     fn command_injection_is_exactly_one_fixed_sink() {
-        let mut argv = vec!["/bin/true".into(), SEALED_VALUE_ARG_PLACEHOLDER.into()];
+        let mut argv = vec![fixed_executable(), SEALED_VALUE_ARG_PLACEHOLDER.into()];
         let identity = pin_argv_executable(&mut argv).unwrap();
         assert!(
             validate_command_kind(
@@ -1414,7 +1434,7 @@ mod tests {
         );
         assert!(
             validate_command_kind(
-                &["/bin/true".into()],
+                &[fixed_executable()],
                 &identity,
                 &CommandInjection::Argument,
                 &BTreeMap::new(),
@@ -1423,7 +1443,7 @@ mod tests {
         );
         assert!(
             validate_command_kind(
-                &["/bin/true".into()],
+                &[fixed_executable()],
                 &identity,
                 &CommandInjection::Environment {
                     variable: "API_TOKEN".into(),
@@ -1434,7 +1454,7 @@ mod tests {
         );
         assert!(
             validate_command_kind(
-                &["/bin/true".into(), SEALED_VALUE_ARG_PLACEHOLDER.into()],
+                &[fixed_executable(), SEALED_VALUE_ARG_PLACEHOLDER.into()],
                 &identity,
                 &CommandInjection::Environment {
                     variable: "API_TOKEN".into(),
@@ -1451,7 +1471,7 @@ mod tests {
             filename: "credential.pem".into(),
         };
         assert!(validate_file_kind(&destination, FilePersistence::Ephemeral, &[], None).is_err());
-        let mut consumer = vec!["/bin/true".into(), SEALED_FILE_PATH_PLACEHOLDER.into()];
+        let mut consumer = vec![fixed_executable(), SEALED_FILE_PATH_PLACEHOLDER.into()];
         let identity = pin_argv_executable(&mut consumer).unwrap();
         assert!(
             validate_file_kind(

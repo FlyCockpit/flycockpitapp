@@ -80,12 +80,12 @@ async fn effective_authorities_are_pairwise_disjoint_across_a_nested_tree() {
     assert_eq!(authorities.len(), 4, "root + a + b + a/inner");
 
     let probes = [
-        h.root().join("a/file.txt"),
-        h.root().join("a/inner/file.txt"),
-        h.root().join("b/file.txt"),
-        h.root().join("shared/file.txt"),
-        h.root().join("ab/file.txt"),
-        h.root().to_path_buf(),
+        h.effective("a/file.txt"),
+        h.effective("a/inner/file.txt"),
+        h.effective("b/file.txt"),
+        h.effective("shared/file.txt"),
+        h.effective("ab/file.txt"),
+        h.effective(""),
     ];
     let probe_refs: Vec<&std::path::Path> = probes.iter().map(|p| p.as_path()).collect();
     assert_pairwise_disjoint(&authorities, &probe_refs);
@@ -93,7 +93,7 @@ async fn effective_authorities_are_pairwise_disjoint_across_a_nested_tree() {
     // And every probe inside the workspace has exactly one owner or none.
     let inner_owners: Vec<_> = authorities
         .iter()
-        .filter(|(_, auth)| auth.allows_path(&h.root().join("a/inner/x")))
+        .filter(|(_, auth)| auth.allows_path(&h.effective("a/inner/x")))
         .collect();
     assert_eq!(
         inner_owners.len(),
@@ -215,9 +215,9 @@ async fn on_the_direct_backend_the_invariant_holds_by_refusing_the_transfer() {
     );
 
     let probes = [
-        h.root().join("a/file.txt"),
-        h.root().join("b/file.txt"),
-        h.root().join("a/inner/file.txt"),
+        h.effective("a/file.txt"),
+        h.effective("b/file.txt"),
+        h.effective("a/inner/file.txt"),
     ];
     let probe_refs: Vec<&std::path::Path> = probes.iter().map(|p| p.as_path()).collect();
     assert_pairwise_disjoint(&authorities, &probe_refs);

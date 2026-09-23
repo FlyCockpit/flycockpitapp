@@ -1017,7 +1017,17 @@ async fn missing_path_canonicalization_matches_boundary_helper_through_symlink_d
     let expected = crate::tools::sandbox::effective_native_path(&target).unwrap();
 
     assert_eq!(canonicalize(&target), expected);
+    // Unix resolves `link/..` physically: the parent of the link's target.
+    #[cfg(unix)]
     assert_eq!(expected, outside_parent.path().join("new.txt"));
+    // Win32 path normalization collapses `link\..` lexically before any
+    // lookup (exactly as the eventual open does), so the syscall-effective
+    // target is beside the link, in the canonical root.
+    #[cfg(windows)]
+    assert_eq!(
+        expected,
+        fs::canonicalize(root.path()).unwrap().join("new.txt")
+    );
 }
 
 // ── Waiter queue + idle-expiry (`read-wait-and-lock-expiry.md`) ──

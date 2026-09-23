@@ -59,7 +59,10 @@ async fn push_bulk_transfer(
             .await?
         {
             Response::BulkTransferChunkAccepted { .. } => {}
-            other => bail!("daemon returned unexpected response to bulk transfer chunk: {other:?}"),
+            other => bail!(
+                "daemon returned unexpected response to bulk transfer chunk: {}",
+                other.wire_tag()
+            ),
         }
     }
     Ok(transfer)
@@ -98,7 +101,10 @@ pub async fn run(args: ImportArgs) -> Result<()> {
             cockpit_core::session::import::ImportResult { imported, redacted }
         }
         other => {
-            bail!("daemon returned unexpected response to session import: {other:?}")
+            bail!(
+                "daemon returned unexpected response to session import: {}",
+                other.wire_tag()
+            )
         }
     };
     if !imported.redacted {

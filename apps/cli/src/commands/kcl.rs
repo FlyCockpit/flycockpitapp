@@ -40,7 +40,10 @@ async fn import() -> Result<()> {
         .context("requesting kcl import from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected kcl import: {error}"))?;
     let Response::KclPackagesImported { result_json } = response else {
-        bail!("daemon returned unexpected response to kcl import: {response:?}");
+        bail!(
+            "daemon returned unexpected response to kcl import: {}",
+            response.wire_tag()
+        );
     };
     let result: KclImportResult =
         serde_json::from_str(&result_json).context("parsing kcl import result")?;

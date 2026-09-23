@@ -35,7 +35,10 @@ pub async fn run(args: ConnectArgs) -> Result<()> {
     {
         Response::FlycockpitAccount { account } => account,
         other => {
-            bail!("daemon returned unexpected response to FlyCockpit account query: {other:?}")
+            bail!(
+                "daemon returned unexpected response to FlyCockpit account query: {}",
+                other.wire_tag()
+            )
         }
     };
     let Some(account) = account else {
@@ -78,7 +81,10 @@ async fn set_connector_enabled(client: &cockpit_client::DaemonClient, enabled: b
     {
         Response::Ack => Ok(()),
         other => {
-            bail!("daemon returned unexpected response to FlyCockpit connector update: {other:?}")
+            bail!(
+                "daemon returned unexpected response to FlyCockpit connector update: {}",
+                other.wire_tag()
+            )
         }
     }
 }

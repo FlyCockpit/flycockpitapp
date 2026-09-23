@@ -63,7 +63,10 @@ pub async fn run(args: ExportArgs) -> Result<()> {
         .context("requesting session export assembly from daemon")?;
     let data = match response {
         Response::ExportSessionData { data } => data,
-        other => bail!("daemon returned unexpected response to session export: {other:?}"),
+        other => bail!(
+            "daemon returned unexpected response to session export: {}",
+            other.wire_tag()
+        ),
     };
 
     // Stream the archive back over the reader that matches its kind.
@@ -150,7 +153,10 @@ async fn resolve_target_session(
         .context("requesting session list from daemon")?;
     let sessions = match response {
         Response::Sessions { sessions } => sessions,
-        other => bail!("daemon returned unexpected response to session list: {other:?}"),
+        other => bail!(
+            "daemon returned unexpected response to session list: {}",
+            other.wire_tag()
+        ),
     };
 
     resolve_from_summaries(&sessions, ident)
@@ -229,7 +235,10 @@ async fn download_export(
             last,
         } = response
         else {
-            bail!("daemon returned unexpected response to export chunk read: {response:?}");
+            bail!(
+                "daemon returned unexpected response to export chunk read: {}",
+                response.wire_tag()
+            );
         };
         if got != chunk_index {
             bail!("daemon returned an out-of-order export chunk");

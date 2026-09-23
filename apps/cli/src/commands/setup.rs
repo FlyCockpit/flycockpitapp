@@ -511,7 +511,10 @@ async fn apply_security_wizard_via_daemon(_cwd: &std::path::Path, run: &WizardRu
         .await?
         .map_err(|error| anyhow!("daemon rejected security settings snapshot: {error}"))?;
     let Response::ExtendedConfigSnapshot { layers, .. } = response else {
-        bail!("daemon returned unexpected security settings snapshot: {response:?}");
+        bail!(
+            "daemon returned unexpected security settings snapshot: {}",
+            response.wire_tag()
+        );
     };
     let layer = layers
         .into_iter()
@@ -666,7 +669,10 @@ async fn apply_model_wizard_via_daemon(
         ..
     } = response
     else {
-        bail!("daemon returned unexpected model settings snapshot: {response:?}");
+        bail!(
+            "daemon returned unexpected model settings snapshot: {}",
+            response.wire_tag()
+        );
     };
     if returned_session_id != snapshot_session_id {
         bail!("daemon returned an unbound model settings snapshot");
@@ -1032,7 +1038,10 @@ impl ProviderSetupActions {
             ..
         } = snapshot
         else {
-            bail!("daemon returned unexpected provider catalog snapshot: {snapshot:?}");
+            bail!(
+                "daemon returned unexpected provider catalog snapshot: {}",
+                snapshot.wire_tag()
+            );
         };
         if returned_session_id != snapshot_session_id {
             bail!("daemon returned an unbound provider catalog snapshot");
@@ -1125,7 +1134,10 @@ impl ProviderSetupActions {
                 anyhow!("daemon rejected provider credential validation: {error}{visibility_hint}")
             })?;
         let Response::ProviderModelsFetched { results, .. } = response else {
-            bail!("daemon returned unexpected provider key test response: {response:?}");
+            bail!(
+                "daemon returned unexpected provider key test response: {}",
+                response.wire_tag()
+            );
         };
         let outcome = results.into_iter().next().map(|result| result.outcome);
         match outcome {
@@ -1178,7 +1190,10 @@ async fn begin_provider_oauth_via_daemon(
             user_code,
             ..
         }) => Ok((flow_id, authorize_url, user_code)),
-        Ok(other) => bail!("daemon returned unexpected OAuth begin response: {other:?}"),
+        Ok(other) => bail!(
+            "daemon returned unexpected OAuth begin response: {}",
+            other.wire_tag()
+        ),
         Err(error) => bail!("daemon rejected OAuth begin: {error}"),
     }
 }
@@ -1202,7 +1217,10 @@ async fn complete_provider_oauth_via_daemon(flow_id: String, input: Option<Strin
         Ok(Response::ProviderOAuthCompleted {
             logged_in: true, ..
         }) => Ok(()),
-        Ok(other) => bail!("daemon returned unexpected OAuth completion response: {other:?}"),
+        Ok(other) => bail!(
+            "daemon returned unexpected OAuth completion response: {}",
+            other.wire_tag()
+        ),
         Err(error) => bail!("daemon rejected OAuth completion: {error}"),
     }
 }
@@ -1402,7 +1420,10 @@ async fn require_subscription_oauth_acknowledgement(
                 && provider_id == provider
                 && request_hash.len() == 64 => {}
             Ok(other) => {
-                bail!("daemon returned unexpected acknowledgement store response: {other:?}")
+                bail!(
+                    "daemon returned unexpected acknowledgement store response: {}",
+                    other.wire_tag()
+                )
             }
             Err(error) => bail!("daemon rejected subscription acknowledgement store: {error}"),
         }
@@ -1595,7 +1616,7 @@ mod tests {
             Response::WorkspaceTrust {
                 config_generation, ..
             } => config_generation,
-            other => panic!("unexpected workspace trust read: {other:?}"),
+            other => panic!("unexpected workspace trust read: {}", other.wire_tag()),
         };
         match daemon
             .client
@@ -1609,7 +1630,7 @@ mod tests {
             .expect("workspace trust set response")
         {
             Response::WorkspaceTrustSet { .. } => {}
-            other => panic!("unexpected workspace trust set: {other:?}"),
+            other => panic!("unexpected workspace trust set: {}", other.wire_tag()),
         }
     }
 

@@ -125,7 +125,8 @@ async fn store_credential_via_daemon(
             Ok(StoreCredentialOutcome::AlreadyLoggedIn { email, server_url })
         }
         Ok(Ok(other)) => anyhow::bail!(
-            "daemon returned unexpected response to FlyCockpit credential store: {other:?}"
+            "daemon returned unexpected response to FlyCockpit credential store: {}",
+            other.wire_tag()
         ),
         Ok(Err(error)) => anyhow::bail!("daemon rejected FlyCockpit credential store: {error}"),
         Err(error) => anyhow::bail!("FlyCockpit credential RPC failed: {error}"),
@@ -144,7 +145,8 @@ async fn clear_credential_via_daemon() -> Result<ClearCredentialOutcome> {
         Ok(Ok(Response::FlycockpitCleared { .. })) => Ok(ClearCredentialOutcome::Cleared),
         Ok(Ok(Response::FlycockpitNotLoggedIn)) => Ok(ClearCredentialOutcome::NotLoggedIn),
         Ok(Ok(other)) => anyhow::bail!(
-            "daemon returned unexpected response to FlyCockpit credential clear: {other:?}"
+            "daemon returned unexpected response to FlyCockpit credential clear: {}",
+            other.wire_tag()
         ),
         Ok(Err(error)) => anyhow::bail!("daemon rejected FlyCockpit credential clear: {error}"),
         Err(error) => anyhow::bail!("FlyCockpit credential clear RPC failed: {error}"),
@@ -162,7 +164,8 @@ async fn set_connector_enabled_via_daemon(enabled: bool) -> Result<()> {
     {
         Ok(Ok(Response::Ack)) => Ok(()),
         Ok(Ok(other)) => anyhow::bail!(
-            "daemon returned unexpected response to FlyCockpit remote access update: {other:?}"
+            "daemon returned unexpected response to FlyCockpit remote access update: {}",
+            other.wire_tag()
         ),
         Ok(Err(error)) => anyhow::bail!("daemon rejected FlyCockpit remote access update: {error}"),
         Err(error) => anyhow::bail!("FlyCockpit remote access update RPC failed: {error}"),
@@ -181,7 +184,8 @@ async fn sync_org_policy_via_daemon()
     {
         Ok(Ok(Response::FlycockpitOrgSync { outcome })) => Ok(outcome),
         Ok(Ok(other)) => anyhow::bail!(
-            "daemon returned unexpected response to FlyCockpit organization policy sync: {other:?}"
+            "daemon returned unexpected response to FlyCockpit organization policy sync: {}",
+            other.wire_tag()
         ),
         Ok(Err(error)) => {
             anyhow::bail!("daemon rejected FlyCockpit organization policy sync: {error}")
@@ -203,7 +207,8 @@ async fn enroll_org_sync_via_daemon(org_id: &str) -> Result<()> {
     {
         Ok(Ok(Response::Ack)) => Ok(()),
         Ok(Ok(other)) => anyhow::bail!(
-            "daemon returned unexpected response to FlyCockpit organization enrollment: {other:?}"
+            "daemon returned unexpected response to FlyCockpit organization enrollment: {}",
+            other.wire_tag()
         ),
         Ok(Err(error)) => {
             anyhow::bail!("daemon rejected FlyCockpit organization enrollment: {error}")
@@ -219,7 +224,8 @@ pub async fn whoami() -> Result<()> {
     let account = match daemon.client.request(Request::GetFlycockpitAccount).await {
         Ok(Ok(Response::FlycockpitAccount { account })) => account,
         Ok(Ok(other)) => anyhow::bail!(
-            "daemon returned unexpected response to FlyCockpit account query: {other:?}"
+            "daemon returned unexpected response to FlyCockpit account query: {}",
+            other.wire_tag()
         ),
         Ok(Err(error)) => anyhow::bail!("daemon rejected FlyCockpit account query: {error}"),
         Err(error) => anyhow::bail!("FlyCockpit account RPC failed: {error}"),

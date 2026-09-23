@@ -44,7 +44,8 @@ async fn history_scope(args: HistoryScopeArgs) -> Result<()> {
             Ok(())
         }
         other => anyhow::bail!(
-            "daemon returned unexpected response to workspace history scope: {other:?}"
+            "daemon returned unexpected response to workspace history scope: {}",
+            other.wire_tag()
         ),
     }
 }
@@ -64,7 +65,10 @@ async fn status(args: TrustStatusArgs) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("daemon rejected workspace trust request: {error}"))?;
     let mode = match response {
         Response::WorkspaceTrust { mode, .. } => mode,
-        other => anyhow::bail!("daemon returned unexpected response to workspace trust: {other:?}"),
+        other => anyhow::bail!(
+            "daemon returned unexpected response to workspace trust: {}",
+            other.wire_tag()
+        ),
     };
     print!("{}", render_status(&trust_root, mode.as_ref()));
     Ok(())
@@ -93,7 +97,10 @@ async fn set(args: TrustSetArgs) -> Result<()> {
             config_generation, ..
         } => config_generation,
         other => {
-            anyhow::bail!("daemon returned unexpected response to startup disclosures: {other:?}")
+            anyhow::bail!(
+                "daemon returned unexpected response to startup disclosures: {}",
+                other.wire_tag()
+            )
         }
     };
     let response = client
@@ -108,7 +115,10 @@ async fn set(args: TrustSetArgs) -> Result<()> {
     match response {
         Response::WorkspaceTrustSet { .. } => {}
         other => {
-            anyhow::bail!("daemon returned unexpected response to workspace trust set: {other:?}")
+            anyhow::bail!(
+                "daemon returned unexpected response to workspace trust set: {}",
+                other.wire_tag()
+            )
         }
     }
     // Fetch the updated decision through the daemon RPC for display — the
@@ -122,7 +132,10 @@ async fn set(args: TrustSetArgs) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("daemon rejected workspace trust request: {error}"))?;
     let mode = match trust_response {
         Response::WorkspaceTrust { mode, .. } => mode,
-        other => anyhow::bail!("daemon returned unexpected response to workspace trust: {other:?}"),
+        other => anyhow::bail!(
+            "daemon returned unexpected response to workspace trust: {}",
+            other.wire_tag()
+        ),
     };
     let mode = mode.ok_or_else(|| {
         anyhow::anyhow!(

@@ -121,7 +121,10 @@ async fn enforce_noninteractive_workspace_trust_via_daemon(
                 set,
                 crate::daemon::proto::Response::WorkspaceTrustSet { .. }
             ) {
-                bail!("daemon returned unexpected workspace trust persist response: {set:?}");
+                bail!(
+                    "daemon returned unexpected workspace trust persist response: {}",
+                    set.wire_tag()
+                );
             }
             crate::config::trust::set_runtime_policy(
                 trust_root,
@@ -129,7 +132,10 @@ async fn enforce_noninteractive_workspace_trust_via_daemon(
             );
             return Ok(());
         }
-        other => bail!("daemon returned unexpected response to workspace trust: {other:?}"),
+        other => bail!(
+            "daemon returned unexpected response to workspace trust: {}",
+            other.wire_tag()
+        ),
     };
     use crate::daemon::proto::WorkspaceTrustMode as ProtoMode;
     let runtime_mode = match mode {
@@ -169,7 +175,10 @@ async fn resolve_requested_session_via_daemon(
             .map_err(|error| anyhow::anyhow!("daemon rejected session lookup: {error}"))?;
         let sessions = match response {
             crate::daemon::proto::Response::Sessions { sessions } => sessions,
-            other => bail!("daemon returned unexpected response to session lookup: {other:?}"),
+            other => bail!(
+                "daemon returned unexpected response to session lookup: {}",
+                other.wire_tag()
+            ),
         };
         let session = sessions
             .iter()
@@ -219,7 +228,10 @@ async fn resolve_requested_session_via_daemon(
         .map_err(|error| anyhow::anyhow!("daemon rejected session list: {error}"))?;
     let sessions = match response {
         crate::daemon::proto::Response::Sessions { sessions } => sessions,
-        other => bail!("daemon returned unexpected response to session list: {other:?}"),
+        other => bail!(
+            "daemon returned unexpected response to session list: {}",
+            other.wire_tag()
+        ),
     };
     sessions
         .first()
@@ -564,7 +576,7 @@ pub(crate) async fn attach_send_pump(
             session_entry_mode,
             repair_required.map(|repair| *repair),
         ),
-        other => anyhow::bail!("unexpected attach response: {other:?}"),
+        other => anyhow::bail!("unexpected attach response: {}", other.wire_tag()),
     };
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
@@ -1632,7 +1644,7 @@ async fn is_processing(client: &ScopedDaemonClient<'_>, session_id: Uuid) -> Res
         Response::SessionLiveStatus { statuses } => Ok(statuses
             .into_iter()
             .any(|s| s.session_id == session_id && s.processing)),
-        other => anyhow::bail!("unexpected live-status response: {other:?}"),
+        other => anyhow::bail!("unexpected live-status response: {}", other.wire_tag()),
     }
 }
 

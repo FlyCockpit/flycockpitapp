@@ -48,7 +48,10 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
         .context("requesting model fetch from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected model fetch request: {error}"))?;
     let Response::ProviderModelsFetched { results, .. } = response else {
-        bail!("daemon returned unexpected response to model fetch request: {response:?}");
+        bail!(
+            "daemon returned unexpected response to model fetch request: {}",
+            response.wire_tag()
+        );
     };
     if results.is_empty() {
         println!("no providers configured");

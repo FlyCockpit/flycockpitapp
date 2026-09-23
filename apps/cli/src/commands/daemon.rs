@@ -355,12 +355,20 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     ..
                 } = status
             {
-                if json {
-                    let worker_status = DaemonClient::connect(&paths.socket)
-                        .await?
-                        .request_ok(Request::DaemonStatus)
-                        .await?;
-                    let Response::DaemonStatus {
+                let supervisor = SupervisorStatus {
+                    supervisor_pid,
+                    worker_pid,
+                    generation,
+                    uptime_ms,
+                    last_handover,
+                };
+                let socket = paths.socket.display().to_string();
+                let worker_status = DaemonClient::connect(&paths.socket)
+                    .await?
+                    .request_ok(Request::DaemonStatus)
+                    .await?;
+                match worker_status {
+                    Response::DaemonStatus {
                         pid,
                         uptime_secs,
                         active_sessions,
@@ -371,65 +379,57 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                         database_path,
                         schema_version,
                         pending_recovery_sessions,
-                    } = worker_status
-                    else {
-                        bail!("unexpected supervised daemon status response: {worker_status:?}");
-                    };
-                    let mut value = running_json_status(RunningJsonStatus {
-                        pid,
-                        uptime_secs,
-                        active_sessions,
-                        paused_sessions,
-                        socket_path,
-                        daemon_version,
-                        protocol_version,
-                        database_path,
-                        schema_version,
-                        pending_recovery_sessions,
-                    });
-                    let object = value
-                        .as_object_mut()
-                        .expect("running daemon status is a JSON object");
-                    object.insert("supervisor_pid".into(), supervisor_pid.into());
-                    object.insert("worker_pid".into(), worker_pid.into());
-                    object.insert("generation".into(), generation.into());
-                    object.insert("uptime_ms".into(), uptime_ms.into());
-                    object.insert(
-                        "last_handover".into(),
-                        last_handover
-                            .map(serde_json::Value::String)
-                            .unwrap_or(serde_json::Value::Null),
-                    );
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                } else {
-                    let outcome = last_handover.as_deref().unwrap_or("none");
-                    let pending_recovery_sessions = match DaemonClient::connect(&paths.socket)
-                        .await?
-                        .request_ok(Request::DaemonStatus)
-                        .await?
-                    {
-                        Response::DaemonStatus {
-                            pending_recovery_sessions,
-                            ..
-                        } => pending_recovery_sessions,
-                        response => {
-                            bail!("unexpected supervised daemon status response: {response:?}")
+                    } => {
+                        if json {
+                            let mut value = running_json_status(RunningJsonStatus {
+                                pid,
+                                uptime_secs,
+                                active_sessions,
+                                paused_sessions,
+                                socket_path,
+                                daemon_version,
+                                protocol_version,
+                                database_path,
+                                schema_version,
+                                pending_recovery_sessions,
+                            });
+                            insert_supervisor_json_fields(&mut value, &supervisor);
+                            println!("{}", serde_json::to_string_pretty(&value)?);
+                        } else {
+                            println!(
+                                "{}",
+                                render_supervised_running_status(
+                                    &socket,
+                                    &supervisor,
+                                    &pending_recovery_sessions,
+                                )
+                            );
                         }
-                    };
-                    let pending = if pending_recovery_sessions.is_empty() {
-                        "none".to_string()
-                    } else {
-                        pending_recovery_sessions
-                            .iter()
-                            .map(uuid::Uuid::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    };
-                    println!(
-                        "daemon: running\n  supervisor pid: {supervisor_pid}\n  worker pid: {worker_pid}\n  generation: {generation}\n  uptime: {:.3}s\n  last handover: {outcome}\n  pending recovery: {pending}\n  socket: {}",
-                        uptime_ms as f64 / 1000.0,
-                        paths.socket.display(),
-                    );
+                    }
+                    Response::LockedBootstrapHello(hello) => {
+                        if json {
+                            let mut value = awaiting_onboarding_json_status(
+                                &socket,
+                                hello.protocol_version,
+                                hello.bootstrap_available,
+                            );
+                            insert_supervisor_json_fields(&mut value, &supervisor);
+                            println!("{}", serde_json::to_string_pretty(&value)?);
+                        } else {
+                            println!(
+                                "{}",
+                                render_awaiting_onboarding_status(
+                                    &socket,
+                                    hello.protocol_version,
+                                    Some(&supervisor),
+                                )
+                            );
+                        }
+                    }
+                    other => bail!(
+                        "unexpected supervised daemon status response: {}",
+                        other.wire_tag()
+                    ),
                 }
                 return Ok(());
             }
@@ -463,7 +463,12 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     }
                     RunningStatusVersionRead::BootstrapLocked { protocol_version } => {
                         println!(
-                            "daemon: running; onboarding bootstrap is in progress (protocol v{protocol_version})"
+                            "{}",
+                            render_awaiting_onboarding_status(
+                                &probe.paths.socket.display().to_string(),
+                                protocol_version,
+                                None,
+                            )
                         );
                     }
                     RunningStatusVersionRead::ProtocolMismatch => {
@@ -641,33 +646,37 @@ async fn print_json_status(probe: &crate::daemon::DaemonProbe) -> Result<()> {
             Ok(response) => response,
             Err(error) => bail!("daemon error: {error}"),
         };
-        let Response::DaemonStatus {
-            pid,
-            uptime_secs,
-            active_sessions,
-            socket_path,
-            daemon_version,
-            protocol_version,
-            paused_sessions,
-            database_path,
-            schema_version,
-            pending_recovery_sessions,
-        } = response
-        else {
-            bail!("unexpected daemon status response: {response:?}");
+        value = match response {
+            Response::DaemonStatus {
+                pid,
+                uptime_secs,
+                active_sessions,
+                socket_path,
+                daemon_version,
+                protocol_version,
+                paused_sessions,
+                database_path,
+                schema_version,
+                pending_recovery_sessions,
+            } => running_json_status(RunningJsonStatus {
+                pid,
+                uptime_secs,
+                active_sessions,
+                paused_sessions,
+                socket_path,
+                daemon_version,
+                protocol_version,
+                database_path,
+                schema_version,
+                pending_recovery_sessions,
+            }),
+            Response::LockedBootstrapHello(hello) => awaiting_onboarding_json_status(
+                &probe.paths.socket.display().to_string(),
+                hello.protocol_version,
+                hello.bootstrap_available,
+            ),
+            other => bail!("unexpected daemon status response: {}", other.wire_tag()),
         };
-        value = running_json_status(RunningJsonStatus {
-            pid,
-            uptime_secs,
-            active_sessions,
-            paused_sessions,
-            socket_path,
-            daemon_version,
-            protocol_version,
-            database_path,
-            schema_version,
-            pending_recovery_sessions,
-        });
     }
 
     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -735,7 +744,8 @@ async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
             protocol_version: hello.protocol_version,
         },
         other => RunningStatusVersionRead::ReadFailed(format!(
-            "unexpected daemon status response: {other:?}"
+            "unexpected daemon status response: {}",
+            other.wire_tag()
         )),
     }
 }
@@ -811,6 +821,7 @@ fn running_json_status(status: RunningJsonStatus) -> serde_json::Value {
     let version_skew_reason = version_skew_reason(&status.daemon_version, status.protocol_version);
     serde_json::json!({
         "status": "running",
+        "state": DAEMON_STATE_READY,
         "pid": status.pid,
         "uptime_secs": status.uptime_secs,
         "active_sessions": status.active_sessions,
@@ -823,6 +834,123 @@ fn running_json_status(status: RunningJsonStatus) -> serde_json::Value {
         "pending_recovery_sessions": status.pending_recovery_sessions,
         "version_skew": version_skew_reason.is_some(),
         "version_skew_reason": version_skew_reason,
+    })
+}
+
+/// `state` of a running daemon whose worker serves normal requests.
+const DAEMON_STATE_READY: &str = "ready";
+/// `state` of a running daemon whose worker is locked behind first-run
+/// onboarding and answers requests with a locked-bootstrap hello.
+const DAEMON_STATE_AWAITING_ONBOARDING: &str = "awaiting_onboarding";
+
+/// Supervisor admin `Status` fields shown alongside the worker's answer.
+struct SupervisorStatus {
+    supervisor_pid: u32,
+    worker_pid: u32,
+    generation: u64,
+    uptime_ms: u64,
+    last_handover: Option<String>,
+}
+
+fn insert_supervisor_json_fields(value: &mut serde_json::Value, supervisor: &SupervisorStatus) {
+    let object = value
+        .as_object_mut()
+        .expect("running daemon status is a JSON object");
+    object.insert("supervisor_pid".into(), supervisor.supervisor_pid.into());
+    object.insert("worker_pid".into(), supervisor.worker_pid.into());
+    object.insert("generation".into(), supervisor.generation.into());
+    object.insert("uptime_ms".into(), supervisor.uptime_ms.into());
+    object.insert(
+        "last_handover".into(),
+        supervisor
+            .last_handover
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    // The worker cannot report its own pid while it is locked; the
+    // supervisor's view of the worker pid is authoritative either way.
+    if object.get("pid").is_some_and(serde_json::Value::is_null) {
+        object.insert("pid".into(), supervisor.worker_pid.into());
+    }
+}
+
+fn render_supervisor_lines(output: &mut String, supervisor: &SupervisorStatus) {
+    output.push_str(&format!(
+        "\n  supervisor pid: {}\n  worker pid: {}\n  generation: {}\n  uptime: {:.3}s\n  last handover: {}",
+        supervisor.supervisor_pid,
+        supervisor.worker_pid,
+        supervisor.generation,
+        supervisor.uptime_ms as f64 / 1000.0,
+        supervisor.last_handover.as_deref().unwrap_or("none"),
+    ));
+}
+
+fn render_supervised_running_status(
+    socket: &str,
+    supervisor: &SupervisorStatus,
+    pending_recovery_sessions: &[uuid::Uuid],
+) -> String {
+    let mut output = "daemon: running".to_string();
+    render_supervisor_lines(&mut output, supervisor);
+    let pending = if pending_recovery_sessions.is_empty() {
+        "none".to_string()
+    } else {
+        pending_recovery_sessions
+            .iter()
+            .map(uuid::Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    output.push_str(&format!(
+        "\n  pending recovery: {pending}\n  socket: {socket}"
+    ));
+    output
+}
+
+/// Text status for a daemon whose worker is waiting for first-run
+/// onboarding. The locked hello is redacted metadata; only its protocol
+/// version is shown (never the capability snapshot).
+fn render_awaiting_onboarding_status(
+    socket: &str,
+    protocol_version: u32,
+    supervisor: Option<&SupervisorStatus>,
+) -> String {
+    let mut output = "daemon: running, awaiting onboarding".to_string();
+    if let Some(supervisor) = supervisor {
+        render_supervisor_lines(&mut output, supervisor);
+    }
+    output.push_str(&format!(
+        "\n  protocol: v{protocol_version}\n  socket: {socket}"
+    ));
+    output
+}
+
+/// JSON status for a daemon awaiting onboarding. Keeps every key of
+/// [`running_json_status`] so existing consumers still find them; values the
+/// locked worker does not report are `null`, and `state` distinguishes it
+/// from a ready daemon.
+fn awaiting_onboarding_json_status(
+    socket_path: &str,
+    protocol_version: u32,
+    bootstrap_available: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "running",
+        "state": DAEMON_STATE_AWAITING_ONBOARDING,
+        "bootstrap_available": bootstrap_available,
+        "pid": serde_json::Value::Null,
+        "uptime_secs": serde_json::Value::Null,
+        "active_sessions": serde_json::Value::Null,
+        "paused_sessions": serde_json::Value::Null,
+        "socket_path": socket_path,
+        "daemon_version": serde_json::Value::Null,
+        "protocol_version": protocol_version,
+        "database_path": serde_json::Value::Null,
+        "schema_version": serde_json::Value::Null,
+        "pending_recovery_sessions": serde_json::Value::Null,
+        "version_skew": false,
+        "version_skew_reason": serde_json::Value::Null,
     })
 }
 
@@ -903,10 +1031,12 @@ fn restart_started_message(restarted: bool, pid: u32, socket: &std::path::Path) 
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonVersions, RunningJsonStatus, incompatible_protocol_json_status,
-        remaining_command_budget_at, render_incompatible_protocol_status, render_running_status,
-        restart_should_stop, restart_started_message, running_json_status, validate_grace,
-        version_skew_reason,
+        DaemonVersions, RunningJsonStatus, SupervisorStatus, awaiting_onboarding_json_status,
+        incompatible_protocol_json_status, insert_supervisor_json_fields,
+        remaining_command_budget_at, render_awaiting_onboarding_status,
+        render_incompatible_protocol_status, render_running_status,
+        render_supervised_running_status, restart_should_stop, restart_started_message,
+        running_json_status, validate_grace, version_skew_reason,
     };
     use crate::daemon::DaemonStatus;
     use crate::daemon::proto;
@@ -1189,6 +1319,7 @@ mod tests {
                 "protocol_version",
                 "schema_version",
                 "socket_path",
+                "state",
                 "status",
                 "uptime_secs",
                 "version_skew",
@@ -1196,6 +1327,7 @@ mod tests {
             ]
         );
         assert_eq!(value["status"], "running");
+        assert_eq!(value["state"], "ready");
         assert!(value["pid"].is_u64());
         assert!(value["uptime_secs"].is_u64());
         assert!(value["active_sessions"].is_u64());
@@ -1217,5 +1349,162 @@ mod tests {
                 proto::DAEMON_VERSION
             )
         );
+    }
+
+    fn supervisor_status() -> SupervisorStatus {
+        SupervisorStatus {
+            supervisor_pid: 111,
+            worker_pid: 222,
+            generation: 3,
+            uptime_ms: 4_500,
+            last_handover: None,
+        }
+    }
+
+    #[test]
+    fn supervised_running_status_text_lists_supervisor_and_worker() {
+        let output =
+            render_supervised_running_status("/tmp/cockpit.sock", &supervisor_status(), &[]);
+
+        assert_eq!(
+            output,
+            "daemon: running\n  supervisor pid: 111\n  worker pid: 222\n  generation: 3\n  uptime: 4.500s\n  last handover: none\n  pending recovery: none\n  socket: /tmp/cockpit.sock"
+        );
+    }
+
+    #[test]
+    fn awaiting_onboarding_status_text_names_supervisor_and_worker_pids() {
+        let output = render_awaiting_onboarding_status(
+            "/tmp/cockpit.sock",
+            proto::PROTOCOL_VERSION,
+            Some(&supervisor_status()),
+        );
+
+        assert_eq!(
+            output,
+            format!(
+                "daemon: running, awaiting onboarding\n  supervisor pid: 111\n  worker pid: 222\n  generation: 3\n  uptime: 4.500s\n  last handover: none\n  protocol: v{}\n  socket: /tmp/cockpit.sock",
+                proto::PROTOCOL_VERSION
+            )
+        );
+        assert!(!output.contains("LockedBootstrapHello"));
+        assert!(!output.contains("host_capabilities"));
+    }
+
+    #[test]
+    fn awaiting_onboarding_status_text_without_supervisor_omits_pids() {
+        let output = render_awaiting_onboarding_status("/tmp/cockpit.sock", 1, None);
+
+        assert_eq!(
+            output,
+            "daemon: running, awaiting onboarding\n  protocol: v1\n  socket: /tmp/cockpit.sock"
+        );
+    }
+
+    #[test]
+    fn awaiting_onboarding_status_json_keeps_running_keys_and_adds_state() {
+        let running_keys = {
+            let value = running_json_status(RunningJsonStatus {
+                pid: 1,
+                uptime_secs: 1,
+                active_sessions: 0,
+                paused_sessions: 0,
+                socket_path: "/tmp/cockpit.sock".to_string(),
+                daemon_version: proto::DAEMON_VERSION.to_string(),
+                protocol_version: proto::PROTOCOL_VERSION,
+                database_path: "/tmp/cockpit.db".to_string(),
+                schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+                pending_recovery_sessions: Vec::new(),
+            });
+            value
+                .as_object()
+                .expect("json object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut value =
+            awaiting_onboarding_json_status("/tmp/cockpit.sock", proto::PROTOCOL_VERSION, true);
+        insert_supervisor_json_fields(&mut value, &supervisor_status());
+        let object = value.as_object().expect("json object");
+
+        for key in &running_keys {
+            assert!(
+                object.contains_key(key),
+                "awaiting-onboarding JSON lacks `{key}`"
+            );
+        }
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "active_sessions",
+                "bootstrap_available",
+                "daemon_version",
+                "database_path",
+                "generation",
+                "last_handover",
+                "paused_sessions",
+                "pending_recovery_sessions",
+                "pid",
+                "protocol_version",
+                "schema_version",
+                "socket_path",
+                "state",
+                "status",
+                "supervisor_pid",
+                "uptime_ms",
+                "uptime_secs",
+                "version_skew",
+                "version_skew_reason",
+                "worker_pid",
+            ]
+        );
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["state"], "awaiting_onboarding");
+        assert_eq!(value["bootstrap_available"], true);
+        assert_eq!(value["supervisor_pid"], 111);
+        assert_eq!(value["worker_pid"], 222);
+        assert_eq!(value["pid"], 222);
+        assert_eq!(value["generation"], 3);
+        assert_eq!(value["uptime_ms"], 4_500);
+        assert!(value["last_handover"].is_null());
+        assert_eq!(value["protocol_version"], proto::PROTOCOL_VERSION);
+        assert_eq!(value["socket_path"], "/tmp/cockpit.sock");
+        assert!(value["daemon_version"].is_null());
+        assert!(value["schema_version"].is_null());
+        assert_eq!(value["version_skew"], false);
+    }
+
+    #[test]
+    fn awaiting_onboarding_status_json_without_supervisor_has_null_pid() {
+        let value = awaiting_onboarding_json_status("/tmp/cockpit.sock", 1, false);
+
+        assert_eq!(value["state"], "awaiting_onboarding");
+        assert_eq!(value["bootstrap_available"], false);
+        assert!(value["pid"].is_null());
+        assert!(value.get("supervisor_pid").is_none());
+    }
+
+    #[test]
+    fn supervisor_json_fields_do_not_override_a_worker_reported_pid() {
+        let mut value = running_json_status(RunningJsonStatus {
+            pid: 999,
+            uptime_secs: 1,
+            active_sessions: 0,
+            paused_sessions: 0,
+            socket_path: "/tmp/cockpit.sock".to_string(),
+            daemon_version: proto::DAEMON_VERSION.to_string(),
+            protocol_version: proto::PROTOCOL_VERSION,
+            database_path: "/tmp/cockpit.db".to_string(),
+            schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+            pending_recovery_sessions: Vec::new(),
+        });
+        insert_supervisor_json_fields(&mut value, &supervisor_status());
+
+        assert_eq!(value["pid"], 999);
+        assert_eq!(value["worker_pid"], 222);
+        assert_eq!(value["state"], "ready");
     }
 }

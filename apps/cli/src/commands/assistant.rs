@@ -56,7 +56,10 @@ async fn set_primary_soul_edit_mode(mode: AssistantSoulEditMode) -> Result<()> {
         .context("updating built-in Assistant SOUL edit mode")?
         .map_err(|error| anyhow::anyhow!("daemon rejected built-in Assistant setting: {error}"))?;
     let Response::PrimaryAssistantSoulEditMode { soul_edit_mode } = response else {
-        bail!("daemon returned unexpected built-in Assistant setting response: {response:?}");
+        bail!(
+            "daemon returned unexpected built-in Assistant setting response: {}",
+            response.wire_tag()
+        );
     };
     println!("Built-in Assistant SOUL edit mode: {soul_edit_mode}");
     Ok(())
@@ -79,7 +82,10 @@ async fn media(command: AssistantMediaCommand) -> Result<()> {
                     anyhow::anyhow!("daemon rejected media reservation diagnosis: {error}")
                 })?;
             let Response::MediaReservationDiagnosis { diagnosis_json } = response else {
-                bail!("daemon returned unexpected response to media diagnosis: {response:?}");
+                bail!(
+                    "daemon returned unexpected response to media diagnosis: {}",
+                    response.wire_tag()
+                );
             };
             // The daemon already serialized the diagnosis (no secret bytes).
             println!("{diagnosis_json}");
@@ -109,7 +115,10 @@ async fn media(command: AssistantMediaCommand) -> Result<()> {
                     anyhow::anyhow!("daemon rejected media reservation repair: {error}")
                 })?;
             let Response::MediaReservationRepaired { outcome } = response else {
-                bail!("daemon returned unexpected response to media repair: {response:?}");
+                bail!(
+                    "daemon returned unexpected response to media repair: {}",
+                    response.wire_tag()
+                );
             };
             println!("{outcome}");
         }
@@ -243,7 +252,10 @@ async fn persist_new_assistant(spec: CreateAssistantSpec) -> Result<(String, Str
         .context("requesting assistant persist from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected assistant persist: {error}"))?;
     let Response::AssistantUpserted { assistant } = response else {
-        bail!("daemon returned unexpected response to assistant persist: {response:?}");
+        bail!(
+            "daemon returned unexpected response to assistant persist: {}",
+            response.wire_tag()
+        );
     };
     Ok((assistant.name, assistant.home_dir))
 }
@@ -260,7 +272,10 @@ async fn list() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("daemon rejected assistant list: {error}"))?;
     let assistants = match response {
         Response::Assistants { assistants, .. } => assistants,
-        other => bail!("daemon returned unexpected response to assistant list: {other:?}"),
+        other => bail!(
+            "daemon returned unexpected response to assistant list: {}",
+            other.wire_tag()
+        ),
     };
     if assistants.is_empty() {
         println!("no assistants");
@@ -406,7 +421,10 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
         ..
     } = response
     else {
-        bail!("daemon returned unexpected response to assistant delete: {response:?}");
+        bail!(
+            "daemon returned unexpected response to assistant delete: {}",
+            response.wire_tag()
+        );
     };
     let expected_intent = cockpit_proto::assistant_mutation_intent_hash(
         &project_root,
@@ -475,7 +493,10 @@ async fn fetch_assistant_inventory(
         config_generation,
     } = response
     else {
-        bail!("daemon returned unexpected response to assistant inventory: {response:?}");
+        bail!(
+            "daemon returned unexpected response to assistant inventory: {}",
+            response.wire_tag()
+        );
     };
     Ok(assistants
         .into_iter()
@@ -495,7 +516,10 @@ async fn fetch_assistant(
         .context("requesting assistant from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected assistant query: {error}"))?;
     let Response::Assistant { assistant } = response else {
-        bail!("daemon returned unexpected response to assistant query: {response:?}");
+        bail!(
+            "daemon returned unexpected response to assistant query: {}",
+            response.wire_tag()
+        );
     };
     Ok(assistant)
 }

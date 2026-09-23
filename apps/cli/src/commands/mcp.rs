@@ -256,7 +256,10 @@ async fn add(args: McpAddArgs) -> Result<()> {
             && returned_intent_hash == mutation_intent_hash
             && cockpit_proto::is_opaque_authority_token(&result_revision)
             && config_generation > 0 => {}
-        Ok(other) => bail!("daemon returned unexpected response to MCP config save: {other:?}"),
+        Ok(other) => bail!(
+            "daemon returned unexpected response to MCP config save: {}",
+            other.wire_tag()
+        ),
         Err(error) => bail!("daemon rejected MCP config save: {error}"),
     }
     println!(

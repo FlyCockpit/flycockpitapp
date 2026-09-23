@@ -28,7 +28,8 @@ pub async fn run(args: DreamArgs, no_sandbox: bool, project: Option<&Path>) -> R
                     .context("running knowledge dream")?;
                 let Response::KnowledgeDreamRuns { results } = response else {
                     anyhow::bail!(
-                        "daemon returned unexpected response to knowledge dream run: {response:?}"
+                        "daemon returned unexpected response to knowledge dream run: {}",
+                        response.wire_tag()
                     );
                 };
                 for line in render_results(&results) {

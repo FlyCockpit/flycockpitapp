@@ -37,7 +37,10 @@ async fn history_scope(args: ConfigHistoryScopeArgs) -> Result<()> {
         mut inbound,
     } = current
     else {
-        anyhow::bail!("daemon returned unexpected history scope response: {current:?}");
+        anyhow::bail!(
+            "daemon returned unexpected history scope response: {}",
+            current.wire_tag()
+        );
     };
     let changed = args.outbound.is_some() || args.inbound.is_some();
     if let Some(value) = args.outbound {
@@ -59,7 +62,10 @@ async fn history_scope(args: ConfigHistoryScopeArgs) -> Result<()> {
             saved,
             crate::daemon::proto::Response::WorkspaceHistoryScope { .. }
         ) {
-            anyhow::bail!("daemon returned unexpected history scope save response: {saved:?}");
+            anyhow::bail!(
+                "daemon returned unexpected history scope save response: {}",
+                saved.wire_tag()
+            );
         }
     }
     println!("outbound: {outbound}\ninbound: {inbound}");
@@ -90,7 +96,10 @@ async fn image_spend(args: ImageSpendArgs) -> Result<()> {
             crate::daemon::proto::Response::ImageSpendPolicy { policy_version, .. } => {
                 policy_version
             }
-            other => bail!("daemon returned unexpected image spend response: {other:?}"),
+            other => bail!(
+                "daemon returned unexpected image spend response: {}",
+                other.wire_tag()
+            ),
         };
         let saved = daemon
             .client
@@ -107,7 +116,10 @@ async fn image_spend(args: ImageSpendArgs) -> Result<()> {
             ..
         } = saved
         else {
-            bail!("daemon returned unexpected image spend save response: {saved:?}");
+            bail!(
+                "daemon returned unexpected image spend save response: {}",
+                saved.wire_tag()
+            );
         };
         println!("saved image spend policy version {policy_version}");
         return Ok(());
@@ -118,7 +130,10 @@ async fn image_spend(args: ImageSpendArgs) -> Result<()> {
         .await?
         .map_err(|error| anyhow::anyhow!("daemon rejected image spend read: {error}"))?;
     let crate::daemon::proto::Response::ImageSpendPolicy { settings, .. } = response else {
-        bail!("daemon returned unexpected image spend response: {response:?}");
+        bail!(
+            "daemon returned unexpected image spend response: {}",
+            response.wire_tag()
+        );
     };
     let settings = settings.unwrap_or_default();
     println!("{}", serde_json::to_string_pretty(&settings)?);
@@ -143,7 +158,10 @@ async fn export_policy(args: ConfigExportPolicyArgs) -> Result<()> {
         .await?
         .map_err(|error| anyhow::anyhow!("daemon rejected policy export: {error}"))?;
     let crate::daemon::proto::Response::PolicyExported { bundle_json: json } = response else {
-        anyhow::bail!("daemon returned unexpected policy export response: {response:?}");
+        anyhow::bail!(
+            "daemon returned unexpected policy export response: {}",
+            response.wire_tag()
+        );
     };
     match args.output {
         Some(path) => {
@@ -191,7 +209,10 @@ async fn import_policy(args: ConfigImportPolicyArgs) -> Result<()> {
         provider_count,
     } = response
     else {
-        anyhow::bail!("daemon returned unexpected policy import response: {response:?}");
+        anyhow::bail!(
+            "daemon returned unexpected policy import response: {}",
+            response.wire_tag()
+        );
     };
 
     let mode = if args.replace { "replaced" } else { "merged" };

@@ -1448,6 +1448,10 @@ pub fn daemon_pid(paths: &DaemonPaths) -> Option<u32> {
 /// reusable numeric PID.
 pub struct RestartReleaseWitness {
     expected_pid: Option<u32>,
+    /// A PID file existed at capture but was not a receipt this build parses
+    /// (e.g. an older build's header). No PID or process handle is derived
+    /// from it; release is observed from metadata disappearance instead.
+    unrecognized_metadata: bool,
     lifetime: Option<cockpit_host::daemon_lifecycle::DaemonLifetimeReleaseWitness>,
     #[cfg(any(
         target_os = "linux",
@@ -1482,8 +1486,12 @@ pub fn capture_restart_release(
         }
         _ => None,
     };
+    let unrecognized_metadata = expected_pid.is_none()
+        && cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file).is_none()
+        && daemon_pid_file_present(&paths.pid_file);
     RestartReleaseWitness {
         expected_pid,
+        unrecognized_metadata,
         lifetime,
         #[cfg(any(
             target_os = "linux",
@@ -1514,15 +1522,23 @@ pub fn restart_release_timeout(_grace_secs: Option<u64>) -> Duration {
 /// * the previous owner process is dead — its metadata can no longer
 ///   change, so the released state is final right now.
 ///
-/// `timeout` bounds only the degenerate call without a known previous pid
-/// (no liveness signal available). Callers with `expected_pid` never hit it.
+/// `timeout` bounds the calls without a stable process handle. When the PID
+/// file present at capture was not a receipt this build recognizes, there is
+/// no PID to await (and none is ever derived from the unparsed file), so the
+/// wait polls within `timeout` for the complete released state instead; see
+/// [`wait_for_unrecognized_metadata_release`]. With no PID file at all there
+/// is no predecessor evidence and the wait fails closed.
 pub async fn wait_for_restart_release(
     paths: &DaemonPaths,
     witness: RestartReleaseWitness,
     timeout: Duration,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
+    let unrecognized_metadata = witness.unrecognized_metadata;
     let Some(lifetime) = witness.lifetime else {
+        if unrecognized_metadata {
+            return wait_for_unrecognized_metadata_release(paths, deadline).await;
+        }
         return false;
     };
     #[cfg(any(
@@ -1542,6 +1558,36 @@ pub async fn wait_for_restart_release(
     // Without a stable process handle, starting a blocking flock/LockFileEx
     // waiter would outlive timeout or cancellation. Fail closed instead.
     false
+}
+
+/// Poll, bounded by `deadline`, for a predecessor whose PID file this build
+/// could not parse to release everything it owned: the PID file and socket are
+/// gone and the lifetime lock is free. A replacement that publishes new
+/// metadata keeps the state unreleased, so `true` is never reported for a
+/// release that was not observed; `false` means the deadline elapsed first.
+async fn wait_for_unrecognized_metadata_release(
+    paths: &DaemonPaths,
+    deadline: tokio::time::Instant,
+) -> bool {
+    const POLL: Duration = Duration::from_millis(100);
+    loop {
+        if unrecognized_metadata_released(paths) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(remaining.min(POLL)).await;
+    }
+}
+
+fn unrecognized_metadata_released(paths: &DaemonPaths) -> bool {
+    !daemon_pid_file_present(&paths.pid_file)
+        && !paths.socket.exists()
+        && cockpit_host::daemon_lifecycle::capture_daemon_lifetime_release(&paths.pid_file)
+            .and_then(cockpit_host::daemon_lifecycle::DaemonLifetimeReleaseWitness::released)
+            .unwrap_or(false)
 }
 
 fn restart_paths_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
@@ -2917,6 +2963,11 @@ async fn run_foreground_inner_with_boot_db_impl(
             })
     {
         let discovered = discover().await;
+        if discovered.status == DaemonStatus::UnrecognizedPidMetadata {
+            // Fail before contending for the lifetime lock an older build's
+            // daemon may still hold, so the user gets the cleanup steps.
+            return Err(unrecognized_pid_metadata_error(&paths));
+        }
         if discovered.paths.socket != paths.socket
             && matches!(
                 discovered.status,
@@ -3687,23 +3738,44 @@ pub fn stop_with_timeout(paths: &DaemonPaths, timeout: Duration) -> Result<bool>
     let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
         return stop_unrecognized_pid_metadata(paths, timeout);
     };
+    let deadline = std::time::Instant::now() + timeout;
     if matches!(
-        supervisor::request_blocking(paths, supervisor::AdminCommand::Stop),
+        supervisor::request_blocking(
+            paths,
+            supervisor::AdminCommand::Stop,
+            admin_stop_request_budget(timeout),
+        ),
         Ok(supervisor::AdminResponse::Stopping { .. })
     ) {
-        return wait_for_supervisor_admin_stop(paths, Some(&record), timeout);
+        return wait_for_supervisor_admin_stop(
+            paths,
+            Some(&record),
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        );
     }
     #[cfg(target_os = "linux")]
-    return stop_linux(paths, record, timeout);
+    return stop_linux(
+        paths,
+        record,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    );
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    return stop_kqueue_unix(paths, record, timeout);
+    return stop_kqueue_unix(
+        paths,
+        record,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    );
     #[cfg(all(
         unix,
         not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
     ))]
     return stop_unix_without_stable_handle(paths, record);
     #[cfg(windows)]
-    return stop_windows(paths, record, timeout);
+    return stop_windows(
+        paths,
+        record,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    );
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (paths, record);
@@ -3711,6 +3783,23 @@ pub fn stop_with_timeout(paths: &DaemonPaths, timeout: Duration) -> Result<bool>
             "daemon lifecycle metadata exists but this platform has no stable process handle; preserving metadata and refusing numeric signaling"
         )
     }
+}
+
+/// Upper bound on one supervisor admin `Stop` round trip. A live supervisor
+/// answers `Stopping` before it drains, so this only has to cover connect +
+/// one short frame; capping it keeps a wedged admin endpoint from consuming
+/// the budget the kernel-witnessed stop or the release wait still needs.
+const SUPERVISOR_ADMIN_STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn admin_stop_request_budget(remaining: Duration) -> Duration {
+    remaining.min(SUPERVISOR_ADMIN_STOP_REQUEST_TIMEOUT)
+}
+
+/// Guidance error for [`DaemonStatus::UnrecognizedPidMetadata`]: names the PID
+/// file and the manual cleanup steps (or the read error when the file exists
+/// but cannot be read). Nothing is derived from the file's contents.
+pub fn unrecognized_pid_metadata_error(paths: &DaemonPaths) -> anyhow::Error {
+    cockpit_host::daemon_lifecycle::unrecognized_daemon_pid_file_error(&paths.pid_file)
 }
 
 /// Whether a daemon PID file is present at all. Any error other than
@@ -3725,15 +3814,27 @@ fn daemon_pid_file_present(pid_file: &Path) -> bool {
 /// Stop path for a PID file this build cannot parse. The file's contents are
 /// never trusted for a PID: the only lever is the supervisor admin channel,
 /// which proves ownership by answering on the private admin endpoint.
+///
+/// The admin request shares the caller's budget: a supervisor endpoint that
+/// accepts but never answers counts as "not accepted" once it elapses.
 fn stop_unrecognized_pid_metadata(paths: &DaemonPaths, timeout: Duration) -> Result<bool> {
     if !daemon_pid_file_present(&paths.pid_file) {
         return Ok(false);
     }
+    let deadline = std::time::Instant::now() + timeout;
     if matches!(
-        supervisor::request_blocking(paths, supervisor::AdminCommand::Stop),
+        supervisor::request_blocking(
+            paths,
+            supervisor::AdminCommand::Stop,
+            admin_stop_request_budget(timeout),
+        ),
         Ok(supervisor::AdminResponse::Stopping { .. })
     ) {
-        return wait_for_supervisor_admin_stop(paths, None, timeout);
+        return wait_for_supervisor_admin_stop(
+            paths,
+            None,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        );
     }
     if !daemon_pid_file_present(&paths.pid_file) {
         // The owner removed its metadata while we were asking.
@@ -5346,20 +5447,25 @@ mod tests {
     fn older_build_pid_file_stop_fails_closed_with_cleanup_guidance() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
-        // The pre-reset header: a structurally complete receipt this build
-        // does not recognize. Its PID (this test process) must never be
-        // signaled.
-        std::fs::write(
-            &paths.pid_file,
-            format!(
-                "cockpit-daemon-pid-v2\n{}\nexe\nstart:{:016x}:{:016x}\nnonce:{}\n",
-                std::process::id(),
-                1,
-                2,
-                "00".repeat(32)
-            ),
-        )
-        .unwrap();
+        // A genuine current-format receipt naming this test process, with ONLY
+        // the header changed to the pre-reset one: the header alone must make
+        // it unrecognized, and its PID must never be signaled.
+        let receipt = test_pid_receipt(std::process::id());
+        let current = cockpit_host::daemon_lifecycle::render_daemon_pid_file(&receipt);
+        std::fs::write(&paths.pid_file, &current).unwrap();
+        assert_eq!(
+            read_daemon_pid_record(&paths.pid_file),
+            Some(receipt),
+            "the fixture body must be a valid current-format receipt"
+        );
+        let older = current.replacen(
+            cockpit_host::daemon_lifecycle::DAEMON_PID_FILE_HEADER,
+            "cockpit-daemon-pid-v2",
+            1,
+        );
+        assert_ne!(older, current);
+        std::fs::write(&paths.pid_file, older).unwrap();
+        assert_eq!(read_daemon_pid_record(&paths.pid_file), None);
 
         let error = stop_with_timeout(&paths, Duration::from_millis(50))
             .expect_err("an older build's PID file must not read as not running");
@@ -5380,6 +5486,172 @@ mod tests {
             status_for_unreachable_pid(&paths),
             DaemonStatus::UnrecognizedPidMetadata
         );
+    }
+
+    /// Write a genuine current-format receipt with only the header replaced
+    /// by the pre-reset one, as an older build would have left it.
+    #[cfg(unix)]
+    fn write_older_build_pid_file(paths: &DaemonPaths) {
+        let current = cockpit_host::daemon_lifecycle::render_daemon_pid_file(&test_pid_receipt(
+            std::process::id(),
+        ));
+        let older = current.replacen(
+            cockpit_host::daemon_lifecycle::DAEMON_PID_FILE_HEADER,
+            "cockpit-daemon-pid-v2",
+            1,
+        );
+        std::fs::write(&paths.pid_file, older).unwrap();
+        assert_eq!(read_daemon_pid_record(&paths.pid_file), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrecognized_pid_file_stop_bounds_a_hung_admin_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        write_older_build_pid_file(&paths);
+        // Accepts connections (via the backlog) but never answers.
+        let _listener =
+            std::os::unix::net::UnixListener::bind(supervisor::admin_socket(&paths).unwrap())
+                .unwrap();
+
+        let started = std::time::Instant::now();
+        let error = stop_with_timeout(&paths, Duration::from_millis(300))
+            .expect_err("an unanswered admin Stop is not accepted");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the admin request must be bounded by the stop budget"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&paths.pid_file.display().to_string())
+                && message.contains("Stop the old"),
+            "stop error must carry the cleanup guidance: {message}"
+        );
+        assert!(paths.pid_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_admin_request_blocking_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let _listener =
+            std::os::unix::net::UnixListener::bind(supervisor::admin_socket(&paths).unwrap())
+                .unwrap();
+        let started = std::time::Instant::now();
+        let error = supervisor::request_blocking(
+            &paths,
+            supervisor::AdminCommand::Stop,
+            Duration::from_millis(100),
+        )
+        .expect_err("a silent admin endpoint must time out");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            format!("{error:#}").contains("did not complete within"),
+            "{error:#}"
+        );
+    }
+
+    /// Serve exactly one admin request with `Stopping`, then release the
+    /// metadata the way a stopping supervisor would.
+    #[cfg(unix)]
+    fn spawn_accepting_admin_stub(
+        paths: &DaemonPaths,
+        release_after: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        use std::io::{BufRead as _, Write as _};
+        let listener =
+            std::os::unix::net::UnixListener::bind(supervisor::admin_socket(paths).unwrap())
+                .unwrap();
+        let paths = paths.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut stream = reader.into_inner();
+            let mut reply = serde_json::to_vec(&supervisor::AdminResponse::Stopping {
+                version: supervisor::ADMIN_PROTOCOL_VERSION,
+            })
+            .unwrap();
+            reply.push(b'\n');
+            stream.write_all(&reply).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(release_after);
+            let _ = std::fs::remove_file(&paths.socket);
+            let _ = std::fs::remove_file(&paths.pid_file);
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrecognized_pid_file_stop_succeeds_when_supervisor_accepts_and_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        write_older_build_pid_file(&paths);
+        std::fs::write(&paths.socket, "").unwrap();
+        let stub = spawn_accepting_admin_stub(&paths, Duration::from_millis(200));
+
+        assert!(
+            stop_with_timeout(&paths, Duration::from_secs(10)).unwrap(),
+            "an accepted admin stop that releases metadata is a successful stop"
+        );
+        stub.join().unwrap();
+        assert!(!paths.pid_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrecognized_pid_file_restart_release_polls_for_metadata_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        write_older_build_pid_file(&paths);
+        std::fs::write(&paths.socket, "").unwrap();
+
+        // No PID is derived from the unparsed file, but the witness still
+        // observes the release instead of failing instantly.
+        let release = capture_restart_release(&paths, daemon_pid(&paths));
+        let releaser = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                std::fs::remove_file(&paths.socket).unwrap();
+                std::fs::remove_file(&paths.pid_file).unwrap();
+            })
+        };
+        assert!(wait_for_restart_release(&paths, release, Duration::from_secs(10)).await);
+        releaser.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrecognized_pid_file_restart_release_times_out_while_metadata_remains() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        write_older_build_pid_file(&paths);
+        std::fs::write(&paths.socket, "").unwrap();
+
+        let release = capture_restart_release(&paths, daemon_pid(&paths));
+        assert!(!wait_for_restart_release(&paths, release, Duration::from_millis(250)).await);
+        assert!(paths.pid_file.exists());
+        assert!(paths.socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrecognized_pid_file_restart_release_waits_for_lifetime_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        write_older_build_pid_file(&paths);
+        let lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+            .expect("hold lifetime");
+
+        let release = capture_restart_release(&paths, daemon_pid(&paths));
+        std::fs::remove_file(&paths.pid_file).unwrap();
+        // Metadata files are gone but the owner still holds its lifetime.
+        assert!(!wait_for_restart_release(&paths, release, Duration::from_millis(250)).await);
+        drop(lifetime);
     }
 
     #[cfg(any(unix, windows))]

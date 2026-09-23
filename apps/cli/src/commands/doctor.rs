@@ -52,8 +52,20 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
     // otherwise it starts an isolated ephemeral daemon. Only the latter can
     // need the one-shot worker: never replace a failure to contact a live
     // daemon with an unrelated local diagnostic.
+    let discovered = crate::daemon::discover().await;
+    if discovered.status == crate::daemon::DaemonStatus::UnrecognizedPidMetadata {
+        // An unrecognized PID file (e.g. an older build's) blocks every boot
+        // with the same guidance; report it directly instead of attempting
+        // an ephemeral daemon that can only fail on the reservation.
+        return Err(
+            DoctorCouldNotRun(crate::daemon::unrecognized_pid_metadata_error(
+                &discovered.paths,
+            ))
+            .into(),
+        );
+    }
     let ephemeral_boot_attempted = !matches!(
-        crate::daemon::discover().await.status,
+        discovered.status,
         crate::daemon::DaemonStatus::Running
             | crate::daemon::DaemonStatus::IncompatibleProtocol
             | crate::daemon::DaemonStatus::LivePidSocketUnreachable

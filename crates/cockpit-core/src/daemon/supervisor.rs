@@ -3025,17 +3025,41 @@ pub async fn request(paths: &DaemonPaths, command: AdminCommand) -> Result<Admin
     serde_json::from_slice(&line).context("decoding supervisor admin response")
 }
 
+/// [`request`] bounded by `timeout` end to end (connect, write, and reading
+/// the response). A supervisor that accepts the connection but never answers
+/// — for example a wedged or foreign process holding the admin endpoint —
+/// yields an error once the budget elapses instead of hanging the caller.
+pub async fn request_with_timeout(
+    paths: &DaemonPaths,
+    command: AdminCommand,
+    timeout: Duration,
+) -> Result<AdminResponse> {
+    tokio::time::timeout(timeout, request(paths, command))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "supervisor admin request did not complete within {}ms",
+                timeout.as_millis()
+            )
+        })?
+}
+
 /// Synchronous compatibility entry point for lifecycle callers that predate
-/// the async admin protocol. The runtime lives on a dedicated thread so this
+/// the async admin protocol, bounded by `timeout` like
+/// [`request_with_timeout`]. The runtime lives on a dedicated thread so this
 /// remains safe when called from a current-thread Tokio executor.
-pub fn request_blocking(paths: &DaemonPaths, command: AdminCommand) -> Result<AdminResponse> {
+pub fn request_blocking(
+    paths: &DaemonPaths,
+    command: AdminCommand,
+    timeout: Duration,
+) -> Result<AdminResponse> {
     let paths = paths.clone();
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("building supervisor admin runtime")?
-            .block_on(request(&paths, command))
+            .block_on(request_with_timeout(&paths, command, timeout))
     })
     .join()
     .map_err(|_| anyhow::anyhow!("supervisor admin request thread panicked"))?

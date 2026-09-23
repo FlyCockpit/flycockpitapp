@@ -10,6 +10,10 @@ use crate::daemon::{self, DaemonPaths, DaemonStatus};
 use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
 
 const MAX_STOP_GRACE_SECS: u64 = 24 * 60 * 60;
+/// Bound on one short supervisor admin round trip (`Stop`, `Status`). A live
+/// supervisor answers these immediately; a wedged admin endpoint must not
+/// hang the command or consume the lifecycle budget the stop still needs.
+const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PROTOCOL_MISMATCH_STATUS_REMEDY: &str =
     "run `cockpit daemon restart` to restart the daemon on this version";
 
@@ -73,9 +77,16 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             validate_grace(grace)?;
             let deadline = lifecycle_deadline.expect("stop command deadline");
             let old_pid = daemon::daemon_pid(&paths);
+            // An unrecognized PID file (e.g. an older build's) yields no PID;
+            // the release witness then observes metadata disappearance.
+            let unrecognized_pid_file = old_pid.is_none() && paths.pid_file.exists();
             let mut release = daemon::capture_restart_release(&paths, old_pid);
-            if let Ok(response) =
-                daemon::supervisor::request(&paths, daemon::supervisor::AdminCommand::Stop).await
+            if let Ok(response) = daemon::supervisor::request_with_timeout(
+                &paths,
+                daemon::supervisor::AdminCommand::Stop,
+                remaining_command_budget(deadline).min(ADMIN_REQUEST_TIMEOUT),
+            )
+            .await
                 && matches!(response, daemon::supervisor::AdminResponse::Stopping { .. })
             {
                 if daemon::wait_for_restart_release(
@@ -87,6 +98,11 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 {
                     println!("daemon: stopped");
                     return Ok(());
+                }
+                if unrecognized_pid_file && daemon::daemon_pid(&paths).is_none() {
+                    return Err(daemon::unrecognized_pid_metadata_error(&paths).context(
+                        "timed out waiting for the supervisor to stop and release metadata",
+                    ));
                 }
                 bail!("timed out waiting for the supervisor and worker to drain and exit");
             }
@@ -201,7 +217,11 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     .await
                     .context("timed out discovering daemon within the restart command deadline")?;
             let should_stop = restart_should_stop(discovered.status);
-            let restarted = should_stop && old_pid.is_some();
+            // An unrecognized PID file has no parseable PID, but a stop that
+            // succeeds against it still replaces a running predecessor.
+            let restarted = should_stop
+                && (old_pid.is_some()
+                    || discovered.status == DaemonStatus::UnrecognizedPidMetadata);
             let replacement_no_sandbox = if should_stop {
                 daemon::derive_restart_no_sandbox(&paths, no_sandbox)
             } else {
@@ -325,8 +345,12 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             }
         }
         DaemonCommand::Status { json } => {
-            if let Ok(status) =
-                daemon::supervisor::request(&paths, daemon::supervisor::AdminCommand::Status).await
+            if let Ok(status) = daemon::supervisor::request_with_timeout(
+                &paths,
+                daemon::supervisor::AdminCommand::Status,
+                ADMIN_REQUEST_TIMEOUT,
+            )
+            .await
                 && let daemon::supervisor::AdminResponse::Status {
                     supervisor_pid,
                     worker_pid,
@@ -487,7 +511,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 }
                 DaemonStatus::UnrecognizedPidMetadata => {
                     println!(
-                        "daemon: pid file is not a receipt this build recognizes (possibly written by an older build); stop the old daemon process manually, then delete the pid file\n  pid: {}\n  socket: {}",
+                        "daemon: pid file is not a receipt this build recognizes (possibly written by an older build) or could not be read; stop the old daemon process manually, then delete the pid file\n  pid: {}\n  socket: {}",
                         probe.paths.pid_file.display(),
                         probe.paths.socket.display(),
                     );

@@ -807,10 +807,21 @@ pub fn read_daemon_pid_record(pid_file: &Path) -> Option<DaemonPidReceipt> {
 
 /// Error for a daemon PID file that exists but is not a receipt this build can
 /// parse (for example one written by an older Cockpit build with a different
-/// header). Nothing is ever derived from such a file: no PID is signaled and
-/// the file is never reclaimed automatically, so the error names the file and
-/// the manual cleanup steps.
+/// header), or that exists but cannot be read at all. Nothing is ever derived
+/// from such a file: no PID is signaled and the file is never reclaimed
+/// automatically, so the error names the file and the manual cleanup steps.
 pub fn unrecognized_daemon_pid_file_error(pid_file: &Path) -> anyhow::Error {
+    if let Err(error) = std::fs::read(pid_file)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return anyhow::anyhow!(
+            "daemon PID file {path} exists but could not be read ({error}); refusing to signal or \
+             reclaim it. Check the file's type and permissions; if a `cockpit` daemon is still \
+             running, stop it manually (for example find it with `ps` or Task Manager and \
+             terminate it), then delete {path} and retry",
+            path = pid_file.display(),
+        );
+    }
     anyhow::anyhow!(
         "daemon PID file {path} exists but is not a recognized `{DAEMON_PID_FILE_HEADER}` receipt \
          (it may have been written by an older Cockpit build); refusing to signal or reclaim it. \
@@ -925,20 +936,30 @@ fn write_pid_file_locked(
     let executable = std::fs::canonicalize(executable)?;
     let process_start = read_process_start_identity(pid)?;
     let publication_nonce = rand::random::<[u8; 32]>();
-    let body = format!(
-        "{DAEMON_PID_FILE_HEADER}\n{pid}\n{}\nstart:{:016x}:{:016x}\nnonce:{}\n",
-        encode_executable_identity(&executable),
-        process_start.primary,
-        process_start.secondary,
-        hex_encode(&publication_nonce),
-    );
-    crate::private_fs::write_private_file_exclusive(pid_file, body.as_bytes())?;
-    Ok(DaemonPidReceipt {
+    let receipt = DaemonPidReceipt {
         pid,
         executable,
         process_start,
         publication_nonce,
-    })
+    };
+    let body = render_daemon_pid_file(&receipt);
+    crate::private_fs::write_private_file_exclusive(pid_file, body.as_bytes())?;
+    Ok(receipt)
+}
+
+/// The exact on-disk text of a daemon PID file for `receipt` (the inverse of
+/// [`read_daemon_pid_record`]). Exposed so tests can build a genuine
+/// current-format body and vary a single field.
+#[doc(hidden)]
+pub fn render_daemon_pid_file(receipt: &DaemonPidReceipt) -> String {
+    format!(
+        "{DAEMON_PID_FILE_HEADER}\n{}\n{}\nstart:{:016x}:{:016x}\nnonce:{}\n",
+        receipt.pid,
+        encode_executable_identity(&receipt.executable),
+        receipt.process_start.primary,
+        receipt.process_start.secondary,
+        hex_encode(&receipt.publication_nonce),
+    )
 }
 
 pub fn with_lifecycle_lock<T>(
@@ -2577,22 +2598,30 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let pid_file = temp.path().join("daemon.pid");
         let socket = temp.path().join("daemon.sock");
-        // The pre-reset receipt header: structurally a receipt, but not one
-        // this build recognizes.
-        std::fs::write(
-            &pid_file,
-            format!(
-                "cockpit-daemon-pid-v2\n{}\nexe\nstart:{:016x}:{:016x}\nnonce:{}\n",
-                i32::MAX,
-                1,
-                2,
-                "00".repeat(32)
-            ),
-        )
-        .expect("old pid file");
+        let executable = std::env::current_exe().expect("test executable");
+        // A genuine current-format receipt body whose ONLY difference is the
+        // pre-reset header, so the header alone must cause the rejection.
+        let receipt = DaemonPidReceipt {
+            pid: i32::MAX as u32,
+            executable: std::fs::canonicalize(&executable).expect("canonical executable"),
+            process_start: ProcessStartIdentity {
+                primary: 1,
+                secondary: 2,
+            },
+            publication_nonce: [7; 32],
+        };
+        let current = render_daemon_pid_file(&receipt);
+        std::fs::write(&pid_file, &current).expect("current pid file");
+        assert_eq!(
+            read_daemon_pid_record(&pid_file),
+            Some(receipt),
+            "the fixture body must be a valid current-format receipt"
+        );
+        let older = current.replacen(DAEMON_PID_FILE_HEADER, "cockpit-daemon-pid-v2", 1);
+        assert_ne!(older, current);
+        std::fs::write(&pid_file, older).expect("older-build pid file");
 
         assert_eq!(read_daemon_pid_record(&pid_file), None);
-        let executable = std::env::current_exe().expect("test executable");
         let error =
             reclaim_stale_and_reserve(&pid_file, &socket, None, std::process::id(), &executable)
                 .expect_err("an unrecognized PID file must fail closed");

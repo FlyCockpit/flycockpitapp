@@ -58,7 +58,7 @@ pub fn sanitizer_provenance() -> VectorSanitizerProvenanceV1 {
 
 fn sanitizer_policy_digest(limits: &[usize; 14]) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"generated-svg-v2\0canonical-v1\0verifier-v1\0");
+    digest.update(b"generated-svg-v1\0canonical-v1\0verifier-v1\0");
     for limit in limits {
         digest.update((*limit as u64).to_be_bytes());
     }

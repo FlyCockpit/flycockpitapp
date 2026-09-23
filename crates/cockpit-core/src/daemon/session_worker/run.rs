@@ -4751,8 +4751,8 @@ pub(super) fn remote_queue_mutation_response(
 /// `accept_message_with_attachments` (`message_operation_receipts` +
 /// `message_submission_receipts` + `message_queue_items` — message + marker +
 /// ledger in ONE tx, committed before the driver is notified), which needs the
-/// `CanonicalSendUserMessageV2` envelope owned by the
-/// `unify-media-model-and-send-user-message-v2-cutover` lane. This lane adds only
+/// `CanonicalSendUserMessage` envelope owned by the
+/// `unify-media-model-and-send-user-message-cutover` lane. This lane adds only
 /// the ledger row; the marker is unchanged from main; the cross-record atomicity
 /// is the V2 cutover's job.
 #[cfg(feature = "remote")]
@@ -4839,7 +4839,7 @@ fn validate_oversized_artifact_admission(
     session_id: Uuid,
     submission: &crate::engine::message::UserSubmission,
     admission: &OversizedTextArtifactAdmission,
-) -> anyhow::Result<crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2> {
+) -> anyhow::Result<crate::proto_crate::send_user_message::CanonicalSendUserMessage> {
     let receipt = submission
         .client_submissions
         .first()
@@ -4864,7 +4864,7 @@ fn validate_oversized_artifact_admission(
             anyhow::bail!("oversized artifact admission model fence does not match the submission")
         }
     }
-    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+    let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(
         &admission.canonical_message,
     )?;
     anyhow::ensure!(
@@ -4942,10 +4942,9 @@ fn resolve_oversized_artifact_queue_admission(
     target: crate::engine::message::QueueTarget,
     admission: &mut OversizedTextArtifactAdmission,
 ) -> anyhow::Result<()> {
-    let mut canonical =
-        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
-            &admission.canonical_message,
-        )?;
+    let mut canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(
+        &admission.canonical_message,
+    )?;
     anyhow::ensure!(
         canonical.session_id == session_id,
         "FCM2 session does not match worker"
@@ -5182,16 +5181,15 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
         .context("loading accepted FCM2 message queue")?;
     let mut replayed = 0usize;
     for row in rows {
-        let canonical =
-            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
-                &row.canonical_message,
+        let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(
+            &row.canonical_message,
+        )
+        .with_context(|| {
+            format!(
+                "decoding accepted FCM2 queue row {} during startup recovery",
+                Uuid::from_bytes(row.queue_item_id)
             )
-            .with_context(|| {
-                format!(
-                    "decoding accepted FCM2 queue row {} during startup recovery",
-                    Uuid::from_bytes(row.queue_item_id)
-                )
-            })?;
+        })?;
         let client_submission_id = Uuid::from_bytes(row.client_submission_id);
         if canonical.session_id != session.live_id()
             || !canonical.request.attachments.is_empty()
@@ -5379,10 +5377,9 @@ pub(crate) async fn replay_accepted_message_attachment_queue(
     let authority = session.message_media_authority();
     let mut replayed = 0usize;
     for row in rows {
-        let canonical =
-            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
-                &row.canonical_message,
-            )?;
+        let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(
+            &row.canonical_message,
+        )?;
         anyhow::ensure!(
             canonical.session_id == session.live_id(),
             "accepted V2 queue row belongs to a different session"
@@ -10374,7 +10371,7 @@ pub(super) async fn run_worker(
                     };
                     let replaying_persisted_artifact = persisted_artifact_canonical.is_some();
                     let target = if let Some(canonical_message) = persisted_artifact_canonical {
-                        let canonical = match crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                        let canonical = match crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(
                             &canonical_message,
                         ) {
                             Ok(canonical) => canonical,

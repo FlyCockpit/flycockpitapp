@@ -424,7 +424,6 @@
         "parent": "Build",
         "task_call_id": "task-1"
       },
-      "compatible": true,
       "daemon_version": "daemon_version-fixture",
       "env_baseline": {
         "digest": "digest-fixture",
@@ -2991,7 +2990,7 @@
                 "choice_routes": [
                   {
                     "choice_id": "choice-0-offering-0",
-                    "route_choice_id": "focused-binding-v2-0000000000000000000000000000000000000000000000000000000000000000",
+                    "route_choice_id": "focused-binding-v1-0000000000000000000000000000000000000000000000000000000000000000",
                     "config_provider_index": 0
                   }
                 ],
@@ -3172,7 +3171,6 @@
           "parent": "Build",
           "task_call_id": "task-1"
         },
-        "compatible": true,
         "daemon_version": "daemon_version-fixture",
         "env_baseline": {
           "digest": "digest-fixture",
@@ -3284,7 +3282,6 @@
           "parent": "Build",
           "task_call_id": "task-1"
         },
-        "compatible": true,
         "daemon_version": "daemon_version-fixture",
         "env_baseline": {
           "digest": "digest-fixture",
@@ -3397,7 +3394,6 @@
             "parent": "Build",
             "task_call_id": "task-1"
           },
-          "compatible": true,
           "daemon_version": "daemon_version-fixture",
           "env_baseline": {
             "digest": "digest-fixture",
@@ -3511,7 +3507,6 @@
             "parent": "Build",
             "task_call_id": "task-1"
           },
-          "compatible": true,
           "daemon_version": "daemon_version-fixture",
           "env_baseline": {
             "digest": "digest-fixture",
@@ -3634,7 +3629,6 @@
           "parent": "Build",
           "task_call_id": "task-1"
         },
-        "compatible": true,
         "daemon_version": "daemon_version-fixture",
         "env_baseline": {
           "digest": "digest-fixture",

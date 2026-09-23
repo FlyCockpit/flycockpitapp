@@ -897,12 +897,12 @@ async fn reserve_oversized_restart_fixture(
     let client_submission_id = Uuid::new_v4();
     let text = "restart-fence-source\n".repeat(4_000);
     assert!(text.len() > 64 * 1024);
-    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+    let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage {
         session_id: session.id,
         canonical_project_digest: [seed; 32],
         model_config_generation: 0,
         canonical_model_digest: [seed.wrapping_add(1); 32],
-        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+        request: crate::proto_crate::send_user_message::SendUserMessage {
             client_submission_id,
             origin,
             text: text.clone(),
@@ -1125,7 +1125,7 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         .find(|row| row.client_submission_id == *matching_submission.as_bytes())
         .expect("matching FCM2 admission must remain durable across restart");
     assert_eq!(
-        crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+        crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(
             &persisted_matching.canonical_message,
         )
         .unwrap()
@@ -2372,12 +2372,12 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
         // merely return an error and strand the accepted reservation.
         let oversized_source = "remote FCM2 in-memory conflict\n".repeat(4_000);
         assert!(oversized_source.len() > 64 * 1024);
-        let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+        let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage {
             session_id: session.id,
             canonical_project_digest: [31; 32],
             model_config_generation: 0,
             canonical_model_digest: [32; 32],
-            request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            request: crate::proto_crate::send_user_message::SendUserMessage {
                 client_submission_id,
                 origin: proto::UserMessageOrigin::ExternalRoot,
                 text: oversized_source.clone(),
@@ -2602,12 +2602,12 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
         let client_submission_id = Uuid::new_v4();
         let source = "remote FCM2 terminalization\n".repeat(4_000);
         assert!(source.len() > 64 * 1024);
-        let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+        let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage {
             session_id: session.id,
             canonical_project_digest: [1; 32],
             model_config_generation: 0,
             canonical_model_digest: [2; 32],
-            request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            request: crate::proto_crate::send_user_message::SendUserMessage {
                 client_submission_id,
                 origin: proto::UserMessageOrigin::ExternalRoot,
                 text: source.clone(),
@@ -3176,7 +3176,7 @@ async fn steer_side_channel_stores_raw_and_stamps_origin() {
                 "task-live",
                 vec![(
                     "alpha".to_string(),
-                    r#"{"version":2,"history":[],"next_prompt":{"User":{"content":[]}}}"#
+                    r#"{"version":1,"history":[],"next_prompt":{"User":{"content":[]}}}"#
                         .to_string(),
                 )],
             )
@@ -3250,7 +3250,7 @@ async fn steer_side_channel_rejects_non_running_child_without_enqueue() {
                 "task-done",
                 vec![(
                     "default".to_string(),
-                    r#"{"version":2,"history":[],"next_prompt":{"User":{"content":[]}}}"#
+                    r#"{"version":1,"history":[],"next_prompt":{"User":{"content":[]}}}"#
                         .to_string(),
                 )],
             )

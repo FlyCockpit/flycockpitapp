@@ -22,7 +22,7 @@ pub struct ImageIngressAdmissionReceiptV1 {
     pub kind: String,
     pub admission_id: Uuid,
     pub session_id: Uuid,
-    pub attachment: crate::send_user_message_v2::MessageAttachmentIdentity,
+    pub attachment: crate::send_user_message::MessageAttachmentIdentity,
     pub availability_generation: u64,
     pub reservation_id: String,
     pub normalized_sha256: String,
@@ -189,7 +189,7 @@ pub enum Response {
     },
 
     AttachmentUploaded {
-        attachment: crate::send_user_message_v2::MessageAttachmentIdentity,
+        attachment: crate::send_user_message::MessageAttachmentIdentity,
     },
 
     TerminalIngress {
@@ -286,8 +286,6 @@ pub enum Response {
         resume_compaction_offer: Option<ResumeCompactionOffer>,
         #[serde(default = "default_daemon_version")]
         daemon_version: String,
-        #[serde(default)]
-        compatible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env_baseline: Option<EnvSnapshotMeta>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1438,7 +1436,6 @@ impl crate::CodeRootReadV1 {
             // is ephemeral authority issued only for an interactive attach.
             resume_compaction_offer: None,
             daemon_version: self.daemon_version,
-            compatible: self.compatible,
             env_baseline: self.env_baseline,
             env_session: self.env_session,
             env_drift: self.env_drift,

@@ -25,10 +25,7 @@ fn daemon_status_response_with(
     }
 }
 
-fn attach_request_with_client_protocol_version(
-    session_id: Option<Uuid>,
-    client_protocol_version: u32,
-) -> Request {
+fn attach_request(session_id: Option<Uuid>) -> Request {
     Request::Attach {
         session_id,
         since_seq: None,
@@ -38,7 +35,6 @@ fn attach_request_with_client_protocol_version(
         interactive: true,
         session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
-        client_protocol_version,
         env_snapshot: None,
         env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
     }
@@ -62,7 +58,6 @@ fn attached_response(session_id: Uuid) -> Response {
         repair_required: None,
         resume_compaction_offer: None,
         daemon_version: proto::DAEMON_VERSION.to_string(),
-        compatible: true,
         env_baseline: None,
         env_session: None,
         env_drift: None,
@@ -328,25 +323,21 @@ async fn negotiation_rejects_a_daemon_that_does_not_send_a_hello() {
 }
 
 #[tokio::test]
-async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
+async fn negotiated_client_round_trips_attach() {
     let (_dir, socket, listener) = bind_test_socket();
     let session_id = Uuid::new_v4();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut daemon = ProtoStream::new(stream);
         send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
-        daemon.set_negotiated_version(proto::PROTOCOL_VERSION);
         complete_wire_connect_handshake(&mut daemon).await;
         let request_id = match daemon.recv().await.unwrap().unwrap() {
             proto::RecvFrame::Envelope(env) => match env.body {
                 Body::Request { id, request, .. } => {
-                    match request {
-                        Request::Attach {
-                            client_protocol_version,
-                            ..
-                        } => assert_eq!(client_protocol_version, proto::PROTOCOL_VERSION),
-                        other => panic!("expected attach request, got {other:?}"),
-                    }
+                    assert!(
+                        matches!(request, Request::Attach { .. }),
+                        "expected attach request, got {request:?}"
+                    );
                     id
                 }
                 other => panic!("expected request body, got {other:?}"),
@@ -364,10 +355,7 @@ async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
 
     let client = DaemonClient::connect(&socket).await.unwrap();
     client
-        .request(attach_request_with_client_protocol_version(
-            Some(session_id),
-            client.negotiated().version,
-        ))
+        .request(attach_request(Some(session_id)))
         .await
         .unwrap()
         .unwrap();
@@ -496,7 +484,7 @@ async fn accepted_assistant_promotion_keeps_the_live_owner_in_place() {
     assert_eq!(promoted.socket, paths.socket);
     assert!(!promoted.ephemeral_owner);
     let receipt = match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
-        Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt)) => receipt,
+        Some(receipt) => receipt,
         other => panic!("in-place promotion must keep the same pid receipt, got {other:?}"),
     };
     assert_eq!(receipt.pid, owner_pid);

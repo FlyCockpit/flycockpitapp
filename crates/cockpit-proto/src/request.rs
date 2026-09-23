@@ -1,5 +1,5 @@
 use super::*;
-use crate::send_user_message_v2::MessageIngressV2;
+use crate::send_user_message::MessageIngress;
 
 /// Provenance of a submitted turn as classified by the originating client.
 ///
@@ -564,8 +564,6 @@ pub enum Request {
         /// frontmatter for the run. Ignored on resume of an existing session.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_override: Option<cockpit_config::config::providers::ActiveModelRef>,
-        #[serde(default = "default_client_protocol_version")]
-        client_protocol_version: u32,
         /// Full client-side environment snapshot for sessions this attach
         /// creates or cold-resumes after daemon restart. Raw values are used
         /// only in memory and never persisted; responses/events carry only
@@ -615,17 +613,17 @@ pub enum Request {
 
     /// Send a user message into the currently attached session. The daemon
     /// enqueues it on the driver and acks immediately — per-turn progress
-    /// flows over the event stream. Carries a strict tagged V2 ingress
-    /// envelope (`MessageIngressV2`) with exactly one of two non-substitutable
+    /// flows over the event stream. Carries a strict tagged ingress
+    /// envelope (`MessageIngress`) with exactly one of two non-substitutable
     /// adapters: `local_owner_direct` (Owner/CLI/TUI only) or
     /// `authenticated_remote_operation` (bound authenticated remote principal).
     /// `Body::Request.id` is the sole transport-attempt request id; the
     /// durable outer operation id is carried inside the ingress (local) or in
     /// `Body.operation` (remote). The FCM2 application parameters live inside
-    /// `ingress.request` (`SendUserMessageV2`); there is no `image_refs` field.
+    /// `ingress.request` (`SendUserMessage`); there is no `image_refs` field.
     #[serde(rename = "send_user_message")]
-    SendUserMessageV2 {
-        ingress: MessageIngressV2,
+    SendUserMessage {
+        ingress: MessageIngress,
     },
 
     /// Remote-safe oversized text ingress. The UTF-8 source itself is staged
@@ -3194,7 +3192,7 @@ impl Request {
                     return Err("reasoning_effort must not be empty".to_string());
                 }
             }
-            Self::SendUserMessageV2 { ingress } => {
+            Self::SendUserMessage { ingress } => {
                 let request = ingress.request();
                 if request.origin != UserMessageOrigin::ExternalRoot {
                     return Err(
@@ -3212,17 +3210,16 @@ impl Request {
                             .to_string(),
                     );
                 }
-                if !crate::send_user_message_v2::has_message_text(&request.text)
+                if !crate::send_user_message::has_message_text(&request.text)
                     && request.attachments.is_empty()
                 {
                     return Err("message has no content".to_string());
                 }
-                if request.attachments.len() > crate::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
-                {
+                if request.attachments.len() > crate::send_user_message::MAX_MESSAGE_ATTACHMENTS {
                     return Err("too many attachments".to_string());
                 }
-                if let Self::SendUserMessageV2 {
-                    ingress: MessageIngressV2::LocalOwnerDirect(local),
+                if let Self::SendUserMessage {
+                    ingress: MessageIngress::LocalOwnerDirect(local),
                 } = self
                 {
                     if local.operation_id.get_version_num() != 7
@@ -3280,7 +3277,7 @@ impl Request {
                     |reference: &crate::bulk_transfer::BulkTransferRef, minimum_length: u64| {
                         reference.mime_class == crate::bulk_transfer::BulkMimeClass::Opaque
                             && (minimum_length
-                                ..=crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64)
+                                ..=crate::send_user_message::MAX_MESSAGE_TEXT_BYTES as u64)
                                 .contains(&reference.total_length_value())
                     };
                 let source_minimum_length = if display_transfer.is_some() {
@@ -4557,7 +4554,7 @@ macro_rules! request_variants {
             (Request::DetachKnowledgeBaseSession { .. }, "detach_knowledge_base_session");
             (Request::KnowledgeDreamStatus { .. }, "knowledge_dream_status");
             (Request::RunKnowledgeDream { .. }, "run_knowledge_dream");
-            (Request::SendUserMessageV2 { .. }, "send_user_message");
+            (Request::SendUserMessage { .. }, "send_user_message");
             (Request::SendUserMessageBulk { .. }, "send_user_message_bulk");
             (Request::GetRunInvocationStatus { .. }, "get_run_invocation_status");
             #[cfg(feature = "remote")]
@@ -4930,14 +4927,14 @@ macro_rules! command {
             (Request::ReadCodeRootDeliveriesV1(request), "read_code_root_deliveries_v1", owner_only, none, false, read_only, none, serialized, none, "request:ReadCodeRootDeliveriesV1Request", [request: $crate::ReadCodeRootDeliveriesV1Request => param]);
             (Request::AckCodeRootDeliveriesV1(request), "ack_code_root_deliveries_v1", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:AckCodeRootDeliveriesV1Request", [request: $crate::AckCodeRootDeliveriesV1Request => param]);
             (Request::ResolveCodeRootInterruptV1(request), "resolve_code_root_interrupt_v1", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "request:ResolveCodeRootInterruptV1", [request: $crate::ResolveCodeRootInterruptV1 => param]);
-            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:NonCodeSessionEntryMode|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: $crate::NonCodeSessionEntryMode => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
+            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:NonCodeSessionEntryMode|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: $crate::NonCodeSessionEntryMode => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
             (Request::AttachKnowledgeBaseSession { knowledge_base_id, session_id }, "attach_knowledge_base_session", session_row_writer(session_id), field(session_id), true, local_only, none, serialized, none, "knowledge_base_id:String|session_id:Uuid", [knowledge_base_id: String => param, session_id: Uuid => session]);
             (Request::DetachKnowledgeBaseSession { knowledge_base_id, session_id }, "detach_knowledge_base_session", session_row_writer(session_id), field(session_id), true, local_only, none, serialized, none, "knowledge_base_id:String|session_id:Uuid", [knowledge_base_id: String => param, session_id: Uuid => session]);
             (Request::KnowledgeDreamStatus { project_root, knowledge_base_id }, "knowledge_dream_status", owner_only, none, false, local_only, none, serialized, path(project_root), "project_root:String|knowledge_base_id:String", [project_root: String => project_root, knowledge_base_id: String => param]);
             (Request::RunKnowledgeDream { project_root, knowledge_base_id, no_sandbox }, "run_knowledge_dream", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|knowledge_base_id:Option<String>|no_sandbox:bool", [project_root: String => project_root, knowledge_base_id: Option<String> => param, no_sandbox: bool => param]);
-            (Request::SendUserMessageV2 { ingress }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "ingress:MessageIngressV2", [ingress: MessageIngressV2 => opaque_fcm2]);
-            (Request::SendUserMessageBulk { client_submission_id, origin, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, delivery_class_override, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|delivery_class_override:Option<QueueDeliveryClass>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, delivery_class_override: Option<QueueDeliveryClass> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
+            (Request::SendUserMessage { ingress }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "ingress:MessageIngress", [ingress: MessageIngress => opaque_fcm2]);
+            (Request::SendUserMessageBulk { client_submission_id, origin, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, delivery_class_override, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|origin:UserMessageOrigin|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|delivery_class_override:Option<QueueDeliveryClass>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => submission_id, origin: UserMessageOrigin => param, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, delivery_class_override: Option<QueueDeliveryClass> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
             #[cfg(feature = "remote")]
             (Request::OperationStatus { operation_id }, "operation_status", public_read, none, false, read_only, none, serialized, none, "operation_id:Uuid", [operation_id: Uuid => param]);
@@ -5570,21 +5567,21 @@ impl Request {
         crate::command!(command_typed_fcor_fields, self)
     }
 
-    /// Canonical parameter bytes for daemon requests. The V2 message envelope
+    /// Canonical parameter bytes for daemon requests. The user-message ingress envelope
     /// encodes its application parameters as opaque FCM2 bytes through the
-    /// registered `SEND_USER_MESSAGE_V2_REGISTRATION` opaque FCOR path on the
+    /// registered `SEND_USER_MESSAGE_REGISTRATION` opaque FCOR path on the
     /// authenticated remote branch; the legacy text-only bulk variant still
     /// has no remote-operation encoding.
     pub fn canonical_remote_operation_params_v1(&self) -> anyhow::Result<Vec<u8>> {
         if matches!(
             self,
-            Self::SendUserMessageV2 { .. } | Self::SendUserMessageBulk { .. }
+            Self::SendUserMessage { .. } | Self::SendUserMessageBulk { .. }
         ) {
             // TODO(remote): wire the registered opaque FCM2 encoding for the
             // `authenticated_remote_operation` ingress branch. Local-owner
             // direct ingress never reaches the remote FCOR path. This fail-closed
             // stub is out of the local CLI/TUI launch scope.
-            anyhow::bail!("send_user_message_v2_remote_opaque_fcor_not_implemented");
+            anyhow::bail!("send_user_message_remote_opaque_fcor_not_implemented");
         }
         crate::command!(command_encode_fcor_params, self)
     }
@@ -5647,7 +5644,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Option<cockpit_config::config::providers::ActiveModelRef>" => {
             "option<struct:ActiveModelRef:v1>"
         }
-        "MessageIngressV2" => "opaque:fcm2",
+        "MessageIngress" => "opaque:fcm2",
         "Option<cockpit_config::config::providers::OnUnlistedModelsFetch>" => {
             "option<enum16:OnUnlistedModelsFetch>"
         }
@@ -6059,14 +6056,14 @@ mod tests {
 
     #[test]
     fn semantic_validation_rejects_ambiguous_model_flags_and_nil_submission_id() {
-        let nil_submission = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let nil_submission = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 None,
                 None,
                 None,
-                crate::send_user_message_v2::SendUserMessageV2 {
+                crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::nil(),
                     origin: Default::default(),
                     text: "hello".to_string(),
@@ -7509,14 +7506,14 @@ mod tests {
             approval_mode: None,
         };
 
-        let send = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let send = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 None,
                 None,
                 Some(unbounded.clone()),
-                crate::send_user_message_v2::SendUserMessageV2 {
+                crate::send_user_message::SendUserMessage {
                     client_submission_id: id,
                     origin: Default::default(),
                     text: "run me".into(),
@@ -7545,14 +7542,14 @@ mod tests {
         assert!(json["params"].get("state_version").is_none());
         assert!(json["params"].get("remaining_ms").is_none());
 
-        let bounded_send = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let bounded_send = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 None,
                 None,
                 Some(bounded.clone()),
-                crate::send_user_message_v2::SendUserMessageV2 {
+                crate::send_user_message::SendUserMessage {
                     client_submission_id: id,
                     origin: Default::default(),
                     text: "run me".into(),
@@ -7581,14 +7578,14 @@ mod tests {
             timeout_ms: None,
             approval_mode: Some(ApprovalMode::Yolo),
         };
-        let mode_send = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let mode_send = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 None,
                 None,
                 Some(with_mode),
-                crate::send_user_message_v2::SendUserMessageV2 {
+                crate::send_user_message::SendUserMessage {
                     client_submission_id: id,
                     origin: Default::default(),
                     text: "run me".into(),
@@ -7611,14 +7608,14 @@ mod tests {
         assert!(mode_json["params"].get("approval_mode").is_none());
         assert!(mode_json["params"].get("state_version").is_none());
 
-        let non_run = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let non_run = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 None,
                 None,
                 None,
-                crate::send_user_message_v2::SendUserMessageV2 {
+                crate::send_user_message::SendUserMessage {
                     client_submission_id: id,
                     origin: Default::default(),
                     text: "interactive".into(),
@@ -7667,8 +7664,8 @@ mod tests {
         assert!(command_tags.contains(&"cancel_run_invocation"));
 
         // Zero is never unbounded: semantic validation rejects it.
-        let zero_turns = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let zero_turns = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 None,
@@ -7678,7 +7675,7 @@ mod tests {
                     timeout_ms: None,
                     approval_mode: None,
                 }),
-                crate::send_user_message_v2::SendUserMessageV2 {
+                crate::send_user_message::SendUserMessage {
                     client_submission_id: id,
                     origin: Default::default(),
                     text: "x".into(),
@@ -7698,8 +7695,8 @@ mod tests {
                 .unwrap_err()
                 .contains("max_turns")
         );
-        let zero_timeout = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let zero_timeout = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 None,
@@ -7709,7 +7706,7 @@ mod tests {
                     timeout_ms: Some(0),
                     approval_mode: None,
                 }),
-                crate::send_user_message_v2::SendUserMessageV2 {
+                crate::send_user_message::SendUserMessage {
                     client_submission_id: id,
                     origin: Default::default(),
                     text: "x".into(),
@@ -7733,10 +7730,10 @@ mod tests {
         // Round-trip preserves options immutably.
         let again: Request = serde_json::from_value(bounded_json).unwrap();
         match again {
-            Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::LocalOwnerDirect(local),
+            Request::SendUserMessage {
+                ingress: MessageIngress::LocalOwnerDirect(local),
             } => assert_eq!(local.run_invocation_options.as_ref().unwrap(), &bounded),
-            other => panic!("expected SendUserMessageV2, got {other:?}"),
+            other => panic!("expected SendUserMessage, got {other:?}"),
         }
     }
 
@@ -7749,14 +7746,14 @@ mod tests {
             thinking_mode: None,
             prompt_cache_retention: None,
         };
-        let request = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let request = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 Some(7),
                 Some(model.clone()),
                 None,
-                crate::send_user_message_v2::SendUserMessageV2 {
+                crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::new_v4(),
                     origin: Default::default(),
                     text: "fenced".to_string(),
@@ -7781,14 +7778,14 @@ mod tests {
             "openai"
         );
 
-        let invalid = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let invalid = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 Some(7),
                 None,
                 None,
-                crate::send_user_message_v2::SendUserMessageV2 {
+                crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::new_v4(),
                     origin: Default::default(),
                     text: "invalid".to_string(),

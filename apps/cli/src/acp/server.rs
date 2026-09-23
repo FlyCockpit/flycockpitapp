@@ -655,19 +655,11 @@ impl DaemonIngress {
     }
 
     fn options(&self) -> CodeRootAttachOptionsV1 {
-        let version = self
-            .state
-            .lock()
-            .expect("ACP state")
-            .client
-            .negotiated()
-            .version;
         CodeRootAttachOptionsV1 {
             initial_model: None,
             model_override: None,
             no_sandbox: false,
             interactive: true,
-            client_protocol_version: version,
             env_snapshot: None,
             env_policy: cockpit_proto::EnvDriftPolicy::default(),
         }
@@ -937,13 +929,13 @@ impl SessionIngress for DaemonIngress {
             invocation_nonce,
             &cockpit_client::submission::run_user_message_submission_fingerprint(&text),
         );
-        let message = cockpit_proto::send_user_message_v2::SendUserMessageV2::text_only(
+        let message = cockpit_proto::send_user_message::SendUserMessage::text_only(
             client_submission_id,
             text,
         );
         self.handle
-            .block_on(client.request_ok(Request::SendUserMessageV2 {
-                ingress: cockpit_proto::send_user_message_v2::MessageIngressV2::local_direct(
+            .block_on(client.request_ok(Request::SendUserMessage {
+                ingress: cockpit_proto::send_user_message::MessageIngress::local_direct(
                     Uuid::now_v7(),
                     session_id,
                     None,

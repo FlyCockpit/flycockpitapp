@@ -1,9 +1,9 @@
-use cockpit_proto::send_user_message_v2::{
-    AuthenticatedRemoteOperationEnvelopeV2, CanonicalSendUserMessageV2,
-    LocalOwnerDirectSendUserMessageV2, MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+use cockpit_proto::send_user_message::{
+    AuthenticatedRemoteOperationEnvelope, CanonicalSendUserMessage,
+    LocalOwnerDirectSendUserMessage, MAX_CANONICAL_SEND_USER_MESSAGE_BYTES,
     MAX_CURRENT_FCM2_ENCODING_BYTES, MAX_MESSAGE_TEXT_BYTES, MAX_MESSAGE_TEXT_SCALARS,
     MessageAttachmentIdentity, MessageAttachmentKind, MessageIngressProvenance,
-    MessageTagExpansion, SendUserMessageV2, has_message_text, validate_fcm2_length,
+    MessageTagExpansion, SendUserMessage, has_message_text, validate_fcm2_length,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -20,15 +20,15 @@ fn hex(raw: &str) -> Vec<u8> {
 }
 
 #[test]
-fn send_user_message_v2_limits_match_shared_fixture() {
+fn send_user_message_limits_match_shared_fixture() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-canonical-vectors.json"
     ))
     .unwrap();
     let limits = fixture["limits"].as_object().unwrap();
     assert_eq!(
         limits["fcm2_max_bytes"].as_u64(),
-        Some(MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES as u64)
+        Some(MAX_CANONICAL_SEND_USER_MESSAGE_BYTES as u64)
     );
     assert_eq!(
         limits["fcm2_max_current_encoding_bytes"].as_u64(),
@@ -45,22 +45,21 @@ fn send_user_message_v2_limits_match_shared_fixture() {
 }
 
 #[test]
-fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
+fn send_user_message_local_envelope_keeps_three_identities_distinct() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-canonical-vectors.json"
     ))
     .unwrap();
-    let mut command = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][0]["fcm2_hex"]
-        .as_str()
-        .unwrap()))
-    .unwrap()
-    .request;
+    let mut command =
+        CanonicalSendUserMessage::decode(&hex(fixture["vectors"][0]["fcm2_hex"].as_str().unwrap()))
+            .unwrap()
+            .request;
     let request_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000001").unwrap();
     let operation_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000002").unwrap();
     // Canonical FCM2 vectors may use placeholder v4 UUIDs; ingress identities
     // are RFC UUIDv7 and must stay pairwise distinct from request/operation.
     command.client_submission_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000003").unwrap();
-    let validated = LocalOwnerDirectSendUserMessageV2 {
+    let validated = LocalOwnerDirectSendUserMessage {
         operation_id,
         session_locator: "opaque-session".into(),
         expected_model_state_generation: None,
@@ -76,7 +75,7 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
         validated.operation_id,
         validated.command.client_submission_id
     );
-    let error = LocalOwnerDirectSendUserMessageV2 {
+    let error = LocalOwnerDirectSendUserMessage {
         operation_id: request_id,
         session_locator: "opaque-session".into(),
         expected_model_state_generation: None,
@@ -93,7 +92,7 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
     let mut request_collision = validated.command.clone();
     request_collision.client_submission_id = request_id;
     assert!(
-        LocalOwnerDirectSendUserMessageV2 {
+        LocalOwnerDirectSendUserMessage {
             operation_id,
             session_locator: "opaque".into(),
             expected_model_state_generation: None,
@@ -107,7 +106,7 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
     let mut operation_collision = validated.command.clone();
     operation_collision.client_submission_id = operation_id;
     assert!(
-        LocalOwnerDirectSendUserMessageV2 {
+        LocalOwnerDirectSendUserMessage {
             operation_id,
             session_locator: "opaque".into(),
             expected_model_state_generation: None,
@@ -120,7 +119,7 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
     );
     let non_rfc_v7 = Uuid::parse_str("018f47a2-7b3c-7def-0123-000000000003").unwrap();
     assert_eq!(
-        LocalOwnerDirectSendUserMessageV2 {
+        LocalOwnerDirectSendUserMessage {
             operation_id,
             session_locator: "opaque".into(),
             expected_model_state_generation: None,
@@ -133,7 +132,7 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
         .to_string(),
         "request_id must be RFC UUIDv7"
     );
-    let remote = AuthenticatedRemoteOperationEnvelopeV2 {
+    let remote = AuthenticatedRemoteOperationEnvelope {
         session_locator: "opaque".into(),
         expected_model_state_generation: None,
         expected_model: None,
@@ -176,9 +175,9 @@ fn compact_bytes(vector: &Value) -> Vec<u8> {
 }
 
 #[test]
-fn send_user_message_v2_shared_scalar_predicate() {
+fn send_user_message_shared_scalar_predicate() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-canonical-vectors.json"
     ))
     .unwrap();
     for vector in fixture["predicate_vectors"].as_array().unwrap() {
@@ -192,7 +191,7 @@ fn send_user_message_v2_shared_scalar_predicate() {
 }
 
 #[test]
-fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
+fn send_user_message_exact_maximum_and_preallocation_guard() {
     let ascii_max = "a".repeat(8_388_608);
     let tags = (0..64)
         .map(|_| MessageTagExpansion {
@@ -214,12 +213,12 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
             },
         })
         .collect();
-    let value = CanonicalSendUserMessageV2 {
+    let value = CanonicalSendUserMessage {
         session_id: Uuid::from_u128(1),
         canonical_project_digest: [1; 32],
         model_config_generation: u64::MAX,
         canonical_model_digest: [2; 32],
-        request: SendUserMessageV2 {
+        request: SendUserMessage {
             client_submission_id: Uuid::from_u128(2),
             origin: cockpit_proto::UserMessageOrigin::ExternalRoot,
             text: ascii_max.clone(),
@@ -241,10 +240,10 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
         value.encode().unwrap().len(),
         MAX_CURRENT_FCM2_ENCODING_BYTES
     );
-    assert!(validate_fcm2_length(MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES).is_ok());
-    let oversized_wire = vec![0; MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES + 1];
+    assert!(validate_fcm2_length(MAX_CANONICAL_SEND_USER_MESSAGE_BYTES).is_ok());
+    let oversized_wire = vec![0; MAX_CANONICAL_SEND_USER_MESSAGE_BYTES + 1];
     assert_eq!(
-        CanonicalSendUserMessageV2::decode(&oversized_wire)
+        CanonicalSendUserMessage::decode(&oversized_wire)
             .unwrap_err()
             .to_string(),
         "FCM2 exceeds maximum size"
@@ -306,18 +305,18 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
         skill_over.encode().unwrap_err().to_string(),
         "fcm2_forced_skill_too_long"
     );
-    assert!(validate_fcm2_length(MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES + 1).is_err());
+    assert!(validate_fcm2_length(MAX_CANONICAL_SEND_USER_MESSAGE_BYTES + 1).is_err());
 }
 
 #[test]
-fn send_user_message_v2_shared_bytes_and_digests() {
+fn send_user_message_shared_bytes_and_digests() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-canonical-vectors.json"
     ))
     .unwrap();
     for vector in fixture["vectors"].as_array().unwrap() {
         let bytes = hex(vector["fcm2_hex"].as_str().unwrap());
-        let decoded = CanonicalSendUserMessageV2::decode(&bytes).unwrap();
+        let decoded = CanonicalSendUserMessage::decode(&bytes).unwrap();
         assert_eq!(
             decoded.request.origin,
             cockpit_proto::UserMessageOrigin::ExternalRoot
@@ -334,7 +333,7 @@ fn send_user_message_v2_shared_bytes_and_digests() {
     }
     for vector in fixture["compact_positive_vectors"].as_array().unwrap() {
         let bytes = compact_bytes(vector);
-        let decoded = CanonicalSendUserMessageV2::decode(&bytes).unwrap();
+        let decoded = CanonicalSendUserMessage::decode(&bytes).unwrap();
         assert_eq!(
             decoded.request.origin,
             cockpit_proto::UserMessageOrigin::ExternalRoot
@@ -352,15 +351,14 @@ fn send_user_message_v2_shared_bytes_and_digests() {
 }
 
 #[test]
-fn send_user_message_v2_rejects_client_claimed_internal_origin() {
+fn send_user_message_rejects_client_claimed_internal_origin() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-canonical-vectors.json"
     ))
     .unwrap();
-    let external = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][1]["fcm2_hex"]
-        .as_str()
-        .unwrap()))
-    .unwrap();
+    let external =
+        CanonicalSendUserMessage::decode(&hex(fixture["vectors"][1]["fcm2_hex"].as_str().unwrap()))
+            .unwrap();
     let mut internal = external.clone();
     internal.request.origin = cockpit_proto::UserMessageOrigin::AutoContinue;
     let error = internal.encode().unwrap_err().to_string();
@@ -368,15 +366,14 @@ fn send_user_message_v2_rejects_client_claimed_internal_origin() {
 }
 
 #[test]
-fn send_user_message_v2_shared_semantic_errors() {
+fn send_user_message_shared_semantic_errors() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-canonical-vectors.json"
     ))
     .unwrap();
-    let base = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][1]["fcm2_hex"]
-        .as_str()
-        .unwrap()))
-    .unwrap();
+    let base =
+        CanonicalSendUserMessage::decode(&hex(fixture["vectors"][1]["fcm2_hex"].as_str().unwrap()))
+            .unwrap();
     for case in fixture["semantic_error_cases"].as_array().unwrap() {
         let mut value = base.clone();
         match case["mutation"].as_str().unwrap() {
@@ -398,14 +395,14 @@ fn send_user_message_v2_shared_semantic_errors() {
 }
 
 #[test]
-fn send_user_message_v2_shared_malformed_bytes_reject() {
+fn send_user_message_shared_malformed_bytes_reject() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-canonical-vectors.json"
     ))
     .unwrap();
     for case in fixture["malformed_fcm2"].as_array().unwrap() {
         let bytes = hex(case["fcm2_hex"].as_str().unwrap());
-        let error = CanonicalSendUserMessageV2::decode(&bytes)
+        let error = CanonicalSendUserMessage::decode(&bytes)
             .unwrap_err()
             .to_string();
         assert_eq!(error, case["error"], "wrong error for {}", case["name"]);
@@ -421,7 +418,7 @@ fn send_user_message_v2_shared_malformed_bytes_reject() {
         if let Some(length) = case["truncate"].as_u64() {
             bytes.truncate(length as usize);
         }
-        let error = CanonicalSendUserMessageV2::decode(&bytes)
+        let error = CanonicalSendUserMessage::decode(&bytes)
             .unwrap_err()
             .to_string();
         assert_eq!(error, case["error"], "wrong error for {}", case["name"]);

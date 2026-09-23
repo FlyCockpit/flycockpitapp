@@ -455,8 +455,6 @@ pub struct AgentRunner {
     pub btw_fork: Option<proto::BtwForkInfo>,
     /// Version advertised by the daemon at attach.
     pub daemon_version: String,
-    /// Whether this client is compatible with the daemon protocol/version.
-    pub daemon_compatible: bool,
     pub(crate) current_client: Option<Arc<RwLock<DaemonClient>>>,
     pub(crate) attach_context: Option<Arc<RwLock<AttachRequestContext>>>,
     pub(crate) last_applied_seq: Option<Arc<Mutex<Option<i64>>>>,
@@ -642,7 +640,6 @@ impl AgentRunner {
             resume_compaction_offer: None,
             btw_fork: None,
             daemon_version: "test".to_string(),
-            daemon_compatible: true,
             current_client: None,
             attach_context: None,
             last_applied_seq,
@@ -1615,7 +1612,6 @@ pub struct SessionSwitchOutcome {
     pub resume_compaction_offer: Option<proto::ResumeCompactionOffer>,
     pub btw_fork: Option<proto::BtwForkInfo>,
     pub daemon_version: String,
-    pub daemon_compatible: bool,
     /// Attachment epoch published by `advance_attachment_epoch` when the
     /// replacement Attach succeeded. App adopts identity only when this
     /// matches the runner's authoritative current epoch.
@@ -2236,12 +2232,10 @@ async fn switch_session_inner(
     let replacement_client = DaemonClient::connect_endpoint(&endpoint)
         .await
         .map_err(|error| format!("connect replacement session client: {error:#}"))?;
-    let client_protocol_version = replacement_client.negotiated().version;
     let request_client = replacement_client.clone();
     let mut outcome = switch_session_with_attach_request(
         attach_context.clone(),
         target,
-        client_protocol_version,
         move |request| async move { request_client.request(request).await },
     )
     .await?;
@@ -2304,7 +2298,6 @@ fn first_party_session_attach_request(
     no_sandbox: bool,
     entry_mode: proto::SessionEntryMode,
     model_override: Option<cockpit_config::providers::ActiveModelRef>,
-    client_protocol_version: u32,
     env_snapshot: Option<proto::EnvSnapshotWire>,
 ) -> Request {
     if entry_mode == proto::SessionEntryMode::Code {
@@ -2316,7 +2309,6 @@ fn first_party_session_attach_request(
                 no_sandbox,
                 true,
                 model_override,
-                client_protocol_version,
                 env_snapshot,
                 cockpit_proto::EnvDriftPolicy::Client,
             ),
@@ -2326,7 +2318,6 @@ fn first_party_session_attach_request(
                 no_sandbox,
                 true,
                 model_override,
-                client_protocol_version,
                 env_snapshot,
                 cockpit_proto::EnvDriftPolicy::Client,
             ),
@@ -2342,7 +2333,6 @@ fn first_party_session_attach_request(
         session_entry_mode: proto::NonCodeSessionEntryMode::try_from(entry_mode)
             .expect("Code handled above"),
         model_override,
-        client_protocol_version,
         env_snapshot,
         env_policy: cockpit_proto::EnvDriftPolicy::Client,
     }
@@ -2351,7 +2341,6 @@ fn first_party_session_attach_request(
 async fn switch_session_with_attach_request<F, Fut>(
     attach_context: Arc<RwLock<AttachRequestContext>>,
     target: SessionTarget,
-    client_protocol_version: u32,
     send_request: F,
 ) -> Result<SessionSwitchOutcome, String>
 where
@@ -2375,7 +2364,6 @@ where
         ctx.no_sandbox,
         ctx.session_entry_mode,
         None,
-        client_protocol_version,
         Some(ctx.env_snapshot.clone()),
     );
     let response = send_request(request)
@@ -2397,7 +2385,6 @@ where
             resume_compaction_offer,
             btw_fork,
             daemon_version,
-            compatible,
             ..
         }) => {
             if target_session_id.is_none() && session_entry_mode != ctx.session_entry_mode {
@@ -2423,7 +2410,6 @@ where
                     resume_compaction_offer,
                     btw_fork,
                     daemon_version,
-                    daemon_compatible: compatible,
                 },
                 requested_target,
             ))
@@ -2458,7 +2444,6 @@ struct SessionSwitchAttached {
     resume_compaction_offer: Option<proto::ResumeCompactionOffer>,
     btw_fork: Option<proto::BtwForkInfo>,
     daemon_version: String,
-    daemon_compatible: bool,
 }
 
 fn session_switch_outcome_from_attached(
@@ -2489,7 +2474,6 @@ fn session_switch_outcome_from_attached(
         resume_compaction_offer: attached.resume_compaction_offer,
         btw_fork: attached.btw_fork,
         daemon_version: attached.daemon_version,
-        daemon_compatible: attached.daemon_compatible,
         attachment_epoch: 0,
         transition_guard: None,
     }
@@ -2768,7 +2752,6 @@ async fn try_spawn_inner(
             no_sandbox,
             entry_mode,
             root_model_override,
-            client.negotiated().version,
             Some(env_snapshot.to_wire()),
         );
         let attached = match client.request(request).await {
@@ -2794,7 +2777,6 @@ async fn try_spawn_inner(
             resume_compaction_offer,
             btw_fork,
             daemon_version,
-            daemon_compatible,
         ) = match attached {
             Response::Attached {
                 session_id,
@@ -2811,7 +2793,6 @@ async fn try_spawn_inner(
                 resume_compaction_offer,
                 btw_fork,
                 daemon_version,
-                compatible,
                 ..
             } => (
                 session_id,
@@ -2828,7 +2809,6 @@ async fn try_spawn_inner(
                 resume_compaction_offer,
                 btw_fork,
                 daemon_version,
-                compatible,
             ),
             other => return Err(format!("unexpected attach response: {other:?}")),
         };
@@ -2907,7 +2887,6 @@ async fn try_spawn_inner(
             resume_compaction_offer,
             btw_fork,
             daemon_version,
-            daemon_compatible,
         ))
     }?;
     let (
@@ -2936,7 +2915,6 @@ async fn try_spawn_inner(
         resume_compaction_offer,
         btw_fork,
         daemon_version,
-        daemon_compatible,
     ) = attached;
 
     let ephemeral_owner = Arc::new(AtomicBool::new(ephemeral_owner));
@@ -2983,7 +2961,7 @@ async fn try_spawn_inner(
     let local_message_operation_ids = Arc::new(Mutex::new(HashMap::<Uuid, Uuid>::new()));
     let local_message_attachments = Arc::new(Mutex::new(HashMap::<
         Uuid,
-        Vec<cockpit_proto::send_user_message_v2::MessageAttachmentIdentity>,
+        Vec<cockpit_proto::send_user_message::MessageAttachmentIdentity>,
     >::new()));
     let (attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
     let (client_epoch_tx, mut client_epoch_rx) = watch::channel(0_u64);
@@ -3136,15 +3114,15 @@ async fn try_spawn_inner(
                             }
                         };
                         client
-                            .request(Request::SendUserMessageV2 {
+                            .request(Request::SendUserMessage {
                                 ingress:
-                                    cockpit_proto::send_user_message_v2::MessageIngressV2::local_direct(
+                                    cockpit_proto::send_user_message::MessageIngress::local_direct(
                                         operation_id,
                                         session_id.to_string(),
                                         sub.expected_model_state_generation,
                                         sub.expected_model,
                                         None,
-                                        cockpit_proto::send_user_message_v2::SendUserMessageV2 {
+                                        cockpit_proto::send_user_message::SendUserMessage {
                                             client_submission_id,
                                             origin: Default::default(),
                                             text: sub.text,
@@ -3642,7 +3620,6 @@ async fn try_spawn_inner(
         resume_compaction_offer,
         btw_fork,
         daemon_version,
-        daemon_compatible,
         current_client: Some(current_client),
         attach_context: Some(attach_context),
         last_applied_seq: Some(last_applied_seq),
@@ -4493,16 +4470,10 @@ async fn resync_attach_payload(
     attach_context: &AttachRequestContext,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
 ) -> Result<AttachedPayload, ReconnectAttachError> {
-    let payload = request_attach_payload(
-        session_id,
-        attach_context,
-        last_applied_seq,
-        client.negotiated().version,
-        |request| {
-            let client = client.clone();
-            async move { client.request(request).await }
-        },
-    )
+    let payload = request_attach_payload(session_id, attach_context, last_applied_seq, |request| {
+        let client = client.clone();
+        async move { client.request(request).await }
+    })
     .await?;
     if payload.session_entry_mode != attach_context.session_entry_mode {
         return Err(ReconnectAttachError::Terminal(format!(
@@ -4518,7 +4489,6 @@ async fn request_attach_payload<F, Fut>(
     session_id: Uuid,
     attach_context: &AttachRequestContext,
     last_applied_seq: &Arc<Mutex<Option<i64>>>,
-    client_protocol_version: u32,
     send_request: F,
 ) -> Result<AttachedPayload, ReconnectAttachError>
 where
@@ -4533,7 +4503,6 @@ where
         attach_context.no_sandbox,
         attach_context.session_entry_mode,
         None,
-        client_protocol_version,
         Some(attach_context.env_snapshot.clone()),
     ))
     .await
@@ -5860,7 +5829,6 @@ mod tests {
             repair_required: None,
             resume_compaction_offer: None,
             daemon_version: "test".to_string(),
-            compatible: true,
             env_baseline: None,
             env_session: None,
             env_drift: None,
@@ -6323,7 +6291,6 @@ mod tests {
             resume_compaction_offer: None,
             btw_fork: None,
             daemon_version: "test".to_string(),
-            daemon_compatible: true,
             attachment_epoch: 0,
             transition_guard: None,
         };
@@ -7153,7 +7120,6 @@ mod tests {
                                 session_id,
                                 &attach_context,
                                 &last,
-                                cockpit_proto::PROTOCOL_VERSION,
                                 |request| async move {
                                     match request {
                                         Request::AttachExistingCodeRootV1(request) => {
@@ -7244,7 +7210,6 @@ mod tests {
             session_id,
             &attach_context,
             &last_applied_seq,
-            proto::PROTOCOL_VERSION,
             |request| async move {
                 assert!(matches!(
                     request,
@@ -7427,7 +7392,6 @@ mod tests {
                 resume_compaction_offer: None,
                 btw_fork: None,
                 daemon_version: "test".to_string(),
-                daemon_compatible: true,
             },
             SessionTarget::Resume {
                 session_id: new_session_id,
@@ -7486,7 +7450,6 @@ mod tests {
         let outcome = switch_session_with_attach_request(
             attach_context,
             SessionTarget::New,
-            cockpit_proto::PROTOCOL_VERSION,
             move |request| {
                 captured.lock().unwrap().push(request);
                 async move {
@@ -7507,7 +7470,6 @@ mod tests {
                         repair_required: None,
                         resume_compaction_offer: None,
                         daemon_version: "test".to_string(),
-                        compatible: true,
                         env_baseline: None,
                         env_session: None,
                         env_drift: None,

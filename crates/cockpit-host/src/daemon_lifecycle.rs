@@ -223,6 +223,12 @@ pub struct DaemonPidReceipt {
     pub publication_nonce: [u8; 32],
 }
 
+/// First line of the daemon pid file text format.
+pub const DAEMON_PID_FILE_HEADER: &str = "cockpit-daemon-pid-v1";
+/// Version of the serialized daemon pid receipt JSON (inside the endpoint
+/// record).
+pub const DAEMON_PID_RECEIPT_VERSION: u8 = 1;
+
 #[derive(Serialize, Deserialize)]
 struct SerializedDaemonPidReceipt {
     version: u8,
@@ -235,7 +241,7 @@ struct SerializedDaemonPidReceipt {
 impl Serialize for DaemonPidReceipt {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         SerializedDaemonPidReceipt {
-            version: 2,
+            version: DAEMON_PID_RECEIPT_VERSION,
             pid: self.pid,
             executable_identity: encode_executable_identity(&self.executable),
             process_start: self.process_start,
@@ -248,7 +254,7 @@ impl Serialize for DaemonPidReceipt {
 impl<'de> Deserialize<'de> for DaemonPidReceipt {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = SerializedDaemonPidReceipt::deserialize(deserializer)?;
-        if value.version != 2 {
+        if value.version != DAEMON_PID_RECEIPT_VERSION {
             return Err(serde::de::Error::custom(
                 "unsupported daemon receipt version",
             ));
@@ -278,12 +284,6 @@ pub struct ProcessStartIdentity {
 /// a numeric PID cannot be recycled between capture and comparison.
 pub fn process_start_identity(pid: u32) -> std::io::Result<ProcessStartIdentity> {
     read_process_start_identity(pid)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DaemonPidRecord {
-    Receipt(DaemonPidReceipt),
-    LegacyNumeric(u32),
 }
 
 /// Result of checking whether a PID still names a Cockpit daemon process.
@@ -777,34 +777,17 @@ fn pidfd_send_signal(pidfd: &std::os::fd::OwnedFd, signal: libc::c_int) -> std::
     }
 }
 
-#[cfg(any(unix, windows))]
-pub fn legacy_pid_identity(pid: u32) -> PidIdentity {
-    if process_exists(pid) {
-        PidIdentity::Unverified
-    } else {
-        PidIdentity::Missing
-    }
-}
-
-/// Read a decimal PID from a daemon metadata file.
+/// Read the PID from a daemon metadata receipt.
 pub fn read_pid_file(pid_file: &Path) -> Option<u32> {
-    match read_daemon_pid_record(pid_file)? {
-        DaemonPidRecord::Receipt(receipt) => Some(receipt.pid),
-        DaemonPidRecord::LegacyNumeric(pid) => Some(pid),
-    }
+    read_daemon_pid_record(pid_file).map(|receipt| receipt.pid)
 }
 
 /// Parse PID and executable identity from one immutable file snapshot.
-pub fn read_daemon_pid_record(pid_file: &Path) -> Option<DaemonPidRecord> {
+pub fn read_daemon_pid_record(pid_file: &Path) -> Option<DaemonPidReceipt> {
     let value = std::fs::read_to_string(pid_file).ok()?;
     let mut lines = value.lines();
-    let first = lines.next()?.trim();
-    if first != "cockpit-daemon-pid-v2" {
-        let pid = first.parse::<u32>().ok()?;
-        if lines.next().is_some() {
-            return None;
-        }
-        return Some(DaemonPidRecord::LegacyNumeric(pid));
+    if lines.next()?.trim() != DAEMON_PID_FILE_HEADER {
+        return None;
     }
     let pid = lines.next()?.parse::<u32>().ok()?;
     let executable = decode_executable_identity(lines.next()?)?;
@@ -814,12 +797,12 @@ pub fn read_daemon_pid_record(pid_file: &Path) -> Option<DaemonPidRecord> {
     if lines.next().is_some() {
         return None;
     }
-    Some(DaemonPidRecord::Receipt(DaemonPidReceipt {
+    Some(DaemonPidReceipt {
         pid,
         executable,
         process_start,
         publication_nonce,
-    }))
+    })
 }
 
 /// Atomically publish a PID together with the exact canonical executable that
@@ -849,22 +832,15 @@ pub fn reclaim_stale_and_reserve(
         if pid_file.exists() {
             let incumbent = read_daemon_pid_record(pid_file)
                 .ok_or_else(|| anyhow::anyhow!("existing daemon PID reservation is malformed"))?;
-            let reclaimable = match &incumbent {
-                DaemonPidRecord::Receipt(receipt) => {
-                    match verify_cockpit_daemon_receipt_identity(receipt) {
-                        PidIdentity::Missing => true,
-                        // A recycled PID has a different kernel start identity
-                        // and cannot own this reservation. A live matching
-                        // incarnation remains protected even if argv probing
-                        // observes it mid-transition.
-                        PidIdentity::NotDaemon => read_process_start_identity(receipt.pid)
-                            .is_ok_and(|start| start != receipt.process_start),
-                        PidIdentity::VerifiedDaemon | PidIdentity::Unverified => false,
-                    }
-                }
-                DaemonPidRecord::LegacyNumeric(pid) => {
-                    legacy_pid_identity(*pid) == PidIdentity::Missing
-                }
+            let reclaimable = match verify_cockpit_daemon_receipt_identity(&incumbent) {
+                PidIdentity::Missing => true,
+                // A recycled PID has a different kernel start identity and
+                // cannot own this reservation. A live matching incarnation
+                // remains protected even if argv probing observes it
+                // mid-transition.
+                PidIdentity::NotDaemon => read_process_start_identity(incumbent.pid)
+                    .is_ok_and(|start| start != incumbent.process_start),
+                PidIdentity::VerifiedDaemon | PidIdentity::Unverified => false,
             };
             if !reclaimable {
                 anyhow::bail!("existing daemon lifecycle reservation is live or unverifiable");
@@ -889,10 +865,7 @@ pub fn reclaim_stale_and_reserve_preserving_endpoint(
     with_lifecycle_lock(pid_file, || {
         let incumbent = read_daemon_pid_record(pid_file)
             .ok_or_else(|| anyhow::anyhow!("existing daemon PID reservation is malformed"))?;
-        let DaemonPidRecord::Receipt(receipt) = &incumbent else {
-            anyhow::bail!("Windows supervisor reexec requires a v2 PID receipt");
-        };
-        if verify_cockpit_daemon_receipt_identity(receipt) != PidIdentity::Missing {
+        if verify_cockpit_daemon_receipt_identity(&incumbent) != PidIdentity::Missing {
             anyhow::bail!("previous supervisor is still live or unverifiable");
         }
         if read_daemon_pid_record(pid_file) != Some(incumbent) {
@@ -908,13 +881,13 @@ fn retire_incumbent_locked(
     pid_file: &Path,
     socket: &Path,
     endpoint: Option<&Path>,
-    incumbent: &DaemonPidRecord,
+    incumbent: &DaemonPidReceipt,
 ) -> anyhow::Result<()> {
     if read_daemon_pid_record(pid_file) != Some(incumbent.clone()) {
         anyhow::bail!("daemon lifecycle reservation changed during locked retirement");
     }
-    if let (Some(endpoint), DaemonPidRecord::Receipt(receipt)) = (endpoint, incumbent) {
-        retire_matching_endpoint(endpoint, socket, receipt)?;
+    if let Some(endpoint) = endpoint {
+        retire_matching_endpoint(endpoint, socket, incumbent)?;
     }
     match std::fs::remove_file(socket) {
         Ok(()) => {}
@@ -938,7 +911,7 @@ fn write_pid_file_locked(
     let process_start = read_process_start_identity(pid)?;
     let publication_nonce = rand::random::<[u8; 32]>();
     let body = format!(
-        "cockpit-daemon-pid-v2\n{pid}\n{}\nstart:{:016x}:{:016x}\nnonce:{}\n",
+        "{DAEMON_PID_FILE_HEADER}\n{pid}\n{}\nstart:{:016x}:{:016x}\nnonce:{}\n",
         encode_executable_identity(&executable),
         process_start.primary,
         process_start.secondary,
@@ -1068,7 +1041,7 @@ pub fn retire_metadata_if_receipt_matches(
     expected: &DaemonPidReceipt,
 ) -> anyhow::Result<bool> {
     with_lifecycle_lock(pid_file, || {
-        if read_daemon_pid_record(pid_file) != Some(DaemonPidRecord::Receipt(expected.clone())) {
+        if read_daemon_pid_record(pid_file) != Some(expected.clone()) {
             return Ok(false);
         }
         if let Some(endpoint) = endpoint {
@@ -1108,39 +1081,6 @@ fn retire_matching_endpoint(
         std::fs::remove_file(endpoint)?;
     }
     Ok(())
-}
-
-/// Retire a verified-stale numeric pid file and its published identity.
-///
-/// The only permitted legacy-metadata retirement: hold `daemon.lifecycle.lock`,
-/// re-read the record, and delete only while it is still `LegacyNumeric(expected_pid)`
-/// and that pid is still `Missing`. A concurrent `reclaim_stale_and_reserve` that
-/// already installed a live receipt is left untouched. Endpoint records are not
-/// owned by a numeric pid file and are not removed here.
-#[cfg(any(unix, windows))]
-pub fn remove_dead_legacy_metadata(
-    pid_file: &Path,
-    socket: &Path,
-    expected_pid: u32,
-) -> anyhow::Result<bool> {
-    with_lifecycle_lock(pid_file, || {
-        if read_daemon_pid_record(pid_file) != Some(DaemonPidRecord::LegacyNumeric(expected_pid))
-            || legacy_pid_identity(expected_pid) != PidIdentity::Missing
-        {
-            return Ok(false);
-        }
-        match std::fs::remove_file(socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        match std::fs::remove_file(pid_file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(true)
-    })
 }
 
 /// Verify that a live PID is the exact approved Cockpit executable and its
@@ -1928,7 +1868,7 @@ pub fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EndpointRecord {
-    #[serde(rename = "socket_path", alias = "socket")]
+    #[serde(rename = "socket_path")]
     socket: PathBuf,
     receipt: DaemonPidReceipt,
 }
@@ -2336,7 +2276,7 @@ mod tests {
 
     fn write_receipt_fixture(path: &Path, receipt: &DaemonPidReceipt) {
         let body = format!(
-            "cockpit-daemon-pid-v2\n{}\n{}\nstart:{:016x}:{:016x}\nnonce:{}\n",
+            "cockpit-daemon-pid-v1\n{}\n{}\nstart:{:016x}:{:016x}\nnonce:{}\n",
             receipt.pid,
             encode_executable_identity(&receipt.executable),
             receipt.process_start.primary,
@@ -2411,10 +2351,7 @@ mod tests {
         let receipt = write_pid_file(&pid_file, pid, &executable).expect("publish pid identity");
 
         assert_eq!(read_pid_file(&pid_file), Some(pid));
-        assert_eq!(
-            read_daemon_pid_record(&pid_file),
-            Some(DaemonPidRecord::Receipt(receipt))
-        );
+        assert_eq!(read_daemon_pid_record(&pid_file), Some(receipt));
     }
 
     #[test]
@@ -2428,10 +2365,7 @@ mod tests {
         write_pid_file(&pid_file, std::process::id(), &executable)
             .expect_err("second starter must not replace reservation");
 
-        assert_eq!(
-            read_daemon_pid_record(&pid_file),
-            Some(DaemonPidRecord::Receipt(first))
-        );
+        assert_eq!(read_daemon_pid_record(&pid_file), Some(first));
     }
 
     #[cfg(unix)]
@@ -2494,10 +2428,7 @@ mod tests {
 
         assert_ne!(reserved.publication_nonce, stale.publication_nonce);
         assert!(!socket.exists());
-        assert_eq!(
-            read_daemon_pid_record(&pid_file),
-            Some(DaemonPidRecord::Receipt(reserved))
-        );
+        assert_eq!(read_daemon_pid_record(&pid_file), Some(reserved));
     }
 
     #[cfg(unix)]
@@ -2530,10 +2461,7 @@ mod tests {
         )
         .expect_err("unreadable endpoint must abort stale reclaim");
 
-        assert_eq!(
-            read_daemon_pid_record(&pid_file),
-            Some(DaemonPidRecord::Receipt(stale))
-        );
+        assert_eq!(read_daemon_pid_record(&pid_file), Some(stale));
         assert!(socket.exists());
         assert!(endpoint.is_dir());
     }
@@ -2552,10 +2480,7 @@ mod tests {
         let receipt = write_pid_file(&pid_file, std::process::id(), &executable)
             .expect("publish pid identity");
 
-        assert_eq!(
-            read_daemon_pid_record(&pid_file),
-            Some(DaemonPidRecord::Receipt(receipt.clone()))
-        );
+        assert_eq!(read_daemon_pid_record(&pid_file), Some(receipt.clone()));
         let endpoint = EndpointRecord {
             socket: temp.path().join("daemon.sock"),
             receipt,
@@ -2612,56 +2537,20 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn dead_legacy_receipt_allows_stale_metadata_cleanup() {
+    fn bare_numeric_pid_file_is_malformed_and_never_reclaimed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pid_file = temp.path().join("daemon.pid");
         let socket = temp.path().join("daemon.sock");
-        let dead_pid = i32::MAX as u32;
-        std::fs::write(&pid_file, dead_pid.to_string()).expect("legacy pid receipt");
-        std::fs::write(&socket, b"stale socket").expect("stale socket");
-
-        assert_eq!(legacy_pid_identity(dead_pid), PidIdentity::Missing);
-        assert!(remove_dead_legacy_metadata(&pid_file, &socket, dead_pid).expect("legacy cleanup"));
-        assert!(!pid_file.exists());
-        assert!(!socket.exists());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn dead_legacy_cleanup_preserves_replaced_receipt() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let pid_file = temp.path().join("daemon.pid");
-        let socket = temp.path().join("daemon.sock");
-        let dead_pid = i32::MAX as u32;
-        let executable = std::env::current_exe().expect("test executable");
-        let replacement =
-            write_pid_file(&pid_file, std::process::id(), &executable).expect("live receipt");
-        std::fs::write(&socket, b"live identity").expect("live identity");
-
-        assert!(
-            !remove_dead_legacy_metadata(&pid_file, &socket, dead_pid)
-                .expect("locked recheck must refuse")
-        );
-        assert_eq!(
-            read_daemon_pid_record(&pid_file),
-            Some(DaemonPidRecord::Receipt(replacement))
-        );
-        assert_eq!(std::fs::read_to_string(&socket).unwrap(), "live identity");
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn live_legacy_pid_is_not_retired() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let pid_file = temp.path().join("daemon.pid");
-        let socket = temp.path().join("daemon.sock");
-        let pid = std::process::id();
-        std::fs::write(&pid_file, pid.to_string()).expect("legacy pid receipt");
+        std::fs::write(&pid_file, (i32::MAX as u32).to_string()).expect("numeric pid file");
         std::fs::write(&socket, b"socket").expect("socket");
 
-        assert_eq!(legacy_pid_identity(pid), PidIdentity::Unverified);
+        assert_eq!(read_daemon_pid_record(&pid_file), None);
+        assert_eq!(read_pid_file(&pid_file), None);
+        let executable = std::env::current_exe().expect("test executable");
         assert!(
-            !remove_dead_legacy_metadata(&pid_file, &socket, pid).expect("live legacy must remain")
+            reclaim_stale_and_reserve(&pid_file, &socket, None, std::process::id(), &executable)
+                .is_err(),
+            "an unreceipted PID file must fail closed rather than be reclaimed"
         );
         assert!(pid_file.exists());
         assert!(socket.exists());
@@ -2678,8 +2567,10 @@ mod tests {
         std::fs::write(&socket, b"socket metadata").expect("socket metadata");
         std::fs::write(
             &endpoint,
-            serde_json::to_vec(&serde_json::json!({"socket": socket, "receipt": receipt.clone()}))
-                .expect("serialize endpoint"),
+            serde_json::to_vec(
+                &serde_json::json!({"socket_path": socket, "receipt": receipt.clone()}),
+            )
+            .expect("serialize endpoint"),
         )
         .expect("endpoint record");
 
@@ -2716,7 +2607,7 @@ mod tests {
         let receipt = write_pid_file(&pid_file, std::process::id(), &executable).expect("pid file");
         std::fs::write(
             &endpoint,
-            serde_json::to_vec(&serde_json::json!({"socket": temp.path().join("other.sock"), "receipt": receipt.clone()}))
+            serde_json::to_vec(&serde_json::json!({"socket_path": temp.path().join("other.sock"), "receipt": receipt.clone()}))
                 .expect("serialize endpoint"),
         )
         .expect("endpoint record");

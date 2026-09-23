@@ -345,7 +345,7 @@ pub mod integration {
             let tag_expansions: Vec<_> = tag_expansions
                 .into_iter()
                 .map(|(tool, path, detail, ok)| {
-                    crate::daemon::proto::send_user_message_v2::MessageTagExpansion {
+                    crate::daemon::proto::send_user_message::MessageTagExpansion {
                         tool,
                         path,
                         detail,
@@ -367,27 +367,26 @@ pub mod integration {
             );
             match self
                 .inner
-                .request_ok(crate::daemon::proto::Request::SendUserMessageV2 {
-                    ingress:
-                        crate::daemon::proto::send_user_message_v2::MessageIngressV2::local_direct(
-                            Uuid::now_v7(),
-                            session_id.to_string(),
-                            None,
-                            None,
-                            None,
-                            crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
-                                client_submission_id,
-                                origin: Default::default(),
-                                text,
-                                display_text,
-                                tag_expansions,
-                                forced_skill: None,
-                                delivery_class_override: None,
-                                resolved_delivery_class: None,
-                                resolved_queue_target: None,
-                                attachments: Vec::new(),
-                            },
-                        ),
+                .request_ok(crate::daemon::proto::Request::SendUserMessage {
+                    ingress: crate::daemon::proto::send_user_message::MessageIngress::local_direct(
+                        Uuid::now_v7(),
+                        session_id.to_string(),
+                        None,
+                        None,
+                        None,
+                        crate::daemon::proto::send_user_message::SendUserMessage {
+                            client_submission_id,
+                            origin: Default::default(),
+                            text,
+                            display_text,
+                            tag_expansions,
+                            forced_skill: None,
+                            delivery_class_override: None,
+                            resolved_delivery_class: None,
+                            resolved_queue_target: None,
+                            attachments: Vec::new(),
+                        },
+                    ),
                 })
                 .await?
             {

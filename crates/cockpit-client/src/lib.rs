@@ -721,11 +721,9 @@ impl DaemonClient {
             let stream = connect_wire(socket).await?;
             let mut proto = ProtoStream::new(stream);
             let negotiated = negotiate_hello(&mut proto).await?;
-            proto.set_negotiated_version(negotiated.version);
-            let mut initial_events =
-                confirm_client_lifetime(&mut proto, negotiated.version).await?;
+            let mut initial_events = confirm_client_lifetime(&mut proto).await?;
             let (exchange_events, owner_capability) =
-                exchange_peer_credential(&mut proto, negotiated.version, socket).await?;
+                exchange_peer_credential(&mut proto, socket).await?;
             initial_events.extend(exchange_events);
             Ok(Self::from_proto_negotiated(
                 proto,
@@ -1151,7 +1149,6 @@ where
 #[cfg(any(unix, windows))]
 async fn exchange_peer_credential<S>(
     proto_stream: &mut ProtoStream<S>,
-    version: u32,
     socket: &Path,
 ) -> Result<(Vec<proto::Event>, Option<proto::OwnerCapabilityToken>)>
 where
@@ -1161,8 +1158,7 @@ where
     let launch_ticket =
         launch_provenance::resolve_launch_ticket(socket).map(proto::OwnerCapabilityToken::new);
     proto_stream
-        .send(&Envelope::request_with_owner_capability_at(
-            version,
+        .send(&Envelope::request_with_owner_capability(
             id,
             Request::ExchangeLocalPeerCredential,
             launch_ticket,
@@ -1239,16 +1235,13 @@ where
 /// [`DaemonClient`] is already a live reference even if its caller is
 /// immediately cancelled or dropped without making an application request.
 #[cfg(any(unix, windows))]
-async fn confirm_client_lifetime<S>(
-    proto_stream: &mut ProtoStream<S>,
-    version: u32,
-) -> Result<Vec<proto::Event>>
+async fn confirm_client_lifetime<S>(proto_stream: &mut ProtoStream<S>) -> Result<Vec<proto::Event>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     let id = Uuid::now_v7();
     proto_stream
-        .send(&Envelope::request_at(version, id, Request::DaemonStatus))
+        .send(&Envelope::request(id, Request::DaemonStatus))
         .await
         .context("sending daemon lifetime confirmation")?;
 
@@ -1722,13 +1715,6 @@ mod tests {
     }
 
     fn attach_request(session_id: Option<Uuid>) -> Request {
-        attach_request_with_client_protocol_version(session_id, proto::PROTOCOL_VERSION)
-    }
-
-    fn attach_request_with_client_protocol_version(
-        session_id: Option<Uuid>,
-        client_protocol_version: u32,
-    ) -> Request {
         Request::Attach {
             session_id,
             since_seq: None,
@@ -1738,7 +1724,6 @@ mod tests {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version,
             env_snapshot: None,
             env_policy: proto::EnvDriftPolicy::Daemon,
         }
@@ -1762,7 +1747,6 @@ mod tests {
             repair_required: None,
             resume_compaction_offer: None,
             daemon_version: proto::DAEMON_VERSION.to_string(),
-            compatible: true,
             env_baseline: None,
             env_session: None,
             env_drift: None,
@@ -2142,54 +2126,6 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn negotiation_sends_attach_with_negotiated_client_protocol_version() {
-        let (_dir, socket, mut listener) = bind_test_socket();
-        let session_id = Uuid::new_v4();
-        let server = tokio::spawn(async move {
-            let stream = accept_test(&mut listener).await;
-            let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
-            daemon.set_negotiated_version(proto::PROTOCOL_VERSION);
-            complete_wire_connect_handshake(&mut daemon).await;
-            let request_id = match daemon.recv().await.unwrap().unwrap() {
-                proto::RecvFrame::Envelope(env) => match env.body {
-                    Body::Request { id, request, .. } => {
-                        match request {
-                            Request::Attach {
-                                client_protocol_version,
-                                ..
-                            } => assert_eq!(client_protocol_version, proto::PROTOCOL_VERSION),
-                            other => panic!("expected attach request, got {other:?}"),
-                        }
-                        id
-                    }
-                    other => panic!("expected request body, got {other:?}"),
-                },
-                other => panic!("expected request envelope, got {other:?}"),
-            };
-            daemon
-                .send(&Envelope::response(
-                    request_id,
-                    attached_response(session_id),
-                ))
-                .await
-                .unwrap();
-        });
-
-        let client = DaemonClient::connect(&socket).await.unwrap();
-        client
-            .request(attach_request_with_client_protocol_version(
-                Some(session_id),
-                client.negotiated().version,
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-
-        server.await.unwrap();
-    }
-
     #[test]
     fn inbound_burst_probes_outbound_after_thirty_two_frames() {
         let mut burst = InboundBurst::default();
@@ -2434,7 +2370,6 @@ mod tests {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: proto::EnvDriftPolicy::Daemon,
         });

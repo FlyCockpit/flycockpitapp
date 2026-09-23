@@ -10,7 +10,6 @@
           "options": {
             "no_sandbox": false,
             "interactive": false,
-            "client_protocol_version": 21,
             "env_policy": "daemon"
           }
         },
@@ -33,7 +32,6 @@
           "options": {
             "no_sandbox": false,
             "interactive": false,
-            "client_protocol_version": 21,
             "env_policy": "daemon"
           }
         },
@@ -75,7 +73,6 @@
             "history": [],
             "paused_work": [],
             "daemon_version": "0.1.0",
-            "compatible": true,
             "env_policy_applied": "daemon",
             "attention": []
           }
@@ -103,7 +100,6 @@
             "history": [],
             "paused_work": [],
             "daemon_version": "0.1.0",
-            "compatible": true,
             "env_policy_applied": "daemon",
             "attention": []
           }

@@ -145,7 +145,7 @@
   },
   {
     "magic": "FCM2",
-    "symbolicType": "RemoteMessageV2",
+    "symbolicType": "RemoteMessageV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -157,7 +157,7 @@
   },
   {
     "magic": "FCNP",
-    "symbolicType": "RemoteNetworkPolicyV1",
+    "symbolicType": "RemoteNoisePrologueV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },

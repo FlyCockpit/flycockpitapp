@@ -505,7 +505,7 @@ fn inherited_reexec_state() -> Result<Option<ReexecState>> {
 
 pub(crate) fn published_owner_pid(paths: &DaemonPaths) -> u32 {
     if is_worker_process()
-        && let Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt)) =
+        && let Some(receipt) =
             cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file)
     {
         return receipt.pid;
@@ -744,8 +744,6 @@ pub fn admin_socket(paths: &DaemonPaths) -> Result<PathBuf> {
 
 #[cfg(any(unix, windows))]
 pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool) -> Result<()> {
-    #[cfg(unix)]
-    use cockpit_host::daemon_lifecycle::DaemonPidRecord;
     use cockpit_host::daemon_lifecycle::{ForegroundMetadataGuard, reclaim_stale_and_reserve};
 
     super::validate_bind_socket_paths(&paths)?;
@@ -778,11 +776,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
         {
             let receipt =
                 match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
-                    Some(DaemonPidRecord::Receipt(receipt))
-                        if receipt.pid == std::process::id() =>
-                    {
-                        receipt
-                    }
+                    Some(receipt) if receipt.pid == std::process::id() => receipt,
                     _ => bail!("supervisor receipt changed during reexec"),
                 };
             // SAFETY: these descriptors were exported by this same process
@@ -2461,9 +2455,7 @@ fn publish_generation(
     };
     cockpit_host::daemon_lifecycle::with_lifecycle_lock(&paths.pid_file, || {
         if cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file)
-            != Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(
-                receipt.clone(),
-            ))
+            != Some(receipt.clone())
         {
             bail!("supervisor receipt changed before generation publication");
         }

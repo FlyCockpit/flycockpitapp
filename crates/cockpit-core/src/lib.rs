@@ -59,6 +59,8 @@ pub mod image_generation_runtime;
 pub mod image_sidecar;
 pub mod init;
 pub mod intel;
+#[cfg(test)]
+mod internal_version_pins;
 pub mod keep_warm;
 pub mod knowledge;
 pub mod leak_report;

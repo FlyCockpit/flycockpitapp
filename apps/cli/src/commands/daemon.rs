@@ -754,12 +754,10 @@ fn render_running_status(
 
 fn render_incompatible_protocol_status(socket: &str, hello: &proto::DaemonHello) -> String {
     format!(
-        "daemon: running but speaks an incompatible protocol\n  socket: {socket}\n  daemon: {} (protocol v{})\n  client: {} (protocol v{}, supports v{}..=v{})\n  {}",
+        "daemon: running but speaks an incompatible protocol\n  socket: {socket}\n  daemon: {} (protocol v{})\n  client: {} (protocol v{})\n  {}",
         hello.daemon_version,
         hello.protocol_version,
         proto::DAEMON_VERSION,
-        proto::PROTOCOL_VERSION,
-        proto::PROTOCOL_VERSION,
         proto::PROTOCOL_VERSION,
         PROTOCOL_MISMATCH_STATUS_REMEDY
     )
@@ -1035,10 +1033,8 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "daemon: running but speaks an incompatible protocol\n  socket: /tmp/cockpit.sock\n  daemon: 0.0.old (protocol v0)\n  client: {} (protocol v{}, supports v{}..=v{})\n  run `cockpit daemon restart` to restart the daemon on this version",
+                "daemon: running but speaks an incompatible protocol\n  socket: /tmp/cockpit.sock\n  daemon: 0.0.old (protocol v0)\n  client: {} (protocol v{})\n  run `cockpit daemon restart` to restart the daemon on this version",
                 proto::DAEMON_VERSION,
-                proto::PROTOCOL_VERSION,
-                proto::PROTOCOL_VERSION,
                 proto::PROTOCOL_VERSION
             )
         );

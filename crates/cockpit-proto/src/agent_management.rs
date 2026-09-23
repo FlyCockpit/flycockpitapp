@@ -220,7 +220,7 @@ pub fn agent_mutation_intent_hash(
     _expected_revision: Option<&str>,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"cockpit-agent-mutation-shape-v2\0");
+    digest.update(b"cockpit-agent-mutation-shape-v1\0");
     let (action, name) = match mutation {
         AgentMutation::EjectBuiltin { name } => ("eject_builtin", Some(name.as_str())),
         AgentMutation::SaveDefinition { name, .. } => ("save_definition", Some(name.as_str())),
@@ -265,7 +265,7 @@ pub fn assistant_mutation_intent_hash(
     intended_markdown: Option<&str>,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"cockpit-assistant-mutation-shape-v2\0");
+    digest.update(b"cockpit-assistant-mutation-shape-v1\0");
     for field in [action, name] {
         digest_field(&mut digest, field.as_bytes());
     }

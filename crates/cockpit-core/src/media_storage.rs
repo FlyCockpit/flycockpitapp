@@ -177,7 +177,7 @@ struct HeldHandleRecoveryProof {
 }
 
 pub(crate) struct AcquireMessageMediaInput<'a> {
-    pub attachments: Vec<crate::proto_crate::send_user_message_v2::MessageAttachmentIdentity>,
+    pub attachments: Vec<crate::proto_crate::send_user_message::MessageAttachmentIdentity>,
     pub session_id: Uuid,
     pub project_digest: String,
     pub consumer_id: String,
@@ -10679,14 +10679,14 @@ mod tests {
             .acquire_message_media_bound(AcquireMessageMediaInput {
                 attachments: fixtures
                     .iter()
-                    .map(|value| {
-                        crate::proto_crate::send_user_message_v2::MessageAttachmentIdentity {
+                    .map(
+                        |value| crate::proto_crate::send_user_message::MessageAttachmentIdentity {
                             attachment_id: value.0,
                             attachment_version: 1,
                             checksum: value.2,
                             kind: MediaKind::Image,
-                        }
-                    })
+                        },
+                    )
                     .collect(),
                 session_id: session,
                 project_digest: project,

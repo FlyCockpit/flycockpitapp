@@ -2083,65 +2083,6 @@ impl WorkerWorkspaceConfigAuthority {
         self.verify_retained_config_source_chain()
     }
 
-    /// Opaque receipt binding for one retained `SetDefaultModel` linearization.
-    ///
-    /// This intentionally hashes immutable attach-time directory identities,
-    /// the exact one-leaf transaction descriptor, and the generation published
-    /// into the worker after the retained reload.  It never serializes a path,
-    /// config body, provider credential, or workspace name.  The caller must
-    /// invoke this only after its final complete-chain verification; this
-    /// method repeats that verification so no caller can accidentally mint a
-    /// receipt for a stale attach capability.
-    pub(crate) fn retained_effective_default_authority_binding(
-        &self,
-        config_generation: u64,
-    ) -> Result<cockpit_config::config::effective_default::DefaultUpdateAuthorityBinding> {
-        self.verify_retained_effective_default_chain()?;
-        let target = self
-            .default_write_target
-            .as_ref()
-            .context("no retained cockpit config layer applies to this attached session")?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"cockpit-retained-default-receipt-authority-v1\0");
-        hasher.update(self.attached_root.identity_digest);
-        hasher.update([u8::from(self.exclusive_config_override)]);
-        hasher.update((self.default_effective_layers.len() as u64).to_le_bytes());
-        for layer in &self.default_effective_layers {
-            // Directory identity and leaf/artifact names together describe
-            // exactly the capability-relative transaction target without
-            // exposing any of them in the public receipt.
-            hasher.update(layer.config_directory.identity_digest);
-            for leaf in [
-                &layer.config_leaf,
-                &layer.effective_default_journal_leaf,
-                &layer.effective_default_backup_leaf,
-            ] {
-                let bytes = leaf.as_encoded_bytes();
-                hasher.update((bytes.len() as u64).to_le_bytes());
-                hasher.update(bytes);
-            }
-        }
-        // Bind the selected descriptor again explicitly.  This makes a future
-        // change to effective-layer ordering fail closed even if its final
-        // element happened to have the same directory identity.
-        hasher.update(target.config_directory.identity_digest);
-        for leaf in [
-            &target.config_leaf,
-            &target.effective_default_journal_leaf,
-            &target.effective_default_backup_leaf,
-        ] {
-            let bytes = leaf.as_encoded_bytes();
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
-        }
-        hasher.update(target.scope.as_str().as_bytes());
-        hasher.update(config_generation.to_le_bytes());
-        cockpit_config::config::effective_default::DefaultUpdateAuthorityBinding::new(
-            crate::intel::hex_lower(&hasher.finalize()),
-            config_generation,
-        )
-    }
-
     /// Create a public-safe receipt binding for the policy projection that
     /// actually authorized a default-model write. Only the projected source
     /// scope and selected target are part of the opaque digest: a receipt
@@ -2168,7 +2109,7 @@ impl WorkerWorkspaceConfigAuthority {
             .filter(|layer| self.retained_layer_is_projected(layer, policy))
             .collect::<Vec<_>>();
         let mut hasher = Sha256::new();
-        hasher.update(b"cockpit-retained-default-receipt-authority-v2\0");
+        hasher.update(b"cockpit-retained-default-receipt-authority-v1\0");
         hasher.update(self.attached_root.identity_digest);
         hasher.update([u8::from(self.exclusive_config_override)]);
         hasher.update((projected.len() as u64).to_le_bytes());

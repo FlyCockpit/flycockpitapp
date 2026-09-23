@@ -12,7 +12,7 @@ use crate::{
         session_worker::{SessionWork, SessionWorkerHandle},
         shutdown::ShutdownPhase,
     },
-    proto_crate::send_user_message_v2::MessageIngressV2,
+    proto_crate::send_user_message::MessageIngress,
     session::Session,
 };
 #[cfg(feature = "remote")]
@@ -2045,7 +2045,6 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
         interactive: false,
         session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
-        client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
         env_policy: EnvDriftPolicy::Daemon,
     };
@@ -2252,7 +2251,6 @@ async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dis
         interactive: false,
         session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
-        client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
         env_policy: EnvDriftPolicy::Daemon,
     };
@@ -4505,7 +4503,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     handle_envelope(
         Envelope {
             v: proto::PROTOCOL_VERSION,
-            body: Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
+            body: Body::RemoteReplayRequest(proto::RemoteReplayRequest {
                 id: request_id,
                 after_event_seq: None,
                 limit: proto::RemoteReplayLimit::new(2).unwrap(),
@@ -4534,7 +4532,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     handle_envelope(
         Envelope {
             v: proto::PROTOCOL_VERSION,
-            body: Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
+            body: Body::RemoteReplayRequest(proto::RemoteReplayRequest {
                 id: Uuid::new_v4(),
                 after_event_seq: None,
                 limit: proto::RemoteReplayLimit::new(2).unwrap(),
@@ -4564,7 +4562,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     handle_envelope(
         Envelope {
             v: proto::PROTOCOL_VERSION,
-            body: Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+            body: Body::RemoteReplayAck(proto::RemoteReplayAck {
                 id: wrong_ack_id,
                 delivery_id: event.delivery_id,
                 lease_token: event.lease_token,
@@ -4588,7 +4586,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     handle_envelope(
         Envelope {
             v: proto::PROTOCOL_VERSION,
-            body: Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+            body: Body::RemoteReplayAck(proto::RemoteReplayAck {
                 id: own_ack_id,
                 delivery_id: event.delivery_id,
                 lease_token: event.lease_token,
@@ -4976,14 +4974,14 @@ async fn send_user_message_rejects_client_claimed_internal_origin_before_queuein
         attached_state_with_worker_receiver(&ctx, tmp.path()).await;
 
     let error = handle_request(
-        Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 session_id.to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::now_v7(),
                     origin: crate::proto_crate::UserMessageOrigin::AutoContinue,
                     text: "forged continuation".into(),
@@ -5032,14 +5030,14 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let mut first = tokio::spawn(async move {
         let mut state = state;
         let result = handle_request(
-            Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     Uuid::now_v7(),
                     session_id.to_string(),
                     None,
                     None,
                     None,
-                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::proto_crate::send_user_message::SendUserMessage {
                         client_submission_id: Uuid::now_v7(),
                         origin: Default::default(),
                         text: "first turn".into(),
@@ -5126,14 +5124,14 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let mut second = tokio::spawn(async move {
         let mut state = state;
         handle_request(
-            Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     Uuid::now_v7(),
                     session_id.to_string(),
                     None,
                     None,
                     None,
-                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::proto_crate::send_user_message::SendUserMessage {
                         client_submission_id: Uuid::now_v7(),
                         origin: Default::default(),
                         text: "second turn".into(),
@@ -5811,7 +5809,6 @@ async fn https_media_ingest_daemon_dispatch_is_owner_bound_ready_and_replayable(
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         }],
@@ -6149,7 +6146,6 @@ async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         };
@@ -6246,7 +6242,6 @@ async fn attach_update_daemon_environment_policy_requires_owner() {
         interactive: true,
         session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
-        client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: Some(
             EnvSnapshot::new(
                 EnvSnapshotSource::ExplicitCli,
@@ -6314,7 +6309,6 @@ async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: Some(
                 EnvSnapshot::new(
                     EnvSnapshotSource::ExplicitCli,
@@ -6584,7 +6578,6 @@ async fn typed_invalid_attach_model_is_rejected_before_any_mutation() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -8440,7 +8433,6 @@ fn assistant_attach_request(project_root: &Path) -> Request {
         interactive: true,
         session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
-        client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
         env_policy: EnvDriftPolicy::Daemon,
     }
@@ -13428,14 +13420,14 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
             .await;
             let mut state = state;
             let mut effects = ClientRequestEffects::default();
-            let request = Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            let request = Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     Uuid::now_v7(),
                     session_id.to_string(),
                     None,
                     None,
                     None,
-                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::proto_crate::send_user_message::SendUserMessage {
                         client_submission_id: client_submission_id,
                         origin: Default::default(),
                         text: "same content".to_string(),
@@ -13570,14 +13562,14 @@ async fn send_user_message_remote_branch_is_explicitly_fail_closed() {
     let operation = remote_owner_operation().await;
     let logical_attachment_id = operation.logical_attachment_id;
     let operation_id = operation.operation_id;
-    let request = Request::SendUserMessageV2 {
-        ingress: MessageIngressV2::local_direct(
+    let request = Request::SendUserMessage {
+        ingress: MessageIngress::local_direct(
             Uuid::now_v7(),
             session_id.to_string(),
             None,
             None,
             None,
-            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            crate::proto_crate::send_user_message::SendUserMessage {
                 client_submission_id: Uuid::now_v7(),
                 origin: Default::default(),
                 text: "remote send must fail closed".to_string(),
@@ -14425,8 +14417,8 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
 fn oauth_completion_receipts_and_cancel_race_are_secret_safe() {
     let source = include_str!("dispatch.rs");
     assert!(
-        source.contains("complete_provider_oauth_receipt_v2")
-            && source.contains("complete_mcp_oauth_receipt_v2"),
+        source.contains("complete_provider_oauth_receipt_v1")
+            && source.contains("complete_mcp_oauth_receipt_v1"),
         "completion receipts must correlate only non-secret identifiers"
     );
     assert!(
@@ -14475,7 +14467,7 @@ fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
     assert!(source.contains("SecretVaultKind::SealedState"));
     assert!(source.contains("mutate_item_on_conn"));
     assert!(source.contains("AgentEditorSettlementStatus"));
-    assert!(source.contains("flycockpit.agent-editor.completion.v2"));
+    assert!(source.contains("flycockpit.agent-editor.completion.v1"));
     assert!(source.contains("recoverable_agent_editor_completions"));
     assert!(source.contains("editor_lease_settlement"));
     assert!(
@@ -17894,19 +17886,18 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let error = handle_request(
-        Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 session_id.to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::now_v7(),
                     origin: Default::default(),
-                    text: "x".repeat(
-                        crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES + 1,
-                    ),
+                    text: "x"
+                        .repeat(crate::proto_crate::send_user_message::MAX_MESSAGE_TEXT_BYTES + 1),
                     display_text: None,
                     tag_expansions: Vec::new(),
                     forced_skill: None,
@@ -17937,20 +17928,20 @@ async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_s
 }
 
 #[tokio::test]
-async fn send_user_message_v2_inline_boundary_rejects_over_limit_and_dispatches_at_limit() {
+async fn send_user_message_inline_boundary_rejects_over_limit_and_dispatches_at_limit() {
     let ctx = test_ctx_with_fake_secure_key_actor().await;
     let project = tempfile::tempdir().unwrap();
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let error = handle_request(
-        Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 session_id.to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::now_v7(),
                     origin: Default::default(),
                     text: "x".repeat(64 * 1024 + 1),
@@ -17985,14 +17976,14 @@ async fn send_user_message_v2_inline_boundary_rejects_over_limit_and_dispatches_
     let boundary_ctx = ctx.clone();
     let mut boundary = tokio::spawn(async move {
         let result = handle_request(
-            Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     Uuid::now_v7(),
                     session_id.to_string(),
                     None,
                     None,
                     None,
-                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::proto_crate::send_user_message::SendUserMessage {
                         client_submission_id: Uuid::now_v7(),
                         origin: Default::default(),
                         text: "x".repeat(64 * 1024),
@@ -18233,12 +18224,12 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
     assert!(source.len() > 1024 * 1024);
     assert!(display.len() > 64 * 1024);
     let client_submission_id = Uuid::now_v7();
-    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+    let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage {
         session_id,
         canonical_project_digest: [41; 32],
         model_config_generation: 0,
         canonical_model_digest: [42; 32],
-        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+        request: crate::proto_crate::send_user_message::SendUserMessage {
             client_submission_id,
             origin: proto::UserMessageOrigin::ExternalRoot,
             text: source.clone(),
@@ -18465,12 +18456,12 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
         source.as_bytes(),
         "the original remote owner has already consumed the ephemeral transfer"
     );
-    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+    let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage {
         session_id,
         canonical_project_digest: [51; 32],
         model_config_generation: 0,
         canonical_model_digest: [52; 32],
-        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+        request: crate::proto_crate::send_user_message::SendUserMessage {
             client_submission_id,
             origin: proto::UserMessageOrigin::ExternalRoot,
             text: source.clone(),
@@ -22031,14 +22022,14 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             task_call_id: "task-1".into(),
             label: "child".into(),
         },
-        "send_user_message" => Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        "send_user_message" => Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 session_id.to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::now_v7(),
                     origin: Default::default(),
                     text: "authz".into(),
@@ -24403,7 +24394,6 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
                     interactive: true,
                     session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                     model_override: None,
-                    client_protocol_version: proto::PROTOCOL_VERSION,
                     env_snapshot: None,
                     env_policy: EnvDriftPolicy::Daemon,
                 },
@@ -24675,7 +24665,6 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
                     interactive: true,
                     session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                     model_override: None,
-                    client_protocol_version: proto::PROTOCOL_VERSION,
                     env_snapshot: None,
                     env_policy: EnvDriftPolicy::Daemon,
                 },
@@ -25089,7 +25078,6 @@ async fn dispatch_attached_worker_request(
                 interactive: true,
                 session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
-                client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
                 env_policy: EnvDriftPolicy::Daemon,
             },
@@ -25186,14 +25174,14 @@ async fn assert_worker_delivery_happy(kind: &str) {
         stage_opaque_user_transfer(bulk_text.as_bytes(), &owner)
     });
     let request = match kind {
-        "send_user_message" => Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        "send_user_message" => Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 session_id.to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::now_v7(),
                     origin: Default::default(),
                     text: "hello worker".into(),
@@ -25735,14 +25723,14 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
         tmp.path(),
         session_id,
         work_rx,
-        Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 session_id.to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: client_submission_id,
                     origin: Default::default(),
                     text: "must remain retryable".to_string(),
@@ -25839,14 +25827,14 @@ async fn set_longcache_returns_longcache_state() {
 async fn assert_attached_required_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
-        "send_user_message" => Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        "send_user_message" => Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 Uuid::nil().to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::now_v7(),
                     origin: Default::default(),
                     text: "detached".into(),
@@ -27671,7 +27659,7 @@ async fn assert_auto_title_mutating_malformed() {
 fn minimal_import_archive_base64(redacted: bool) -> (Uuid, String) {
     let session_id = Uuid::new_v4();
     let manifest = serde_json::json!({
-        "schema": "cockpit-session-export/4",
+        "schema": "cockpit-session-export/1",
         "redacted": redacted,
         "target": {
             "project_id": "import-dispatch-test",
@@ -28739,7 +28727,6 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
         interactive: true,
         session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
-        client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
         env_policy: EnvDriftPolicy::Daemon,
     }
@@ -28784,7 +28771,6 @@ async fn modes_session_setup_lazy_live_reattach_uses_daemon_mode_before_first_me
         interactive: true,
         session_entry_mode: mode,
         model_override: None,
-        client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
         env_policy: EnvDriftPolicy::Daemon,
     };
@@ -29306,7 +29292,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 interactive: false,
                 session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
-                client_protocol_version: Default::default(),
                 env_snapshot: None,
                 env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
             },
@@ -29383,14 +29368,14 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
-            request: Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            request: Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     Uuid::now_v7(),
                     transcript_session_id.to_string(),
                     None,
                     None,
                     None,
-                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::proto_crate::send_user_message::SendUserMessage {
                         client_submission_id: Uuid::now_v7(),
                         origin: Default::default(),
                         text: "hello".into(),
@@ -31377,7 +31362,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ReadRedactedExportChunk,
         Attach,
         SubagentTranscript,
-        SendUserMessageV2,
+        SendUserMessage,
         SendUserMessageBulk,
         GetRunInvocationStatus,
         CancelRunInvocation,
@@ -31767,7 +31752,7 @@ async fn finish_upload_admitted_for(
     ctx: &Arc<DaemonContext>,
     state: &mut MutableClientState,
     png: &[u8],
-) -> crate::proto_crate::send_user_message_v2::MessageAttachmentIdentity {
+) -> crate::proto_crate::send_user_message::MessageAttachmentIdentity {
     let response = begin_attachment_upload_admitted(
         ctx,
         state,
@@ -31841,7 +31826,6 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -31918,14 +31902,14 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         .unwrap();
 
     let exact = handle_request(
-        Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 session_id.to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: client_submission_id,
                     origin: Default::default(),
                     text: text.to_string(),
@@ -31952,14 +31936,14 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
     );
 
     let conflict = handle_request(
-        Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 session_id.to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: client_submission_id,
                     origin: Default::default(),
                     text: "different payload".to_string(),
@@ -32342,8 +32326,8 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
             .collect::<Vec<_>>();
 
         for (index, (operation_id, submission_id)) in identities.iter().copied().enumerate() {
-            let request = Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            let request = Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     operation_id,
                     session_id.to_string(),
                     None,
@@ -32353,7 +32337,7 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
                         timeout_ms: Some(60_000),
                         approval_mode: None,
                     }),
-                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::proto_crate::send_user_message::SendUserMessage {
                         client_submission_id: submission_id,
                         origin: Default::default(),
                         text: format!("history message {index}"),
@@ -32413,7 +32397,7 @@ fn tool_media_subject_binding_replay_and_propagation_daemon_restart_and_release(
         assert_eq!(restart_projection.len(), 3);
         for row in &restart_projection {
             let canonical =
-                crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                crate::proto_crate::send_user_message::CanonicalSendUserMessage::decode(
                     &row.canonical_message,
                 )
                 .unwrap();
@@ -32756,7 +32740,6 @@ async fn image_submission_exact_retry_case() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -32771,26 +32754,24 @@ async fn image_submission_exact_retry_case() {
     let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let operation_id = Uuid::now_v7();
     let client_submission_id = Uuid::now_v7();
-    let request = |operation_id, id, text: &str, attachment| Request::SendUserMessageV2 {
-        ingress: MessageIngressV2::local_direct(
+    let request = |operation_id, id, text: &str, attachment| Request::SendUserMessage {
+        ingress: MessageIngress::local_direct(
             operation_id,
             session_id.to_string(),
             None,
             None,
             None,
-            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            crate::proto_crate::send_user_message::SendUserMessage {
                 client_submission_id: id,
                 origin: Default::default(),
                 text: text.to_string(),
                 display_text: Some("message with image".to_string()),
-                tag_expansions: vec![
-                    crate::proto_crate::send_user_message_v2::MessageTagExpansion {
-                        tool: "read".to_string(),
-                        path: "image-test.png".to_string(),
-                        detail: "expanded image context".to_string(),
-                        ok: true,
-                    },
-                ],
+                tag_expansions: vec![crate::proto_crate::send_user_message::MessageTagExpansion {
+                    tool: "read".to_string(),
+                    path: "image-test.png".to_string(),
+                    detail: "expanded image context".to_string(),
+                    ok: true,
+                }],
                 forced_skill: Some("image-skill".to_string()),
                 delivery_class_override: None,
                 resolved_delivery_class: None,
@@ -32898,7 +32879,6 @@ async fn image_submission_exact_retry_case() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -33051,14 +33031,14 @@ async fn ambiguous_image_submission_case(ctx: Arc<DaemonContext>) -> Arc<DaemonC
     let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let first_operation_id = Uuid::now_v7();
     let first_id = Uuid::now_v7();
-    let request = |operation_id, id| Request::SendUserMessageV2 {
-        ingress: MessageIngressV2::local_direct(
+    let request = |operation_id, id| Request::SendUserMessage {
+        ingress: MessageIngress::local_direct(
             operation_id,
             session_id.to_string(),
             None,
             None,
             None,
-            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            crate::proto_crate::send_user_message::SendUserMessage {
                 client_submission_id: id,
                 origin: Default::default(),
                 text: "ambiguous image delivery".to_string(),
@@ -35940,7 +35920,6 @@ async fn attach_fails_closed_on_an_unrecoverable_default_model_journal() {
             interactive: false,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
         },
@@ -36623,7 +36602,6 @@ async fn recv_writer_body(
 ) -> Body {
     loop {
         match writer_rx.recv().await.expect(label) {
-            ClientWriterMessage::SetVersion(_) => continue,
             ClientWriterMessage::Envelope(envelope) => return envelope.body,
             ClientWriterMessage::EnvelopeWithAck { envelope, ack } => {
                 let _ = ack.send(Ok(()));
@@ -36714,7 +36692,6 @@ async fn serialized_requests_apply_in_receipt_order() {
                     interactive: true,
                     session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                     model_override: None,
-                    client_protocol_version: proto::PROTOCOL_VERSION,
                     env_snapshot: None,
                     env_policy: EnvDriftPolicy::Daemon,
                 },
@@ -36767,14 +36744,14 @@ async fn serialized_requests_apply_in_receipt_order() {
         .send(ClientExecutorInput::Frame(RecvFrame::Envelope(Box::new(
             Envelope::request(
                 message_id,
-                Request::SendUserMessageV2 {
-                    ingress: MessageIngressV2::local_direct(
+                Request::SendUserMessage {
+                    ingress: MessageIngress::local_direct(
                         Uuid::now_v7(),
                         session.session_id.to_string(),
                         None,
                         None,
                         None,
-                        crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                        crate::proto_crate::send_user_message::SendUserMessage {
                             client_submission_id: Uuid::now_v7(),
                             origin: Default::default(),
                             text: "after model switch".to_string(),
@@ -37328,7 +37305,6 @@ async fn attach_replay_precedes_live_events_under_task_split() {
                 interactive: true,
                 session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
-                client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
                 env_policy: EnvDriftPolicy::Daemon,
             },
@@ -37453,7 +37429,6 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
                 interactive: true,
                 session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
-                client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
                 env_policy: EnvDriftPolicy::Daemon,
             },
@@ -38580,14 +38555,14 @@ async fn btw_concurrent_with_parent_turn() {
     let ctx_for_parent = ctx.clone();
     let parent_request = tokio::spawn(async move {
         handle_request(
-            Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     Uuid::now_v7(),
                     parent_session_id.to_string(),
                     None,
                     None,
                     None,
-                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::proto_crate::send_user_message::SendUserMessage {
                         client_submission_id: Uuid::now_v7(),
                         origin: Default::default(),
                         text: "parent work".to_string(),
@@ -38668,14 +38643,14 @@ async fn btw_concurrent_with_parent_turn() {
     let ctx_for_btw = ctx.clone();
     let btw_request = tokio::spawn(async move {
         handle_request(
-            Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     Uuid::now_v7(),
                     btw_session_id.to_string(),
                     None,
                     None,
                     None,
-                    crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::proto_crate::send_user_message::SendUserMessage {
                         client_submission_id: Uuid::now_v7(),
                         origin: Default::default(),
                         text: "btw work".to_string(),
@@ -38817,7 +38792,6 @@ async fn btw_rehydrate_reports_live_fork() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -39098,14 +39072,14 @@ async fn send_user_message_refused_while_draining() {
     ctx.shutdown.begin_drain();
 
     let err = handle_request(
-        Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 Uuid::nil().to_string(),
                 None,
                 None,
                 None,
-                crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                crate::proto_crate::send_user_message::SendUserMessage {
                     client_submission_id: Uuid::now_v7(),
                     origin: Default::default(),
                     text: "hi".into(),
@@ -39227,7 +39201,6 @@ async fn attach_replays_drain_state_after_attached_response() {
                 interactive: true,
                 session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
                 model_override: None,
-                client_protocol_version: proto::PROTOCOL_VERSION,
                 env_snapshot: None,
                 env_policy: EnvDriftPolicy::Daemon,
             },
@@ -39339,7 +39312,6 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -39463,7 +39435,6 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -39507,7 +39478,6 @@ async fn attach_since_seq_replays_retracted_user_row_identity() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -39635,7 +39605,6 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns_inner() 
         interactive: true,
         session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
         model_override: None,
-        client_protocol_version: proto::PROTOCOL_VERSION,
         env_snapshot: None,
         env_policy: EnvDriftPolicy::Daemon,
     };
@@ -39669,14 +39638,14 @@ async fn cancel_turn_rpc_retracts_only_reasoning_only_real_worker_turns_inner() 
         .handle
         .subscribe();
 
-    let send = |client_submission_id, text: &str| Request::SendUserMessageV2 {
-        ingress: MessageIngressV2::local_direct(
+    let send = |client_submission_id, text: &str| Request::SendUserMessage {
+        ingress: MessageIngress::local_direct(
             Uuid::now_v7(),
             session_id.to_string(),
             None,
             None,
             None,
-            crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            crate::proto_crate::send_user_message::SendUserMessage {
                 client_submission_id,
                 origin: Default::default(),
                 text: text.to_string(),
@@ -40187,70 +40156,6 @@ async fn wait_for_retraction_provider_request(
     provider.next_response_started().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn attach_compatible_reflects_client_protocol_version() {
-    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
-    let ctx = test_ctx();
-    let tmp = tempfile::tempdir().unwrap();
-    ctx.db
-        .set_workspace_trust(
-            tmp.path(),
-            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
-        )
-        .await
-        .unwrap();
-
-    let mut state = MutableClientState::detached_for_test();
-    let response = handle_request(
-        Request::Attach {
-            session_id: None,
-            since_seq: None,
-            project_root: Some(tmp.path().to_string_lossy().into_owned()),
-            initial_model: None,
-            no_sandbox: false,
-            interactive: true,
-            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
-            model_override: None,
-            client_protocol_version: 0,
-            env_snapshot: None,
-            env_policy: EnvDriftPolicy::Daemon,
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .expect("old client attaches");
-    match response {
-        Response::Attached { compatible, .. } => assert!(!compatible),
-        other => panic!("expected Attached, got {other:?}"),
-    }
-
-    let mut state = MutableClientState::detached_for_test();
-    let response = handle_request(
-        Request::Attach {
-            session_id: None,
-            since_seq: None,
-            project_root: Some(tmp.path().to_string_lossy().into_owned()),
-            initial_model: None,
-            no_sandbox: false,
-            interactive: true,
-            session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
-            model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
-            env_snapshot: None,
-            env_policy: EnvDriftPolicy::Daemon,
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .expect("current client attaches");
-    match response {
-        Response::Attached { compatible, .. } => assert!(compatible),
-        other => panic!("expected Attached, got {other:?}"),
-    }
-}
-
 /// Regression (`daemon-trust-test-isolation.md`): daemon attach resolves
 /// the session's model from the [`ConfigSource`] injected through the
 /// `DaemonContext` constructor — never from the machine's live layered
@@ -40307,7 +40212,6 @@ async fn attach_resolves_model_from_injected_config_source() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -40422,7 +40326,6 @@ async fn reconnect_attach_uses_authoritative_default_correction_before_config_wa
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -40591,7 +40494,7 @@ async fn client_transport_executor_error_wins_over_dependent_clean_writer_exit()
 }
 
 #[tokio::test]
-async fn server_responses_use_negotiated_client_protocol_version() {
+async fn server_responses_use_the_single_protocol_version() {
     let ctx = test_ctx();
     let (server_stream, client_stream) = test_stream_pair();
     let server = tokio::spawn(handle_client_transport_as(
@@ -40602,19 +40505,14 @@ async fn server_responses_use_negotiated_client_protocol_version() {
         false,
         None,
     ));
-    let mut client = ProtoStream::with_version(client_stream, proto::PROTOCOL_VERSION);
+    let mut client = ProtoStream::new(client_stream);
 
-    // The hello is intentionally emitted at the daemon's current protocol so
-    // older clients can parse it as a raw handshake before negotiation.
+    // The hello is parsed as a raw handshake before the first request.
     let _ = recv_body(&mut client).await;
 
     let status_id = Uuid::new_v4();
     client
-        .send(&Envelope::request_at(
-            proto::PROTOCOL_VERSION,
-            status_id,
-            Request::DaemonStatus,
-        ))
+        .send(&Envelope::request(status_id, Request::DaemonStatus))
         .await
         .unwrap();
 
@@ -40771,7 +40669,6 @@ async fn attach_requires_db_workspace_trust_row() {
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -40823,7 +40720,6 @@ async fn modes_session_setup_dispatch_reports_trust_reconciliation_as_retryable(
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -40912,7 +40808,6 @@ async fn modes_session_setup_dispatch_preserves_attach_time_workspace_identity()
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -40982,7 +40877,6 @@ async fn modes_session_setup_dispatch_rejects_replaced_ancestor_config_authority
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -41046,7 +40940,6 @@ async fn modes_session_setup_shared_dispatch_rejects_replaced_ancestor_config_au
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -41124,7 +41017,6 @@ async fn modes_session_setup_dispatch_never_rereads_workspace_config_after_swap_
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },
@@ -41256,7 +41148,6 @@ async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_dura
             interactive: true,
             session_entry_mode: proto::NonCodeSessionEntryMode::Assistant,
             model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,
             env_policy: EnvDriftPolicy::Daemon,
         },

@@ -72,7 +72,6 @@ fn switch_outcome_with_epoch(session_id: uuid::Uuid, attachment_epoch: u64) -> A
         resume_compaction_offer: None,
         btw_fork: None,
         daemon_version: "test".to_string(),
-        daemon_compatible: true,
         attachment_epoch,
         transition_guard: None,
     }))
@@ -1074,7 +1073,6 @@ async fn successful_side_return_commits_snapshot_restore_and_discard_after_resul
         resume_compaction_offer: None,
         btw_fork: None,
         daemon_version: "test".to_string(),
-        daemon_compatible: true,
         attachment_epoch: 0,
         transition_guard: None,
     };

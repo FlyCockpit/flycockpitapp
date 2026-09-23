@@ -35,7 +35,7 @@ use cockpit_db::db::{
 
 use crate::resource_limits::ResourceLimits;
 
-const EXPORT_SCHEMA: &str = "cockpit-session-export/4";
+use super::export::EXPORT_SCHEMA;
 const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 const MAX_TEXT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
@@ -1581,12 +1581,12 @@ mod tests {
     #[test]
     fn queued_fcm2_limit_matches_protocol_and_shared_fixture() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+            "../../../../packages/cockpit-protocol/fixtures/send-user-message-canonical-vectors.json"
         ))
         .unwrap();
         assert_eq!(
             cockpit_db::db::message_attachments::MAX_QUEUED_CANONICAL_MESSAGE_BYTES,
-            crate::proto_crate::send_user_message_v2::MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES
+            crate::proto_crate::send_user_message::MAX_CANONICAL_SEND_USER_MESSAGE_BYTES
         );
         assert_eq!(
             fixture["limits"]["fcm2_max_bytes"].as_u64(),
@@ -1722,15 +1722,15 @@ mod tests {
     }
 
     #[test]
-    fn modes_session_setup_rejects_prerelease_export_schema_three_without_a_shim() {
+    fn modes_session_setup_rejects_unknown_export_schema_without_a_shim() {
         let archive = archive_bytes_with_schema(
-            "cockpit-session-export/3",
+            "cockpit-session-export/2",
             vec![session(Uuid::new_v4(), None)],
             Vec::new(),
             false,
         );
         let error = read_archive_bytes(&archive)
-            .expect_err("the obsolete export schema must not be parsed as v4")
+            .expect_err("a non-current export schema must not be parsed as v1")
             .to_string();
         assert!(
             error.contains("unsupported session export schema"),
@@ -2111,7 +2111,7 @@ mod tests {
     }
 
     #[test]
-    fn import_rejects_flat_v1_export_shape() {
+    fn import_rejects_non_current_flat_export_shape() {
         let id = Uuid::new_v4();
         let flat = json!({
             "session_id": id,
@@ -2126,7 +2126,7 @@ mod tests {
             "title": "Old export",
         });
         let bytes =
-            archive_bytes_with_schema("cockpit-session-export/1", vec![flat], vec![], false);
+            archive_bytes_with_schema("cockpit-session-export/2", vec![flat], vec![], false);
         let error = read_archive_bytes(&bytes).unwrap_err();
         assert!(
             error

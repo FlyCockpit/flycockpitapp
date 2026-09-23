@@ -9390,10 +9390,10 @@ pub(crate) struct NoninteractiveOutcome {
     pub fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
 }
 
-/// The durable continuation of a noninteractive executor.  Version one was a
-/// ready-to-run `(history, next_prompt)` pair.  Version two additionally
-/// records the one tool result that has not yet been injected because the
-/// parent is waiting on its exact recursive executor set.
+/// The durable continuation of a noninteractive executor: either a
+/// ready-to-run `(history, next_prompt)` pair, or a history plus the one tool
+/// result that has not yet been injected because the parent is waiting on its
+/// exact recursive executor set.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::engine::driver) struct NoninteractiveRecoverySnapshot {
     version: u8,
@@ -9559,7 +9559,7 @@ pub(in crate::engine::driver) fn ready_noninteractive_recovery_snapshot_with_lat
     late_user_steer_continuation_id: Option<uuid::Uuid>,
 ) -> Result<String> {
     serde_json::to_string(&NoninteractiveRecoverySnapshot {
-        version: 2,
+        version: crate::db::agent_tree_decisions::NONINTERACTIVE_RECOVERY_SNAPSHOT_VERSION,
         history,
         next_prompt: Some(next_prompt),
         late_user_steer_continuation_id,
@@ -9590,7 +9590,7 @@ fn waiting_recursive_recovery_snapshot(
     late_user_steer_continuation_id: Option<uuid::Uuid>,
 ) -> Result<String> {
     serde_json::to_string(&NoninteractiveRecoverySnapshot {
-        version: 2,
+        version: crate::db::agent_tree_decisions::NONINTERACTIVE_RECOVERY_SNAPSHOT_VERSION,
         history,
         next_prompt: None,
         late_user_steer_continuation_id,
@@ -9608,32 +9608,12 @@ pub(in crate::engine::driver) fn parse_noninteractive_recovery_snapshot(
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .context("recovered noninteractive snapshot has no version")?;
-    match version {
-        1 => Ok(NoninteractiveRecoverySnapshot {
-            version: 1,
-            history: serde_json::from_value(
-                snapshot
-                    .get("history")
-                    .cloned()
-                    .context("recovered noninteractive snapshot has no history")?,
-            )
-            .context("decoding recovered noninteractive history")?,
-            next_prompt: Some(
-                serde_json::from_value(
-                    snapshot
-                        .get("next_prompt")
-                        .cloned()
-                        .context("recovered noninteractive snapshot has no next prompt")?,
-                )
-                .context("decoding recovered noninteractive next prompt")?,
-            ),
-            late_user_steer_continuation_id: None,
-            pending_recursive: None,
-        }),
-        2 => serde_json::from_value(snapshot)
-            .context("decoding version-two noninteractive recovery snapshot"),
-        _ => anyhow::bail!("recovered noninteractive snapshot version is unsupported"),
-    }
+    anyhow::ensure!(
+        version
+            == u64::from(crate::db::agent_tree_decisions::NONINTERACTIVE_RECOVERY_SNAPSHOT_VERSION),
+        "recovered noninteractive snapshot version is unsupported"
+    );
+    serde_json::from_value(snapshot).context("decoding noninteractive recovery snapshot")
 }
 
 async fn collect_recursive_recovery_endpoint_ids(
@@ -9720,7 +9700,10 @@ async fn prepare_recovered_recursive_noninteractive_executor(
     let launch: serde_json::Value = serde_json::from_str(descriptor.launch.as_json())
         .context("parsing recursive executor launch descriptor")?;
     anyhow::ensure!(
-        launch.get("version").and_then(serde_json::Value::as_u64) == Some(2),
+        launch.get("version").and_then(serde_json::Value::as_u64)
+            == Some(u64::from(
+                crate::db::agent_tree_decisions::RECURSIVE_LAUNCH_DESCRIPTOR_VERSION
+            )),
         "recursive executor launch descriptor version is unsupported"
     );
     let task_call_id = launch
@@ -13055,7 +13038,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                         match waiting_snapshot {
                             Ok(waiting_snapshot) => {
                                 let launch_json = serde_json::to_string(&serde_json::json!({
-                                    "version": 2,
+                                    "version": crate::db::agent_tree_decisions::RECURSIVE_LAUNCH_DESCRIPTOR_VERSION,
                                     "task_call_id": &task_call_id,
                                     "label": &parent_target.label,
                                     "child_agent": &child_agent,
@@ -13675,7 +13658,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                                                 &entry.child_agent,
                                             )?,
                                         launch: validated_recursive_noninteractive_launch(serde_json::to_string(&serde_json::json!({
-                                            "version": 2,
+                                            "version": crate::db::agent_tree_decisions::RECURSIVE_LAUNCH_DESCRIPTOR_VERSION,
                                             "task_call_id": &task_call_id,
                                             "label": &parent_target.label,
                                             "depends_on": &entry.depends_on,

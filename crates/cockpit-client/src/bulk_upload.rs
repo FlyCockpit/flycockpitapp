@@ -36,10 +36,10 @@ pub async fn stage_opaque_user_text<C: DaemonRequestClient>(
             "bulk user-message source text must not be empty".to_owned(),
         ));
     }
-    if bytes.len() > proto::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES {
+    if bytes.len() > proto::send_user_message::MAX_MESSAGE_TEXT_BYTES {
         return Err(BulkUserMessageUploadError::Usage(format!(
             "bulk user-message text exceeds the {} byte FCM2 limit",
-            proto::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES
+            proto::send_user_message::MAX_MESSAGE_TEXT_BYTES
         )));
     }
 

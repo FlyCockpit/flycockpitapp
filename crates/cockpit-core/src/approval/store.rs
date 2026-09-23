@@ -1994,10 +1994,10 @@ struct StoredCommandShape {
 }
 
 /// Convert a versioned command storage key into the non-secret shape the user
-/// approved. Legacy keys remain readable so they can be removed, but never
-/// match at authorization time.
+/// approved. Unrecognized keys are displayed verbatim so they can be removed,
+/// but never match at authorization time.
 fn command_shape_display(storage: &str) -> String {
-    let Some(json) = storage.strip_prefix("v2:") else {
+    let Some(json) = storage.strip_prefix(super::classify::APPROVAL_KEY_VERSION_PREFIX) else {
         return storage.to_string();
     };
     let Ok(shape) = serde_json::from_str::<StoredCommandShape>(json) else {

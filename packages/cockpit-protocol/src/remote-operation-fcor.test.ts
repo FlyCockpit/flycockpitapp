@@ -10,7 +10,7 @@ import {
   hashFcorV1,
   validateFcorV1,
   validateProviderModelResourceV1,
-  validateRegisteredSendUserMessageV2,
+  validateRegisteredSendUserMessage,
 } from "./remote-operation-fcor";
 
 describe("FCOR v1", () => {
@@ -218,7 +218,7 @@ describe("FCOR v1", () => {
     expect(listRollback.finish()).toEqual(new Uint8Array());
     const opaque = new TextEncoder().encode("FCM2foundation-owned");
     let decoded: Uint8Array | undefined;
-    validateRegisteredSendUserMessageV2(opaque, {
+    validateRegisteredSendUserMessage(opaque, {
       owner: "message-attachment-protocol-foundation",
       validate(bytes) {
         decoded = bytes;
@@ -226,13 +226,13 @@ describe("FCOR v1", () => {
     });
     expect(decoded).toBe(opaque);
     expect(() =>
-      validateRegisteredSendUserMessageV2(new TextEncoder().encode("BAD!"), {
+      validateRegisteredSendUserMessage(new TextEncoder().encode("BAD!"), {
         owner: "message-attachment-protocol-foundation",
         validate() {},
       }),
     ).toThrow();
     expect(() =>
-      validateRegisteredSendUserMessageV2(opaque, {
+      validateRegisteredSendUserMessage(opaque, {
         owner: "message-attachment-protocol-foundation",
         validate() {
           throw new Error("semantic rejection");

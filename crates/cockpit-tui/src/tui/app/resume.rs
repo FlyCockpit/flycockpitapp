@@ -474,18 +474,4 @@ impl App {
             Some(_) => {}
         }
     }
-
-    pub(super) fn maybe_show_daemon_version_chip(
-        &mut self,
-        daemon_version: &str,
-        compatible: bool,
-    ) {
-        if compatible || daemon_version == cockpit_proto::DAEMON_VERSION {
-            return;
-        }
-        self.push_plain(format!(
-            "daemon {daemon_version} is newer than this client {}; relaunch cockpit to refresh",
-            cockpit_proto::DAEMON_VERSION
-        ));
-    }
 }

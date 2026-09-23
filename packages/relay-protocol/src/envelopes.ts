@@ -1,8 +1,8 @@
 import { z } from "zod";
 
-export const RELAY_ENVELOPE_VERSION = 2 as const;
-export const RELAY_MIN_SUPPORTED_ENVELOPE_VERSION = 1 as const;
-export const relayEnvelopeVersionSchema = z.union([z.literal(1), z.literal(2)]);
+/** The single relay envelope version; peers accept exactly this value. */
+export const RELAY_ENVELOPE_VERSION = 1 as const;
+export const relayEnvelopeVersionSchema = z.literal(RELAY_ENVELOPE_VERSION);
 const canonicalUuidSchema = z
   .string()
   .uuid()
@@ -134,16 +134,7 @@ export const stampedClientRelayFrameSchema = z
     principal: relayPrincipalSchema,
     payload: z.unknown(),
   })
-  .strict()
-  .superRefine((frame, ctx) => {
-    if (frame.v === 1 && frame.principal.actorBinding) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["principal", "actorBinding"],
-        message: "relay envelope v1 must be actorless",
-      });
-    }
-  });
+  .strict();
 export type StampedClientRelayFrame = z.infer<typeof stampedClientRelayFrameSchema>;
 
 export const daemonClientRelayFrameSchema = z

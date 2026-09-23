@@ -11069,10 +11069,20 @@ fn required_recursive_noninteractive_string<'a>(
     Ok(raw)
 }
 
+/// Version of the persisted recursive noninteractive launch descriptor. The
+/// `cockpit-core` noninteractive driver writes exactly this value.
+pub const RECURSIVE_LAUNCH_DESCRIPTOR_VERSION: u8 = 1;
+
+/// Version of the persisted noninteractive recovery (continuation) snapshot.
+/// The `cockpit-core` noninteractive driver writes and reads exactly this
+/// value; there is no older snapshot decoder.
+pub const NONINTERACTIVE_RECOVERY_SNAPSHOT_VERSION: u8 = 1;
+
 fn validate_recursive_noninteractive_launch_json(raw: &str) -> Result<String> {
     let value = canonical_recursive_noninteractive_json(raw, "launch descriptor")?;
     ensure!(
-        value.get("version").and_then(Value::as_u64) == Some(2),
+        value.get("version").and_then(Value::as_u64)
+            == Some(u64::from(RECURSIVE_LAUNCH_DESCRIPTOR_VERSION)),
         "recursive noninteractive launch descriptor version is unsupported"
     );
     for field in ["task_call_id", "label", "child_agent", "cwd"] {
@@ -11145,7 +11155,8 @@ fn validate_recursive_noninteractive_launch_json(raw: &str) -> Result<String> {
 fn validate_recursive_noninteractive_snapshot_json(raw: &str) -> Result<String> {
     let value = canonical_recursive_noninteractive_json(raw, "continuation snapshot")?;
     ensure!(
-        value.get("version").and_then(Value::as_u64) == Some(2),
+        value.get("version").and_then(Value::as_u64)
+            == Some(u64::from(NONINTERACTIVE_RECOVERY_SNAPSHOT_VERSION)),
         "recursive noninteractive continuation snapshot version is unsupported"
     );
     ensure!(
@@ -11624,20 +11635,20 @@ mod tests {
     #[test]
     fn recursive_executor_descriptors_are_versioned_canonical_and_fail_closed() {
         let launch = ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
-            r#"{"write_scope":null,"cwd":"/workspace","granted_tools":[],"model":{},"child_agent":"child","label":"label","task_call_id":"task","version":2}"#,
+            r#"{"write_scope":null,"cwd":"/workspace","granted_tools":[],"model":{},"child_agent":"child","label":"label","task_call_id":"task","version":1}"#,
         )
         .unwrap();
         assert_eq!(
             launch.as_json(),
-            r#"{"child_agent":"child","cwd":"/workspace","granted_tools":[],"label":"label","model":{},"task_call_id":"task","version":2,"write_scope":null}"#
+            r#"{"child_agent":"child","cwd":"/workspace","granted_tools":[],"label":"label","model":{},"task_call_id":"task","version":1,"write_scope":null}"#
         );
         assert!(ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
-            r#"{"version":1,"task_call_id":"task","label":"label","child_agent":"child","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
+            r#"{"version":2,"task_call_id":"task","label":"label","child_agent":"child","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
         )
         .is_err());
         assert!(
             ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(
-                r#"{"version":3,"history":[]}"#,
+                r#"{"version":2,"history":[]}"#,
             )
             .is_err()
         );
@@ -11645,7 +11656,7 @@ mod tests {
             ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize("not-json").is_err()
         );
         let with_budget = ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
-            r#"{"budget":{"maxRounds":4},"write_scope":null,"cwd":"/workspace","granted_tools":[],"model":{},"child_agent":"child","label":"label","task_call_id":"task","version":2}"#,
+            r#"{"budget":{"maxRounds":4},"write_scope":null,"cwd":"/workspace","granted_tools":[],"model":{},"child_agent":"child","label":"label","task_call_id":"task","version":1}"#,
         )
         .unwrap();
         assert!(
@@ -11656,7 +11667,7 @@ mod tests {
             with_budget.as_json()
         );
         assert!(ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
-            r#"{"version":2,"task_call_id":"task","label":"label","child_agent":"child","model":{},"granted_tools":[],"cwd":"/workspace","budget":"unlimited"}"#,
+            r#"{"version":1,"task_call_id":"task","label":"label","child_agent":"child","model":{},"granted_tools":[],"cwd":"/workspace","budget":"unlimited"}"#,
         )
         .is_err());
     }
@@ -11676,11 +11687,11 @@ mod tests {
             .await
             .unwrap();
         let valid_launch = ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
-            r#"{"version":2,"task_call_id":"parent","label":"parent","child_agent":"agent","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
+            r#"{"version":1,"task_call_id":"parent","label":"parent","child_agent":"agent","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
         )
         .unwrap();
         let valid_snapshot = ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(
-            r#"{"version":2,"history":[],"next_prompt":null,"pending_recursive":null}"#,
+            r#"{"version":1,"history":[],"next_prompt":null,"pending_recursive":null}"#,
         )
         .unwrap();
         db.insert_recursive_noninteractive_executor(
@@ -11696,7 +11707,7 @@ mod tests {
 
         let child_id = Uuid::new_v4();
         assert!(ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
-            r#"{"version":1,"task_call_id":"child","label":"child","child_agent":"agent","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
+            r#"{"version":2,"task_call_id":"child","label":"child","child_agent":"agent","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
         )
         .is_err());
         assert!(
@@ -14523,11 +14534,11 @@ mod tests {
                 child,
                 parent.agent_instance_id,
                 ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
-                    r#"{"version":2,"task_call_id":"task","label":"child","child_agent":"agent","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
+                    r#"{"version":1,"task_call_id":"task","label":"child","child_agent":"agent","model":{},"granted_tools":[],"cwd":"/workspace"}"#,
                 )
                 .unwrap(),
                 ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(
-                    r#"{"version":2,"history":[],"next_prompt":null,"pending_recursive":null}"#,
+                    r#"{"version":1,"history":[],"next_prompt":null,"pending_recursive":null}"#,
                 )
                 .unwrap(),
                 14,

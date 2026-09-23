@@ -2029,7 +2029,7 @@ fn held_key_journal_identity(display: &str) -> Result<[u8; 32], ComputerError> {
         crate::computer::platform::x11::canonical_x11_server_identity(display)
             .ok_or_else(|| input_journal_error("X11 display identity is malformed"))?;
     Ok(crate::computer::host_identity::domain_hash(
-        b"cockpit.x11.held-keys.v2",
+        b"cockpit.x11.held-keys.v1",
         &[transport.as_bytes(), &display_number.to_le_bytes()],
     ))
 }

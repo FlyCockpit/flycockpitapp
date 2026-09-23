@@ -3358,6 +3358,12 @@ fn materialize_reserved_user_artifacts_conn(
     ))
 }
 
+/// Version of the durable accepted-submission model envelope
+/// (`session_user_message_model_envelopes.envelope_json`). The producer in
+/// `cockpit-core` `engine::text_artifact_frame` stamps this exact value and
+/// [`validate_user_model_envelope`] accepts nothing else.
+pub const USER_MESSAGE_MODEL_ENVELOPE_VERSION: i64 = 1;
+
 /// Validate the deliberately closed durable accepted-submission envelope.
 ///
 /// This is kept in the database leaf as JSON because the DB must not depend on
@@ -3374,7 +3380,8 @@ pub(crate) fn validate_user_model_envelope(raw: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("user model envelope must be an object"))?;
     ensure!(
         (object.len() == 2 || object.len() == 3)
-            && object.get("version").and_then(serde_json::Value::as_i64) == Some(3),
+            && object.get("version").and_then(serde_json::Value::as_i64)
+                == Some(USER_MESSAGE_MODEL_ENVELOPE_VERSION),
         "unknown user model envelope"
     );
     ensure!(
@@ -4096,7 +4103,7 @@ mod tests {
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: serde_json::json!({ "text": source }).to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                model_envelope_json: r#"{"version":1,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: "s".repeat(MIN_USER_ARTIFACT_SOURCE_BYTES),
                 source_blob_path: Some(source_blob_path),
@@ -4146,7 +4153,7 @@ mod tests {
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: serde_json::json!({ "text": source }).to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                model_envelope_json: r#"{"version":1,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source.clone(),
                 source_blob_path: Some(source_blob_path),
@@ -4352,7 +4359,7 @@ mod tests {
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: serde_json::json!({ "text": source.clone() }).to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                model_envelope_json: r#"{"version":1,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
                 source_blob_path: Some(source_blob_path),
@@ -4834,7 +4841,7 @@ mod tests {
                     "images": [{"id": Uuid::new_v4()}],
                 })
                 .to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                model_envelope_json: r#"{"version":1,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
                 source_blob_path: None,
@@ -4893,7 +4900,7 @@ mod tests {
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: serde_json::json!({ "text": source }).to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                model_envelope_json: r#"{"version":1,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source,
                 source_blob_path: Some(source_blob_path),
@@ -5641,7 +5648,7 @@ mod tests {
             // Model-bound preparation is already complete at phase two. A
             // statement fault must still leave neither this forced prelude nor
             // any owner/event row durable.
-            model_envelope_json: r#"{"version":3,"prelude":[{"type":"forced_skill","call_id":"forced-fault","name":"review","args":{"name":"review"},"body":"FORCED","hard_fail":false}],"parts":[{"type":"text","text":"AUTO\nTAG\n"},{"type":"authored_text_slot"}]}"#.to_owned(),
+            model_envelope_json: r#"{"version":1,"prelude":[{"type":"forced_skill","call_id":"forced-fault","name":"review","args":{"name":"review"},"body":"FORCED","hard_fail":false}],"parts":[{"type":"text","text":"AUTO\nTAG\n"},{"type":"authored_text_slot"}]}"#.to_owned(),
             source_text: source,
             source_blob_path: Some(source_blob_path),
             source_preview_lines: None,

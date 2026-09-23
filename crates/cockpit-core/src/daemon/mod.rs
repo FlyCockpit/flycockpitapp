@@ -126,8 +126,6 @@ use anyhow::{Context, Result};
 use cockpit_host::daemon_lifecycle::parse_macos_procargs2;
 #[cfg(any(unix, windows))]
 use cockpit_host::daemon_lifecycle::reclaim_stale_and_reserve;
-#[cfg(any(unix, windows))]
-use cockpit_host::daemon_lifecycle::remove_dead_legacy_metadata;
 #[cfg(all(test, unix))]
 use cockpit_host::daemon_lifecycle::split_proc_cmdline;
 #[cfg(test)]
@@ -137,7 +135,6 @@ use cockpit_host::daemon_lifecycle::{
     DaemonPidReceipt, ForegroundMetadataGuard, PidIdentity, retire_metadata_if_receipt_matches,
     with_lifecycle_lock,
 };
-use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record, read_pid_file};
 #[cfg(any(
     target_os = "linux",
     target_os = "macos",
@@ -145,9 +142,10 @@ use cockpit_host::daemon_lifecycle::{DaemonPidRecord, read_daemon_pid_record, re
     windows
 ))]
 use cockpit_host::daemon_lifecycle::{VerifiedProcessOutcome, acquire_verified_daemon_process};
+use cockpit_host::daemon_lifecycle::{read_daemon_pid_record, read_pid_file};
 #[cfg(any(unix, windows))]
 use cockpit_host::daemon_lifecycle::{
-    legacy_pid_identity, read_process_start_identity, verify_cockpit_daemon_receipt_identity,
+    read_process_start_identity, verify_cockpit_daemon_receipt_identity,
 };
 use cockpit_host::private_fs::ensure_private_dir;
 #[cfg(windows)]
@@ -386,9 +384,7 @@ fn read_published_endpoint_record_from(
         return None;
     }
     let record = read_endpoint_record_from(path)?;
-    let DaemonPidRecord::Receipt(receipt) = read_daemon_pid_record(&canonical.pid_file)? else {
-        return None;
-    };
+    let receipt = read_daemon_pid_record(&canonical.pid_file)?;
     (record.receipt == receipt
         && record.pid == receipt.pid
         && record.start_time == receipt.process_start)
@@ -396,7 +392,7 @@ fn read_published_endpoint_record_from(
 }
 
 fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
-    let Some(DaemonPidRecord::Receipt(receipt)) = read_daemon_pid_record(&paths.pid_file) else {
+    let Some(receipt) = read_daemon_pid_record(&paths.pid_file) else {
         anyhow::bail!("daemon PID receipt is missing before endpoint publication");
     };
     let canonical = DaemonPaths::resolve_canonical()
@@ -429,9 +425,7 @@ fn write_endpoint_record_with_receipt_and_canonical(
     };
     let path = endpoint_file_for_state(state);
     with_lifecycle_lock(&paths.pid_file, || {
-        if read_daemon_pid_record(&paths.pid_file)
-            != Some(DaemonPidRecord::Receipt(receipt.clone()))
-        {
+        if read_daemon_pid_record(&paths.pid_file) != Some(receipt.clone()) {
             anyhow::bail!("daemon PID receipt changed before endpoint publication");
         }
         let record = DaemonEndpointRecord {
@@ -1101,14 +1095,10 @@ fn socket_responds_blocking(_socket: &Path) -> Option<SocketHelloResponse> {
 
 #[cfg(any(unix, windows))]
 fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
-    let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
+    let Some(receipt) = read_daemon_pid_record(&paths.pid_file) else {
         return DaemonStatus::Stale;
     };
-    let identity = match record {
-        DaemonPidRecord::Receipt(receipt) => verify_cockpit_daemon_receipt_identity(&receipt),
-        DaemonPidRecord::LegacyNumeric(pid) => legacy_pid_identity(pid),
-    };
-    status_for_pid_identity(identity)
+    status_for_pid_identity(verify_cockpit_daemon_receipt_identity(&receipt))
 }
 
 #[cfg(any(unix, windows))]
@@ -1473,9 +1463,7 @@ pub fn capture_restart_release(
         windows
     ))]
     let process = match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
-        Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt))
-            if expected_pid == Some(receipt.pid) =>
-        {
+        Some(receipt) if expected_pid == Some(receipt.pid) => {
             match cockpit_host::daemon_lifecycle::acquire_verified_daemon_process(&receipt) {
                 cockpit_host::daemon_lifecycle::VerifiedProcessOutcome::Verified(process) => {
                     Some(process)
@@ -1557,7 +1545,7 @@ fn restart_paths_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> boo
 /// The lifetime marker is internal; the socket remains discoverable so every
 /// client of this ledger can share the same owner.
 /// Returns the live child handle. The owning guard retains it until verified
-/// shutdown, so PID reuse is impossible even before the v2 receipt publishes.
+/// shutdown, so PID reuse is impossible even before the PID receipt publishes.
 ///
 /// An auto-promoted ephemeral daemon is never launched `--no-sandbox`:
 /// the client's `--no-sandbox` is a *per-session* default passed at
@@ -3712,7 +3700,7 @@ pub fn stop_with_timeout(paths: &DaemonPaths, timeout: Duration) -> Result<bool>
 
 fn wait_for_supervisor_admin_stop(
     paths: &DaemonPaths,
-    record: &DaemonPidRecord,
+    record: &DaemonPidReceipt,
     timeout: Duration,
 ) -> Result<bool> {
     let deadline = std::time::Instant::now() + timeout;
@@ -3729,10 +3717,7 @@ fn wait_for_supervisor_admin_stop(
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
-            let pid = match record {
-                DaemonPidRecord::LegacyNumeric(pid) => *pid,
-                DaemonPidRecord::Receipt(receipt) => receipt.pid,
-            };
+            let pid = record.pid;
             anyhow::bail!(
                 "timed out waiting for supervisor PID {pid} to drain its worker and release metadata"
             );
@@ -3743,34 +3728,22 @@ fn wait_for_supervisor_admin_stop(
 
 pub(crate) fn stop_exact(paths: &DaemonPaths, expected: &DaemonPidReceipt) -> Result<bool> {
     let current = read_daemon_pid_record(&paths.pid_file);
-    if current != Some(DaemonPidRecord::Receipt(expected.clone())) {
+    if current != Some(expected.clone()) {
         anyhow::bail!(
             "daemon PID receipt changed; refusing to signal or clean a replacement incarnation"
         );
     }
     #[cfg(target_os = "linux")]
-    return stop_linux(
-        paths,
-        DaemonPidRecord::Receipt(expected.clone()),
-        restart_release_timeout(None),
-    );
+    return stop_linux(paths, expected.clone(), restart_release_timeout(None));
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    return stop_kqueue_unix(
-        paths,
-        DaemonPidRecord::Receipt(expected.clone()),
-        restart_release_timeout(None),
-    );
+    return stop_kqueue_unix(paths, expected.clone(), restart_release_timeout(None));
     #[cfg(all(
         unix,
         not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
     ))]
-    return stop_unix_without_stable_handle(paths, DaemonPidRecord::Receipt(expected.clone()));
+    return stop_unix_without_stable_handle(paths, expected.clone());
     #[cfg(windows)]
-    return stop_windows(
-        paths,
-        DaemonPidRecord::Receipt(expected.clone()),
-        restart_release_timeout(None),
-    );
+    return stop_windows(paths, expected.clone(), restart_release_timeout(None));
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (paths, expected);
@@ -3779,11 +3752,7 @@ pub(crate) fn stop_exact(paths: &DaemonPaths, expected: &DaemonPidReceipt) -> Re
 }
 
 #[cfg(target_os = "linux")]
-fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord, timeout: Duration) -> Result<bool> {
-    let receipt = match record {
-        DaemonPidRecord::LegacyNumeric(pid) => return settle_legacy_stop(paths, pid),
-        DaemonPidRecord::Receipt(receipt) => receipt,
-    };
+fn stop_linux(paths: &DaemonPaths, receipt: DaemonPidReceipt, timeout: Duration) -> Result<bool> {
     let process = match acquire_verified_daemon_process(&receipt) {
         VerifiedProcessOutcome::Verified(process) => process,
         VerifiedProcessOutcome::Identity(PidIdentity::Missing | PidIdentity::NotDaemon) => {
@@ -3795,7 +3764,7 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord, timeout: Duration) -
         }
         VerifiedProcessOutcome::Identity(PidIdentity::VerifiedDaemon) => unreachable!(),
     };
-    if read_daemon_pid_record(&paths.pid_file) != Some(DaemonPidRecord::Receipt(receipt.clone())) {
+    if read_daemon_pid_record(&paths.pid_file) != Some(receipt.clone()) {
         anyhow::bail!(
             "daemon PID receipt changed after stable process acquisition; refusing signal"
         );
@@ -3814,9 +3783,7 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord, timeout: Duration) -
     }
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if read_daemon_pid_record(&paths.pid_file)
-            != Some(DaemonPidRecord::Receipt(receipt.clone()))
-        {
+        if read_daemon_pid_record(&paths.pid_file) != Some(receipt.clone()) {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -3845,13 +3812,9 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord, timeout: Duration) -
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn stop_kqueue_unix(
     paths: &DaemonPaths,
-    record: DaemonPidRecord,
+    receipt: DaemonPidReceipt,
     timeout: Duration,
 ) -> Result<bool> {
-    let receipt = match record {
-        DaemonPidRecord::LegacyNumeric(pid) => return settle_legacy_stop(paths, pid),
-        DaemonPidRecord::Receipt(receipt) => receipt,
-    };
     let process = match acquire_verified_daemon_process(&receipt) {
         VerifiedProcessOutcome::Verified(process) => process,
         VerifiedProcessOutcome::Identity(PidIdentity::Missing | PidIdentity::NotDaemon) => {
@@ -3863,7 +3826,7 @@ fn stop_kqueue_unix(
         }
         VerifiedProcessOutcome::Identity(PidIdentity::VerifiedDaemon) => unreachable!(),
     };
-    if read_daemon_pid_record(&paths.pid_file) != Some(DaemonPidRecord::Receipt(receipt.clone())) {
+    if read_daemon_pid_record(&paths.pid_file) != Some(receipt.clone()) {
         anyhow::bail!(
             "daemon PID receipt changed after exact kqueue witness acquisition; refusing signal"
         );
@@ -3892,95 +3855,68 @@ fn stop_kqueue_unix(
     unix,
     not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
 ))]
-fn stop_unix_without_stable_handle(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
-    match record {
-        DaemonPidRecord::LegacyNumeric(pid) => settle_legacy_stop(paths, pid),
-        DaemonPidRecord::Receipt(receipt) => {
-            match verify_cockpit_daemon_receipt_identity(&receipt) {
-                PidIdentity::Missing | PidIdentity::NotDaemon => {
-                    cleanup_receipt_metadata(paths, &receipt)?;
-                    Ok(false)
-                }
-                PidIdentity::VerifiedDaemon | PidIdentity::Unverified => anyhow::bail!(
-                    "daemon PID {} is live but this platform has no stable process handle; refusing numeric signaling",
-                    receipt.pid
-                ),
-            }
-        }
-    }
-}
-
-#[cfg(any(unix, windows))]
-fn settle_legacy_stop(paths: &DaemonPaths, pid: u32) -> Result<bool> {
-    match legacy_pid_identity(pid) {
-        PidIdentity::Missing => {
-            remove_dead_legacy_metadata(&paths.pid_file, &paths.socket, pid)?;
+fn stop_unix_without_stable_handle(paths: &DaemonPaths, receipt: DaemonPidReceipt) -> Result<bool> {
+    match verify_cockpit_daemon_receipt_identity(&receipt) {
+        PidIdentity::Missing | PidIdentity::NotDaemon => {
+            cleanup_receipt_metadata(paths, &receipt)?;
             Ok(false)
         }
-        PidIdentity::VerifiedDaemon | PidIdentity::NotDaemon | PidIdentity::Unverified => {
-            anyhow::bail!(
-                "legacy numeric-only daemon PID {pid} is live; refusing unbound numeric signaling"
-            )
-        }
+        PidIdentity::VerifiedDaemon | PidIdentity::Unverified => anyhow::bail!(
+            "daemon PID {} is live but this platform has no stable process handle; refusing numeric signaling",
+            receipt.pid
+        ),
     }
 }
 
 #[cfg(windows)]
-fn stop_windows(paths: &DaemonPaths, record: DaemonPidRecord, timeout: Duration) -> Result<bool> {
-    match record {
-        DaemonPidRecord::LegacyNumeric(pid) => settle_legacy_stop(paths, pid),
-        DaemonPidRecord::Receipt(receipt) => {
-            match verify_cockpit_daemon_receipt_identity(&receipt) {
-                PidIdentity::Missing | PidIdentity::NotDaemon => {
+fn stop_windows(paths: &DaemonPaths, receipt: DaemonPidReceipt, timeout: Duration) -> Result<bool> {
+    match verify_cockpit_daemon_receipt_identity(&receipt) {
+        PidIdentity::Missing | PidIdentity::NotDaemon => {
+            cleanup_receipt_metadata(paths, &receipt)?;
+            Ok(false)
+        }
+        PidIdentity::Unverified => {
+            anyhow::bail!("refusing to signal daemon: PID receipt could not be verified")
+        }
+        PidIdentity::VerifiedDaemon => {
+            // Retry the graceful StopDaemon for the whole drain window.
+            // A single-shot open loses the request to ERROR_PIPE_BUSY
+            // (one pending instance) and would skip straight to
+            // TerminateProcess. Once a request is delivered, keep
+            // waiting for the process rather than sending more.
+            // Each send re-reads the pid file after connect so a
+            // replacement incarnation that published at `paths.socket`
+            // never receives a shutdown intended for this receipt.
+            let deadline = std::time::Instant::now() + timeout;
+            let mut delivered = false;
+            while std::time::Instant::now() < deadline {
+                if read_daemon_pid_record(&paths.pid_file) != Some(receipt.clone()) {
+                    return Ok(true);
+                }
+                if !delivered {
+                    delivered = crate::daemon::ephemeral_guard::stop_daemon_blocking(
+                        &paths.socket,
+                        &paths.pid_file,
+                        &receipt,
+                    );
+                }
+                if !cockpit_host::daemon_lifecycle::process_exists(receipt.pid)
+                    || matches!(
+                        verify_cockpit_daemon_receipt_identity(&receipt),
+                        PidIdentity::Missing | PidIdentity::NotDaemon
+                    )
+                {
                     cleanup_receipt_metadata(paths, &receipt)?;
-                    Ok(false)
+                    return Ok(true);
                 }
-                PidIdentity::Unverified => {
-                    anyhow::bail!("refusing to signal daemon: PID receipt could not be verified")
-                }
-                PidIdentity::VerifiedDaemon => {
-                    // Retry the graceful StopDaemon for the whole drain window.
-                    // A single-shot open loses the request to ERROR_PIPE_BUSY
-                    // (one pending instance) and would skip straight to
-                    // TerminateProcess. Once a request is delivered, keep
-                    // waiting for the process rather than sending more.
-                    // Each send re-reads the pid file after connect so a
-                    // replacement incarnation that published at `paths.socket`
-                    // never receives a shutdown intended for this receipt.
-                    let deadline = std::time::Instant::now() + timeout;
-                    let mut delivered = false;
-                    while std::time::Instant::now() < deadline {
-                        if read_daemon_pid_record(&paths.pid_file)
-                            != Some(DaemonPidRecord::Receipt(receipt.clone()))
-                        {
-                            return Ok(true);
-                        }
-                        if !delivered {
-                            delivered = crate::daemon::ephemeral_guard::stop_daemon_blocking(
-                                &paths.socket,
-                                &paths.pid_file,
-                                &receipt,
-                            );
-                        }
-                        if !cockpit_host::daemon_lifecycle::process_exists(receipt.pid)
-                            || matches!(
-                                verify_cockpit_daemon_receipt_identity(&receipt),
-                                PidIdentity::Missing | PidIdentity::NotDaemon
-                            )
-                        {
-                            cleanup_receipt_metadata(paths, &receipt)?;
-                            return Ok(true);
-                        }
-                        std::thread::sleep(
-                            Duration::from_millis(100)
-                                .min(deadline.saturating_duration_since(std::time::Instant::now())),
-                        );
-                    }
-                    cockpit_host::daemon_lifecycle::terminate_verified_daemon_process(&receipt)?;
-                    cleanup_receipt_metadata(paths, &receipt)?;
-                    Ok(true)
-                }
+                std::thread::sleep(
+                    Duration::from_millis(100)
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
             }
+            cockpit_host::daemon_lifecycle::terminate_verified_daemon_process(&receipt)?;
+            cleanup_receipt_metadata(paths, &receipt)?;
+            Ok(true)
         }
     }
 }
@@ -4367,8 +4303,8 @@ mod tests {
         let state_home = dir.path().join("state");
         let runtime_dir = dir.path().join("runtime");
         let paths = canonical_in(&state_home, &runtime_dir);
-        let hello = proto::Envelope::response_at(
-            0,
+        // A skewed daemon stamps its own (foreign) envelope version.
+        let mut hello = proto::Envelope::response(
             uuid::Uuid::nil(),
             proto::Response::DaemonStatus {
                 pid: 1,
@@ -4383,6 +4319,7 @@ mod tests {
                 pending_recovery_sessions: Vec::new(),
             },
         );
+        hello.v = 0;
         let listener = spawn_hello_socket_with_line(
             paths.socket.clone(),
             serde_json::to_string(&hello).unwrap(),
@@ -5167,8 +5104,8 @@ mod tests {
         let socket = eph.socket.clone();
         let pid_file = eph.pid_file.clone();
         tokio::task::spawn_blocking(move || {
-            let Some(DaemonPidRecord::Receipt(receipt)) = read_daemon_pid_record(&pid_file) else {
-                panic!("ephemeral daemon did not publish a v2 receipt");
+            let Some(receipt) = read_daemon_pid_record(&pid_file) else {
+                panic!("ephemeral daemon did not publish a PID receipt");
             };
             stop_daemon_blocking(&socket, &pid_file, &receipt)
         })
@@ -5326,17 +5263,14 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn live_legacy_numeric_pid_fails_closed() {
+    fn bare_numeric_pid_file_is_never_signaled_or_retired() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         std::fs::write(&paths.pid_file, std::process::id().to_string()).unwrap();
 
-        let error = settle_legacy_stop(&paths, std::process::id()).unwrap_err();
-
         assert!(
-            error
-                .to_string()
-                .contains("refusing unbound numeric signaling")
+            !stop_with_timeout(&paths, Duration::from_millis(50)).unwrap(),
+            "an unreceipted PID file names no daemon this binary may signal"
         );
         assert!(paths.pid_file.exists());
     }
@@ -5353,10 +5287,7 @@ mod tests {
 
         cleanup_receipt_metadata(&paths, &old).unwrap();
 
-        assert_eq!(
-            read_daemon_pid_record(&paths.pid_file),
-            Some(DaemonPidRecord::Receipt(replacement))
-        );
+        assert_eq!(read_daemon_pid_record(&paths.pid_file), Some(replacement));
         assert_eq!(
             std::fs::read_to_string(&paths.socket).unwrap(),
             "replacement socket"

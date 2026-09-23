@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::support::{IsolatedHome, ReplayLaunchBarrier, SpawnedDaemon, log_tail, output_text};
 use cockpit_cli::integration::{AttachedSession, DaemonEvent};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 const TOOL_CALL_ID: &str = "call_lifecycle_bash";
@@ -1200,6 +1200,15 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         interrupt_row(&daemon.db_path(), interrupt_id).state,
         "interrupted"
     );
+    // The replay crossed its host-effect boundary before the crash, so it may
+    // have partially run: #492 proof-gated recovery asks the user instead of
+    // settling silently. Skipping settles it without re-execution.
+    let recovery = open_tool_recovery_decision(&daemon.db_path(), attached.session_id)
+        .expect("a dispatched replay killed mid-run must queue a recovery decision");
+    client
+        .answer_interrupt_option(recovery, "skip".to_string())
+        .await
+        .expect("skip the crash-interrupted replay");
 
     client
         .approve_interrupt_once(interrupt_id)
@@ -1210,6 +1219,23 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         tool_call_count(&daemon.db_path(), attached.session_id) <= 1,
         "executing crash must not re-execute parked replay"
     );
+    assert!(
+        open_tool_recovery_decision(&daemon.db_path(), attached.session_id).is_none(),
+        "skip must settle the recovery decision"
+    );
+}
+
+fn open_tool_recovery_decision(db_path: &Path, session_id: Uuid) -> Option<Uuid> {
+    let conn = open_db(db_path);
+    conn.query_row(
+        "SELECT interrupt_id FROM needs_attention
+          WHERE session_id = ?1 AND recovery_intent_id IS NOT NULL AND state = 'open'",
+        params![session_id.to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .expect("query open tool recovery decision")
+    .map(|id| Uuid::parse_str(&id).expect("recovery interrupt id"))
 }
 
 #[tokio::test(flavor = "multi_thread")]

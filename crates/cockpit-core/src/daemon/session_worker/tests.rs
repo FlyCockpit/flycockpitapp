@@ -5766,6 +5766,7 @@ fn parked_replay_test_payload() -> crate::db::needs_attention::InterruptParkPayl
         },
         gate: None,
         verification: None,
+        call_session_id: None,
     }
 }
 

@@ -1618,6 +1618,7 @@ local	needs_attention	description	non_relationship
 local	needs_attention	interrupt_id	primary
 local	needs_attention	parked_args_json	non_relationship
 local	needs_attention	parked_call_id	external
+local	needs_attention	parked_call_session_id	denormalized
 local	needs_attention	parked_claim_generation	non_relationship
 local	needs_attention	parked_gate_json	non_relationship
 local	needs_attention	parked_resume_json	non_relationship

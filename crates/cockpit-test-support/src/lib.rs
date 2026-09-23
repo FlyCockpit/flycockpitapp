@@ -553,13 +553,32 @@ mod tests {
             panic!("read source file {}: {err}", path.display());
         });
         let mut symbol = "<module>".to_string();
+        // A `use` statement may span several lines (`use std::{\n env::{..}\n};`),
+        // so it is accumulated until its terminating `;` and judged as a whole,
+        // attributed to the line that opened it.
+        let mut pending_use: Option<(usize, String)> = None;
         for (idx, line) in source.lines().enumerate() {
             if let Some(next_symbol) = parse_rust_fn_symbol(line) {
                 symbol = next_symbol.to_string();
             }
-            if !line_contains_env_mutation(line) {
-                continue;
+            if pending_use.is_none() && starts_use_statement(line) {
+                pending_use = Some((idx, String::new()));
             }
+            let mut flagged_at = line_contains_env_mutation(line).then_some(idx);
+            if let Some((start, statement)) = pending_use.as_mut() {
+                statement.push_str(line);
+                statement.push('\n');
+                if line.contains(';') {
+                    if flagged_at.is_none() && use_statement_imports_env_mutator(statement) {
+                        flagged_at = Some(*start);
+                    }
+                    pending_use = None;
+                }
+            }
+            let Some(idx) = flagged_at else {
+                continue;
+            };
+            let line = source.lines().nth(idx).unwrap_or(line);
             if let Some(allowed_idx) = allowed
                 .iter()
                 .position(|entry| entry.file == rel && entry.symbol == symbol)
@@ -582,6 +601,91 @@ mod tests {
         .iter()
         .any(|needle| line.contains(needle))
             || contains_bare_set_current_dir_call(line)
+    }
+
+    /// Whether `line` opens a `use` declaration (any visibility).
+    fn starts_use_statement(line: &str) -> bool {
+        let mut rest = line.trim_start();
+        if let Some(stripped) = rest.strip_prefix("pub") {
+            let stripped = stripped.trim_start();
+            rest = match stripped.strip_prefix('(') {
+                Some(scoped) => match scoped.find(')') {
+                    Some(close) => scoped[close + 1..].trim_start(),
+                    None => return false,
+                },
+                None => stripped,
+            };
+        }
+        rest.starts_with("use ") || rest.starts_with("use\t")
+    }
+
+    /// Whether a complete `use` declaration imports a process-environment
+    /// mutator from `std::env` (or the module itself by glob), however it is
+    /// spelled: grouped (`use std::env::{self, set_var};`), nested across
+    /// lines (`use std::{env::{remove_var}};`) or aliased
+    /// (`use std::env::set_current_dir as cd;`). An imported mutator can be
+    /// called, or taken as a function pointer, under any name, so the import
+    /// itself is the mutation site the allow-list must name.
+    fn use_statement_imports_env_mutator(statement: &str) -> bool {
+        let Some(start) = statement.find("use") else {
+            return false;
+        };
+        let tree = statement[start + "use".len()..]
+            .split(';')
+            .next()
+            .unwrap_or_default();
+        let mut paths = Vec::new();
+        expand_use_tree(tree, "", &mut paths);
+        paths.iter().any(|path| {
+            let path = path.trim_start_matches("::");
+            let item = path
+                .strip_prefix("std::env::")
+                .or_else(|| path.strip_prefix("env::"));
+            matches!(
+                item,
+                Some("set_var" | "remove_var" | "set_current_dir" | "*")
+            )
+        })
+    }
+
+    /// Flatten a use tree into its full paths, without aliases or whitespace.
+    fn expand_use_tree(tree: &str, prefix: &str, out: &mut Vec<String>) {
+        let tree = tree.trim();
+        if tree.is_empty() {
+            return;
+        }
+        let join = |path: &str| -> String {
+            let path: String = path.split_whitespace().collect();
+            match (prefix.is_empty(), path.is_empty()) {
+                (true, _) => path,
+                (false, true) => prefix.to_string(),
+                (false, false) => format!("{prefix}::{path}"),
+            }
+        };
+        let Some(open) = tree.find('{') else {
+            let path = tree.split_whitespace().take_while(|token| *token != "as");
+            out.push(join(&path.collect::<Vec<_>>().join("")));
+            return;
+        };
+        let Some(close) = tree.rfind('}') else {
+            return;
+        };
+        let head = join(tree[..open].trim().trim_end_matches("::"));
+        let inner = &tree[open + 1..close];
+        let mut depth = 0usize;
+        let mut item_start = 0;
+        for (at, ch) in inner.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    expand_use_tree(&inner[item_start..at], &head, out);
+                    item_start = at + 1;
+                }
+                _ => {}
+            }
+        }
+        expand_use_tree(&inner[item_start..], &head, out);
     }
 
     /// A `set_current_dir(` call reached through an import
@@ -614,6 +718,39 @@ mod tests {
         assert!(!line_contains_env_mutation(
             "    pub fn set_current_dir(&self, dir: &Path) {"
         ));
+    }
+
+    #[test]
+    fn env_mutation_scan_flags_grouped_nested_and_aliased_env_imports() {
+        for statement in [
+            "use std::env::set_current_dir as cd;",
+            "use std::env::{self, set_var};",
+            "pub(crate) use std::env::{remove_var as unset, var};",
+            "use std::{\n    env::{set_current_dir as chdir},\n    path::Path,\n};",
+            "use ::std::env::*;",
+            "    use std::{ffi::OsStr, env::{self as e, set_var as put}};",
+        ] {
+            let first = statement.lines().next().unwrap();
+            assert!(starts_use_statement(first), "{statement}");
+            assert!(
+                use_statement_imports_env_mutator(statement),
+                "must flag {statement:?}"
+            );
+        }
+        for statement in [
+            "use std::env;",
+            "use std::env::{self, var, var_os};",
+            "use std::{ffi::OsStr, path::{Path, PathBuf}};",
+            "use crate::test_env::set_var;",
+            "use cockpit_test_support::TestEnvGuard as set_var;",
+        ] {
+            assert!(
+                !use_statement_imports_env_mutator(statement),
+                "must not flag {statement:?}"
+            );
+        }
+        assert!(!starts_use_statement("    // use std::env::{set_var};"));
+        assert!(!starts_use_statement("let used = 1;"));
     }
 
     fn parse_rust_fn_symbol(line: &str) -> Option<&str> {

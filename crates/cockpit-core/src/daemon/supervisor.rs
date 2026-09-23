@@ -925,7 +925,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
         // a new client) left its last generation in the durable fence; the
         // first worker of this run must start strictly above it.
         let mut generations = WorkerGenerations::resume(&database_owner, 0)?;
-        let generation = generations.allocate()?;
+        let generation = generations.allocate(&database_owner)?;
         let worker = spawn_ready_worker(WorkerSpawnRequest {
             endpoints: &endpoint_owner,
             binary: &executable,
@@ -974,6 +974,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                 let Some(replacement) = retry_worker_spawn(
                     &mut storm,
                     &mut generations,
+                    &_database_owner,
                     &mut generation,
                     |attempt_generation| spawn_ready_worker(WorkerSpawnRequest {
                         endpoints: &endpoint_owner,
@@ -1051,7 +1052,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 AdminCommand::Roll => executable.clone(),
                                 _ => unreachable!("roll command was matched above"),
                             };
-                            let next_generation = match generations.allocate() {
+                            let next_generation = match generations.allocate(&_database_owner) {
                                 Ok(next_generation) => next_generation,
                                 Err(error) => {
                                     reply_admin(&mut stream, &AdminResponse::Error {
@@ -1141,7 +1142,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                         // An aborted attempt burns its generation, so the
                         // retry never shares a number with a process that
                         // may still be exiting.
-                        let next_generation = match generations.allocate() {
+                        let next_generation = match generations.allocate(&_database_owner) {
                             Ok(next_generation) => next_generation,
                             Err(error) => {
                                 let reason = format!("allocating successor generation: {error:#}");
@@ -1299,6 +1300,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 let Some(replacement) = retry_worker_spawn(
                                     &mut storm,
                                     &mut generations,
+                                    &_database_owner,
                                     &mut generation,
                                     |attempt_generation| spawn_ready_worker(WorkerSpawnRequest {
                                         endpoints: &endpoint_owner,
@@ -1362,6 +1364,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             let Some(replacement) = retry_worker_spawn(
                                 &mut storm,
                                 &mut generations,
+                                &_database_owner,
                                 &mut generation,
                                 |attempt_generation| spawn_ready_worker(WorkerSpawnRequest {
                                     endpoints: &endpoint_owner,
@@ -1470,6 +1473,20 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
     Ok(())
 }
 
+/// Read access to the durable worker generation fence. The production
+/// implementation is the supervisor's database-owner witness; the seam lets
+/// allocation defer an unreadable fence without owning the witness itself.
+trait DurableGenerationFence {
+    fn read_durable_generation(&self) -> Result<u64>;
+}
+
+impl DurableGenerationFence for crate::db::SupervisorDatabaseOwner {
+    fn read_durable_generation(&self) -> Result<u64> {
+        self.durable_worker_generation()
+            .context("reading durable worker generation fence")
+    }
+}
+
 /// Allocates supervised worker generations strictly above the durable writer
 /// fence and above every generation this supervisor has already attempted.
 ///
@@ -1479,16 +1496,22 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
 #[derive(Debug)]
 struct WorkerGenerations {
     highest_attempted: u64,
+    /// The durable fence has not been folded into `highest_attempted` and
+    /// nothing else proves allocation is above it: a reexec from a
+    /// pre-upgrade supervisor (no inherited attempted generations) whose
+    /// fence read failed. Burned attempts of the old supervisor may have
+    /// advanced the fence past the live worker's generation, so every
+    /// allocation re-reads the fence first and fails — that allocation only,
+    /// never the supervisor — until the read succeeds.
+    durable_unverified: bool,
 }
 
 impl WorkerGenerations {
     /// Resume allocation above both the durable fence and `current`, the
     /// generation of the worker this supervisor already owns (0 for none).
     #[cfg(any(unix, windows))]
-    fn resume(owner: &crate::db::SupervisorDatabaseOwner, current: u64) -> Result<Self> {
-        let durable = owner
-            .durable_worker_generation()
-            .context("reading durable worker generation fence")?;
+    fn resume(fence: &impl DurableGenerationFence, current: u64) -> Result<Self> {
+        let durable = fence.read_durable_generation()?;
         Ok(Self::above(durable.max(current)))
     }
 
@@ -1497,15 +1520,29 @@ impl WorkerGenerations {
     /// reexec on a transient SQLite error would exit the supervisor and take
     /// that healthy worker down with it. The pre-reexec supervisor's
     /// `inherited_highest` (every attempted generation, ready or burned) and
-    /// the live worker's `current` generation still bound allocation.
+    /// the live worker's `current` generation still bound allocation. A
+    /// pre-upgrade supervisor's state carries no attempted generations
+    /// (`inherited_highest == 0`); then only the durable fence bounds its
+    /// burned attempts, and allocation stays deferred until it is read.
     #[cfg(any(unix, windows))]
     fn resume_after_reexec(
-        owner: &crate::db::SupervisorDatabaseOwner,
+        fence: &impl DurableGenerationFence,
         current: u64,
         inherited_highest: u64,
     ) -> Self {
-        let durable = match owner.durable_worker_generation() {
-            Ok(durable) => durable,
+        match fence.read_durable_generation() {
+            Ok(durable) => Self::above(durable.max(current).max(inherited_highest)),
+            Err(error) if inherited_highest == 0 => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    current,
+                    "reexecuted supervisor could not read the durable worker generation fence and inherited no attempted generations; deferring allocation until the fence is readable"
+                );
+                Self {
+                    highest_attempted: current,
+                    durable_unverified: true,
+                }
+            }
             Err(error) => {
                 tracing::warn!(
                     error = %format!("{error:#}"),
@@ -1513,14 +1550,16 @@ impl WorkerGenerations {
                     inherited_highest,
                     "reexecuted supervisor could not read the durable worker generation fence; allocating above its inherited generations"
                 );
-                0
+                Self::above(current.max(inherited_highest))
             }
-        };
-        Self::above(durable.max(current).max(inherited_highest))
+        }
     }
 
     fn above(highest_attempted: u64) -> Self {
-        Self { highest_attempted }
+        Self {
+            highest_attempted,
+            durable_unverified: false,
+        }
     }
 
     #[cfg(any(unix, windows))]
@@ -1528,7 +1567,19 @@ impl WorkerGenerations {
         self.highest_attempted
     }
 
-    fn allocate(&mut self) -> Result<u64> {
+    /// Whether allocation is deferred on an unreadable durable fence.
+    fn durable_unverified(&self) -> bool {
+        self.durable_unverified
+    }
+
+    fn allocate(&mut self, fence: &impl DurableGenerationFence) -> Result<u64> {
+        if self.durable_unverified {
+            let durable = fence
+                .read_durable_generation()
+                .context("worker generation allocation deferred on an unreadable durable fence")?;
+            self.highest_attempted = self.highest_attempted.max(durable);
+            self.durable_unverified = false;
+        }
         let next = self
             .highest_attempted
             .checked_add(1)
@@ -1538,9 +1589,15 @@ impl WorkerGenerations {
     }
 }
 
+/// Pause before retrying a respawn whose generation allocation was deferred on
+/// an unreadable durable fence, so the attempt does not spin through the
+/// restart budget.
+const DEFERRED_FENCE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 async fn retry_worker_spawn<T, F, Fut>(
     storm: &mut cockpit_client::RestartStormGuard,
     generations: &mut WorkerGenerations,
+    fence: &impl DurableGenerationFence,
     generation: &mut u64,
     mut spawn: F,
 ) -> Option<T>
@@ -1556,8 +1613,18 @@ where
             );
             return None;
         }
-        *generation = match generations.allocate() {
+        *generation = match generations.allocate(fence) {
             Ok(next) => next,
+            Err(error) if generations.durable_unverified() => {
+                // Only this attempt fails: it consumes restart budget like a
+                // spawn failure, and the next attempt re-reads the fence.
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "worker generation allocation deferred on an unreadable durable fence; retrying"
+                );
+                tokio::time::sleep(DEFERRED_FENCE_RETRY_DELAY).await;
+                continue;
+            }
             Err(error) => {
                 tracing::error!(%error, "worker generation allocation failed; supervisor is exiting");
                 return None;
@@ -2860,12 +2927,35 @@ async fn accept_admin(listener: &mut AdminListener) -> Result<DaemonStream> {
     return listener.accept().await;
 }
 
+/// Bound on one admin connection's request read and reply write. The
+/// supervisor serves admin connections inline in its supervision loop (and in
+/// the handover waits), so a client that connects and then stays silent — or
+/// never drains its reply — must fail that connection alone instead of
+/// stalling worker supervision, shutdown, and every other admin client.
+/// Legitimate clients (the CLI and worker announcements) write their one
+/// request line immediately after connecting.
+const ADMIN_CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
 async fn read_admin<S>(stream: S) -> Result<(AdminRequest, S)>
 where
     S: AsyncRead + Unpin,
 {
+    read_admin_within(stream, ADMIN_CONNECTION_IO_TIMEOUT).await
+}
+
+async fn read_admin_within<S>(stream: S, timeout: Duration) -> Result<(AdminRequest, S)>
+where
+    S: AsyncRead + Unpin,
+{
     let mut reader = BufReader::new(stream);
-    let request = read_admin_request(&mut reader).await?;
+    let request = tokio::time::timeout(timeout, read_admin_request(&mut reader))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "supervisor admin client sent no request within {}ms",
+                timeout.as_millis()
+            )
+        })??;
     Ok((request, reader.into_inner()))
 }
 
@@ -2900,8 +2990,17 @@ where
 {
     let mut line = serde_json::to_vec(response)?;
     line.push(b'\n');
-    stream.write_all(&line).await?;
-    stream.flush().await?;
+    tokio::time::timeout(ADMIN_CONNECTION_IO_TIMEOUT, async {
+        stream.write_all(&line).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "supervisor admin client did not accept its reply within {}ms",
+            ADMIN_CONNECTION_IO_TIMEOUT.as_millis()
+        )
+    })??;
     Ok(())
 }
 
@@ -3251,6 +3350,7 @@ mod tests {
         let worker = retry_worker_spawn(
             &mut storm,
             &mut generations,
+            &TestFence::readable(0),
             &mut generation,
             |attempt_generation| {
                 attempts.push(attempt_generation);
@@ -3278,6 +3378,7 @@ mod tests {
         let worker = retry_worker_spawn(
             &mut storm,
             &mut generations,
+            &TestFence::readable(0),
             &mut generation,
             |attempt_generation| {
                 attempts.push(attempt_generation);
@@ -3326,16 +3427,186 @@ mod tests {
     fn worker_generations_never_reuse_an_attempted_or_durable_generation() {
         // A fresh supervisor on a home whose previous run reached durable
         // generation 5 starts above it rather than at 1.
+        let fence = TestFence::readable(5);
         let mut generations = WorkerGenerations::above(5);
-        assert_eq!(generations.allocate().unwrap(), 6);
+        assert_eq!(generations.allocate(&fence).unwrap(), 6);
         // An aborted handover attempt (7) is burned: the retry after it rolls
         // from the still-serving generation 6 to 8, never back to 7.
-        assert_eq!(generations.allocate().unwrap(), 7);
-        assert_eq!(generations.allocate().unwrap(), 8);
+        assert_eq!(generations.allocate(&fence).unwrap(), 7);
+        assert_eq!(generations.allocate(&fence).unwrap(), 8);
 
         let mut exhausted = WorkerGenerations::above(u64::MAX);
-        assert!(exhausted.allocate().is_err());
-        assert!(exhausted.allocate().is_err(), "exhaustion must not wrap");
+        assert!(exhausted.allocate(&fence).is_err());
+        assert!(
+            exhausted.allocate(&fence).is_err(),
+            "exhaustion must not wrap"
+        );
+    }
+
+    /// Durable fence double: the first `failures` reads fail, later reads
+    /// return `durable`.
+    struct TestFence {
+        durable: u64,
+        failures: std::sync::atomic::AtomicUsize,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TestFence {
+        fn readable(durable: u64) -> Self {
+            Self::failing(durable, 0)
+        }
+
+        fn failing(durable: u64, failures: usize) -> Self {
+            Self {
+                durable,
+                failures: std::sync::atomic::AtomicUsize::new(failures),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DurableGenerationFence for TestFence {
+        fn read_durable_generation(&self) -> Result<u64> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let failed = self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            if failed {
+                bail!("controlled durable fence read failure");
+            }
+            Ok(self.durable)
+        }
+    }
+
+    /// A reexec from a pre-upgrade supervisor inherits no attempted
+    /// generations. Its burned attempts may have advanced the durable fence
+    /// past the live worker (4 -> 5 here), so with the fence unreadable no
+    /// generation is allocated at all — the live worker's `current + 1` would
+    /// reuse the burned 5 — until the fence is read and folded in.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn reexec_from_legacy_state_never_reuses_a_generation_on_an_unreadable_fence() {
+        let fence = TestFence::failing(5, 3);
+        let mut generations = WorkerGenerations::resume_after_reexec(&fence, 4, 0);
+        assert!(generations.durable_unverified());
+
+        for _ in 0..2 {
+            let error = generations.allocate(&fence).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("deferred on an unreadable durable fence"),
+                "{error:#}"
+            );
+            assert!(generations.durable_unverified());
+        }
+        assert_eq!(
+            generations.highest_attempted(),
+            4,
+            "failed reads burn nothing"
+        );
+
+        assert_eq!(generations.allocate(&fence).unwrap(), 6);
+        assert!(!generations.durable_unverified());
+        let reads = fence.reads();
+        assert_eq!(generations.allocate(&fence).unwrap(), 7);
+        assert_eq!(fence.reads(), reads, "a folded fence is not re-read");
+
+        // Inherited attempted generations already bound every burned attempt,
+        // so an unreadable fence does not defer allocation for current state.
+        let fence = TestFence::failing(5, 1);
+        let mut generations = WorkerGenerations::resume_after_reexec(&fence, 4, 5);
+        assert!(!generations.durable_unverified());
+        assert_eq!(generations.allocate(&fence).unwrap(), 6);
+    }
+
+    /// A deferred allocation fails only that respawn attempt: the retry loop
+    /// keeps the supervisor alive and spawns above the fence once it reads.
+    #[cfg(any(unix, windows))]
+    #[tokio::test(start_paused = true)]
+    async fn deferred_fence_allocation_fails_the_attempt_not_the_supervisor() {
+        let fence = TestFence::failing(9, 2);
+        let mut generations = WorkerGenerations::resume_after_reexec(&fence, 4, 0);
+        let mut storm = cockpit_client::RestartStormGuard::default();
+        let mut generation = 4;
+        let mut attempts = Vec::new();
+
+        let worker = retry_worker_spawn(
+            &mut storm,
+            &mut generations,
+            &fence,
+            &mut generation,
+            |attempt_generation| {
+                attempts.push(attempt_generation);
+                std::future::ready(Ok::<_, anyhow::Error>(7_u32))
+            },
+        )
+        .await;
+
+        assert_eq!(worker, Some(7));
+        assert_eq!(attempts, vec![10], "the first spawn is above the fence");
+        assert_eq!(generation, 10);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_admin_read_fails_that_connection_after_its_timeout() {
+        let (_client, server) = tokio::io::duplex(64);
+
+        let error = read_admin(server).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("sent no request"),
+            "{error:#}"
+        );
+    }
+
+    /// A client that connects and never writes must not hold the supervisor's
+    /// admin loop: the worker's boundary report behind it is still served
+    /// well inside the handover deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn silent_admin_client_times_out_without_stalling_supervision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sup.ctl");
+        let mut admin = bind_admin(&path).unwrap();
+        let _silent = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let reporter = tokio::spawn({
+            let path = path.clone();
+            async move {
+                let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+                let mut line = serde_json::to_vec(&AdminRequest {
+                    version: ADMIN_PROTOCOL_VERSION,
+                    command: AdminCommand::WorkerBoundary {
+                        worker_pid: 456,
+                        generation: 7,
+                        last_boundary: Vec::new(),
+                    },
+                })
+                .unwrap();
+                line.push(b'\n');
+                stream.write_all(&line).await.unwrap();
+                let mut reply = String::new();
+                BufReader::new(stream).read_line(&mut reply).await.unwrap();
+                reply
+            }
+        });
+
+        let started = Instant::now();
+        let boundary =
+            wait_for_worker_boundary(&mut admin, 456, 7, ADMIN_CONNECTION_IO_TIMEOUT * 4, 1, None)
+                .await
+                .expect("the silent client must not consume the handover deadline");
+
+        assert!(boundary.is_empty());
+        assert!(started.elapsed() < ADMIN_CONNECTION_IO_TIMEOUT * 3);
+        let reply: AdminResponse =
+            serde_json::from_str(reporter.await.unwrap().trim_end()).unwrap();
+        assert!(matches!(reply, AdminResponse::Status { .. }), "{reply:?}");
     }
 
     #[cfg(unix)]

@@ -126,6 +126,13 @@ pub struct InterruptParkPayload {
     pub gate: Option<InterruptGateMemo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<InterruptVerificationMemo>,
+    /// Session the parked call runs in, where its write-ahead intent lives.
+    /// The interrupt row is raised under the hub's owned session, which may
+    /// be an ancestor of this one (a fork task or loop session); `None`
+    /// means the interrupt's own session. Together with `call_id` it names
+    /// the exact intent the park owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_session_id: Option<Uuid>,
 }
 
 // Full hydrated mirror of the `needs_attention` row; its fields back the
@@ -321,6 +328,9 @@ impl Db {
             .transpose()
             .context("serializing parked args")?;
         let parked_call_id = parked.map(|payload| payload.call_id.clone());
+        let parked_call_session_id = parked
+            .and_then(|payload| payload.call_session_id)
+            .map(|call_session_id| call_session_id.to_string());
         let parked_resume_json = parked
             .map(|payload| serde_json::to_string(&payload.resume))
             .transpose()
@@ -343,8 +353,8 @@ impl Db {
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, agent_id, agent_instance_id, description, questions_json, raised_at,
                   state, parked_tool, parked_args_json, parked_call_id, parked_resume_json,
-                  parked_gate_json, parked_verification_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, ?11, ?12, ?13)",
+                  parked_gate_json, parked_verification_json, parked_call_session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     interrupt_id.to_string(),
                     session_id.to_string(),
@@ -359,6 +369,7 @@ impl Db {
                     parked_resume_json,
                     parked_gate_json,
                     parked_verification_json,
+                    parked_call_session_id,
                 ],
             )
             .context("inserting needs_attention (questions)")?;
@@ -426,7 +437,8 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json, parked_verification_json
+                            parked_resume_json, parked_gate_json, parked_verification_json,
+                            parked_call_session_id
                        FROM needs_attention
                       WHERE session_id = ?1
                         AND (decision_request_id IS NULL
@@ -461,7 +473,8 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json, parked_verification_json
+                            parked_resume_json, parked_gate_json, parked_verification_json,
+                            parked_call_session_id
                        FROM needs_attention
                       WHERE session_id = ?1
                         AND (decision_request_id IS NULL
@@ -495,7 +508,8 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json, parked_verification_json
+                            parked_resume_json, parked_gate_json, parked_verification_json,
+                            parked_call_session_id
                        FROM needs_attention
                       WHERE session_id = ?1
                         AND (decision_request_id IS NULL
@@ -544,7 +558,8 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json, parked_verification_json
+                            parked_resume_json, parked_gate_json, parked_verification_json,
+                            parked_call_session_id
                        FROM needs_attention
                       WHERE interrupt_id = ?1
                         AND (decision_request_id IS NULL
@@ -683,7 +698,7 @@ impl Db {
     }
 
     pub async fn mark_interrupt_interrupted(&self, interrupt_id: Uuid) -> Result<bool> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
@@ -694,6 +709,15 @@ impl Db {
                     params![interrupt_id.to_string()],
                 )
                 .context("marking needs_attention interrupted")?;
+            if affected > 0 {
+                // A claimed replay that reached dispatch leaves its intent
+                // behind (see `needs_attention_parked_call_settled`); it is
+                // now an ambiguous crash-interrupted call.
+                crate::db::tool_recovery::queue_recovery_for_interrupted_park_conn(
+                    conn,
+                    interrupt_id,
+                )?;
+            }
             Ok(affected > 0)
         })
         .await
@@ -755,6 +779,10 @@ impl Db {
                 )
                 .context("marking linked executing interrupt interrupted")?;
             if affected == 1 {
+                crate::db::tool_recovery::queue_recovery_for_interrupted_park_conn(
+                    conn,
+                    interrupt_id,
+                )?;
                 crate::db::agent_tree_decisions::insert_control_event(
                     conn,
                     session_id,
@@ -1047,6 +1075,13 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
     let parked_resume_json: Option<String> = row.get("parked_resume_json")?;
     let parked_gate_json: Option<String> = row.get("parked_gate_json")?;
     let parked_verification_json: Option<String> = row.get("parked_verification_json")?;
+    let parked_call_session_id = row
+        .get::<_, Option<String>>("parked_call_session_id")?
+        .map(|raw| Uuid::parse_str(&raw))
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     let parked = match (
         parked_tool,
         parked_args_json,
@@ -1097,6 +1132,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
                 resume,
                 gate,
                 verification,
+                call_session_id: parked_call_session_id,
             })
         }
         _ => None,
@@ -1223,6 +1259,7 @@ mod tests {
                 recheck_result: true,
             }),
             verification: None,
+            call_session_id: None,
         };
 
         let interrupt_id = db
@@ -1428,6 +1465,7 @@ mod tests {
                 recheck_result: true,
             }),
             verification: None,
+            call_session_id: None,
         };
         let iid = db
             .raise_interrupt_questions_with_payload(
@@ -1508,6 +1546,7 @@ mod tests {
             },
             gate: None,
             verification: None,
+            call_session_id: None,
         };
         let iid = db
             .raise_interrupt_questions_with_payload(

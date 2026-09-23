@@ -501,7 +501,10 @@ pub async fn build_sandboxed_command_with_visibility_root(
         sandbox = sandbox.deny_read(path.clone()).deny_write(path.clone());
     }
     // A write deny under a fully denied ancestor is already covered, and would
-    // need a mount point inside the ancestor's read-only mask.
+    // need a mount point inside the ancestor's read-only mask. Coverage through
+    // a symlinked ancestor spelling alone does not count: `control_denies`
+    // carries each ancestor's canonical form, which is what covers a write
+    // deny spelled through the real target.
     for path in write_denied_paths {
         if !control_denies
             .iter()

@@ -719,10 +719,19 @@ pub fn owner_capability_path_for_socket(control_socket: &Path) -> PathBuf {
 /// read-only tmpfs, so a nested deny would need a mkdir inside that mask and
 /// fail every sandboxed command with EROFS; the ancestor already denies it.
 ///
-/// Only absolute paths take part in collapsing (see [`deny_path_covers`]): a
-/// relative entry is kept verbatim, deduplicated exactly, and neither covers
-/// nor is covered by anything. An empty path names nothing and is dropped
-/// (as a prefix it would otherwise swallow every other deny).
+/// Every absolute deny is recorded both as spelled and in canonical form (when
+/// the two differ). The spelled entry keeps the mask where the caller named
+/// it; the canonical entry masks the real target even if a symlink on the
+/// spelled path resolves differently inside the sandbox. A path counts as
+/// covered only lexically or through such a canonical entry (see
+/// [`deny_path_covers`]), so collapsing never relies on a symlinked spelling
+/// alone. The two spellings of one directory are aliases of the same mount
+/// point, not a nesting, and both stay.
+///
+/// Only absolute paths take part in collapsing: a relative entry is kept
+/// verbatim, deduplicated exactly, and neither covers nor is covered by
+/// anything. An empty path names nothing and is dropped (as a prefix it would
+/// otherwise swallow every other deny).
 pub(crate) fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if path.as_os_str().is_empty() {
         return;
@@ -733,9 +742,18 @@ pub(crate) fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
         }
         return;
     }
+    let canonical = canonical_deny_form(&path);
+    let alias = (canonical != path).then_some(canonical);
+    push_collapsed_deny_path(paths, path);
+    if let Some(canonical) = alias {
+        push_collapsed_deny_path(paths, canonical);
+    }
+}
+
+fn push_collapsed_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if paths
         .iter()
-        .any(|existing| existing == &path || deny_path_covers(existing, &path))
+        .any(|existing| deny_path_covers(existing, &path))
     {
         return;
     }
@@ -743,17 +761,29 @@ pub(crate) fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     paths.push(path);
 }
 
-/// Whether denying `ancestor` already denies `path`: both are absolute and
-/// `path` lies at or under `ancestor`, compared both as spelled and in
-/// canonical form, so a symlinked ancestor (for example an
-/// `XDG_RUNTIME_DIR` reached through a symlink) still covers a path spelled
-/// through its target.
+/// Whether denying `ancestor` (an entry of a deny list built by
+/// [`push_unique_deny_path`]) already denies `path`: both are absolute and
+/// `path` lies at or under `ancestor` as spelled, or `path`'s canonical form
+/// lies strictly under `ancestor`.
+///
+/// The canonical comparison is made against `ancestor` as spelled, never
+/// against its canonical form: a canonical path contains no symlinks, so it
+/// can only lie under an ancestor that is itself a canonical (symlink-free)
+/// spelling, whose mask covers the real target however any symlink resolves
+/// inside the sandbox. Coverage through a symlinked ancestor spelling alone
+/// does not count; [`push_unique_deny_path`] records that ancestor's canonical
+/// form beside it, which then covers the path. A path whose canonical form
+/// equals `ancestor` is an alias of that directory (the same mount point), not
+/// a nested deny.
 pub(crate) fn deny_path_covers(ancestor: &Path, path: &Path) -> bool {
     if !ancestor.is_absolute() || !path.is_absolute() {
         return false;
     }
-    path.starts_with(ancestor)
-        || canonical_deny_form(path).starts_with(canonical_deny_form(ancestor))
+    if path.starts_with(ancestor) {
+        return true;
+    }
+    let canonical = canonical_deny_form(path);
+    canonical != ancestor && canonical.starts_with(ancestor)
 }
 
 /// Canonical spelling of an absolute deny path: its deepest existing ancestor
@@ -4012,21 +4042,74 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let real = root.path().join("real");
         std::fs::create_dir_all(real.join("cockpit")).unwrap();
+        let canonical_real = std::fs::canonicalize(&real).unwrap();
         let link = root.path().join("runtime");
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        let expected = vec![link.join("cockpit"), canonical_real.join("cockpit")];
 
-        // The runtime root is denied through its symlink; the rendezvous dir
-        // resolves through the target (and need not exist yet).
+        // The runtime root is denied through its symlink (recorded with its
+        // canonical alias); the rendezvous dir resolves through the target
+        // (and need not exist yet) and is covered by that canonical alias.
         let mut paths = Vec::new();
         push_unique_deny_path(&mut paths, link.join("cockpit"));
         push_unique_deny_path(&mut paths, real.join("cockpit").join("rendezvous"));
-        assert_eq!(paths, vec![link.join("cockpit")]);
+        assert_eq!(paths, expected);
 
-        // Either order yields the single covering deny.
+        // Either order yields the same covering denies.
         let mut paths = Vec::new();
         push_unique_deny_path(&mut paths, real.join("cockpit").join("rendezvous"));
         push_unique_deny_path(&mut paths, link.join("cockpit"));
-        assert_eq!(paths, vec![link.join("cockpit")]);
+        assert_eq!(paths, expected);
+    }
+
+    /// A deny covered only canonically — through an ancestor spelled via a
+    /// symlink — must not lose protection: the symlinked spelling alone never
+    /// counts as coverage (inside the sandbox the link may resolve
+    /// elsewhere), and the ancestor's canonical form is denied beside it so
+    /// the real target stays masked. The result still never nests.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_only_deny_coverage_keeps_the_real_target_denied() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("cockpit")).unwrap();
+        let canonical_real = std::fs::canonicalize(&real).unwrap();
+        let link = root.path().join("runtime");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let symlinked_ancestor = link.join("cockpit");
+        let nested_target = canonical_real.join("cockpit").join("rendezvous");
+
+        // The symlinked spelling alone does not cover the real target.
+        assert!(!deny_path_covers(&symlinked_ancestor, &nested_target));
+
+        let mut paths = Vec::new();
+        push_unique_deny_path(&mut paths, symlinked_ancestor.clone());
+        push_unique_deny_path(&mut paths, nested_target.clone());
+        assert!(
+            paths.contains(&symlinked_ancestor),
+            "the caller's spelling stays denied: {paths:?}"
+        );
+        assert!(
+            paths.contains(&canonical_real.join("cockpit")),
+            "the symlinked ancestor's real target must be denied too: {paths:?}"
+        );
+        // The nested target is protected by a canonical (symlink-free)
+        // covering entry, not merely through the symlinked spelling.
+        let covering = paths
+            .iter()
+            .filter(|denied| deny_path_covers(denied, &nested_target))
+            .collect::<Vec<_>>();
+        assert_eq!(covering, vec![&canonical_real.join("cockpit")]);
+        // No entry nests under another (the two spellings of one directory are
+        // aliases of the same mount point).
+        for (i, outer) in paths.iter().enumerate() {
+            for (j, inner) in paths.iter().enumerate() {
+                assert!(
+                    i == j || !deny_path_covers(outer, inner),
+                    "deny list must not nest {inner:?} under {outer:?}: {paths:?}"
+                );
+            }
+        }
     }
 
     #[test]

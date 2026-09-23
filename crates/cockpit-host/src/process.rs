@@ -1848,16 +1848,22 @@ pub fn kill_direct_child_process_groups() -> usize {
 }
 
 /// PIDs of this process's direct children, or empty where the platform
-/// offers no enumeration.
+/// offers no enumeration. An unavailable enumeration (for example a Linux
+/// kernel built without `CONFIG_PROC_CHILDREN`, which omits
+/// `/proc/<pid>/task/<tid>/children`) is reported once on stderr, so a
+/// containment pass that signals nothing is distinguishable from one that
+/// found no children.
 #[cfg(unix)]
 fn direct_child_pids() -> Vec<libc::pid_t> {
     let mut pids: Vec<libc::pid_t> = Vec::new();
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // Each thread lists the children it forked.
+        let mut enumerated = false;
         if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
             for task in tasks.flatten() {
                 if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
+                    enumerated = true;
                     pids.extend(
                         children
                             .split_ascii_whitespace()
@@ -1865,6 +1871,11 @@ fn direct_child_pids() -> Vec<libc::pid_t> {
                     );
                 }
             }
+        }
+        if !enumerated {
+            report_child_enumeration_unavailable(
+                "/proc/self/task/*/children is unreadable (kernel without CONFIG_PROC_CHILDREN?)",
+            );
         }
     }
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1876,15 +1887,38 @@ fn direct_child_pids() -> Vec<libc::pid_t> {
         // at most that many.
         let count =
             unsafe { libc::proc_listchildpids(libc::getpid(), buffer.as_mut_ptr().cast(), bytes) };
+        if count < 0 {
+            report_child_enumeration_unavailable("proc_listchildpids failed");
+        }
         // Callers disagree whether the result counts PIDs or bytes; the
         // zero-initialized tail makes either reading safe.
         let count = usize::try_from(count).unwrap_or(0).min(buffer.len());
         pids.extend(buffer[..count].iter().copied());
     }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    report_child_enumeration_unavailable("no direct-child enumeration on this platform");
     pids.retain(|pid| *pid > 0);
     pids.sort_unstable();
     pids.dedup();
     pids
+}
+
+/// Report, once per process, that direct children cannot be enumerated and
+/// last-resort containment will therefore signal none of them.
+#[cfg(unix)]
+fn report_child_enumeration_unavailable(reason: &str) {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        eprintln!(
+            "warning: cannot enumerate direct child processes ({reason}); \
+             child process groups will not be killed on supervisor loss"
+        );
+    });
 }
 
 /// Signal a process group only while the unreaped assigned-leader pin holds.

@@ -2774,6 +2774,18 @@ CREATE TABLE needs_attention (
     parked_claim_generation INTEGER CHECK (
         parked_claim_generation IS NULL OR parked_claim_generation >= 0
     ),
+    -- [relationship:denormalized] Session the parked tool call ran in, and
+    -- so the session of its write-ahead intent. Interrupts are raised under
+    -- the hub's owned session while the call may run in a fork task or loop
+    -- session of it; `(parked_call_session_id, parked_call_id)` names the
+    -- one intent this park owns, because provider call ids recur across a
+    -- fork lineage. NULL means the park's own `session_id`. Not a foreign
+    -- key: a park outlives neither side's history, and the intent it names
+    -- may not exist yet (a pre-dispatch gate parks before the intent opens).
+    parked_call_session_id TEXT CHECK (
+        parked_call_session_id IS NULL
+        OR (parked_call_id IS NOT NULL AND length(parked_call_session_id) = 36)
+    ),
     -- Recursive-agent decisions use this typed ownership edge. A linked real
     -- QuestionTool interrupt retains its immutable question and parked-call
     -- continuation; synthetic attention rows carry neither.
@@ -2933,11 +2945,16 @@ END;
 -- When the park settles terminally, close that intent in the same statement,
 -- whichever path settled it: the park's outcome is the durable answer for the
 -- call, and a surviving intent would resurface the same call as an unowned
--- crash-recovery decision. The intent may belong to the park's session or a
--- fork descendant whose tool raised the interrupt through the owner's hub.
--- `open -> resolved` is excluded: a live waiter's tool continues after its
--- answer and closes its own intent with its result. A sibling live park of
--- the same call (a replay that parked again) keeps the intent.
+-- crash-recovery decision. The intent is exactly the one keyed by the park's
+-- call session (`parked_call_session_id`, else the park's own session) and
+-- call id; a colliding call id in another session of the lineage is never
+-- touched. `open -> resolved` is excluded: a live waiter's tool continues
+-- after its answer and closes its own intent with its result. A sibling live
+-- park of the same call (a replay that parked again) keeps the intent.
+-- `executing -> interrupted` keeps an intent the claiming generation adopted
+-- (`generation = parked_claim_generation`): that replay reached dispatch, so
+-- its effect may have partially run, and the intent must surface as an
+-- ambiguous crash-recovery decision instead of vanishing with the park.
 CREATE TRIGGER needs_attention_parked_call_settled
 AFTER UPDATE OF state ON needs_attention
 WHEN NEW.parked_call_id IS NOT NULL
@@ -2947,21 +2964,19 @@ WHEN NEW.parked_call_id IS NOT NULL
  AND NOT (OLD.state = 'open' AND NEW.state = 'resolved')
 BEGIN
     DELETE FROM tool_execution_intents
-     WHERE call_id = NEW.parked_call_id
-       AND session_id IN (
-           WITH RECURSIVE owned(session_id) AS (
-               SELECT NEW.session_id
-               UNION
-               SELECT s.session_id
-                 FROM sessions s
-                 JOIN owned o ON s.parent_session_id = o.session_id
-           )
-           SELECT session_id FROM owned
+     WHERE session_id = COALESCE(NEW.parked_call_session_id, NEW.session_id)
+       AND call_id = NEW.parked_call_id
+       AND NOT (
+           OLD.state = 'executing'
+           AND NEW.state = 'interrupted'
+           AND OLD.parked_claim_generation IS NOT NULL
+           AND generation = OLD.parked_claim_generation
        )
        AND NOT EXISTS (
            SELECT 1 FROM needs_attention other
             WHERE other.parked_call_id = NEW.parked_call_id
-              AND other.session_id = NEW.session_id
+              AND COALESCE(other.parked_call_session_id, other.session_id)
+                  = COALESCE(NEW.parked_call_session_id, NEW.session_id)
               AND other.interrupt_id <> NEW.interrupt_id
               AND other.recovery_intent_id IS NULL
               AND other.state IN ('open', 'parked', 'executing')

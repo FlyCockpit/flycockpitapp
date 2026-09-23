@@ -264,7 +264,10 @@ pub(crate) async fn run_knowledge_dream(
     let project_root = CanonicalDreamProjectRoot::from_session_path(workspace_root)?;
     let diag_t0 = std::time::Instant::now();
     let run_fence = crate::session::DreamRunFence::acquire(&project_root, &knowledge_base.id).await;
-    eprintln!("DREAM-STEP fence acquired in {:?}", diag_t0.elapsed());
+    crate::daemon::daemon_log::daemon_eprintln!(
+        "DREAM-STEP fence acquired in {:?}",
+        diag_t0.elapsed()
+    );
     // Source selection and post-turn verification use the same
     // installation-scoped ledger partition under one execution fence.
     let consumer = db.ensure_installation_identity().await?;
@@ -276,7 +279,7 @@ pub(crate) async fn run_knowledge_dream(
             caller_trust,
         )
         .await?;
-    eprintln!(
+    crate::daemon::daemon_log::daemon_eprintln!(
         "DREAM-STEP sources={} in {:?}",
         sources.len(),
         diag_t0.elapsed()
@@ -312,7 +315,7 @@ pub(crate) async fn run_knowledge_dream(
         )
         .await
         .context("starting Dream session")?;
-    eprintln!(
+    crate::daemon::daemon_log::daemon_eprintln!(
         "DREAM-STEP dream session attached in {:?}",
         diag_t0.elapsed()
     );
@@ -1097,7 +1100,7 @@ mod tests {
                     false,
                 )
                 .await;
-                eprintln!(
+                crate::daemon::daemon_log::daemon_eprintln!(
                     "DREAM-RUN-DIAG finished in {:?}: {:?}",
                     started.elapsed(),
                     result

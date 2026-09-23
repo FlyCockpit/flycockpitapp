@@ -37,6 +37,11 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             if !daemon::supervisor::is_worker_process() {
                 bail!("`cockpit daemon worker` may only be launched by the supervisor");
             }
+            // The worker's stderr is daemon.log: prefix its plain stderr
+            // lines with a timestamp, role, and pid.
+            cockpit_core::daemon::daemon_log::set_process_role(
+                cockpit_core::daemon::daemon_log::DaemonLogRole::Worker,
+            );
             if no_sandbox {
                 // SAFETY: set before the worker boots any session tasks.
                 unsafe {

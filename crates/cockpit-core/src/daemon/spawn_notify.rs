@@ -328,6 +328,10 @@ fn open_daemon_log_append(state_dir: &Path) -> Result<std::fs::File> {
     }
 }
 
+/// The last `n` lines of `daemon.log` that belong to the current run: lines
+/// before the last run marker (see [`super::daemon_log`]) are earlier runs and
+/// are never shown as if they were current. Without a marker in the read
+/// window this is simply the last `n` lines.
 pub(crate) fn last_log_lines(log_path: &Path, n: usize) -> String {
     let Ok(data) = std::fs::read(log_path) else {
         return String::new();
@@ -339,7 +343,7 @@ pub(crate) fn last_log_lines(log_path: &Path, n: usize) -> String {
         &data
     };
     let text = String::from_utf8_lossy(slice);
-    let lines: Vec<&str> = text.lines().collect();
+    let lines = super::daemon_log::current_run_lines(&text);
     lines
         .iter()
         .rev()
@@ -806,6 +810,83 @@ mod tests {
         assert!(tail.starts_with("line-10"), "{tail}");
         assert!(tail.ends_with("line-29"), "{tail}");
         assert!(!tail.contains("line-9"), "{tail}");
+    }
+
+    #[test]
+    fn last_log_lines_show_only_the_current_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DAEMON_LOG_FILE);
+        let mut log = std::fs::File::create(&path).unwrap();
+        writeln!(log, "Error: stale failure from an older binary").unwrap();
+        super::super::daemon_log::write_run_marker(
+            &log,
+            super::super::daemon_log::DaemonLogRole::Supervisor,
+        );
+        writeln!(log, "current-run-line").unwrap();
+        drop(log);
+
+        let tail = last_log_lines(&path, 20);
+        assert!(
+            tail.starts_with(super::super::daemon_log::DAEMON_LOG_RUN_MARKER_PREFIX),
+            "{tail}"
+        );
+        assert!(tail.ends_with("current-run-line"), "{tail}");
+        assert!(!tail.contains("stale failure"), "{tail}");
+
+        let error = error_with_log_tail("boot failed", &path);
+        let text = format!("{error:#}");
+        assert!(text.contains("current-run-line"), "{text}");
+        assert!(!text.contains("stale failure"), "{text}");
+    }
+
+    #[test]
+    fn last_log_lines_without_a_marker_fall_back_to_the_trailing_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DAEMON_LOG_FILE);
+        std::fs::write(&path, "legacy-1\nlegacy-2\nlegacy-3\n").unwrap();
+
+        assert_eq!(last_log_lines(&path, 2), "legacy-2\nlegacy-3");
+    }
+
+    #[test]
+    fn a_run_with_only_its_marker_attaches_no_stale_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DAEMON_LOG_FILE);
+        let mut log = std::fs::File::create(&path).unwrap();
+        writeln!(log, "Error: stale failure from an older binary").unwrap();
+        super::super::daemon_log::write_run_marker(
+            &log,
+            super::super::daemon_log::DaemonLogRole::Launcher,
+        );
+        drop(log);
+
+        let error = error_with_log_tail("daemon exited before reporting ready", &path);
+        assert_eq!(format!("{error:#}"), "daemon exited before reporting ready");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_daemon_log_keeps_earlier_runs_behind_a_launcher_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        cockpit_host::private_fs::ensure_private_dir(dir.path()).unwrap();
+        let log_path = dir.path().join(DAEMON_LOG_FILE);
+        std::fs::write(&log_path, "old-run-error\n").unwrap();
+        let file = prepare_daemon_log(dir.path()).unwrap();
+        super::super::daemon_log::write_run_marker(
+            &file,
+            super::super::daemon_log::DaemonLogRole::Launcher,
+        );
+        drop(file);
+
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[0], "old-run-error");
+        assert!(
+            lines[1].starts_with(super::super::daemon_log::DAEMON_LOG_RUN_MARKER_PREFIX),
+            "{text}"
+        );
+        assert!(lines[1].contains("role=launcher"), "{text}");
     }
 
     #[cfg(unix)]

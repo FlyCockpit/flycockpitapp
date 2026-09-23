@@ -814,7 +814,16 @@ pub fn main_entry() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("{}", error_stderr_line(&err));
+            // A supervisor or worker writes this line into daemon.log;
+            // `stderr_line` stamps it with time, role, and pid there and
+            // leaves every other command's error line unchanged.
+            eprintln!(
+                "{}",
+                cockpit_core::daemon::daemon_log::stderr_line(format_args!(
+                    "{}",
+                    error_stderr_line(&err)
+                ))
+            );
             ExitCode::from(error_exit_code(&err))
         }
     }

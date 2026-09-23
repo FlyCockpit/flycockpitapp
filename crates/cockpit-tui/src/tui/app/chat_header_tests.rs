@@ -785,7 +785,14 @@ fn header_and_transcript_hold_reserved_columns_at_probe_widths() {
         // the unbarred body remains visible below it.
         let chat = app.chat_area.expect("history area");
         assert!(chat.y >= layout.area.y + 3);
-        let ts = chrono::Local::now().format("%H:%M").to_string();
+        // Match any HH:MM stamp: the render and this assertion can straddle a
+        // minute boundary, so recomputing "now" here is racy.
+        let is_stamp = |word: &str| {
+            let bytes = word.as_bytes();
+            bytes.len() == 5
+                && bytes[2] == b':'
+                && [0, 1, 3, 4].iter().all(|&i| bytes[i].is_ascii_digit())
+        };
         let agent_header = (chat.y..chat.bottom())
             .map(|y| row_text(&buf, y))
             .find(|text| text.contains("▌ Agent"))
@@ -798,7 +805,7 @@ fn header_and_transcript_hold_reserved_columns_at_probe_widths() {
                 )
             });
         assert!(
-            agent_header.contains(&ts) || agent_header.trim_end().ends_with(&ts),
+            agent_header.split_whitespace().last().is_some_and(is_stamp),
             "timestamp reserved at {width}: {agent_header:?}"
         );
         assert!(

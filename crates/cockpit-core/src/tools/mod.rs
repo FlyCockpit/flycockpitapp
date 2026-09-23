@@ -37,6 +37,7 @@ pub mod list_sealed_value_descriptions;
 mod lock_wait;
 pub mod lsp;
 pub mod mcp_tool;
+pub(crate) mod output_backstop;
 pub mod plan_doc;
 pub mod question;
 pub mod raise;

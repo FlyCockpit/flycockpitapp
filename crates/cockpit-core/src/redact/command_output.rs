@@ -1,6 +1,13 @@
 //! Substitution-site novel-secret scrub for freshly captured `!`-command
 //! output (GOALS §7; issue #279).
 //!
+//! The same passes also back ordinary bash, custom-tool and background-job
+//! output in [`NovelScrubMode::KeyedNarrow`] (secrets increment I2, see
+//! `crate::tools::output_backstop`): keyed forms, well-known credential
+//! formats, JWTs, PEM blocks and URL-userinfo passwords only — no keyless
+//! opaque-token rule, so git SHAs, UUIDs and digests survive. Everything
+//! below describes the skill `!` [`NovelScrubMode::Full`] mode.
+//!
 //! [`RedactionTable::scrub`] only replaces literals already registered in
 //! the table. A skill `!`-command can surface a *novel* secret the table
 //! has never seen — `` !`cat .env` ``, `` !`aws sts get-session-token` `` —
@@ -96,7 +103,8 @@ use std::collections::HashMap;
 
 use super::structured::strip_quotes;
 use super::{
-    MIN_REDACTION_ENTRY_LENGTH, NEVER_SCRUB_LITERALS, RedactionTable, is_secret_shaped_key,
+    MIN_REDACTION_ENTRY_LENGTH, NEVER_SCRUB_LITERALS, RedactionTable, credential_shaped_key,
+    is_secret_shaped_key,
 };
 
 /// Minimum total length for the opaque keyless-credential token rule (the
@@ -128,6 +136,132 @@ fn keyed_novel_value_is_visible(value: &str) -> bool {
             .any(|lit| value.eq_ignore_ascii_case(lit))
 }
 
+/// Which shape families a novel-secret scrub applies.
+///
+/// - [`NovelScrubMode::Full`] is the skill `!`-command boundary: every shape
+///   in the module docs, including the fail-closed keyless opaque-token rule
+///   that also redacts git SHAs, UUIDs and digests.
+/// - [`NovelScrubMode::KeyedNarrow`] is the backstop for ordinary shell,
+///   custom-tool and background-job output, where hashes and UUIDs are the
+///   work product and must survive. It keeps the keyed forms (whose key is
+///   the secrecy evidence), well-known credential formats, JWTs and PEM
+///   private-key blocks, adds URL-userinfo passwords
+///   (`scheme://user:PASS@host`), and drops the keyless opaque-token rule.
+///   Short all-digit values under keys outside the `*_PIN`/`*_PASSWORD`/
+///   `*_PASSWD`/`*_SECRET` family (`"max_tokens": 4096`) stay visible: they
+///   are counts, not credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NovelScrubMode {
+    Full,
+    KeyedNarrow,
+}
+
+/// Below this length an all-digit keyed value outside the credential-shaped
+/// key family is a count or limit in [`NovelScrubMode::KeyedNarrow`].
+const NARROW_NUMERIC_VALUE_MIN_LEN: usize = 8;
+
+/// A value a novel-secret scrub replaced, carried back so the caller can
+/// register it in the session redaction table. Registration then catches
+/// later echoes of the same value (and its encoded / case variants) that no
+/// longer carry the shape the scrub keyed on.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ObservedSecret {
+    pub(crate) value: String,
+    /// Exempt from the table's `min_secret_length` prune: the value's own
+    /// format (a known credential prefix, a JWT, a PEM block) or its
+    /// credential-shaped key is the secrecy evidence.
+    pub(crate) length_exempt: bool,
+    /// Register base64 / hex / URL encodings.
+    pub(crate) encoded_variants: bool,
+    /// Register lower / upper / capitalized spellings.
+    pub(crate) case_variants: bool,
+}
+
+impl std::fmt::Debug for ObservedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObservedSecret")
+            .field("value", &format_args!("[REDACTED; {}]", self.value.len()))
+            .field("length_exempt", &self.length_exempt)
+            .field("encoded_variants", &self.encoded_variants)
+            .field("case_variants", &self.case_variants)
+            .finish()
+    }
+}
+
+impl ObservedSecret {
+    fn keyed(key: &str, value: &str) -> Self {
+        let credential = credential_shaped_key(key);
+        Self {
+            value: strip_matching_quotes(value).to_string(),
+            length_exempt: credential,
+            encoded_variants: true,
+            case_variants: credential,
+        }
+    }
+
+    fn known_format(value: &str) -> Self {
+        Self {
+            value: value.to_string(),
+            length_exempt: true,
+            encoded_variants: true,
+            case_variants: false,
+        }
+    }
+
+    fn literal(value: String, length_exempt: bool) -> Self {
+        Self {
+            value,
+            length_exempt,
+            encoded_variants: false,
+            case_variants: false,
+        }
+    }
+}
+
+/// The result of a novel-secret scrub: the rewritten text plus every value
+/// it replaced, deduplicated, in first-seen order.
+pub(crate) struct NovelScrubOutput {
+    pub(crate) text: String,
+    pub(crate) found: Vec<ObservedSecret>,
+}
+
+impl std::fmt::Debug for NovelScrubOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NovelScrubOutput")
+            .field("text_len", &self.text.len())
+            .field("found", &self.found)
+            .finish()
+    }
+}
+
+/// Strip one layer of matching surrounding quotes (`"v"` / `'v'`).
+fn strip_matching_quotes(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'"' || bytes[0] == b'\'')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+/// Keyed-value visibility under `mode`: the shared plausibility floor, plus
+/// the [`NovelScrubMode::KeyedNarrow`] short-count exemption.
+fn keyed_value_is_visible(mode: NovelScrubMode, key: &str, value: &str) -> bool {
+    if keyed_novel_value_is_visible(value) {
+        return true;
+    }
+    if mode == NovelScrubMode::KeyedNarrow && !credential_shaped_key(key) {
+        let bare = strip_matching_quotes(value);
+        return !bare.is_empty()
+            && bare.len() < NARROW_NUMERIC_VALUE_MIN_LEN
+            && bare.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
+}
+
 impl RedactionTable {
     /// Redact *novel* secret-shaped values in freshly captured `!`-command
     /// output — values this table has no entry for, so [`Self::scrub`]
@@ -144,11 +278,30 @@ impl RedactionTable {
     /// equal to the placeholder is left alone, so re-scrubbing rendered
     /// output is byte-stable.
     pub(crate) fn scrub_novel_command_output_secrets(&self, body: &str) -> String {
+        self.scrub_novel_command_output_secrets_with_mode(body, NovelScrubMode::Full)
+            .text
+    }
+
+    /// [`Self::scrub_novel_command_output_secrets`] under an explicit
+    /// [`NovelScrubMode`], also returning every replaced value so the caller
+    /// can register it in the session table.
+    pub(crate) fn scrub_novel_command_output_secrets_with_mode(
+        &self,
+        body: &str,
+        mode: NovelScrubMode,
+    ) -> NovelScrubOutput {
+        let mut found = Vec::new();
         if self.disabled {
-            return body.to_string();
+            return NovelScrubOutput {
+                text: body.to_string(),
+                found,
+            };
         }
         let mut out = String::with_capacity(body.len());
         let mut in_private_key_block = false;
+        // The raw lines of the private-key block being dropped, fences
+        // included, so the block (and each body line) can be registered.
+        let mut private_key_lines: Vec<&str> = Vec::new();
         // YAML block scalar opened by a secret-shaped key: the key line's
         // indent. The value is the run of following lines indented deeper
         // than the key line.
@@ -162,8 +315,10 @@ impl RedactionTable {
                 // The whole block collapsed to one placeholder at its BEGIN
                 // fence; keep dropping lines (the END fence included) until
                 // the block closes.
+                private_key_lines.push(content);
                 if is_private_key_fence(content, "-----END") {
                     in_private_key_block = false;
+                    observe_private_key_block(&mut private_key_lines, &mut found);
                 }
                 continue;
             }
@@ -171,6 +326,7 @@ impl RedactionTable {
                 out.push_str(&self.placeholder);
                 out.push_str(newline);
                 in_private_key_block = true;
+                private_key_lines.push(content);
                 continue;
             }
             if let Some(key_indent) = block_scalar {
@@ -186,6 +342,7 @@ impl RedactionTable {
                     if trimmed != self.placeholder && !keyed_novel_value_is_visible(trimmed) {
                         out.push_str(&content[..indent]);
                         out.push_str(&self.placeholder);
+                        found.push(ObservedSecret::literal(trimmed.to_string(), false));
                     } else {
                         out.push_str(content);
                     }
@@ -196,27 +353,130 @@ impl RedactionTable {
                 block_scalar = None;
             }
             let intro = secret_shaped_block_scalar_intro(content);
-            let scrubbed = scrub_line(content, &self.placeholder);
+            let scrubbed = scrub_line(content, &self.placeholder, mode, &mut found);
             out.push_str(&scrubbed);
             out.push_str(newline);
             if let Some(intro) = intro {
                 block_scalar = Some(intro);
             }
         }
-        out
+        if !private_key_lines.is_empty() {
+            // Output ended inside the block (truncated key): register what
+            // was captured.
+            observe_private_key_block(&mut private_key_lines, &mut found);
+        }
+        let mut seen = std::collections::HashSet::new();
+        found.retain(|secret| {
+            !secret.value.is_empty()
+                && secret.value != self.placeholder
+                && seen.insert(secret.value.clone())
+        });
+        NovelScrubOutput { text: out, found }
     }
+}
+
+/// Minimum length for a single PEM body line registered on its own (a
+/// partial echo such as `head -3 id_rsa`). Base64 body lines are 64 wide.
+const PRIVATE_KEY_LINE_MIN_LEN: usize = 20;
+
+/// Register a dropped private-key block: the whole block verbatim plus each
+/// distinctive body line.
+fn observe_private_key_block(lines: &mut Vec<&str>, found: &mut Vec<ObservedSecret>) {
+    if lines.is_empty() {
+        return;
+    }
+    found.push(ObservedSecret::literal(lines.join("\n"), true));
+    for line in lines.iter() {
+        let trimmed = line.trim();
+        if trimmed.len() >= PRIVATE_KEY_LINE_MIN_LEN && !trimmed.starts_with("-----") {
+            found.push(ObservedSecret::literal(trimmed.to_string(), true));
+        }
+    }
+    lines.clear();
 }
 
 /// The per-line pass pipeline. Ordering only matters for idempotency (every
 /// pass skips a value already equal to the placeholder), and each pass sees
 /// only the previous passes' output, so a line can be scrubbed by any one of
 /// them independently.
-fn scrub_line(content: &str, placeholder: &str) -> String {
-    let xml = scrub_secret_shaped_xml(content, placeholder);
-    let assignments = scrub_secret_shaped_assignments(&xml, placeholder);
-    let members = scrub_secret_shaped_quoted_members(&assignments, placeholder);
-    let pairs = scrub_secret_shaped_colon_pairs(&members, placeholder);
-    scrub_keyless_credential_tokens(&pairs, placeholder)
+fn scrub_line(
+    content: &str,
+    placeholder: &str,
+    mode: NovelScrubMode,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
+    let xml = scrub_secret_shaped_xml(content, placeholder, mode, found);
+    let assignments = scrub_secret_shaped_assignments(&xml, placeholder, mode, found);
+    let members = scrub_secret_shaped_quoted_members(&assignments, placeholder, mode, found);
+    let pairs = scrub_secret_shaped_colon_pairs(&members, placeholder, mode, found);
+    match mode {
+        NovelScrubMode::Full => scrub_keyless_credential_tokens(&pairs, placeholder, found),
+        NovelScrubMode::KeyedNarrow => {
+            let known = scrub_known_credential_tokens(&pairs, placeholder, found);
+            scrub_url_userinfo_passwords(&known, placeholder, found)
+        }
+    }
+}
+
+/// Scrub the password of every `scheme://user:PASS@host` URL on the line
+/// (the `DATABASE_URL` / `REDIS_URL` shape, whose key is not secret-shaped).
+/// The user name and host survive. The registered value is the whole
+/// `user:PASS` userinfo rather than the bare password, so a common password
+/// word (`postgres:postgres@`) is not installed as a session-wide pattern on
+/// its own while echoes of the same credential pair are still caught.
+fn scrub_url_userinfo_passwords(
+    content: &str,
+    placeholder: &str,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
+    if !content.contains("://") {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(rel) = content[search..].find("://") {
+        let sep = search + rel;
+        let authority_start = sep + 3;
+        search = authority_start;
+        // A scheme must precede the separator.
+        let has_scheme = content[..sep]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        if !has_scheme {
+            continue;
+        }
+        let authority_len = content[authority_start..]
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'' | '`' | '<' | '>')
+            })
+            .unwrap_or(content.len() - authority_start);
+        let authority_end = authority_start + authority_len;
+        let authority = &content[authority_start..authority_end];
+        let Some(at) = authority.rfind('@') else {
+            continue;
+        };
+        let userinfo = &authority[..at];
+        let Some(colon) = userinfo.find(':') else {
+            continue;
+        };
+        let password = &userinfo[colon + 1..];
+        if password.is_empty() || password == placeholder || keyed_novel_value_is_visible(password)
+        {
+            search = authority_end;
+            continue;
+        }
+        let password_start = authority_start + colon + 1;
+        let password_end = authority_start + at;
+        out.push_str(&content[copied..password_start]);
+        out.push_str(placeholder);
+        copied = password_end;
+        search = authority_end;
+        found.push(ObservedSecret::literal(userinfo.to_string(), false));
+    }
+    out.push_str(&content[copied..]);
+    out
 }
 
 /// `true` when `line` is a PEM `-----BEGIN`/`-----END` fence for a private
@@ -237,7 +497,12 @@ fn is_private_key_fence(line: &str, fence: &str) -> bool {
 /// search over those indexes. No `<` ever rescans the remaining suffix, so
 /// a line of N `<` bytes is O(N log N) — the previous per-`<` full-suffix
 /// scans made it O(N²) on attacker-controlled output.
-fn scrub_secret_shaped_xml(line: &str, placeholder: &str) -> String {
+fn scrub_secret_shaped_xml(
+    line: &str,
+    placeholder: &str,
+    mode: NovelScrubMode,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
     if !line.contains('<') {
         return line.to_string();
     }
@@ -276,7 +541,8 @@ fn scrub_secret_shaped_xml(line: &str, placeholder: &str) -> String {
                 // `</` + tag + `>`
                 let close_end = close_start + tag.len() + 3;
                 let value = &line[value_start..close_start];
-                if value != placeholder && !keyed_novel_value_is_visible(value) {
+                if value != placeholder && !keyed_value_is_visible(mode, tag, value) {
+                    found.push(ObservedSecret::keyed(tag, value));
                     out.push_str(&line[copied..value_start]);
                     out.push_str(placeholder);
                     // Only the inner text is secret: the close tag is
@@ -321,7 +587,12 @@ fn is_xml_tag_name(tag: &str) -> bool {
 /// not reinterpreted as keys. Quoted values (escaped quotes honored — an
 /// embedded `\"` is value text, never the closing delimiter) lose their
 /// quotes; keys and surroundings survive.
-fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
+fn scrub_secret_shaped_assignments(
+    content: &str,
+    placeholder: &str,
+    mode: NovelScrubMode,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
     if !content.contains('=') {
         return content.to_string();
     }
@@ -378,7 +649,8 @@ fn scrub_secret_shaped_assignments(content: &str, placeholder: &str) -> String {
                 assignment_value_span(content, eq + 1, opening_quote, query_context, &quotes)
         {
             let value = &content[value_start..value_end];
-            if value != placeholder && !keyed_novel_value_is_visible(value) {
+            if value != placeholder && !keyed_value_is_visible(mode, key, value) {
+                found.push(ObservedSecret::keyed(key, value));
                 redacted = Some((value_start, value_end));
             }
         }
@@ -445,9 +717,14 @@ fn assignment_value_span(
 /// delimiters only, so a well-formed member whose value embeds a literal
 /// quote (`{"API_TOKEN":"ab\"cd"}`) is redacted whole instead of closing at
 /// the escaped quote and leaking the value's remainder.
-fn scrub_secret_shaped_quoted_members(content: &str, placeholder: &str) -> String {
-    let double = scrub_quoted_members_of_kind(content, placeholder, '"');
-    scrub_quoted_members_of_kind(&double, placeholder, '\'')
+fn scrub_secret_shaped_quoted_members(
+    content: &str,
+    placeholder: &str,
+    mode: NovelScrubMode,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
+    let double = scrub_quoted_members_of_kind(content, placeholder, '"', mode, found);
+    scrub_quoted_members_of_kind(&double, placeholder, '\'', mode, found)
 }
 
 /// One quote kind of [`scrub_secret_shaped_quoted_members`]: walk same-kind
@@ -456,7 +733,13 @@ fn scrub_secret_shaped_quoted_members(content: &str, placeholder: &str) -> Strin
 /// is a secret-shaped key, the separator between it and the next quote is
 /// a single colon with optional surrounding whitespace, and the string
 /// after that separator is a scrubbable value, replace the value.
-fn scrub_quoted_members_of_kind(content: &str, placeholder: &str, kind: char) -> String {
+fn scrub_quoted_members_of_kind(
+    content: &str,
+    placeholder: &str,
+    kind: char,
+    mode: NovelScrubMode,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
     if !content.contains(':') {
         return content.to_string();
     }
@@ -476,7 +759,8 @@ fn scrub_quoted_members_of_kind(content: &str, placeholder: &str, kind: char) ->
             let mut parts = separator.split_whitespace();
             if parts.next() == Some(":") && parts.next().is_none() {
                 let value = &content[val_open + 1..val_close];
-                if value != placeholder && !keyed_novel_value_is_visible(value) {
+                if value != placeholder && !keyed_value_is_visible(mode, key, value) {
+                    found.push(ObservedSecret::keyed(key, value));
                     out.push_str(&content[copied..val_open + 1]);
                     out.push_str(placeholder);
                     copied = val_close;
@@ -502,7 +786,12 @@ fn scrub_quoted_members_of_kind(content: &str, placeholder: &str, kind: char) ->
 /// `''` single-quote escape makes next-quote pairing ambiguous — so
 /// escaped quotes inside the value are covered as value text, and a line
 /// whose quotes do not balance passes through untouched.
-fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
+fn scrub_secret_shaped_colon_pairs(
+    content: &str,
+    placeholder: &str,
+    mode: NovelScrubMode,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
     if !content.contains(':') {
         return content.to_string();
     }
@@ -579,9 +868,10 @@ fn scrub_secret_shaped_colon_pairs(content: &str, placeholder: &str) -> String {
         }
         _ => value_and_close,
     };
-    if keyed_novel_value_is_visible(value) || value == placeholder {
+    if keyed_value_is_visible(mode, key, value) || value == placeholder {
         return content.to_string();
     }
+    found.push(ObservedSecret::keyed(key, value));
     let mut out = String::with_capacity(content.len());
     out.push_str(&content[..value_start]);
     if let Some(q) = quote {
@@ -653,12 +943,16 @@ fn is_opaque_token_char(c: char) -> bool {
 /// same, and a digitless passphrase classifies exactly like a hex key.
 /// Neither position nor charset mix ever decides secrecy. See the module
 /// docs for the fail-closed stance on hashes and UUIDs.
-fn scrub_keyless_credential_tokens(content: &str, placeholder: &str) -> String {
+fn scrub_keyless_credential_tokens(
+    content: &str,
+    placeholder: &str,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
     // Known formats first: they delimit multi-part tokens (a JWT's dot
     // segments are not opaque-run characters) that the embedded run pass
     // would otherwise chop into partial redactions.
-    let known = scrub_known_credential_tokens(content, placeholder);
-    scrub_embedded_opaque_tokens(&known, placeholder)
+    let known = scrub_known_credential_tokens(content, placeholder, found);
+    scrub_embedded_opaque_tokens(&known, placeholder, found)
 }
 
 /// `true` when `text` contains a keyless credential shape anywhere — the
@@ -676,7 +970,7 @@ pub(super) fn contains_keyless_credential_shape(text: &str) -> bool {
     // output exactly when a shape was replaced, and matches byte-for-byte
     // when no shape is present.
     const SENTINEL: &str = "\u{1}";
-    scrub_keyless_credential_tokens(text, SENTINEL) != text
+    scrub_keyless_credential_tokens(text, SENTINEL, &mut Vec::new()) != text
 }
 
 /// `true` when `token` has the shape of a novel keyless credential: an
@@ -740,7 +1034,11 @@ fn is_novel_opaque_credential(token: &str) -> bool {
 /// checked once. A run already equal to the placeholder is left alone, so
 /// re-scrubbing stays idempotent even for a user-configured opaque-shaped
 /// placeholder.
-fn scrub_embedded_opaque_tokens(content: &str, placeholder: &str) -> String {
+fn scrub_embedded_opaque_tokens(
+    content: &str,
+    placeholder: &str,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
     if content.len() < KEYLESS_TOKEN_MIN_LEN {
         return content.to_string();
     }
@@ -757,6 +1055,7 @@ fn scrub_embedded_opaque_tokens(content: &str, placeholder: &str) -> String {
         };
         let run = &content[start..idx];
         if run != placeholder && is_novel_opaque_credential(run) {
+            found.push(ObservedSecret::known_format(run));
             out.push_str(&content[copied..start]);
             out.push_str(placeholder);
             copied = idx;
@@ -765,6 +1064,7 @@ fn scrub_embedded_opaque_tokens(content: &str, placeholder: &str) -> String {
     if let Some(start) = run_start {
         let run = &content[start..];
         if run != placeholder && is_novel_opaque_credential(run) {
+            found.push(ObservedSecret::known_format(run));
             out.push_str(&content[copied..start]);
             out.push_str(placeholder);
             copied = content.len();
@@ -807,22 +1107,26 @@ fn is_jwt_char(c: char) -> bool {
 /// Replace every occurrence of a known credential format on the line with
 /// the placeholder. Mid-line coverage is what catches a secret echoed into
 /// prose or mixed output (`token is ghp_…`, `Authorization: Bearer eyJ…`).
-fn scrub_known_credential_tokens(content: &str, placeholder: &str) -> String {
+fn scrub_known_credential_tokens(
+    content: &str,
+    placeholder: &str,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
     let mut current: Option<String> = None;
     for (prefix, min_total) in CREDENTIAL_PREFIX_RULES {
         let source = current.as_deref().unwrap_or(content);
         if let Cow::Owned(scrubbed) =
-            scrub_prefixed_token_run(source, placeholder, prefix, *min_total)
+            scrub_prefixed_token_run(source, placeholder, prefix, *min_total, found)
         {
             current = Some(scrubbed);
         }
     }
     let source = current.as_deref().unwrap_or(content);
-    if let Cow::Owned(scrubbed) = scrub_aws_access_key_ids(source, placeholder) {
+    if let Cow::Owned(scrubbed) = scrub_aws_access_key_ids(source, placeholder, found) {
         current = Some(scrubbed);
     }
     let source = current.as_deref().unwrap_or(content);
-    if let Cow::Owned(scrubbed) = scrub_jwt_tokens(source, placeholder) {
+    if let Cow::Owned(scrubbed) = scrub_jwt_tokens(source, placeholder, found) {
         current = Some(scrubbed);
     }
     current.unwrap_or_else(|| content.to_string())
@@ -838,6 +1142,7 @@ fn scrub_prefixed_token_run<'a>(
     placeholder: &str,
     prefix: &str,
     min_total: usize,
+    found: &mut Vec<ObservedSecret>,
 ) -> Cow<'a, str> {
     if !content.contains(prefix) {
         return Cow::Borrowed(content);
@@ -861,6 +1166,7 @@ fn scrub_prefixed_token_run<'a>(
                 .next_back()
                 .is_some_and(|prev| !is_credential_word_char(prev));
         if at_boundary && end - start >= min_total {
+            found.push(ObservedSecret::known_format(&content[start..end]));
             out.push_str(&content[copied..start]);
             out.push_str(placeholder);
             copied = end;
@@ -875,7 +1181,11 @@ fn scrub_prefixed_token_run<'a>(
 
 /// AWS access key ids: `AKIA` followed by exactly sixteen uppercase
 /// alphanumerics, at a non-alphanumeric boundary on both sides.
-fn scrub_aws_access_key_ids<'a>(content: &'a str, placeholder: &str) -> Cow<'a, str> {
+fn scrub_aws_access_key_ids<'a>(
+    content: &'a str,
+    placeholder: &str,
+    found: &mut Vec<ObservedSecret>,
+) -> Cow<'a, str> {
     if !content.contains("AKIA") {
         return Cow::Borrowed(content);
     }
@@ -893,6 +1203,7 @@ fn scrub_aws_access_key_ids<'a>(content: &'a str, placeholder: &str) -> Cow<'a, 
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
             && (end == bytes.len() || !bytes[end].is_ascii_alphanumeric());
         if bounded && matches_shape {
+            found.push(ObservedSecret::known_format(&content[start..end]));
             out.push_str(&content[copied..start]);
             out.push_str(placeholder);
             copied = end;
@@ -907,7 +1218,11 @@ fn scrub_aws_access_key_ids<'a>(content: &'a str, placeholder: &str) -> Cow<'a, 
 
 /// JWTs: an `eyJ`-anchored run of JWT characters containing at least two
 /// dots and clearing [`JWT_MIN_LEN`].
-fn scrub_jwt_tokens<'a>(content: &'a str, placeholder: &str) -> Cow<'a, str> {
+fn scrub_jwt_tokens<'a>(
+    content: &'a str,
+    placeholder: &str,
+    found: &mut Vec<ObservedSecret>,
+) -> Cow<'a, str> {
     if !content.contains("eyJ") {
         return Cow::Borrowed(content);
     }
@@ -934,6 +1249,7 @@ fn scrub_jwt_tokens<'a>(content: &'a str, placeholder: &str) -> Cow<'a, str> {
                 .next_back()
                 .is_some_and(|prev| !is_jwt_char(prev));
         if at_boundary && dots >= 2 && end - start >= JWT_MIN_LEN {
+            found.push(ObservedSecret::known_format(&content[start..end]));
             out.push_str(&content[copied..start]);
             out.push_str(placeholder);
             copied = end;
@@ -1789,5 +2105,179 @@ mod tests {
             &scrubbed[scrubbed.len() - 64..]
         );
         assert!(!scrubbed.contains("filler0"), "got {scrubbed:?}");
+    }
+
+    // ---- NovelScrubMode::KeyedNarrow (secrets I2: bash / custom-tool /
+    // background output backstop) ----
+
+    fn narrow(table: &RedactionTable, body: &str) -> NovelScrubOutput {
+        table.scrub_novel_command_output_secrets_with_mode(body, NovelScrubMode::KeyedNarrow)
+    }
+
+    fn found_values(out: &NovelScrubOutput) -> Vec<&str> {
+        out.found
+            .iter()
+            .map(|secret| secret.value.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn narrow_dotenv_dump_redacts_secret_keys_and_reports_values() {
+        let table = table_with_placeholder(PH);
+        let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
+        let body = format!(
+            "NODE_ENV=production\nSTRIPE_SECRET_KEY={stripe}\nexport DB_PASSWORD=\"hunter2hunter2\"\nPORT=3000\n"
+        );
+        let out = narrow(&table, &body);
+        assert_eq!(
+            out.text,
+            "NODE_ENV=production\nSTRIPE_SECRET_KEY=[ph]\nexport DB_PASSWORD=[ph]\nPORT=3000\n"
+        );
+        assert_eq!(found_values(&out), vec![stripe.as_str(), "hunter2hunter2"]);
+        // `DB_PASSWORD` is credential-shaped: length-exempt with case variants.
+        let password = &out.found[1];
+        assert!(password.length_exempt && password.case_variants);
+        let stripe_secret = &out.found[0];
+        assert!(!stripe_secret.length_exempt && stripe_secret.encoded_variants);
+    }
+
+    #[test]
+    fn narrow_json_members_redact_only_secret_shaped_keys() {
+        let table = table_with_placeholder(PH);
+        let key = ["k9Vt", "Qw2mZx8LpR4s"].concat();
+        let body = format!(
+            "{{\"name\": \"demo\", \"api_key\": \"{key}\", \"max_tokens\": 4096, \"version\": \"1.2.3\"}}\n  \"max_tokens\": 4096,\n"
+        );
+        let out = narrow(&table, &body);
+        assert!(!out.text.contains(&key), "{}", out.text);
+        assert!(out.text.contains("\"api_key\": \"[ph]\""), "{}", out.text);
+        assert!(out.text.contains("\"name\": \"demo\""), "{}", out.text);
+        assert!(out.text.contains("\"version\": \"1.2.3\""), "{}", out.text);
+        // A short count under a token-ish key is not a credential here.
+        assert!(out.text.contains("\"max_tokens\": 4096,\n"), "{}", out.text);
+        assert_eq!(found_values(&out), vec![key.as_str()]);
+    }
+
+    #[test]
+    fn narrow_mode_keeps_git_shas_uuids_digests_and_plain_assignments() {
+        let table = table_with_placeholder(PH);
+        let body = format!(
+            "commit {sha}\nHEAD={sha}\nid: 123e4567-e89b-42d3-a456-426614174000\nimage@sha256:{digest}\nRUST_LOG=debug\nDATABASE_HOST=db.internal.example\n{sha}  src/main.rs\n",
+            sha = git_sha(),
+            digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        );
+        let out = narrow(&table, &body);
+        assert_eq!(out.text, body);
+        assert!(out.found.is_empty());
+    }
+
+    #[test]
+    fn narrow_mode_redacts_pem_blocks_and_registers_block_and_lines() {
+        let table = table_with_placeholder(PH);
+        let line = "b3BlbnNzaC1rZXktdjEAAAAAbase64dataMoreBase64Data0123"; // pragma: allowlist secret
+        let body = format!(
+            "before\n-----BEGIN OPENSSH PRIVATE KEY-----\n{line}\n-----END OPENSSH PRIVATE KEY-----\nafter\n" // pragma: allowlist secret
+        );
+        let out = narrow(&table, &body);
+        assert_eq!(out.text, "before\n[ph]\nafter\n");
+        let values = found_values(&out);
+        assert!(values.contains(&line), "{:?}", out.found);
+        assert!(
+            values
+                .iter()
+                .any(|value| value.starts_with("-----BEGIN") && value.contains(line)),
+            "whole block registered: {:?}",
+            out.found
+        );
+    }
+
+    #[test]
+    fn narrow_mode_redacts_jwts_and_known_prefix_tokens() {
+        let table = table_with_placeholder(PH);
+        let body = format!(
+            "Authorization header was {jwt}\ntoken is {pat} and key {akid}\n",
+            jwt = jwt(),
+            pat = github_pat(),
+            akid = aws_access_key_id(),
+        );
+        let out = narrow(&table, &body);
+        assert_eq!(
+            out.text,
+            "Authorization header was [ph]\ntoken is [ph] and key [ph]\n"
+        );
+        let values = found_values(&out);
+        for expected in [jwt(), github_pat(), aws_access_key_id()] {
+            assert!(values.contains(&expected.as_str()), "{:?}", out.found);
+        }
+        assert!(out.found.iter().all(|secret| secret.length_exempt));
+    }
+
+    #[test]
+    fn narrow_mode_redacts_url_userinfo_passwords_and_registers_the_pair() {
+        let table = table_with_placeholder(PH);
+        let password = ["s3cr", "etPassw0rd"].concat();
+        let body = format!(
+            "DATABASE_URL=postgres://app:{password}@db.example:5432/app\nsee https://example.com/a:b@c and https://docs.rs/x\n"
+        );
+        let out = narrow(&table, &body);
+        assert_eq!(
+            out.text,
+            "DATABASE_URL=postgres://app:[ph]@db.example:5432/app\nsee https://example.com/a:b@c and https://docs.rs/x\n"
+        );
+        let registered = format!("app:{password}");
+        assert_eq!(found_values(&out), vec![registered.as_str()]);
+    }
+
+    #[test]
+    fn full_mode_is_unchanged_for_skill_bang_output() {
+        // Skill `!`-commands stay on the fail-closed Full mode: a standalone
+        // SHA is still redacted there, and the public wrapper is Full.
+        let table = table_with_placeholder(PH);
+        let full =
+            table.scrub_novel_command_output_secrets_with_mode(&git_sha(), NovelScrubMode::Full);
+        assert_eq!(full.text, "[ph]");
+        assert_eq!(
+            full.text,
+            table.scrub_novel_command_output_secrets(&git_sha())
+        );
+    }
+
+    #[test]
+    fn observed_values_register_so_later_and_encoded_echoes_are_scrubbed() {
+        use base64::Engine as _;
+        let table = table_with_placeholder(PH);
+        let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
+        let out = narrow(&table, &format!("STRIPE_SECRET_KEY={stripe}\n"));
+        let cfg = RedactConfig {
+            placeholder: PH.to_string(),
+            ..RedactConfig::default()
+        };
+        let updated = table
+            .with_observed_output_secrets(&cfg, &out.found)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(stripe.as_bytes());
+        let later = format!("echo {stripe} | base64 -> {encoded}; commit {}", git_sha());
+        let scrubbed = updated.scrub(&later);
+        assert!(!scrubbed.contains(&stripe), "{scrubbed}");
+        assert!(!scrubbed.contains(&encoded), "{scrubbed}");
+        assert!(scrubbed.contains(&git_sha()), "{scrubbed}");
+        // Observed values are persisted with the session table (not
+        // disk-derived origin-only markers).
+        let restored =
+            RedactionTable::from_persisted_json(&updated.to_persisted_json().unwrap()).unwrap();
+        assert!(!restored.scrub(&later).contains(&stripe));
+    }
+
+    #[test]
+    fn observed_values_below_the_floor_are_not_registered() {
+        let table = table_with_placeholder(PH);
+        // `API_TOKEN` is secret-shaped but not credential-shaped: a 5-byte
+        // value is redacted in place but never installed as a session-wide
+        // pattern (it would match unrelated output).
+        let out = narrow(&table, "API_TOKEN=abcde\n");
+        assert_eq!(out.text, "API_TOKEN=[ph]\n");
+        let cfg = RedactConfig::default();
+        let addition = table.observed_output_addition(&cfg, &out.found).unwrap();
+        assert!(addition.is_empty());
     }
 }

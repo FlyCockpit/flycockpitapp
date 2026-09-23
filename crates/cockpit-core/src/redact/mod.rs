@@ -85,6 +85,7 @@ impl std::fmt::Display for RedactionTableUnavailable {
 impl std::error::Error for RedactionTableUnavailable {}
 
 mod command_output;
+pub(crate) use command_output::{NovelScrubMode, NovelScrubOutput, ObservedSecret};
 pub(crate) mod coverage_authority;
 pub(crate) mod coverage_bindings;
 mod dotenv;
@@ -782,6 +783,14 @@ impl std::fmt::Debug for Candidate {
             .finish()
     }
 }
+
+/// Diagnostic origin of a value registered because a novel-secret output
+/// scrub replaced it in tool output (not disk-derived: the value itself is
+/// persisted with the session table so resume keeps covering it).
+const OBSERVED_OUTPUT_ORIGIN: &str = "$observed:command-output";
+
+/// Per-process sequence giving each observed value a distinct origin.
+static OBSERVED_OUTPUT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn origin_is_forced(origin: &str) -> bool {
     origin == "$denylist"
@@ -1722,6 +1731,73 @@ impl RedactionTable {
             Vec::new(),
             self.protected.clone(),
         )?;
+        self.union(&addition)
+    }
+
+    /// A table holding ONLY the entries for values a novel-secret output scrub
+    /// observed ([`Self::scrub_novel_command_output_secrets_with_mode`]),
+    /// pruned exactly like table-builder candidates (`min_secret_length`
+    /// unless length-exempt, never-scrub literals) and expanded with the
+    /// requested encoded / case variants. It inherits this table's
+    /// placeholder, opt-out and protected paths, but not its entries, so a
+    /// caller can scrub fresh output for just these values without applying
+    /// the whole session table early.
+    pub(crate) fn observed_output_addition(
+        &self,
+        cfg: &RedactConfig,
+        observed: &[ObservedSecret],
+    ) -> Result<Self> {
+        let mut entries: Vec<(String, String, OrdinarySource)> = Vec::new();
+        for secret in observed {
+            if is_pruned_candidate(&secret.value, cfg.min_secret_length, secret.length_exempt) {
+                continue;
+            }
+            let mut values = Vec::new();
+            if secret.encoded_variants {
+                values.extend(encoded_secret_variants(&secret.value));
+            }
+            if secret.case_variants {
+                values.extend(case_secret_variants(&secret.value));
+            }
+            values.push(secret.value.clone());
+            // Automatic registration never installs a filesystem path: the
+            // construction funnel drops EVERY entry of an origin when one of
+            // them names a protected / existing absolute path, so skip such a
+            // value here and give each observed value its own origin, keeping
+            // one path-shaped value from unregistering its siblings.
+            if values.iter().any(|value| {
+                self.protected.contains_value(value) || is_existing_absolute_path(value)
+            }) {
+                continue;
+            }
+            let origin = format!(
+                "{OBSERVED_OUTPUT_ORIGIN}#{}",
+                OBSERVED_OUTPUT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            for value in values {
+                entries.push((value, origin.clone(), OrdinarySource::Credential));
+            }
+        }
+        Self::from_entries(
+            entries,
+            self.placeholder.clone(),
+            self.disabled,
+            Vec::new(),
+            self.protected.clone(),
+        )
+    }
+
+    /// Union the values a novel-secret output scrub observed into this table
+    /// (see [`Self::observed_output_addition`]). Later echoes of the same
+    /// value — including base64 / hex / URL encodings — are then scrubbed by
+    /// the ordinary table pass everywhere, not only where the original shape
+    /// survives.
+    pub(crate) fn with_observed_output_secrets(
+        &self,
+        cfg: &RedactConfig,
+        observed: &[ObservedSecret],
+    ) -> Result<Self> {
+        let addition = self.observed_output_addition(cfg, observed)?;
         self.union(&addition)
     }
 

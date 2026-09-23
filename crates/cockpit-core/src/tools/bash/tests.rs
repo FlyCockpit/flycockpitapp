@@ -171,6 +171,61 @@ async fn bash_output_secret_straddling_truncation_boundary_is_redacted() {
     );
 }
 
+// Secrets I2: `cat` of another project's `.env` reaches the model with the
+// secret-keyed value replaced (the table has never seen it), the value is
+// registered so a later echo is table-scrubbed, and ordinary assignments,
+// git SHAs and UUIDs are untouched.
+#[tokio::test]
+async fn bash_cat_of_unregistered_dotenv_is_scrubbed_and_registered() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("other")).unwrap();
+    let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
+    let sha = ["0d1a4b2c8e3f60718293", "a4b5c6d7e8f9a0b1c2d3"].concat();
+    let uuid = "123e4567-e89b-42d3-a456-426614174000";
+    std::fs::write(
+        tmp.path().join("other").join(".env"),
+        format!(
+            "NODE_ENV=production\nSTRIPE_SECRET_KEY={stripe}\nBUILD_SHA={sha}\nREQUEST_ID={uuid}\n"
+        ),
+    )
+    .unwrap();
+    let command = "cat other/.env";
+    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+
+    let output = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+
+    assert!(!output.content.contains(&stripe), "{}", output.content);
+    assert!(
+        output.content.contains("STRIPE_SECRET_KEY=")
+            && output.content.contains(ctx.redact.placeholder()),
+        "{}",
+        output.content
+    );
+    assert!(
+        output.content.contains("NODE_ENV=production"),
+        "{}",
+        output.content
+    );
+    assert!(output.content.contains(&sha), "{}", output.content);
+    assert!(output.content.contains(uuid), "{}", output.content);
+    if let Some(sidecar) = output.output_sidecar.as_ref() {
+        assert!(!sidecar.payload.to_string().contains(&stripe));
+    }
+
+    let persisted = ctx
+        .session
+        .persisted_redaction_table()
+        .unwrap()
+        .expect("observed value persisted with the session table");
+    let later = format!("deploy used {stripe} again");
+    assert!(!persisted.scrub(&later).contains(&stripe));
+}
+
 #[tokio::test]
 async fn bash_untruncated_output_carries_no_text_artifact_capture() {
     let tmp = tempfile::tempdir().unwrap();

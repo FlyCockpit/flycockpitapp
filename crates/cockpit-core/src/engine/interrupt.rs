@@ -1745,6 +1745,29 @@ impl InterruptHub {
         Ok(Some(table))
     }
 
+    /// Register values a novel-secret output scrub replaced in tool output
+    /// (bash, custom tools, background jobs) in the worker's live redaction
+    /// table, so later echoes of the same value elsewhere — in other encodings
+    /// included — are table-scrubbed. Same serialization and fail-closed
+    /// ordering as [`Self::register_approved_secret_file`]: latest table under
+    /// the write lock, union, persist, then swap. Detached hubs return `None`.
+    pub(crate) async fn register_observed_output_secrets(
+        &self,
+        session: &crate::session::Session,
+        cfg: &crate::config::extended::RedactConfig,
+        observed: &[crate::redact::ObservedSecret],
+    ) -> anyhow::Result<Option<Arc<crate::redact::RedactionTable>>> {
+        let Some(redaction) = &self.redaction else {
+            return Ok(None);
+        };
+        let _guard = self.redaction_table_write_lock.lock().await;
+        let table = current_redaction(redaction).with_observed_output_secrets(cfg, observed)?;
+        let table = Arc::new(table);
+        session.persist_redaction_table(&table)?;
+        set_current_redaction(redaction, table.clone());
+        Ok(Some(table))
+    }
+
     /// Union a freshly-built disk-scan table onto the session's LIVE redaction
     /// table under the serialized write lock, persisting the result BEFORE it is
     /// swapped live, and return the committed table.

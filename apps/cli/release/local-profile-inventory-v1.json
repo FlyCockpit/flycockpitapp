@@ -16,6 +16,5 @@
     "sync_flycockpit_org_policy",
     "enroll_flycockpit_org_sync",
     "upsert_provider_config"
-  ],
-  "remoteSchemaExtension": "0001_remote_profile.sql"
+  ]
 }

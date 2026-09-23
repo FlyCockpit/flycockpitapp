@@ -356,7 +356,7 @@ pub(super) async fn fork_session(
     }
     Ok(Response::Forked {
         session_id: row.session_id,
-        short_id: row.short_id.unwrap_or_default(),
+        short_id: row.short_id,
         parent_session_id,
         fork_point_turn_id,
     })
@@ -366,7 +366,7 @@ pub(super) fn btw_info_to_proto(info: crate::db::sessions::BtwForkInfo) -> proto
     proto::BtwForkInfo {
         session_id: info.session_id,
         parent_session_id: info.parent_session_id,
-        short_id: info.short_id,
+        short_id: Some(info.short_id),
         tangent: info.tangent,
         created_at: info.created_at_unix_ms,
         message_count: info.message_count,

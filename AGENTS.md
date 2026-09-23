@@ -56,6 +56,7 @@ Rules that follow from the graph:
 - `cockpit doctor` is read-only inspection: it must not require workspace trust, must not auto-promote an ephemeral daemon to persistent, and must not open SQLite in the CLI process. The hidden `daemon diagnostic-snapshot` worker is the only permitted SQLite-owning diagnostic path.
 - Do not stub diagnostics (`"unavailable"`, `"unresolved"`, empty sections) to keep a target compiling. Inspect, or fail closed with a real error.
 - Do not bind or publish the daemon socket until boot (database/config) has completed. Clients that see a socket expect a hello promptly.
+- The local SQLite schema is one unconditional migration, `crates/cockpit-db/src/db/migrations/0001_initial.sql`, applied identically by every build. Pre-launch, fold schema changes into that file (base, extended-domain, and remote-domain sections); do not add `0002_*` until the #305 launch freeze. The `remote`/`extended` Cargo features gate code only, never DDL: tables in the domain sections are created everywhere and touched only by feature-gated code (`crates/cockpit-db/schema-ownership.toml` `launch_profile` records the owner).
 
 ### Wire protocol (prerelease)
 

@@ -35,7 +35,7 @@ pub struct SearchHit {
     /// Owning workspace identity, used by the history-scope consent gate
     /// before a cross-workspace result is exposed.
     pub project_id: String,
-    pub short_id: Option<String>,
+    pub short_id: String,
     pub title: Option<String>,
     /// `last_active_at_unix_ms` — the human-date source + recency
     /// tiebreaker.
@@ -671,7 +671,7 @@ fn search_candidates_inner(
                 Ok((
                     sid,
                     row.get::<_, String>("project_id")?,
-                    row.get::<_, Option<String>>("short_id")?,
+                    row.get::<_, String>("short_id")?,
                     row.get::<_, Option<String>>("title")?,
                     row.get::<_, i64>("last_active_at_unix_ms")?,
                     row.get::<_, Option<String>>("body")?,
@@ -802,7 +802,7 @@ fn search_candidates_in_sessions_inner(
                     Ok((
                         sid,
                         row.get::<_, String>("project_id")?,
-                        row.get::<_, Option<String>>("short_id")?,
+                        row.get::<_, String>("short_id")?,
                         row.get::<_, Option<String>>("title")?,
                         row.get::<_, i64>("last_active_at_unix_ms")?,
                         row.get::<_, Option<String>>("body")?,

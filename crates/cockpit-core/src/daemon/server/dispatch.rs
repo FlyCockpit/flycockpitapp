@@ -7555,7 +7555,7 @@ async fn handle_serialized_request_impl(
                     roots.push(proto::CodeRootSummaryV1 {
                         root_id: proto::CodeRootIdV1(row.session_id),
                         title: row.title,
-                        short_id: row.short_id.unwrap_or_default(),
+                        short_id: row.short_id,
                         workspace_path: row.project_root,
                         last_active_at_unix_ms: row.last_active_at_unix_ms,
                         lifecycle,
@@ -15543,7 +15543,6 @@ async fn handle_serialized_request_impl(
                 let response = ctx
                     .db
                     .transaction(move |conn| {
-                        cockpit_db::secret_vault::ensure_inventory_generation_conn(conn)?;
                         let consumed_vault_generation =
                             cockpit_db::secret_vault::inventory_generation_conn(conn)?;
                         let changed = match vault.get_item_on_conn(
@@ -30496,7 +30495,7 @@ async fn code_root_read_snapshot(
         root_id,
         workspace_path: row.project_root,
         title: row.title,
-        short_id: row.short_id.unwrap_or_default(),
+        short_id: row.short_id,
         project_id: row.project_id,
         active_agent,
         active_agent_path: foreground.active_agent_path,

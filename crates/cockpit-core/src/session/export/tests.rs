@@ -3424,7 +3424,7 @@ async fn resolve_unknown_short_id_is_usage_error() {
 async fn resolve_accepts_uuid_and_short_id() {
     let db = Db::open_in_memory().unwrap();
     let s = create_test_session(&db, "p", "/x", "builder").await;
-    let short = s.short_id.clone().unwrap();
+    let short = s.short_id.clone();
     // By short id.
     assert_eq!(
         resolve_session(&db, &short)
@@ -3496,7 +3496,7 @@ async fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     assert_eq!(manifest["session_count"], 1);
     assert_eq!(
         manifest["target"]["short_id"],
-        json!(target.short_id.clone().unwrap())
+        json!(target.short_id.clone())
     );
 }
 

@@ -351,8 +351,8 @@ pub struct SessionRow {
     /// sessions and for historical rows.
     pub assistant_name: Option<String>,
     /// 6-char display id, unique within `project_id`. Every session creator
-    /// generates it at insert time.
-    pub short_id: Option<String>,
+    /// generates it at insert time; the column is `NOT NULL`.
+    pub short_id: String,
     /// Parent session in the fork tree. NULL = root session (GOALS §17e).
     pub parent_session_id: Option<Uuid>,
     /// Turn id in the parent at which this fork branched off. NULL for
@@ -443,7 +443,7 @@ pub struct SessionRow {
 pub struct BtwForkInfo {
     pub session_id: Uuid,
     pub parent_session_id: Uuid,
-    pub short_id: Option<String>,
+    pub short_id: String,
     pub tangent: bool,
     pub created_at_unix_ms: i64,
     pub message_count: u32,
@@ -791,10 +791,7 @@ fn is_short_id_collision(conn: &Connection, err: &rusqlite::Error, row: &Session
     if !is_constraint_violation(err) {
         return false;
     }
-    row.short_id
-        .as_deref()
-        .and_then(|short_id| short_id_exists(conn, &row.project_id, short_id).ok())
-        .unwrap_or(false)
+    short_id_exists(conn, &row.project_id, &row.short_id).unwrap_or(false)
 }
 
 fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
@@ -858,7 +855,7 @@ fn insert_session_row_with_short_id_retry(
                 if attempt == 15 {
                     return Err(short_id_exhausted());
                 }
-                row.short_id = Some(generate_unique_short_id(conn, &row.project_id)?);
+                row.short_id = generate_unique_short_id(conn, &row.project_id)?;
             }
             Err(err) => return Err(err),
         }
@@ -969,7 +966,7 @@ fn insert_fork_row_with_short_id_retry(
                 if attempt == 15 {
                     return Err(short_id_exhausted());
                 }
-                row.short_id = Some(generate_unique_short_id(conn, &row.project_id)?);
+                row.short_id = generate_unique_short_id(conn, &row.project_id)?;
             }
             Err(err) => return Err(err),
         }
@@ -1007,7 +1004,7 @@ fn build_session_row(
     project_id: &str,
     project_root: &str,
     active_agent: &str,
-    short_id: Option<String>,
+    short_id: String,
     assistant_name: Option<String>,
 ) -> SessionRow {
     let session_id = Uuid::new_v4();
@@ -2012,7 +2009,7 @@ impl Db {
         active_agent: &str,
         short_id: String,
     ) -> SessionRow {
-        build_session_row(project_id, project_root, active_agent, Some(short_id), None)
+        build_session_row(project_id, project_root, active_agent, short_id, None)
     }
 
     /// Insert an assistant `sessions` row **without** redaction-table vault
@@ -2096,7 +2093,7 @@ impl Db {
             project_id,
             project_root,
             active_agent,
-            Some(short_id),
+            short_id,
             Some(assistant_name.to_string()),
         );
         // Assistant creation is a distinct immutable session setup. Do not
@@ -2353,7 +2350,7 @@ impl Db {
             active_agent: parent.active_agent,
             pending_remote_agent_selection: None,
             assistant_name: parent.assistant_name,
-            short_id: Some(short_id),
+            short_id,
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: None,
             is_assistant_thread: false,
@@ -2573,7 +2570,7 @@ impl Db {
             active_agent: parent.active_agent,
             pending_remote_agent_selection: None,
             assistant_name: parent.assistant_name,
-            short_id: Some(short_id),
+            short_id,
             parent_session_id: Some(parent_session_id),
             fork_point_turn_id: fork_point_turn_id.clone(),
             is_assistant_thread: fresh_thread,
@@ -2766,7 +2763,7 @@ impl Db {
             active_agent: predecessor.active_agent.clone(),
             pending_remote_agent_selection: None,
             assistant_name: predecessor.assistant_name.clone(),
-            short_id: Some(short_id),
+            short_id,
             parent_session_id: None,
             fork_point_turn_id: None,
             is_assistant_thread: predecessor.is_assistant_thread,
@@ -4732,7 +4729,7 @@ impl Db {
         Ok(crate::db::wire::SessionSummary {
             session_id: row.session_id,
             session_entry_mode: row.session_entry_mode,
-            short_id: row.short_id,
+            short_id: Some(row.short_id),
             project_root: row.project_root,
             project_id: row.project_id,
             started_at_unix_ms: row.started_at_unix_ms,
@@ -5565,7 +5562,7 @@ mod tests {
         // + short_id but writes nothing; inserting it makes it queryable.
         let db = Db::open_in_memory().unwrap();
         let row = db.new_session_row("p", "/x", "builder").await.unwrap();
-        assert!(row.short_id.is_some());
+        assert!(!row.short_id.is_empty());
         assert!(db.get_session(row.session_id).await.unwrap().is_none());
         assert!(db.list_sessions(false, 100).await.unwrap().is_empty());
         db.insert_session_row_without_redaction_custody(&row)
@@ -5754,7 +5751,7 @@ mod tests {
     async fn create_session_populates_short_id() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").await.unwrap();
-        let sid = s.short_id.expect("short_id missing");
+        let sid = s.short_id;
         assert_eq!(sid.len(), SHORT_ID_LEN);
         assert!(sid.chars().all(|c| CROCKFORD_BASE32.contains(&(c as u8))));
         let by_short = db
@@ -5771,7 +5768,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
             let s = db.create_session("p", "/x", "a").await.unwrap();
-            assert!(seen.insert(s.short_id.unwrap()));
+            assert!(seen.insert(s.short_id));
         }
     }
 
@@ -5780,19 +5777,18 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         set_test_short_ids(&db, &["aaaaaa"]).await;
         let first = db.create_session("p", "/x", "a").await.unwrap();
-        assert_eq!(first.short_id.as_deref(), Some("aaaaaa"));
+        assert_eq!(first.short_id, "aaaaaa");
 
         set_test_short_ids(&db, &["aaaaaa", "bbbbbb"]).await;
         let second = db.create_session("p", "/x", "a").await.unwrap();
-        assert_eq!(second.short_id.as_deref(), Some("bbbbbb"));
+        assert_eq!(second.short_id, "bbbbbb");
         assert_eq!(
             db.get_session(second.session_id)
                 .await
                 .unwrap()
                 .unwrap()
-                .short_id
-                .as_deref(),
-            Some("bbbbbb")
+                .short_id,
+            "bbbbbb"
         );
     }
 
@@ -5801,20 +5797,20 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         set_test_short_ids(&db, &["aaaaaa"]).await;
         let row = db.new_session_row("p", "/x", "a").await.unwrap();
-        assert_eq!(row.short_id.as_deref(), Some("aaaaaa"));
+        assert_eq!(row.short_id, "aaaaaa");
 
         set_test_short_ids(&db, &["aaaaaa"]).await;
         let competing = db.create_session("p", "/x", "a").await.unwrap();
-        assert_eq!(competing.short_id.as_deref(), Some("aaaaaa"));
+        assert_eq!(competing.short_id, "aaaaaa");
 
         set_test_short_ids(&db, &["bbbbbb"]).await;
         let inserted = db
             .insert_session_row_without_redaction_custody(&row)
             .await
             .unwrap();
-        assert_eq!(inserted.short_id.as_deref(), Some("bbbbbb"));
+        assert_eq!(inserted.short_id, "bbbbbb");
         let got = db.get_session(row.session_id).await.unwrap().unwrap();
-        assert_eq!(got.short_id.as_deref(), Some("bbbbbb"));
+        assert_eq!(got.short_id, "bbbbbb");
     }
 
     #[tokio::test]
@@ -5825,15 +5821,14 @@ mod tests {
 
         set_test_short_ids(&db, &["aaaaaa", "bbbbbb"]).await;
         let fork = db.create_fork(parent.session_id, None).await.unwrap();
-        assert_eq!(fork.short_id.as_deref(), Some("bbbbbb"));
+        assert_eq!(fork.short_id, "bbbbbb");
         assert_eq!(
             db.get_session(fork.session_id)
                 .await
                 .unwrap()
                 .unwrap()
-                .short_id
-                .as_deref(),
-            Some("bbbbbb")
+                .short_id,
+            "bbbbbb"
         );
     }
 

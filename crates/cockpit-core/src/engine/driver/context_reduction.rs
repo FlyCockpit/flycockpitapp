@@ -2146,10 +2146,7 @@ impl Driver {
                 ));
             }
         };
-        let successor_short_id = successor_row
-            .short_id
-            .clone()
-            .unwrap_or_else(|| successor_row.session_id.to_string());
+        let successor_short_id = successor_row.short_id.clone();
 
         self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
         self.drop_stale_owner_ledgers().await;

@@ -1840,7 +1840,7 @@ mod tests {
         let imported = import_archive(&db, archive, false).await.unwrap();
         assert_ne!(imported.imported[0], id);
         let restored = db.get_session(imported.imported[0]).await.unwrap().unwrap();
-        assert_eq!(restored.short_id.as_deref(), Some("ab3def"));
+        assert_eq!(restored.short_id, "ab3def");
         let events = db.list_session_events(imported.imported[0]).await.unwrap();
         assert!(events.iter().any(|event| event.kind == "notice"
             && event.data["original_session_id"] == id.to_string()
@@ -2067,7 +2067,7 @@ mod tests {
         );
         assert_eq!(restored.ended_at_unix_ms, Some(777));
         assert_eq!(restored.title.as_deref(), Some("Restored title"));
-        assert_eq!(restored.short_id.as_deref(), Some("ch1d23"));
+        assert_eq!(restored.short_id, "ch1d23");
         assert_eq!(restored.provider.as_deref(), Some("test-provider"));
         assert_eq!(restored.model.as_deref(), Some("test-model"));
         assert_eq!(

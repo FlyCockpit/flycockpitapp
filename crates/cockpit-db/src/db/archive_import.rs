@@ -457,7 +457,7 @@ fn import_session_archive_graph_conn(
                     |row| row.get(0),
                 )?;
                 if exists == 0 {
-                    row.short_id = Some(short_id);
+                    row.short_id = short_id;
                 }
             }
             if let (Some(parent_source_id), Some(fork_point_turn_id)) =

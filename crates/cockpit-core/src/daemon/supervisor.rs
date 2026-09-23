@@ -505,7 +505,7 @@ fn inherited_reexec_state() -> Result<Option<ReexecState>> {
 
 pub(crate) fn published_owner_pid(paths: &DaemonPaths) -> u32 {
     if is_worker_process()
-        && let Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt)) =
+        && let Some(receipt) =
             cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file)
     {
         return receipt.pid;
@@ -744,8 +744,6 @@ pub fn admin_socket(paths: &DaemonPaths) -> Result<PathBuf> {
 
 #[cfg(any(unix, windows))]
 pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool) -> Result<()> {
-    #[cfg(unix)]
-    use cockpit_host::daemon_lifecycle::DaemonPidRecord;
     use cockpit_host::daemon_lifecycle::{ForegroundMetadataGuard, reclaim_stale_and_reserve};
 
     super::validate_bind_socket_paths(&paths)?;
@@ -778,11 +776,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
         {
             let receipt =
                 match cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file) {
-                    Some(DaemonPidRecord::Receipt(receipt))
-                        if receipt.pid == std::process::id() =>
-                    {
-                        receipt
-                    }
+                    Some(receipt) if receipt.pid == std::process::id() => receipt,
                     _ => bail!("supervisor receipt changed during reexec"),
                 };
             // SAFETY: these descriptors were exported by this same process
@@ -2461,9 +2455,7 @@ fn publish_generation(
     };
     cockpit_host::daemon_lifecycle::with_lifecycle_lock(&paths.pid_file, || {
         if cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file)
-            != Some(cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(
-                receipt.clone(),
-            ))
+            != Some(receipt.clone())
         {
             bail!("supervisor receipt changed before generation publication");
         }
@@ -3033,17 +3025,41 @@ pub async fn request(paths: &DaemonPaths, command: AdminCommand) -> Result<Admin
     serde_json::from_slice(&line).context("decoding supervisor admin response")
 }
 
+/// [`request`] bounded by `timeout` end to end (connect, write, and reading
+/// the response). A supervisor that accepts the connection but never answers
+/// — for example a wedged or foreign process holding the admin endpoint —
+/// yields an error once the budget elapses instead of hanging the caller.
+pub async fn request_with_timeout(
+    paths: &DaemonPaths,
+    command: AdminCommand,
+    timeout: Duration,
+) -> Result<AdminResponse> {
+    tokio::time::timeout(timeout, request(paths, command))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "supervisor admin request did not complete within {}ms",
+                timeout.as_millis()
+            )
+        })?
+}
+
 /// Synchronous compatibility entry point for lifecycle callers that predate
-/// the async admin protocol. The runtime lives on a dedicated thread so this
+/// the async admin protocol, bounded by `timeout` like
+/// [`request_with_timeout`]. The runtime lives on a dedicated thread so this
 /// remains safe when called from a current-thread Tokio executor.
-pub fn request_blocking(paths: &DaemonPaths, command: AdminCommand) -> Result<AdminResponse> {
+pub fn request_blocking(
+    paths: &DaemonPaths,
+    command: AdminCommand,
+    timeout: Duration,
+) -> Result<AdminResponse> {
     let paths = paths.clone();
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("building supervisor admin runtime")?
-            .block_on(request(&paths, command))
+            .block_on(request_with_timeout(&paths, command, timeout))
     })
     .join()
     .map_err(|_| anyhow::anyhow!("supervisor admin request thread panicked"))?

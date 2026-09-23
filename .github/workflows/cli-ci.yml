@@ -25,6 +25,7 @@ name: CLI CI
       - "scripts/check-feature-gated-test-coverage.sh"
       - "scripts/check-tenant-authority-acceptance-manifest.sh"
       - "scripts/check-no-source-scan-tests.sh"
+      - "scripts/check-single-daemon-proto-fixture-version.sh"
       - "scripts/lib/check_no_source_scan_tests.py"
       - "scripts/fixtures/no-source-scan-tests/**"
       - ".github/workflows/cli-ci.yml"
@@ -49,6 +50,7 @@ name: CLI CI
       - "scripts/check-feature-gated-test-coverage.sh"
       - "scripts/check-tenant-authority-acceptance-manifest.sh"
       - "scripts/check-no-source-scan-tests.sh"
+      - "scripts/check-single-daemon-proto-fixture-version.sh"
       - "scripts/lib/check_no_source_scan_tests.py"
       - "scripts/fixtures/no-source-scan-tests/**"
       - ".github/workflows/cli-ci.yml"
@@ -203,6 +205,9 @@ jobs:
 
       - name: Check Code-root constructor inventory
         run: bash scripts/check-code-root-constructors.sh
+
+      - name: Check single daemon protocol fixture version
+        run: bash scripts/check-single-daemon-proto-fixture-version.sh
 
       # Vault-open guardrail (issue #306): no CI job or hook ran this before;
       # it is now part of the serialized Rust gate on every leg.

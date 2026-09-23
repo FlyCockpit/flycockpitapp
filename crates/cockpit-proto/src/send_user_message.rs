@@ -13,11 +13,11 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 pub const FCM2_MAGIC: [u8; 4] = *b"FCM2";
-pub const FCM2_SCHEMA_VERSION: u8 = 4;
+pub const FCM2_SCHEMA_VERSION: u8 = 1;
 /// Closed outer allocation bound for an FCM2 envelope.  This deliberately
 /// leaves 128 KiB of prerelease headroom above the largest encoding accepted
 /// by the current field limits; it is not a field-level budget.
-pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 17_439_564;
+pub const MAX_CANONICAL_SEND_USER_MESSAGE_BYTES: usize = 17_439_564;
 pub const MAX_MESSAGE_TEXT_BYTES: usize = 8_388_608;
 pub const MAX_MESSAGE_TEXT_SCALARS: usize = 8_388_608;
 /// The exact largest encoding admitted by the current FCM2 field layout.
@@ -27,7 +27,9 @@ pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
 pub const MAX_QUEUE_TARGET_ID_BYTES: usize = 4096;
 pub const MAX_QUEUE_TARGET_AGENT_BYTES: usize = 1024;
 pub const MAX_QUEUE_TARGET_TASK_CALL_ID_BYTES: usize = 4096;
-const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v2\0";
+/// Hash domain of [`CanonicalSendUserMessage::message_request_digest`]
+/// (mirrored by the TypeScript `send-user-message.ts` digest).
+pub const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v1\0";
 const ATTACHMENT_SET_DIGEST_DOMAIN: &[u8] = b"flycockpit-message-attachment-set-v1\0";
 
 /// Canonical media-kind discriminant. This is the sole kind enum across
@@ -77,7 +79,7 @@ impl From<MessageTagExpansion> for crate::TagExpansionMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SendUserMessageV2 {
+pub struct SendUserMessage {
     pub client_submission_id: Uuid,
     /// Required provenance, bound into canonical bytes and replay identity.
     pub origin: crate::UserMessageOrigin,
@@ -93,7 +95,7 @@ pub struct SendUserMessageV2 {
     pub attachments: Vec<MessageAttachmentIdentity>,
 }
 
-impl SendUserMessageV2 {
+impl SendUserMessage {
     /// Ergonomic text-only constructor for CLI/TUI and tests.
     pub fn text_only(client_submission_id: Uuid, text: impl Into<String>) -> Self {
         Self {
@@ -112,12 +114,12 @@ impl SendUserMessageV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalSendUserMessageV2 {
+pub struct CanonicalSendUserMessage {
     pub session_id: Uuid,
     pub canonical_project_digest: [u8; 32],
     pub model_config_generation: u64,
     pub canonical_model_digest: [u8; 32],
-    pub request: SendUserMessageV2,
+    pub request: SendUserMessage,
 }
 
 /// Local-owner direct ingress adapter. Only an authenticated daemon-local
@@ -130,7 +132,7 @@ pub struct CanonicalSendUserMessageV2 {
 /// acceptance; it is replay-neutral and stays outside FCM2. `run_invocation_options`
 /// is local/CLI-oriented only and is never carried by the remote envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalOwnerDirectSendUserMessageV2 {
+pub struct LocalOwnerDirectSendUserMessage {
     pub operation_id: Uuid,
     pub session_locator: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,7 +141,7 @@ pub struct LocalOwnerDirectSendUserMessageV2 {
     pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_invocation_options: Option<crate::RunInvocationOptions>,
-    pub request: SendUserMessageV2,
+    pub request: SendUserMessage,
 }
 
 /// Authenticated remote ingress adapter. A bound authenticated remote
@@ -148,27 +150,27 @@ pub struct LocalOwnerDirectSendUserMessageV2 {
 /// `RemoteOperationIdentityV1`), not here; this envelope carries no
 /// `operation_id` and no `run_invocation_options`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthenticatedRemoteOperationEnvelopeV2 {
+pub struct AuthenticatedRemoteOperationEnvelope {
     pub session_locator: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_model_state_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
-    pub request: SendUserMessageV2,
+    pub request: SendUserMessage,
 }
 
-/// Internally-tagged V2 ingress envelope. `Request::SendUserMessageV2` carries
+/// Internally-tagged user-message ingress envelope. `Request::SendUserMessage` carries
 /// exactly this as `ingress`. The `ingress` discriminator selects
 /// `local_owner_direct` or `authenticated_remote_operation`; the two branches
 /// are non-substitutable (Owner/direct vs. bound authenticated remote).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "ingress", rename_all = "snake_case")]
-pub enum MessageIngressV2 {
-    LocalOwnerDirect(LocalOwnerDirectSendUserMessageV2),
-    AuthenticatedRemoteOperation(AuthenticatedRemoteOperationEnvelopeV2),
+pub enum MessageIngress {
+    LocalOwnerDirect(LocalOwnerDirectSendUserMessage),
+    AuthenticatedRemoteOperation(AuthenticatedRemoteOperationEnvelope),
 }
 
-impl MessageIngressV2 {
+impl MessageIngress {
     /// Ergonomic local-direct constructor for CLI/TUI and tests.
     pub fn local_direct(
         operation_id: Uuid,
@@ -176,9 +178,9 @@ impl MessageIngressV2 {
         expected_model_state_generation: Option<u64>,
         expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
         run_invocation_options: Option<crate::RunInvocationOptions>,
-        request: SendUserMessageV2,
+        request: SendUserMessage,
     ) -> Self {
-        Self::LocalOwnerDirect(LocalOwnerDirectSendUserMessageV2 {
+        Self::LocalOwnerDirect(LocalOwnerDirectSendUserMessage {
             operation_id,
             session_locator: session_locator.into(),
             expected_model_state_generation,
@@ -188,14 +190,14 @@ impl MessageIngressV2 {
         })
     }
 
-    pub fn as_local_direct(&self) -> Option<&LocalOwnerDirectSendUserMessageV2> {
+    pub fn as_local_direct(&self) -> Option<&LocalOwnerDirectSendUserMessage> {
         match self {
             Self::LocalOwnerDirect(inner) => Some(inner),
             _ => None,
         }
     }
 
-    pub fn as_authenticated_remote(&self) -> Option<&AuthenticatedRemoteOperationEnvelopeV2> {
+    pub fn as_authenticated_remote(&self) -> Option<&AuthenticatedRemoteOperationEnvelope> {
         match self {
             Self::AuthenticatedRemoteOperation(inner) => Some(inner),
             _ => None,
@@ -209,7 +211,7 @@ impl MessageIngressV2 {
         }
     }
 
-    pub fn request(&self) -> &SendUserMessageV2 {
+    pub fn request(&self) -> &SendUserMessage {
         match self {
             Self::LocalOwnerDirect(inner) => &inner.request,
             Self::AuthenticatedRemoteOperation(inner) => &inner.request,
@@ -250,7 +252,7 @@ pub struct ValidatedMessageIngress {
     pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     /// Local-direct only; always `None` for authenticated remote ingress.
     pub run_invocation_options: Option<crate::RunInvocationOptions>,
-    pub command: SendUserMessageV2,
+    pub command: SendUserMessage,
     pub provenance: MessageIngressProvenance,
 }
 
@@ -271,7 +273,7 @@ fn validate_ingress(
     expected_model_state_generation: Option<u64>,
     expected_model: Option<&cockpit_config::config::providers::ActiveModelRef>,
     run_invocation_options: Option<&crate::RunInvocationOptions>,
-    command: SendUserMessageV2,
+    command: SendUserMessage,
     provenance: MessageIngressProvenance,
 ) -> Result<ValidatedMessageIngress> {
     ensure!(
@@ -340,7 +342,7 @@ fn validate_ingress(
     })
 }
 
-impl LocalOwnerDirectSendUserMessageV2 {
+impl LocalOwnerDirectSendUserMessage {
     /// Validate with the transport `Body::Request.id` (not carried in the
     /// adapter struct). The durable `operation_id` is the adapter field.
     pub fn into_validated(self, request_id: Uuid) -> Result<ValidatedMessageIngress> {
@@ -357,7 +359,7 @@ impl LocalOwnerDirectSendUserMessageV2 {
     }
 }
 
-impl AuthenticatedRemoteOperationEnvelopeV2 {
+impl AuthenticatedRemoteOperationEnvelope {
     /// Validate with the transport `Body::Request.id` and the durable
     /// `operation_id` from `Body.operation` (neither is carried in the
     /// adapter struct), plus the verified remote actor binding.
@@ -396,7 +398,7 @@ pub fn has_message_text(text: &str) -> bool {
 /// Checks the outer allocation bound before a decoder allocates any field.
 pub fn validate_fcm2_length(length: usize) -> Result<()> {
     ensure!(
-        length <= MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+        length <= MAX_CANONICAL_SEND_USER_MESSAGE_BYTES,
         "FCM2 exceeds maximum size"
     );
     Ok(())
@@ -414,7 +416,7 @@ fn validate_text(value: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-impl CanonicalSendUserMessageV2 {
+impl CanonicalSendUserMessage {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.request.origin == crate::UserMessageOrigin::ExternalRoot,
@@ -547,7 +549,7 @@ impl CanonicalSendUserMessageV2 {
             out.push(item.kind.code());
         }
         ensure!(
-            out.len() <= MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+            out.len() <= MAX_CANONICAL_SEND_USER_MESSAGE_BYTES,
             "FCM2 exceeds maximum size"
         );
         Ok(out)
@@ -633,7 +635,7 @@ impl CanonicalSendUserMessageV2 {
             canonical_project_digest,
             model_config_generation,
             canonical_model_digest,
-            request: SendUserMessageV2 {
+            request: SendUserMessage {
                 client_submission_id,
                 origin,
                 text,

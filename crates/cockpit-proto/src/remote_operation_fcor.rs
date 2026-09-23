@@ -5,12 +5,13 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
-use crate::send_user_message_v2::MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES;
+/// Single definition lives with the FCM2 codec; re-exported for FCOR users.
+pub use crate::send_user_message::FCM2_MAGIC;
+use crate::send_user_message::MAX_CANONICAL_SEND_USER_MESSAGE_BYTES;
 
 pub const FCOR_MAGIC: [u8; 4] = *b"FCOR";
 pub const FCOR_SCHEMA_VERSION: u8 = 1;
 pub const MAX_FCOR_V1_BYTES: u64 = u32::MAX as u64;
-pub const FCM2_MAGIC: [u8; 4] = *b"FCM2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalParamErrorCode {
@@ -62,11 +63,11 @@ pub struct OpaqueCanonicalParamsRegistrationV1 {
     pub owner: &'static str,
 }
 
-pub const SEND_USER_MESSAGE_V2_REGISTRATION: OpaqueCanonicalParamsRegistrationV1 =
+pub const SEND_USER_MESSAGE_REGISTRATION: OpaqueCanonicalParamsRegistrationV1 =
     OpaqueCanonicalParamsRegistrationV1 {
         request_kind: "send_user_message",
         magic: FCM2_MAGIC,
-        maximum_bytes: MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+        maximum_bytes: MAX_CANONICAL_SEND_USER_MESSAGE_BYTES,
         owner: "message-attachment-protocol-foundation",
     };
 
@@ -76,7 +77,7 @@ pub fn validate_registered_opaque_params(
     decoder: &dyn OpaqueCanonicalParamsDecoder,
 ) -> Result<()> {
     ensure!(
-        registration == SEND_USER_MESSAGE_V2_REGISTRATION,
+        registration == SEND_USER_MESSAGE_REGISTRATION,
         "unknown opaque canonical parameter registration"
     );
     ensure!(
@@ -2176,7 +2177,7 @@ mod tests {
         }
         let opaque = b"FCM2foundation-owned";
         validate_registered_opaque_params(
-            SEND_USER_MESSAGE_V2_REGISTRATION,
+            SEND_USER_MESSAGE_REGISTRATION,
             opaque,
             &FoundationDecoder,
         )
@@ -2190,7 +2191,7 @@ mod tests {
             validate_registered_opaque_params(
                 OpaqueCanonicalParamsRegistrationV1 {
                     request_kind: "other",
-                    ..SEND_USER_MESSAGE_V2_REGISTRATION
+                    ..SEND_USER_MESSAGE_REGISTRATION
                 },
                 opaque,
                 &FoundationDecoder,
@@ -2208,7 +2209,7 @@ mod tests {
         }
         assert!(
             validate_registered_opaque_params(
-                SEND_USER_MESSAGE_V2_REGISTRATION,
+                SEND_USER_MESSAGE_REGISTRATION,
                 opaque,
                 &RejectingFoundationDecoder,
             )
@@ -2216,7 +2217,7 @@ mod tests {
         );
         assert!(
             validate_registered_opaque_params(
-                SEND_USER_MESSAGE_V2_REGISTRATION,
+                SEND_USER_MESSAGE_REGISTRATION,
                 b"BAD!foundation-owned",
                 &FoundationDecoder,
             )
@@ -2241,20 +2242,20 @@ mod tests {
         }
 
         let decoder = RecordingFoundationDecoder(std::sync::atomic::AtomicBool::new(false));
-        let mut exact = vec![0_u8; MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES];
+        let mut exact = vec![0_u8; MAX_CANONICAL_SEND_USER_MESSAGE_BYTES];
         exact[..FCM2_MAGIC.len()].copy_from_slice(&FCM2_MAGIC);
-        validate_registered_opaque_params(SEND_USER_MESSAGE_V2_REGISTRATION, &exact, &decoder)
+        validate_registered_opaque_params(SEND_USER_MESSAGE_REGISTRATION, &exact, &decoder)
             .expect("the exact registered FCM2 allocation boundary reaches its owner decoder");
         assert!(decoder.0.load(std::sync::atomic::Ordering::SeqCst));
         let fcor = encode_fcor_v1("send_user_message", &[], &exact).unwrap();
         assert!(fcor.ends_with(&exact), "FCOR preserves FCM2 bytes exactly");
 
         decoder.0.store(false, std::sync::atomic::Ordering::SeqCst);
-        let mut oversized = vec![0_u8; MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES + 1];
+        let mut oversized = vec![0_u8; MAX_CANONICAL_SEND_USER_MESSAGE_BYTES + 1];
         oversized[..FCM2_MAGIC.len()].copy_from_slice(&FCM2_MAGIC);
         assert!(
             validate_registered_opaque_params(
-                SEND_USER_MESSAGE_V2_REGISTRATION,
+                SEND_USER_MESSAGE_REGISTRATION,
                 &oversized,
                 &decoder,
             )

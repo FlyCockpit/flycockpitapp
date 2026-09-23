@@ -85,7 +85,7 @@ pub(super) async fn admit_image_ingress(
                 kind: "imageIngressAdmissionReceipt".into(),
                 admission_id: published.admission_id,
                 session_id: published.session_id,
-                attachment: proto::send_user_message_v2::MessageAttachmentIdentity {
+                attachment: proto::send_user_message::MessageAttachmentIdentity {
                     attachment_id: published.attachment_id,
                     attachment_version: published.attachment_version,
                     checksum: decode_sha256_hex(&published.normalized_sha256)?,
@@ -330,7 +330,7 @@ pub(super) async fn admit_image_ingress(
             kind: "imageIngressAdmissionReceipt".into(),
             admission_id,
             session_id,
-            attachment: proto::send_user_message_v2::MessageAttachmentIdentity {
+            attachment: proto::send_user_message::MessageAttachmentIdentity {
                 attachment_id: published.attachment_id,
                 attachment_version: published.attachment_version,
                 checksum: decode_sha256_hex(&published.normalized_sha256)?,
@@ -1140,7 +1140,7 @@ pub(super) async fn finish_attachment_upload(
                 },
             );
             Ok(Response::AttachmentUploaded {
-                attachment: proto::send_user_message_v2::MessageAttachmentIdentity {
+                attachment: proto::send_user_message::MessageAttachmentIdentity {
                     attachment_id,
                     attachment_version: 1,
                     checksum,
@@ -1390,7 +1390,7 @@ pub(super) async fn finish_attachment_upload_admitted(
             let component_checksum = component_checksum
                 .ok_or_else(|| internal("materialized image derivative is unavailable"))?;
             Ok(Response::AttachmentUploaded {
-                attachment: proto::send_user_message_v2::MessageAttachmentIdentity {
+                attachment: proto::send_user_message::MessageAttachmentIdentity {
                     attachment_id,
                     attachment_version: attachment.attachment_version,
                     checksum: decode_sha256_hex(&component_checksum)?,
@@ -1441,11 +1441,11 @@ pub(super) fn read_test_images(
 fn validate_test_attachment_shape(
     attachment_ids: &[Uuid],
 ) -> std::result::Result<(), ErrorPayload> {
-    if attachment_ids.len() > proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
+    if attachment_ids.len() > proto::send_user_message::MAX_MESSAGE_ATTACHMENTS {
         return Err(bad_request(format!(
             "too many images: {} exceeds {} image limit",
             attachment_ids.len(),
-            proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
+            proto::send_user_message::MAX_MESSAGE_ATTACHMENTS
         )));
     }
     let mut seen = HashSet::new();

@@ -453,7 +453,7 @@ fn daemon_process_watch(socket: &Path) -> Option<cockpit_client::DaemonProcessWa
         let (watch, exited) = cockpit_client::DaemonProcessWatch::channel();
         let socket = socket.to_path_buf();
         tokio::spawn(async move {
-            // Reacquire only from the same v2 receipt after a bounded wait.
+            // Reacquire only from the same receipt after a bounded wait.
             // This keeps Windows waits below their DWORD timeout ceiling and
             // never falls back to polling a bare numeric PID.
             let mut process = process;
@@ -652,7 +652,11 @@ fn discover_attach_plan(
         DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid => {
             DiscoverAttachPlan::FailUnreachable
         }
-        DaemonStatus::NotRunning | DaemonStatus::Stale => DiscoverAttachPlan::Spawn,
+        // Spawning reaches the host reservation, which fails closed on an
+        // unrecognized PID file with an error naming it and the cleanup steps.
+        DaemonStatus::NotRunning | DaemonStatus::Stale | DaemonStatus::UnrecognizedPidMetadata => {
+            DiscoverAttachPlan::Spawn
+        }
     }
 }
 
@@ -1247,11 +1251,7 @@ fn persistent_owner_identity(
     if endpoint.ephemeral || endpoint.socket_path != paths.socket {
         return None;
     }
-    let cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt) =
-        cockpit_host::daemon_lifecycle::read_daemon_pid_record(&canonical.pid_file)?
-    else {
-        return None;
-    };
+    let receipt = cockpit_host::daemon_lifecycle::read_daemon_pid_record(&canonical.pid_file)?;
     (receipt == endpoint.receipt).then_some((endpoint.socket_path, receipt))
 }
 
@@ -1269,11 +1269,7 @@ fn ephemeral_owner_identity(
     if !endpoint.ephemeral || endpoint.socket_path != paths.socket {
         return None;
     }
-    let cockpit_host::daemon_lifecycle::DaemonPidRecord::Receipt(receipt) =
-        cockpit_host::daemon_lifecycle::read_daemon_pid_record(&canonical.pid_file)?
-    else {
-        return None;
-    };
+    let receipt = cockpit_host::daemon_lifecycle::read_daemon_pid_record(&canonical.pid_file)?;
     (receipt == endpoint.receipt).then_some((endpoint.socket_path, receipt))
 }
 

@@ -204,8 +204,6 @@ pub struct CodeRootAttachOptionsV1 {
     pub no_sandbox: bool,
     #[serde(default)]
     pub interactive: bool,
-    #[serde(default = "crate::default_client_protocol_version")]
-    pub client_protocol_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_snapshot: Option<crate::EnvSnapshotWire>,
     #[serde(default)]
@@ -332,7 +330,6 @@ pub struct CodeRootReadV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair_required: Option<Box<crate::ResumeRepairState>>,
     pub daemon_version: String,
-    pub compatible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_baseline: Option<crate::EnvSnapshotMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -433,7 +430,6 @@ pub fn create_code_root_v1_request(
     no_sandbox: bool,
     interactive: bool,
     model_override: Option<cockpit_config::config::providers::ActiveModelRef>,
-    client_protocol_version: u32,
     env_snapshot: Option<crate::EnvSnapshotWire>,
     env_policy: crate::EnvDriftPolicy,
 ) -> crate::Request {
@@ -449,7 +445,6 @@ pub fn create_code_root_v1_request(
             model_override,
             no_sandbox,
             interactive,
-            client_protocol_version,
             env_snapshot,
             env_policy,
         },
@@ -464,7 +459,6 @@ pub fn attach_existing_code_root_v1_request(
     no_sandbox: bool,
     interactive: bool,
     model_override: Option<cockpit_config::config::providers::ActiveModelRef>,
-    client_protocol_version: u32,
     env_snapshot: Option<crate::EnvSnapshotWire>,
     env_policy: crate::EnvDriftPolicy,
 ) -> crate::Request {
@@ -483,7 +477,6 @@ pub fn attach_existing_code_root_v1_request(
             model_override,
             no_sandbox,
             interactive,
-            client_protocol_version,
             env_snapshot,
             env_policy,
         },

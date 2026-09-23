@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
 use crate::daemon::client::{OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient};
-use crate::daemon::proto::{self, Request, Response, send_user_message_v2::MessageIngressV2};
+use crate::daemon::proto::{self, Request, Response, send_user_message::MessageIngress};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -512,7 +512,6 @@ pub(crate) async fn attach_send_pump(
             no_sandbox,
             false,
             model_override,
-            client.negotiated().version,
             Some(env_snapshot.to_wire()),
             crate::env_snapshot::EnvDriftPolicy::Daemon,
         ),
@@ -522,7 +521,6 @@ pub(crate) async fn attach_send_pump(
             no_sandbox,
             false,
             model_override,
-            client.negotiated().version,
             Some(env_snapshot.to_wire()),
             crate::env_snapshot::EnvDriftPolicy::Daemon,
         ),
@@ -702,14 +700,14 @@ pub(crate) async fn attach_send_pump(
                     .await
                     .map_err(classify_v2_image_upload_error)?;
             client
-                .request(Request::SendUserMessageV2 {
-                    ingress: MessageIngressV2::local_direct(
+                .request(Request::SendUserMessage {
+                    ingress: MessageIngress::local_direct(
                         Uuid::now_v7(),
                         session_id.to_string(),
                         None,
                         None,
                         options.run_invocation_options.clone(),
-                        crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
+                        crate::daemon::proto::send_user_message::SendUserMessage {
                             client_submission_id,
                             origin: Default::default(),
                             text: prompt,
@@ -844,11 +842,11 @@ fn resolve_attachment_paths(root: &Path, files: &[PathBuf]) -> Result<Vec<PathBu
 }
 
 fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
-    if paths.len() > proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
+    if paths.len() > proto::send_user_message::MAX_MESSAGE_ATTACHMENTS {
         return Err(RunUsageError(format!(
             "too many images: {} exceeds {} image limit",
             paths.len(),
-            proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
+            proto::send_user_message::MAX_MESSAGE_ATTACHMENTS
         ))
         .into());
     }
@@ -977,7 +975,7 @@ fn build_prompt_from_reader(args: &RunArgs, root: &Path, stdin: &mut impl Read) 
         // instead of allocating or blocking the CLI before any cap runs.
         let bytes = cockpit_host::bounded::read_at_most(
             &path,
-            proto::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64,
+            proto::send_user_message::MAX_MESSAGE_TEXT_BYTES as u64,
         )
         .with_context(|| format!("reading prompt file {}", path.display()))?;
         return String::from_utf8(bytes)
@@ -2297,7 +2295,7 @@ mod tests {
 
     #[test]
     fn run_permission_mode_uses_submission_id_and_immutable_options() {
-        use crate::daemon::proto::send_user_message_v2::MessageIngressV2;
+        use crate::daemon::proto::send_user_message::MessageIngress;
         use crate::daemon::proto::{ApprovalMode, Request, RunInvocationOptions};
         use uuid::Uuid;
 
@@ -2309,14 +2307,14 @@ mod tests {
             timeout_ms: None,
             approval_mode: Some(ApprovalMode::Yolo),
         };
-        let send = Request::SendUserMessageV2 {
-            ingress: MessageIngressV2::local_direct(
+        let send = Request::SendUserMessage {
+            ingress: MessageIngress::local_direct(
                 Uuid::now_v7(),
                 "session",
                 None,
                 None,
                 Some(options.clone()),
-                crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
+                crate::daemon::proto::send_user_message::SendUserMessage {
                     client_submission_id: id,
                     origin: Default::default(),
                     text: "go".into(),
@@ -2354,11 +2352,10 @@ mod tests {
         };
         assert_eq!(set.wire_tag(), "set_approval_mode");
         assert_ne!(set.wire_tag(), send.wire_tag());
-        // Shared envelope requires SendUserMessageV2 with options marker.
+        // Shared envelope requires SendUserMessage with options marker.
         match send {
-            Request::SendUserMessageV2 {
-                ingress:
-                    cockpit_proto::send_user_message_v2::MessageIngressV2::LocalOwnerDirect(local),
+            Request::SendUserMessage {
+                ingress: cockpit_proto::send_user_message::MessageIngress::LocalOwnerDirect(local),
             } => {
                 assert_eq!(local.request.client_submission_id, id);
                 assert_eq!(
@@ -2366,7 +2363,7 @@ mod tests {
                     Some(ApprovalMode::Yolo)
                 );
             }
-            other => panic!("run path must send SendUserMessageV2, got {other:?}"),
+            other => panic!("run path must send SendUserMessage, got {other:?}"),
         }
     }
 
@@ -2514,7 +2511,7 @@ mod tests {
 
     #[test]
     fn attachment_limits_and_daemon_bad_requests_are_usage_errors() {
-        let paths = (0..=proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS)
+        let paths = (0..=proto::send_user_message::MAX_MESSAGE_ATTACHMENTS)
             .map(|index| PathBuf::from(format!("unread-image-{index}.png")))
             .collect::<Vec<_>>();
         let error = load_and_validate_images(&paths).unwrap_err();

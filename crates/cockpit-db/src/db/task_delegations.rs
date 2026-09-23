@@ -1447,7 +1447,7 @@ mod tests {
                 "task-initial-snapshot",
                 vec![(
                     "default".to_string(),
-                    r#"{"version":2,"history":[],"next_prompt":{"User":{"content":[]}}}"#
+                    r#"{"version":1,"history":[],"next_prompt":{"User":{"content":[]}}}"#
                         .to_string(),
                 )],
             )

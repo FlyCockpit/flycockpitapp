@@ -2737,11 +2737,11 @@ mod tests {
             parent.agent_instance_id,
             root.agent_instance_id,
             crate::db::agent_tree_decisions::ValidatedRecursiveNoninteractiveLaunch::parse_and_canonicalize(
-                r#"{"version":2,"task_call_id":"task","label":"parent","child_agent":"child","model":{},"granted_tools":[],"cwd":"/repo"}"#,
+                r#"{"version":1,"task_call_id":"task","label":"parent","child_agent":"child","model":{},"granted_tools":[],"cwd":"/repo"}"#,
             )
             .unwrap(),
             crate::db::agent_tree_decisions::ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(
-                r#"{"version":2,"history":[],"next_prompt":null,"pending_recursive":null}"#,
+                r#"{"version":1,"history":[],"next_prompt":null,"pending_recursive":null}"#,
             )
             .unwrap(),
             20,
@@ -2759,7 +2759,7 @@ mod tests {
                 session.session_id,
                 parent.agent_instance_id,
                 crate::db::agent_tree_decisions::ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(
-                    r#"{"version":2,"history":["must-not-commit"],"next_prompt":null,"pending_recursive":null}"#,
+                    r#"{"version":1,"history":["must-not-commit"],"next_prompt":null,"pending_recursive":null}"#,
                 )
                 .unwrap(),
                 vec![(child.agent_instance_id, false)],
@@ -2778,7 +2778,7 @@ mod tests {
         assert_eq!(
             descriptor.snapshot.as_json(),
             crate::db::agent_tree_decisions::ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(
-                r#"{"version":2,"history":[],"next_prompt":null,"pending_recursive":null}"#,
+                r#"{"version":1,"history":[],"next_prompt":null,"pending_recursive":null}"#,
             )
             .unwrap()
             .as_json()
@@ -2821,7 +2821,7 @@ mod tests {
             session.session_id,
             parent.agent_instance_id,
             crate::db::agent_tree_decisions::ValidatedRecursiveNoninteractiveSnapshot::parse_and_canonicalize(
-                r#"{"version":2,"history":["committed"],"next_prompt":null,"pending_recursive":null}"#,
+                r#"{"version":1,"history":["committed"],"next_prompt":null,"pending_recursive":null}"#,
             )
             .unwrap(),
             vec![(child.agent_instance_id, false)],

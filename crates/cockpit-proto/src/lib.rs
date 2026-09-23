@@ -168,7 +168,7 @@ pub mod remote_turn_ice_policy;
 pub mod remote_version;
 #[cfg(feature = "remote")]
 pub mod remote_wire_magic_registry;
-pub mod send_user_message_v2;
+pub mod send_user_message;
 pub mod terminal;
 pub mod wire_scalar;
 
@@ -1361,24 +1361,14 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. Launch v1 includes the daemon-authoritative
-/// `SetupWizardApplied.config_generation` a required field carrying the
-/// apply's post-commit published generation (wizard onboarding settlements
-/// prove stage advancement against the receipt itself, with no compatibility
-/// window for daemons predating the field), adds daemon-rendered redaction
-/// coverage, input-prediction, and tag-preview projections, and adds the
-/// onboarding-facing agent authoring projection with the atomic
-/// authored-package apply/receipt family. On top of v23's durable
-/// logical-conversation favorites (`SetSessionFavorite` /
-/// `SessionFavoriteApplied` and the resolved-root `SessionSummary.favorite`
-/// bit), daemon-authoritative onboarding (`BeginOrReopenOnboarding` /
-/// `ApplyOnboardingTransition` and bootstrap snapshots), first-class
-/// assistant-thread creation and durable lineage projections, the V2 tagged
-/// ingress envelope, queued-message delivery classes, local queue controls,
-/// MCP credential profiles, agent-dimensioned MCP scopes on the
-/// attached-session and daemon-owned setup inventory, bounded base64 media
-/// previews, the rolling-precompaction resume choice, and knowledge-dream
-/// completion receipts including ordered all-KB runs.
+/// The single daemon wire protocol version.
+///
+/// Pre-launch the protocol was reset to 1 and there is no compatibility
+/// window: every envelope is stamped with this value, and a peer must match
+/// it exactly (see [`is_protocol_compatible`]). There is deliberately no
+/// minimum-supported version. A version-skewed peer is told to run
+/// `cockpit daemon restart` rather than being downgraded. The frozen wire
+/// shapes for this version live in `tests/fixtures/daemon_proto/v1/`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Version string the daemon advertises to clients on attach/status.
@@ -1664,11 +1654,7 @@ mod owner_capability_token_tests {
 
 impl Envelope {
     pub fn request(id: Uuid, request: Request) -> Self {
-        Self::request_at(PROTOCOL_VERSION, id, request)
-    }
-
-    pub fn request_at(v: u32, id: Uuid, request: Request) -> Self {
-        Self::request_with_owner_capability_at(v, id, request, None)
+        Self::request_with_owner_capability(id, request, None)
     }
 
     pub fn request_with_owner_capability(
@@ -1676,17 +1662,8 @@ impl Envelope {
         request: Request,
         owner_capability: Option<OwnerCapabilityToken>,
     ) -> Self {
-        Self::request_with_owner_capability_at(PROTOCOL_VERSION, id, request, owner_capability)
-    }
-
-    pub fn request_with_owner_capability_at(
-        v: u32,
-        id: Uuid,
-        request: Request,
-        owner_capability: Option<OwnerCapabilityToken>,
-    ) -> Self {
         Self {
-            v,
+            v: PROTOCOL_VERSION,
             body: Body::Request {
                 id,
                 #[cfg(feature = "remote")]
@@ -1715,12 +1692,8 @@ impl Envelope {
     }
 
     pub fn response(id: Uuid, response: Response) -> Self {
-        Self::response_at(PROTOCOL_VERSION, id, response)
-    }
-
-    pub fn response_at(v: u32, id: Uuid, response: Response) -> Self {
         Self {
-            v,
+            v: PROTOCOL_VERSION,
             body: Body::Response {
                 id,
                 response: Box::new(response),
@@ -1729,23 +1702,15 @@ impl Envelope {
     }
 
     pub fn event(event: Event) -> Self {
-        Self::event_at(PROTOCOL_VERSION, event)
-    }
-
-    pub fn event_at(v: u32, event: Event) -> Self {
         Self {
-            v,
+            v: PROTOCOL_VERSION,
             body: Body::Event { event },
         }
     }
 
     pub fn error(id: Option<Uuid>, error: ErrorPayload) -> Self {
-        Self::error_at(PROTOCOL_VERSION, id, error)
-    }
-
-    pub fn error_at(v: u32, id: Option<Uuid>, error: ErrorPayload) -> Self {
         Self {
-            v,
+            v: PROTOCOL_VERSION,
             body: Body::Error { id, error },
         }
     }
@@ -1795,16 +1760,16 @@ pub enum Body {
     },
     #[cfg(feature = "remote")]
     #[serde(rename = "replay_req")]
-    RemoteReplayRequest(RemoteReplayRequestV2),
+    RemoteReplayRequest(RemoteReplayRequest),
     #[cfg(feature = "remote")]
     #[serde(rename = "replay_res")]
-    RemoteReplayResponse(RemoteReplayResponseV2),
+    RemoteReplayResponse(RemoteReplayResponse),
     #[cfg(feature = "remote")]
     #[serde(rename = "replay_ack")]
-    RemoteReplayAck(RemoteReplayAckV2),
+    RemoteReplayAck(RemoteReplayAck),
     #[cfg(feature = "remote")]
     #[serde(rename = "replay_ack_res")]
-    RemoteReplayAckResponse(RemoteReplayAckResponseV2),
+    RemoteReplayAckResponse(RemoteReplayAckResponse),
     #[serde(other)]
     Unknown,
 }
@@ -1812,7 +1777,7 @@ pub enum Body {
 #[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RemoteReplayRequestV2 {
+pub struct RemoteReplayRequest {
     pub id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_event_seq: Option<crate::remote_protocol_id::CanonicalU64DecimalStringV1>,
@@ -1822,7 +1787,7 @@ pub struct RemoteReplayRequestV2 {
 #[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RemoteReplayResponseV2 {
+pub struct RemoteReplayResponse {
     pub id: Uuid,
     pub events: Vec<RemoteOutboxDeliveryV1>,
     pub high_water_mark: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
@@ -1831,7 +1796,7 @@ pub struct RemoteReplayResponseV2 {
 #[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RemoteReplayAckV2 {
+pub struct RemoteReplayAck {
     pub id: Uuid,
     pub delivery_id: CanonicalRfcUuidV1,
     pub lease_token: CanonicalRfcUuidV1,
@@ -1840,7 +1805,7 @@ pub struct RemoteReplayAckV2 {
 #[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RemoteReplayAckResponseV2 {
+pub struct RemoteReplayAckResponse {
     pub id: Uuid,
     pub acked: bool,
 }
@@ -1996,6 +1961,15 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 }
 
 // ---- Requests --------------------------------------------------------------
+
+/// Label that opens the public receipt correlation tuple of a
+/// `complete_provider_oauth` local operation. The daemon and the TUI hash the
+/// same `(label, client_operation_id, flow_id)` tuple, so both read it here.
+pub const COMPLETE_PROVIDER_OAUTH_RECEIPT_LABEL: &str = "complete_provider_oauth_receipt_v1";
+/// Label that opens the public receipt correlation tuple of a
+/// `complete_mcp_oauth` local operation (see
+/// [`COMPLETE_PROVIDER_OAUTH_RECEIPT_LABEL`]).
+pub const COMPLETE_MCP_OAUTH_RECEIPT_LABEL: &str = "complete_mcp_oauth_receipt_v1";
 
 mod request;
 pub use request::{
@@ -2256,10 +2230,6 @@ fn default_true() -> bool {
 
 fn default_daemon_version() -> String {
     DAEMON_VERSION.to_string()
-}
-
-fn default_client_protocol_version() -> u32 {
-    PROTOCOL_VERSION
 }
 
 // (The wire event variant for the same state change lives on `Event`
@@ -2692,10 +2662,9 @@ pub struct LiveStatus {
     pub has_active_schedules: bool,
     /// A turn is in flight (between `ThinkingStarted` and `AgentIdle`).
     pub processing: bool,
-    /// v10-only: the session's canonical project root, so a `cockpit run
+    /// The session's canonical project root, so a `cockpit run
     /// --session <id>` client can validate it matches `--cwd`/`--project`
-    /// before attaching. Absent for v9 clients (the field is a v10
-    /// extension on the existing v9 `session_live_status` response tag).
+    /// before attaching. Absent when the daemon has no resolved root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<String>,
 }
@@ -4087,7 +4056,6 @@ pub enum InterruptRaiseReason {
 /// `Body` variants differ per direction.
 pub struct ProtoStream<S> {
     framed: Framed<S, LinesCodec>,
-    version: u32,
 }
 
 impl<S> ProtoStream<S>
@@ -4095,21 +4063,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     pub fn new(stream: S) -> Self {
-        Self::with_version(stream, PROTOCOL_VERSION)
-    }
-
-    pub fn with_version(stream: S, version: u32) -> Self {
         Self {
             framed: Framed::new(
                 stream,
                 LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
             ),
-            version,
         }
     }
 
     pub fn into_split(self) -> (ProtoReadHalf<ReadHalf<S>>, ProtoWriteHalf<WriteHalf<S>>) {
-        let version = self.version;
         let (read, write) = tokio::io::split(self.framed.into_inner());
         (
             ProtoReadHalf {
@@ -4123,25 +4085,16 @@ where
                     write,
                     LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
                 ),
-                version,
             },
         )
     }
 
-    pub fn negotiated_version(&self) -> u32 {
-        self.version
-    }
-
-    pub fn set_negotiated_version(&mut self, version: u32) {
-        self.version = version;
-    }
-
-    /// Send one envelope. Serializes to a compact single-line JSON
-    /// string and writes a trailing newline (`LinesCodec` adds the
-    /// newline).
+    /// Send one envelope stamped with [`PROTOCOL_VERSION`]. Serializes to a
+    /// compact single-line JSON string and writes a trailing newline
+    /// (`LinesCodec` adds the newline).
     pub async fn send(&mut self, env: &Envelope) -> Result<()> {
         let mut env = env.clone();
-        env.v = self.version;
+        env.v = PROTOCOL_VERSION;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
         self.framed
             .send(line)
@@ -4187,23 +4140,18 @@ where
 
 pub struct ProtoWriteHalf<W> {
     framed: FramedWrite<W, LinesCodec>,
-    version: u32,
 }
 
 impl<W> ProtoWriteHalf<W>
 where
     W: AsyncWrite + Unpin,
 {
-    pub fn set_negotiated_version(&mut self, version: u32) {
-        self.version = version;
-    }
-
-    /// Send one envelope. Serializes to a compact single-line JSON
-    /// string and writes a trailing newline (`LinesCodec` adds the
-    /// newline).
+    /// Send one envelope stamped with [`PROTOCOL_VERSION`]. Serializes to a
+    /// compact single-line JSON string and writes a trailing newline
+    /// (`LinesCodec` adds the newline).
     pub async fn send(&mut self, env: &Envelope) -> Result<()> {
         let mut env = env.clone();
-        env.v = self.version;
+        env.v = PROTOCOL_VERSION;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
         self.framed
             .send(line)
@@ -4357,10 +4305,6 @@ mod proto_fixture_tests {
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
     const WIRE_SCHEMA_DIGEST_FILE: &str = "wire-schema.sha256";
 
-    fn supported_protocol_versions() -> std::ops::RangeInclusive<u32> {
-        PROTOCOL_VERSION..=PROTOCOL_VERSION
-    }
-
     #[test]
     fn proto_fixture_request_full_shapes_round_trip() {
         assert_enum_fixture::<Request>(
@@ -4427,36 +4371,17 @@ mod proto_fixture_tests {
     }
 
     #[test]
-    fn frozen_fixture_directories_are_well_formed_without_expanding_compatibility() {
-        let listed = supported_protocol_versions().collect::<BTreeSet<_>>();
-        assert!(
-            !listed.is_empty(),
-            "supported protocol version list is empty"
+    fn daemon_proto_fixtures_hold_exactly_the_current_version() {
+        // There is one protocol version and no compatibility window, so the
+        // fixture root holds exactly one `v{PROTOCOL_VERSION}/` directory
+        // (plus the archive checksum manifest). CI enforces the same rule
+        // with scripts/check-single-daemon-proto-fixture-version.sh.
+        assert_eq!(
+            fixture_directories(),
+            BTreeSet::from([PROTOCOL_VERSION]),
+            "daemon_proto must contain only the current v{PROTOCOL_VERSION}/ fixture directory"
         );
-        let directories = supported_fixture_directories();
-        assert!(
-            !directories.is_empty(),
-            "daemon_proto has no v*/ fixture directories"
-        );
-        assert!(
-            directories.is_superset(&listed),
-            "every live protocol version needs a daemon_proto/vN fixture directory"
-        );
-        // Older vN directories may remain in-tree as migration archaeology.
-        // Their presence must not widen the live protocol-compatibility window.
-        for version in listed {
-            assert_fixture_directory_files(version);
-        }
-    }
-
-    #[test]
-    fn frozen_fixture_current_version_directory_exists() {
-        let root = fixture_root_for(PROTOCOL_VERSION);
-        assert!(
-            root.is_dir(),
-            "current protocol fixture directory must exist: {}",
-            root.display()
-        );
+        assert_fixture_directory_files();
     }
 
     fn assert_enum_fixture<T>(tag: &str, file_name: &str, expected_kinds: Vec<String>)
@@ -4513,11 +4438,7 @@ mod proto_fixture_tests {
     }
 
     pub(super) fn read_fixture(file_name: &str) -> Map<String, Value> {
-        read_fixture_for(PROTOCOL_VERSION, file_name)
-    }
-
-    pub(crate) fn read_fixture_for(version: u32, file_name: &str) -> Map<String, Value> {
-        let path = fixture_root_for(version).join(file_name);
+        let path = current_fixture_root().join(file_name);
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
         serde_json::from_str(&raw)
@@ -4569,11 +4490,11 @@ mod proto_fixture_tests {
         crate::event_variants!(collect_tags)
     }
 
-    fn fixture_root_for(version: u32) -> PathBuf {
-        let path = daemon_proto_fixture_root().join(format!("v{version}"));
+    fn current_fixture_root() -> PathBuf {
+        let path = daemon_proto_fixture_root().join(format!("v{PROTOCOL_VERSION}"));
         if !path.is_dir() {
             panic!(
-                "missing daemon proto fixture directory for protocol v{version}: {}",
+                "missing daemon proto fixture directory for protocol v{PROTOCOL_VERSION}: {}",
                 path.display()
             );
         }
@@ -4587,7 +4508,7 @@ mod proto_fixture_tests {
             .join("daemon_proto")
     }
 
-    fn supported_fixture_directories() -> BTreeSet<u32> {
+    fn fixture_directories() -> BTreeSet<u32> {
         let root = daemon_proto_fixture_root();
         let entries = std::fs::read_dir(&root)
             .unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
@@ -4624,8 +4545,9 @@ mod proto_fixture_tests {
         versions
     }
 
-    fn assert_fixture_directory_files(version: u32) {
-        let root = fixture_root_for(version);
+    fn assert_fixture_directory_files() {
+        let version = PROTOCOL_VERSION;
+        let root = current_fixture_root();
         let entries = std::fs::read_dir(&root)
             .unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
         let mut actual = BTreeSet::new();
@@ -4640,24 +4562,16 @@ mod proto_fixture_tests {
             );
             actual.insert(entry.file_name().to_string_lossy().to_string());
         }
-        let mut allowed = DAEMON_PROTO_FIXTURE_FILES
+        let allowed = DAEMON_PROTO_FIXTURE_FILES
             .iter()
-            .map(|name| (*name).to_string())
+            .copied()
+            .chain([WIRE_SCHEMA_DIGEST_FILE])
+            .map(str::to_string)
             .collect::<BTreeSet<_>>();
-        assert!(
-            actual.is_superset(&allowed),
-            "daemon_proto v{version} must contain {allowed:?}"
-        );
-        if version == PROTOCOL_VERSION {
-            assert!(
-                actual.contains(WIRE_SCHEMA_DIGEST_FILE),
-                "the current daemon_proto v{version} must contain {WIRE_SCHEMA_DIGEST_FILE}"
-            );
-        }
-        assert!(
-            actual.is_subset(&allowed),
-            "unexpected files under daemon_proto v{version}: only event.json, \
-             request.json, and response.json belong there"
+        assert_eq!(
+            actual, allowed,
+            "daemon_proto v{version} must contain exactly event.json, request.json, \
+             response.json, and {WIRE_SCHEMA_DIGEST_FILE}"
         );
     }
 
@@ -5755,7 +5669,7 @@ mod forward_open_guard_tests {
                         kind: "retained_image".into(),
                         admission_id,
                         session_id,
-                        attachment: crate::send_user_message_v2::MessageAttachmentIdentity {
+                        attachment: crate::send_user_message::MessageAttachmentIdentity {
                             attachment_id: Uuid::new_v4(),
                             attachment_version: 1,
                             checksum: [0; 32],
@@ -5900,15 +5814,11 @@ mod proto_fixture_files {
     use std::path::Path;
 
     pub(super) fn read_fixture(file_name: &str) -> Map<String, Value> {
-        read_fixture_for(super::PROTOCOL_VERSION, file_name)
-    }
-
-    pub(super) fn read_fixture_for(version: u32, file_name: &str) -> Map<String, Value> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join("daemon_proto")
-            .join(format!("v{version}"))
+            .join(format!("v{}", super::PROTOCOL_VERSION))
             .join(file_name);
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
@@ -5920,7 +5830,7 @@ mod proto_fixture_files {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::send_user_message_v2::MessageIngressV2;
+    use crate::send_user_message::MessageIngress;
 
     #[cfg(feature = "remote")]
     #[test]
@@ -6109,42 +6019,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn envelope_constructors_stamp_the_negotiated_version() {
-        let negotiated = PROTOCOL_VERSION;
+    async fn envelope_constructors_and_stream_stamp_the_current_version() {
         let (left, right) = duplex(4096);
-        let mut sender = ProtoStream::with_version(left, negotiated);
+        let mut sender = ProtoStream::new(left);
         let mut receiver = ProtoStream::new(right);
 
         let request = Envelope::request(Uuid::new_v4(), Request::DaemonStatus);
         assert_eq!(request.v, PROTOCOL_VERSION);
-        sender.send(&request).await.unwrap();
+        // Even a hand-built envelope with a foreign version is re-stamped on
+        // send: the codec only ever writes the single current version.
+        let mut foreign = request.clone();
+        foreign.v = PROTOCOL_VERSION + 1;
+        sender.send(&foreign).await.unwrap();
 
         match receiver.recv().await.unwrap().expect("frame") {
-            RecvFrame::Envelope(env) => assert_eq!(env.v, negotiated),
+            RecvFrame::Envelope(env) => assert_eq!(env.v, PROTOCOL_VERSION),
             other => panic!("expected envelope, got {other:?}"),
         }
 
         assert_eq!(
-            Envelope::request_at(negotiated, Uuid::new_v4(), Request::DaemonStatus).v,
-            negotiated
+            Envelope::response(Uuid::new_v4(), Response::Ack).v,
+            PROTOCOL_VERSION
         );
         assert_eq!(
-            Envelope::response_at(negotiated, Uuid::new_v4(), Response::Ack).v,
-            negotiated
-        );
-        assert_eq!(
-            Envelope::event_at(
-                negotiated,
-                Event::LspNotice {
-                    text: "notice".to_string()
-                }
-            )
+            Envelope::event(Event::LspNotice {
+                text: "notice".to_string()
+            })
             .v,
-            negotiated
+            PROTOCOL_VERSION
         );
         assert_eq!(
-            Envelope::error_at(
-                negotiated,
+            Envelope::error(
                 None,
                 ErrorPayload {
                     code: ErrorCode::Internal,
@@ -6152,7 +6057,7 @@ mod tests {
                 }
             )
             .v,
-            negotiated
+            PROTOCOL_VERSION
         );
     }
 
@@ -6160,14 +6065,14 @@ mod tests {
     fn request_round_trip() {
         let env = Envelope::request(
             Uuid::new_v4(),
-            Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     Uuid::now_v7(),
                     "session",
                     None,
                     None,
                     None,
-                    crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::send_user_message::SendUserMessage {
                         client_submission_id: Uuid::new_v4(),
                         origin: Default::default(),
                         text: "hello".into(),
@@ -6186,10 +6091,10 @@ mod tests {
         let back: Envelope = serde_json::from_str(&s).unwrap();
         match back.body {
             Body::Request {
-                request: Request::SendUserMessageV2 { ingress },
+                request: Request::SendUserMessage { ingress },
                 ..
             } => assert_eq!(ingress.request().text, "hello"),
-            other => panic!("expected SendUserMessageV2, got {other:?}"),
+            other => panic!("expected SendUserMessage, got {other:?}"),
         }
     }
 
@@ -6229,18 +6134,18 @@ mod tests {
     }
 
     #[test]
-    fn send_user_message_v2_serializes_typed_attachment_identity_without_raw_bytes() {
+    fn send_user_message_serializes_typed_attachment_identity_without_raw_bytes() {
         let attachment_id = Uuid::now_v7();
         let env = Envelope::request(
             Uuid::new_v4(),
-            Request::SendUserMessageV2 {
-                ingress: MessageIngressV2::local_direct(
+            Request::SendUserMessage {
+                ingress: MessageIngress::local_direct(
                     Uuid::now_v7(),
                     "session",
                     None,
                     None,
                     None,
-                    crate::send_user_message_v2::SendUserMessageV2 {
+                    crate::send_user_message::SendUserMessage {
                         client_submission_id: Uuid::new_v4(),
                         origin: Default::default(),
                         text: IMAGE_PART_SENTINEL.to_string(),
@@ -6250,7 +6155,7 @@ mod tests {
                         delivery_class_override: None,
                         resolved_delivery_class: None,
                         resolved_queue_target: None,
-                        attachments: vec![crate::send_user_message_v2::MessageAttachmentIdentity {
+                        attachments: vec![crate::send_user_message::MessageAttachmentIdentity {
                             attachment_id,
                             attachment_version: 1,
                             checksum: [7; 32],
@@ -7332,10 +7237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_only_request_is_rejected_by_exact_version_gate() {
-        let (a, b) = duplex(4096);
-        let mut v9_sender = ProtoStream::with_version(a, 9);
-        let mut v9_receiver = ProtoStream::with_version(b, 9);
+    async fn non_current_version_frames_are_rejected_by_exact_version_gate() {
         let request = Envelope::request(
             Uuid::new_v4(),
             Request::ListSecretInventory {
@@ -7343,217 +7245,32 @@ mod tests {
                 limit: Some(32),
             },
         );
-        v9_sender
-            .send(&request)
-            .await
-            .expect("sender stamps the negotiated version without a payload gate");
-        assert!(matches!(
-            v9_receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn v17_provider_credential_receipt_is_rejected_by_exact_version_gate() {
-        let (a, b) = duplex(4096);
-        let mut v9_sender = ProtoStream::with_version(a, 9);
-        let mut v9_receiver = ProtoStream::with_version(b, 9);
         let response = Envelope::response(
             Uuid::new_v4(),
-            Response::ProviderCredentialCommitted {
-                client_operation_id: "put-provider".into(),
-                mutation_intent_hash: "00".repeat(32),
-                provider_id: "example".into(),
-                project_root: None,
-                owner_root: None,
-                owner_scope: "global".into(),
-                stored: true,
-                changed: true,
-                consumed_vault_generation: 6,
-                result_vault_generation: 7,
-                config_generation: 7,
-            },
-        );
-        v9_sender
-            .send(&response)
-            .await
-            .expect("sender stamps the negotiated version without a payload gate");
-        assert!(matches!(
-            v9_receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn recv_rejects_v10_only_request_labeled_as_v9() {
-        let (a, b) = duplex(4096);
-        let mut sender = ProtoStream::with_version(a, 9);
-        let mut receiver = ProtoStream::with_version(b, 9);
-        let id = Uuid::new_v4();
-        let forged = Envelope {
-            v: 9,
-            body: Body::Request {
-                id,
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: Request::ListSecretInventory {
-                    cursor: None,
-                    limit: Some(32),
-                },
-            },
-        };
-        sender
-            .framed
-            .send(serde_json::to_string(&forged).unwrap())
-            .await
-            .unwrap();
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn recv_rejects_v10_only_response_labeled_as_v9() {
-        let (a, b) = duplex(4096);
-        let mut sender = ProtoStream::with_version(a, 9);
-        let mut receiver = ProtoStream::with_version(b, 9);
-        let id = Uuid::new_v4();
-        let forged = Envelope::response_at(
-            9,
-            id,
-            Response::ProviderCredentialCommitted {
-                client_operation_id: "put-provider".into(),
-                mutation_intent_hash: "00".repeat(32),
-                provider_id: "example".into(),
-                project_root: None,
-                owner_root: None,
-                owner_scope: "global".into(),
-                stored: true,
-                changed: true,
-                consumed_vault_generation: 6,
-                result_vault_generation: 7,
-                config_generation: 7,
-            },
-        );
-        sender
-            .framed
-            .send(serde_json::to_string(&forged).unwrap())
-            .await
-            .unwrap();
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn recv_rejects_v10_only_list_sessions_assistant_filter_labeled_as_v9() {
-        let (a, b) = duplex(4096);
-        let mut sender = ProtoStream::with_version(a, 9);
-        let mut receiver = ProtoStream::with_version(b, 9);
-        let id = Uuid::new_v4();
-        let forged = Envelope {
-            v: 9,
-            body: Body::Request {
-                id,
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: Request::ListSessions {
-                    project_id: None,
-                    parent_session_id: None,
-                    assistant_id: Some("helper-bot".into()),
-                    compaction_lineage_root_id: None,
-                    include_archived: false,
-                },
-            },
-        };
-        sender
-            .framed
-            .send(serde_json::to_string(&forged).unwrap())
-            .await
-            .unwrap();
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn recv_rejects_v10_only_apply_sealed_owner_operation_labeled_as_v9() {
-        let (a, b) = duplex(4096);
-        let mut sender = ProtoStream::with_version(a, 9);
-        let mut receiver = ProtoStream::with_version(b, 9);
-        let id = Uuid::new_v4();
-        let forged = Envelope {
-            v: 9,
-            body: Body::Request {
-                id,
-                #[cfg(feature = "remote")]
-                operation: None,
-                owner_capability: None,
-                request: Request::ApplySealedOwnerOperation {
-                    capability_id: "cap".into(),
-                    literal: Some(SensitiveWireLiteral::new("s3cr3t".into())),
-                },
-            },
-        };
-        sender
-            .framed
-            .send(serde_json::to_string(&forged).unwrap())
-            .await
-            .unwrap();
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn recv_rejects_v10_only_docs_answer_labeled_as_v9() {
-        let (a, b) = duplex(4096);
-        let mut sender = ProtoStream::with_version(a, 9);
-        let mut receiver = ProtoStream::with_version(b, 9);
-        let id = Uuid::new_v4();
-        let forged = Envelope::response_at(
-            9,
-            id,
             Response::DocsAnswer {
                 answer: "cited answer".into(),
             },
         );
-        sender
-            .framed
-            .send(serde_json::to_string(&forged).unwrap())
-            .await
-            .unwrap();
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 9, .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v1_cutover() {
-        let (a, b) = duplex(4096);
-        let mut sender = ProtoStream::with_version(a, 10);
-        let mut receiver = ProtoStream::with_version(b, 10);
-        sender
-            .send(&Envelope::request(
-                Uuid::new_v4(),
-                Request::ListSecretInventory {
-                    cursor: None,
-                    limit: Some(32),
-                },
-            ))
-            .await
-            .unwrap();
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            Some(RecvFrame::VersionMismatch { v: 10, .. })
-        ));
+        for foreign in [0, PROTOCOL_VERSION + 1, u32::MAX] {
+            for template in [&request, &response] {
+                let (a, b) = duplex(4096);
+                let mut sender = ProtoStream::new(a);
+                let mut receiver = ProtoStream::new(b);
+                let mut forged = template.clone();
+                forged.v = foreign;
+                // Bypass the stamping `send` so the foreign version reaches
+                // the wire exactly as a skewed peer would write it.
+                sender
+                    .framed
+                    .send(serde_json::to_string(&forged).unwrap())
+                    .await
+                    .unwrap();
+                match receiver.recv().await.unwrap() {
+                    Some(RecvFrame::VersionMismatch { v, .. }) => assert_eq!(v, foreign),
+                    other => panic!("v{foreign} frame must be rejected, got {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]

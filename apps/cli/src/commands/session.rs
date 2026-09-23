@@ -364,7 +364,6 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
                     false,
                     false,
                     None,
-                    client.negotiated().version,
                     Some(env_snapshot.to_wire()),
                     crate::env_snapshot::EnvDriftPolicy::Daemon,
                 ))

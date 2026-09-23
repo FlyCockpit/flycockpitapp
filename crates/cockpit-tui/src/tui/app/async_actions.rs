@@ -276,7 +276,7 @@ async fn complete_provider_oauth(
         .await
         .map_err(|e| e.to_string())?;
     let expected_hash = oauth_request_hash(&(
-        "complete_provider_oauth_receipt_v2",
+        cockpit_proto::COMPLETE_PROVIDER_OAUTH_RECEIPT_LABEL,
         &client_operation_id,
         &flow_id,
     ))?;

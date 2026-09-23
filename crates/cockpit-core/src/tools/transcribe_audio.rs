@@ -46,7 +46,7 @@ use crate::{
     tool_media_authority::{AdmittedHandle, session_authority::AdmissionDenial},
 };
 
-const RESULT_SCHEMA_VERSION: u8 = 1;
+pub(crate) const RESULT_SCHEMA_VERSION: u8 = 1;
 
 /// Transcription currently accepts only a session attachment. This is the only
 /// source kind backed by an authoritative normalized derivative and duration.

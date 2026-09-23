@@ -1,4 +1,4 @@
-import { FCM2_MAX_BYTES } from "./send-user-message-v2";
+import { FCM2_MAX_BYTES } from "./send-user-message";
 
 export const FCOR_MAGIC = new Uint8Array([0x46, 0x43, 0x4f, 0x52]);
 export const FCOR_SCHEMA_VERSION = 1;
@@ -27,7 +27,7 @@ export type ValidatedFcorV1 = Uint8Array & { readonly [validatedFcorV1]: true };
 
 const U32_MAX = 0xffffffff;
 export const MAX_FCOR_V1_BYTES = U32_MAX;
-export const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES = FCM2_MAX_BYTES;
+export const MAX_CANONICAL_SEND_USER_MESSAGE_BYTES = FCM2_MAX_BYTES;
 export type CanonicalParamErrorCode =
   | "non_nfc"
   | "nul"
@@ -41,23 +41,23 @@ export class CanonicalParamError extends Error {
     super(message);
   }
 }
-export const sendUserMessageV2OpaqueRegistration = {
+export const sendUserMessageOpaqueRegistration = {
   requestKind: "send_user_message",
   magic: new Uint8Array([0x46, 0x43, 0x4d, 0x32]),
-  maximumBytes: MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+  maximumBytes: MAX_CANONICAL_SEND_USER_MESSAGE_BYTES,
   owner: "message-attachment-protocol-foundation",
 } as const;
 
-export type SendUserMessageV2FoundationDecoder = {
+export type SendUserMessageFoundationDecoder = {
   readonly owner: "message-attachment-protocol-foundation";
   validate(bytes: Uint8Array): void;
 };
 
-export function validateRegisteredSendUserMessageV2(
+export function validateRegisteredSendUserMessage(
   bytes: Uint8Array,
-  foundationDecoder: SendUserMessageV2FoundationDecoder,
+  foundationDecoder: SendUserMessageFoundationDecoder,
 ): void {
-  const registration = sendUserMessageV2OpaqueRegistration;
+  const registration = sendUserMessageOpaqueRegistration;
   if (bytes.length > registration.maximumBytes) throw new Error("FCM2 exceeds registered maximum");
   if (!registration.magic.every((byte, index) => bytes[index] === byte)) {
     throw new Error("FCM2 has wrong magic");

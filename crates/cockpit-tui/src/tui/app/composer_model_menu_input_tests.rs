@@ -1217,7 +1217,6 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         resume_compaction_offer: None,
         btw_fork: None,
         daemon_version: "test".to_string(),
-        daemon_compatible: true,
         attachment_epoch: 0,
         transition_guard: Some(transition_guard),
     });

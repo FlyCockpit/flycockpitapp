@@ -112,10 +112,10 @@ mod daemon_tag_coverage_tests {
         assert!(!tui.contains(&["RedactionTable", "build"].join("::")));
         assert!(!tui.contains(&["RedactionTable", "empty"].join("::")));
         let submission = daemon
-            .split("async fn handle_send_user_message_v2(")
+            .split("async fn handle_message_ingress(")
             .nth(1)
             .and_then(|body| body.split("async fn ").next())
-            .expect("V2 submission route");
+            .expect("message ingress submission route");
         assert!(submission.contains("CoverageScope::TagInline"));
         assert!(submission.contains("admission.use_at_sink"));
         assert!(submission.contains("expand_tags_with_policy"));
@@ -125,10 +125,10 @@ mod daemon_tag_coverage_tests {
     fn no_tag_policy_cannot_admit_submission_without_coverage() {
         let daemon = include_str!("../../../../cockpit-core/src/daemon/server/dispatch.rs");
         let submission = daemon
-            .split("async fn handle_send_user_message_v2(")
+            .split("async fn handle_message_ingress(")
             .nth(1)
             .and_then(|body| body.split("async fn ").next())
-            .expect("V2 submission route");
+            .expect("message ingress submission route");
         assert!(
             submission.contains("request.tag_expansions.is_empty() && request.text.contains('@')")
         );
@@ -4738,11 +4738,11 @@ pub(super) fn validate_pasted_images_for_submit(
 fn validate_pasted_image_sizes(
     images: &[cockpit_client::image_upload::SubmissionImage],
 ) -> Result<(), String> {
-    if images.len() > cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS {
+    if images.len() > cockpit_proto::send_user_message::MAX_MESSAGE_ATTACHMENTS {
         return Err(format!(
             "Too many pasted images: {} exceeds the {} image limit.",
             images.len(),
-            cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS
+            cockpit_proto::send_user_message::MAX_MESSAGE_ATTACHMENTS
         ));
     }
     let mut total = 0usize;
@@ -4805,7 +4805,7 @@ mod image_submit_validation_tests {
         let png = sample_png();
         let images = vec![
             cockpit_client::image_upload::SubmissionImage::png(png);
-            cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS + 1
+            cockpit_proto::send_user_message::MAX_MESSAGE_ATTACHMENTS + 1
         ];
         let err = validate_pasted_images_for_submit(&images).expect_err("too many");
         assert!(err.contains("Too many pasted images"));
@@ -4824,7 +4824,7 @@ mod image_submit_validation_tests {
 
     #[test]
     fn exact_image_count_and_byte_boundaries() {
-        let count = cockpit_proto::send_user_message_v2::MAX_MESSAGE_ATTACHMENTS;
+        let count = cockpit_proto::send_user_message::MAX_MESSAGE_ATTACHMENTS;
         let single = cockpit_proto::MAX_SINGLE_IMAGE_BYTES;
         let total = cockpit_proto::MAX_TOTAL_IMAGE_BYTES;
         assert!(

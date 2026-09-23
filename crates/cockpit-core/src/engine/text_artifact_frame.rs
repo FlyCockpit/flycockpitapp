@@ -261,7 +261,10 @@ pub fn accepted_user_envelope_with_composition(
         parts.push(serde_json::json!({"type":"text","text":guidance}));
     }
     parts.push(serde_json::json!({"type":"authored_text_slot"}));
-    let mut envelope = serde_json::json!({"version":3,"parts":parts});
+    let mut envelope = serde_json::json!({
+        "version": crate::db::text_artifacts::USER_MESSAGE_MODEL_ENVELOPE_VERSION,
+        "parts": parts,
+    });
     if let Some(prelude) = prelude {
         envelope["prelude"] = serde_json::json!([prelude]);
     }
@@ -305,7 +308,10 @@ pub fn accepted_user_envelope_from_parts(
         slots == 1,
         "accepted user composition must have exactly one authored text part"
     );
-    let mut envelope = serde_json::json!({"version":3,"parts":encoded});
+    let mut envelope = serde_json::json!({
+        "version": crate::db::text_artifacts::USER_MESSAGE_MODEL_ENVELOPE_VERSION,
+        "parts": encoded,
+    });
     if let Some(prelude) = prelude {
         envelope["prelude"] = serde_json::json!([prelude]);
     }
@@ -539,7 +545,7 @@ mod tests {
         let image =
             UserContent::image_base64("YWJj", Some(rig::message::ImageMediaType::PNG), None);
         let envelope = serde_json::json!({
-            "version": 3,
+            "version": 1,
             "parts": [
                 {"type":"text","text":"auto skill\n"},
                 {"type":"image","payload": serde_json::to_value(&image).unwrap()},
@@ -564,7 +570,7 @@ mod tests {
         let image =
             UserContent::image_base64("YWJj", Some(rig::message::ImageMediaType::PNG), None);
         let envelope = serde_json::json!({
-            "version": 3,
+            "version": 1,
             "prelude": [{"type":"forced_skill","call_id":"fc-skillslash-test","name":"skill","args":{"name":"skill"},"body":"FORCED","hard_fail":false}],
             "parts": [
                 {"type":"text","text":"AUTO"},
@@ -595,7 +601,7 @@ mod tests {
             serde_json::json!({"name":"other"}),
             serde_json::json!({"name":"skill","extra":true}),
         ] {
-            let envelope = serde_json::json!({"version":3,"prelude":[{"type":"forced_skill","call_id":"call","name":"skill","args":args,"body":"body","hard_fail":false}],"parts":[{"type":"authored_text_slot"}]});
+            let envelope = serde_json::json!({"version":1,"prelude":[{"type":"forced_skill","call_id":"call","name":"skill","args":args,"body":"body","hard_fail":false}],"parts":[{"type":"authored_text_slot"}]});
             assert!(render_accepted_user_composition(&envelope.to_string(), "<frame>").is_err());
         }
     }

@@ -1,3 +1,4 @@
+import { RELAY_ENVELOPE_VERSION } from "@flycockpit/relay-protocol/envelopes";
 import {
   TERMINAL_PROTOCOL_VERSION,
   type TerminalClientPayload,
@@ -186,7 +187,9 @@ export class TerminalClient {
 
   private sendPayload(payload: TerminalClientPayload) {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ v: 1, channelId: this.options.channelId, payload }));
+    this.ws.send(
+      JSON.stringify({ v: RELAY_ENVELOPE_VERSION, channelId: this.options.channelId, payload }),
+    );
   }
 
   private handleMessage(raw: unknown) {

@@ -1,4 +1,5 @@
 import {
+  RELAY_ENVELOPE_VERSION,
   type UserNotificationRelayFrame,
   userNotificationRelayFrameSchema,
 } from "@flycockpit/relay-protocol/envelopes";
@@ -46,7 +47,7 @@ export function useUserNotifications() {
     (visible: boolean) => {
       if (!signedIn || typeof document === "undefined") return;
       const frame = JSON.stringify({
-        v: 1,
+        v: RELAY_ENVELOPE_VERSION,
         type: "presence",
         clientId,
         visible,

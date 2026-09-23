@@ -2951,7 +2951,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
             crate::db::text_artifacts::ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: json!({"text": source.clone()}).to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                model_envelope_json: r#"{"version":1,"parts":[{"type":"authored_text_slot"}]}"#
                     .to_owned(),
                 source_text: source.clone(),
                 source_blob_path: Some(source_blob_path),
@@ -3410,7 +3410,7 @@ async fn export_older_events_without_new_fields_still_parse() {
     // The pre-release export contract is the intentional breaking /3 shape.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/4");
+    assert_eq!(manifest["schema"], "cockpit-session-export/1");
 }
 
 #[tokio::test]
@@ -3492,7 +3492,7 @@ async fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     // Manifest round-trips and lists the session.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&bytes, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/4");
+    assert_eq!(manifest["schema"], "cockpit-session-export/1");
     assert_eq!(manifest["session_count"], 1);
     assert_eq!(
         manifest["target"]["short_id"],

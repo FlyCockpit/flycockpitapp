@@ -59,6 +59,10 @@ use crate::db::task_delegation_payloads::{LoadedTaskDelegationPayload, TaskDeleg
 use crate::db::tool_calls::ToolCallEvent;
 use crate::redact::RedactionTable;
 
+/// The single session-export archive format identifier, shared by the
+/// writer here and the exact-match reader in `session::import`.
+pub(crate) const EXPORT_SCHEMA: &str = "cockpit-session-export/1";
+
 mod tandem_validation;
 
 /// Directory holding regular (foreground) inference request bodies.
@@ -1801,7 +1805,7 @@ fn build_manifest_conn(
         .collect::<Result<Vec<Value>>>()?;
 
     let mut manifest = json!({
-        "schema": "cockpit-session-export/4",
+        "schema": EXPORT_SCHEMA,
         // The version of the cockpit binary producing THIS export — not
         // persisted per session, so a CLI export of an old session reflects
         // the exporting binary, not the one that created the session.

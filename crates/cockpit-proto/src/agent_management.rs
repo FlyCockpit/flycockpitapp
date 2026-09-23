@@ -211,6 +211,11 @@ pub fn agent_mutation_name(mutation: &AgentMutation) -> Option<&str> {
     }
 }
 
+/// Hash domain of [`agent_mutation_intent_hash`].
+pub const AGENT_MUTATION_SHAPE_DOMAIN: &[u8] = b"cockpit-agent-mutation-shape-v1\0";
+/// Hash domain of [`assistant_mutation_intent_hash`].
+pub const ASSISTANT_MUTATION_SHAPE_DOMAIN: &[u8] = b"cockpit-assistant-mutation-shape-v1\0";
+
 /// Public correlation hash for an ordinary agent mutation. Secret material is
 /// never accepted by this protocol family; length framing prevents ambiguous
 /// concatenations and the domain separator permits future formats.
@@ -220,7 +225,7 @@ pub fn agent_mutation_intent_hash(
     _expected_revision: Option<&str>,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"cockpit-agent-mutation-shape-v2\0");
+    digest.update(AGENT_MUTATION_SHAPE_DOMAIN);
     let (action, name) = match mutation {
         AgentMutation::EjectBuiltin { name } => ("eject_builtin", Some(name.as_str())),
         AgentMutation::SaveDefinition { name, .. } => ("save_definition", Some(name.as_str())),
@@ -265,7 +270,7 @@ pub fn assistant_mutation_intent_hash(
     intended_markdown: Option<&str>,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"cockpit-assistant-mutation-shape-v2\0");
+    digest.update(ASSISTANT_MUTATION_SHAPE_DOMAIN);
     for field in [action, name] {
         digest_field(&mut digest, field.as_bytes());
     }

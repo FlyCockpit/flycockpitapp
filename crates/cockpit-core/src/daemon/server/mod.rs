@@ -568,7 +568,6 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             repair_required,
             resume_compaction_offer: _,
             daemon_version: _,
-            compatible: _,
             env_baseline: _,
             env_session: _,
             env_drift,
@@ -8340,7 +8339,6 @@ enum ClientExecutorInput {
 }
 
 enum ClientWriterMessage {
-    SetVersion(u32),
     Envelope(Envelope),
     EnvelopeWithAck {
         envelope: Envelope,
@@ -8452,22 +8450,15 @@ where
                 if matches!(&frame, RecvFrame::Envelope(_)) {
                     client_lifetime.activate();
                 }
-                if let Some(version) = negotiated_writer_version_for_frame(&frame) {
-                    if writer_tx
-                        .send(ClientWriterMessage::SetVersion(version))
+                // Every frame past the mismatch gate carries exactly
+                // `PROTOCOL_VERSION`, so the first one completes negotiation.
+                if let Some(event) = initial_event_after_negotiation.take()
+                    && writer_tx
+                        .send(ClientWriterMessage::Envelope(Envelope::event(event)))
                         .await
                         .is_err()
-                    {
-                        anyhow::bail!("client reader lost writer control channel");
-                    }
-                    if let Some(event) = initial_event_after_negotiation.take()
-                        && writer_tx
-                            .send(ClientWriterMessage::Envelope(Envelope::event(event)))
-                            .await
-                            .is_err()
-                    {
-                        anyhow::bail!("client reader lost writer event channel");
-                    }
+                {
+                    anyhow::bail!("client reader lost writer event channel");
                 }
                 if executor_tx
                     .send(ClientExecutorInput::Frame(frame))
@@ -8483,14 +8474,6 @@ where
     }
 }
 
-fn negotiated_writer_version_for_frame(frame: &RecvFrame) -> Option<u32> {
-    match frame {
-        RecvFrame::Envelope(env) => Some(env.v.min(proto::PROTOCOL_VERSION)),
-        RecvFrame::Unknown { v, .. } => Some((*v).min(proto::PROTOCOL_VERSION)),
-        RecvFrame::VersionMismatch { .. } => None,
-    }
-}
-
 async fn run_client_writer<W>(
     mut writer: ProtoWriteHalf<W>,
     mut writer_rx: mpsc::Receiver<ClientWriterMessage>,
@@ -8499,10 +8482,6 @@ async fn run_client_writer<W>(
 {
     while let Some(message) = writer_rx.recv().await {
         let (envelope, ack) = match message {
-            ClientWriterMessage::SetVersion(version) => {
-                writer.set_negotiated_version(version);
-                continue;
-            }
             ClientWriterMessage::Envelope(envelope) => (envelope, None),
             ClientWriterMessage::EnvelopeWithAck { envelope, ack } => (envelope, Some(ack)),
         };
@@ -9081,7 +9060,7 @@ async fn handle_envelope(
             }
         }
         #[cfg(feature = "remote")]
-        Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
+        Body::RemoteReplayRequest(proto::RemoteReplayRequest {
             id,
             after_event_seq,
             limit,
@@ -9153,7 +9132,7 @@ async fn handle_envelope(
             let high_water = ctx.db.remote_outbox_high_water(&attachment).await?;
             let envelope = Envelope {
                 v: proto::PROTOCOL_VERSION,
-                body: Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 {
+                body: Body::RemoteReplayResponse(proto::RemoteReplayResponse {
                     id,
                     events,
                     high_water_mark:
@@ -9163,7 +9142,7 @@ async fn handle_envelope(
             let _ = send_writer_envelope(writer_tx, envelope).await;
         }
         #[cfg(feature = "remote")]
-        Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+        Body::RemoteReplayAck(proto::RemoteReplayAck {
             id,
             delivery_id,
             lease_token,
@@ -9214,7 +9193,7 @@ async fn handle_envelope(
                 writer_tx,
                 Envelope {
                     v: proto::PROTOCOL_VERSION,
-                    body: Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 {
+                    body: Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponse {
                         id,
                         acked,
                     }),
@@ -9223,8 +9202,8 @@ async fn handle_envelope(
             .await;
         }
         #[cfg(feature = "remote")]
-        Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 { id, .. })
-        | Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 { id, .. }) => {
+        Body::RemoteReplayResponse(proto::RemoteReplayResponse { id, .. })
+        | Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponse { id, .. }) => {
             tracing::warn!(%id, "client sent a replay response; ignoring");
         }
         Body::Response { id, .. } => {
@@ -9788,6 +9767,13 @@ pub(crate) mod storage;
 pub(crate) mod tests;
 #[cfg(test)]
 pub(crate) use tests::{disk_test_ctx, test_ctx};
+
+// Re-exported only so `internal_version_pins` can pin these labels.
+#[cfg(test)]
+pub(crate) use dispatch::{
+    AGENT_MUTATION_UPDATE_REQUEST_DOMAIN, ASSISTANT_MUTATION_REQUEST_DOMAIN,
+    FCM2_MODEL_DIGEST_DOMAIN, USER_MESSAGE_IDENTITY_TAG,
+};
 
 pub use attachments::validate_png_attachment_blocking;
 pub(crate) use dispatch::CONFIG_PUBLICATION_RPC_LOCK;

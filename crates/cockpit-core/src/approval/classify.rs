@@ -186,17 +186,20 @@ pub struct ApprovalKey {
     pub option_names: BTreeSet<String>,
 }
 
+/// Version prefix of every persisted command-approval key (`approvals.json`).
+pub const APPROVAL_KEY_VERSION_PREFIX: &str = "v1:";
+
 impl ApprovalKey {
     /// Versioned persistence identity. JSON escaping makes the delimiter
-    /// unambiguous even for unusual quoted executable names; `v2:` ensures
-    /// every pre-shape grant fails closed instead of matching.
+    /// unambiguous even for unusual quoted executable names; the `v1:` prefix
+    /// makes any unversioned or foreign key fail closed instead of matching.
     pub fn as_storage_str(&self) -> String {
         let shape = serde_json::json!({
             "program": self.program,
             "subcommand": self.subcommand,
             "options": self.option_names,
         });
-        format!("v2:{shape}")
+        format!("{APPROVAL_KEY_VERSION_PREFIX}{shape}")
     }
 
     /// Coarse identity used only for configuration policy lookup and human

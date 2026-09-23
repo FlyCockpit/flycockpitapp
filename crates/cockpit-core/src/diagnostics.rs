@@ -867,6 +867,9 @@ fn daemon_status_label(status: crate::daemon::DaemonStatus) -> &'static str {
             "live daemon pid but socket is unreachable"
         }
         crate::daemon::DaemonStatus::UnverifiedPid => "pid identity could not be verified",
+        crate::daemon::DaemonStatus::UnrecognizedPidMetadata => {
+            "unrecognized daemon pid file metadata (possibly an older build)"
+        }
         crate::daemon::DaemonStatus::Stale => "stale daemon pid or socket",
         crate::daemon::DaemonStatus::NotRunning => "not running",
     }

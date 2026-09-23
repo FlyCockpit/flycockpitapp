@@ -8,9 +8,9 @@
  *
  * The `application` component of every registry tuple is sourced from the
  * single `PROTOCOL_VERSION` constant — never hardcoded in the registry, in any
- * fixture, or in any test. Pre-release bumps of that constant update tuple
- * `0x0001`'s recorded application component in place; `proto-version-reset-at-tag`
- * renumbers it to 1 at tag time without editing this registry.
+ * fixture, or in any test. The protocol was reset to 1 before launch; a change
+ * to that constant updates tuple `0x0001`'s recorded application component in
+ * place without editing this registry.
  *
  * New negotiation code never sniffs, aliases, or falls back: this module
  * contains no legacy-envelope parsing, no environment-defined tuples, no

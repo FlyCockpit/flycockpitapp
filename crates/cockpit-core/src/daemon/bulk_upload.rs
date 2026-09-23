@@ -56,10 +56,10 @@ pub async fn stage_opaque_user_text(
             "bulk user-message source text must not be empty".to_owned(),
         ));
     }
-    if bytes.len() > crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES {
+    if bytes.len() > crate::proto_crate::send_user_message::MAX_MESSAGE_TEXT_BYTES {
         return Err(BulkUserMessageUploadError::Usage(format!(
             "bulk user-message text exceeds the {} byte FCM2 limit",
-            crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES
+            crate::proto_crate::send_user_message::MAX_MESSAGE_TEXT_BYTES
         )));
     }
 

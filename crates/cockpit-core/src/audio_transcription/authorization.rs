@@ -137,10 +137,9 @@ impl MediaEgressTranscriptionRequest {
     }
 }
 
-/// The versioned canonical digest version. Bumped to 2 for the unambiguous
-/// length-prefixed canonical encoding (v1 used label/newline delimiters that
-/// were collision-prone under embedded newlines).
-pub const TRANSCRIPTION_REQUEST_DIGEST_VERSION: u8 = 2;
+/// The canonical digest version: the unambiguous length-prefixed encoding
+/// below, hashed after this fixed-width version byte.
+pub const TRANSCRIPTION_REQUEST_DIGEST_VERSION: u8 = 1;
 
 /// Length-prefix a variable-length field into the hasher: an 8-byte
 /// little-endian byte count, then the bytes. This makes the concatenation

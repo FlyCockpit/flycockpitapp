@@ -1,24 +1,24 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import type { CanonicalSendUserMessageV2 } from "./send-user-message-v2";
+import type { CanonicalSendUserMessage } from "./send-user-message";
 import {
   attachmentSetDigest,
-  decodeCanonicalSendUserMessageV2,
-  encodeCanonicalSendUserMessageV2,
+  decodeCanonicalSendUserMessage,
+  encodeCanonicalSendUserMessage,
   FCM2_MAX_BYTES,
   FCM2_MAX_CURRENT_ENCODING_BYTES,
   FCM2_MAX_TEXT_BYTES,
   FCM2_MAX_TEXT_SCALARS,
   hasMessageText,
   messageRequestDigest,
-  validateAuthenticatedRemoteMessageV2,
+  validateAuthenticatedRemoteMessage,
   validateFcm2Length,
-  validateLocalOwnerDirectMessageV2,
-} from "./send-user-message-v2";
+  validateLocalOwnerDirectMessage,
+} from "./send-user-message";
 
 const fixture = JSON.parse(
   readFileSync(
-    new URL("../fixtures/send-user-message-v2-canonical-vectors.json", import.meta.url),
+    new URL("../fixtures/send-user-message-canonical-vectors.json", import.meta.url),
     "utf8",
   ),
 );
@@ -62,7 +62,7 @@ function compactBytes(vector: {
   return out;
 }
 
-describe("send_user_message_v2_canonical_vectors", () => {
+describe("send_user_message_canonical_vectors", () => {
   it("matches the shared protocol-limit fixture", () => {
     expect(fixture.limits).toEqual({
       fcm2_max_bytes: FCM2_MAX_BYTES,
@@ -73,9 +73,9 @@ describe("send_user_message_v2_canonical_vectors", () => {
   });
 
   it("validates distinct UUIDv7 transport and operation identities", () => {
-    const request = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex)).request;
+    const request = decodeCanonicalSendUserMessage(fromHex(fixture.vectors[0].fcm2_hex)).request;
     const requestId = "018f47a2-7b3c-7def-8123-000000000001";
-    const envelope = validateLocalOwnerDirectMessageV2(requestId, {
+    const envelope = validateLocalOwnerDirectMessage(requestId, {
       ingress: "local_owner_direct",
       operation_id: "018f47a2-7b3c-7def-8123-000000000002",
       session_locator: "opaque-session",
@@ -84,7 +84,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
     expect(envelope.operation_id).not.toBe(request.client_submission_id);
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2(envelope.operation_id, {
+        validateLocalOwnerDirectMessage(envelope.operation_id, {
           ingress: "local_owner_direct",
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
@@ -96,7 +96,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
     requestCollision.client_submission_id = envelope.request_id;
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2(envelope.request_id, {
+        validateLocalOwnerDirectMessage(envelope.request_id, {
           ingress: "local_owner_direct",
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
@@ -108,7 +108,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
     operationCollision.client_submission_id = envelope.operation_id;
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2(envelope.request_id, {
+        validateLocalOwnerDirectMessage(envelope.request_id, {
           ingress: "local_owner_direct",
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
@@ -118,7 +118,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
     ).toBe("request, operation, and submission identities must be pairwise distinct");
     expect(
       exactError(() =>
-        validateLocalOwnerDirectMessageV2("018f47a2-7b3c-7def-0123-000000000003", {
+        validateLocalOwnerDirectMessage("018f47a2-7b3c-7def-0123-000000000003", {
           ingress: "local_owner_direct",
           operation_id: envelope.operation_id,
           session_locator: envelope.session_locator,
@@ -126,7 +126,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
         }),
       ),
     ).toBe("request_id must be UUIDv7");
-    const remote = validateAuthenticatedRemoteMessageV2(
+    const remote = validateAuthenticatedRemoteMessage(
       envelope.request_id,
       envelope.operation_id,
       {
@@ -145,7 +145,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
   });
 
   it("rejects daemon-owned provenance at both ingress boundaries", () => {
-    const request = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex)).request;
+    const request = decodeCanonicalSendUserMessage(fromHex(fixture.vectors[0].fcm2_hex)).request;
     request.origin = "auto_continue";
     const envelope = {
       request_id: "018f47a2-7b3c-7def-8123-000000000001",
@@ -154,7 +154,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
       request,
     };
     expect(() =>
-      validateLocalOwnerDirectMessageV2(envelope.request_id, {
+      validateLocalOwnerDirectMessage(envelope.request_id, {
         ingress: "local_owner_direct",
         operation_id: envelope.operation_id,
         session_locator: envelope.session_locator,
@@ -162,7 +162,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
       }),
     ).toThrow("user-message ingress origin must be external_root");
     expect(() =>
-      validateAuthenticatedRemoteMessageV2(
+      validateAuthenticatedRemoteMessage(
         envelope.request_id,
         envelope.operation_id,
         {
@@ -177,9 +177,9 @@ describe("send_user_message_v2_canonical_vectors", () => {
   it("round trips the shared bytes and digests", async () => {
     for (const vector of [...fixture.vectors, ...fixture.compact_positive_vectors]) {
       const bytes = vector.fcm2_hex ? fromHex(vector.fcm2_hex) : compactBytes(vector);
-      const decoded = decodeCanonicalSendUserMessageV2(bytes);
+      const decoded = decodeCanonicalSendUserMessage(bytes);
       expect(decoded.request.origin, vector.name).toBe("external_root");
-      expect(toHex(encodeCanonicalSendUserMessageV2(decoded)), vector.name).toBe(toHex(bytes));
+      expect(toHex(encodeCanonicalSendUserMessage(decoded)), vector.name).toBe(toHex(bytes));
       expect(toHex(await messageRequestDigest(decoded)), vector.name).toBe(
         vector.message_request_digest_hex,
       );
@@ -190,22 +190,22 @@ describe("send_user_message_v2_canonical_vectors", () => {
   });
 
   it("rejects daemon-owned provenance from canonical encode and decode", () => {
-    const external = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[1].fcm2_hex));
+    const external = decodeCanonicalSendUserMessage(fromHex(fixture.vectors[1].fcm2_hex));
     const internal = structuredClone(external);
     internal.request.origin = "auto_continue";
-    expect(() => encodeCanonicalSendUserMessageV2(internal)).toThrow(
+    expect(() => encodeCanonicalSendUserMessage(internal)).toThrow(
       "FCM2 user-message origin must be external_root",
     );
 
     const internalBytes = fromHex(fixture.vectors[1].fcm2_hex);
     internalBytes[21] = 4;
-    expect(() => decodeCanonicalSendUserMessageV2(internalBytes)).toThrow(
+    expect(() => decodeCanonicalSendUserMessage(internalBytes)).toThrow(
       "FCM2 user-message origin must be external_root",
     );
   });
 
   it("rejects shared semantic mutations with exact errors", () => {
-    const base = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[1].fcm2_hex));
+    const base = decodeCanonicalSendUserMessage(fromHex(fixture.vectors[1].fcm2_hex));
     for (const testCase of fixture.semantic_error_cases) {
       const value = structuredClone(base);
       const tag = value.request.tag_expansions[0];
@@ -216,7 +216,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
       else if (testCase.mutation === "invalid_skill") value.request.forced_skill = "bad/skill";
       else if (testCase.mutation === "multibyte_tool") tag.tool = "é".repeat(65);
       expect(
-        exactError(() => encodeCanonicalSendUserMessageV2(value)),
+        exactError(() => encodeCanonicalSendUserMessage(value)),
         testCase.name,
       ).toBe(testCase.error_code);
     }
@@ -225,16 +225,14 @@ describe("send_user_message_v2_canonical_vectors", () => {
   it("rejects every shared malformed byte sequence", () => {
     for (const malformed of fixture.malformed_fcm2)
       expect(
-        () => decodeCanonicalSendUserMessageV2(fromHex(malformed.fcm2_hex)),
+        () => decodeCanonicalSendUserMessage(fromHex(malformed.fcm2_hex)),
         malformed.name,
       ).toThrow(malformed.error);
     for (const malformed of fixture.mutation_cases) {
       const bytes = fromHex(fixture.vectors[malformed.source].fcm2_hex);
       if (malformed.offset !== undefined) bytes.set(fromHex(malformed.bytes_hex), malformed.offset);
       const input = malformed.truncate === undefined ? bytes : bytes.slice(0, malformed.truncate);
-      expect(() => decodeCanonicalSendUserMessageV2(input), malformed.name).toThrow(
-        malformed.error,
-      );
+      expect(() => decodeCanonicalSendUserMessage(input), malformed.name).toThrow(malformed.error);
     }
   });
 
@@ -245,22 +243,22 @@ describe("send_user_message_v2_canonical_vectors", () => {
   });
 
   it("rejects noncanonical UUIDs and out-of-range u64 values", () => {
-    const decoded = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex));
+    const decoded = decodeCanonicalSendUserMessage(fromHex(fixture.vectors[0].fcm2_hex));
     expect(() =>
-      encodeCanonicalSendUserMessageV2({
+      encodeCanonicalSendUserMessage({
         ...decoded,
         session_id: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
       }),
     ).toThrow(/canonical/);
     expect(() =>
-      encodeCanonicalSendUserMessageV2({ ...decoded, model_config_generation: 1n << 64n }),
+      encodeCanonicalSendUserMessage({ ...decoded, model_config_generation: 1n << 64n }),
     ).toThrow(/u64/);
   });
 
   it("encodes the exact maximum and rejects cap plus one before allocation", () => {
     const scalarMax = "a".repeat(8_388_608);
-    const decoded = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex));
-    const maximum: CanonicalSendUserMessageV2 = {
+    const decoded = decodeCanonicalSendUserMessage(fromHex(fixture.vectors[0].fcm2_hex));
+    const maximum: CanonicalSendUserMessage = {
       ...decoded,
       model_config_generation: 0xffffffffffffffffn,
       request: {
@@ -289,40 +287,40 @@ describe("send_user_message_v2_canonical_vectors", () => {
         })),
       },
     };
-    expect(encodeCanonicalSendUserMessageV2(maximum)).toHaveLength(FCM2_MAX_CURRENT_ENCODING_BYTES);
+    expect(encodeCanonicalSendUserMessage(maximum)).toHaveLength(FCM2_MAX_CURRENT_ENCODING_BYTES);
     expect(() => validateFcm2Length(FCM2_MAX_BYTES)).not.toThrow();
-    expect(() => decodeCanonicalSendUserMessageV2(new Uint8Array(FCM2_MAX_BYTES + 1))).toThrow(
+    expect(() => decodeCanonicalSendUserMessage(new Uint8Array(FCM2_MAX_BYTES + 1))).toThrow(
       "FCM2 exceeds maximum size",
     );
     maximum.request.text += "a";
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("text exceeds byte limit");
+    expect(() => encodeCanonicalSendUserMessage(maximum)).toThrow("text exceeds byte limit");
     // Four-byte scalars exhaust the byte budget before the scalar ceiling.
     maximum.request.text = "😀".repeat(2_097_153);
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("text exceeds byte limit");
+    expect(() => encodeCanonicalSendUserMessage(maximum)).toThrow("text exceeds byte limit");
     maximum.request.text = "x";
     maximum.request.display_text = `${scalarMax}a`;
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow(
+    expect(() => encodeCanonicalSendUserMessage(maximum)).toThrow(
       "display text exceeds byte limit",
     );
     maximum.request.display_text = null;
     maximum.request.tag_expansions.push(maximum.request.tag_expansions[0]!);
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("too many tags");
+    expect(() => encodeCanonicalSendUserMessage(maximum)).toThrow("too many tags");
     maximum.request.tag_expansions.pop();
     maximum.request.attachments.push(maximum.request.attachments[0]!);
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("too many attachments");
+    expect(() => encodeCanonicalSendUserMessage(maximum)).toThrow("too many attachments");
     maximum.request.attachments.pop();
     maximum.request.tag_expansions[0]!.tool += "t";
-    expect(exactError(() => encodeCanonicalSendUserMessageV2(maximum))).toBe(
+    expect(exactError(() => encodeCanonicalSendUserMessage(maximum))).toBe(
       "fcm2_tag_tool_too_long",
     );
     maximum.request.tag_expansions[0]!.tool = "t";
     maximum.request.tag_expansions[0]!.path += "p";
-    expect(exactError(() => encodeCanonicalSendUserMessageV2(maximum))).toBe(
+    expect(exactError(() => encodeCanonicalSendUserMessage(maximum))).toBe(
       "fcm2_tag_path_too_long",
     );
     maximum.request.tag_expansions[0]!.path = "p";
     maximum.request.forced_skill += "s";
-    expect(exactError(() => encodeCanonicalSendUserMessageV2(maximum))).toBe(
+    expect(exactError(() => encodeCanonicalSendUserMessage(maximum))).toBe(
       "fcm2_forced_skill_too_long",
     );
     expect(() => validateFcm2Length(FCM2_MAX_BYTES + 1)).toThrow(/maximum/);

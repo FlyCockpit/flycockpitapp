@@ -4,7 +4,7 @@ export const FCM2_MAX_BYTES = 17_439_564;
 export const FCM2_MAX_CURRENT_ENCODING_BYTES = 17_320_799;
 export const FCM2_MAX_TEXT_BYTES = 8_388_608;
 export const FCM2_MAX_TEXT_SCALARS = 8_388_608;
-export const FCM2_SCHEMA_VERSION = 4;
+export const FCM2_SCHEMA_VERSION = 1;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -38,7 +38,7 @@ export interface CanonicalQueueTarget {
   depth: bigint;
   task_call_id: string | null;
 }
-export interface SendUserMessageV2 {
+export interface SendUserMessage {
   client_submission_id: string;
   /** Required provenance, bound into canonical bytes and replay identity. */
   origin: UserMessageOrigin;
@@ -51,14 +51,14 @@ export interface SendUserMessageV2 {
   resolved_queue_target: CanonicalQueueTarget | null;
   attachments: MessageAttachmentIdentity[];
 }
-export interface CanonicalSendUserMessageV2 {
+export interface CanonicalSendUserMessage {
   session_id: string;
   canonical_project_digest: Uint8Array;
   model_config_generation: bigint;
   canonical_model_digest: Uint8Array;
-  request: SendUserMessageV2;
+  request: SendUserMessage;
 }
-interface MessageIngressEnvelopeV2 {
+interface MessageIngressEnvelope {
   session_locator: string;
   expected_model_state_generation?: number;
   expected_model?: {
@@ -68,9 +68,9 @@ interface MessageIngressEnvelopeV2 {
     thinking_mode?: string | null;
     prompt_cache_retention?: string | null;
   };
-  request: SendUserMessageV2;
+  request: SendUserMessage;
 }
-export interface LocalOwnerDirectSendUserMessageV2 extends MessageIngressEnvelopeV2 {
+export interface LocalOwnerDirectSendUserMessage extends MessageIngressEnvelope {
   ingress: "local_owner_direct";
   operation_id: string;
   run_invocation_options?: {
@@ -79,15 +79,15 @@ export interface LocalOwnerDirectSendUserMessageV2 extends MessageIngressEnvelop
     approval_mode?: "manual" | "auto" | "yolo";
   };
 }
-export interface AuthenticatedRemoteOperationEnvelopeV2 extends MessageIngressEnvelopeV2 {
+export interface AuthenticatedRemoteOperationEnvelope extends MessageIngressEnvelope {
   ingress: "authenticated_remote_operation";
 }
-export type ValidatedMessageIngressV2 =
-  | (LocalOwnerDirectSendUserMessageV2 & {
+export type ValidatedMessageIngress =
+  | (LocalOwnerDirectSendUserMessage & {
       request_id: string;
       actor: { kind: "local_owner" };
     })
-  | (AuthenticatedRemoteOperationEnvelopeV2 & {
+  | (AuthenticatedRemoteOperationEnvelope & {
       request_id: string;
       operation_id: string;
       actor: { kind: "remote_device"; id: Uint8Array; generation: bigint };
@@ -97,7 +97,7 @@ const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 function validateEnvelopeIdentities(
   requestId: string,
   operationId: string,
-  envelope: MessageIngressEnvelopeV2,
+  envelope: MessageIngressEnvelope,
 ) {
   if (!UUID_V7.test(requestId)) throw new Error("request_id must be UUIDv7");
   if (!UUID_V7.test(operationId)) throw new Error("operation_id must be UUIDv7");
@@ -115,19 +115,19 @@ function validateEnvelopeIdentities(
   if (new Set([requestId, operationId, envelope.request.client_submission_id]).size !== 3)
     throw new Error("request, operation, and submission identities must be pairwise distinct");
 }
-export function validateLocalOwnerDirectMessageV2(
+export function validateLocalOwnerDirectMessage(
   requestId: string,
-  envelope: LocalOwnerDirectSendUserMessageV2,
-): ValidatedMessageIngressV2 {
+  envelope: LocalOwnerDirectSendUserMessage,
+): ValidatedMessageIngress {
   validateEnvelopeIdentities(requestId, envelope.operation_id, envelope);
   return { ...envelope, request_id: requestId, actor: { kind: "local_owner" } };
 }
-export function validateAuthenticatedRemoteMessageV2(
+export function validateAuthenticatedRemoteMessage(
   requestId: string,
   operationId: string,
-  envelope: AuthenticatedRemoteOperationEnvelopeV2,
+  envelope: AuthenticatedRemoteOperationEnvelope,
   actor: { id: Uint8Array; generation: bigint },
-): ValidatedMessageIngressV2 {
+): ValidatedMessageIngress {
   validateEnvelopeIdentities(requestId, operationId, envelope);
   if (
     actor.id.length !== 16 ||
@@ -243,7 +243,7 @@ const originFromCode = (code: number): UserMessageOrigin => {
   if (!origin) throw new Error("invalid user message origin");
   return origin;
 };
-function validate(v: CanonicalSendUserMessageV2) {
+function validate(v: CanonicalSendUserMessage) {
   uuid(v.session_id);
   uuid(v.request.client_submission_id);
   if (v.request.origin !== "external_root")
@@ -361,7 +361,7 @@ class Writer {
     return out;
   }
 }
-export function encodeCanonicalSendUserMessageV2(v: CanonicalSendUserMessageV2) {
+export function encodeCanonicalSendUserMessage(v: CanonicalSendUserMessage) {
   validate(v);
   const w = new Writer();
   w.raw(Uint8Array.of(70, 67, 77, 50));
@@ -461,7 +461,7 @@ class Reader {
     return this.text(this.u32());
   }
 }
-export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUserMessageV2 {
+export function decodeCanonicalSendUserMessage(b: Uint8Array): CanonicalSendUserMessage {
   validateFcm2Length(b.length);
   const r = new Reader(b);
   if (r.text(4) !== "FCM2" || r.u8() !== FCM2_SCHEMA_VERSION)
@@ -546,15 +546,15 @@ export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUs
 async function sha256(b: Uint8Array) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(b).buffer));
 }
-export async function messageRequestDigest(v: CanonicalSendUserMessageV2) {
-  const domain = encoder.encode("flycockpit-send-user-message-v2\0"),
-    body = encodeCanonicalSendUserMessageV2(v),
+export async function messageRequestDigest(v: CanonicalSendUserMessage) {
+  const domain = encoder.encode("flycockpit-send-user-message-v1\0"),
+    body = encodeCanonicalSendUserMessage(v),
     all = new Uint8Array(domain.length + body.length);
   all.set(domain);
   all.set(body, domain.length);
   return sha256(all);
 }
-export async function attachmentSetDigest(v: CanonicalSendUserMessageV2) {
+export async function attachmentSetDigest(v: CanonicalSendUserMessage) {
   validate(v);
   const w = new Writer();
   w.u8(v.request.attachments.length);

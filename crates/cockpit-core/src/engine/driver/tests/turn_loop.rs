@@ -1217,12 +1217,12 @@ async fn oversized_user_provider_projection_replaces_the_full_source_with_its_ty
     assert!(source.len() > 64 * 1024);
     let operation_id = uuid::Uuid::new_v4();
     let client_submission_id = uuid::Uuid::new_v4();
-    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+    let canonical = crate::proto_crate::send_user_message::CanonicalSendUserMessage {
         session_id: driver.session.id,
         canonical_project_digest: [1; 32],
         model_config_generation: 0,
         canonical_model_digest: [2; 32],
-        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+        request: crate::proto_crate::send_user_message::SendUserMessage {
             client_submission_id,
             origin: crate::proto_crate::UserMessageOrigin::ExternalRoot,
             text: source.clone(),

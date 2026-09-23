@@ -18,6 +18,11 @@ use cockpit_config::config::sandbox_mode::{SandboxIntent, SandboxMode};
 
 pub const AGENT_EFFECTIVE_SETTINGS_DTO_VERSION: u32 = 1;
 
+/// Hash domain of [`focused_model_binding_choice_id`]'s digest preimage.
+pub const FOCUSED_MODEL_ROUTE_DIGEST_DOMAIN: &[u8] = b"flycockpit-focused-model-route-v1\0";
+/// Wire prefix of every focused-model binding choice id.
+pub const FOCUSED_BINDING_CHOICE_ID_PREFIX: &str = "focused-binding-v1-";
+
 /// Opaque wire identity for one focused node route. The profile handle is
 /// included only in this one-way digest preimage: the returned value cannot
 /// reveal it, while two credential profiles with the same display provider
@@ -28,14 +33,15 @@ pub fn focused_model_binding_choice_id(
     model_id: &str,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"flycockpit-focused-model-route-v2\0");
+    digest.update(FOCUSED_MODEL_ROUTE_DIGEST_DOMAIN);
     for component in [provider_profile_handle, provider_id, model_id] {
         digest.update((component.len() as u64).to_be_bytes());
         digest.update(component.as_bytes());
     }
     let digest = digest.finalize();
-    let mut encoded = String::with_capacity(19 + digest.len() * 2);
-    encoded.push_str("focused-binding-v2-");
+    let mut encoded =
+        String::with_capacity(FOCUSED_BINDING_CHOICE_ID_PREFIX.len() + digest.len() * 2);
+    encoded.push_str(FOCUSED_BINDING_CHOICE_ID_PREFIX);
     for byte in digest {
         use std::fmt::Write as _;
         write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
@@ -405,7 +411,7 @@ mod tests {
         let first = focused_model_binding_choice_id("profile-secret-a", "openai", "gpt");
         let second = focused_model_binding_choice_id("profile-secret-b", "openai", "gpt");
         assert_ne!(first, second);
-        assert!(first.starts_with("focused-binding-v2-"));
+        assert!(first.starts_with("focused-binding-v1-"));
         assert!(!first.contains("profile-secret-a"));
         assert!(!first.contains("openai"));
         assert!(!first.contains("gpt"));

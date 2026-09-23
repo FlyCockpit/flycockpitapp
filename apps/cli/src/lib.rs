@@ -32,7 +32,7 @@ pub(crate) mod daemon {
         capture_restart_release, daemon_pid, derive_restart_no_sandbox, discover, proto,
         restart_release_timeout, run_foreground, run_foreground_with_resume, send_current_event,
         server, session_worker, spawn_detached_with_resume_async, stop_with_timeout, terminal,
-        wait_for_restart_release,
+        unrecognized_pid_metadata_error, wait_for_restart_release,
     };
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{
@@ -266,7 +266,6 @@ pub mod integration {
                     false,
                     interactive,
                     None,
-                    self.inner.negotiated().version,
                     None,
                     crate::env_snapshot::EnvDriftPolicy::default(),
                 ),
@@ -276,7 +275,6 @@ pub mod integration {
                     false,
                     interactive,
                     None,
-                    self.inner.negotiated().version,
                     None,
                     crate::env_snapshot::EnvDriftPolicy::default(),
                 ),
@@ -345,7 +343,7 @@ pub mod integration {
             let tag_expansions: Vec<_> = tag_expansions
                 .into_iter()
                 .map(|(tool, path, detail, ok)| {
-                    crate::daemon::proto::send_user_message_v2::MessageTagExpansion {
+                    crate::daemon::proto::send_user_message::MessageTagExpansion {
                         tool,
                         path,
                         detail,
@@ -367,27 +365,26 @@ pub mod integration {
             );
             match self
                 .inner
-                .request_ok(crate::daemon::proto::Request::SendUserMessageV2 {
-                    ingress:
-                        crate::daemon::proto::send_user_message_v2::MessageIngressV2::local_direct(
-                            Uuid::now_v7(),
-                            session_id.to_string(),
-                            None,
-                            None,
-                            None,
-                            crate::daemon::proto::send_user_message_v2::SendUserMessageV2 {
-                                client_submission_id,
-                                origin: Default::default(),
-                                text,
-                                display_text,
-                                tag_expansions,
-                                forced_skill: None,
-                                delivery_class_override: None,
-                                resolved_delivery_class: None,
-                                resolved_queue_target: None,
-                                attachments: Vec::new(),
-                            },
-                        ),
+                .request_ok(crate::daemon::proto::Request::SendUserMessage {
+                    ingress: crate::daemon::proto::send_user_message::MessageIngress::local_direct(
+                        Uuid::now_v7(),
+                        session_id.to_string(),
+                        None,
+                        None,
+                        None,
+                        crate::daemon::proto::send_user_message::SendUserMessage {
+                            client_submission_id,
+                            origin: Default::default(),
+                            text,
+                            display_text,
+                            tag_expansions,
+                            forced_skill: None,
+                            delivery_class_override: None,
+                            resolved_delivery_class: None,
+                            resolved_queue_target: None,
+                            attachments: Vec::new(),
+                        },
+                    ),
                 })
                 .await?
             {

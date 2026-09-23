@@ -309,7 +309,8 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const DIRECTORY_SECURITY_ACCESS: u32 = 0x0002_0000 | 0x0004_0000 | 0x0010_0000 | 0x0000_0080;
+    const DIRECTORY_SECURITY_ACCESS: u32 =
+        0x0002_0000 | 0x0004_0000 | 0x0008_0000 | 0x0010_0000 | 0x0000_0080;
 
     reject_windows_reparse_components(path)?;
     std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
@@ -319,7 +320,9 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     // need the lease retain their own handle after this preflight.
     let directory = std::fs::OpenOptions::new()
         .read(true)
-        // READ_CONTROL | WRITE_DAC | SYNCHRONIZE | FILE_READ_ATTRIBUTES.
+        // READ_CONTROL | WRITE_DAC | WRITE_OWNER | SYNCHRONIZE |
+        // FILE_READ_ATTRIBUTES. WRITE_OWNER lets the repair name the current
+        // user as owner (see `set_private_windows_dacl_handle`).
         .access_mode(DIRECTORY_SECURITY_ACCESS)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
@@ -400,7 +403,8 @@ pub(crate) fn repair_private_file(path: &Path, label: &str) -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_SECURITY_ACCESS: u32 = 0xC000_0000 | 0x0002_0000 | 0x0004_0000;
+    // GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER.
+    const FILE_SECURITY_ACCESS: u32 = 0xC000_0000 | 0x0002_0000 | 0x0004_0000 | 0x0008_0000;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -462,9 +466,15 @@ pub(crate) fn set_private_windows_dacl_handle(file: &std::fs::File) -> Result<()
     }
 
     const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 1;
     const DACL_SECURITY_INFORMATION: u32 = 4;
     const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
 
+    // The verifier requires the current user as owner. An elevated
+    // administrator token creates objects owned by BUILTIN\Administrators,
+    // so the owner is set explicitly alongside the protected DACL; the
+    // token's user SID is always assignable as owner without privilege, and
+    // it narrows (never widens) who holds implicit owner rights.
     let sid = current_windows_user_sid()?;
     let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
     let wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
@@ -495,8 +505,10 @@ pub(crate) fn set_private_windows_dacl_handle(file: &std::fs::File) -> Result<()
         SetSecurityInfo(
             file.as_raw_handle(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
             std::ptr::null_mut(),
             dacl,
             std::ptr::null_mut(),
@@ -595,18 +607,65 @@ fn validate_private_windows_sddl(sddl: &str) -> Result<()> {
         .filter_map(|value| value.split(')').next())
         .collect::<Vec<_>>();
     let current_user = current_windows_user_sid()?;
+    // SIDs are compared structurally: the SDDL renderer abbreviates
+    // well-known account SIDs to aliases (e.g. `LA` for the built-in local
+    // Administrator), so the owner/ACE text may differ from the token user's
+    // `S-1-5-21-...` spelling while denoting the same principal.
     anyhow::ensure!(
         sddl.contains("D:P")
             && sddl.matches('(').count() == 2
             && sddl.matches("(A;").count() == 2
-            && owner == Some(current_user.as_str())
-            && ace_sids.contains(&current_user.as_str())
+            && owner.is_some_and(|owner| sid_text_denotes(owner, &current_user))
+            && ace_sids
+                .iter()
+                .any(|sid| sid_text_denotes(sid, &current_user))
             && ace_sids
                 .iter()
                 .any(|sid| *sid == "SY" || *sid == "S-1-5-18"),
         "database object DACL is not protected current-user-and-SYSTEM-only full control"
     );
     Ok(())
+}
+
+/// Whether two SDDL SID tokens (`S-1-...` strings or SDDL aliases such as
+/// `LA`/`SY`) denote the same SID. Unparseable tokens never match.
+#[cfg(windows)]
+fn sid_text_denotes(left: &str, right: &str) -> bool {
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut *mut core::ffi::c_void) -> i32;
+        fn EqualSid(left: *mut core::ffi::c_void, right: *mut core::ffi::c_void) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    if left == right {
+        return true;
+    }
+    let convert = |text: &str| -> Option<*mut core::ffi::c_void> {
+        let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        let mut sid = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated and the out-pointer is valid; a
+        // successful conversion returns a LocalAlloc'd SID freed below.
+        (unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } != 0 && !sid.is_null())
+            .then_some(sid)
+    };
+    let Some(left_sid) = convert(left) else {
+        return false;
+    };
+    let Some(right_sid) = convert(right) else {
+        unsafe { LocalFree(left_sid) };
+        return false;
+    };
+    // SAFETY: both SIDs came from ConvertStringSidToSidW and are freed once.
+    let equal = unsafe { EqualSid(left_sid, right_sid) } != 0;
+    unsafe {
+        LocalFree(left_sid);
+        LocalFree(right_sid);
+    }
+    equal
 }
 
 #[cfg(windows)]

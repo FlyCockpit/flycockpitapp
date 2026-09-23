@@ -7450,7 +7450,7 @@ mod tests {
         assert!(agent["result_revision"].is_string());
         assert_eq!(agent["consumed_config_generation"], 7);
         assert_eq!(agent["result_config_generation"], 8);
-        assert_eq!(agent["config_generation"], 8);
+        assert!(agent.get("config_generation").is_none());
         assert_eq!(
             fixture["agent_editor_lease_completed"]["data"]["status"]["outcome"]["status"],
             "reconciled"

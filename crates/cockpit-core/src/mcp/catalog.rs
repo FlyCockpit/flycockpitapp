@@ -479,7 +479,6 @@ pub async fn invoke(
         "endpoint": &server_cfg.endpoint,
         "command": &server_cfg.command,
         "args": &server_cfg.args,
-        "mode": format!("{:?}", server_cfg.mode),
         "auth_kind": server_cfg.auth.kind_str(),
         "oauth_scopes": oauth_scopes,
         "profile": entry.profile,

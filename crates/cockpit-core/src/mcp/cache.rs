@@ -137,7 +137,6 @@ mod tests {
             env: BTreeMap::new(),
             env_credential_refs: BTreeMap::new(),
             auth: Default::default(),
-            mode: Default::default(),
             enabled: true,
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,

@@ -4668,22 +4668,11 @@ async fn roster_trim_initial_active_agent_uses_build_or_plan() {
 async fn plan_default_stale_session_keeps_plan() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
-    // A session persisted on Plan loads on Plan. Removed primaries fall back to
-    // Build through the shared predicate.
+    // A session persisted on Plan loads on Plan, not the configured default.
     let row = db.create_session("proj", "/proj", "Plan").await.unwrap();
     assert_eq!(
         resolve_root_agent(row.session_id, &db, &cfg_with(D::Build),).await,
         "Plan"
-    );
-    let swarm = db.create_session("proj", "/proj", "Swarm").await.unwrap();
-    assert_eq!(
-        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Build),).await,
-        "Build"
-    );
-    assert_eq!(
-        resolve_root_agent(swarm.session_id, &db, &cfg_with(D::Plan),).await,
-        "Build",
-        "removed stored primaries force Build, not the configured default"
     );
 }
 

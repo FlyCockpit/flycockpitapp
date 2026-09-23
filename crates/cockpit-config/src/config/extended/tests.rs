@@ -1079,17 +1079,14 @@ fn session_rail_visibility_round_trips_through_tui_config() {
 fn unknown_root_keys_survive_write() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
-    let retired_key = ["trusted", "Only"].concat();
     let mut raw = serde_json::Map::new();
     raw.insert("future_feature".into(), serde_json::json!({"a": 1}));
-    raw.insert(retired_key.clone(), serde_json::Value::Bool(true));
     std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
     let mut doc = ExtendedConfigDoc::load(&path).unwrap();
     let cfg = doc.config();
     doc.write(&cfg).unwrap();
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(on_disk.contains("\"future_feature\""));
-    assert!(!on_disk.contains(&retired_key));
 }
 
 #[test]

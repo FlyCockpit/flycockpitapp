@@ -422,6 +422,7 @@ where
     deserialize_bounded_optional_string::<MAX_OWNER_PROVIDER_MODEL_ID_BYTES, D>(deserializer)
 }
 
+#[cfg(any(feature = "extended", feature = "remote"))]
 fn deserialize_owner_provider_metadata_json<'de, D>(
     deserializer: D,
 ) -> std::result::Result<String, D::Error>

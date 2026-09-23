@@ -690,10 +690,16 @@ pub fn owner_capability_path_for_socket(control_socket: &Path) -> PathBuf {
     }
 }
 
-fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
+/// Keep a deny list minimal: skip a path already covered by a denied ancestor
+/// and drop entries the new path covers. bwrap masks a denied directory with a
+/// read-only tmpfs, so a nested deny would need a mkdir inside that mask and
+/// fail every sandboxed command with EROFS; the ancestor already denies it.
+pub(crate) fn push_unique_deny_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if paths.iter().any(|existing| path.starts_with(existing)) {
+        return;
     }
+    paths.retain(|existing| !existing.starts_with(&path));
+    paths.push(path);
 }
 
 fn state_dir() -> Option<PathBuf> {

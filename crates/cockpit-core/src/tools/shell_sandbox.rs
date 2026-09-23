@@ -493,17 +493,19 @@ pub async fn build_sandboxed_command_with_visibility_root(
     // (socket, leak-reveal socket, owner-capability file). Deny takes
     // precedence over cwd/PATH/extra allow lists. Follow-up #337 replaces
     // blanket Owner with authenticated per-peer identity.
-    let mut control_denies = policy.deny_paths.clone();
-    for path in denied_paths {
-        if !control_denies.iter().any(|existing| existing == path) {
-            control_denies.push(path.clone());
-        }
+    let mut control_denies = Vec::new();
+    for path in policy.deny_paths.iter().chain(denied_paths) {
+        crate::daemon::push_unique_deny_path(&mut control_denies, path.clone());
     }
     for path in &control_denies {
         sandbox = sandbox.deny_read(path.clone()).deny_write(path.clone());
     }
+    // A write deny under a fully denied ancestor is already covered, and would
+    // need a mount point inside the ancestor's read-only mask.
     for path in write_denied_paths {
-        sandbox = sandbox.deny_write(path.clone());
+        if !control_denies.iter().any(|denied| path.starts_with(denied)) {
+            sandbox = sandbox.deny_write(path.clone());
+        }
     }
 
     if workspace_write_allowed
@@ -1292,6 +1294,86 @@ printf 'marker=%s cap=%s sock=%s connected=%s\n' "$marker" "$cap" "$sock" "$conn
             stdout.contains("connected=0"),
             "confined child must not connect to the daemon socket: stdout={stdout:?} stderr={stderr:?}"
         );
+    }
+
+    /// With an XDG runtime root the rendezvous dir nests under the denied
+    /// `$XDG_RUNTIME_DIR/cockpit`. bwrap masks a denied dir with a read-only
+    /// tmpfs, so a nested deny made every sandboxed command fail with
+    /// "Can't mkdir …: Read-only file system" once the daemon was running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nested_control_plane_denies_collapse_and_confined_child_runs() {
+        init();
+        let env = crate::test_env::lock_async().await;
+
+        let cwd = tempfile::tempdir().unwrap();
+        // Short root so the rendezvous socket fits `sun_path` and stays under
+        // the runtime root instead of falling back beneath TMPDIR.
+        let runtime_root = tempfile::tempdir_in("/tmp").unwrap();
+        let state_home = cwd.path().join("xdg-state");
+        let data_home = cwd.path().join("xdg-data");
+        std::fs::create_dir_all(&state_home).unwrap();
+        std::fs::create_dir_all(&data_home).unwrap();
+        env.set_var("XDG_RUNTIME_DIR", runtime_root.path());
+        env.set_var("XDG_STATE_HOME", &state_home);
+        env.set_var("XDG_DATA_HOME", &data_home);
+
+        let canonical = crate::daemon::DaemonPaths::resolve_canonical()
+            .expect("resolve daemon control plane under the runtime root");
+        let rendezvous = canonical.socket.parent().unwrap().to_path_buf();
+        assert!(
+            rendezvous.starts_with(runtime_root.path().join("cockpit")),
+            "rendezvous must nest under the runtime cockpit dir: {rendezvous:?}"
+        );
+        std::fs::create_dir_all(&rendezvous).unwrap();
+
+        let denied = crate::daemon::control_plane_deny_paths();
+        for (i, outer) in denied.iter().enumerate() {
+            for (j, inner) in denied.iter().enumerate() {
+                assert!(
+                    i == j || !inner.starts_with(outer),
+                    "deny list must not nest {inner:?} under {outer:?}: {denied:?}"
+                );
+            }
+        }
+        assert!(
+            denied.iter().any(|path| rendezvous.starts_with(path)),
+            "rendezvous must stay covered by a denied ancestor: {denied:?}"
+        );
+
+        let session_env = std::collections::HashMap::from([(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        )]);
+        let mut cmd = build_sandboxed_command(
+            "printf confined-ok",
+            cwd.path(),
+            None,
+            &[],
+            &session_env,
+            &[],
+            None,
+        )
+        .await
+        .expect("sandbox command builds");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output())
+            .await
+            .expect("confined child must not hang")
+            .expect("spawn confined child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Can't mkdir"),
+            "nested deny mounts must not break the sandbox: stderr={stderr:?}"
+        );
+        if output.status.success() {
+            assert_eq!(stdout, "confined-ok");
+        }
+        // Otherwise the host cannot create the sandbox at all (for example a
+        // restricted user namespace); that path is covered by the probe tests.
     }
 
     #[cfg(target_os = "linux")]

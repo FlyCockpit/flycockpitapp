@@ -2588,22 +2588,16 @@ impl App {
         let generation = self.startup_background.generation;
         // The daemon's update notice lives in its process. Run the check here
         // as well so this interactive process can render the result. Channel
-        // resolution reads installation config, so it stays off the draw path
-        // inside a tracked action that exit cancels.
-        self.async_actions.start(
-            crate::tui::async_action::AsyncActionKind::Internal("startup.update-check"),
-            crate::tui::async_action::AsyncActionPolicy::Dedupe(
-                crate::tui::async_action::AsyncActionKey::new("startup.update-check"),
-            ),
-            async move {
-                if let Ok(channel) = cockpit_core::updater::effective_update_channel()
-                    && cockpit_core::updater::update_checks_enabled(channel)
-                {
-                    let _ = cockpit_core::updater::run_startup_check(channel).await;
-                }
-                Ok(crate::tui::async_action::AsyncActionPayload::Unit)
-            },
-        );
+        // resolution reads installation config, so it stays off the draw
+        // path; it is detached from the action tracker because its result is
+        // published through the updater's notice slot, not an action payload.
+        crate::tui::async_action::spawn_action_task(async move {
+            if let Ok(channel) = cockpit_core::updater::effective_update_channel()
+                && cockpit_core::updater::update_checks_enabled(channel)
+            {
+                let _ = cockpit_core::updater::run_startup_check(channel).await;
+            }
+        });
         // The first authority operation is isolated in the action runner so
         // an exit before the worker begins has no configuration I/O.  It
         // reads only `daemon.background_agents`; project configuration is not

@@ -567,8 +567,7 @@ async fn startup_background_tasks_are_explicitly_started_after_construction() {
     app.start_startup_background_tasks_with_policy(std::future::pending());
 
     assert!(app.startup_background.started);
-    // Lifetime policy plus the tracked update check.
-    assert_eq!(app.async_actions.pending_count(), 2);
+    assert_eq!(app.async_actions.pending_count(), 1);
 }
 
 #[test]
@@ -642,8 +641,7 @@ fn blocked_export_recovery_cannot_block_first_draw_or_input_ready() {
     app.schedule_startup_export_recovery(std::future::pending());
 
     assert!(app.first_paint_completed);
-    // Lifetime policy, tracked update check, and export recovery.
-    assert_eq!(app.async_actions.pending_count(), 3);
+    assert_eq!(app.async_actions.pending_count(), 2);
     assert!(app.startup_lifecycle.is_none());
     assert!(app.agent_runner.is_none());
 }

@@ -105,13 +105,37 @@ impl DaemonBootConfig {
         if let Some(path) = &self.secret_store_path {
             validate_absolute_clean_path("secret_store_path", path)?;
         }
-        for (name, path) in [
-            ("docker_env", &self.container_probe_paths.docker_env),
-            ("container_env", &self.container_probe_paths.container_env),
-            ("init_cgroup", &self.container_probe_paths.init_cgroup),
-            ("self_mountinfo", &self.container_probe_paths.self_mountinfo),
+        let defaults = DaemonContainerProbePaths::default();
+        for (name, path, default) in [
+            (
+                "docker_env",
+                &self.container_probe_paths.docker_env,
+                &defaults.docker_env,
+            ),
+            (
+                "container_env",
+                &self.container_probe_paths.container_env,
+                &defaults.container_env,
+            ),
+            (
+                "init_cgroup",
+                &self.container_probe_paths.init_cgroup,
+                &defaults.init_cgroup,
+            ),
+            (
+                "self_mountinfo",
+                &self.container_probe_paths.self_mountinfo,
+                &defaults.self_mountinfo,
+            ),
         ] {
-            validate_absolute_clean_path(name, path)?;
+            // The built-in probes are fixed Linux container markers. They are
+            // root-anchored, but on Windows a path without a drive prefix is
+            // not `is_absolute`, so the unconfigured default would otherwise
+            // fail every Windows daemon boot. Only operator-supplied overrides
+            // must satisfy the absolute-path rule.
+            if path != default {
+                validate_absolute_clean_path(name, path)?;
+            }
             match std::fs::symlink_metadata(path) {
                 Ok(metadata) => anyhow::ensure!(
                     metadata.file_type().is_file(),
@@ -326,7 +350,14 @@ mod tests {
                 .contains("absolute")
         );
 
-        boot.secret_store_path = Some(PathBuf::from("/safe/../escape"));
+        // Rooted with a drive prefix on Windows, where `/safe` alone is not
+        // absolute and would be rejected before the traversal check.
+        let safe_root = if cfg!(windows) {
+            PathBuf::from(r"C:\safe")
+        } else {
+            PathBuf::from("/safe")
+        };
+        boot.secret_store_path = Some(safe_root.join("..").join("escape"));
         assert!(
             boot.validate_paths()
                 .unwrap_err()

@@ -223,7 +223,7 @@ fn retained_config_only_target(
     write_layer(&config_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
     let config_path = config_dir.join("config.json");
     let target = RetainedEffectiveDefaultTarget::new(
-        std::fs::File::open(&config_dir).unwrap(),
+        crate::config::files::open_directory_handle_nofollow(&config_dir).unwrap(),
         std::ffi::OsString::from("config.json"),
         journal_path_for_config(&config_path)
             .file_name()
@@ -811,7 +811,7 @@ fn retained_config_only_recovery_matches_prepared_and_committed_journal_contract
         write_layer(&config_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
         let config_path = config_dir.join("config.json");
         let target = RetainedEffectiveDefaultTarget::new(
-            std::fs::File::open(&config_dir).unwrap(),
+            crate::config::files::open_directory_handle_nofollow(&config_dir).unwrap(),
             std::ffi::OsString::from("config.json"),
             journal_path_for_config(&config_path)
                 .file_name()
@@ -1029,7 +1029,7 @@ fn ambient_recovery_reclassifies_a_replaced_journal_before_touching_retained_sid
         &[("old", "a"), ("new", "b")],
     );
     let retained_target = RetainedEffectiveDefaultTarget::new(
-        std::fs::File::open(&replacement_dir).unwrap(),
+        crate::config::files::open_directory_handle_nofollow(&replacement_dir).unwrap(),
         std::ffi::OsString::from("config.json"),
         journal_path_for_config(&live_config)
             .file_name()
@@ -1144,7 +1144,7 @@ fn ambient_mutation_keeps_probe_and_lock_on_captured_a_after_path_becomes_b() {
         &[("old", "a"), ("new", "b")],
     );
     let retained_target = RetainedEffectiveDefaultTarget::new(
-        std::fs::File::open(&replacement_dir).unwrap(),
+        crate::config::files::open_directory_handle_nofollow(&replacement_dir).unwrap(),
         std::ffi::OsString::from("config.json"),
         journal_path_for_config(&live_config)
             .file_name()
@@ -1305,7 +1305,7 @@ fn retained_commit_keeps_journal_until_terminal_finalization() {
     write_layer(&config_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
     let config_path = config_dir.join("config.json");
     let target = RetainedEffectiveDefaultTarget::new(
-        std::fs::File::open(&config_dir).unwrap(),
+        crate::config::files::open_directory_handle_nofollow(&config_dir).unwrap(),
         std::ffi::OsString::from("config.json"),
         journal_path_for_config(&config_path)
             .file_name()
@@ -1377,7 +1377,7 @@ fn retained_receipt_marker_makes_post_receipt_recovery_cleanup_only() {
     write_layer(&config_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
     let config_path = config_dir.join("config.json");
     let target = RetainedEffectiveDefaultTarget::new(
-        std::fs::File::open(&config_dir).unwrap(),
+        crate::config::files::open_directory_handle_nofollow(&config_dir).unwrap(),
         std::ffi::OsString::from("config.json"),
         journal_path_for_config(&config_path)
             .file_name()

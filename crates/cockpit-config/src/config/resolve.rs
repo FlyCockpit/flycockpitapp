@@ -38,26 +38,42 @@ use anyhow::{Context, Result};
 #[cfg(any(test, feature = "test-support"))]
 use cockpit_test_support::home_isolation::{CockpitHomeKind, finalize_test_cockpit_path};
 
+/// An explicit XDG base-directory override, honored on every platform so the
+/// config, data, and state roots follow one rule. Per the XDG spec a relative
+/// value is ignored; a value with no root would otherwise resolve against the
+/// process cwd and let the working directory choose the user-global layer.
+fn xdg_base_override(variable: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(variable)?;
+    if value.to_string_lossy().trim().is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    path.has_root().then_some(path)
+}
+
 pub(crate) fn cockpit_config_dir_unchecked() -> Result<PathBuf> {
+    // `dirs::config_dir()` already honors XDG_CONFIG_HOME on Linux but not on
+    // Windows (FOLDERID_RoamingAppData) or macOS (Application Support); the
+    // data and state roots below honor their XDG overrides everywhere, so the
+    // config root does too.
+    if let Some(base) = xdg_base_override("XDG_CONFIG_HOME") {
+        return Ok(base.join("cockpit"));
+    }
     let base = dirs::config_dir().context("could not locate user config dir")?;
     Ok(base.join("cockpit"))
 }
 
 pub(crate) fn cockpit_data_dir_unchecked() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_DATA_HOME")
-        && !s.trim().is_empty()
-    {
-        return Ok(PathBuf::from(s).join("cockpit"));
+    if let Some(base) = xdg_base_override("XDG_DATA_HOME") {
+        return Ok(base.join("cockpit"));
     }
     let base = dirs::data_dir().context("could not locate user data dir")?;
     Ok(base.join("cockpit"))
 }
 
 pub(crate) fn cockpit_state_dir_unchecked() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("XDG_STATE_HOME")
-        && !s.trim().is_empty()
-    {
-        return Ok(PathBuf::from(s).join("cockpit"));
+    if let Some(base) = xdg_base_override("XDG_STATE_HOME") {
+        return Ok(base.join("cockpit"));
     }
     #[cfg(unix)]
     {
@@ -73,8 +89,10 @@ pub(crate) fn cockpit_state_dir_unchecked() -> Result<PathBuf> {
 
 /// Platform-default global configuration directory.
 ///
-/// This is `~/.config/cockpit` on Linux (respecting `XDG_CONFIG_HOME`) and
-/// the platform configuration location elsewhere. It is intentionally
+/// A rooted `XDG_CONFIG_HOME` wins on every platform (as `XDG_DATA_HOME` and
+/// `XDG_STATE_HOME` do for the data and state roots). Otherwise this is
+/// `~/.config/cockpit` on Linux and the platform configuration location
+/// elsewhere (`%APPDATA%\cockpit` on Windows). It is intentionally
 /// separate from workspace `.cockpit/` directories: workspace trust controls
 /// only those project-local layers, never this user-owned global directory.
 pub fn cockpit_config_dir() -> Result<PathBuf> {

@@ -1059,11 +1059,16 @@ pub(crate) fn read_file_nofollow_with_identity(
     let file = {
         use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, SYNCHRONIZE,
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE,
         };
         let mut access = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
         if writable {
             access |= FILE_WRITE_DATA;
+        }
+        if enforce_private {
+            // `verify_windows_protected_dacl` reads the owner and DACL
+            // through this handle.
+            access |= READ_CONTROL;
         }
         match open_windows_relative_nofollow(&parent, &file_name, false, access, FILE_OPEN) {
             Ok(file) => file,
@@ -1723,6 +1728,31 @@ pub(crate) fn open_retained_child_directory_optional(
     }
 }
 
+/// Reopen a retained directory handle for enumeration.
+///
+/// Retained directory capabilities are opened with traversal/attribute rights
+/// only, while `FileIdBothDirectory*` enumeration requires
+/// FILE_LIST_DIRECTORY. The listing handle is a relative open of the *same*
+/// directory object with an empty name (the `ReOpenFile` form): the kernel
+/// resolves no pathname, so a rename or reparse-point swap of the original
+/// spelling cannot redirect enumeration — the Windows analogue of
+/// `fdopendir(dup(fd))` on Unix. Access is checked against the directory's
+/// own DACL as for any open.
+#[cfg(windows)]
+fn open_windows_directory_listing(directory: &std::fs::File) -> Result<std::fs::File> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_LIST_DIRECTORY, SYNCHRONIZE};
+
+    open_windows_relative_nofollow(
+        directory,
+        std::ffi::OsStr::new(""),
+        true,
+        FILE_LIST_DIRECTORY | SYNCHRONIZE,
+        FILE_OPEN,
+    )
+    .context("reopening retained directory for enumeration")
+}
+
 #[cfg(windows)]
 fn retained_directory_names(directory: &std::fs::File) -> Result<Vec<std::ffi::OsString>> {
     use std::os::windows::ffi::OsStringExt as _;
@@ -1732,6 +1762,7 @@ fn retained_directory_names(directory: &std::fs::File) -> Result<Vec<std::ffi::O
         FILE_ID_BOTH_DIR_INFO, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
         GetFileInformationByHandleEx,
     };
+    let listing = open_windows_directory_listing(directory)?;
     let mut names = Vec::new();
     let mut restart = true;
     loop {
@@ -1743,7 +1774,7 @@ fn retained_directory_names(directory: &std::fs::File) -> Result<Vec<std::ffi::O
         };
         let ok = unsafe {
             GetFileInformationByHandleEx(
-                directory.as_raw_handle(),
+                listing.as_raw_handle(),
                 class,
                 buffer.as_mut_ptr().cast(),
                 buffer.len() as u32,
@@ -2021,6 +2052,7 @@ fn snapshot_markdown_directory(
     if depth > limits.max_depth {
         anyhow::bail!("knowledge snapshot exceeds its directory depth limit");
     }
+    let listing = open_windows_directory_listing(directory)?;
     let mut names = Vec::new();
     let mut restart = true;
     loop {
@@ -2032,7 +2064,7 @@ fn snapshot_markdown_directory(
         };
         let ok = unsafe {
             GetFileInformationByHandleEx(
-                directory.as_raw_handle(),
+                listing.as_raw_handle(),
                 class,
                 buffer.as_mut_ptr().cast(),
                 buffer.len() as u32,
@@ -2072,10 +2104,15 @@ fn snapshot_markdown_directory(
             .filter(|entries| *entries <= limits.max_entries)
             .ok_or_else(|| anyhow::anyhow!("knowledge snapshot exceeds its entry limit"))?;
         let child_relative = relative.join(&name);
+        // The enumeration's directory attribute selects the open shape:
+        // NtCreateFile with FILE_NON_DIRECTORY_FILE on a directory fails with
+        // STATUS_FILE_IS_A_DIRECTORY (surfaced as "Access is denied"). A
+        // concurrent type swap makes the open fail closed; the metadata check
+        // below still decides how the opened object is treated.
         let child = open_windows_relative_nofollow(
             directory,
             &name,
-            false,
+            directory_hint,
             if directory_hint {
                 FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
             } else {
@@ -2395,12 +2432,16 @@ fn open_private_lock_file_at(
         FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, SYNCHRONIZE,
     };
 
-    let file = open_windows_relative_nofollow(
+    // A newly created lock leaf is private (the Unix path creates it 0600);
+    // the descriptor is ignored when the leaf already exists.
+    let security = WindowsPrivateSecurityDescriptor::new(false)?;
+    let file = open_windows_relative_nofollow_with_security(
         parent,
         name,
         false,
         FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         FILE_OPEN_IF,
+        Some(&security),
     )
     .with_context(|| format!("opening config mutation lock {}", display_path.display()))?;
     reject_windows_reparse_handle(&file, display_path)?;
@@ -2469,9 +2510,12 @@ impl PreparedAtomicWrite {
             rename_open_file_on_windows(tmp_file, &self.parent_dir, &self.destination_name, true)
                 .with_context(|| format!("replacing {}", self.parent.display()))?;
             self.tmp_file = None;
-            self.parent_dir
-                .sync_all()
-                .context("fsync config directory after replacement")?;
+            // The staged file was flushed before publication. Windows has no
+            // directory durability barrier (see `fsync_dir`): FlushFileBuffers
+            // requires write access that retained directory capabilities do
+            // not hold, and NTFS journals the rename itself. Best effort only,
+            // mirroring `remove_leaf_from_retained_directory`.
+            let _ = self.parent_dir.sync_all();
             Ok(())
         }
         #[cfg(all(not(unix), not(windows)))]
@@ -2530,7 +2574,8 @@ impl PreparedAtomicWrite {
                 .expect("prepared atomic write retains its temporary file");
             rename_open_file_on_windows(tmp_file, &self.parent_dir, &self.destination_name, false)?;
             self.tmp_file = None;
-            self.parent_dir.sync_all()?;
+            // Best effort only; see `commit` and `fsync_dir`.
+            let _ = self.parent_dir.sync_all();
             Ok(())
         }
         #[cfg(all(not(unix), not(windows)))]
@@ -2726,7 +2771,7 @@ fn open_windows_directory_nofollow_with_final_access(
 ) -> Result<std::fs::File> {
     use windows_sys::Wdk::Storage::FileSystem::{FILE_CREATE, FILE_OPEN};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE, WRITE_DAC,
+        FILE_READ_ATTRIBUTES, FILE_TRAVERSE, READ_CONTROL, SYNCHRONIZE,
     };
 
     let (anchor, names) = windows_absolute_path_parts(path)?;
@@ -2751,16 +2796,25 @@ fn open_windows_directory_nofollow_with_final_access(
         ) {
             Ok(directory) => directory,
             Err(error) if create_missing && error.kind() == std::io::ErrorKind::NotFound => {
-                match open_windows_relative_nofollow(
+                // The private owner and protected DACL are applied by the
+                // create itself; READ_CONTROL lets the verifier read them
+                // back through the same handle.
+                let security = WindowsPrivateSecurityDescriptor::new(true)?;
+                match open_windows_relative_nofollow_with_security(
                     &directory,
                     &name,
                     true,
-                    desired_access | WRITE_DAC,
+                    desired_access | READ_CONTROL,
                     FILE_CREATE,
+                    Some(&security),
                 ) {
                     Ok(directory) => {
-                        protect_windows_dacl(&directory)?;
-                        verify_windows_protected_dacl(&directory)?;
+                        verify_windows_protected_dacl(&directory).with_context(|| {
+                            format!(
+                                "verifying private Windows directory {}",
+                                traversed.display()
+                            )
+                        })?;
                         directory
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2879,6 +2933,32 @@ fn open_windows_relative_nofollow(
     desired_access: u32,
     create_disposition: u32,
 ) -> std::io::Result<std::fs::File> {
+    open_windows_relative_nofollow_with_security(
+        parent,
+        name,
+        directory,
+        desired_access,
+        create_disposition,
+        None,
+    )
+}
+
+/// Open (or create) one component relative to a retained parent handle.
+///
+/// `security` is applied only when this call creates the object. Private
+/// creations pass [`WindowsPrivateSecurityDescriptor`] so the owner and the
+/// protected owner-only DACL are part of the create itself: there is no window
+/// in which the new object carries the parent's inherited ACEs, and no
+/// post-create READ_CONTROL/WRITE_DAC/WRITE_OWNER handle rights are required.
+#[cfg(windows)]
+fn open_windows_relative_nofollow_with_security(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    directory: bool,
+    desired_access: u32,
+    create_disposition: u32,
+    security: Option<&WindowsPrivateSecurityDescriptor>,
+) -> std::io::Result<std::fs::File> {
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -2915,14 +2995,20 @@ fn open_windows_relative_nofollow(
     let unicode_name = UNICODE_STRING {
         Length: byte_len,
         MaximumLength: byte_len,
-        Buffer: name_wide.as_mut_ptr(),
+        // An empty name reopens the retained parent object itself (the same
+        // relative-open form `ReOpenFile` uses); pass no buffer for it.
+        Buffer: if name_wide.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            name_wide.as_mut_ptr()
+        },
     };
     let object_attributes = OBJECT_ATTRIBUTES {
         Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: parent.as_raw_handle(),
         ObjectName: std::ptr::from_ref(&unicode_name),
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: std::ptr::null(),
+        SecurityDescriptor: security.map_or(std::ptr::null(), |security| security.as_ptr()),
         SecurityQualityOfService: std::ptr::null(),
     };
     let mut handle: HANDLE = std::ptr::null_mut();
@@ -2936,8 +3022,10 @@ fn open_windows_relative_nofollow(
             FILE_NON_DIRECTORY_FILE
         };
     // SAFETY: the retained parent handle, component buffer, object attributes,
-    // and status block all remain live for the call. A single-component name
-    // with RootDirectory makes lookup relative to the exact retained parent.
+    // status block, and optional borrowed security descriptor (with the SID
+    // and ACL storage it points into) all remain live for the call. A
+    // single-component name with RootDirectory makes lookup relative to the
+    // exact retained parent.
     let status = unsafe {
         NtCreateFile(
             &mut handle,
@@ -3305,8 +3393,11 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
             .with_context(|| {
                 format!("renaming {} to {}", source.display(), destination.display())
             })?;
-        source_parent.sync_all()?;
-        destination_parent.sync_all()?;
+        // Best effort only: the source parent is held without write access
+        // (FlushFileBuffers would be denied) and Windows offers no directory
+        // durability barrier; see `fsync_dir`.
+        let _ = source_parent.sync_all();
+        let _ = destination_parent.sync_all();
         Ok(())
     }
     #[cfg(all(not(unix), not(windows)))]
@@ -3685,7 +3776,9 @@ pub(crate) fn stale_private_temp_leaves_from_retained_directory(
     stale_after: std::time::Duration,
 ) -> Result<Vec<std::ffi::OsString>> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_READ_ATTRIBUTES, READ_CONTROL, SYNCHRONIZE,
+    };
 
     let mut leaves = Vec::new();
     for leaf in retained_directory_names(directory)? {
@@ -3694,11 +3787,14 @@ pub(crate) fn stale_private_temp_leaves_from_retained_directory(
         if !display_name.starts_with('.') || !display_name.ends_with(".tmp") {
             continue;
         }
+        // READ_CONTROL is required for the private-DACL proof below; without
+        // it the owner/DACL query is denied and no stale temporary could ever
+        // qualify for cleanup.
         let file = match open_windows_relative_nofollow(
             directory,
             &leaf,
             false,
-            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
             FILE_OPEN,
         ) {
             Ok(file) => file,
@@ -3744,72 +3840,148 @@ fn open_windows_private_atomic_temp(
     use windows_sys::Wdk::Storage::FileSystem::FILE_CREATE;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, SYNCHRONIZE,
-        WRITE_DAC,
     };
 
-    let file = open_windows_relative_nofollow(
+    // Windows counterpart of `O_CREAT|O_EXCL` with mode 0600: the owner and
+    // protected owner-only DACL are part of the exclusive create.
+    let security = WindowsPrivateSecurityDescriptor::new(false)?;
+    let file = open_windows_relative_nofollow_with_security(
         parent,
         name,
         false,
-        DELETE
-            | FILE_WRITE_DATA
-            | FILE_WRITE_ATTRIBUTES
-            | FILE_READ_ATTRIBUTES
-            | SYNCHRONIZE
-            | WRITE_DAC,
+        DELETE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         FILE_CREATE,
+        Some(&security),
     )
     .with_context(|| format!("creating temporary file {}", display_path.display()))?;
     reject_windows_reparse_handle(&file, display_path)?;
-    protect_windows_dacl(&file)?;
     Ok(file)
 }
 
+/// Absolute security descriptor for a Cockpit-private Windows object: owner is
+/// the current process user, and the DACL is protected (no inherited ACEs)
+/// and grants full control only to that user and LocalSystem — the Windows
+/// equivalent of Unix `0600`/`0700`.
+///
+/// The owner is set explicitly because an elevated administrator token
+/// otherwise creates objects owned by BUILTIN\Administrators, which
+/// [`verify_windows_protected_dacl`] rejects. The token's own user SID is
+/// always assignable as owner without privilege, and it narrows (never widens)
+/// who holds implicit owner rights. Directory ACEs are object- and
+/// container-inheritable so children created inside a private directory stay
+/// private.
+///
+/// The descriptor points into the SID and ACL buffers it owns; heap storage
+/// does not move when the value moves, so the pointers stay valid for as long
+/// as the value is alive.
 #[cfg(windows)]
-fn protect_windows_dacl(file: &std::fs::File) -> Result<()> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetKernelObjectSecurity, PROTECTED_DACL_SECURITY_INFORMATION,
-        SetKernelObjectSecurity,
-    };
-    let mut needed = 0u32;
-    // First call obtains the exact self-relative descriptor size.
-    unsafe {
-        GetKernelObjectSecurity(
-            file.as_raw_handle(),
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
-        );
+struct WindowsPrivateSecurityDescriptor {
+    descriptor: windows_sys::Win32::Security::SECURITY_DESCRIPTOR,
+    _owner: Vec<u8>,
+    _system: Vec<u8>,
+    _acl: Vec<u32>,
+}
+
+#[cfg(windows)]
+impl WindowsPrivateSecurityDescriptor {
+    fn new(directory: bool) -> Result<Self> {
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
+            CreateWellKnownSid, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+            SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE,
+            SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+            WinLocalSystemSid,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+        // winnt.h SECURITY_DESCRIPTOR_REVISION (windows-sys places it behind
+        // the unrelated System_SystemServices feature).
+        const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+        let mut owner = current_windows_user_sid()?;
+        let mut system = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut system_len = SECURITY_MAX_SID_SIZE;
+        // SAFETY: `system` is a writable SECURITY_MAX_SID_SIZE buffer and
+        // `system_len` reports its size; no domain SID is needed.
+        if unsafe {
+            CreateWellKnownSid(
+                WinLocalSystemSid,
+                std::ptr::null_mut(),
+                system.as_mut_ptr().cast(),
+                &mut system_len,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("creating the LocalSystem SID");
+        }
+        system.truncate(system_len as usize);
+
+        // ACCESS_ALLOWED_ACE's trailing `SidStart` DWORD is the first word of
+        // the variable-length SID, so each ACE is its fixed part plus the SID.
+        let ace_fixed = std::mem::size_of::<ACCESS_ALLOWED_ACE>() - std::mem::size_of::<u32>();
+        let acl_bytes = (std::mem::size_of::<ACL>() + 2 * ace_fixed + owner.len() + system.len())
+            .next_multiple_of(std::mem::size_of::<u32>());
+        let acl_len = u32::try_from(acl_bytes).context("private Windows ACL is too large")?;
+        let mut acl = vec![0u32; acl_bytes / std::mem::size_of::<u32>()];
+        let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+        // SAFETY: `acl` is DWORD-aligned, `acl_len` bytes long, and sized for
+        // the header plus both ACEs added below.
+        if unsafe { InitializeAcl(acl_ptr, acl_len, ACL_REVISION) } == 0 {
+            return Err(std::io::Error::last_os_error()).context("initializing private ACL");
+        }
+        let inheritance = if directory {
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        } else {
+            0
+        };
+        for sid in [&mut owner, &mut system] {
+            // SAFETY: the ACL was initialized above with room for this ACE and
+            // `sid` is a valid SID buffer that outlives the call (the ACE
+            // copies the SID bytes).
+            if unsafe {
+                AddAccessAllowedAceEx(
+                    acl_ptr,
+                    ACL_REVISION,
+                    inheritance,
+                    FILE_ALL_ACCESS,
+                    sid.as_mut_ptr().cast(),
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error()).context("adding private ACL entry");
+            }
+        }
+
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        let descriptor_ptr: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR =
+            std::ptr::from_mut(&mut descriptor).cast();
+        // SAFETY: `descriptor` is a live absolute SECURITY_DESCRIPTOR. The
+        // owner SID and ACL it is pointed at are heap buffers moved into the
+        // returned value, so they outlive every use of the descriptor.
+        unsafe {
+            if InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION) == 0
+                || SetSecurityDescriptorOwner(descriptor_ptr, owner.as_mut_ptr().cast(), 0) == 0
+                || SetSecurityDescriptorDacl(descriptor_ptr, 1, acl_ptr, 0) == 0
+                || SetSecurityDescriptorControl(
+                    descriptor_ptr,
+                    SE_DACL_PROTECTED,
+                    SE_DACL_PROTECTED,
+                ) == 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("building private security descriptor");
+            }
+        }
+        Ok(Self {
+            descriptor,
+            _owner: owner,
+            _system: system,
+            _acl: acl,
+        })
     }
-    if needed == 0 {
-        return Err(std::io::Error::last_os_error().into());
+
+    fn as_ptr(&self) -> *const windows_sys::Win32::Security::SECURITY_DESCRIPTOR {
+        std::ptr::from_ref(&self.descriptor)
     }
-    let mut descriptor = vec![0u8; needed as usize];
-    if unsafe {
-        GetKernelObjectSecurity(
-            file.as_raw_handle(),
-            DACL_SECURITY_INFORMATION,
-            descriptor.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    if unsafe {
-        SetKernelObjectSecurity(
-            file.as_raw_handle(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            descriptor.as_mut_ptr().cast(),
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -4026,6 +4198,12 @@ mod windows_tests {
         );
     }
 
+    /// On Windows the parent swap itself is refused: NTFS denies renaming a
+    /// directory while a handle to an entry inside it is open, and the
+    /// prepared write holds its staged temporary inside the retained parent.
+    /// The attacker therefore cannot relocate the parent and plant a junction
+    /// at its spelling; the commit must land in the owned directory and never
+    /// reach the attacker's.
     #[test]
     fn prepared_atomic_write_stays_bound_to_open_parent_across_junction_swap() {
         let temp = tempfile::tempdir().unwrap();
@@ -4039,12 +4217,18 @@ mod windows_tests {
 
         let prepared =
             super::prepare_atomic_write(&parent.join("config.json"), b"authoritative").unwrap();
-        std::fs::rename(&parent, &relocated).unwrap();
-        symlink_dir(&attacker, &parent).unwrap();
+        let swap = std::fs::rename(&parent, &relocated).unwrap_err();
+        assert_eq!(
+            swap.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the held staged temporary must pin the parent against a rename swap"
+        );
+        assert!(!relocated.exists());
+        symlink_dir(&attacker, &parent).unwrap_err();
         prepared.commit().unwrap();
 
         assert_eq!(
-            std::fs::read(relocated.join("config.json")).unwrap(),
+            std::fs::read(parent.join("config.json")).unwrap(),
             b"authoritative"
         );
         assert_eq!(
@@ -4120,6 +4304,9 @@ mod windows_tests {
         assert!(format!("{error:#}").contains("reparse-point component"));
     }
 
+    /// As above: the prepared removal holds the exact file open, so NTFS
+    /// refuses to rename its parent and no junction can be planted at the
+    /// parent spelling. Deletion stays bound to the held file.
     #[test]
     fn prepared_file_removal_stays_bound_to_open_file_across_parent_junction_swap() {
         let temp = tempfile::tempdir().unwrap();
@@ -4132,11 +4319,17 @@ mod windows_tests {
         std::fs::write(attacker.join("provider.json"), b"outside").unwrap();
 
         let prepared = super::prepare_file_removal(&parent.join("provider.json")).unwrap();
-        std::fs::rename(&parent, &relocated).unwrap();
-        symlink_dir(&attacker, &parent).unwrap();
+        let swap = std::fs::rename(&parent, &relocated).unwrap_err();
+        assert_eq!(
+            swap.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the held file must pin its parent against a rename swap"
+        );
+        assert!(!relocated.exists());
+        symlink_dir(&attacker, &parent).unwrap_err();
         prepared.commit().unwrap();
 
-        assert!(!relocated.join("provider.json").exists());
+        assert!(!parent.join("provider.json").exists());
         assert_eq!(
             std::fs::read(attacker.join("provider.json")).unwrap(),
             b"outside",
@@ -4183,7 +4376,7 @@ mod mutation_lock_tests {
         let (ready_tx, ready_rx) = mpsc::channel();
         let retained_dir = config_dir.clone();
         std::thread::spawn(move || {
-            let directory = std::fs::File::open(&retained_dir).unwrap();
+            let directory = super::open_directory_handle_nofollow(&retained_dir).unwrap();
             let _retained_guard =
                 super::ConfigMutationLock::acquire_retained(&directory, &canonical, &retained_dir)
                     .unwrap();

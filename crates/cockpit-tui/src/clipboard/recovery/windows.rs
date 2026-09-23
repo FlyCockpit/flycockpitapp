@@ -214,9 +214,24 @@ fn owner_only_sddl(owner_sid: &str) -> String {
     format!("O:{owner_sid}G:{owner_sid}D:P(A;OICI;FA;;;{owner_sid})(A;OICI;FA;;;SY)")
 }
 
+/// The exact SDDL a recovery *file* is born with: explicitly owned by the
+/// current user (and group), protected, current-user + LocalSystem full
+/// control, no inheritance flags. The file must name its owner at create
+/// time: an `NtCreateFile` without a descriptor takes the token's default
+/// owner, which on an elevated administrator token is
+/// `BUILTIN\Administrators`, not the user — so a fresh artifact failed its
+/// own `WrongOwner` containment check. Naming the token user as owner needs
+/// no privilege and is strictly narrower than the default.
+fn owner_only_file_sddl(owner_sid: &str) -> String {
+    format!("O:{owner_sid}G:{owner_sid}D:P(A;;FA;;;{owner_sid})(A;;FA;;;SY)")
+}
+
 fn build_owner_only_descriptor(owner_sid: &str) -> io::Result<OwnedSecurityDescriptor> {
-    let sddl = owner_only_sddl(owner_sid);
-    let wide_sddl = wide(&sddl);
+    build_descriptor(&owner_only_sddl(owner_sid))
+}
+
+fn build_descriptor(sddl: &str) -> io::Result<OwnedSecurityDescriptor> {
+    let wide_sddl = wide(sddl);
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `wide_sddl` is a live NUL-terminated string for the call; the
     // returned descriptor is owned exactly once by `OwnedSecurityDescriptor`.
@@ -230,7 +245,7 @@ fn build_owner_only_descriptor(owner_sid: &str) -> io::Result<OwnedSecurityDescr
     };
     if converted == 0 {
         return Err(last_error(
-            "building recovery directory security descriptor",
+            "building recovery security descriptor",
         ));
     }
     Ok(OwnedSecurityDescriptor(descriptor))
@@ -388,6 +403,26 @@ fn open_relative_nofollow(
     desired_access: u32,
     create_disposition: u32,
 ) -> io::Result<std::fs::File> {
+    open_relative_nofollow_with_security(
+        parent,
+        name,
+        directory,
+        desired_access,
+        create_disposition,
+        std::ptr::null(),
+    )
+}
+
+/// `security_descriptor` is applied only when the call creates the object
+/// (`FILE_CREATE`); it must stay live for the duration of the call.
+fn open_relative_nofollow_with_security(
+    parent: HANDLE,
+    name: &str,
+    directory: bool,
+    desired_access: u32,
+    create_disposition: u32,
+    security_descriptor: *const c_void,
+) -> io::Result<std::fs::File> {
     let mut name_wide = wide(name);
     name_wide.pop(); // UNICODE_STRING is not NUL-terminated.
     let byte_len = (name_wide.len() * std::mem::size_of::<u16>()) as u16;
@@ -401,7 +436,7 @@ fn open_relative_nofollow(
         RootDirectory: parent,
         ObjectName: std::ptr::from_ref(&unicode_name),
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: std::ptr::null(),
+        SecurityDescriptor: security_descriptor.cast(),
         SecurityQualityOfService: std::ptr::null(),
     };
     let mut handle: HANDLE = std::ptr::null_mut();
@@ -501,11 +536,17 @@ impl DirHandle {
         // (`Wdk::FILE_OPEN == 1 == Win32::CREATE_NEW`), so passing the NT
         // constant here compiled but meant "fail unless the directory does
         // not exist yet", the opposite of what a reopen-after-create needs.
+        //
+        // `FILE_WRITE_DATA` (for a directory: `FILE_ADD_FILE`) is required by
+        // `sync()`: `FlushFileBuffers` on a handle without write-data/append
+        // access fails `ERROR_ACCESS_DENIED`, which turned both durability
+        // barriers of every `write_artifact`/`reconcile_startup` into a hard
+        // error. The directory's own owner-only DACL already grants it.
         let wide_open = wide(&path.to_string_lossy());
         let handle = unsafe {
             windows_sys::Win32::Storage::FileSystem::CreateFileW(
                 wide_open.as_ptr(),
-                FILE_READ_ATTRIBUTES | SYNCHRONIZE | READ_CONTROL,
+                FILE_READ_ATTRIBUTES | FILE_WRITE_DATA | SYNCHRONIZE | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null(),
                 windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
@@ -549,7 +590,10 @@ impl DirHandle {
     }
 
     pub fn create_file_exclusive(&self, name: &str) -> io::Result<std::fs::File> {
-        let file = open_relative_nofollow(
+        // Born private: owner + protected DACL ride in the create itself, so
+        // the artifact never exists with the token-default owner/DACL.
+        let descriptor = build_descriptor(&owner_only_file_sddl(&self.owner.string_form))?;
+        let file = open_relative_nofollow_with_security(
             self.dir_handle(),
             name,
             false,
@@ -560,7 +604,9 @@ impl DirHandle {
                 | READ_CONTROL
                 | SYNCHRONIZE,
             FILE_CREATE,
+            descriptor.0.cast_const(),
         )?;
+        drop(descriptor);
         let stat = self.stat_open_file(&file)?;
         policy::verify_windows_file(stat).map_err(|v| {
             io::Error::other(format!("new recovery artifact failed containment: {v:?}"))
@@ -743,6 +789,21 @@ mod tests {
         assert!(sddl.contains(";SY)"));
         assert!(!sddl.contains("WD"));
         assert!(!sddl.contains("AU"));
+    }
+
+    #[test]
+    fn owner_only_file_sddl_names_the_owner_and_grants_exactly_owner_and_system() {
+        let sid = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        let sddl = owner_only_file_sddl(sid);
+        assert_eq!(
+            sddl,
+            "O:S-1-5-21-1111111111-2222222222-3333333333-1001\
+             G:S-1-5-21-1111111111-2222222222-3333333333-1001\
+             D:P(A;;FA;;;S-1-5-21-1111111111-2222222222-3333333333-1001)\
+             (A;;FA;;;SY)"
+        );
+        assert!(sddl.starts_with(&format!("O:{sid}")));
+        assert_eq!(sddl.matches("FA;;;").count(), 2);
     }
 
     #[test]

@@ -59,12 +59,9 @@ pub fn acquire_daemon_lifetime(
     #[cfg(windows)]
     {
         let mutex = WindowsMutexHandle::open(pid_file)?;
-        if mutex.try_acquire()? {
-            Ok(DaemonLifetimeGuard {
-                _mutex: WindowsMutexGuard { mutex },
-            })
-        } else {
-            Err(AcquireDaemonLifetimeError::Busy)
+        match WindowsMutexGuard::acquire(mutex)? {
+            Some(guard) => Ok(DaemonLifetimeGuard { _mutex: guard }),
+            None => Err(AcquireDaemonLifetimeError::Busy),
         }
     }
 }
@@ -98,6 +95,10 @@ impl DaemonLifetimeReleaseWitness {
         }
         #[cfg(windows)]
         {
+            // Acquire-and-release on this thread is sound: no caller thread
+            // ever owns the lifetime mutex (each guard holds it on its own
+            // dedicated owner thread), so this cannot be a recursive
+            // re-acquisition that falsely reports release.
             let acquired = self.mutex.try_acquire()?;
             if acquired {
                 self.mutex.release()?;
@@ -202,16 +203,79 @@ impl WindowsMutexHandle {
     }
 }
 
+/// Ownership of the named lifetime mutex, held by a dedicated owner thread.
+///
+/// A Win32 mutex is thread-affine and recursive: `WaitForSingleObject` on a
+/// mutex the *calling thread* already owns succeeds again (bumping the
+/// recursion count), and `ReleaseMutex` from any other thread fails with
+/// `ERROR_NOT_OWNER`. Acquiring on the caller's thread therefore broke both
+/// halves of the flock-equivalent contract: a second in-process acquisition
+/// on the same thread was granted instead of `Busy`, and a guard dropped on a
+/// different thread (routine for a `Send` guard held across async awaits)
+/// silently never released, stranding the mutex until that thread exited.
+/// Each acquisition instead runs on its own thread that holds the mutex until
+/// the guard drops, so every acquisition is a distinct owner (non-recursive,
+/// like a distinct flock open-file description) and release always happens
+/// on the owning thread. Abandonment-on-crash semantics are unchanged: the
+/// process dying still abandons the mutex for the next generation.
 #[cfg(windows)]
 #[derive(Debug)]
 struct WindowsMutexGuard {
-    mutex: WindowsMutexHandle,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    owner: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl WindowsMutexGuard {
+    /// One nonblocking acquisition. `Ok(None)` is a live owner (`Busy`).
+    fn acquire(mutex: WindowsMutexHandle) -> std::io::Result<Option<Self>> {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<std::io::Result<bool>>(1);
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let owner = std::thread::Builder::new()
+            .name("cockpit-daemon-lifetime".into())
+            .spawn(move || {
+                let acquired = mutex.try_acquire();
+                let owned = matches!(acquired, Ok(true));
+                let _ = result_tx.send(acquired);
+                if owned {
+                    // Hold until the guard drops (sender dropped => Err).
+                    let _ = stop_rx.recv();
+                    let _ = mutex.release();
+                }
+            })?;
+        let outcome = result_rx.recv();
+        match outcome {
+            Ok(Ok(true)) => Ok(Some(Self {
+                stop: Some(stop_tx),
+                owner: Some(owner),
+            })),
+            Ok(Ok(false)) => {
+                let _ = owner.join();
+                Ok(None)
+            }
+            Ok(Err(error)) => {
+                let _ = owner.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = owner.join();
+                Err(std::io::Error::other(
+                    "daemon lifetime owner thread exited before reporting",
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Drop for WindowsMutexGuard {
     fn drop(&mut self) {
-        let _ = self.mutex.release();
+        drop(self.stop.take());
+        // Join so the release is complete before the guard's drop returns:
+        // an immediate re-acquisition after `drop(guard)` must succeed.
+        if let Some(owner) = self.owner.take() {
+            let _ = owner.join();
+        }
     }
 }
 

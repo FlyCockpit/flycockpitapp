@@ -9,8 +9,8 @@
 //! check-then-rename anywhere in this module — the "does the target exist"
 //! answer always comes from the one atomic publish primitive itself
 //! (`renameat2(RENAME_NOREPLACE)`/`linkat` on Linux, `renameatx_np(...,
-//! RENAME_EXCL)` on macOS, `SetFileInformationByHandle(FileRenameInfoEx)`
-//! without `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` on Windows), so an existing
+//! RENAME_EXCL)` on macOS, `NtSetInformationFile(FileRenameInformation)`
+//! with `ReplaceIfExists = FALSE` on Windows), so an existing
 //! target, a target that appears mid-operation, or a parent swapped for a
 //! symlink/junction all fail the same way: the target is preserved and
 //! nothing is overwritten.

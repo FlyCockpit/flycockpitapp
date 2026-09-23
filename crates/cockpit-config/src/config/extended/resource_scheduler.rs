@@ -98,7 +98,6 @@ pub struct ResourceSchedulerRuleConfig {
     pub subcommand: Option<String>,
     #[serde(
         rename = "approvalKey",
-        alias = "approval_key",
         default,
         skip_serializing_if = "Option::is_none"
     )]

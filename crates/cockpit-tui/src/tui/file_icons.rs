@@ -16,21 +16,13 @@ pub const GENERIC_FILE_GLYPH: &str = "\u{e612}";
 /// Whether `tool` is a write/edit variant whose glyph column may be replaced
 /// with a file icon.
 pub fn is_file_icon_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "write"
-            | "edit"
-            // Historical display only: pre-rename persisted sessions used
-            // these retired verb names in tool-call rows.
-            | "writeunlock"
-            | "editunlock"
-    )
+    matches!(tool, "write" | "edit")
 }
 
 /// Icon for a tool. Write/edit tools derive their icon from `path`.
 pub fn glyph_for_tool(tool: &str, path: Option<&str>) -> Option<&'static str> {
     match tool {
-        "write" | "edit" | "writeunlock" | "editunlock" => path.map(glyph_for_path),
+        "write" | "edit" => path.map(glyph_for_path),
         _ => None,
     }
 }
@@ -463,7 +455,7 @@ mod tests {
 
     #[test]
     fn file_icon_tools_include_write_edit_variants() {
-        for tool in ["write", "edit", "writeunlock", "editunlock"] {
+        for tool in ["write", "edit"] {
             assert!(is_file_icon_tool(tool), "{tool}");
             assert_eq!(glyph_for_tool(tool, Some("src/lib.rs")), Some(ICON_RUST));
         }

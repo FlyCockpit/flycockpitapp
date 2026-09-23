@@ -5,10 +5,8 @@ use super::{
 };
 use std::collections::HashMap;
 
-/// `/notes` → `/scratchpad` rename (implementation note):
-/// the visible menu offers `/scratchpad` and the new `/note`, and the old
-/// `/notes` is absent from the registry (it survives only as a hidden,
-/// exact-match alias resolved in `complete_or_submit`).
+/// The visible menu offers `/scratchpad` and `/note`; there is no `/notes`
+/// command or alias.
 #[test]
 fn scratchpad_replaces_notes_and_note_is_registered() {
     assert!(
@@ -23,11 +21,7 @@ fn scratchpad_replaces_notes_and_note_is_registered() {
         !SLASH_COMMANDS.iter().any(|c| c.name == "notes"),
         "the old /notes command is gone from the visible menu"
     );
-    // The hidden alias resolves to the registered scratchpad command.
-    assert_eq!(
-        super::hidden_slash_alias("notes").unwrap().name,
-        "scratchpad"
-    );
+    assert!(super::hidden_slash_alias("notes").is_none());
     // `/note <text>` is arg-taking (drives the trailing-space completion).
     let note = SLASH_COMMANDS.iter().find(|c| c.name == "note").unwrap();
     assert!(note.takes_args);
@@ -49,27 +43,6 @@ fn slash_matches_hyphen_insensitive_model_settings() {
 }
 
 #[test]
-fn slash_matches_hidden_aliases_as_canonical_commands() {
-    let cases = [
-        ("keybindings", "keys"),
-        ("notes", "scratchpad"),
-        ("toggle-redact", "toggle-redaction"),
-    ];
-
-    for (query, expected) in cases {
-        let names: Vec<&str> = slash_matches(query, &HashMap::new())
-            .into_iter()
-            .map(|c| c.name)
-            .collect();
-        assert_eq!(names, vec![expected], "query {query}");
-        assert!(
-            !SLASH_COMMANDS.iter().any(|c| c.name == query),
-            "{query} stays hidden"
-        );
-    }
-}
-
-#[test]
 fn slash_matches_note_does_not_inject_scratchpad_alias() {
     let names: Vec<&str> = slash_matches("note", &HashMap::new())
         .into_iter()
@@ -79,20 +52,14 @@ fn slash_matches_note_does_not_inject_scratchpad_alias() {
 }
 
 #[test]
-fn hidden_alias_exact_lookup_uses_canonical_commands() {
-    assert_eq!(
-        super::hidden_slash_alias("modelsettings").unwrap().name,
-        "model-settings"
-    );
-    assert_eq!(
-        super::hidden_slash_alias("toggle-redact").unwrap().name,
-        "toggle-redaction"
-    );
-    assert_eq!(
-        super::hidden_slash_alias("keybindings").unwrap().name,
-        "keys"
-    );
-    assert!(super::hidden_slash_alias("modelsetting").is_none());
+fn hidden_alias_lookup_is_only_the_help_shortcut() {
+    assert_eq!(super::hidden_slash_alias("?").unwrap().name, "help");
+    for removed in ["modelsettings", "toggle-redact", "notes", "keybindings"] {
+        assert!(
+            super::hidden_slash_alias(removed).is_none(),
+            "/{removed} is not an alias"
+        );
+    }
 }
 
 #[test]

@@ -17,7 +17,7 @@
 //! /sealed promote <record-id> --scope <project|global>
 //! /sealed recover <record-id>
 //! /sealed action list
-//! /sealed action create <kind-id> --project <id> --description <safe-text> --origin-id <id> --projection-id <id>
+//! /sealed action create-declared --project <id> --description <safe-text> --declaration-json <json>
 //! /sealed action revise <action-id> --description <safe-text>|--enabled true|false
 //! /sealed action retire <action-id> --confirm <action-id>
 //! ```
@@ -90,23 +90,14 @@ pub enum SealedCommand {
 pub enum SealedActionCommand {
     /// `/sealed action list`
     List,
-    /// `/sealed action create <kind-id> --project <id> --description <safe-text> --origin-id <id> --projection-id <id>`.
-    /// For `knowledge_base_copy`, `origin_id` is the configured KB registry
-    /// label; the daemon resolves and pins its immutable sealed namespace.
-    Create {
-        kind_id: String,
-        project_id: String,
-        description: SealedDescription,
-        origin_id: String,
-        projection_id: String,
-    },
     /// `/sealed action create-declared --project <id> --description <safe-text>
-    /// --declaration-json <owner-authored-json>`. The declaration is parsed by
-    /// the local owner RPC into a typed sink; models never receive this payload.
+    /// --declaration-json <owner-authored-json>`. The declaration is parsed
+    /// locally into a typed sink (malformed JSON rejects before any RPC); the
+    /// daemon then validates and pins it. Models never receive this payload.
     CreateDeclared {
         project_id: String,
         description: SealedDescription,
-        declaration_json: String,
+        declaration: cockpit_proto::SealedActionDeclaration,
     },
     /// `/sealed action revise <action-id> --description <safe-text>`
     ReviseDescription {
@@ -364,74 +355,11 @@ fn parse_action(tokens: &[&str]) -> Result<SealedActionCommand> {
             }
             Ok(SealedActionCommand::List)
         }
-        "create" => parse_action_create(&tokens[1..]),
         "create-declared" => parse_action_create_declared(&tokens[1..]),
         "revise" => parse_action_revise(&tokens[1..]),
         "retire" => parse_action_retire(&tokens[1..]),
         _ => bail!("unknown `/sealed action` subcommand: `{}`", tokens[0]),
     }
-}
-
-fn parse_action_create(tokens: &[&str]) -> Result<SealedActionCommand> {
-    let kind_id = tokens
-        .first()
-        .context("`/sealed action create` requires a kind-id")?;
-    let mut project_id = None;
-    let mut description = None;
-    let mut origin_id = None;
-    let mut projection_id = None;
-    let mut i = 1;
-    while i < tokens.len() {
-        match tokens[i] {
-            "--project" => {
-                i += 1;
-                project_id = Some(
-                    tokens
-                        .get(i)
-                        .context("--project requires a value")?
-                        .to_string(),
-                );
-            }
-            "--description" => {
-                i += 1;
-                description = Some(SealedDescription::parse(
-                    tokens.get(i).context("--description requires a value")?,
-                )?);
-            }
-            "--origin-id" => {
-                i += 1;
-                origin_id = Some(
-                    tokens
-                        .get(i)
-                        .context("--origin-id requires a value")?
-                        .to_string(),
-                );
-            }
-            "--projection-id" => {
-                i += 1;
-                projection_id = Some(
-                    tokens
-                        .get(i)
-                        .context("--projection-id requires a value")?
-                        .to_string(),
-                );
-            }
-            _ => bail!("unknown `/sealed action create` flag: `{}`", tokens[i]),
-        }
-        i += 1;
-    }
-    let project_id = project_id.context("`/sealed action create` requires --project")?;
-    let description = description.context("`/sealed action create` requires --description")?;
-    let origin_id = origin_id.context("`/sealed action create` requires --origin-id")?;
-    let projection_id =
-        projection_id.context("`/sealed action create` requires --projection-id")?;
-    Ok(SealedActionCommand::Create {
-        kind_id: kind_id.to_string(),
-        project_id,
-        description,
-        origin_id,
-        projection_id,
-    })
 }
 
 fn parse_action_create_declared(tokens: &[&str]) -> Result<SealedActionCommand> {
@@ -476,8 +404,11 @@ fn parse_action_create_declared(tokens: &[&str]) -> Result<SealedActionCommand> 
         project_id: project_id.context("`/sealed action create-declared` requires --project")?,
         description: description
             .context("`/sealed action create-declared` requires --description")?,
-        declaration_json: declaration_json
-            .context("`/sealed action create-declared` requires --declaration-json")?,
+        declaration: serde_json::from_str(
+            &declaration_json
+                .context("`/sealed action create-declared` requires --declaration-json")?,
+        )
+        .context("`--declaration-json` is not a valid sealed-action declaration")?,
     })
 }
 
@@ -778,52 +709,49 @@ mod tests {
     }
 
     #[test]
-    fn action_create_parses() {
+    fn action_create_declared_parses_typed_declaration() {
         let cmd = parse_sealed_command(&[
             "action",
-            "create",
-            "https.deploy.notify",
+            "create-declared",
             "--project",
             "my-proj",
             "--description",
             "Notify",
-            "--origin-id",
-            "0",
-            "--projection-id",
-            "http_status_and_ok",
+            "--declaration-json",
+            r#"{"sink":"command_argument","argv":["/bin/notify","{{sealed_value}}"]}"#,
         ])
         .unwrap();
         match cmd {
-            SealedCommand::Action(SealedActionCommand::Create {
-                kind_id,
+            SealedCommand::Action(SealedActionCommand::CreateDeclared {
                 project_id,
                 description,
-                origin_id,
-                projection_id,
+                declaration,
             }) => {
-                assert_eq!(kind_id, "https.deploy.notify");
                 assert_eq!(project_id, "my-proj");
                 assert_eq!(description.as_str(), "Notify");
-                assert_eq!(origin_id, "0");
-                assert_eq!(projection_id, "http_status_and_ok");
+                assert_eq!(
+                    declaration,
+                    cockpit_proto::SealedActionDeclaration::CommandArgument {
+                        argv: vec!["/bin/notify".into(), "{{sealed_value}}".into()],
+                    }
+                );
             }
-            _ => panic!("expected Action Create"),
+            _ => panic!("expected Action CreateDeclared"),
         }
     }
 
     #[test]
-    fn action_create_requires_all_flags() {
+    fn action_create_declared_rejects_malformed_declaration() {
         assert!(
             parse_sealed_command(&[
                 "action",
-                "create",
-                "kind",
+                "create-declared",
                 "--project",
                 "p",
                 "--description",
                 "d",
-                "--origin-id",
-                "0",
+                "--declaration-json",
+                "not-json",
             ])
             .is_err()
         );

@@ -441,7 +441,6 @@ fn settings_config_mutations_stay_daemon_owned() {
         source.contains("apply_settings_patch_via_daemon"),
         "settings writes must route through the revisioned patch helper"
     );
-    assert!(!source.contains("Request::SaveExtendedConfig"));
     assert!(!source.contains("base_hash = None"));
     // The retired local-save helper must be gone entirely.
     assert!(!source.contains("remove_raw_path_and_save"));

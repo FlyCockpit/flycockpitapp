@@ -76,7 +76,7 @@ async fn one_shot_run_seeds_trust_in_never_trusted_home() {
     home.write_local_provider_config(&provider.base_url());
     let output = home
         .cockpit()
-        .args(["--no-sandbox", "run", "--json", "hello"])
+        .args(["--no-sandbox", "run", "--format", "json", "hello"])
         .output()
         .expect("one-shot run in a never-trusted home");
     assert_success("one-shot run without prior trust set", &output, &home);

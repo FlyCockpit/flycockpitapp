@@ -813,11 +813,6 @@ impl SettingsEditor {
         self.field_count()
     }
 
-    /// Deprecated list-row save cursor; save uses the help-row ActionBar.
-    pub(super) fn on_save_row(&self) -> bool {
-        false
-    }
-
     /// The field at a row index (clamped to the last on overflow).
     fn field_at(&self, row: usize) -> ProviderSettingId {
         let fields = self.fields();
@@ -1704,14 +1699,14 @@ impl SettingsEditor {
             // mode, so `s` is always free as the accelerator).
             KeyCode::Char('s') => SettingsResult::Save,
             // Media capability refresh (generation-keyed; ignored while saving).
-            KeyCode::Char('r') if self.multimodal.is_some() && !self.on_save_row() => {
+            KeyCode::Char('r') if self.multimodal.is_some() => {
                 let _ = self.begin_multimodal_refresh();
                 // Completing refresh requires the parent entry; mark pending and
                 // let the providers page finish with the live ProviderEntry.
                 self.provider_trust_confirm_pending = false;
                 SettingsResult::Stay
             }
-            KeyCode::Char('x') if !self.on_save_row() => {
+            KeyCode::Char('x') => {
                 // Prefer multimodal recovery Discard when the action list
                 // exposes it (save_failed / conflict / unavailable_dirty).
                 if self

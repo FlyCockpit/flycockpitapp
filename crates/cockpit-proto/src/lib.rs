@@ -3216,17 +3216,19 @@ impl<'de> Deserialize<'de> for LeakRevealToken {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        // Historical response fixtures used an empty placeholder before the
-        // live v16 contract required canonical tokens. Keep deserialization
-        // bounded and zeroizing; live request semantics and the reveal frame
-        // enforce the exact 64-byte lowercase-hex shape.
-        if value.len() > 64 {
+        let value = zeroize::Zeroizing::new(String::deserialize(deserializer)?);
+        // Fail closed on anything but the canonical 64-byte lowercase-hex
+        // token the daemon mints; the value is zeroized on every path.
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             return Err(serde::de::Error::custom(
-                "leak reveal token exceeds 64 bytes",
+                "leak reveal token must be 64 lowercase hex characters",
             ));
         }
-        Ok(Self(zeroize::Zeroizing::new(value)))
+        Ok(Self(value))
     }
 }
 
@@ -3553,6 +3555,29 @@ mod sensitive_wire_literal_tests {
         assert!(debug.contains("REDACTED"));
         let owned = token.into_zeroizing();
         assert_eq!(owned.as_str(), marker);
+    }
+
+    #[test]
+    fn leak_reveal_token_deserialize_accepts_only_canonical_lowercase_hex() {
+        let canonical = "0123456789abcdef".repeat(4);
+        let parsed: LeakRevealToken =
+            serde_json::from_value(serde_json::Value::String(canonical.clone())).unwrap();
+        assert_eq!(parsed.as_str(), canonical);
+        for invalid in [
+            String::new(),
+            "cap-token".to_string(),
+            "0".repeat(63),
+            "0".repeat(65),
+            "0123456789ABCDEF".repeat(4),
+            "g".repeat(64),
+        ] {
+            let parsed: std::result::Result<LeakRevealToken, _> =
+                serde_json::from_value(serde_json::Value::String(invalid.clone()));
+            assert!(
+                parsed.is_err(),
+                "non-canonical token {invalid:?} must be rejected"
+            );
+        }
     }
 
     #[test]

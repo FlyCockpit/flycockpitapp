@@ -1800,10 +1800,6 @@ fn capability_enum_serde_names_are_stable() {
         serde_json::json!("probed")
     );
     assert_eq!(
-        serde_json::to_value(CapabilitySource::LegacySynthesized).unwrap(),
-        serde_json::json!("legacy_synthesized")
-    );
-    assert_eq!(
         serde_json::to_value(CapabilityStatus::RequiresEntitlement).unwrap(),
         serde_json::json!("requires_entitlement")
     );
@@ -1904,39 +1900,6 @@ fn legacy_configs_load_with_unknown_default_capability_state() {
     assert!(provider.capabilities.is_empty());
     assert!(provider.last_model_fetch.is_none());
     assert!(provider.provider_metadata.is_empty());
-}
-
-#[test]
-fn reasoning_effort_projection_is_documented_compatibility_only() {
-    let capability = ReasoningEffortCapability {
-        values: vec![
-            CapabilityValue {
-                value: "off".into(),
-                ..Default::default()
-            },
-            CapabilityValue {
-                value: "minimal".into(),
-                ..Default::default()
-            },
-            CapabilityValue {
-                value: "low".into(),
-                ..Default::default()
-            },
-            CapabilityValue {
-                value: "xhigh".into(),
-                ..Default::default()
-            },
-            CapabilityValue {
-                value: "high".into(),
-                ..Default::default()
-            },
-        ],
-        ..Default::default()
-    };
-    assert_eq!(
-        project_reasoning_effort_to_thinking_modes(&capability),
-        vec![ThinkingMode::Off, ThinkingMode::Low, ThinkingMode::High]
-    );
 }
 
 #[test]

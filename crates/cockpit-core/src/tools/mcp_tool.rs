@@ -392,7 +392,6 @@ mod tests {
                 env: Default::default(),
                 env_credential_refs: Default::default(),
                 auth: Default::default(),
-                mode: Default::default(),
                 enabled: true,
                 cache_ttl_secs: 0,
                 connect_timeout_secs: None,

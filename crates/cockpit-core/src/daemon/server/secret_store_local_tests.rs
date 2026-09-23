@@ -27,7 +27,6 @@ fn attach_succeeds_when_platform_keyring_unavailable() {
         SecretStoreInjected {
             file_kek: Some(file_kek),
             keyring_kek: None,
-            legacy_keyring: None,
         },
     )
     .expect("first-run database must attach without a platform keyring");

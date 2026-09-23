@@ -12,8 +12,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::theme::{BRASS, FOG, INK};
 use crate::tui::textfield::TextField;
+use crate::tui::theme::{BRASS, FOG, INK};
 use cockpit_core::providers::ProviderTemplate;
 
 /// Ordered onboarding catalog: subscription logins first, then the rest of
@@ -446,7 +446,7 @@ impl ProviderSearchScreen {
         self.status.as_ref().map(|status| {
             Paragraph::new(Line::from(Span::styled(
                 status.clone(),
-                Style::default().fg(super::theme::BAD),
+                Style::default().fg(crate::tui::theme::BAD),
             )))
         })
     }

@@ -802,28 +802,10 @@ struct HiddenSlashAlias {
     canonical: &'static str,
 }
 
-const HIDDEN_SLASH_ALIASES: &[HiddenSlashAlias] = &[
-    HiddenSlashAlias {
-        alias: "?",
-        canonical: "help",
-    },
-    HiddenSlashAlias {
-        alias: "modelsettings",
-        canonical: "model-settings",
-    },
-    HiddenSlashAlias {
-        alias: "toggle-redact",
-        canonical: "toggle-redaction",
-    },
-    HiddenSlashAlias {
-        alias: "notes",
-        canonical: "scratchpad",
-    },
-    HiddenSlashAlias {
-        alias: "keybindings",
-        canonical: "keys",
-    },
-];
+const HIDDEN_SLASH_ALIASES: &[HiddenSlashAlias] = &[HiddenSlashAlias {
+    alias: "?",
+    canonical: "help",
+}];
 
 pub(crate) fn slash_command_by_name(name: &str) -> Option<&'static SlashCommand> {
     SLASH_COMMANDS.iter().find(|c| c.name == name)
@@ -2145,7 +2127,7 @@ impl App {
         );
     }
 
-    /// `/toggle-redaction [env|file|ssh]` (alias `/toggle-redact`): flip a
+    /// `/toggle-redaction [env|file|ssh]`: flip a
     /// redaction source for the running session. `env` flips environment-
     /// variable redaction, `file` flips environment-file redaction, and `ssh`
     /// flips private SSH-key redaction; a bare invocation opens a multiselect

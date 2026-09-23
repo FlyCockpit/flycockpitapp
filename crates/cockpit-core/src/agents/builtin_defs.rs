@@ -47,15 +47,6 @@ pub fn is_builtin_agent(name: &str) -> bool {
     BUILTIN_AGENT_NAMES.contains(&name)
 }
 
-/// Builtin primaries removed before release. These names stay reserved so
-/// stale sessions/configs degrade to `Build` and old ejected overrides do not
-/// resurrect them as custom agents.
-pub const REMOVED_PRIMARY_NAMES: &[&str] = &["Auto", "Swarm"];
-
-pub fn is_removed_primary(name: &str) -> bool {
-    REMOVED_PRIMARY_NAMES.contains(&name)
-}
-
 /// Built-in primaries that are real primary agents but never appear in the
 /// normal `/agent` list or Shift+Tab cycle. They are reached only through a
 /// dedicated feature flow.
@@ -90,20 +81,16 @@ pub fn is_builtin_primary(name: &str) -> bool {
     BUILTIN_PRIMARY_NAMES.contains(&name)
 }
 
-/// The builtin primary used when a stored or configured primary is no longer
-/// available.
+/// The builtin primary used when no stored or configured primary applies.
 pub const FALLBACK_PRIMARY: &str = "Build";
 
 /// Resolve the primary agent for a session (issue #75): the mode axis no
 /// longer selects `Careful` automatically — `defaultPrimaryAgent` (the
-/// configured default) governs. A stored/requested name wins (with
-/// removed-primary fallback to `Build`); otherwise the configured default
-/// applies (with the same removed-primary fallback).
+/// configured default) governs. A stored/requested name wins; otherwise the
+/// configured default applies.
 pub fn resolve_primary(requested_or_stored: Option<&str>, configured_default: &str) -> String {
     match requested_or_stored.filter(|name| !name.is_empty()) {
-        Some(name) if is_removed_primary(name) => FALLBACK_PRIMARY.to_string(),
         Some(name) => name.to_string(),
-        None if is_removed_primary(configured_default) => FALLBACK_PRIMARY.to_string(),
         None => configured_default.to_string(),
     }
 }
@@ -1026,20 +1013,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_primary_falls_back_to_build() {
-        assert_eq!(
-            resolve_primary(Some("Swarm"), FALLBACK_PRIMARY),
-            FALLBACK_PRIMARY,
-            "removed stored primaries keep the existing Build fallback"
-        );
-        assert_eq!(
-            resolve_primary(None, "Swarm"),
-            FALLBACK_PRIMARY,
-            "removed configured defaults keep the existing Build fallback"
-        );
-    }
-
-    #[test]
     fn defensive_role_def_grants_at_most_eleven_tools() {
         let def = embedded_default("Careful").expect("Careful embedded default");
         let grants = builtin_tool_names(&def);
@@ -1103,7 +1076,6 @@ mod tests {
         assert!(BUILTIN_AGENT_NAMES.contains(&"Careful"));
         assert!(is_builtin_primary("Careful"));
         assert!(!is_hidden_primary("Careful"));
-        assert!(!is_removed_primary("Careful"));
         assert_eq!(
             embedded_default("Careful")
                 .expect("Careful embedded default")

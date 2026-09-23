@@ -350,8 +350,8 @@ pub struct SessionRow {
     /// Owning assistant for assistant-backed sessions. NULL for ordinary
     /// sessions and for historical rows.
     pub assistant_name: Option<String>,
-    /// 6-char display id, unique within `project_id`. NULL for pre-§17
-    /// rows until lazy backfill populates them (see [`Db::resume_session`]).
+    /// 6-char display id, unique within `project_id`. Every session creator
+    /// generates it at insert time.
     pub short_id: Option<String>,
     /// Parent session in the fork tree. NULL = root session (GOALS §17e).
     pub parent_session_id: Option<Uuid>,
@@ -977,21 +977,17 @@ fn insert_fork_row_with_short_id_retry(
     Err(short_id_exhausted())
 }
 
-fn backfill_short_id_with_retry(
+/// Run a caller-owned `INSERT INTO sessions` that binds a freshly generated
+/// short id, retrying with a new id when the insert loses a per-project
+/// short-id uniqueness race. Returns the short id that was written.
+pub(crate) fn insert_session_with_unique_short_id(
     conn: &Connection,
-    session_id: Uuid,
     project_id: &str,
+    mut insert: impl FnMut(&str) -> rusqlite::Result<usize>,
 ) -> rusqlite::Result<String> {
     for attempt in 0..16 {
-        let short_id = if attempt == 0 {
-            short_id_candidate(conn)
-        } else {
-            generate_unique_short_id(conn, project_id)?
-        };
-        match conn.execute(
-            "UPDATE sessions SET short_id = ?1 WHERE session_id = ?2",
-            params![short_id, session_id.to_string()],
-        ) {
+        let short_id = generate_unique_short_id(conn, project_id)?;
+        match insert(&short_id) {
             Ok(_) => return Ok(short_id),
             Err(err)
                 if is_constraint_violation(&err)
@@ -3155,24 +3151,6 @@ impl Db {
             out.push(row.context("decoding session row")?);
         }
         Ok(out)
-    }
-
-    /// Ensure the session has a short_id (lazy backfill for rows
-    /// migrated from pre-§17 schemas). Returns the resolved short_id.
-    pub async fn ensure_short_id(&self, session_id: Uuid) -> Result<String> {
-        self.write(move |conn| Self::ensure_short_id_conn(conn, session_id))
-            .await
-    }
-
-    pub fn ensure_short_id_conn(conn: &Connection, session_id: Uuid) -> Result<String> {
-        let row = get_session_inner(conn, session_id)?
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
-        if let Some(existing) = row.short_id {
-            return Ok(existing);
-        }
-        let short_id = backfill_short_id_with_retry(conn, session_id, &row.project_id)
-            .context("backfilling short_id")?;
-        Ok(short_id)
     }
 
     /// Set or replace the session's title. `user_renamed` flips to true
@@ -5860,30 +5838,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_short_id_retries_backfill_collision() {
-        let db = Db::open_in_memory().unwrap();
-        set_test_short_ids(&db, &["aaaaaa"]).await;
-        let existing = db.create_session("p", "/x", "a").await.unwrap();
-        assert_eq!(existing.short_id.as_deref(), Some("aaaaaa"));
-
-        set_test_short_ids(&db, &["bbbbbb"]).await;
-        let target = db.create_session("p", "/x", "a").await.unwrap();
-        db.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET short_id = NULL WHERE session_id = ?1",
-                [target.session_id.to_string()],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-        set_test_short_ids(&db, &["aaaaaa", "cccccc"]).await;
-        let backfilled = db.ensure_short_id(target.session_id).await.unwrap();
-        assert_eq!(backfilled, "cccccc");
-    }
-
-    #[tokio::test]
     async fn short_id_retry_exhaustion_names_the_condition() {
         let db = Db::open_in_memory().unwrap();
         set_test_short_ids(&db, &["aaaaaa"]).await;
@@ -7289,27 +7243,6 @@ mod tests {
         assert!(log.contains("latest_activity_at"));
         assert!(log.contains("open_interrupts"));
         assert!(log.contains("pin_count"));
-    }
-
-    #[tokio::test]
-    async fn ensure_short_id_backfills_null() {
-        let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "a").await.unwrap();
-        // Simulate a pre-0002 row by clearing the short_id.
-        db.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET short_id = NULL WHERE session_id = ?1",
-                [s.session_id.to_string()],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-        let backfilled = db.ensure_short_id(s.session_id).await.unwrap();
-        assert_eq!(backfilled.len(), SHORT_ID_LEN);
-        // Idempotent: a second call returns the same id, doesn't churn.
-        let again = db.ensure_short_id(s.session_id).await.unwrap();
-        assert_eq!(again, backfilled);
     }
 
     #[tokio::test]

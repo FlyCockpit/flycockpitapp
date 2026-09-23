@@ -2872,22 +2872,6 @@ fn mixed_harness_policy_loaded_from_files_covers_trust_and_hidden_models() {
 }
 
 #[test]
-fn legacy_redact_fields_are_rejected_with_migration_hint() {
-    let tmp = TempDir::new().unwrap();
-    let config_path = tmp.path().join("config.json");
-    std::fs::write(&config_path, "{}").unwrap();
-    write_provider_file(
-        &config_path,
-        "p",
-        r#"{"url":"https://x","models":[{"id":"m","redact":false}]}"#,
-    );
-    let path = provider_file_path_for_config(&config_path, "p").unwrap();
-    let err = load_provider_raw_file(&path).unwrap_err().to_string();
-    assert!(err.contains("legacy `redact`"));
-    assert!(err.contains("trust"));
-}
-
-#[test]
 fn resolve_inline_think_three_tier_precedence() {
     let mut cfg = ProvidersConfig::default();
 

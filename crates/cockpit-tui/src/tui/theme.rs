@@ -70,22 +70,12 @@ pub const MUTED_COLOR_INDEX: u8 = FOG_INDEX;
 pub const ACCENT_BLUE: Color = BRASS;
 pub const ACCENT_BLUE_INDEX: u8 = BRASS_INDEX;
 pub const SUBAGENT_ORANGE: Color = TEAL;
-pub const SUBAGENT_ORANGE_INDEX: u8 = TEAL_INDEX;
 pub const TRANSCRIPT_HOVER_BG: Color = HOVER_BG;
-pub const TRANSCRIPT_HOVER_BG_INDEX: u8 = HOVER_BG_INDEX;
 
 // TODO(#434): drop aliases
 pub const INK_ANSI: Color = Color::Indexed(INK_INDEX);
 pub const FOG_ANSI: Color = Color::Indexed(FOG_INDEX);
-pub const BRASS_ANSI: Color = Color::Indexed(BRASS_INDEX);
-pub const NIGHT_ANSI: Color = Color::Indexed(NIGHT_INDEX);
-pub const GOOD_ANSI: Color = Color::Indexed(GOOD_INDEX);
-pub const WARN_ANSI: Color = Color::Indexed(WARN_INDEX);
 pub const BAD: Color = RED;
-pub const BAD_ANSI: Color = Color::Indexed(RED_INDEX);
-pub const DISABLED_ANSI: Color = Color::Indexed(DISABLED_INDEX);
-pub const HOVER_BG_ANSI: Color = Color::Indexed(HOVER_BG_INDEX);
-pub const PLACEHOLDER_ANSI: Color = Color::Indexed(PLACEHOLDER_INDEX);
 
 pub const STATUS_BRANCH_BADGE: Color = Color::Indexed(220);
 pub const FAVORITE_MODEL: Color = Color::Indexed(178);
@@ -275,7 +265,6 @@ mod tests {
         assert_eq!(TRANSCRIPT_HOVER_BG, HOVER_BG);
         assert_eq!(MUTED_COLOR_INDEX, FOG_INDEX);
         assert_eq!(ACCENT_BLUE_INDEX, BRASS_INDEX);
-        assert_eq!(SUBAGENT_ORANGE_INDEX, TEAL_INDEX);
     }
 
     #[test]
@@ -347,32 +336,13 @@ mod tests {
         // Every `*_ANSI` fallback is the indexed spelling of its token.
         assert_eq!(INK_ANSI, Color::Indexed(255));
         assert_eq!(FOG_ANSI, Color::Indexed(109));
-        assert_eq!(BRASS_ANSI, Color::Indexed(179));
-        assert_eq!(NIGHT_ANSI, Color::Indexed(240));
-        assert_eq!(GOOD_ANSI, Color::Indexed(114));
-        assert_eq!(WARN_ANSI, Color::Indexed(173));
-        assert_eq!(BAD_ANSI, Color::Indexed(167));
-        assert_eq!(DISABLED_ANSI, Color::Indexed(241));
-        assert_eq!(HOVER_BG_ANSI, Color::Indexed(236));
-        assert_eq!(PLACEHOLDER_ANSI, Color::Indexed(245));
         // Yellow shares BRASS's RGB, so it shares its fallback too.
         assert_eq!(YELLOW_INDEX, BRASS_INDEX);
     }
 
     #[test]
     fn ansi_fallbacks_are_indexed_never_reset() {
-        for color in [
-            INK_ANSI,
-            FOG_ANSI,
-            BRASS_ANSI,
-            NIGHT_ANSI,
-            GOOD_ANSI,
-            WARN_ANSI,
-            BAD_ANSI,
-            DISABLED_ANSI,
-            HOVER_BG_ANSI,
-            PLACEHOLDER_ANSI,
-        ] {
+        for color in [INK_ANSI, FOG_ANSI] {
             assert!(
                 matches!(color, Color::Indexed(_)),
                 "ANSI fallback must be indexed, got {color:?}"

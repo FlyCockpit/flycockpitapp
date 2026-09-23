@@ -42,25 +42,6 @@ impl Transport {
     }
 }
 
-/// Legacy mode field (GOALS §18a). All MCP access now routes
-/// through the Monty sandbox; old `always-disclose` values deserialize as
-/// Monty so existing configs remain usable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum DisclosureMode {
-    /// Tools are *not* in context; reached only through the Python
-    /// sandbox `mcp` tool (`mcp.search`/`mcp.invoke`). The default.
-    #[default]
-    #[serde(alias = "always-disclose", alias = "traditional", alias = "trad")]
-    Monty,
-}
-
-impl DisclosureMode {
-    pub fn is_monty(mode: &Self) -> bool {
-        matches!(mode, DisclosureMode::Monty)
-    }
-}
-
 /// Per-server authentication. Credentials/tokens are stored via
 /// `credentials.rs`; `$VAR` references resolve through `envref.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -175,11 +156,6 @@ pub struct ServerConfig {
     /// Authentication block. Defaults to `none`.
     #[serde(default)]
     pub auth: Auth,
-
-    /// Legacy mode value. Defaults to `monty`, accepts old aliases, and is
-    /// skipped on new writes.
-    #[serde(default, skip_serializing_if = "DisclosureMode::is_monty")]
-    pub mode: DisclosureMode,
 
     /// Whether this server is active. Defaults to `true`.
     #[serde(default = "default_true")]
@@ -363,11 +339,6 @@ pub struct McpConfig {
     pub servers: BTreeMap<String, ServerConfig>,
 }
 
-/// Retired sealed child-environment binding field names. MCP config must
-/// reject these before any server dispatch (no silent ignore).
-const RETIRED_SEALED_BINDING_FIELDS: &[&str] =
-    &["sealed_values", "sealedValues", "sealed_env", "sealedEnv"];
-
 /// Error text when a layer tries to define the reserved `cockpit` server.
 pub const RESERVED_BUILTIN_SERVER_PARSE_ERROR: &str =
     "`cockpit` is a reserved MCP server id and cannot be defined, shadowed, or unbound";
@@ -388,32 +359,17 @@ fn reject_reserved_builtin_server(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn reject_retired_sealed_bindings_in_mcp_value(value: &serde_json::Value) -> Result<()> {
-    let Some(root) = value.as_object() else {
-        return Ok(());
-    };
-    for key in RETIRED_SEALED_BINDING_FIELDS {
-        if root.contains_key(*key) {
-            anyhow::bail!(
-                "sealed child-environment injection is retired; `{key}` is not accepted in mcp.json"
-            );
-        }
-    }
-    let Some(servers) = root.get("servers").and_then(|v| v.as_object()) else {
+/// Configured MCP child environments must never declare `SEALED_*` keys:
+/// that prefix is reserved and scrubbed from every child environment, so a
+/// config that names one is refused before any server dispatch.
+fn reject_sealed_env_keys_in_mcp_value(value: &serde_json::Value) -> Result<()> {
+    let Some(servers) = value.get("servers").and_then(|v| v.as_object()) else {
         return Ok(());
     };
     for (server_name, server) in servers {
         let Some(obj) = server.as_object() else {
             continue;
         };
-        for key in RETIRED_SEALED_BINDING_FIELDS {
-            if obj.contains_key(*key) {
-                anyhow::bail!(
-                    "MCP server `{server_name}`: sealed child-environment injection is retired; `{key}` is not accepted"
-                );
-            }
-        }
-        // Configured env maps must not declare SEALED_* keys either.
         for env_field in ["env", "env_credential_refs"] {
             if let Some(env_map) = obj.get(env_field).and_then(|v| v.as_object()) {
                 for env_key in env_map.keys() {
@@ -447,7 +403,7 @@ impl McpConfig {
             return Ok(Self::default());
         }
         let value: serde_json::Value = serde_json::from_str(raw).context("parsing mcp.json")?;
-        reject_retired_sealed_bindings_in_mcp_value(&value)?;
+        reject_sealed_env_keys_in_mcp_value(&value)?;
         reject_reserved_builtin_server(&value)?;
         serde_json::from_value(value).context("parsing mcp.json")
     }
@@ -743,7 +699,6 @@ mod tests {
             ]),
             env_credential_refs: BTreeMap::new(),
             auth,
-            mode: DisclosureMode::Monty,
             enabled: true,
             cache_ttl_secs: 3600,
             connect_timeout_secs: None,
@@ -948,7 +903,6 @@ mod tests {
                     value: "Bearer secret".into(),
                     credential_ref: None,
                 }),
-                mode: DisclosureMode::Monty,
                 enabled: true,
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,
@@ -988,7 +942,6 @@ mod tests {
               "transport": "sse",
               "endpoint": "https://legacy.example.com/sse",
               "auth": { "kind": "header", "header": "X-Api-Key", "value": "$KEY" },
-              "mode": "always-disclose",
               "enabled": false
             },
             "public": {
@@ -1003,7 +956,6 @@ mod tests {
 
         let http = &cfg.servers["http_oauth"];
         assert_eq!(http.transport, Transport::Streamable);
-        assert_eq!(http.mode, DisclosureMode::Monty, "default mode is monty");
         assert!(http.enabled, "default enabled is true");
         assert_eq!(http.cache_ttl_secs, 3600, "default ttl");
         assert_eq!(
@@ -1027,7 +979,6 @@ mod tests {
 
         let sse = &cfg.servers["sse_header"];
         assert_eq!(sse.transport, Transport::Sse);
-        assert_eq!(sse.mode, DisclosureMode::Monty);
         assert!(!sse.enabled);
         match &sse.auth {
             Auth::Header(h) => {
@@ -1131,11 +1082,11 @@ mod tests {
     }
 
     #[test]
-    fn enabled_servers_include_legacy_always_disclose_aliases() {
+    fn enabled_servers_filters_disabled_entries() {
         let raw = r#"{ "servers": {
-          "a": { "transport": "streamable", "endpoint": "u", "mode": "monty", "enabled": true },
-          "b": { "transport": "streamable", "endpoint": "u", "mode": "monty", "enabled": false },
-          "c": { "transport": "streamable", "endpoint": "u", "mode": "always-disclose", "enabled": true }
+          "a": { "transport": "streamable", "endpoint": "u", "enabled": true },
+          "b": { "transport": "streamable", "endpoint": "u", "enabled": false },
+          "c": { "transport": "streamable", "endpoint": "u", "enabled": true }
         } }"#;
         let cfg = McpConfig::parse(raw).unwrap();
         let enabled = cfg.enabled_servers();
@@ -1143,7 +1094,6 @@ mod tests {
             enabled.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
             vec!["a", "c"]
         );
-        assert_eq!(cfg.servers["c"].mode, DisclosureMode::Monty);
     }
 
     #[test]
@@ -1164,22 +1114,8 @@ mod tests {
 
     #[test]
     fn sealed_child_injection_is_absent_from_mcp_config() {
-        // AC1: MCP server config rejects retired sealed-binding fields/aliases
-        // and SEALED_* env keys before any dispatch path can use them.
-        for field in ["sealed_values", "sealedValues", "sealed_env", "sealedEnv"] {
-            let raw = format!(
-                r#"{{ "servers": {{
-                  "s": {{ "transport": "stdio", "command": "echo", "{field}": ["prod-token"] }}
-                }} }}"#
-            );
-            let err = McpConfig::parse(&raw).expect_err(field);
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("sealed") || msg.contains(field),
-                "field `{field}` must be rejected, got: {msg}"
-            );
-        }
-
+        // AC1: MCP server config rejects SEALED_* env keys before any
+        // dispatch path can use them.
         let env_err = McpConfig::parse(
             r#"{ "servers": {
               "s": {

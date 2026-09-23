@@ -1893,7 +1893,7 @@ fn monty_to_json(obj: &MontyObject) -> Value {
 mod tests {
     use super::*;
     use crate::engine::agent::TurnEvent;
-    use crate::mcp::config::{DisclosureMode, ServerConfig, Transport};
+    use crate::mcp::config::{ServerConfig, Transport};
 
     #[tokio::test]
     async fn projection_refuses_without_bound_coverage() {
@@ -2329,7 +2329,6 @@ mod tests {
                 env: BTreeMap::new(),
                 env_credential_refs: BTreeMap::new(),
                 auth: Default::default(),
-                mode: DisclosureMode::Monty,
                 enabled: true,
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,
@@ -3877,7 +3876,6 @@ for line in sys.stdin:
                 env: BTreeMap::new(),
                 env_credential_refs: BTreeMap::new(),
                 auth: Default::default(),
-                mode: DisclosureMode::Monty,
                 enabled: true,
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: None,
@@ -4079,7 +4077,6 @@ f()",
                 },
                 env_credential_refs: BTreeMap::new(),
                 auth: Default::default(),
-                mode: DisclosureMode::Monty,
                 enabled: true,
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: Some(1),
@@ -4162,7 +4159,6 @@ f()",
                 env: BTreeMap::new(),
                 env_credential_refs: BTreeMap::new(),
                 auth: Default::default(),
-                mode: DisclosureMode::Monty,
                 enabled: true,
                 cache_ttl_secs: 3600,
                 connect_timeout_secs: Some(1),

@@ -606,8 +606,7 @@ pub struct Session {
         Mutex<Option<Arc<crate::image_generation_job::ImageGenerationDispatchService>>>,
     active_sandbox_escalate_eligible: AtomicBool,
     /// 6-char human-display id, unique within `project_id`
-    /// (GOALS §17b). Populated at create-time; backfilled lazily for
-    /// pre-§17 rows on [`Session::resume`]. Insert collision retry can
+    /// (GOALS §17b). Populated at create-time. Insert collision retry can
     /// replace the in-memory value — read through [`Self::short_id`].
     short_id: Mutex<String>,
     /// Parent session in the fork tree (GOALS §17e). `None` = root.

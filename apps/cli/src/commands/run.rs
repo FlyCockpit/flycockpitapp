@@ -2156,7 +2156,6 @@ mod tests {
             approve: Vec::new(),
             fork: false,
             format: OutputFormat::Default,
-            json: false,
             verbose: false,
             follow: false,
             file: Vec::new(),

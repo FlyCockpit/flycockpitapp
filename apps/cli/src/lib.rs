@@ -808,8 +808,6 @@ fn error_exit_code(err: &anyhow::Error) -> u8 {
         2
     } else if err.is::<commands::doctor::DoctorChecksFailed>() {
         1
-    } else if err.is::<commands::RemovedCommandError>() {
-        commands::REMOVED_COMMAND_EXIT_CODE
     } else if err.is::<commands::CommandUsageError>() {
         commands::USAGE_EXIT_CODE
     } else if err.is::<commands::InteractiveOnboardingRequired>() {
@@ -934,9 +932,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
 }
 
 fn error_stderr_line(err: &anyhow::Error) -> String {
-    if let Some(removed) = err.downcast_ref::<commands::RemovedCommandError>() {
-        format!("error: {}", removed.message())
-    } else if let Some(usage) = err.downcast_ref::<commands::CommandUsageError>() {
+    if let Some(usage) = err.downcast_ref::<commands::CommandUsageError>() {
         format!("error: {}", usage.message())
     } else if let Some(required) = err.downcast_ref::<commands::InteractiveOnboardingRequired>() {
         format!("error: {}", required.message())
@@ -1107,12 +1103,6 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Debug(sub)) => commands::debug::run(sub).await,
         Some(Command::Config(sub)) => commands::config::run(sub).await,
         Some(Command::Mcp(cmd)) => commands::mcp::run(cmd).await,
-        #[cfg(feature = "remote")]
-        Some(Command::Login(_)) => Err(commands::RemovedCommandError::new("login").into()),
-        #[cfg(feature = "remote")]
-        Some(Command::Logout) => Err(commands::RemovedCommandError::new("logout").into()),
-        #[cfg(feature = "remote")]
-        Some(Command::Whoami) => Err(commands::RemovedCommandError::new("whoami").into()),
         #[cfg(feature = "remote")]
         Some(Command::Sync(sub)) => commands::sync::run(sub).await,
         #[cfg(feature = "remote")]
@@ -2035,7 +2025,6 @@ mod tests {
                 approve: Vec::new(),
                 fork: false,
                 format: crate::cli::OutputFormat::Default,
-                json: false,
                 verbose: false,
                 follow: false,
                 file: Vec::new(),
@@ -2087,17 +2076,6 @@ mod tests {
         assert_eq!(error_stderr_line(&err), "Error: boom");
     }
 
-    #[test]
-    fn removed_login_stub_points_and_exits_2() {
-        let err = anyhow::Error::new(commands::RemovedCommandError::new("login"));
-
-        assert_eq!(error_exit_code(&err), commands::REMOVED_COMMAND_EXIT_CODE);
-        let line = error_stderr_line(&err);
-        assert!(line.contains("`cockpit login` was split"), "{line}");
-        assert!(line.contains("`cockpit account login`"), "{line}");
-        assert!(line.contains("`cockpit provider add`"), "{line}");
-    }
-    #[cfg(unix)]
     #[test]
     fn log_file_is_private() {
         use std::os::unix::fs::PermissionsExt;

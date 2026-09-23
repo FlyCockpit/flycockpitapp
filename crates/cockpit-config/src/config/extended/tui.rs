@@ -3,7 +3,7 @@ use super::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuiConfig {
-    #[serde(default, deserialize_with = "deserialize_vim_mode_setting")]
+    #[serde(default)]
     pub vim_mode: VimModeSetting,
     #[serde(default)]
     pub thinking: ThinkingDisplay,
@@ -435,32 +435,6 @@ impl VimModeSetting {
 
     pub fn show_hint(self) -> bool {
         matches!(self, Self::Hint)
-    }
-}
-
-/// Accept the legacy `vim_mode: bool` schema as well as the new
-/// string enum. `true` maps to `Hint` (the default), `false` to
-/// `Disabled`. Lets us roll the schema forward without breaking
-/// existing configs on disk.
-fn deserialize_vim_mode_setting<'de, D>(d: D) -> Result<VimModeSetting, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    let v = serde_json::Value::deserialize(d)?;
-    match v {
-        serde_json::Value::Bool(true) => Ok(VimModeSetting::Hint),
-        serde_json::Value::Bool(false) => Ok(VimModeSetting::Disabled),
-        serde_json::Value::String(s) => match s.as_str() {
-            "hint" => Ok(VimModeSetting::Hint),
-            "enabled" => Ok(VimModeSetting::Enabled),
-            "disabled" => Ok(VimModeSetting::Disabled),
-            other => Err(D::Error::custom(format!(
-                "unknown vim_mode `{other}` (expected hint|enabled|disabled)"
-            ))),
-        },
-        serde_json::Value::Null => Ok(VimModeSetting::default()),
-        _ => Err(D::Error::custom("vim_mode must be a string or bool")),
     }
 }
 

@@ -1610,7 +1610,6 @@ fn full_production_tree_rejects_agent_and_config_authority() {
                 "ConfigDoc::load(",
                 "ConfigDoc::providers_from_paths(",
                 "McpConfig::discover(",
-                "Request::SaveExtendedConfig",
                 "patch_json:",
             ] {
                 if production.contains(forbidden) {
@@ -2158,7 +2157,6 @@ fn tui_settings_use_revisioned_typed_mutation() {
     let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
     assert!(settings.contains("GetExtendedConfigSnapshot"));
     assert!(settings.contains("ApplyExtendedConfigPatch"));
-    assert!(!settings.contains("Request::SaveExtendedConfig"));
     assert!(!settings.contains("base_hash = None"));
 }
 

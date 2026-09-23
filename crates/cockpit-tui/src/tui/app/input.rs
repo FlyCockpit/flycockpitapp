@@ -2898,17 +2898,6 @@ impl App {
         );
         self.lock_pending_agent_switch_log();
 
-        // `/compact` review-then-commit (T6.e): the composer holds the
-        // assembled handoff (user may have edited it). On submit, re-attach
-        // to the fresh session the daemon created and send the handoff as
-        // its first message. The old session stays whole in SQLite,
-        // recoverable via `cockpit session show/resume`.
-        if self.pending_compact.is_some() {
-            self.submission_fences.remove(&client_submission_id);
-            let _ = self.submission_order.complete(fence_sequence);
-            return self.commit_compact(submitted);
-        }
-
         // Collapse only after the submission has passed readiness and input
         // validation and owns its ordered fence. Opening setup or rejecting a
         // second queued submit must leave the panel available.

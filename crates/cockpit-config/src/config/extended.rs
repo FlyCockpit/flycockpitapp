@@ -1,5 +1,4 @@
-//! Loader for the cockpit-only config keys — the former
-//! `extended-config.json` superset, now top-level keys in the single
+//! Loader for the cockpit-only config keys: top-level keys in the single
 //! per-layer `config.json` (GOALS §2a).
 //!
 //! Lives alongside layer-wide provider metadata in each discovered `.cockpit/`
@@ -631,19 +630,6 @@ pub struct ExtendedConfig {
     )]
     pub agent_runtime_defaults: BTreeMap<String, AgentRuntimeDefaults>,
 
-    /// Raw removed/unknown `defaultPrimaryAgent` value that degraded to
-    /// [`DefaultPrimaryAgent::Build`]. This is runtime-only notice state:
-    /// it is derived from config input, cloned through daemon snapshots, and
-    /// intentionally omitted from serialized config/protocol output.
-    #[serde(skip)]
-    pub removed_default_primary_agent: Option<String>,
-
-    /// Runtime-only tombstone recording that a loaded layer still contained
-    /// the removed `llm_mode` key. It is never serialized back to config; the
-    /// daemon uses it to surface the migration notice once per session.
-    #[serde(skip)]
-    pub removed_llm_mode: Option<String>,
-
     /// Round-trip utility-model translation (implementation note).
     /// The user's language and the model's language; when both are set and
     /// differ, the inbound prompt is translated into the model's language
@@ -655,14 +641,7 @@ pub struct ExtendedConfig {
     /// Whether sandbox escalation is enabled for new sessions. When true, a
     /// sandboxed command may offer an explicit unsandboxed retry path; the
     /// approval mode still controls whether that retry requires confirmation.
-    /// The camelCase `alias` is a read-only legacy spelling: it must stay
-    /// registered in `EXTENDED_CONFIG_KEY_ALIASES` so the canonical spelling
-    /// wins when a document carries both.
-    #[serde(
-        default = "default_true",
-        rename = "sandbox_escalation_enabled",
-        alias = "sandboxEscalationEnabled"
-    )]
+    #[serde(default = "default_true", rename = "sandbox_escalation_enabled")]
     pub sandbox_escalation_enabled: bool,
 
     /// Which command-approval mode new sessions start in
@@ -976,7 +955,7 @@ pub enum ApprovalPolicyScope {
     Global,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CommandResourceProfilesConfig {
     /// User-defined declarative command resource profiles. Built-ins are not
     /// represented here; they are supplied by the registry and may be toggled
@@ -994,37 +973,6 @@ pub struct CommandResourceProfilesConfig {
     /// Forward-compatible fields under `commandResourceProfiles`.
     #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Value>,
-}
-
-impl<'de> Deserialize<'de> for CommandResourceProfilesConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize, Default)]
-        struct Raw {
-            #[serde(default)]
-            profiles: BTreeMap<String, CommandResourceProfileDefinition>,
-            #[serde(default)]
-            wrappers: BTreeMap<String, Vec<String>>,
-            #[serde(default)]
-            enabled: BTreeMap<String, bool>,
-            #[serde(flatten, default)]
-            extra: Map<String, Value>,
-        }
-        let raw = Raw::deserialize(deserializer)?;
-        if raw.extra.contains_key("rustToolchain") {
-            return Err(serde::de::Error::custom(
-                "commandResourceProfiles.rustToolchain is no longer supported; use commandResourceProfiles.wrappers",
-            ));
-        }
-        Ok(Self {
-            profiles: raw.profiles,
-            wrappers: raw.wrappers,
-            enabled: raw.enabled,
-            extra: raw.extra,
-        })
-    }
 }
 
 impl CommandResourceProfilesConfig {
@@ -1219,7 +1167,7 @@ impl TranslationConfig {
 /// The serde spelling is lowercase (`build`/`plan`); the resolved
 /// agent name [`Self::agent_name`] keeps the in-binary casing convention
 /// (capitalized primaries — `Build`/`Plan`).
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultPrimaryAgent {
     /// Start directly on `Build` (make-the-change-now).
@@ -1252,20 +1200,6 @@ pub struct AgentRuntimeDefaults {
         skip_serializing_if = "DelegationBudgetSpec::is_empty"
     )]
     pub budget: DelegationBudgetSpec,
-}
-
-impl<'de> Deserialize<'de> for DefaultPrimaryAgent {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "plan" => DefaultPrimaryAgent::Plan,
-            "build" | "auto" | "swarm" => DefaultPrimaryAgent::Build,
-            _ => DefaultPrimaryAgent::Build,
-        })
-    }
 }
 
 impl DefaultPrimaryAgent {
@@ -1548,11 +1482,7 @@ pub struct ScheduleConfig {
     pub max_concurrent: usize,
     /// Allow schedule `limit = 0` loops to ask for a one-time per-session
     /// interactive approval. Default false: unbounded loops are rejected.
-    #[serde(
-        rename = "allowUnboundedLoops",
-        alias = "allow_unbounded_loops",
-        default
-    )]
+    #[serde(rename = "allowUnboundedLoops", default)]
     pub allow_unbounded_loops: bool,
 }
 
@@ -1881,20 +1811,12 @@ impl ExtendedConfig {
             .filter(|s| !s.is_empty())
     }
 
-    pub fn removed_default_primary_agent(&self) -> Option<&str> {
-        self.removed_default_primary_agent.as_deref()
-    }
-
     pub fn default_agent_name(&self) -> &str {
         self.default_agent
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| self.default_primary_agent.agent_name())
-    }
-
-    pub fn removed_llm_mode(&self) -> Option<&str> {
-        self.removed_llm_mode.as_deref()
     }
 
     /// Resolve the hierarchical spend budget for `agent_name`.
@@ -1985,8 +1907,6 @@ impl Default for ExtendedConfig {
             default_primary_agent: DefaultPrimaryAgent::default(),
             default_agent: None,
             agent_runtime_defaults: BTreeMap::new(),
-            removed_default_primary_agent: None,
-            removed_llm_mode: None,
             translation: TranslationConfig::default(),
             sandbox_escalation_enabled: true,
             default_approval_mode: ApprovalMode::default(),
@@ -2938,7 +2858,7 @@ pub(crate) fn strip_remote_daemon_boot(raw: &mut Value) {
 /// Parse config.json bytes into an object root, mirroring
 /// [`ExtendedConfigDoc::load`]: empty/whitespace bytes are an empty object, and
 /// a non-object root is rejected (fail closed). Shared by the layered loader's
-/// posture and the `SaveExtendedConfig` merge below.
+/// posture and the settings-patch merge below.
 fn parse_config_root_object(bytes: &[u8]) -> Result<Value> {
     let text = std::str::from_utf8(bytes).context("config.json is not valid UTF-8")?;
     if text.trim().is_empty() {
@@ -2951,14 +2871,14 @@ fn parse_config_root_object(bytes: &[u8]) -> Result<Value> {
     }
 }
 
-/// Render the config.json bytes to persist for a daemon `SaveExtendedConfig`
+/// Render the config.json bytes to persist for a daemon settings-patch
 /// write, preserving the on-disk `image_generation` registry.
 ///
-/// DATA-LOSS / SECURITY: `SaveExtendedConfig` is NEVER the authoritative writer
+/// DATA-LOSS / SECURITY: a settings write is NEVER the authoritative writer
 /// of `image_generation`. The daemon redacts the registry to the empty default
 /// (`ImageGenerationConfig::default`, via `redacted_for_snapshot`) before it
 /// sends a config snapshot to any client, so a client that round-trips that
-/// snapshot back through `SaveExtendedConfig` always carries an EMPTY
+/// snapshot back through a settings write always carries an EMPTY
 /// `image_generation`. A verbatim write would therefore WIPE the on-disk
 /// endpoints/targets/workflows/allowlist on any generic settings save.
 /// `image_generation` is mutated ONLY through the dedicated `image_endpoint_*` /
@@ -2979,7 +2899,7 @@ pub fn render_saved_extended_config_preserving_image_generation(
     on_disk_bytes: &[u8],
 ) -> Result<Vec<u8>> {
     let mut incoming = parse_config_root_object(incoming_bytes)
-        .context("parsing incoming SaveExtendedConfig config.json")?;
+        .context("parsing incoming settings config.json")?;
     // The client can never author `image_generation`; drop whatever it sent
     // (the redacted round-trip always sends the empty registry).
     strip_remote_image_generation(&mut incoming);
@@ -3002,77 +2922,6 @@ pub(crate) fn strip_secret_store_key(raw: &mut Value) {
     if let Some(obj) = raw.as_object_mut() {
         obj.remove("secretStore");
         obj.remove("secret_store");
-    }
-}
-
-/// Accepted alternate spellings for top-level [`ExtendedConfig`] keys,
-/// paired with the key's canonical spelling.
-///
-/// A rename/alias pair is ONE setting, not two sections. serde's derived
-/// deserializer treats both spellings as the same field, so a document
-/// carrying both fails the typed decode with `duplicate field`, and without
-/// normalization the per-section recovery path would commit whichever
-/// spelling sorts first in the (BTree-backed) object map — inverting the
-/// documented canonical-spelling-wins contract and making layered
-/// last-layer-wins depend on which spelling each layer happened to use.
-/// [`canonicalize_extended_config_key_aliases`] renames every accepted
-/// spelling to its canonical key (canonical spelling wins when a document
-/// carries both) at the typed decode/merge funnels, so serde never sees a
-/// duplicate field.
-///
-/// When adding a `serde(alias)` to a top-level `ExtendedConfig` field,
-/// register the pair here: `extended_config_key_alias_table_matches_serde`
-/// in `extended/tests.rs` fails a stale entry, and the incremental fallback
-/// in [`ExtendedConfigDoc::recover_typed_config`] keeps an unregistered pair
-/// from zeroing the settings view (one spelling still wins by commit order).
-///
-/// The persist path ([`ExtendedConfigDoc::merge_config_raw`]) consults this
-/// table too: written documents are canonical-only, and the alternate
-/// spelling's value is re-seated under the canonical key, so an alias-only
-/// document never loses the setting on save. The daemon's settings
-/// snapshot/patch RPCs (which decode and mutate raw documents outside this
-/// crate) enforce the same one-setting view through
-/// [`canonicalize_extended_config_document_aliases`].
-const EXTENDED_CONFIG_KEY_ALIASES: &[(&str, &str)] =
-    &[("sandboxEscalationEnabled", "sandbox_escalation_enabled")];
-
-/// Rename accepted alternate spellings ([`EXTENDED_CONFIG_KEY_ALIASES`]) to
-/// their canonical key. The canonical spelling wins when the document
-/// carries both, matching the pre-typed-decode parse order that applied the
-/// canonical key last; a document carrying only the alternate spelling is
-/// honored unchanged. Applied to clones at the decode/merge funnels
-/// ([`ExtendedConfigDoc::config_with_warnings`] and
-/// [`ExtendedConfigDoc::raw_for_layer_merge`]) so the stored raw keeps the
-/// on-disk spelling for round-trip preservation while no decode or merge
-/// ever sees two spellings of one setting.
-fn canonicalize_extended_config_key_aliases(raw: &mut Map<String, Value>) {
-    for &(alias, canonical) in EXTENDED_CONFIG_KEY_ALIASES {
-        // Rename the alternate spelling to the canonical key. When the
-        // document carries both, the canonical spelling wins and the
-        // alternate value is dropped — exactly like the pre-typed-decode
-        // parse order, which applied the canonical key last.
-        if let Some(value) = raw.remove(alias)
-            && raw.get(canonical).is_none()
-        {
-            raw.insert(canonical.to_string(), value);
-        }
-    }
-}
-
-/// Document-level form of [`canonicalize_extended_config_key_aliases`] for
-/// config boundaries outside this crate: the daemon's settings snapshot and
-/// patch RPCs (and their disk-backed test fake) decode and mutate raw config
-/// documents without passing through [`ExtendedConfigDoc`]'s load, merge, and
-/// persist funnels. Normalizing at those boundaries gives them the same
-/// ONE-setting view of a registered pair the funnels enforce: a canonical-path
-/// Set can never land beside a still-live legacy spelling (which serde's
-/// derived deserializer rejects as `duplicate field`), a canonical-path Unset
-/// removes the one setting instead of leaving the legacy spelling in effect,
-/// and an alias-only document is persisted under the canonical key, exactly
-/// like [`ExtendedConfigDoc::merge_config_raw`]'s re-seat.
-pub fn canonicalize_extended_config_document_aliases(document: &mut Value) {
-    if let Some(object) = document.as_object_mut() {
-        canonicalize_extended_config_key_aliases(object);
     }
 }
 
@@ -3197,22 +3046,15 @@ impl ExtendedConfigDoc {
     /// decode fails, each top-level key is retried on its own
     /// ([`Self::recover_typed_config`]), so one malformed section is dropped
     /// with a warning instead of zeroing the entire settings view.
-    ///
-    /// Alternate spellings (`EXTENDED_CONFIG_KEY_ALIASES`) are normalized
-    /// to the canonical key first (canonical spelling wins when the document
-    /// carries both), so serde never sees a duplicate field.
     pub fn config_with_warnings(&self) -> (ExtendedConfig, Vec<String>) {
         let mut cfg = ExtendedConfig::default();
         let mut warnings = Vec::new();
         let Some(raw_obj) = self.raw.as_object() else {
             return (cfg, warnings);
         };
-        let mut raw = raw_obj.clone();
-        canonicalize_extended_config_key_aliases(&mut raw);
-
-        match serde_json::from_value::<ExtendedConfig>(Value::Object(raw.clone())) {
+        match serde_json::from_value::<ExtendedConfig>(Value::Object(raw_obj.clone())) {
             Ok(parsed) => cfg = parsed,
-            Err(_) => cfg = self.recover_typed_config(&raw, &mut warnings),
+            Err(_) => cfg = self.recover_typed_config(raw_obj, &mut warnings),
         }
 
         // `image_spend` is intentionally not a config section: spend policy
@@ -3220,30 +3062,6 @@ impl ExtendedConfigDoc {
         // unknown to the typed decode, so it is ignored and can never
         // authorize paid dispatch.
 
-        // The typed decode degrades a removed/unknown `defaultPrimaryAgent`
-        // spelling to `Build`; keep the notice state so the daemon can
-        // surface what was configured.
-        if let Some(value) = raw.get("defaultPrimaryAgent")
-            && let Some(removed) = value.as_str()
-            && !matches!(removed, "build" | "plan")
-        {
-            cfg.removed_default_primary_agent = Some(removed.to_string());
-        }
-        if raw.contains_key("llm_mode") {
-            cfg.removed_llm_mode = Some(
-                raw.get("llm_mode")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("<non-string>")
-                    .to_string(),
-            );
-            tracing::warn!(
-                key = "llm_mode",
-                "llm_mode is no longer used; posture now comes from agent definitions"
-            );
-            warnings.push(
-                "llm_mode is no longer used; posture now comes from agent definitions".to_string(),
-            );
-        }
         // The typed decode accepts any well-formed registry; the local trust
         // policy is a config boundary, so an invalid registry is dropped
         // here rather than selected or persisted to fail later at runtime.
@@ -3254,8 +3072,6 @@ impl ExtendedConfigDoc {
             warnings.push("ignored invalid `knowledgeBases` policy".to_string());
             cfg.knowledge_bases = Vec::new();
         }
-
-        migrate_legacy_web_tool_templates(&mut cfg);
 
         (cfg, warnings)
     }
@@ -3273,14 +3089,12 @@ impl ExtendedConfigDoc {
     /// key was quadratic in the number of top-level keys, and the 2 MiB
     /// document cap ([`crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES`])
     /// admits on the order of 10^5 of them. Top-level fields decode
-    /// independently and alternate spellings are normalized away by
-    /// [`canonicalize_extended_config_key_aliases`] before this runs, so the
-    /// union of individually-valid keys decodes in one final pass. The
-    /// incremental fallback inside is the drift guard for a future
-    /// `serde(alias)` added without a companion
-    /// [`EXTENDED_CONFIG_KEY_ALIASES`] entry: two spellings of one field
-    /// would fail jointly (duplicate field) there, and commit-order recovery
-    /// still loads every other section instead of zeroing the settings view.
+    /// independently, so the union of individually-valid keys decodes in one
+    /// final pass. The incremental fallback inside is a drift guard for keys
+    /// that are valid alone but fail jointly (for example a future
+    /// `serde(alias)` whose two spellings collide as a duplicate field):
+    /// commit-order recovery still loads every other section instead of
+    /// zeroing the settings view.
     fn recover_typed_config(
         &self,
         raw: &Map<String, Value>,
@@ -3380,11 +3194,6 @@ impl ExtendedConfigDoc {
         let Some(obj) = raw.as_object_mut() else {
             return raw;
         };
-        // Normalize alternate spellings to the canonical key per layer, so
-        // every layer contributes at most one spelling of a setting and
-        // `deep_merge_value` last-layer-wins is decided by layer order alone,
-        // never by which spelling a layer happened to use.
-        canonicalize_extended_config_key_aliases(obj);
 
         // `image_spend` is deliberately not merged here: spend policy is never
         // a layered config value (its only authority is the ledger), so there
@@ -3598,56 +3407,8 @@ impl ExtendedConfigDoc {
                 );
             }
         }
-        // A rename/alias pair is ONE setting (see EXTENDED_CONFIG_KEY_ALIASES)
-        // and persistence is canonical-only. Discarding the alternate
-        // spelling must never drop the setting it carries: for an alias-only
-        // document whose typed value this caller did not change,
-        // `apply_object_delta` above is a no-op, so removing the alias alone
-        // would delete the only copy and revert the setting to its default on
-        // the next load — fail-open for `sandbox_escalation_enabled`'s
-        // default-true. Re-seat the alias's on-disk value under the canonical
-        // key. When the canonical key is already present — the document
-        // carried both spellings (canonical wins) or this caller changed the
-        // typed value (the delta above already wrote it) — the alias is
-        // simply dropped, as before.
-        for &(alias, canonical) in EXTENDED_CONFIG_KEY_ALIASES {
-            if let Some(value) = obj.remove(alias)
-                && !obj.contains_key(canonical)
-            {
-                obj.insert(canonical.to_string(), value);
-            }
-        }
-        obj.remove("llm_mode");
-        obj.remove(&["trusted", "Only"].concat());
-        obj.remove(&["trusted", "_only"].concat());
         Ok(())
     }
-}
-
-fn migrate_legacy_web_tool_templates(cfg: &mut ExtendedConfig) {
-    migrate_legacy_web_tool_template(cfg, "webfetch", |web| &mut web.custom.fetch_command);
-    migrate_legacy_web_tool_template(cfg, "websearch", |web| &mut web.custom.search_command);
-}
-
-fn migrate_legacy_web_tool_template(
-    cfg: &mut ExtendedConfig,
-    legacy_name: &str,
-    target: impl FnOnce(&mut WebConfig) -> &mut Option<String>,
-) {
-    let Some(template) = cfg.tools.remove(legacy_name) else {
-        return;
-    };
-    let destination = target(&mut cfg.web);
-    if destination
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return;
-    }
-
-    // Legacy web tool descriptions are intentionally not migrated. WebCustomConfig
-    // fixes the tool contract by name; only the user-supplied command varies.
-    *destination = Some(template.command);
 }
 
 fn raw_get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {

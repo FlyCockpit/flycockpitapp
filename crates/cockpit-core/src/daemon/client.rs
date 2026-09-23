@@ -1236,9 +1236,9 @@ async fn try_attach_verified_persistent_replacement(
 fn persistent_owner_identity(
     paths: &crate::daemon::DaemonPaths,
 ) -> Option<(PathBuf, cockpit_host::daemon_lifecycle::DaemonPidReceipt)> {
-    // A numeric legacy PID is not an owner generation. Require the current
-    // PID receipt and the shared endpoint record that binds that receipt to
-    // this persistent socket before and after the connection handshake.
+    // Require the current PID receipt and the shared endpoint record that
+    // binds that receipt to this persistent socket before and after the
+    // connection handshake.
     if paths.ephemeral {
         return None;
     }

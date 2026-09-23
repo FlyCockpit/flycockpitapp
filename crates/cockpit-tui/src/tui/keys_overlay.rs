@@ -2,7 +2,7 @@
 //!
 //! Pressing the leader key (`Ctrl+K` — `Ctrl+X` is already the embedded-pane
 //! force-close, so the nearest free binding is used) or running `/keys`
-//! (`/keybindings`) opens a modal overlay that lists the keybindings live in
+//! opens a modal overlay that lists the keybindings live in
 //! the *current* TUI context first, followed by the always-available global
 //! bindings. It is purely informational: `Esc`, `q`, or the leader again
 //! closes it, focus unchanged.

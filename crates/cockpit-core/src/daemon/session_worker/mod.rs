@@ -773,7 +773,7 @@ pub(crate) use handle::{HostCapabilitiesRefreshError, HostCapabilityRefreshRunti
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 pub(crate) use helpers::daemon_no_sandbox;
 #[allow(unused_imports)]
-pub(crate) use helpers::{removed_primary_notice, resolve_root_agent, resolve_root_agent_conn};
+pub(crate) use helpers::{resolve_root_agent, resolve_root_agent_conn};
 pub(crate) use lifecycle::initial_active_agent;
 #[cfg(feature = "remote")]
 pub(crate) use remote::{

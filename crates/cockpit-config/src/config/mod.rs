@@ -13,9 +13,6 @@
 //!   by `extended.rs` via `ExtendedConfig`/`ExtendedConfigDoc`). Provider
 //!   bodies live beside it under `providers/<provider-id>.json` and are typed
 //!   by `providers.rs` via `ConfigDoc`.
-//! - The retired `extended-config.json` is read by no code path; a stray
-//!   one in a discovered layer triggers a single one-time warning (see
-//!   `dirs::warn_if_stray_extended_config`) and is otherwise ignored.
 
 macro_rules! default_const {
     ($name:ident, $ty:ty, $val:expr) => {

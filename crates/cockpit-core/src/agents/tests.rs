@@ -1735,35 +1735,6 @@ fn roster_trim_auto_and_swarm_removed() {
     assert!(!is_builtin_agent("Swarm"));
     assert!(embedded_default("Auto").is_none());
     assert!(embedded_default("Swarm").is_none());
-    assert!(is_removed_primary("Auto"));
-    assert!(is_removed_primary("Swarm"));
-}
-
-#[test]
-fn roster_trim_removed_builtin_override_file_ignored() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = project_agents_dir(tmp.path());
-    for name in ["Auto", "Swarm"] {
-        fs::write(
-            dir.join(format!("{name}.md")),
-            "---\ndescription: removed primary override\nmode: primary\n---\nbody\n",
-        )
-        .unwrap();
-
-        assert!(
-            trusted_resolve(tmp.path(), name).unwrap().is_none(),
-            "removed builtin {name} override must not resolve"
-        );
-    }
-
-    let listed: Vec<String> = trusted_list_all(tmp.path())
-        .into_iter()
-        .map(|a| a.name)
-        .collect();
-    assert!(
-        !listed.iter().any(|name| name == "Auto" || name == "Swarm"),
-        "removed builtin overrides must not appear in list_all: {listed:?}"
-    );
 }
 
 #[test]

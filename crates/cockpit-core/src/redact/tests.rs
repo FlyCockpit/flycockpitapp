@@ -1848,15 +1848,26 @@ fn resumed_session_redacts_disk_derived_values() {
 
 #[test]
 fn failed_rederivation_is_reported() {
-    let secret = "legacy-file-secret-123456";
-    let legacy = serde_json::json!({
+    let persisted = serde_json::json!({
+        "entries": [],
+        "disk_derived_origins": ["$ssh:id_missing"],
+        "placeholder": "***REDACT***", "disabled": false, "unsupported_files": []
+    });
+    let origins = RedactionTable::persisted_disk_derived_origins(&persisted.to_string()).unwrap();
+    assert_eq!(origins, vec!["$ssh:id_missing"]);
+}
+
+#[test]
+fn persisted_disk_derived_value_is_refused() {
+    let secret = "disk-file-secret-123456";
+    let persisted = serde_json::json!({
         "entries": [{"value": secret, "class": "ordinary", "origin": "$ssh:id_missing"}],
         "placeholder": "***REDACT***", "disabled": false, "unsupported_files": []
     });
-    let origins = RedactionTable::persisted_disk_derived_origins(&legacy.to_string()).unwrap();
-    assert_eq!(origins, vec!["$ssh:id_missing"]);
-    let purged = RedactionTable::from_persisted_json(&legacy.to_string()).unwrap();
-    assert_eq!(purged.scrub(secret), secret);
+    let error = RedactionTable::from_persisted_json(&persisted.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("disk-derived origin"), "{error}");
 }
 
 #[test]
@@ -1901,18 +1912,6 @@ fn short_entries_are_refused_from_all_sources() {
     )
     .unwrap();
     assert_eq!(table.scrub("x"), "x");
-}
-
-#[test]
-fn legacy_persisted_disk_entries_are_purged() {
-    let secret = "legacy-dotenv-secret-123456";
-    let legacy = serde_json::json!({
-        "entries": [{"value": secret, "class": "ordinary", "origin": "$TOKEN (/project/.env)"}],
-        "placeholder": "***REDACT***", "disabled": false, "unsupported_files": []
-    });
-    let restored = RedactionTable::from_persisted_json(&legacy.to_string()).unwrap();
-    assert_eq!(restored.scrub(secret), secret);
-    assert!(!restored.to_persisted_json().unwrap().contains(secret));
 }
 
 #[test]

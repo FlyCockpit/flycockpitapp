@@ -185,18 +185,6 @@ pub enum PublicCommand {
     /// Manage MCP servers: add, list, and smoke-test.
     #[command(subcommand)]
     Mcp(McpCommand),
-    /// Removed: use `cockpit account login` or `cockpit provider add`.
-    #[cfg(feature = "remote")]
-    #[command(hide = true)]
-    Login(RemovedCommandArgs),
-    /// Removed: use `cockpit account logout` or `cockpit provider add`.
-    #[cfg(feature = "remote")]
-    #[command(hide = true)]
-    Logout,
-    /// Removed: use `cockpit account whoami` or `cockpit provider add`.
-    #[cfg(feature = "remote")]
-    #[command(hide = true)]
-    Whoami,
     /// Inspect enterprise org-policy synchronization.
     #[cfg(feature = "remote")]
     #[command(subcommand)]
@@ -272,12 +260,6 @@ impl From<PublicCli> for Cli {
                 PublicCommand::Debug(args) => Command::Debug(args),
                 PublicCommand::Config(args) => Command::Config(args),
                 PublicCommand::Mcp(args) => Command::Mcp(args),
-                #[cfg(feature = "remote")]
-                PublicCommand::Login(args) => Command::Login(args),
-                #[cfg(feature = "remote")]
-                PublicCommand::Logout => Command::Logout,
-                #[cfg(feature = "remote")]
-                PublicCommand::Whoami => Command::Whoami,
                 #[cfg(feature = "remote")]
                 PublicCommand::Sync(args) => Command::Sync(args),
                 #[cfg(feature = "remote")]
@@ -416,21 +398,6 @@ pub enum Command {
     /// Manage MCP servers: add, list, and smoke-test.
     #[command(subcommand)]
     Mcp(McpCommand),
-
-    /// Removed: use `cockpit account login` or `cockpit provider add`.
-    #[cfg(feature = "remote")]
-    #[command(hide = true)]
-    Login(RemovedCommandArgs),
-
-    /// Removed: use `cockpit account logout` or `cockpit provider add`.
-    #[cfg(feature = "remote")]
-    #[command(hide = true)]
-    Logout,
-
-    /// Removed: use `cockpit account whoami` or `cockpit provider add`.
-    #[cfg(feature = "remote")]
-    #[command(hide = true)]
-    Whoami,
 
     /// Inspect enterprise org-policy synchronization.
     #[cfg(feature = "remote")]
@@ -781,13 +748,6 @@ pub enum AccountCommand {
 }
 
 #[derive(Debug, clap::Args)]
-pub struct RemovedCommandArgs {
-    /// Ignored old arguments. The command always prints the split-command pointer.
-    #[arg(hide = true, trailing_var_arg = true, allow_hyphen_values = true)]
-    pub rest: Vec<String>,
-}
-
-#[derive(Debug, clap::Args)]
 pub struct ConfigExportPolicyArgs {
     /// Output JSON path. Defaults to stdout.
     #[arg(short, long, value_name = "PATH")]
@@ -946,10 +906,6 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Default)]
     pub format: OutputFormat,
 
-    /// Emit newline-delimited JSON events. Hidden alias for `--format json`.
-    #[arg(long, hide = true)]
-    pub json: bool,
-
     /// Include raw daemon envelope details in JSON output.
     #[arg(long)]
     pub verbose: bool,
@@ -986,11 +942,7 @@ pub struct RunArgs {
 
 impl RunArgs {
     pub fn output_format(&self) -> OutputFormat {
-        if self.json {
-            OutputFormat::Json
-        } else {
-            self.format
-        }
+        self.format
     }
 
     /// Immutable run bounds for `SendUserMessage`. Always `Some` for `cockpit run`.
@@ -1374,9 +1326,6 @@ pub enum DaemonCommand {
         /// Cockpit binary for the staged successor.
         #[arg(long, value_name = "PATH")]
         binary: Option<std::path::PathBuf>,
-        /// Positional compatibility spelling for the staged successor binary.
-        #[arg(value_name = "BINARY", conflicts_with = "binary")]
-        binary_path: Option<std::path::PathBuf>,
     },
     /// Re-execute the stable supervisor from its current binary.
     Reexec,
@@ -1461,10 +1410,6 @@ pub struct LoginArgs {
 pub struct FetchModelsArgs {
     /// Provider id to refresh. Omit to refresh every configured provider's model list.
     #[arg(value_name = "PROVIDER")]
-    pub provider_arg: Option<String>,
-
-    /// Only refresh this provider id. Kept as a compatibility alias for the positional provider.
-    #[arg(long, value_name = "ID")]
     pub provider: Option<String>,
 
     /// `keep` | `remove` — skip the interactive prompt when configured
@@ -1829,7 +1774,7 @@ pub struct PackagesAddArgs {
     #[arg(long)]
     pub branch: Option<String>,
     /// Full clone. Default is a shallow `--depth 1 --no-single-branch` clone.
-    #[arg(long, alias = "shallow")]
+    #[arg(long)]
     pub deep: bool,
 }
 
@@ -2177,7 +2122,7 @@ mod tests {
     #[test]
     fn remote_profile_public_roots_map_to_runtime_commands() {
         // Remote-profile roots are public only in the build that compiles
-        // them; the removed stubs parse but stay hidden.
+        // them.
         assert!(matches!(
             Cli::from(PublicCli::try_parse_from(["cockpit", "account", "whoami"]).unwrap()).command,
             Some(Command::Account(AccountCommand::Whoami))
@@ -2190,10 +2135,12 @@ mod tests {
             Cli::from(PublicCli::try_parse_from(["cockpit", "connect", "status"]).unwrap()).command,
             Some(Command::Connect(_))
         ));
-        assert!(matches!(
-            Cli::from(PublicCli::try_parse_from(["cockpit", "login", "--force"]).unwrap()).command,
-            Some(Command::Login(_))
-        ));
+        for removed in ["login", "logout", "whoami"] {
+            assert!(
+                PublicCli::try_parse_from(["cockpit", removed]).is_err(),
+                "`cockpit {removed}` is not a root command; use `cockpit account {removed}`"
+            );
+        }
     }
 
     #[cfg(feature = "extended")]
@@ -2462,9 +2409,10 @@ mod tests {
 
     #[cfg(feature = "remote")]
     #[test]
-    fn removed_login_stub_parses_but_is_hidden_from_help() {
-        let cli = Cli::try_parse_from(["cockpit", "login", "--force"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Login(_))));
+    fn root_help_lists_account_not_top_level_login() {
+        for removed in ["login", "logout", "whoami"] {
+            assert!(Cli::try_parse_from(["cockpit", removed]).is_err());
+        }
 
         let help = Cli::command().render_help().to_string();
         // The account surface is remote-only: the local artifact must not
@@ -2690,14 +2638,21 @@ mod tests {
         let cli = Cli::try_parse_from(["cockpit", "fetch-models", "codex-oauth"]).unwrap();
         match cli.command {
             Some(Command::FetchModels(args)) => {
-                assert_eq!(args.provider_arg.as_deref(), Some("codex-oauth"));
-                assert!(args.provider.is_none());
+                assert_eq!(args.provider.as_deref(), Some("codex-oauth"));
                 assert!(!args.deep);
                 assert!(!args.yes);
                 assert!(args.model.is_none());
             }
             other => panic!("expected fetch-models command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fetch_models_has_no_provider_flag() {
+        assert!(
+            Cli::try_parse_from(["cockpit", "fetch-models", "--provider", "openai"]).is_err(),
+            "the provider id is positional only"
+        );
     }
 
     #[test]
@@ -2729,7 +2684,7 @@ mod tests {
             Some(Command::FetchModels(args)) => {
                 assert!(args.deep);
                 assert!(args.yes);
-                assert_eq!(args.provider_arg.as_deref(), Some("openai"));
+                assert_eq!(args.provider.as_deref(), Some("openai"));
                 assert_eq!(args.model.as_deref(), Some("gpt-5-mini"));
             }
             other => panic!("expected fetch-models command, got {other:?}"),
@@ -2759,20 +2714,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_upgrade_accepts_legacy_positional_binary_and_binary_flag() {
-        let positional =
-            Cli::try_parse_from(["cockpit", "daemon", "upgrade", "/tmp/next-cockpit"]).unwrap();
-        match positional.command {
-            Some(Command::Daemon(DaemonCommand::Upgrade {
-                binary,
-                binary_path,
-            })) => {
-                assert_eq!(binary, None);
-                assert_eq!(binary_path, Some(PathBuf::from("/tmp/next-cockpit")));
-            }
-            other => panic!("expected daemon upgrade command, got {other:?}"),
-        }
-
+    fn daemon_upgrade_takes_binary_only_as_a_flag() {
         let flag = Cli::try_parse_from([
             "cockpit",
             "daemon",
@@ -2782,15 +2724,16 @@ mod tests {
         ])
         .unwrap();
         match flag.command {
-            Some(Command::Daemon(DaemonCommand::Upgrade {
-                binary,
-                binary_path,
-            })) => {
+            Some(Command::Daemon(DaemonCommand::Upgrade { binary })) => {
                 assert_eq!(binary, Some(PathBuf::from("/tmp/next-cockpit")));
-                assert_eq!(binary_path, None);
             }
             other => panic!("expected daemon upgrade command, got {other:?}"),
         }
+
+        assert!(
+            Cli::try_parse_from(["cockpit", "daemon", "upgrade", "/tmp/next-cockpit"]).is_err(),
+            "the successor binary is only accepted through --binary"
+        );
     }
 
     #[test]
@@ -2885,14 +2828,12 @@ mod tests {
     }
 
     #[test]
-    fn run_json_flag_reconciled() {
+    fn run_json_is_only_a_format_value() {
         let args = parse_run(&["cockpit", "run", "hi", "--format", "json"]);
         assert_eq!(args.message, ["hi"]);
         assert_eq!(args.output_format(), OutputFormat::Json);
 
-        let args = parse_run(&["cockpit", "run", "hi", "--json"]);
-        assert_eq!(args.message, ["hi"]);
-        assert_eq!(args.output_format(), OutputFormat::Json);
+        assert!(Cli::try_parse_from(["cockpit", "run", "hi", "--json"]).is_err());
 
         let mut cmd = Cli::command();
         let help = cmd
@@ -2906,7 +2847,14 @@ mod tests {
 
     #[test]
     fn run_prompt_file_json_parses() {
-        let args = parse_run(&["cockpit", "run", "--prompt-file", "/tmp/p.md", "--json"]);
+        let args = parse_run(&[
+            "cockpit",
+            "run",
+            "--prompt-file",
+            "/tmp/p.md",
+            "--format",
+            "json",
+        ]);
         assert_eq!(args.prompt_file, Some(PathBuf::from("/tmp/p.md")));
         assert_eq!(args.output_format(), OutputFormat::Json);
     }
@@ -2914,7 +2862,15 @@ mod tests {
     #[test]
     fn run_session_message_json_parses() {
         let id = uuid::Uuid::new_v4().to_string();
-        let args = parse_run(&["cockpit", "run", "--session", &id, "follow up", "--json"]);
+        let args = parse_run(&[
+            "cockpit",
+            "run",
+            "--session",
+            &id,
+            "follow up",
+            "--format",
+            "json",
+        ]);
         assert_eq!(args.session.as_deref(), Some(id.as_str()));
         assert_eq!(args.message, ["follow up"]);
         assert_eq!(args.output_format(), OutputFormat::Json);
@@ -2950,7 +2906,15 @@ mod tests {
     #[test]
     fn run_session_follow_json_parses() {
         let id = uuid::Uuid::new_v4().to_string();
-        let args = parse_run(&["cockpit", "run", "--session", &id, "--follow", "--json"]);
+        let args = parse_run(&[
+            "cockpit",
+            "run",
+            "--session",
+            &id,
+            "--follow",
+            "--format",
+            "json",
+        ]);
         assert_eq!(args.session.as_deref(), Some(id.as_str()));
         assert!(args.follow);
         assert_eq!(args.output_format(), OutputFormat::Json);
@@ -2958,7 +2922,7 @@ mod tests {
 
     #[test]
     fn run_json_verbose_parses() {
-        let args = parse_run(&["cockpit", "run", "hi", "--json", "--verbose"]);
+        let args = parse_run(&["cockpit", "run", "hi", "--format", "json", "--verbose"]);
         assert!(args.verbose);
         assert_eq!(args.output_format(), OutputFormat::Json);
     }

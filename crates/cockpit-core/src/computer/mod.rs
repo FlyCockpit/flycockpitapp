@@ -2023,13 +2023,17 @@ impl HeldKeyJournal {
     }
 }
 
+/// Hash domain of the X11 held-key journal's display identity.
+#[cfg(target_os = "linux")]
+pub(crate) const X11_HELD_KEYS_JOURNAL_DOMAIN: &[u8] = b"cockpit.x11.held-keys.v1";
+
 #[cfg(target_os = "linux")]
 fn held_key_journal_identity(display: &str) -> Result<[u8; 32], ComputerError> {
     let (transport, display_number) =
         crate::computer::platform::x11::canonical_x11_server_identity(display)
             .ok_or_else(|| input_journal_error("X11 display identity is malformed"))?;
     Ok(crate::computer::host_identity::domain_hash(
-        b"cockpit.x11.held-keys.v1",
+        X11_HELD_KEYS_JOURNAL_DOMAIN,
         &[transport.as_bytes(), &display_number.to_le_bytes()],
     ))
 }

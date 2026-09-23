@@ -805,6 +805,21 @@ pub fn read_daemon_pid_record(pid_file: &Path) -> Option<DaemonPidReceipt> {
     })
 }
 
+/// Error for a daemon PID file that exists but is not a receipt this build can
+/// parse (for example one written by an older Cockpit build with a different
+/// header). Nothing is ever derived from such a file: no PID is signaled and
+/// the file is never reclaimed automatically, so the error names the file and
+/// the manual cleanup steps.
+pub fn unrecognized_daemon_pid_file_error(pid_file: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "daemon PID file {path} exists but is not a recognized `{DAEMON_PID_FILE_HEADER}` receipt \
+         (it may have been written by an older Cockpit build); refusing to signal or reclaim it. \
+         Stop the old `cockpit` daemon process manually (for example find it with `ps` or Task \
+         Manager and terminate it), then delete {path} and retry",
+        path = pid_file.display(),
+    )
+}
+
 /// Atomically publish a PID together with the exact canonical executable that
 /// owns it. This receipt is the authority later used before signaling.
 pub fn write_pid_file(
@@ -831,7 +846,7 @@ pub fn reclaim_stale_and_reserve(
     with_lifecycle_lock(pid_file, || {
         if pid_file.exists() {
             let incumbent = read_daemon_pid_record(pid_file)
-                .ok_or_else(|| anyhow::anyhow!("existing daemon PID reservation is malformed"))?;
+                .ok_or_else(|| unrecognized_daemon_pid_file_error(pid_file))?;
             let reclaimable = match verify_cockpit_daemon_receipt_identity(&incumbent) {
                 PidIdentity::Missing => true,
                 // A recycled PID has a different kernel start identity and
@@ -864,7 +879,7 @@ pub fn reclaim_stale_and_reserve_preserving_endpoint(
 ) -> anyhow::Result<DaemonPidReceipt> {
     with_lifecycle_lock(pid_file, || {
         let incumbent = read_daemon_pid_record(pid_file)
-            .ok_or_else(|| anyhow::anyhow!("existing daemon PID reservation is malformed"))?;
+            .ok_or_else(|| unrecognized_daemon_pid_file_error(pid_file))?;
         if verify_cockpit_daemon_receipt_identity(&incumbent) != PidIdentity::Missing {
             anyhow::bail!("previous supervisor is still live or unverifiable");
         }
@@ -2554,6 +2569,43 @@ mod tests {
         );
         assert!(pid_file.exists());
         assert!(socket.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn older_build_pid_file_reserve_error_names_file_and_cleanup_steps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        let socket = temp.path().join("daemon.sock");
+        // The pre-reset receipt header: structurally a receipt, but not one
+        // this build recognizes.
+        std::fs::write(
+            &pid_file,
+            format!(
+                "cockpit-daemon-pid-v2\n{}\nexe\nstart:{:016x}:{:016x}\nnonce:{}\n",
+                i32::MAX,
+                1,
+                2,
+                "00".repeat(32)
+            ),
+        )
+        .expect("old pid file");
+
+        assert_eq!(read_daemon_pid_record(&pid_file), None);
+        let executable = std::env::current_exe().expect("test executable");
+        let error =
+            reclaim_stale_and_reserve(&pid_file, &socket, None, std::process::id(), &executable)
+                .expect_err("an unrecognized PID file must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&pid_file.display().to_string()),
+            "reserve error must name the PID file: {message}"
+        );
+        assert!(
+            message.contains("delete") && message.contains("Stop the old"),
+            "reserve error must give manual cleanup steps: {message}"
+        );
+        assert!(pid_file.exists(), "the unrecognized file is never removed");
     }
 
     #[test]

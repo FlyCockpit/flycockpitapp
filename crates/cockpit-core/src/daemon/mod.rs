@@ -949,6 +949,11 @@ pub enum DaemonStatus {
     /// verified. Mutating commands must fail closed rather than assuming it is
     /// safe to ignore or signal.
     UnverifiedPid,
+    /// PID file exists but is not a receipt this build recognizes (for
+    /// example one written by an older build). Nothing is derived from it:
+    /// stop asks the supervisor admin channel, otherwise the user must stop
+    /// the old daemon and delete the file.
+    UnrecognizedPidMetadata,
     /// PID file exists but the process is dead, not a daemon, or the socket is gone.
     Stale,
     /// No PID file.
@@ -1096,7 +1101,11 @@ fn socket_responds_blocking(_socket: &Path) -> Option<SocketHelloResponse> {
 #[cfg(any(unix, windows))]
 fn status_for_unreachable_pid(paths: &DaemonPaths) -> DaemonStatus {
     let Some(receipt) = read_daemon_pid_record(&paths.pid_file) else {
-        return DaemonStatus::Stale;
+        return if daemon_pid_file_present(&paths.pid_file) {
+            DaemonStatus::UnrecognizedPidMetadata
+        } else {
+            DaemonStatus::Stale
+        };
     };
     status_for_pid_identity(verify_cockpit_daemon_receipt_identity(&receipt))
 }
@@ -3668,15 +3677,21 @@ pub fn stop(paths: &DaemonPaths) -> Result<bool> {
 }
 
 /// Stop using only the caller's remaining command-level budget.
+///
+/// Returns `Ok(false)` only when no PID file exists. A PID file that exists
+/// but is not a receipt this build can parse (for example an older build's
+/// header) is never treated as "not running" and never yields a numeric PID
+/// to signal: the supervisor's own admin channel is asked to stop, and if it
+/// does not accept, the error names the file and the manual cleanup steps.
 pub fn stop_with_timeout(paths: &DaemonPaths, timeout: Duration) -> Result<bool> {
     let Some(record) = read_daemon_pid_record(&paths.pid_file) else {
-        return Ok(false);
+        return stop_unrecognized_pid_metadata(paths, timeout);
     };
     if matches!(
         supervisor::request_blocking(paths, supervisor::AdminCommand::Stop),
         Ok(supervisor::AdminResponse::Stopping { .. })
     ) {
-        return wait_for_supervisor_admin_stop(paths, &record, timeout);
+        return wait_for_supervisor_admin_stop(paths, Some(&record), timeout);
     }
     #[cfg(target_os = "linux")]
     return stop_linux(paths, record, timeout);
@@ -3698,9 +3713,42 @@ pub fn stop_with_timeout(paths: &DaemonPaths, timeout: Duration) -> Result<bool>
     }
 }
 
+/// Whether a daemon PID file is present at all. Any error other than
+/// `NotFound` (permissions, I/O) counts as present so callers fail closed.
+fn daemon_pid_file_present(pid_file: &Path) -> bool {
+    match std::fs::symlink_metadata(pid_file) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Stop path for a PID file this build cannot parse. The file's contents are
+/// never trusted for a PID: the only lever is the supervisor admin channel,
+/// which proves ownership by answering on the private admin endpoint.
+fn stop_unrecognized_pid_metadata(paths: &DaemonPaths, timeout: Duration) -> Result<bool> {
+    if !daemon_pid_file_present(&paths.pid_file) {
+        return Ok(false);
+    }
+    if matches!(
+        supervisor::request_blocking(paths, supervisor::AdminCommand::Stop),
+        Ok(supervisor::AdminResponse::Stopping { .. })
+    ) {
+        return wait_for_supervisor_admin_stop(paths, None, timeout);
+    }
+    if !daemon_pid_file_present(&paths.pid_file) {
+        // The owner removed its metadata while we were asking.
+        return Ok(false);
+    }
+    Err(cockpit_host::daemon_lifecycle::unrecognized_daemon_pid_file_error(&paths.pid_file))
+}
+
+/// Wait for a supervisor that accepted an admin `Stop` to drain its worker
+/// and release its lifetime lock, PID file, and socket. `record` is the
+/// receipt the stop was issued against, or `None` when the PID file was not a
+/// receipt this build recognizes (then only file disappearance is observed).
 fn wait_for_supervisor_admin_stop(
     paths: &DaemonPaths,
-    record: &DaemonPidReceipt,
+    record: Option<&DaemonPidReceipt>,
     timeout: Duration,
 ) -> Result<bool> {
     let deadline = std::time::Instant::now() + timeout;
@@ -3710,17 +3758,31 @@ fn wait_for_supervisor_admin_stop(
                 .and_then(cockpit_host::daemon_lifecycle::DaemonLifetimeReleaseWitness::released)
                 .unwrap_or(false);
         if receipt_released
-            && read_daemon_pid_record(&paths.pid_file).as_ref() != Some(record)
+            && (record.is_none() || read_daemon_pid_record(&paths.pid_file).as_ref() != record)
             && !paths.pid_file.exists()
             && !paths.socket.exists()
         {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
-            let pid = record.pid;
-            anyhow::bail!(
-                "timed out waiting for supervisor PID {pid} to drain its worker and release metadata"
-            );
+            match record {
+                Some(record) => {
+                    let pid = record.pid;
+                    anyhow::bail!(
+                        "timed out waiting for supervisor PID {pid} to drain its worker and release metadata"
+                    );
+                }
+                None => {
+                    return Err(
+                        cockpit_host::daemon_lifecycle::unrecognized_daemon_pid_file_error(
+                            &paths.pid_file,
+                        )
+                        .context(
+                            "timed out waiting for the supervisor to stop and release metadata",
+                        ),
+                    );
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -4407,7 +4469,7 @@ mod tests {
         std::fs::write(&endpoint, serde_json::to_vec(&record).unwrap()).expect("write endpoint");
 
         let probe = discover_blocking_with_canonical(paths);
-        assert_eq!(probe.status, DaemonStatus::Stale);
+        assert_eq!(probe.status, DaemonStatus::UnrecognizedPidMetadata);
         assert!(
             endpoint.exists(),
             "unbound endpoint cleanup must fail closed"
@@ -5266,11 +5328,66 @@ mod tests {
         let paths = test_paths(&dir);
         std::fs::write(&paths.pid_file, std::process::id().to_string()).unwrap();
 
+        // An unreceipted PID file names no daemon this binary may signal, but
+        // it is not "not running" either: with no supervisor answering the
+        // admin channel, stop fails closed and names the file.
+        let error = stop_with_timeout(&paths, Duration::from_millis(50))
+            .expect_err("an unrecognized PID file must not read as not running");
+        let message = format!("{error:#}");
         assert!(
-            !stop_with_timeout(&paths, Duration::from_millis(50)).unwrap(),
-            "an unreceipted PID file names no daemon this binary may signal"
+            message.contains(&paths.pid_file.display().to_string()),
+            "stop error must name the PID file: {message}"
         );
         assert!(paths.pid_file.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn older_build_pid_file_stop_fails_closed_with_cleanup_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        // The pre-reset header: a structurally complete receipt this build
+        // does not recognize. Its PID (this test process) must never be
+        // signaled.
+        std::fs::write(
+            &paths.pid_file,
+            format!(
+                "cockpit-daemon-pid-v2\n{}\nexe\nstart:{:016x}:{:016x}\nnonce:{}\n",
+                std::process::id(),
+                1,
+                2,
+                "00".repeat(32)
+            ),
+        )
+        .unwrap();
+
+        let error = stop_with_timeout(&paths, Duration::from_millis(50))
+            .expect_err("an older build's PID file must not read as not running");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&paths.pid_file.display().to_string()),
+            "stop error must name the PID file: {message}"
+        );
+        assert!(
+            message.contains("delete") && message.contains("Stop the old"),
+            "stop error must give manual cleanup steps: {message}"
+        );
+        assert!(
+            paths.pid_file.exists(),
+            "the unrecognized file is never removed"
+        );
+        assert_eq!(
+            status_for_unreachable_pid(&paths),
+            DaemonStatus::UnrecognizedPidMetadata
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn absent_pid_file_stop_reports_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        assert!(!stop_with_timeout(&paths, Duration::from_millis(50)).unwrap());
     }
 
     #[test]

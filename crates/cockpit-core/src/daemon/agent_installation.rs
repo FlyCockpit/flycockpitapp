@@ -49,6 +49,10 @@ use futures::stream::BoxStream;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// Hash domain of the retained effective-default receipt authority digest.
+pub(crate) const RETAINED_DEFAULT_RECEIPT_AUTHORITY_DOMAIN: &[u8] =
+    b"cockpit-retained-default-receipt-authority-v1\0";
+
 pub(crate) const PACKAGE_CHILD_SOURCE_MARKER: &str = "#package-subagent:";
 
 pub(crate) fn is_package_child_installation(row: &AgentInstallationRow) -> bool {
@@ -2109,7 +2113,7 @@ impl WorkerWorkspaceConfigAuthority {
             .filter(|layer| self.retained_layer_is_projected(layer, policy))
             .collect::<Vec<_>>();
         let mut hasher = Sha256::new();
-        hasher.update(b"cockpit-retained-default-receipt-authority-v1\0");
+        hasher.update(RETAINED_DEFAULT_RECEIPT_AUTHORITY_DOMAIN);
         hasher.update(self.attached_root.identity_digest);
         hasher.update([u8::from(self.exclusive_config_override)]);
         hasher.update((projected.len() as u64).to_le_bytes());

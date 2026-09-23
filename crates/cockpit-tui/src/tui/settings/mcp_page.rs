@@ -613,7 +613,7 @@ impl SettingsCx {
                     let flow_id = flow.flow_id.clone();
                     let client_operation_id = uuid::Uuid::new_v4().to_string();
                     let expected_request_hash = match super::local_receipt_request_hash(&(
-                        "complete_mcp_oauth_receipt_v1",
+                        cockpit_proto::COMPLETE_MCP_OAUTH_RECEIPT_LABEL,
                         &client_operation_id,
                         &flow_id,
                     )) {

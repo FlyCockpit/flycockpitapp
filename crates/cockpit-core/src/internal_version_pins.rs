@@ -15,6 +15,21 @@
 //!
 //! TypeScript mirrors (`RELAY_ENVELOPE_VERSION`, `FCM2_SCHEMA_VERSION`, ...)
 //! are pinned against the same cross-language fixtures their Rust owners read.
+//!
+//! Versioned hash-domain and correlation labels are pinned here too, by the
+//! named constant that owns each one (see [`hash_domain_labels_are_v1`]).
+//! Changing a label changes every digest derived from it, which silently
+//! orphans any durable hash computed under the old label; a new versioned
+//! label belongs in a named constant at its definition site plus a pin here,
+//! never an inline literal.
+//!
+//! Feature gating: [`remote_wire_protocol_versions_are_one`] compiles only
+//! with `--features remote` and [`extended_wire_protocol_versions_are_one`]
+//! only with `--features extended`. The default `--no-default-features`
+//! gate skips them; CI executes them in the `remote-lockstep` job of
+//! `.github/workflows/cli-ci.yml` (remote-only and extended-only nextest
+//! matrices). Locally, pass `--features cockpit-core/remote` or
+//! `cockpit-core/extended` to exercise them.
 
 #[test]
 fn daemon_wire_protocol_versions_are_one() {
@@ -46,6 +61,7 @@ fn daemon_wire_protocol_versions_are_one() {
     assert_eq!(cockpit_host::named_pipe::PIPE_IDENTITY_VERSION, 1);
 }
 
+/// Compiled only with `--features extended` (see the module docs).
 #[cfg(feature = "extended")]
 #[test]
 fn extended_wire_protocol_versions_are_one() {
@@ -55,6 +71,7 @@ fn extended_wire_protocol_versions_are_one() {
     );
 }
 
+/// Compiled only with `--features remote` (see the module docs).
 #[cfg(feature = "remote")]
 #[test]
 fn remote_wire_protocol_versions_are_one() {
@@ -174,5 +191,86 @@ fn persisted_format_versions_are_one() {
     assert_eq!(
         crate::config::media_budget::MEDIA_RESOURCE_POLICY_VERSION,
         1
+    );
+}
+
+#[test]
+fn hash_domain_labels_are_v1() {
+    // Wire / cross-crate labels (cockpit-proto).
+    assert_eq!(
+        cockpit_proto::send_user_message::MESSAGE_DIGEST_DOMAIN,
+        b"flycockpit-send-user-message-v1\0"
+    );
+    assert_eq!(
+        cockpit_proto::session_override::FOCUSED_MODEL_ROUTE_DIGEST_DOMAIN,
+        b"flycockpit-focused-model-route-v1\0"
+    );
+    assert_eq!(
+        cockpit_proto::session_override::FOCUSED_BINDING_CHOICE_ID_PREFIX,
+        "focused-binding-v1-"
+    );
+    assert_eq!(
+        cockpit_proto::agent_management::AGENT_MUTATION_SHAPE_DOMAIN,
+        b"cockpit-agent-mutation-shape-v1\0"
+    );
+    assert_eq!(
+        cockpit_proto::agent_management::ASSISTANT_MUTATION_SHAPE_DOMAIN,
+        b"cockpit-assistant-mutation-shape-v1\0"
+    );
+    assert_eq!(
+        cockpit_proto::COMPLETE_PROVIDER_OAUTH_RECEIPT_LABEL,
+        "complete_provider_oauth_receipt_v1"
+    );
+    assert_eq!(
+        cockpit_proto::COMPLETE_MCP_OAUTH_RECEIPT_LABEL,
+        "complete_mcp_oauth_receipt_v1"
+    );
+
+    // Daemon labels (cockpit-core).
+    assert_eq!(
+        crate::daemon::server::FCM2_MODEL_DIGEST_DOMAIN,
+        b"flycockpit-fcm2-model-digest-v1\0"
+    );
+    assert_eq!(crate::daemon::server::USER_MESSAGE_IDENTITY_TAG, b"user-v1");
+    assert_eq!(
+        crate::daemon::server::AGENT_MUTATION_UPDATE_REQUEST_DOMAIN,
+        b"flycockpit.agent-mutation.update-request.v1"
+    );
+    assert_eq!(
+        crate::daemon::server::ASSISTANT_MUTATION_REQUEST_DOMAIN,
+        b"flycockpit.assistant-mutation.request.v1"
+    );
+    assert_eq!(
+        crate::daemon::agent_management::AGENT_MUTATION_REQUEST_DOMAIN,
+        b"flycockpit.agent-mutation.request.v1"
+    );
+    // Create and update agent mutations are separate request families and
+    // must never share a keyed request-identity domain.
+    assert_ne!(
+        crate::daemon::agent_management::AGENT_MUTATION_REQUEST_DOMAIN,
+        crate::daemon::server::AGENT_MUTATION_UPDATE_REQUEST_DOMAIN
+    );
+    assert_eq!(
+        crate::daemon::agent_management::AGENT_EDITOR_COMPLETION_IDENTITY_DOMAIN,
+        b"flycockpit.agent-editor.completion.v1"
+    );
+    assert_eq!(
+        crate::daemon::agent_installation::RETAINED_DEFAULT_RECEIPT_AUTHORITY_DOMAIN,
+        b"cockpit-retained-default-receipt-authority-v1\0"
+    );
+
+    // Application labels (cockpit-core).
+    assert_eq!(
+        crate::generated_svg::SANITIZER_POLICY_DIGEST_DOMAIN,
+        b"generated-svg-v1\0canonical-v1\0verifier-v1\0"
+    );
+    assert_eq!(
+        crate::onboarding_agent::AGENT_POLICY_SNAPSHOT_DIGEST_DOMAIN,
+        b"cockpit-agent-policy-snapshot-v1\0"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        crate::computer::X11_HELD_KEYS_JOURNAL_DOMAIN,
+        b"cockpit.x11.held-keys.v1"
     );
 }

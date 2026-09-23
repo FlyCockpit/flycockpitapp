@@ -9768,6 +9768,13 @@ pub(crate) mod tests;
 #[cfg(test)]
 pub(crate) use tests::{disk_test_ctx, test_ctx};
 
+// Re-exported only so `internal_version_pins` can pin these labels.
+#[cfg(test)]
+pub(crate) use dispatch::{
+    AGENT_MUTATION_UPDATE_REQUEST_DOMAIN, ASSISTANT_MUTATION_REQUEST_DOMAIN,
+    FCM2_MODEL_DIGEST_DOMAIN, USER_MESSAGE_IDENTITY_TAG,
+};
+
 pub use attachments::validate_png_attachment_blocking;
 pub(crate) use dispatch::CONFIG_PUBLICATION_RPC_LOCK;
 pub use dispatch::request_shutdown;

@@ -27,7 +27,9 @@ pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
 pub const MAX_QUEUE_TARGET_ID_BYTES: usize = 4096;
 pub const MAX_QUEUE_TARGET_AGENT_BYTES: usize = 1024;
 pub const MAX_QUEUE_TARGET_TASK_CALL_ID_BYTES: usize = 4096;
-const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v1\0";
+/// Hash domain of [`CanonicalSendUserMessage::message_request_digest`]
+/// (mirrored by the TypeScript `send-user-message.ts` digest).
+pub const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v1\0";
 const ATTACHMENT_SET_DIGEST_DOMAIN: &[u8] = b"flycockpit-message-attachment-set-v1\0";
 
 /// Canonical media-kind discriminant. This is the sole kind enum across

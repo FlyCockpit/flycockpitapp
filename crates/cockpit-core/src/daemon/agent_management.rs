@@ -71,6 +71,14 @@ impl zeroize::Zeroize for SealedEditorCompletion {
     }
 }
 
+/// Keyed-identity domain of a sealed agent-editor completion.
+pub(crate) const AGENT_EDITOR_COMPLETION_IDENTITY_DOMAIN: &[u8] =
+    b"flycockpit.agent-editor.completion.v1";
+/// Keyed request-identity domain of an agent create/delete/reset mutation.
+/// Distinct from the dispatch-owned update-request domain so the two request
+/// families can never share a durable request hash.
+pub(crate) const AGENT_MUTATION_REQUEST_DOMAIN: &[u8] = b"flycockpit.agent-mutation.request.v1";
+
 fn editor_replay_handle(lease_id: &str) -> String {
     format!("agent-editor-lease:{lease_id}")
 }
@@ -132,7 +140,7 @@ fn load_editor_completion_sync(
         .map_err(internal)?,
     );
     let identity = vault.keyed_identity(
-        b"flycockpit.agent-editor.completion.v1",
+        AGENT_EDITOR_COMPLETION_IDENTITY_DOMAIN,
         identity_plaintext.as_slice(),
     );
     if row.completion_identity != Some(identity) {
@@ -893,7 +901,7 @@ fn agent_mutation_keyed_identity(
     );
     Ok(ctx
         .secret_vault
-        .keyed_request_identity(b"flycockpit.agent-mutation.request.v1", encoded.as_slice()))
+        .keyed_request_identity(AGENT_MUTATION_REQUEST_DOMAIN, encoded.as_slice()))
 }
 
 fn prepare_mutation_plan_sync(
@@ -2150,7 +2158,7 @@ async fn complete_editor_lease_inner(
         .map_err(internal)?,
     );
     let completion_identity = ctx.secret_vault.keyed_identity(
-        b"flycockpit.agent-editor.completion.v1",
+        AGENT_EDITOR_COMPLETION_IDENTITY_DOMAIN,
         completion_plaintext.as_slice(),
     );
     if known_lease.state == "open" {

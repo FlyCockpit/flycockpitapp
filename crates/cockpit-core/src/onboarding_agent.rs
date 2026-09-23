@@ -506,13 +506,16 @@ fn capability_labels(
     labels
 }
 
+/// Hash domain of an agent policy snapshot revision digest.
+pub(crate) const AGENT_POLICY_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"cockpit-agent-policy-snapshot-v1\0";
+
 fn policy_revision_digest(
     routes: &[AgentPolicyRoute],
     catalog_revision: &str,
     provider_config_fingerprint: &str,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"cockpit-agent-policy-snapshot-v1\0");
+    digest.update(AGENT_POLICY_SNAPSHOT_DIGEST_DOMAIN);
     digest.update(catalog_revision.as_bytes());
     digest.update([0]);
     digest.update(provider_config_fingerprint.as_bytes());

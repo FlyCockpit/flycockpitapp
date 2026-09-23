@@ -485,6 +485,13 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                         probe.paths.socket.display(),
                     );
                 }
+                DaemonStatus::UnrecognizedPidMetadata => {
+                    println!(
+                        "daemon: pid file is not a receipt this build recognizes (possibly written by an older build); stop the old daemon process manually, then delete the pid file\n  pid: {}\n  socket: {}",
+                        probe.paths.pid_file.display(),
+                        probe.paths.socket.display(),
+                    );
+                }
                 DaemonStatus::Stale => {
                     println!(
                         "daemon: canonical daemon not responding (stale pid file or socket)\n  pid: {}\n  socket: {}",
@@ -823,6 +830,7 @@ fn daemon_status_name(status: DaemonStatus) -> &'static str {
         DaemonStatus::IncompatibleProtocol => "incompatible_protocol",
         DaemonStatus::LivePidSocketUnreachable => "live_pid_socket_unreachable",
         DaemonStatus::UnverifiedPid => "unverified_pid",
+        DaemonStatus::UnrecognizedPidMetadata => "unrecognized_pid_metadata",
         DaemonStatus::Stale => "stale",
         DaemonStatus::NotRunning => "not_running",
     }
@@ -844,6 +852,7 @@ fn restart_should_stop(status: DaemonStatus) -> bool {
             | DaemonStatus::IncompatibleProtocol
             | DaemonStatus::LivePidSocketUnreachable
             | DaemonStatus::UnverifiedPid
+            | DaemonStatus::UnrecognizedPidMetadata
     )
 }
 
@@ -898,6 +907,7 @@ mod tests {
         assert!(restart_should_stop(DaemonStatus::IncompatibleProtocol));
         assert!(restart_should_stop(DaemonStatus::LivePidSocketUnreachable));
         assert!(restart_should_stop(DaemonStatus::UnverifiedPid));
+        assert!(restart_should_stop(DaemonStatus::UnrecognizedPidMetadata));
         assert!(!restart_should_stop(DaemonStatus::Stale));
         assert!(!restart_should_stop(DaemonStatus::NotRunning));
     }

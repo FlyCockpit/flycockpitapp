@@ -2135,6 +2135,42 @@ mod tests {
         );
     }
 
+    /// `cockpit-session-export/1` was, before the pre-launch version reset,
+    /// the label of the original flat export shape. The label now names the
+    /// structured format, so an old flat archive passes the schema check and
+    /// must still be rejected by the structural session parser rather than
+    /// imported with defaulted fields.
+    #[test]
+    fn import_rejects_pre_reset_flat_archive_carrying_current_schema_label() {
+        let id = Uuid::new_v4();
+        let flat = json!({
+            "session_id": id,
+            "short_id": "ab3def",
+            "parent_session_id": null,
+            "fork_point_turn_id": null,
+            "provider": "test-provider",
+            "model": "test-model",
+            "active_agent": "Build",
+            "started_at": 100,
+            "ended_at": null,
+            "title": "Old export",
+        });
+        let bytes = archive_bytes_with_schema(EXPORT_SCHEMA, vec![flat], vec![], false);
+        let error = format!(
+            "{:#}",
+            read_archive_bytes(&bytes)
+                .expect_err("a pre-reset flat archive must not import under the current label")
+        );
+        assert!(
+            !error.contains("unsupported session export schema"),
+            "the label matches; rejection must be structural: {error}"
+        );
+        assert!(
+            error.contains("import manifest session lacks string `session_entry_mode`"),
+            "flat archive must be rejected naming the missing structured field: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn import_preserves_null_active_model_without_projections() {
         let db = Db::open_in_memory().unwrap();

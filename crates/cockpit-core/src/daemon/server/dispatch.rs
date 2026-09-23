@@ -24,6 +24,18 @@ pub(crate) use crate::secret_ownership::{
 };
 use rusqlite::OptionalExtension;
 
+/// Hash domain of an FCM2 canonical model digest (fence-free requests hash
+/// the bare domain; fenced requests append the model selection JSON).
+pub(crate) const FCM2_MODEL_DIGEST_DOMAIN: &[u8] = b"flycockpit-fcm2-model-digest-v1\0";
+/// Leading length-framed tag of a user-message dispatch identity hash.
+pub(crate) const USER_MESSAGE_IDENTITY_TAG: &[u8] = b"user-v1";
+/// Keyed request-identity domain of an agent definition update mutation.
+pub(crate) const AGENT_MUTATION_UPDATE_REQUEST_DOMAIN: &[u8] =
+    b"flycockpit.agent-mutation.update-request.v1";
+/// Keyed request-identity domain of an assistant definition mutation.
+pub(crate) const ASSISTANT_MUTATION_REQUEST_DOMAIN: &[u8] =
+    b"flycockpit.assistant-mutation.request.v1";
+
 // Keep the local dispatch AST free of remote operation types and helpers while
 // sharing the mutation body with the opt-in remote profile. In the local
 // expansion the operation token is deliberately consumed but never emitted.
@@ -3456,13 +3468,10 @@ pub(super) fn oversized_text_artifact_admission(
     // part of the accepted request identity, so it must be represented in
     // FCM2 rather than only in the worker-side acceptance check.
     let (model_config_generation, canonical_model_digest) = match &model_fence {
-        None => (
-            0,
-            Sha256::digest(b"flycockpit-fcm2-model-digest-v1\0").into(),
-        ),
+        None => (0, Sha256::digest(FCM2_MODEL_DIGEST_DOMAIN).into()),
         Some((generation, model)) => {
             let model_json = serde_json::to_vec(model).map_err(internal)?;
-            let mut digest_input = b"flycockpit-fcm2-model-digest-v1\0".to_vec();
+            let mut digest_input = FCM2_MODEL_DIGEST_DOMAIN.to_vec();
             digest_input.extend_from_slice(&model_json);
             (*generation, Sha256::digest(digest_input).into())
         }
@@ -3811,13 +3820,10 @@ async fn handle_message_ingress(
         (stored, true)
     } else {
         let (model_config_generation, canonical_model_digest) = match authoritative_model.as_ref() {
-            None => (
-                0,
-                Sha256::digest(b"flycockpit-fcm2-model-digest-v1\0").into(),
-            ),
+            None => (0, Sha256::digest(FCM2_MODEL_DIGEST_DOMAIN).into()),
             Some(model) => {
                 let model_json = serde_json::to_vec(&model.selection).map_err(internal)?;
-                let mut digest_input = b"flycockpit-fcm2-model-digest-v1\0".to_vec();
+                let mut digest_input = FCM2_MODEL_DIGEST_DOMAIN.to_vec();
                 digest_input.extend_from_slice(&model_json);
                 (model.generation, Sha256::digest(digest_input).into())
             }
@@ -4358,7 +4364,7 @@ fn user_message_wire_fingerprint_bytes(
         }
     }
     let mut hasher = Sha256::new();
-    part(&mut hasher, b"user-v1");
+    part(&mut hasher, USER_MESSAGE_IDENTITY_TAG);
     part(
         &mut hasher,
         match origin {
@@ -11826,7 +11832,7 @@ async fn handle_serialized_request_impl(
                     .map_err(internal)?,
             );
             let request_hash = ctx.secret_vault.keyed_request_identity(
-                b"flycockpit.agent-mutation.update-request.v1",
+                AGENT_MUTATION_UPDATE_REQUEST_DOMAIN,
                 request_material.as_slice(),
             );
             let fencing_generation = match begin_local_operation(
@@ -16335,7 +16341,7 @@ async fn handle_serialized_request_impl(
             // `request_hash`; the wire receipt is bound by the caller nonce and
             // exact flow while owner binding is enforced by the receipt row.
             let receipt_request_hash = local_operation_request_hash(&(
-                "complete_provider_oauth_receipt_v1",
+                crate::proto_crate::COMPLETE_PROVIDER_OAUTH_RECEIPT_LABEL,
                 &client_operation_id,
                 &flow_id,
             ))?;
@@ -17505,7 +17511,7 @@ async fn handle_serialized_request_impl(
                 &("complete_mcp_oauth", &flow_id, &input),
             )?;
             let receipt_request_hash = local_operation_request_hash(&(
-                "complete_mcp_oauth_receipt_v1",
+                crate::proto_crate::COMPLETE_MCP_OAUTH_RECEIPT_LABEL,
                 &client_operation_id,
                 &flow_id,
             ))?;
@@ -22193,10 +22199,9 @@ fn assistant_mutation_request_identity(
         ))
         .map_err(internal)?,
     );
-    Ok(ctx.secret_vault.keyed_request_identity(
-        b"flycockpit.assistant-mutation.request.v1",
-        encoded.as_slice(),
-    ))
+    Ok(ctx
+        .secret_vault
+        .keyed_request_identity(ASSISTANT_MUTATION_REQUEST_DOMAIN, encoded.as_slice()))
 }
 
 #[allow(clippy::too_many_arguments)]

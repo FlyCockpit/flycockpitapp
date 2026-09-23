@@ -1962,6 +1962,15 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 
 // ---- Requests --------------------------------------------------------------
 
+/// Label that opens the public receipt correlation tuple of a
+/// `complete_provider_oauth` local operation. The daemon and the TUI hash the
+/// same `(label, client_operation_id, flow_id)` tuple, so both read it here.
+pub const COMPLETE_PROVIDER_OAUTH_RECEIPT_LABEL: &str = "complete_provider_oauth_receipt_v1";
+/// Label that opens the public receipt correlation tuple of a
+/// `complete_mcp_oauth` local operation (see
+/// [`COMPLETE_PROVIDER_OAUTH_RECEIPT_LABEL`]).
+pub const COMPLETE_MCP_OAUTH_RECEIPT_LABEL: &str = "complete_mcp_oauth_receipt_v1";
+
 mod request;
 pub use request::{
     ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,

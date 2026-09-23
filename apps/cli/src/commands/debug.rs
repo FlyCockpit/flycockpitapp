@@ -244,6 +244,11 @@ async fn failed_calls(args: FailedCallsArgs) -> Result<()> {
                 "cannot inspect failed calls while a shared daemon is live but unreachable; run `cockpit daemon status`"
             )
         }
+        DaemonStatus::UnrecognizedPidMetadata => {
+            bail!(
+                "cannot inspect failed calls while the daemon pid file is unrecognized (possibly an older build's daemon); run `cockpit daemon status`"
+            )
+        }
     };
 
     if args.json {

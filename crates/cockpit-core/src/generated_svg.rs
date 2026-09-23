@@ -56,9 +56,14 @@ pub fn sanitizer_provenance() -> VectorSanitizerProvenanceV1 {
     }
 }
 
+/// Hash domain of the generated-SVG sanitizer policy digest: the generator,
+/// canonicalizer, and verifier format labels.
+pub(crate) const SANITIZER_POLICY_DIGEST_DOMAIN: &[u8] =
+    b"generated-svg-v1\0canonical-v1\0verifier-v1\0";
+
 fn sanitizer_policy_digest(limits: &[usize; 14]) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"generated-svg-v1\0canonical-v1\0verifier-v1\0");
+    digest.update(SANITIZER_POLICY_DIGEST_DOMAIN);
     for limit in limits {
         digest.update((*limit as u64).to_be_bytes());
     }

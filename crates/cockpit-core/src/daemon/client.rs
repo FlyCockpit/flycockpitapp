@@ -652,7 +652,11 @@ fn discover_attach_plan(
         DaemonStatus::LivePidSocketUnreachable | DaemonStatus::UnverifiedPid => {
             DiscoverAttachPlan::FailUnreachable
         }
-        DaemonStatus::NotRunning | DaemonStatus::Stale => DiscoverAttachPlan::Spawn,
+        // Spawning reaches the host reservation, which fails closed on an
+        // unrecognized PID file with an error naming it and the cleanup steps.
+        DaemonStatus::NotRunning | DaemonStatus::Stale | DaemonStatus::UnrecognizedPidMetadata => {
+            DiscoverAttachPlan::Spawn
+        }
     }
 }
 

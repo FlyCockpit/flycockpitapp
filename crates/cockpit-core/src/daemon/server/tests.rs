@@ -14417,8 +14417,8 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
 fn oauth_completion_receipts_and_cancel_race_are_secret_safe() {
     let source = include_str!("dispatch.rs");
     assert!(
-        source.contains("complete_provider_oauth_receipt_v1")
-            && source.contains("complete_mcp_oauth_receipt_v1"),
+        source.contains("COMPLETE_PROVIDER_OAUTH_RECEIPT_LABEL")
+            && source.contains("COMPLETE_MCP_OAUTH_RECEIPT_LABEL"),
         "completion receipts must correlate only non-secret identifiers"
     );
     assert!(

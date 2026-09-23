@@ -833,21 +833,26 @@ impl App {
         if self.onboarding_skip || self.onboarding_dismissed {
             return;
         }
-        // Poll only the daemon that served this snapshot: never resolve (and
-        // possibly spawn) a default owner merely to watch probes settle.
-        let Some(endpoint) = self
+        // Poll the same onboarding authority every other onboarding read
+        // uses: the startup-selected daemon when startup resolved one, else
+        // the default owner (a launch that fetched the bootstrap without a
+        // startup selection, e.g. `/setup` or a reopened shell, was served
+        // by exactly that owner). Returning early here would strand the
+        // screen on its probing rows forever, since a locked connection
+        // carries no push events.
+        let lifecycle = self.lifecycle.clone();
+        let selected_endpoint = self
             .startup_lifecycle
             .as_ref()
-            .map(|selected| selected.endpoint.clone())
-        else {
-            return;
-        };
+            .map(|selected| selected.endpoint.clone());
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::Refresh("onboarding.capabilities"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.capabilities"),
             ),
             async move {
+                let endpoint =
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
                     .map_err(|error| error.to_string())?;

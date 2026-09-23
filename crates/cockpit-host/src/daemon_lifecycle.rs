@@ -545,16 +545,14 @@ impl VerifiedDaemonProcess {
     }
 }
 
+/// Open a kqueue holding a one-shot `NOTE_EXIT` registration for `pid`.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub fn acquire_verified_daemon_process(receipt: &DaemonPidReceipt) -> VerifiedProcessOutcome {
+fn open_process_exit_kqueue(pid: libc::pid_t) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd as _;
-    let Ok(pid) = libc::pid_t::try_from(receipt.pid) else {
-        return VerifiedProcessOutcome::Identity(PidIdentity::Unverified);
-    };
     // SAFETY: kqueue returns a fresh descriptor on success.
     let raw = unsafe { libc::kqueue() };
     if raw < 0 {
-        return VerifiedProcessOutcome::Identity(PidIdentity::Unverified);
+        return Err(std::io::Error::last_os_error());
     }
     let kqueue = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
     let change = libc::kevent {
@@ -578,13 +576,23 @@ pub fn acquire_verified_daemon_process(receipt: &DaemonPidReceipt) -> VerifiedPr
         )
     } < 0
     {
-        let error = std::io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ESRCH) {
-            VerifiedProcessOutcome::Identity(PidIdentity::Missing)
-        } else {
-            VerifiedProcessOutcome::Identity(PidIdentity::Unverified)
-        };
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(kqueue)
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub fn acquire_verified_daemon_process(receipt: &DaemonPidReceipt) -> VerifiedProcessOutcome {
+    let Ok(pid) = libc::pid_t::try_from(receipt.pid) else {
+        return VerifiedProcessOutcome::Identity(PidIdentity::Unverified);
+    };
+    let kqueue = match open_process_exit_kqueue(pid) {
+        Ok(kqueue) => kqueue,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+            return VerifiedProcessOutcome::Identity(PidIdentity::Missing);
+        }
+        Err(_) => return VerifiedProcessOutcome::Identity(PidIdentity::Unverified),
+    };
     let identity = verify_cockpit_daemon_receipt_identity(receipt);
     if identity != PidIdentity::VerifiedDaemon {
         return VerifiedProcessOutcome::Identity(identity);
@@ -602,7 +610,11 @@ async fn wait_for_verified_process_exit(
 ) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd as _;
     let pid = process.receipt.pid;
-    let kqueue = tokio::io::unix::AsyncFd::new(process.kqueue)?;
+    // Tokio's macOS/FreeBSD reactor is itself a kqueue; nesting a kqueue in it
+    // is only valid for read interest (EVFILT_WRITE on a kqueue is EINVAL), so
+    // the default read+write interest of `AsyncFd::new` must not be used.
+    let kqueue =
+        tokio::io::unix::AsyncFd::with_interest(process.kqueue, tokio::io::Interest::READABLE)?;
     let ready = async {
         loop {
             let mut readiness = kqueue.readable().await?;
@@ -2145,6 +2157,54 @@ mod tests {
     use super::*;
 
     const LIFETIME_CHILD_PATH: &str = "COCKPIT_TEST_DAEMON_LIFETIME_CHILD_PATH";
+
+    /// Regression: registering the process-exit kqueue with Tokio's own
+    /// kqueue reactor using write interest fails with EINVAL, which crashed
+    /// the supervisor's stable worker watch on every macOS/FreeBSD start.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn kqueue_process_exit_witness_registers_with_tokio_reactor_and_fires() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id();
+        let receipt = DaemonPidReceipt {
+            pid,
+            executable: std::path::PathBuf::from("/bin/sleep"),
+            process_start: process_start_identity(pid).expect("child start identity"),
+            publication_nonce: [0; 32],
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+
+        let timed_process = VerifiedDaemonProcess {
+            receipt: receipt.clone(),
+            kqueue: open_process_exit_kqueue(pid as libc::pid_t).expect("timed kqueue"),
+        };
+        assert!(
+            !runtime
+                .block_on(timed_process.wait_for_exit(std::time::Duration::from_millis(50)))
+                .expect("live child wait must register with the reactor"),
+            "a live child must not report exit"
+        );
+
+        let exit_process = VerifiedDaemonProcess {
+            receipt,
+            kqueue: open_process_exit_kqueue(pid as libc::pid_t).expect("exit kqueue"),
+        };
+        child.kill().expect("kill sleep child");
+        assert!(
+            runtime
+                .block_on(exit_process.wait_for_exit(std::time::Duration::from_secs(5)))
+                .expect("wait for child exit"),
+            "child exit must fire the kqueue witness"
+        );
+        child.wait().expect("reap sleep child");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn competing_startup_lifetime_acquisition_is_nonblocking_and_typed() {

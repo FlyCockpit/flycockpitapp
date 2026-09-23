@@ -4739,10 +4739,19 @@ mod tests {
             paths.owner_capability_path(),
             PathBuf::from("/run/user/1000/cockpit/cockpit.owner-capability")
         );
+        // The deny list is minimal: the socket directory's deny covers every
+        // control-plane file inside it.
         let denied = paths.sandbox_deny_paths();
-        assert!(denied.contains(&paths.socket));
-        assert!(denied.contains(&paths.leak_reveal_socket()));
-        assert!(denied.contains(&paths.owner_capability_path()));
+        for path in [
+            paths.socket.clone(),
+            paths.leak_reveal_socket(),
+            paths.owner_capability_path(),
+        ] {
+            assert!(
+                denied.iter().any(|deny| path.starts_with(deny)),
+                "{path:?} must be covered by {denied:?}"
+            );
+        }
     }
 
     /// Two ephemeral daemons (distinct control stems) in one runtime dir get

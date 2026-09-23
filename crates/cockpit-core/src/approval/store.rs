@@ -2702,7 +2702,14 @@ fn open_live_in_dir(
 enum PublishKind {
     /// `linkat(AT_EMPTY_PATH)` created the destination from the held inode.
     /// There was no source name to substitute.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     LinkedDirect,
+    /// The named staging entry `tmp` was renamed onto an absent destination
+    /// with no-replace semantics (first write where the staged inode has a
+    /// directory entry). `tmp` is free afterwards; if the destination is not
+    /// the held inode (the staging name was substituted before the rename),
+    /// renaming it back to `tmp` restores the previous, absent, store.
+    RenamedDirect { tmp: std::ffi::CString },
     /// The destination was exchanged with `tmp`. `tmp` now names whatever
     /// previously occupied the destination (the previous store, which a
     /// substituted publish can restore by exchanging again).
@@ -2710,11 +2717,15 @@ enum PublishKind {
 }
 
 /// Install the held staged inode as `dest` relative to the flocked
-/// directory fd. First write on Linux names the inode directly at
-/// `dest` (`linkat(AT_EMPTY_PATH)`) — the source is the fd, so a
-/// staged-name substitution cannot be installed. Replace gives the
-/// inode a unique name and `RENAME_EXCHANGE`s it with `dest`, keeping
-/// the previous store named at that unique name for rollback.
+/// directory fd. First write of an unnamed (`O_TMPFILE`) inode names it
+/// directly at `dest` (`linkat(AT_EMPTY_PATH)`) — the source is the fd, so
+/// a staged-name substitution cannot be installed. First write of a named
+/// staged entry (platforms without `O_TMPFILE`, such as macOS) renames it
+/// onto `dest` with no-replace semantics; the caller then proves the
+/// installed entry is the held inode. Replace (the destination exists)
+/// gives the inode a unique name and exchanges it with `dest` (Linux
+/// `RENAME_EXCHANGE`, macOS `RENAME_SWAP`), keeping the previous store
+/// named at that unique name for rollback.
 #[cfg(unix)]
 fn publish_staged_store(
     dir: &std::fs::File,
@@ -2758,6 +2769,21 @@ fn publish_staged_store(
     };
 
     run_before_publish_rename_hook();
+    if staged.named.is_some() {
+        // An exchange needs both names to exist, so a first write of a named
+        // staged entry is a no-replace rename. An existing store (EEXIST)
+        // takes the exchange below, which keeps it for rollback.
+        match cockpit_host::private_fs::held_fd::rename_noreplace(
+            dir.as_raw_fd(),
+            &tmp,
+            dir.as_raw_fd(),
+            dest,
+        ) {
+            Ok(()) => return Ok(PublishKind::RenamedDirect { tmp }),
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(error) => return Err(error),
+        }
+    }
     cockpit_host::private_fs::held_fd::rename_exchange(
         dir.as_raw_fd(),
         &tmp,
@@ -2765,6 +2791,21 @@ fn publish_staged_store(
         dest,
     )?;
     Ok(PublishKind::Exchanged { tmp })
+}
+
+/// Undo a no-replace first publish that installed a substituted entry:
+/// rename whatever `dest` now names back to the consumed staging name, so
+/// the store returns to its previous (absent) state. No-replace on the way
+/// back too, so an entry that appeared at `tmp` meanwhile is never
+/// clobbered; that failure is reported instead.
+#[cfg(unix)]
+fn rollback_renamed_publish(
+    dir: &std::fs::File,
+    dest: &std::ffi::CStr,
+    tmp: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    cockpit_host::private_fs::held_fd::rename_noreplace(dir.as_raw_fd(), dest, dir.as_raw_fd(), tmp)
 }
 
 #[cfg(unix)]
@@ -3320,20 +3361,32 @@ fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Re
             }
         }
         Ok(false) => {
-            if let PublishKind::Exchanged { tmp } = published {
-                rollback_exchanged_publish(lock, &dest, &tmp).context(
-                    "restoring the previous approvals store after a substituted publish",
-                )?;
-                anyhow::bail!(
-                    "the approvals store write would have installed an entry that is \
-                     not the staged object this process wrote and synced; the previous \
-                     store was restored"
-                );
+            match published {
+                PublishKind::Exchanged { tmp } => {
+                    rollback_exchanged_publish(lock, &dest, &tmp).context(
+                        "restoring the previous approvals store after a substituted publish",
+                    )?;
+                    anyhow::bail!(
+                        "the approvals store write would have installed an entry that is \
+                         not the staged object this process wrote and synced; the previous \
+                         store was restored"
+                    );
+                }
+                PublishKind::RenamedDirect { tmp } => {
+                    rollback_renamed_publish(lock, &dest, &tmp)
+                        .context("withdrawing a substituted first approvals store publish")?;
+                    anyhow::bail!(
+                        "the approvals store write would have installed an entry that is \
+                         not the staged object this process wrote and synced; it was \
+                         withdrawn and the store remains absent"
+                    );
+                }
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                PublishKind::LinkedDirect => anyhow::bail!(
+                    "the approvals store write did not install the staged object this \
+                     process wrote and synced; the live path was left as found"
+                ),
             }
-            anyhow::bail!(
-                "the approvals store write did not install the staged object this \
-                 process wrote and synced; the live path was left as found"
-            );
         }
         Err(error) => {
             return Err(anyhow::Error::from(error))
@@ -5869,6 +5922,41 @@ mod tests {
         assert!(
             file.commands_reject.is_empty(),
             "later reads must not consume attacker-supplied policy"
+        );
+    }
+
+    /// First write without `O_TMPFILE` (macOS): the named staging entry is
+    /// renamed onto the absent store with no-replace semantics. A staging
+    /// name substituted before that rename must never be left installed.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[test]
+    fn first_store_publish_withdraws_a_substituted_staging_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_approvals(dir.path()).unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let attacker = br#"{"commands_reject":["pwned"]}"#;
+        BEFORE_PUBLISH_RENAME_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let staged = find_staged_store_temp(&dir_path);
+                std::fs::remove_file(&staged).unwrap();
+                std::fs::write(&staged, attacker).unwrap();
+            }));
+        });
+
+        let error = store_approvals(
+            dir.path(),
+            &lock,
+            &ApprovalsFile {
+                commands_reject: BTreeSet::from(["never-reported-success".to_string()]),
+                ..ApprovalsFile::default()
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("the store remains absent"), "{message}");
+        assert!(
+            !dir.path().join(APPROVALS_FILE).exists(),
+            "a substituted first publish must not leave attacker bytes installed"
         );
     }
 

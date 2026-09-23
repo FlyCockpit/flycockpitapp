@@ -1242,12 +1242,22 @@ fn onboarding_shell_disables_structured_paste_intake() {
     );
 }
 
+/// #428 gates Welcome input on the landed fly-in; land it the way the
+/// animation tick would before driving the Welcome transition.
+fn land_welcome(app: &mut App) {
+    app.onboarding_shell
+        .as_mut()
+        .expect("welcome shell")
+        .set_frame_for_golden(crate::tui::onboarding::WELCOME_ANIMATION_FRAMES);
+}
+
 #[test]
 fn duplicate_transition_intent_while_pending_is_visible_not_silent() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
     inject_onboarding_stage(&mut app, OnboardingStage::Welcome);
+    land_welcome(&mut app);
 
     shell_key(&mut app, KeyCode::Char(' '));
     assert!(
@@ -1277,6 +1287,7 @@ fn transition_correlation_failure_clears_latch_and_surfaces_retryable_error() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
     inject_onboarding_stage(&mut app, OnboardingStage::Welcome);
+    land_welcome(&mut app);
     let snapshot = app.onboarding_snapshot.clone().expect("welcome snapshot");
 
     shell_key(&mut app, KeyCode::Char(' '));
@@ -1342,6 +1353,7 @@ fn stale_generation_transition_completion_is_inert_not_erroring() {
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = App::new(Some(tmp.path()), false);
     inject_onboarding_stage(&mut app, OnboardingStage::Welcome);
+    land_welcome(&mut app);
 
     shell_key(&mut app, KeyCode::Char(' '));
     let (action_id, request_id) = app

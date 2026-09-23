@@ -455,6 +455,11 @@ mod tests {
                 reason: "daemon boot scrubs the launch-ticket environment slot once so descendant processes never inherit owner-class provenance",
             },
             AllowedMutation {
+                file: "crates/cockpit-core/src/daemon/supervisor.rs",
+                symbol: "prepare_process_entry_environment",
+                reason: "process-entry hook (CLI main_entry / spawn harness) runs before any runtime or thread; scrubs worker/reexec role env so helpers never inherit it and publishes the worker's exact LISTEN_PID",
+            },
+            AllowedMutation {
                 file: "crates/cockpit-core/src/providers/provider_http.rs",
                 symbol: "set",
                 reason: "test-local proxy env guard saves/restores one variable serialized by its own static mutex for the test lifetime",
@@ -572,7 +577,7 @@ mod tests {
             "std::env::remove_var",
             "env::set_var",
             "env::remove_var",
-            "set_current_dir",
+            "env::set_current_dir",
         ]
         .iter()
         .any(|needle| line.contains(needle))

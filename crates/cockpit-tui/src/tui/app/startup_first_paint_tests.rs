@@ -557,6 +557,8 @@ fn startup_guidance_backfill_discards_stale_session_or_model() {
 #[tokio::test]
 async fn startup_background_tasks_are_explicitly_started_after_construction() {
     let tmp = tempfile::tempdir().unwrap();
+    let home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    home.set_var("COCKPIT_UPDATES", "off");
     let mut app = App::new(Some(tmp.path()), false);
     assert!(!app.startup_background.started);
     assert_eq!(app.async_actions.pending_count(), 0);
@@ -565,7 +567,8 @@ async fn startup_background_tasks_are_explicitly_started_after_construction() {
     app.start_startup_background_tasks_with_policy(std::future::pending());
 
     assert!(app.startup_background.started);
-    assert_eq!(app.async_actions.pending_count(), 1);
+    // Lifetime policy plus the tracked update check.
+    assert_eq!(app.async_actions.pending_count(), 2);
 }
 
 #[test]
@@ -629,6 +632,9 @@ async fn stale_clipboard_reconciliation_completion_is_ui_inert() {
 
 #[test]
 fn blocked_export_recovery_cannot_block_first_draw_or_input_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    home.set_var("COCKPIT_UPDATES", "off");
     let mut app = App::new(None, false);
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
@@ -636,7 +642,8 @@ fn blocked_export_recovery_cannot_block_first_draw_or_input_ready() {
     app.schedule_startup_export_recovery(std::future::pending());
 
     assert!(app.first_paint_completed);
-    assert_eq!(app.async_actions.pending_count(), 2);
+    // Lifetime policy, tracked update check, and export recovery.
+    assert_eq!(app.async_actions.pending_count(), 3);
     assert!(app.startup_lifecycle.is_none());
     assert!(app.agent_runner.is_none());
 }

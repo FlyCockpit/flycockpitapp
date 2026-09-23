@@ -163,7 +163,11 @@ opens search. `Ctrl+J` focuses the rail; Escape returns to the composer.
 | --- | --- | --- |
 | `Ctrl+J` | focus | focus the session rail |
 | `↑/↓` | move | highlight a session |
-| `Enter` | resume | resume the highlighted session |
+| `Enter` | open | open the highlighted session |
+| `Tab` | preview | focus the selected session preview |
+| `Ctrl+N` | new session | start a fresh session |
+| `Alt+↑/↓` | switch | resume the previous or next session |
+| `Ctrl+B` | hide/show | toggle the session rail |
 | `/` | search | search the current projection |
 | `i` | inbox source | open the latest assistant inbox source thread |
 | `n` | inbox | show notify and pending assistant inbox entries |

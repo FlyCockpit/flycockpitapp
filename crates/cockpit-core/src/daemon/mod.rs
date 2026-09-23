@@ -2936,6 +2936,14 @@ async fn run_foreground_inner_with_boot_db_impl(
                 Some(listeners) => listeners,
                 None => prepare_and_publish_socket_pair(&paths)?,
             };
+            // A first-run worker serves the locked bootstrap on the inherited
+            // listeners, so it must report readiness here exactly as the ready
+            // branch does; otherwise the supervisor times out and the spawner
+            // never observes a ready daemon on a fresh install.
+            if !standby_promoted_before_recovery {
+                supervisor::report_worker_ready()?;
+                supervisor::wait_for_worker_promotion()?;
+            }
             let locked_outcome = tokio::select! {
                 result = server::run_locked_until_ready(
                     std::sync::Arc::new(locked),
@@ -4659,9 +4667,12 @@ mod tests {
 
         release_tx.send(()).expect("release promotion");
         promotion.await.expect("promotion task joins");
+        // Persistent now waits for further presence changes (#426); closing
+        // the channel lets the reaper exit.
+        drop(presence_tx);
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
-            .expect("reaper observes the promoted lifetime")
+            .expect("reaper observes the promoted lifetime and exits on channel close")
             .expect("reaper task joins");
         assert!(
             !reaped.load(std::sync::atomic::Ordering::Acquire),

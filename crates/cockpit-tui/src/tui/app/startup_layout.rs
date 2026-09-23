@@ -1,4 +1,5 @@
 use super::*;
+use cockpit_config::providers::AuthKind;
 
 #[cfg(test)]
 mod tests {
@@ -1508,7 +1509,7 @@ impl App {
                 self.apply_onboarding_model(submission);
             }
             Some(OnboardingShellAction::SelectTemplate(template)) => {
-                if matches!(template.auth, cockpit_config::providers::AuthKind::None) {
+                if matches!(template.auth, AuthKind::None) {
                     let submission = crate::tui::onboarding::AuthSubmission::NoCredential {
                         provider_id: template.id.to_string(),
                         base_url: template.url.to_string(),
@@ -2585,15 +2586,24 @@ impl App {
         }
         self.startup_background.started = true;
         let generation = self.startup_background.generation;
-        if let Ok(channel) = cockpit_core::updater::effective_update_channel()
-            && cockpit_core::updater::update_checks_enabled(channel)
-        {
-            // The daemon's update notice lives in its process. Run the check
-            // here as well so this interactive process can render the result.
-            tokio::spawn(async move {
-                let _ = cockpit_core::updater::run_startup_check(channel).await;
-            });
-        }
+        // The daemon's update notice lives in its process. Run the check here
+        // as well so this interactive process can render the result. Channel
+        // resolution reads installation config, so it stays off the draw path
+        // inside a tracked action that exit cancels.
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Internal("startup.update-check"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.update-check"),
+            ),
+            async move {
+                if let Ok(channel) = cockpit_core::updater::effective_update_channel()
+                    && cockpit_core::updater::update_checks_enabled(channel)
+                {
+                    let _ = cockpit_core::updater::run_startup_check(channel).await;
+                }
+                Ok(crate::tui::async_action::AsyncActionPayload::Unit)
+            },
+        );
         // The first authority operation is isolated in the action runner so
         // an exit before the worker begins has no configuration I/O.  It
         // reads only `daemon.background_agents`; project configuration is not

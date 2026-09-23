@@ -1004,9 +1004,11 @@ mod tests {
     /// history or treats `run_user_input` Ok as a completed turn, plus the
     /// post-select idle tail and control siblings that rewrite history.
     /// This fully closes: `recv_for`, pending-completion drain, `job_event_rx`,
-    /// and the goal watchdog share `waiting_for_keep_parked_siblings`; the
-    /// post-select tail gates `maybe_shadow_brief` / `maybe_auto_compact` on
-    /// the same flag; function-level owners (`maybe_continue_active_goal`,
+    /// and the goal watchdog share `waiting_for_turn_admission` (which folds
+    /// tool recovery together with
+    /// `persist_on_reentry_owns_started_unsettled_siblings`); the post-select
+    /// tail gates `maybe_shadow_brief` / `maybe_auto_compact` /
+    /// `maybe_schedule_keep_warm` on the same flag; function-level owners (`maybe_continue_active_goal`,
     /// `dispatch_goal_root_turn`, `run_parent_tool_result`, `run_job_event`,
     /// `deliver_background_noninteractive_completion`) consult the predicate
     /// before committing; `maybe_auto_compact` / `maybe_auto_prune` /
@@ -1022,22 +1024,54 @@ mod tests {
     fn keep_park_idle_fence_covers_sibling_idle_arms() {
         let driver = include_str!("../driver/mod.rs");
         assert!(
-            driver
-                .matches("if !waiting_for_keep_parked_siblings")
-                .count()
-                >= 5,
-            "recv_for, pending drain, job_event_rx, goal-watchdog, and the post-select idle tail must share the keep-park idle fence"
+            driver.matches("if !waiting_for_turn_admission").count() >= 5,
+            "recv_for, pending drain, job_event_rx, goal-watchdog, and the post-select idle tail must share the keep-park idle fence (`waiting_for_turn_admission`)"
         );
+        let flag_definition = driver
+            .split("let waiting_for_turn_admission =")
+            .nth(1)
+            .expect("idle loop must define the `waiting_for_turn_admission` fence")
+            .split(';')
+            .next()
+            .expect("`waiting_for_turn_admission` definition");
         assert!(
-            driver.contains("waiting_for_keep_parked_siblings"),
-            "idle loop must name the keep-park fence"
+            flag_definition.contains("self.persist_on_reentry_owns_started_unsettled_siblings()"),
+            "`waiting_for_turn_admission` must still include the keep-park predicate so persist-on-re-entry keeps fencing sibling idle arms"
         );
-        assert!(
-            driver.contains(
-                "if !waiting_for_keep_parked_siblings && settled_user_turn {\n                self.maybe_shadow_brief(tx).await;\n                self.maybe_auto_compact(tx).await;\n                self.maybe_schedule_keep_warm().await;\n            }"
-            ),
-            "post-select idle tail must not run shadow-brief/auto-compact/keep-warm while persist-on-re-entry owns keep-parked siblings"
-        );
+        let post_select_tail: String = driver
+            .split("let settled_user_turn")
+            .nth(1)
+            .expect("post-select idle tail must compute `settled_user_turn`")
+            .split("self.emit_context_projection(tx)")
+            .next()
+            .expect("post-select idle tail body")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for required in [
+            "if !waiting_for_turn_admission && settled_user_turn {",
+            "self.maybe_shadow_brief(tx).await;",
+            "self.maybe_auto_compact(tx).await;",
+            "self.maybe_schedule_keep_warm().await;",
+        ] {
+            assert!(
+                post_select_tail.contains(required),
+                "post-select idle tail must not run shadow-brief/auto-compact/keep-warm while persist-on-re-entry owns keep-parked siblings; missing `{required}`"
+            );
+        }
+        let guard_at = post_select_tail
+            .find("if !waiting_for_turn_admission && settled_user_turn {")
+            .expect("post-select idle tail guard");
+        for call in [
+            "self.maybe_shadow_brief(tx).await;",
+            "self.maybe_auto_compact(tx).await;",
+            "self.maybe_schedule_keep_warm().await;",
+        ] {
+            assert!(
+                post_select_tail.find(call).is_some_and(|at| at > guard_at),
+                "post-select idle tail must call `{call}` only inside the keep-park guard"
+            );
+        }
         let maybe_continue = driver
             .split("async fn maybe_continue_active_goal")
             .nth(1)

@@ -683,7 +683,7 @@ appear to see different trust or session state.
 
 ### Database migration recovery
 
-Cockpit creates a private, timestamped backup beside the SQLite database before applying a pending migration and retains the three newest backups. If it detects a database from the pre-0.1.0 squashed-schema format, it automatically moves that database and its WAL/SHM sidecars aside, recreates a fresh database, and reports the moved path. No interactive action is required.
+Every open verifies the SQLite migration ledger checksum and the exact schema DDL against the schema compiled into the binary; every build (with or without optional features) uses the same schema. A database written by a newer Cockpit, an altered schema, or an unledgered file with application tables is refused rather than modified. To recover, restore a compatible backup or stop the daemon, move the database (and its WAL/SHM sidecars) aside, and restart to create a fresh one.
 
 ## Providers
 

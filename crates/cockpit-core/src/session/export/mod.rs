@@ -1040,14 +1040,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
     // session_id → short_id lookup for tagging events.
     let short_ids: BTreeMap<Uuid, String> = bundle
         .iter()
-        .map(|s| {
-            (
-                s.session_id,
-                s.short_id
-                    .clone()
-                    .unwrap_or_else(|| s.session_id.to_string()),
-            )
-        })
+        .map(|s| (s.session_id, s.short_id.clone()))
         .collect();
 
     // Gather + merge every session's events into one seq-sorted timeline.
@@ -2966,14 +2959,9 @@ fn is_generated_layer_artifact(rel: &Path, is_dir: bool) -> bool {
             || name.ends_with(".debug.log"))
 }
 
-/// `./cockpit-session-<short_id>.zip`, falling back to the UUID when no
-/// short id is set.
+/// `./cockpit-session-<short_id>.zip`.
 pub fn default_output_path(target: &SessionRow) -> PathBuf {
-    let id = target
-        .short_id
-        .clone()
-        .unwrap_or_else(|| target.session_id.to_string());
-    PathBuf::from(format!("cockpit-session-{id}.zip"))
+    PathBuf::from(format!("cockpit-session-{}.zip", target.short_id))
 }
 
 #[cfg(test)]

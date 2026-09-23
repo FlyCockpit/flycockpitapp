@@ -15,9 +15,9 @@
 //! | `intel_files` (+ cascaded symbol graph) | intel_index | Stale workspace index snapshots past the evidence window |
 //! | `sealed_value_acquisition_audit`, `sealed_action_invocation_audit`, `sealed_recovery_audit` | terminal_evidence | Terminal sealed audit metadata past the evidence window (`pending` acquisition rows are never age-deleted) |
 //! | `media_retained_https_audit`, `media_local_path_registration_audit`, `local_media_operation_audit` | terminal_evidence | Terminal media-operation audit rows past the evidence window |
-//! | `remote_principal_audit` | terminal_evidence | Remote principal request audit rows past the evidence window (remote profile only) |
-//! | `image_generation_artifact_security_recovery_audits` (+ cascaded components) | terminal_evidence | Terminal security-recovery audit rows past the evidence window (`recorded` rows are never age-deleted; extended profile only) |
-//! | `image_generation_artifact_security_recovery_attempts` | terminal_evidence | Terminal security-recovery attempt rows past the evidence window (`received` rows are never age-deleted; extended profile only) |
+//! | `remote_principal_audit` | terminal_evidence | Remote principal request audit rows past the evidence window (rows written only by `remote` builds) |
+//! | `image_generation_artifact_security_recovery_audits` (+ cascaded components) | terminal_evidence | Terminal security-recovery audit rows past the evidence window (`recorded` rows are never age-deleted; rows written only by `extended` builds) |
+//! | `image_generation_artifact_security_recovery_attempts` | terminal_evidence | Terminal security-recovery attempt rows past the evidence window (`received` rows are never age-deleted; rows written only by `extended` builds) |
 //!
 //! `computer_audit_entries` remains append-only with SQL-enforced immutability;
 //! chain truncation is owned by the machine-local audit writer, not this sweep.
@@ -306,34 +306,29 @@ pub(crate) fn prune_append_only_ledgers_conn(
         .context("pruning local media operation audit rows")
     })?;
 
-    let remote_principal_audit_deleted = if table_exists(conn, "remote_principal_audit")? {
-        delete_in_batches(batch, || {
-            conn.execute(
-                "DELETE FROM remote_principal_audit
-                  WHERE audit_id IN (
-                      SELECT audit_id
-                        FROM remote_principal_audit
-                       WHERE ts_ms < ?1
-                       ORDER BY ts_ms ASC
-                       LIMIT ?2
-                  )",
-                params![cutoff_unix_ms, batch],
-            )
-            .context("pruning remote principal audit rows")
-        })?
-    } else {
-        0
-    };
+    // The remote and extended domain tables exist in every build (one
+    // unconditional schema); in builds without those features they are simply
+    // empty, so pruning them is a no-op.
+    let remote_principal_audit_deleted = delete_in_batches(batch, || {
+        conn.execute(
+            "DELETE FROM remote_principal_audit
+              WHERE audit_id IN (
+                  SELECT audit_id
+                    FROM remote_principal_audit
+                   WHERE ts_ms < ?1
+                   ORDER BY ts_ms ASC
+                   LIMIT ?2
+              )",
+            params![cutoff_unix_ms, batch],
+        )
+        .context("pruning remote principal audit rows")
+    })?;
 
     let (
         image_security_recovery_components_deleted,
         image_security_recovery_audits_deleted,
         image_security_recovery_attempts_deleted,
-    ) = if table_exists(conn, "image_generation_artifact_security_recovery_audits")? {
-        prune_image_security_recovery_ledgers_conn(conn, cutoff_unix_ms, batch)?
-    } else {
-        (0, 0, 0)
-    };
+    ) = prune_image_security_recovery_ledgers_conn(conn, cutoff_unix_ms, batch)?;
 
     Ok(LedgerRetentionOutcome {
         external_journal_operations_deleted,
@@ -355,29 +350,14 @@ pub(crate) fn prune_append_only_ledgers_conn(
     })
 }
 
-const IMAGE_SECURITY_RECOVERY_COMPONENT_DELETE_TRIGGER_SQL: &str = "
-CREATE TRIGGER image_generation_security_recovery_component_delete_forbidden
-BEFORE DELETE ON image_generation_artifact_security_recovery_components
-BEGIN
-    SELECT RAISE(ABORT,'security recovery component identity is durable');
-END;
-";
+// These must be byte-identical to the trigger DDL in `0001_initial.sql`:
+// the exact-DDL fingerprint verified on every open hashes the stored text,
+// so a drop/recreate with different whitespace would brick the database.
+const IMAGE_SECURITY_RECOVERY_COMPONENT_DELETE_TRIGGER_SQL: &str = "CREATE TRIGGER image_generation_security_recovery_component_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_components BEGIN SELECT RAISE(ABORT,'security recovery component identity is durable'); END;";
 
-const IMAGE_SECURITY_RECOVERY_ATTEMPT_DELETE_TRIGGER_SQL: &str = "
-CREATE TRIGGER image_generation_security_recovery_attempt_delete_forbidden
-BEFORE DELETE ON image_generation_artifact_security_recovery_attempts
-BEGIN
-    SELECT RAISE(ABORT,'security recovery attempt audit is durable');
-END;
-";
+const IMAGE_SECURITY_RECOVERY_ATTEMPT_DELETE_TRIGGER_SQL: &str = "CREATE TRIGGER image_generation_security_recovery_attempt_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_attempts BEGIN SELECT RAISE(ABORT,'security recovery attempt audit is durable'); END;";
 
-const IMAGE_SECURITY_RECOVERY_AUDIT_DELETE_TRIGGER_SQL: &str = "
-CREATE TRIGGER image_generation_security_recovery_audit_delete_forbidden
-BEFORE DELETE ON image_generation_artifact_security_recovery_audits
-BEGIN
-    SELECT RAISE(ABORT,'security recovery audit is durable');
-END;
-";
+const IMAGE_SECURITY_RECOVERY_AUDIT_DELETE_TRIGGER_SQL: &str = "CREATE TRIGGER image_generation_security_recovery_audit_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_audits BEGIN SELECT RAISE(ABORT,'security recovery audit is durable'); END;";
 
 const IMAGE_SECURITY_RECOVERY_DELETE_TRIGGERS: [(&str, &str); 3] = [
     (
@@ -475,6 +455,28 @@ fn prune_image_security_recovery_ledgers_conn(
     cutoff_unix_ms: i64,
     batch: i64,
 ) -> Result<(u64, u64, u64)> {
+    // Dropping and recreating the delete fences is schema DDL. Skip it when
+    // nothing is prunable (always the case in builds without `extended`,
+    // whose code never writes these tables), so ordinary retention passes do
+    // not churn the exact-DDL-fingerprinted schema.
+    let prunable: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM image_generation_artifact_security_recovery_audits
+                  WHERE state IN ('applied', 'denied', 'proof_failed', 'stale')
+                    AND COALESCE(decided_at_unix_ms, created_at_unix_ms) < ?1
+             ) OR EXISTS(
+                 SELECT 1 FROM image_generation_artifact_security_recovery_attempts
+                  WHERE state IN ('validated', 'denied')
+                    AND COALESCE(decided_at_unix_ms, created_at_unix_ms) < ?1
+             )",
+            params![cutoff_unix_ms],
+            |row| row.get(0),
+        )
+        .context("probing prunable image security recovery ledgers")?;
+    if !prunable {
+        return Ok((0, 0, 0));
+    }
     let mut trigger_guard = ImageSecurityRecoveryDeleteTriggerGuard::acquire(conn)?;
     let pruning = catch_unwind(AssertUnwindSafe(|| -> Result<(u64, u64, u64)> {
         let image_security_recovery_components_deleted = delete_in_batches(batch, || {
@@ -578,20 +580,6 @@ fn sql_in_list(values: &[&str]) -> String {
         .join(", ")
 }
 
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    let mut exists = false;
-    let mut stmt = conn
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1")
-        .context("preparing table existence probe")?;
-    let mut rows = stmt
-        .query([table])
-        .context("querying table existence probe")?;
-    if rows.next()?.is_some() {
-        exists = true;
-    }
-    Ok(exists)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +609,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.external_journal_operations_deleted, 1);
+    }
+
+    /// The image security-recovery delete fences are dropped and recreated
+    /// while pruning. The recreated DDL must be byte-identical to the
+    /// migration, or the next open's exact-DDL fingerprint check refuses the
+    /// database.
+    #[test]
+    fn delete_fence_restore_and_prune_preserve_exact_schema_fingerprint() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let before = crate::db::exact_ddl_fingerprint(&conn).unwrap();
+
+        let mut guard = ImageSecurityRecoveryDeleteTriggerGuard::acquire(&conn).unwrap();
+        assert_ne!(
+            crate::db::exact_ddl_fingerprint(&conn).unwrap(),
+            before,
+            "acquiring the guard drops the delete fences"
+        );
+        guard.restore().unwrap();
+        drop(guard);
+        assert_eq!(crate::db::exact_ddl_fingerprint(&conn).unwrap(), before);
+
+        prune_append_only_ledgers_conn(&conn, 2_000, 2).unwrap();
+        assert_eq!(crate::db::exact_ddl_fingerprint(&conn).unwrap(), before);
     }
 }

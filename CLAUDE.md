@@ -81,4 +81,5 @@ These three checks are what CLI CI enforces.
 - Avoid direct `useEffect` in web route/component files unless encapsulated in an approved hook; use Skeletons for loading states; avoid `transition: all` / Tailwind `transition-all`.
 - When changing public routes, keep `sitemap.md` and `apps/server/src/seo.ts` in sync.
 - Asset and video URLs are bearer-style access URLs — verify authorization before returning one from any API, SSR response, email, or admin tool.
+- The local Rust SQLite schema is a single `crates/cockpit-db/src/db/migrations/0001_initial.sql` shared by every build (Cargo features gate code, not DDL); fold pre-launch schema changes into it and do not append `0002_*` until the #305 launch freeze.
 - Environment variables are validated in `@flycockpit/env`; add new ones there (and to `turbo.json` `passThroughEnv` if dev servers need them). Secrets never go in git; `.env.example` holds placeholders only.

@@ -1,4 +1,4 @@
-//! Executed-schema contract for the physical local-v0.1 profile.
+//! Executed-schema contract for the single unconditional v0.1 schema file.
 
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -343,8 +343,8 @@ fn host_authorization_tool_call_identity_is_per_agent_and_indexes_its_owner_fk()
         .unwrap();
     conn.execute(
         "INSERT INTO sessions
-         (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms)
-         VALUES (?1, 'project', '/project', 1, 1)",
+         (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, short_id)
+         VALUES (?1, 'project', '/project', 1, 1, lower(hex(randomblob(3))))",
         ["00000000-0000-0000-0000-000000000001"],
     )
     .unwrap();
@@ -1823,12 +1823,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
             terminal.is_subset(&allowed),
             "family {name} terminal states must be allowed"
         );
-        let sql = [
-            include_str!("../src/db/migrations/0001_initial.sql"),
-            include_str!("../src/db/migrations/0001_extended_profile.sql"),
-            include_str!("../src/db/migrations/0001_remote_profile.sql"),
-        ]
-        .join("\n");
+        let sql = include_str!("../src/db/migrations/0001_initial.sql").to_owned();
         let table = required_text(name, family, "table");
         let declaration = table_declaration(&sql, table);
         if family.get("state_columns").is_none() {
@@ -1970,12 +1965,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
         .get("sql_state_machine")
         .and_then(toml::Value::as_table)
         .expect("schema-ownership.toml must contain SQL-only state-machine families");
-    let all_sql = [
-        include_str!("../src/db/migrations/0001_initial.sql"),
-        include_str!("../src/db/migrations/0001_extended_profile.sql"),
-        include_str!("../src/db/migrations/0001_remote_profile.sql"),
-    ]
-    .join("\n");
+    let all_sql = include_str!("../src/db/migrations/0001_initial.sql").to_owned();
     for (name, value) in sql_families {
         let family = value
             .as_table()
@@ -2091,12 +2081,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
         .get("table")
         .and_then(toml::Value::as_table)
         .expect("schema-ownership.toml must contain a nonempty [table] map");
-    let sql = [
-        include_str!("../src/db/migrations/0001_initial.sql"),
-        include_str!("../src/db/migrations/0001_extended_profile.sql"),
-        include_str!("../src/db/migrations/0001_remote_profile.sql"),
-    ]
-    .join("\n");
+    let sql = include_str!("../src/db/migrations/0001_initial.sql").to_owned();
     let guarded_tables = semantic_transition_guard_tables(&sql);
     let explicit_guarded_tables = [
         "agent_editor_leases",
@@ -2306,23 +2291,56 @@ fn ownership() -> BTreeMap<String, Ownership> {
         .collect()
 }
 
-fn applied_profile_inventory(
+/// Section markers inside the single unconditional `0001_initial.sql`. The
+/// file is one migration applied identically by every build; the sections
+/// only record which Cargo feature's code owns (reads/writes) the tables.
+const EXTENDED_SECTION_MARKER: &str = "-- ==== extended domains";
+const REMOTE_SECTION_MARKER: &str = "-- ==== remote domains";
+
+/// Split `0001_initial.sql` into its base, extended-domain, and remote-domain
+/// sections. Each section boundary appears exactly once and in that order, so
+/// the three slices concatenate back to the exact migration text.
+fn schema_sections(sql: &str) -> (&str, &str, &str) {
+    for marker in [EXTENDED_SECTION_MARKER, REMOTE_SECTION_MARKER] {
+        assert_eq!(
+            sql.matches(marker).count(),
+            1,
+            "0001_initial.sql must contain section marker {marker:?} exactly once"
+        );
+    }
+    let extended_start = sql.find(EXTENDED_SECTION_MARKER).unwrap();
+    let remote_start = sql.find(REMOTE_SECTION_MARKER).unwrap();
+    assert!(
+        extended_start < remote_start,
+        "0001_initial.sql sections must be ordered base, extended, remote"
+    );
+    (
+        &sql[..extended_start],
+        &sql[extended_start..remote_start],
+        &sql[remote_start..],
+    )
+}
+
+/// Apply the base section plus the selected domain sections. Applying a
+/// subset proves the layering the single file relies on: domain sections
+/// reference base tables only, and no base object references a domain table.
+fn applied_section_inventory(
     extended: bool,
     remote: bool,
     ownership: &BTreeMap<String, Ownership>,
 ) -> BTreeMap<String, BTreeSet<String>> {
+    let (local_sql, extended_sql, remote_sql) =
+        schema_sections(include_str!("../src/db/migrations/0001_initial.sql"));
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
-        .expect("local base schema must apply first");
+    conn.execute_batch(local_sql)
+        .expect("base section must apply on its own");
     if extended {
-        conn.execute_batch(include_str!(
-            "../src/db/migrations/0001_extended_profile.sql"
-        ))
-        .expect("extended-local schema must apply after local base");
+        conn.execute_batch(extended_sql)
+            .expect("extended-domain section must apply after the base section");
     }
     if remote {
-        conn.execute_batch(include_str!("../src/db/migrations/0001_remote_profile.sql"))
-            .expect("remote schema must apply after local base");
+        conn.execute_batch(remote_sql)
+            .expect("remote-domain section must apply after the base section");
     }
     let inventory = schema_inventory(&conn);
     let tables = inventory.get("table").cloned().unwrap_or_default();
@@ -2347,7 +2365,7 @@ fn applied_profile_inventory(
         if matches!(kind.as_str(), "index" | "trigger") {
             assert!(
                 tables.contains(&owning_table) || is_runtime_managed_table(&owning_table),
-                "profile object {kind} {name} has absent owning table {owning_table}"
+                "section object {kind} {name} has absent owning table {owning_table}"
             );
         }
         // Tokenize the object's SQL once and probe the classified tables
@@ -2360,7 +2378,7 @@ fn applied_profile_inventory(
             assert!(
                 !sql_tokens.contains(classified_table.as_str())
                     || tables.contains(classified_table),
-                "profile object {kind} {name} references absent table {classified_table}"
+                "section object {kind} {name} references absent table {classified_table}"
             );
         }
     }
@@ -2368,29 +2386,22 @@ fn applied_profile_inventory(
 }
 
 #[test]
-fn all_four_schema_profiles_have_exact_physical_ownership() {
-    let local_sql = include_str!("../src/db/migrations/0001_initial.sql");
-    let extended_sql = include_str!("../src/db/migrations/0001_extended_profile.sql");
-    let remote_sql = include_str!("../src/db/migrations/0001_remote_profile.sql");
-    let profile_sql = [
-        local_sql.to_owned(),
-        [local_sql, extended_sql].concat(),
-        [local_sql, remote_sql].concat(),
+fn single_schema_file_sections_have_exact_physical_ownership() {
+    let full_sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let (local_sql, extended_sql, remote_sql) = schema_sections(full_sql);
+    assert_eq!(
         [local_sql, extended_sql, remote_sql].concat(),
-    ];
-    assert!(
-        profile_sql[3].starts_with(&profile_sql[1])
-            && &profile_sql[3][profile_sql[1].len()..] == remote_sql,
-        "full profile composition must be local then extended then remote"
+        full_sql,
+        "schema sections must partition 0001_initial.sql exactly"
     );
     let ownership = ownership();
-    // Keep this source-level gate before either migration is handed to SQLite:
-    // malformed or unavailable extensions must not hide ownership drift.
+    // Keep this source-level gate before any SQL is handed to SQLite:
+    // malformed sections must not hide ownership drift.
     assert_static_table_ownership(&ownership, local_sql, extended_sql, remote_sql);
     for remote_vocabulary in ["remote_device", "public_remote"] {
         assert!(
             !local_sql.contains(remote_vocabulary),
-            "local launch schema contains remote-only vocabulary {remote_vocabulary}"
+            "base schema section contains remote-only vocabulary {remote_vocabulary}"
         );
     }
     for deferred_table in [
@@ -2402,25 +2413,33 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
             !sql_table_objects(local_sql)
                 .iter()
                 .any(|table| table == deferred_table),
-            "local launch schema contains deferred table {deferred_table}"
+            "base schema section contains extended-domain table {deferred_table}"
         );
         assert!(
             sql_table_objects(extended_sql)
                 .iter()
                 .any(|table| table == deferred_table),
-            "extended-local schema is missing deferred table {deferred_table}"
+            "extended-domain section is missing table {deferred_table}"
         );
     }
     let local = Connection::open_in_memory().unwrap();
     local
         .execute_batch(local_sql)
-        .expect("0001_initial.sql must execute as SQLite");
+        .expect("0001_initial.sql base section must execute as SQLite");
     assert_session_fts_runtime_contract(&local, local_sql);
-    let local_inventory = applied_profile_inventory(false, false, &ownership);
+    let full = Connection::open_in_memory().unwrap();
+    full.execute_batch(full_sql)
+        .expect("0001_initial.sql must execute as SQLite");
+    let local_inventory = applied_section_inventory(false, false, &ownership);
     let local_tables = local_inventory.get("table").cloned().unwrap_or_default();
-    let extended_inventory = applied_profile_inventory(true, false, &ownership);
-    let remote_inventory = applied_profile_inventory(false, true, &ownership);
-    let full_inventory = applied_profile_inventory(true, true, &ownership);
+    let extended_inventory = applied_section_inventory(true, false, &ownership);
+    let remote_inventory = applied_section_inventory(false, true, &ownership);
+    let full_inventory = applied_section_inventory(true, true, &ownership);
+    assert_eq!(
+        full_inventory,
+        schema_inventory(&full),
+        "applying every section must equal applying the whole migration file"
+    );
     let full_tables = full_inventory.get("table").cloned().unwrap_or_default();
     assert_eq!(
         ownership.keys().cloned().collect::<BTreeSet<_>>(),
@@ -2429,15 +2448,15 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
     );
 
     for (label, inventory, included_profiles) in [
-        ("local", &local_inventory, &["local"][..]),
+        ("base", &local_inventory, &["local"][..]),
         (
-            "local+extended",
+            "base+extended",
             &extended_inventory,
             &["local", "extended"][..],
         ),
-        ("local+remote", &remote_inventory, &["local", "remote"][..]),
+        ("base+remote", &remote_inventory, &["local", "remote"][..]),
         (
-            "local+extended+remote",
+            "base+extended+remote",
             &full_inventory,
             &["local", "extended", "remote"][..],
         ),
@@ -2453,7 +2472,7 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
         assert_eq!(
             inventory.get("table").cloned().unwrap_or_default(),
             expected,
-            "{label} profile table inventory disagrees with ownership manifest"
+            "{label} section table inventory disagrees with ownership manifest"
         );
     }
 
@@ -2471,12 +2490,12 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
             .cloned()
             .collect::<BTreeSet<_>>(),
         deferred_tables,
-        "full profile additions must be exactly the extended and remote ownership layers"
+        "domain sections must add exactly the extended and remote ownership layers"
     );
 
     assert!(
         remote_tables.is_disjoint(&local_tables),
-        "local base migration must not contain a remote-owned table"
+        "base schema section must not contain a remote-owned table"
     );
 
     let mut stmt = local.prepare(
@@ -2500,7 +2519,7 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
             });
             assert_ne!(
                 owner.status, "remove-from-v0.1",
-                "retained {kind} {name} belongs to removed table {owning_table}"
+                "base {kind} {name} belongs to remote-domain table {owning_table}"
             );
         }
         for remote in &remote_tables {
@@ -2509,7 +2528,7 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
                     |character: char| !(character.is_ascii_alphanumeric() || character == '_')
                 )
                 .any(|token| token == remote),
-                "retained {kind} {name} references removed table {remote}"
+                "base {kind} {name} references remote-domain table {remote}"
             );
         }
     }
@@ -2527,10 +2546,10 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
     let retained = Connection::open_in_memory().unwrap();
     retained
         .execute_batch(local_sql)
-        .expect("local base schema must apply for retained dependency inspection");
+        .expect("base section must apply for retained dependency inspection");
     retained
         .execute_batch(extended_sql)
-        .expect("extended schema must apply for retained dependency inspection");
+        .expect("extended section must apply for retained dependency inspection");
     for (table, owner) in &ownership {
         if owner.status == "launch-disabled-but-schema-required" {
             let referenced = schema_inventory(&retained).iter().any(|(_, objects)| {
@@ -2558,6 +2577,217 @@ fn all_four_schema_profiles_have_exact_physical_ownership() {
             );
         }
     }
+}
+
+/// `cfg(feature = "...")` features named by an attribute list, ignoring
+/// negated (`not(...)`) gates. `test` is reported as the pseudo-feature
+/// `"test"`.
+fn cfg_features(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut features = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("cfg") {
+            continue;
+        }
+        let Ok(list) = attr.meta.require_list() else {
+            continue;
+        };
+        let tokens = list.tokens.to_string();
+        if tokens.trim() == "test" {
+            features.push("test".to_owned());
+            continue;
+        }
+        if tokens.contains("not") {
+            continue;
+        }
+        for profile in ["extended", "remote"] {
+            if tokens.contains(&format!("feature = \"{profile}\"")) {
+                features.push(profile.to_owned());
+            }
+        }
+    }
+    features
+}
+
+/// Records every Rust string literal that names a domain-owned table together
+/// with the cfg gates in force at that literal.
+struct DomainTableReferenceAudit<'a> {
+    domain_tables: &'a BTreeMap<String, String>,
+    gates: Vec<String>,
+    violations: Vec<String>,
+    file: String,
+}
+
+impl DomainTableReferenceAudit<'_> {
+    fn with_gates(&mut self, attrs: &[syn::Attribute], visit: impl FnOnce(&mut Self)) {
+        let added = cfg_features(attrs);
+        let depth = self.gates.len();
+        self.gates.extend(added);
+        visit(self);
+        self.gates.truncate(depth);
+    }
+}
+
+impl<'ast> Visit<'ast> for DomainTableReferenceAudit<'_> {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        let attrs: &[syn::Attribute] = match item {
+            syn::Item::Const(item) => &item.attrs,
+            syn::Item::Fn(item) => &item.attrs,
+            syn::Item::Impl(item) => &item.attrs,
+            syn::Item::Mod(item) => &item.attrs,
+            syn::Item::Static(item) => &item.attrs,
+            syn::Item::Struct(item) => &item.attrs,
+            syn::Item::Enum(item) => &item.attrs,
+            syn::Item::Trait(item) => &item.attrs,
+            syn::Item::Use(item) => &item.attrs,
+            _ => &[],
+        };
+        self.with_gates(attrs, |audit| visit::visit_item(audit, item));
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        let attrs: &[syn::Attribute] = match item {
+            syn::ImplItem::Const(item) => &item.attrs,
+            syn::ImplItem::Fn(item) => &item.attrs,
+            _ => &[],
+        };
+        self.with_gates(attrs, |audit| visit::visit_impl_item(audit, item));
+    }
+
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        let attrs: &[syn::Attribute] = match stmt {
+            syn::Stmt::Local(local) => &local.attrs,
+            syn::Stmt::Expr(syn::Expr::Block(block), _) => &block.attrs,
+            _ => &[],
+        };
+        self.with_gates(attrs, |audit| visit::visit_stmt(audit, stmt));
+    }
+
+    fn visit_attribute(&mut self, _attribute: &'ast syn::Attribute) {
+        // Doc comments and attribute arguments are not SQL.
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        self.with_gates(&arm.attrs, |audit| visit::visit_arm(audit, arm));
+    }
+
+    fn visit_stmt_macro(&mut self, stmt: &'ast syn::StmtMacro) {
+        self.with_gates(&stmt.attrs, |audit| visit::visit_stmt_macro(audit, stmt));
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        // syn does not parse macro bodies (`format!`, `params!`, ...), so
+        // audit their string literal tokens directly.
+        self.audit_macro_tokens(mac.tokens.clone());
+        visit::visit_macro(self, mac);
+    }
+
+    fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+        self.audit_literal(&literal.value(), literal.span().start().line);
+    }
+}
+
+impl DomainTableReferenceAudit<'_> {
+    fn audit_macro_tokens(&mut self, tokens: proc_macro2::TokenStream) {
+        for tree in tokens {
+            match tree {
+                proc_macro2::TokenTree::Group(group) => self.audit_macro_tokens(group.stream()),
+                proc_macro2::TokenTree::Literal(literal) => {
+                    if let Ok(string) = syn::parse_str::<syn::LitStr>(&literal.to_string()) {
+                        self.audit_literal(&string.value(), literal.span().start().line);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn audit_literal(&mut self, value: &str, line: usize) {
+        if self.gates.iter().any(|gate| gate == "test") {
+            return;
+        }
+        for token in
+            value.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        {
+            if let Some(profile) = self.domain_tables.get(token)
+                && !self.gates.iter().any(|gate| gate == profile)
+            {
+                self.violations.push(format!(
+                    "{}:{line} names {profile}-domain table {token} outside #[cfg(feature = \"{profile}\")]",
+                    self.file,
+                ));
+            }
+        }
+    }
+}
+
+/// Every build creates every table, so the `remote`/`extended` features must
+/// keep gating the CODE that reads and writes the domain tables. Production
+/// cockpit-db code may name a domain table only under the matching feature
+/// gate (on its module declaration, item, or statement).
+#[test]
+fn domain_tables_are_touched_only_by_feature_gated_db_code() {
+    let domain_tables = ownership()
+        .into_iter()
+        .filter(|(_, owner)| owner.launch_profile != "local")
+        .map(|(name, owner)| (name, owner.launch_profile))
+        .collect::<BTreeMap<_, _>>();
+    assert!(!domain_tables.is_empty());
+    // Feature-independent by design: retention pruning of the append-only
+    // domain audit ledgers runs in every build (the tables are simply empty
+    // where the feature is off), so it cannot silently skip evidence.
+    const FEATURE_INDEPENDENT: &[&str] = &["ledger_retention.rs"];
+
+    let db_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("db");
+    let root = syn::parse_file(&std::fs::read_to_string(db_dir.join("mod.rs")).unwrap())
+        .expect("db/mod.rs parses");
+    let module_gates = root
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(module) if module.content.is_none() => {
+                Some((format!("{}.rs", module.ident), cfg_features(&module.attrs)))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut violations = Vec::new();
+    let mut audited = 0usize;
+    for entry in std::fs::read_dir(&db_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !file.ends_with(".rs") || FEATURE_INDEPENDENT.contains(&file) {
+            continue;
+        }
+        let gates = if file == "mod.rs" {
+            Vec::new()
+        } else {
+            let Some(gates) = module_gates.get(file) else {
+                continue;
+            };
+            gates.clone()
+        };
+        let source = std::fs::read_to_string(&path).unwrap();
+        let parsed =
+            syn::parse_file(&source).unwrap_or_else(|error| panic!("{file} must parse: {error}"));
+        let mut audit = DomainTableReferenceAudit {
+            domain_tables: &domain_tables,
+            gates,
+            violations: Vec::new(),
+            file: file.to_owned(),
+        };
+        audit.visit_file(&parsed);
+        violations.extend(audit.violations);
+        audited += 1;
+    }
+    assert!(audited > 1, "no cockpit-db modules were audited");
+    assert!(
+        violations.is_empty(),
+        "domain tables named by ungated cockpit-db code:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]
@@ -2592,8 +2822,19 @@ fn extended_local_and_remote_feature_gates_remain_independent() {
         );
     }
 
+    // Features gate code only: the migration runner applies one
+    // unconditional schema file in every build.
     let migration_runner = include_str!("../src/db/mod.rs");
-    assert!(migration_runner.contains("#[cfg(feature = \"extended\")]\n    deferred_sql:"));
-    assert!(migration_runner.contains("#[cfg(feature = \"remote\")]\n    extension_sql:"));
-    assert!(migration_runner.contains("remote-extended-v0.1"));
+    assert!(migration_runner.contains("sql: include_str!(\"migrations/0001_initial.sql\"),"));
+    for profile_machinery in [
+        "deferred_sql",
+        "extension_sql",
+        "SCHEMA_PROFILE",
+        "schema_profile",
+    ] {
+        assert!(
+            !migration_runner.contains(profile_machinery),
+            "migration runner reintroduced per-feature schema machinery: {profile_machinery}"
+        );
+    }
 }

@@ -428,7 +428,11 @@ fn generated_local_profile_inventory_is_bound_to_sources() {
             .unwrap_or_else(|| panic!("missing {tag}"));
         assert!(protocol[offset.saturating_sub(180)..offset].contains("feature = \"remote\""));
     }
+    // The SQLite schema is one unconditional migration in every build: the
+    // `remote` feature gates code, never DDL.
+    assert!(inventory.get("remoteSchemaExtension").is_none());
     let db = source("crates/cockpit-db/src/db/mod.rs");
-    assert!(db.contains("extension_sql: \"\""));
-    assert!(db.contains(inventory["remoteSchemaExtension"].as_str().unwrap()));
+    assert!(db.contains("sql: include_str!(\"migrations/0001_initial.sql\"),"));
+    assert!(!db.contains("extension_sql"));
+    assert!(!db.contains("0001_remote_profile.sql"));
 }

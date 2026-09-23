@@ -3586,8 +3586,9 @@ mod tests {
         }
 
         // The external-journal schema lives entirely in `0001_initial.sql`.
-        // Pre-release: fold schema changes into that file. Do not append
-        // `0002_*`. The expected schema version is one.
+        // Pre-launch: fold schema changes into that file. Do not append
+        // `0002_*` until the #305 launch freeze. The expected schema version
+        // is one.
         assert_eq!(crate::db::EXPECTED_SCHEMA_VERSION, 1);
 
         let db = Db::open_in_memory().unwrap();

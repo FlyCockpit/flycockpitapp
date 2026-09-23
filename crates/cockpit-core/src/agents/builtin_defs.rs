@@ -496,7 +496,7 @@ fn build_def() -> AgentDef {
         None,
     );
     // Image generation is an explicit privileged capability of the primary
-    // coding surface, and only exists in the extended schema profile. Do not
+    // coding surface, and only exists in `extended` feature builds. Do not
     // leave it to the generic fallback tiering rule: ejected definitions and
     // materialization must carry the grant directly when the profile is on.
     #[cfg(feature = "extended")]

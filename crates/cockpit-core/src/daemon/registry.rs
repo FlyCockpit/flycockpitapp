@@ -7184,10 +7184,7 @@ mod tests {
             .await
             .unwrap();
         let successor_id = successor.session_id;
-        let successor_short = successor
-            .short_id
-            .clone()
-            .unwrap_or_else(|| successor_id.to_string());
+        let successor_short = successor.short_id.clone();
 
         let (handle, _rx) = test_handle_with_rx(&reg, session.clone());
         let generation = reg.insert_test_worker(handle.clone(), tokio::spawn(async {}));

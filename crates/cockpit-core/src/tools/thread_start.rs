@@ -65,9 +65,7 @@ impl Tool for ThreadStartTool {
             false,
             true,
         )?;
-        let short_id = thread
-            .short_id
-            .unwrap_or_else(|| thread.session_id.to_string());
+        let short_id = thread.short_id;
         Ok(ToolOutput::text(format!(
             "Started fresh thread {short_id} from message {seq}. Its transcript is empty; the parent/message anchor is retained for navigation and history search."
         )))

@@ -198,9 +198,6 @@ pub(crate) fn advance_writer_generation(conn: &Connection, generation: u64) -> R
 
 /// The durable fence, or 0 before any supervised writer has advanced it.
 pub(crate) fn durable_writer_generation(conn: &Connection) -> Result<u64> {
-    if !super::table_exists(conn, "worker_generation_fence")? {
-        return Ok(0);
-    }
     let current: Option<i64> = conn
         .query_row(
             "SELECT generation FROM worker_generation_fence WHERE singleton=1",

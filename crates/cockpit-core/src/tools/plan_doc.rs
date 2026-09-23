@@ -69,7 +69,7 @@ impl Tool for StartBuildTool {
             && let Some(existing) =
                 find_existing_build_handoff(&ctx.session.db, ctx.session.live_id()).await?
         {
-            let build_ref = existing.short_id.as_deref().unwrap_or("unknown");
+            let build_ref = existing.short_id.as_str();
             return Ok(ToolOutput::text(format!(
                 "Build session `{build_ref}` was already started from this plan; no new session was created"
             )));
@@ -86,7 +86,7 @@ impl Tool for StartBuildTool {
         insert_user_message(&ctx.session.db, row.session_id, &doc.content)
             .await
             .context("recording Build kickoff message")?;
-        let build_ref = row.short_id.as_deref().unwrap_or("unknown");
+        let build_ref = row.short_id.as_str();
         let plan_ref = ctx.session.short_id();
         insert_note(
             &ctx.session.db,
@@ -511,9 +511,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .short_id
-                .as_deref(),
-            Some(build_ref.as_str())
+                .short_id,
+            build_ref
         );
 
         rewrite_handoff_note_text(&db, ctx.session.id, "arbitrary prose").await;

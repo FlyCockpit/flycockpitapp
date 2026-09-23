@@ -3231,19 +3231,13 @@ mod trusted_journaling_tests {
         .unwrap();
         let window1 = session.id;
         let window2 = db.create_compaction_successor(window1).await.unwrap();
-        let window2_short = window2
-            .short_id
-            .clone()
-            .unwrap_or_else(|| window2.session_id.to_string());
+        let window2_short = window2.short_id.clone();
         session.adopt_compaction_successor(window2.session_id, window2_short.clone());
         let window3 = db
             .create_compaction_successor(window2.session_id)
             .await
             .unwrap();
-        let window3_short = window3
-            .short_id
-            .clone()
-            .unwrap_or_else(|| window3.session_id.to_string());
+        let window3_short = window3.short_id.clone();
         session
             .record_session_compacted_with_source(
                 "Build",

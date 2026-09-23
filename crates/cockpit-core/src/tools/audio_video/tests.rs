@@ -1747,7 +1747,7 @@ async fn durable_authorized_ctx() -> (
     let db = cockpit_db::Db::open_in_memory().unwrap();
     db.transaction(move |conn| {
         conn.execute(
-            "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",
+            "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms,short_id) VALUES(?1,'p','/redacted',1,1,lower(hex(randomblob(3))))",
             [session_id.to_string()],
         )?;
         Ok(())

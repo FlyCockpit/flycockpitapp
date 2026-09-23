@@ -3986,7 +3986,6 @@ impl DaemonContext {
         let (mutation, prior_sync) = self
             .db
             .transaction(move |conn| {
-                cockpit_db::secret_vault::ensure_inventory_generation_conn(conn)?;
                 let mut stmt =
                     conn.prepare("SELECT org_id, enabled FROM sync_state WHERE server_url = ?1")?;
                 let prior_sync = stmt

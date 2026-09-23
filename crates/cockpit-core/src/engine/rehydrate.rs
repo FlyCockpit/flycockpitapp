@@ -8262,7 +8262,7 @@ mod tests {
                     predecessor_session_id: predecessor.id,
                     predecessor_short_id: &predecessor.short_id(),
                     successor_session_id: successor_row.session_id,
-                    successor_short_id: successor_row.short_id.as_deref().unwrap_or("succ01"),
+                    successor_short_id: &successor_row.short_id,
                     seed_tool_count: 0,
                     brief_text: "brief",
                     handoff_text: "exact handoff",

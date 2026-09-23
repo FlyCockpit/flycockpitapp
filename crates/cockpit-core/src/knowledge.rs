@@ -7787,8 +7787,7 @@ fn render_fresh_session_retrieval(
     } else {
         out.push_str("Undreamed-session citations:\n");
         for hit in &freshness.hits {
-            let fallback_reference = hit.session_id.to_string();
-            let reference = hit.short_id.as_deref().unwrap_or(&fallback_reference);
+            let reference = hit.short_id.as_str();
             out.push_str("- session ");
             out.push_str(reference);
             out.push_str(" — ");
@@ -8605,7 +8604,7 @@ mod tests {
             hits: vec![crate::db::session_search::SearchHit {
                 session_id,
                 project_id: "project".to_string(),
-                short_id: Some("ab12cd".to_string()),
+                short_id: "ab12cd".to_string(),
                 title: Some("Recent deploy discussion".to_string()),
                 last_active_at_unix_ms: 101,
                 snippet: "The rollout is waiting for approval.".to_string(),

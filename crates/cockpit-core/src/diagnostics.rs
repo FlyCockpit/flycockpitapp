@@ -755,15 +755,14 @@ fn is_absent_database(message: &str) -> bool {
 #[allow(dead_code)]
 fn is_schema_rejection(message: &str) -> bool {
     [
-        crate::db::SCHEMA_PROFILE_MISMATCH_CODE,
-        "incompatible prerelease database schema",
-        "incompatible legacy prerelease database schema",
+        "incompatible database schema",
+        "unledgered database contains application schema objects",
         "database migration ledger is corrupt",
-        "database schema version mismatch",
+        "database migration ledger is empty",
         "database schema version is inconsistent",
-        "database migration ledger is newer than this binary",
         "migration checksum mismatch",
         "database schema fingerprint mismatch",
+        "database schema does not match the exact DDL",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -2728,10 +2727,11 @@ mod tests {
     #[test]
     fn database_schema_rejection_classifier_covers_every_boot_rejection_family() {
         for message in [
-            "FCDB_SCHEMA_PROFILE_MISMATCH: wrong profile",
-            "incompatible prerelease database schema v2",
-            "incompatible legacy prerelease database schema v1",
+            "incompatible database schema v2; this binary supports v1",
+            "unledgered database contains application schema objects; refusing to bootstrap",
             "database migration ledger is corrupt: gap",
+            "database migration ledger is empty",
+            "database schema does not match the exact DDL compiled into this binary",
             "database schema version is inconsistent: user_version drift",
             "migration checksum mismatch for 0001_initial.sql",
             "database schema fingerprint mismatch at migration 1",

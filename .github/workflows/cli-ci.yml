@@ -334,7 +334,8 @@ jobs:
   # workspace `default` is empty, so `required-features = ["remote"]` /
   # `["extended"]` integration tests and `#[cfg(feature)]` lib tests never run
   # there unless the command names them. Keep the local-v0.1 gate local-only
-  # (no `remote`). This job is the blocking execution of every package that
+  # (no `remote`). Features gate code only: every build applies the same
+  # single migration, so these cells differ in code paths, not schema. This job is the blocking execution of every package that
   # has remote/extended-gated tests. Package-specific `--features pkg/feat`
   # is required because not every selected crate declares both features.
   # Live-infra jobs (PKCS#11, coturn) stay workflow_dispatch opt-ins below;
@@ -393,7 +394,8 @@ jobs:
           --features
           cockpit-proto/remote,cockpit-core/remote,cockpit-db/remote,cockpit-tui/remote,cockpit-cli/remote,cockpit-client/remote
 
-      # The supported extended-local schema profile compiles without remote.
+      # The extended feature (code only; the SQLite schema is one unconditional
+      # 0001_initial.sql in every build) compiles without remote.
       - name: Build extended-only profile matrix
         run: >
           cargo build --locked

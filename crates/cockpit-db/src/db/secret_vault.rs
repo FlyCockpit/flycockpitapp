@@ -223,51 +223,6 @@ pub struct SecretVaultSagaRow {
     pub updated_at: i64,
 }
 
-/// Verify the durable owner-inventory schema installed by the database
-/// migration. Schema changes are migration-owned; vault operations must never
-/// repair a live database with ad-hoc DDL while another process may be using
-/// it.
-pub fn ensure_inventory_generation_conn(conn: &rusqlite::Connection) -> Result<()> {
-    for table in [
-        "secret_vault_items",
-        "secret_vault_item_revisions",
-        "secret_vault_inventory_state",
-    ] {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            [table],
-            |row| row.get::<_, i64>(0).map(|value| value != 0),
-        )?;
-        if !exists {
-            bail!("secret vault schema is missing migrated table `{table}`");
-        }
-    }
-    let has_revision = conn
-        .prepare("PRAGMA table_info(secret_vault_items)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .any(|name| name == "revision");
-    if !has_revision {
-        bail!("secret vault schema is missing migrated column `revision`");
-    }
-    for trigger in [
-        "secret_vault_inventory_insert_generation",
-        "secret_vault_inventory_update_generation",
-        "secret_vault_inventory_delete_generation",
-    ] {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1)",
-            [trigger],
-            |row| row.get::<_, i64>(0).map(|value| value != 0),
-        )?;
-        if !exists {
-            bail!("secret vault schema is missing migrated trigger `{trigger}`");
-        }
-    }
-    Ok(())
-}
-
 pub fn inventory_generation_conn(conn: &rusqlite::Connection) -> Result<u64> {
     let generation: i64 = conn.query_row(
         "SELECT generation FROM secret_vault_inventory_state WHERE id = 1",
@@ -1056,7 +1011,6 @@ mod tests {
         // trigger is otherwise live.
         let db = Db::open_in_memory().unwrap();
         db.blocking_write_for_sync_maintenance(|conn| {
-            ensure_inventory_generation_conn(conn)?;
             insert_key_conn(conn, 1, 1, &[3u8; 12], &[4u8; 48], true)?;
             let before = inventory_generation_conn(conn)?;
             upsert_item_conn(conn, SecretVaultKind::Command, "cmd", 1, &[8; 12], &[1; 16])?;
@@ -1101,7 +1055,6 @@ mod tests {
     fn inventory_generation_is_durable_and_tracks_direct_writes() {
         let db = Db::open_in_memory().unwrap();
         db.blocking_write_for_sync_maintenance(|conn| {
-            ensure_inventory_generation_conn(conn)?;
             let before = inventory_generation_conn(conn)?;
             let nonce = [7u8; 12];
             let wrapped = [9u8; 48];
@@ -1135,7 +1088,6 @@ mod tests {
         let path = temp.path().join("vault.db");
         let db = Db::open(&path).unwrap();
         db.blocking_write_for_sync_maintenance(|conn| {
-            ensure_inventory_generation_conn(conn)?;
             insert_key_conn(conn, 1, 1, &[9; 12], &[8; 48], true)?;
             upsert_item_conn(
                 conn,
@@ -1188,8 +1140,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("vault.db");
         let db = Db::open(&path).unwrap();
-        db.blocking_write_for_sync_maintenance(ensure_inventory_generation_conn)
-            .unwrap();
         drop(db);
 
         let left = rusqlite::Connection::open(&path).unwrap();
@@ -1299,10 +1249,6 @@ mod tests {
                     !sql.contains("secret_vault_"),
                     "{name} must not define vault objects"
                 );
-                assert!(
-                    !name.contains("0004") && !name.contains("0005"),
-                    "folded vault migrations must not remain on disk: {name}"
-                );
             }
         }
         assert!(saw_initial, "0001_initial.sql must exist");
@@ -1313,8 +1259,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.blocking_write_for_sync_maintenance(|conn| {
             conn.execute(
-                "INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms)
-                 VALUES ('00000000-0000-4000-8000-000000000001', 'p', '/p', 1, 1)",
+                "INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, short_id)
+                 VALUES ('00000000-0000-4000-8000-000000000001', 'p', '/p', 1, 1, lower(hex(randomblob(3))))",
                 [],
             )?;
             conn.execute(

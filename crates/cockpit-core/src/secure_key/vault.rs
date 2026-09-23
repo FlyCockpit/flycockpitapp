@@ -8,10 +8,10 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use cockpit_db::secret_vault::{
     SecretVaultItemRow, SecretVaultKind, SecretVaultPlacement, VAULT_ALGORITHM, VAULT_NONCE_LEN,
     VAULT_TAG_LEN, VAULT_WRAP_VERSION, VAULT_WRAPPED_DEK_LEN, count_active_keys_conn,
-    deactivate_key_conn, delete_item_conn, ensure_inventory_generation_conn, insert_key_conn,
-    insert_passphrase_kdf_conn, is_unique_constraint, list_inventory_page_conn, list_item_ids_conn,
-    load_active_key_conn, load_authority_conn, load_item_conn,
-    upsert_authority_with_file_kek_mode_conn, upsert_item_conn,
+    deactivate_key_conn, delete_item_conn, insert_key_conn, insert_passphrase_kdf_conn,
+    is_unique_constraint, list_inventory_page_conn, list_item_ids_conn, load_active_key_conn,
+    load_authority_conn, load_item_conn, upsert_authority_with_file_kek_mode_conn,
+    upsert_item_conn,
 };
 use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand::Rng;
@@ -139,7 +139,6 @@ impl SecretVault {
         let mutation = self
             .db
             .blocking_write_for_sync_maintenance(move |conn| {
-                ensure_inventory_generation_conn(conn).map_err(map_db_err)?;
                 conn.execute_batch("BEGIN IMMEDIATE;")
                     .map_err(|error| SecureKeyError::Internal(error.to_string()))?;
                 let result = (|| -> Result<SecretVaultMutation, SecureKeyError> {
@@ -296,7 +295,6 @@ impl SecretVault {
                 move |conn| {
                     conn.execute_batch("BEGIN IMMEDIATE;")?;
                     let result = (|| {
-                        ensure_inventory_generation_conn(conn)?;
                         if count_active_keys_conn(conn)? != 0 {
                             anyhow::bail!("vault already has an active DEK");
                         }
@@ -486,7 +484,6 @@ impl SecretVault {
         let vault = self.clone();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
-                ensure_inventory_generation_conn(conn).map_err(map_db_err)?;
                 conn.execute_batch("BEGIN IMMEDIATE;")
                     .map_err(|error| SecureKeyError::Internal(error.to_string()))?;
                 let result = vault.mutate_item_on_conn(conn, kind, &item_id, plaintext.as_deref());
@@ -812,7 +809,6 @@ impl SecretVault {
         let after = after.map(|(kind, item_id)| (kind.to_string(), item_id.to_string()));
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
-                ensure_inventory_generation_conn(conn)?;
                 list_inventory_page_conn(
                     conn,
                     after
@@ -898,7 +894,6 @@ impl SecretVault {
     ) -> Result<Self, SecureKeyError> {
         let snapshot = db
             .blocking_write_for_sync_maintenance(|conn| {
-                ensure_inventory_generation_conn(conn)?;
                 let active = count_active_keys_conn(conn)?;
                 if active != 1 {
                     return Ok(Err(SecureKeyError::Corrupt(format!(

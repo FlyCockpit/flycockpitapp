@@ -606,10 +606,7 @@ mod tests {
         .unwrap();
         let spawn_id = session.id;
         let successor = db.create_compaction_successor(spawn_id).await.unwrap();
-        let successor_short = successor
-            .short_id
-            .clone()
-            .unwrap_or_else(|| successor.session_id.to_string());
+        let successor_short = successor.short_id.clone();
         let live_id = successor.session_id;
         session.adopt_compaction_successor(live_id, successor_short);
 

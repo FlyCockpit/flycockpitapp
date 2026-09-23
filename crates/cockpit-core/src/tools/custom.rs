@@ -379,6 +379,26 @@ impl Tool for CustomBashTool {
         // no-op passthrough.)
         let stdout = boundary_safe_join(&ctx.redact, stdout_task.join().await);
         let stderr = boundary_safe_join(&ctx.redact, stderr_task.join().await);
+        // Narrow novel-secret backstop (secrets I2): replace secret-shaped
+        // values the session table has never seen and register them, before
+        // the output is assembled for the model.
+        let redact_config = ctx.config.extended().redact;
+        let stdout = crate::tools::output_backstop::scrub_command_output(
+            &ctx.interrupts,
+            &ctx.session,
+            &ctx.redact,
+            &redact_config,
+            &stdout,
+        )
+        .await?;
+        let stderr = crate::tools::output_backstop::scrub_command_output(
+            &ctx.interrupts,
+            &ctx.session,
+            &ctx.redact,
+            &redact_config,
+            &stderr,
+        )
+        .await?;
 
         let mut combined = String::new();
         combined.push_str(&stdout);

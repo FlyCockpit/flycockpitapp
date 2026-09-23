@@ -163,6 +163,15 @@ where
     }
 }
 
+/// `true` inside a host-conferred acquisition profile. Every successful bash
+/// result there is quarantined at production ([`quarantine_bash_result`]) and
+/// never reaches a model, and its raw text IS the value being captured, so
+/// the narrow output backstop ([`crate::tools::output_backstop`]) must leave it
+/// intact rather than seal a placeholder.
+pub(crate) fn acquisition_quarantines_shell_output() -> bool {
+    CURRENT_ACQUISITION_RUNTIME.try_with(|_| ()).is_ok()
+}
+
 /// Production-time quarantine. This runs immediately after successful bash
 /// dispatch and before hooks, audit rows, artifacts, timeline events, or model
 /// history can observe the result. Only the task-local coordinator can later

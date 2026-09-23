@@ -152,6 +152,26 @@ impl Driver {
                     self.fire_swarm_subagent_stop_if_tracked(&job_id, failed)
                         .await;
                 }
+                // Narrow novel-secret backstop (secrets I2) for background
+                // shell output: replace and register secret-shaped values the
+                // session table has never seen before the result is injected.
+                // Fail-closed: a registration failure withholds the output.
+                let result = if matches!(kind, ScheduleKind::Background) {
+                    match self.scrub_background_output(&result).await {
+                        Ok(scrubbed) => scrubbed,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "registering secrets found in background output failed"
+                            );
+                            format!(
+                                "background `{label}` finished; its output was withheld because registering a secret found in it failed"
+                            )
+                        }
+                    }
+                } else {
+                    result
+                };
                 if self
                     .handle_goal_supervision_completion(&job_id, &result, failed, input_rx, tx)
                     .await?
@@ -213,6 +233,25 @@ impl Driver {
             }
         }
         Ok(())
+    }
+
+    /// Apply the narrow novel-secret backstop
+    /// ([`crate::tools::output_backstop`]) to model-bound background-job
+    /// output (tail and completion), registering what it replaces in the
+    /// session redaction table.
+    pub(in crate::engine::driver) async fn scrub_background_output(
+        &self,
+        text: &str,
+    ) -> Result<String> {
+        let redact_config = self.config.extended().redact;
+        crate::tools::output_backstop::scrub_command_output(
+            &self.interrupts,
+            &self.session,
+            &self.redact,
+            &redact_config,
+            text,
+        )
+        .await
     }
 
     /// Dispatch a `schedule` meta-tool action against the authority and return
@@ -389,7 +428,10 @@ impl Driver {
             ScheduleAction::BackgroundTail => {
                 let parsed = crate::engine::schedule::parse_background_tail(action_args)?;
                 match self.schedule.background_handle(&parsed.job_id) {
-                    Some(handle) => Ok(handle.tail(parsed.lines, &self.redact).await),
+                    Some(handle) => {
+                        let tail = handle.tail(parsed.lines, &self.redact).await;
+                        self.scrub_background_output(&tail).await
+                    }
                     None => Ok(format!("no live background `{}`", parsed.job_id)),
                 }
             }

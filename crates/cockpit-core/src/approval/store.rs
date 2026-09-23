@@ -3360,34 +3360,32 @@ fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Re
                 discard_consumed_tmp(lock, &tmp, &staged.file);
             }
         }
-        Ok(false) => {
-            match published {
-                PublishKind::Exchanged { tmp } => {
-                    rollback_exchanged_publish(lock, &dest, &tmp).context(
-                        "restoring the previous approvals store after a substituted publish",
-                    )?;
-                    anyhow::bail!(
-                        "the approvals store write would have installed an entry that is \
+        Ok(false) => match published {
+            PublishKind::Exchanged { tmp } => {
+                rollback_exchanged_publish(lock, &dest, &tmp).context(
+                    "restoring the previous approvals store after a substituted publish",
+                )?;
+                anyhow::bail!(
+                    "the approvals store write would have installed an entry that is \
                          not the staged object this process wrote and synced; the previous \
                          store was restored"
-                    );
-                }
-                PublishKind::RenamedDirect { tmp } => {
-                    rollback_renamed_publish(lock, &dest, &tmp)
-                        .context("withdrawing a substituted first approvals store publish")?;
-                    anyhow::bail!(
-                        "the approvals store write would have installed an entry that is \
+                );
+            }
+            PublishKind::RenamedDirect { tmp } => {
+                rollback_renamed_publish(lock, &dest, &tmp)
+                    .context("withdrawing a substituted first approvals store publish")?;
+                anyhow::bail!(
+                    "the approvals store write would have installed an entry that is \
                          not the staged object this process wrote and synced; it was \
                          withdrawn and the store remains absent"
-                    );
-                }
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                PublishKind::LinkedDirect => anyhow::bail!(
-                    "the approvals store write did not install the staged object this \
-                     process wrote and synced; the live path was left as found"
-                ),
+                );
             }
-        }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            PublishKind::LinkedDirect => anyhow::bail!(
+                "the approvals store write did not install the staged object this \
+                     process wrote and synced; the live path was left as found"
+            ),
+        },
         Err(error) => {
             return Err(anyhow::Error::from(error))
                 .with_context(|| format!("verifying the published store in {}", dir.display()));

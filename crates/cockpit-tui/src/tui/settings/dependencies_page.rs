@@ -49,7 +49,11 @@ fn first_paint_state(
     current: Option<&cockpit_core::external_runtime::ExternalRuntimeSnapshot>,
     descriptors: &[cockpit_core::external_runtime::ExternalRuntimeDescriptor],
 ) -> cockpit_core::external_runtime::DependenciesPageState {
-    match crate::tui::golden::pinned_host_platform() {
+    #[cfg(any(test, feature = "test-support"))]
+    let pinned = crate::tui::golden::pinned_host_platform();
+    #[cfg(not(any(test, feature = "test-support")))]
+    let pinned = None;
+    match pinned {
         Some(platform) => {
             cockpit_core::external_runtime::DependenciesPageState::first_paint_for_platform(
                 current,

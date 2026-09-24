@@ -3612,6 +3612,50 @@ fn installation_handover_timer_overrides_load_from_the_supervisor_layer() {
 }
 
 #[test]
+fn installation_extended_config_reads_only_the_global_layer() {
+    let tmp = TempDir::new().unwrap();
+    let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+    std::fs::write(
+        config_dir.join(crate::config::dirs::CONFIG_FILE),
+        r#"{"redact":{"denylist":["global-deny"],"extra_dotenv_paths":["/abs/global.env"]}}"#,
+    )
+    .unwrap();
+    // A project layer under the process cwd and an explicit override are both
+    // workspace/invocation scoped: neither may reach daemon-global policy.
+    let project = tmp.path().join("launch");
+    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+    std::fs::write(
+        project
+            .join(".cockpit")
+            .join(crate::config::dirs::CONFIG_FILE),
+        r#"{"redact":{"denylist":["project-deny"]}}"#,
+    )
+    .unwrap();
+    let explicit = tmp.path().join("explicit.json");
+    std::fs::write(&explicit, r#"{"redact":{"denylist":["explicit-deny"]}}"#).unwrap();
+    env.set_current_dir(&project).unwrap();
+    env.set_cockpit_config(&explicit);
+
+    let redact = load_installation_extended_config().unwrap().redact;
+    assert_eq!(redact.denylist, vec!["global-deny".to_string()]);
+    assert_eq!(
+        redact.extra_dotenv_paths,
+        vec![PathBuf::from("/abs/global.env")]
+    );
+}
+
+#[test]
+fn installation_extended_config_defaults_without_a_global_layer() {
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let redact = load_installation_extended_config().unwrap().redact;
+    assert!(redact.denylist.is_empty());
+    assert!(redact.extra_dotenv_paths.is_empty());
+    assert_eq!(redact.dotenv_patterns, default_dotenv_patterns());
+}
+
+#[test]
 fn extended_config_ignores_secret_store_key() {
     let isolated = TempDir::new().unwrap();
     let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());

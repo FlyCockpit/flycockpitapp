@@ -23,6 +23,7 @@ use crate::config::trust::WorkspaceTrustPolicy;
 
 type LoadFn = dyn Fn(&Path) -> Result<(ProvidersConfig, ExtendedConfig)> + Send + Sync;
 type BootLoadFn = dyn Fn() -> Result<crate::config::extended::DaemonBootConfig> + Send + Sync;
+type GlobalLoadFn = dyn Fn() -> Result<ExtendedConfig> + Send + Sync;
 type DaemonLoadFn = dyn Fn(&Path) -> Result<DaemonConfigLoad> + Send + Sync;
 type WorkspaceDaemonLoadFn = dyn Fn(
         &Path,
@@ -93,6 +94,10 @@ impl ConfigWatchPaths {
 pub struct ConfigSource {
     load: Arc<LoadFn>,
     boot_load: Arc<BootLoadFn>,
+    /// Daemon-global policy (global redaction coverage, retention): the
+    /// canonical global layer only, never resolved against a project root or
+    /// the daemon's inherited working directory.
+    global_load: Arc<GlobalLoadFn>,
     daemon_load: Arc<DaemonLoadFn>,
     workspace_daemon_load: Arc<WorkspaceDaemonLoadFn>,
     write_target: Arc<WriteTargetFn>,
@@ -142,6 +147,10 @@ impl ConfigSource {
                 let load = load.clone();
                 move || Ok(load(Path::new("/"))?.1.daemon.boot)
             }),
+            global_load: Arc::new({
+                let load = load.clone();
+                move || Ok(load(Path::new("/"))?.1)
+            }),
             daemon_load: Arc::new(move |cwd| {
                 let (providers, extended) = daemon_source(cwd)?;
                 Ok(DaemonConfigLoad {
@@ -186,6 +195,10 @@ impl ConfigSource {
             boot_load: Arc::new({
                 let daemon_load = daemon_load.clone();
                 move || Ok(daemon_load(Path::new("/"))?.extended.daemon.boot)
+            }),
+            global_load: Arc::new({
+                let daemon_load = daemon_load.clone();
+                move || Ok(daemon_load(Path::new("/"))?.extended)
             }),
             daemon_load,
             workspace_daemon_load: Arc::new(move |cwd, _workspace| {
@@ -270,6 +283,7 @@ impl ConfigSource {
         Self {
             load,
             boot_load: Arc::new(crate::config::extended::load_installation_daemon_boot),
+            global_load: Arc::new(crate::config::extended::load_installation_extended_config),
             daemon_load,
             workspace_daemon_load,
             write_target: Arc::new(|cwd, provider_id| {
@@ -343,6 +357,14 @@ impl ConfigSource {
 
     pub fn load_boot(&self) -> Result<crate::config::extended::DaemonBootConfig> {
         (self.boot_load)()
+    }
+
+    /// Load daemon-global policy from the global config layer alone. Callers
+    /// that build daemon-wide state (global redaction coverage, retention)
+    /// use this rather than [`Self::load`] so no project root, and in
+    /// particular not the daemon's inherited working directory, participates.
+    pub fn load_global(&self) -> Result<ExtendedConfig> {
+        (self.global_load)()
     }
 
     /// Load the effective configs for `cwd` under a resolved workspace-trust

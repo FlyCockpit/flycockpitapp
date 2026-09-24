@@ -2167,6 +2167,23 @@ pub fn load_installation_handover_timers() -> Result<HandoverTimersConfig> {
     })
 }
 
+/// Load the effective extended config of the canonical user-owned global layer
+/// alone, for daemon-global policy (daemon-wide redaction coverage, retention).
+///
+/// No project root participates: project `.cockpit/` layers, machine-local
+/// per-directory layers, and the `COCKPIT_CONFIG` explicit override are all
+/// workspace/invocation scoped and therefore outside daemon-global authority.
+/// The layer is resolved through the same merge path as every layered load
+/// (list unions, fail-closed sections, malformed-layer handling), so a global
+/// setting means the same thing here as in a session's effective config. A
+/// missing global layer is the fresh-install default; an unresolvable global
+/// config directory is an error.
+pub fn load_installation_extended_config() -> Result<ExtendedConfig> {
+    let path = crate::config::dirs::global_config_file()?;
+    let docs = load_existing_docs_from_paths(&[path]);
+    Ok(resolve_loaded_docs(&docs))
+}
+
 /// Read the only installation-wide setting that participates in interactive
 /// daemon acquisition. This deliberately does not resolve a workspace, a
 /// machine-local layer, or any other part of the effective configuration.

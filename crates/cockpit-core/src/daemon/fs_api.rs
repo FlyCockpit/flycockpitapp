@@ -2026,11 +2026,17 @@ fn dotenv_pattern_matches(
         .map_err(internal)?
         .1
         .redact;
-    if cfg
-        .extra_dotenv_paths
-        .iter()
-        .any(|extra| std::fs::canonicalize(extra).ok().as_deref() == Some(path))
-    {
+    // Relative configured paths are workspace-relative: resolve them through
+    // the redaction funnel against `root`, never the daemon's working dir.
+    if cfg.extra_dotenv_paths.iter().any(|extra| {
+        crate::redact::resolve_explicit_dotenv_path(
+            crate::redact::RedactionSourceScope::Workspace(root),
+            extra,
+        )
+        .and_then(|extra| std::fs::canonicalize(extra).ok())
+        .as_deref()
+            == Some(path)
+    }) {
         return Ok(true);
     }
     let matcher = crate::gitignore::build_allowlist_matcher(root, &cfg.dotenv_patterns);

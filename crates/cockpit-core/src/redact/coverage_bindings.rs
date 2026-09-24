@@ -10,7 +10,7 @@ use crate::daemon::principal::ClientPrincipal;
 use crate::env_snapshot::EnvSnapshot;
 
 use super::coverage_authority::{CoverageBinding, RedactionCoverageKey};
-use super::{RedactionTable, matched_dotenv_paths};
+use super::{RedactionSourceScope, RedactionTable, matched_dotenv_sources};
 
 /// Inputs needed to derive a session coverage key and to snapshot capture
 /// boundary revisions at publication time.
@@ -28,6 +28,11 @@ pub(crate) struct SessionCoverageInputs<'a> {
     pub redact_config: &'a RedactConfig,
 }
 
+/// Inputs of daemon-wide coverage. There is deliberately no root: daemon-global
+/// coverage is built from daemon-global sources only (the environment
+/// snapshot, vault/keyring and command secrets, and the global config layer's
+/// redact settings) and never walks a workspace or the daemon's working
+/// directory. Workspace env files are covered per session.
 pub(crate) struct DaemonGlobalCoverageInputs<'a> {
     pub environment: &'a EnvSnapshot,
     pub vault_revision: u64,
@@ -35,8 +40,27 @@ pub(crate) struct DaemonGlobalCoverageInputs<'a> {
     pub policy_digest: &'a str,
     pub sealed: CoverageBinding,
     pub override_revision: u64,
-    pub source_root: &'a Path,
     pub redact_config: &'a RedactConfig,
+}
+
+/// Daemon-global coverage could not resolve one of its owned sources. Callers
+/// fail closed (no table is published) instead of panicking.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DaemonGlobalCoverageError {
+    #[error("coverage_unavailable: loading the global redaction config layer: {0:#}")]
+    GlobalRedactConfig(anyhow::Error),
+}
+
+/// The single read of daemon-global redaction policy: the global config layer
+/// through the injected [`ConfigSource`](crate::daemon::config_source::ConfigSource),
+/// with no project root.
+pub(crate) fn load_daemon_global_redact_config(
+    config_source: &crate::daemon::config_source::ConfigSource,
+) -> Result<RedactConfig, DaemonGlobalCoverageError> {
+    config_source
+        .load_global()
+        .map(|extended| extended.redact)
+        .map_err(DaemonGlobalCoverageError::GlobalRedactConfig)
 }
 
 /// Owned-input revisions recorded at the completed-scan boundary and re-checked
@@ -91,20 +115,23 @@ pub(crate) fn credential_vault_binding(
     CoverageBinding::derive(b"credential-vault", &material)
 }
 
-pub(crate) fn machine_sources_probe_binding(config: &RedactConfig, root: &Path) -> CoverageBinding {
-    machine_sources_binding(config, root, None)
+pub(crate) fn machine_sources_probe_binding(
+    config: &RedactConfig,
+    scope: RedactionSourceScope<'_>,
+) -> CoverageBinding {
+    machine_sources_binding(config, scope, None)
 }
 
 pub(crate) fn machine_sources_binding(
     config: &RedactConfig,
-    root: &Path,
+    scope: RedactionSourceScope<'_>,
     table: Option<&RedactionTable>,
 ) -> CoverageBinding {
     let mut hasher = Sha256::new();
     hasher.update(b"flycockpit-redaction-machine-sources-v1\0");
     if config.scan_dotenv {
         if let Ok(paths) =
-            matched_dotenv_paths(root, &config.dotenv_patterns, &config.extra_dotenv_paths)
+            matched_dotenv_sources(scope, &config.dotenv_patterns, &config.extra_dotenv_paths)
         {
             for path in paths {
                 hasher.update(path.as_os_str().as_encoded_bytes());
@@ -166,7 +193,10 @@ impl SessionCoverageInputs<'_> {
             CoverageBinding::derive(b"policy", self.policy_digest.as_bytes()),
             self.sealed,
             CoverageBinding::derive(b"override", &self.override_revision.to_le_bytes()),
-            machine_sources_probe_binding(self.redact_config, self.workspace_root),
+            machine_sources_probe_binding(
+                self.redact_config,
+                RedactionSourceScope::Workspace(self.workspace_root),
+            ),
         )
     }
 
@@ -185,7 +215,7 @@ impl SessionCoverageInputs<'_> {
             ),
             machine_sources: machine_sources_binding(
                 self.redact_config,
-                self.workspace_root,
+                RedactionSourceScope::Workspace(self.workspace_root),
                 Some(table),
             ),
         }
@@ -234,7 +264,7 @@ impl DaemonGlobalCoverageInputs<'_> {
             CoverageBinding::derive(b"policy", self.policy_digest.as_bytes()),
             self.sealed,
             CoverageBinding::derive(b"override", &self.override_revision.to_le_bytes()),
-            machine_sources_probe_binding(self.redact_config, self.source_root),
+            machine_sources_probe_binding(self.redact_config, RedactionSourceScope::DaemonGlobal),
         )
     }
 
@@ -253,7 +283,7 @@ impl DaemonGlobalCoverageInputs<'_> {
             ),
             machine_sources: machine_sources_binding(
                 self.redact_config,
-                self.source_root,
+                RedactionSourceScope::DaemonGlobal,
                 Some(table),
             ),
         }
@@ -305,7 +335,11 @@ impl SessionCoveragePublishOwners {
                 b"override",
                 &override_revision.to_le_bytes(),
             ),
-            machine_sources: machine_sources_binding(&redact_config, &workspace_root, Some(table)),
+            machine_sources: machine_sources_binding(
+                &redact_config,
+                RedactionSourceScope::Workspace(&workspace_root),
+                Some(table),
+            ),
         })
     }
 
@@ -315,12 +349,14 @@ impl SessionCoveragePublishOwners {
 }
 
 /// Live owner reads consulted independently at daemon-global publication time.
+///
+/// `redact_config` is read once per fence and both the policy digest and the
+/// machine-source binding derive from that one read, so the two cannot come
+/// from different config instants. A failed read fails the fence closed.
 pub(crate) struct DaemonGlobalCoveragePublishLive {
     pub environment: std::sync::Arc<dyn Fn() -> anyhow::Result<EnvSnapshot> + Send + Sync>,
-    pub policy_digest: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
     pub override_revision: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
-    pub redact_config: std::sync::Arc<dyn Fn() -> RedactConfig + Send + Sync>,
-    pub source_root: std::sync::Arc<dyn Fn() -> PathBuf + Send + Sync>,
+    pub redact_config: std::sync::Arc<dyn Fn() -> anyhow::Result<RedactConfig> + Send + Sync>,
     pub sealed: std::sync::Arc<dyn Fn() -> CoverageBinding + Send + Sync>,
 }
 
@@ -341,10 +377,9 @@ impl DaemonGlobalCoveragePublishOwners {
             .current_inventory_generation()
             .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
         let environment = (self.live.environment)()?;
-        let policy_digest = (self.live.policy_digest)();
         let override_revision = (self.live.override_revision)();
-        let redact_config = (self.live.redact_config)();
-        let source_root = (self.live.source_root)();
+        let redact_config = (self.live.redact_config)()?;
+        let policy_digest = redact_config_digest(&redact_config);
         Ok(OwnedSourceRevisions {
             environment: CoverageBinding::derive(b"environment", environment.digest().as_bytes()),
             credential_vault: credential_vault_binding(vault_revision, &self.command_cache),
@@ -354,7 +389,11 @@ impl DaemonGlobalCoveragePublishOwners {
                 b"override",
                 &override_revision.to_le_bytes(),
             ),
-            machine_sources: machine_sources_binding(&redact_config, &source_root, Some(table)),
+            machine_sources: machine_sources_binding(
+                &redact_config,
+                RedactionSourceScope::DaemonGlobal,
+                Some(table),
+            ),
         })
     }
 
@@ -424,38 +463,14 @@ pub(crate) fn daemon_global_publish_owners_for_config(
     command_cache: std::sync::Arc<crate::secret_command::CommandSecretCache>,
     environment: std::sync::Arc<dyn Fn() -> anyhow::Result<EnvSnapshot> + Send + Sync>,
 ) -> DaemonGlobalCoveragePublishOwners {
-    let config_source_for_policy = config_source.clone();
-    let config_source_for_redact = config_source.clone();
     daemon_global_publish_owners(
         vault,
         command_cache,
         DaemonGlobalCoveragePublishLive {
             environment,
-            policy_digest: std::sync::Arc::new(move || {
-                let root = std::env::current_dir()
-                    .and_then(|path| path.canonicalize())
-                    .expect("canonical daemon source root");
-                let (_, extended) = config_source_for_policy
-                    .load(&root)
-                    .expect("loading daemon redact policy");
-                redact_config_digest(&extended.redact)
-            }),
             override_revision: std::sync::Arc::new(|| 0),
             redact_config: std::sync::Arc::new(move || {
-                let root = std::env::current_dir()
-                    .and_then(|path| path.canonicalize())
-                    .expect("canonical daemon source root");
-                config_source_for_redact
-                    .load(&root)
-                    .expect("loading daemon redact config")
-                    .1
-                    .redact
-                    .clone()
-            }),
-            source_root: std::sync::Arc::new(|| {
-                std::env::current_dir()
-                    .and_then(|path| path.canonicalize())
-                    .expect("canonical daemon source root")
+                load_daemon_global_redact_config(&config_source).map_err(anyhow::Error::from)
             }),
             sealed: std::sync::Arc::new(|| CoverageBinding::derive(b"sealed", b"daemon-global")),
         },

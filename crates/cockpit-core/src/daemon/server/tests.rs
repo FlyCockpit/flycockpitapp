@@ -33598,32 +33598,32 @@ async fn attachment_config_failure_leaves_no_pending_or_accounting_state() {
     let saw_trust_policy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let saw_trust_policy_in_load = saw_trust_policy.clone();
     // The daemon redaction table is built fail-closed at context construction
-    // (it loads config for `std::env::current_dir()`); that load must succeed
-    // so the context exists. Only the session/attachment config load (for the
-    // session's project root, never the process cwd) is injected to fail, so
-    // this test still exercises attachment admission's graceful failure.
-    let construction_cwd =
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    // from the global config layer (never a project root or the process cwd);
+    // that load must succeed so the context exists. Only the session /
+    // attachment config load for the session's workspace is injected to fail,
+    // so this test still exercises attachment admission's graceful failure.
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().to_path_buf();
+    let canonical_workspace = workspace.canonicalize().unwrap();
     let source = crate::daemon::config_source::ConfigSource::new(
         move |cwd| {
-            if cwd == construction_cwd {
-                Ok((
-                    crate::config::providers::ProvidersConfig::default(),
-                    crate::config::extended::ExtendedConfig::default(),
-                ))
-            } else {
+            if cwd.starts_with(&workspace) || cwd.starts_with(&canonical_workspace) {
                 saw_trust_policy_in_load.store(
                     crate::config::trust::current_workspace_trust_policy().is_some(),
                     std::sync::atomic::Ordering::SeqCst,
                 );
                 Err(anyhow::anyhow!("injected attachment config failure"))
+            } else {
+                Ok((
+                    crate::config::providers::ProvidersConfig::default(),
+                    crate::config::extended::ExtendedConfig::default(),
+                ))
             }
         },
         |_cwd, _provider_id| None,
         |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
     );
     let ctx = test_ctx_with_config_source(source);
-    let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
 
@@ -43398,6 +43398,189 @@ fn global_coverage_helper_has_no_legacy_builder() {
     assert!(!helper.contains("build_daemon_redaction_table"));
     assert!(!helper.contains("refresh_global_redaction_table"));
     assert!(!helper.contains("RedactionTable::empty"));
+    // Daemon-global coverage has no root: the funnel must never consult the
+    // daemon's inherited working directory.
+    assert!(!helper.contains("current_dir"));
+}
+
+/// Daemon-global coverage is built from daemon-global sources only. Started
+/// with its working directory inside a tree holding env files, the daemon must
+/// neither read those files nor walk that tree, while a session in workspace W
+/// still redacts W's own `.env` through its workspace-scoped coverage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_global_coverage_never_reads_or_walks_the_daemon_cwd() {
+    use crate::redact::coverage_authority::{CoverageBuild, CoverageScope};
+
+    const CWD_CANARY: &str = "daemon-cwd-dotenv-canary-7f3a91c2";
+    const NESTED_CWD_CANARY: &str = "daemon-cwd-nested-canary-0be4d7a9";
+    const RELATIVE_EXTRA_CANARY: &str = "daemon-cwd-relative-extra-canary-51e2";
+    const WORKSPACE_CANARY: &str = "workspace-dotenv-canary-c83b10f4";
+    const GLOBAL_DENYLIST_CANARY: &str = "global-layer-denylist-canary-9d2e";
+
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let launch = tempfile::tempdir().unwrap();
+    std::fs::write(
+        launch.path().join(".env"),
+        format!("CWD_TOKEN={CWD_CANARY}\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(launch.path().join("nested/deeper")).unwrap();
+    std::fs::write(
+        launch.path().join("nested/deeper/.env.local"),
+        format!("NESTED_TOKEN={NESTED_CWD_CANARY}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        launch.path().join("relative.secrets"),
+        format!("RELATIVE_TOKEN={RELATIVE_EXTRA_CANARY}\n"),
+    )
+    .unwrap();
+    // A directory the walker cannot list: dotenv discovery treats a traversal
+    // error as a hard capture failure, so any walk of the launch directory
+    // fails coverage outright instead of silently skipping it.
+    #[cfg(unix)]
+    let _locked = {
+        use std::os::unix::fs::PermissionsExt as _;
+        /// Restores the directory's mode even when an assertion panics, so
+        /// the temp tree stays removable.
+        struct Unlistable(PathBuf);
+        impl Drop for Unlistable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let locked = launch.path().join("unlistable");
+        std::fs::create_dir(&locked).unwrap();
+        let guard = Unlistable(locked.clone());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        guard
+    };
+    env.set_current_dir(launch.path()).unwrap();
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join(".env"),
+        format!("WORKSPACE_TOKEN={WORKSPACE_CANARY}\n"),
+    )
+    .unwrap();
+
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_dotenv = true;
+    extended.redact.scan_ssh_keys = false;
+    extended.redact.dotenv_patterns = crate::config::extended::default_dotenv_patterns();
+    // Relative configured paths are workspace-relative, never cwd-relative.
+    extended.redact.extra_dotenv_paths = vec![PathBuf::from("relative.secrets")];
+    extended.redact.denylist = vec![GLOBAL_DENYLIST_CANARY.to_string()];
+    let redact_config = extended.redact.clone();
+    let source =
+        crate::daemon::config_source::ConfigSource::fixed(stub_providers_config(), extended);
+    let ctx = test_ctx_with_config_source(source.clone());
+
+    let global = acquire_daemon_redaction_table(
+        ctx.registry.coverage_authority().clone(),
+        &source,
+        &ctx.secret_vault,
+        &ctx.registry.command_secret_cache(),
+        CoverageScope::DaemonGlobalRefresh,
+    )
+    .await
+    .expect("daemon-global coverage never walks the unlistable launch directory");
+    let construction = current_redaction(&ctx.global_redaction);
+
+    // The session capture funnel (the registry's SessionStart shape) for a
+    // session in workspace W.
+    let command_cache = ctx.registry.command_secret_cache();
+    let vault_revision = ctx.secret_vault.current_inventory_generation().unwrap();
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&redact_config);
+    let environment = crate::env_snapshot::EnvSnapshot::new(
+        proto::EnvSnapshotSource::SessionWorker,
+        HashMap::new(),
+    );
+    let sealed = crate::redact::coverage_authority::CoverageBinding::derive(b"sealed", b"test");
+    let session_id = Uuid::now_v7();
+    let workspace_root = workspace.path().to_path_buf();
+    let key = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &ClientPrincipal::owner(),
+        owner_authorization_revision: 1,
+        session_id,
+        workspace_root: &workspace_root,
+        environment: &environment,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed,
+        override_revision: 0,
+        redact_config: &redact_config,
+    }
+    .coverage_key();
+    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    let capture_config = redact_config.clone();
+    let session_table = ctx
+        .registry
+        .coverage_authority()
+        .acquire(key, CoverageScope::SessionStart, move || {
+            let principal = ClientPrincipal::owner();
+            let inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                principal: &principal,
+                owner_authorization_revision: 1,
+                session_id,
+                workspace_root: &workspace_root,
+                environment: &environment,
+                vault_revision,
+                command_cache: &command_cache,
+                policy_digest: &policy_digest,
+                sealed,
+                override_revision: 0,
+                redact_config: &capture_config,
+            };
+            CoverageBuild::capture(
+                &capture_config,
+                &workspace_root,
+                environment.vars(),
+                &store,
+                &RedactionTable::empty(),
+                &inputs,
+            )
+        })
+        .await
+        .expect("session coverage for workspace W")
+        .install_table()
+        .expect("installed session table");
+
+    for table in [&global, &construction] {
+        for canary in [
+            CWD_CANARY,
+            NESTED_CWD_CANARY,
+            RELATIVE_EXTRA_CANARY,
+            WORKSPACE_CANARY,
+        ] {
+            assert_eq!(
+                table.scrub(canary),
+                canary,
+                "daemon-global coverage must not contain file-backed values from the daemon cwd or a workspace"
+            );
+        }
+        assert!(
+            !table
+                .scrub(GLOBAL_DENYLIST_CANARY)
+                .contains(GLOBAL_DENYLIST_CANARY),
+            "daemon-global coverage still applies the global layer's redact settings"
+        );
+    }
+    assert!(
+        !session_table
+            .scrub(WORKSPACE_CANARY)
+            .contains(WORKSPACE_CANARY),
+        "a session in workspace W redacts W's .env"
+    );
+    for canary in [CWD_CANARY, NESTED_CWD_CANARY, RELATIVE_EXTRA_CANARY] {
+        assert_eq!(
+            session_table.scrub(canary),
+            canary,
+            "session coverage is scoped to its workspace, not the daemon cwd"
+        );
+    }
+    drop(env);
 }
 
 #[tokio::test]

@@ -42,7 +42,7 @@ fn build_with_session_env(
 }
 
 fn protected_paths(cwd: &Path, env: &HashMap<String, String>) -> Vec<String> {
-    protected::ProtectedPaths::from_session(cwd, env).to_persisted()
+    protected::ProtectedPaths::from_scope(RedactionSourceScope::Workspace(cwd), env).to_persisted()
 }
 
 fn entry_origins(table: &RedactionTable) -> Vec<String> {
@@ -1484,6 +1484,75 @@ fn extra_dotenv_paths_still_honored() {
     cfg.extra_dotenv_paths = vec![extra];
     let t = RedactionTable::build(&cfg, root).unwrap();
     assert_eq!(t.scrub("extra-path-secret-value"), "***REDACT***");
+}
+
+#[test]
+fn daemon_global_scope_discovers_only_absolute_configured_env_files() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join(".env"), "WALKED=walked-dotenv-secret-value\n").unwrap();
+    let absolute = root.join("absolute.secrets");
+    std::fs::write(&absolute, "ABS=absolute-extra-secret-value\n").unwrap();
+    let relative = PathBuf::from("absolute.secrets");
+
+    let paths = matched_dotenv_sources(
+        RedactionSourceScope::DaemonGlobal,
+        &crate::config::extended::default_dotenv_patterns(),
+        &[absolute.clone(), relative.clone()],
+    )
+    .unwrap();
+    assert_eq!(
+        paths,
+        vec![absolute.clone()],
+        "daemon-global scope walks nothing and has no root for relative paths"
+    );
+
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    cfg.extra_dotenv_paths = vec![absolute, relative];
+    let global = RedactionTable::build_scoped(
+        &cfg,
+        RedactionSourceScope::DaemonGlobal,
+        &HashMap::new(),
+        Vec::<(String, String)>::new(),
+    )
+    .unwrap();
+    assert_eq!(global.scrub("absolute-extra-secret-value"), "***REDACT***");
+    assert_eq!(
+        global.scrub("walked-dotenv-secret-value"),
+        "walked-dotenv-secret-value"
+    );
+}
+
+#[test]
+fn relative_extra_dotenv_paths_resolve_against_the_workspace_root() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::create_dir_all(workspace.path().join("secrets")).unwrap();
+    std::fs::write(
+        workspace.path().join("secrets/ci.env"),
+        "CI=workspace-relative-extra-value\n",
+    )
+    .unwrap();
+    let relative = PathBuf::from("secrets/ci.env");
+    assert_eq!(
+        resolve_explicit_dotenv_path(RedactionSourceScope::Workspace(workspace.path()), &relative),
+        Some(workspace.path().join("secrets/ci.env"))
+    );
+    assert_eq!(
+        resolve_explicit_dotenv_path(RedactionSourceScope::DaemonGlobal, &relative),
+        None
+    );
+
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    cfg.dotenv_patterns = Vec::new();
+    cfg.extra_dotenv_paths = vec![relative];
+    let table = RedactionTable::build(&cfg, workspace.path()).unwrap();
+    assert_eq!(
+        table.scrub("workspace-relative-extra-value"),
+        "***REDACT***",
+        "a relative configured path names a file in the session's workspace, not the process cwd"
+    );
 }
 
 #[test]

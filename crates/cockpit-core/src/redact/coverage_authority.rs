@@ -432,15 +432,16 @@ impl CoverageBuild {
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 
+    /// Daemon-global capture. It takes no root: the build is scoped to
+    /// daemon-global sources and never walks a directory.
     pub(crate) fn capture_without_sealed(
         config: &crate::config::extended::RedactConfig,
-        root: &Path,
         environment: &HashMap<String, String>,
         store: &crate::credentials::CredentialStore,
         boundary_inputs: &super::coverage_bindings::DaemonGlobalCoverageInputs<'_>,
     ) -> Result<Self> {
         let table =
-            RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
+            RedactionTable::build_daemon_global_with_credential_store(config, environment, store)?;
         let boundary_revisions = boundary_inputs.boundary_revisions(&table);
         Ok(Self::from_complete_table(table, boundary_revisions))
     }

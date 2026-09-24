@@ -24,6 +24,49 @@ pub(crate) fn dotenv_max_depth(in_git_repo: bool) -> Option<usize> {
     if in_git_repo { None } else { Some(8) }
 }
 
+/// The env-file sources of one build scope: the single discovery funnel for
+/// table builds and coverage bindings.
+///
+/// A [`RedactionSourceScope::Workspace`] walks `patterns` below its root and
+/// adds the configured `extra` paths (relative ones resolved against that
+/// root). [`RedactionSourceScope::DaemonGlobal`] walks nothing: it honors only
+/// absolute configured paths, because a relative path names a file inside a
+/// workspace and is covered by that workspace's sessions.
+pub(crate) fn matched_dotenv_sources(
+    scope: RedactionSourceScope<'_>,
+    patterns: &[String],
+    extra: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    match scope {
+        RedactionSourceScope::Workspace(root) => matched_dotenv_paths(root, patterns, extra),
+        RedactionSourceScope::DaemonGlobal => {
+            let mut out = Vec::new();
+            collect_explicit_dotenv_paths(scope, extra, &mut out)?;
+            out.sort();
+            out.dedup();
+            Ok(out)
+        }
+    }
+}
+
+/// Resolve one configured `extra_dotenv_paths` entry for `scope`. Absolute
+/// paths are scope-independent. A relative path is workspace-relative, so it
+/// resolves against a workspace root and is never resolved against the
+/// process working directory; daemon-global scope has no root and yields
+/// `None`.
+pub(crate) fn resolve_explicit_dotenv_path(
+    scope: RedactionSourceScope<'_>,
+    path: &Path,
+) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    match scope {
+        RedactionSourceScope::Workspace(root) => Some(root.join(path)),
+        RedactionSourceScope::DaemonGlobal => None,
+    }
+}
+
 pub(crate) fn matched_dotenv_paths(
     cwd: &Path,
     patterns: &[String],
@@ -33,6 +76,7 @@ pub(crate) fn matched_dotenv_paths(
     use ignore::overrides::OverrideBuilder;
 
     let mut out: Vec<PathBuf> = Vec::new();
+    let scope = RedactionSourceScope::Workspace(cwd);
 
     let in_git_repo = crate::git::find_worktree_root(cwd).is_some();
     if !in_git_repo && dotenv_scan_start_is_unbounded(cwd) {
@@ -40,7 +84,7 @@ pub(crate) fn matched_dotenv_paths(
             cwd = %cwd.display(),
             "redaction `.env` walk skipped from unbounded filesystem start; explicit extra dotenv paths are still honored"
         );
-        collect_explicit_dotenv_paths(extra, &mut out)?;
+        collect_explicit_dotenv_paths(scope, extra, &mut out)?;
         out.sort();
         out.dedup();
         return Ok(out);
@@ -106,15 +150,23 @@ pub(crate) fn matched_dotenv_paths(
         }
     }
 
-    collect_explicit_dotenv_paths(extra, &mut out)?;
+    collect_explicit_dotenv_paths(scope, extra, &mut out)?;
 
     out.sort();
     out.dedup();
     Ok(out)
 }
 
-fn collect_explicit_dotenv_paths(extra: &[PathBuf], out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_explicit_dotenv_paths(
+    scope: RedactionSourceScope<'_>,
+    extra: &[PathBuf],
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
     for path in extra {
+        let Some(path) = resolve_explicit_dotenv_path(scope, path) else {
+            continue;
+        };
+        let path = &path;
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {

@@ -44,6 +44,24 @@ use base64::Engine as _;
 
 use crate::config::extended::RedactConfig;
 
+/// Where file-backed redaction sources (env files, relative configured env
+/// paths, protected path literals) are discovered for one table build.
+///
+/// This is the single funnel that decides whether a build may touch a
+/// workspace. Daemon-global coverage has no workspace: it must never be rooted
+/// at the daemon's inherited working directory, which is wherever the daemon
+/// happened to be launched and can be an arbitrarily large tree.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RedactionSourceScope<'a> {
+    /// A session's workspace root: `dotenv_patterns` are walked below it and
+    /// relative `extra_dotenv_paths` resolve against it.
+    Workspace(&'a Path),
+    /// Daemon-wide coverage: environment, stored/command secrets, private SSH
+    /// keys and absolute `extra_dotenv_paths` only. No directory is walked;
+    /// workspace env files are covered by each session's own scope.
+    DaemonGlobal,
+}
+
 /// A redaction table could not be loaded on a security-relevant path.
 ///
 /// Callers must fail closed (refuse to send, fork, export, or acknowledge
@@ -88,9 +106,9 @@ mod command_output;
 pub(crate) mod coverage_authority;
 pub(crate) mod coverage_bindings;
 mod dotenv;
-pub(super) use dotenv::matched_dotenv_paths;
 #[cfg(test)]
-pub(crate) use dotenv::{dotenv_max_depth, dotenv_scan_start_is_unbounded};
+pub(crate) use dotenv::{dotenv_max_depth, dotenv_scan_start_is_unbounded, matched_dotenv_paths};
+pub(crate) use dotenv::{matched_dotenv_sources, resolve_explicit_dotenv_path};
 mod protected;
 pub(crate) mod protected_redaction_history;
 // The production key resolver is wired into the daemon / registry / Session
@@ -1184,14 +1202,27 @@ impl RedactionTable {
         env: &HashMap<String, String>,
         store: &crate::credentials::CredentialStore,
     ) -> Result<Self> {
-        let mut entries = store
-            .named_secret_entries()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect::<Vec<_>>();
-        entries.extend(store.provider_credential_entries());
-        entries.extend(store.provider_auth_command_entries());
-        entries.extend(store.provider_oauth_descriptor_entries());
-        Self::build_with_env_and_secrets(cfg, cwd, env, entries)
+        Self::build_scoped(
+            cfg,
+            RedactionSourceScope::Workspace(cwd),
+            env,
+            credential_store_entries(store),
+        )
+    }
+
+    /// Daemon-global builder: the same collectors as a session build, minus
+    /// every workspace-rooted source (see [`RedactionSourceScope::DaemonGlobal`]).
+    pub(crate) fn build_daemon_global_with_credential_store(
+        cfg: &RedactConfig,
+        env: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<Self> {
+        Self::build_scoped(
+            cfg,
+            RedactionSourceScope::DaemonGlobal,
+            env,
+            credential_store_entries(store),
+        )
     }
 
     /// Hermetic table builder with an injected named-secret source. Production
@@ -1203,7 +1234,23 @@ impl RedactionTable {
         env: &HashMap<String, String>,
         stored_secrets: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self> {
-        let protected = ProtectedPaths::from_session(cwd, env);
+        Self::build_scoped(
+            cfg,
+            RedactionSourceScope::Workspace(cwd),
+            env,
+            stored_secrets,
+        )
+    }
+
+    /// The one table-build funnel. `scope` alone decides which file-backed
+    /// sources may be discovered.
+    pub(crate) fn build_scoped(
+        cfg: &RedactConfig,
+        scope: RedactionSourceScope<'_>,
+        env: &HashMap<String, String>,
+        stored_secrets: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self> {
+        let protected = ProtectedPaths::from_scope(scope, env);
         // `cfg.enabled == false` is a *scrub-time* opt-out, never a reason to
         // skip collection. The table is always built for real so that an
         // untrusted route can enforce it (see [`Self::enforced`]); the
@@ -1254,7 +1301,7 @@ impl RedactionTable {
 
         if cfg.scan_dotenv {
             let discovered =
-                matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?;
+                matched_dotenv_sources(scope, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?;
             for path in &discovered {
                 match collect_env_file_candidates(path, &cfg.allowlist) {
                     EnvFileScan::Candidates(file_entries) => {
@@ -1279,7 +1326,7 @@ impl RedactionTable {
             // capture must refuse this generation rather than publish coverage
             // for only one side of the mutable directory view.
             if discovered
-                != matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?
+                != matched_dotenv_sources(scope, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?
             {
                 return Err(RedactionSourceChangedError.into());
             }
@@ -2318,6 +2365,21 @@ impl RedactionTable {
 /// Extract secret-bearing leaves from an MCP named-secret JSON record. Keep
 /// this allowlist closed: metadata such as expiry timestamps and issuer URLs
 /// must not become redaction literals merely because they live beside tokens.
+/// Every stored-secret literal a credential store contributes to coverage:
+/// named secrets, provider credentials, provider auth commands, and OAuth
+/// descriptors. Shared by the workspace and daemon-global builders so the two
+/// scopes can never disagree about store-backed sources.
+fn credential_store_entries(store: &crate::credentials::CredentialStore) -> Vec<(String, String)> {
+    let mut entries = store
+        .named_secret_entries()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect::<Vec<_>>();
+    entries.extend(store.provider_credential_entries());
+    entries.extend(store.provider_auth_command_entries());
+    entries.extend(store.provider_oauth_descriptor_entries());
+    entries
+}
+
 fn mcp_sensitive_json_values(raw: &str) -> Vec<(String, String)> {
     const SENSITIVE_FIELDS: &[&str] = &[
         "access_token",

@@ -1524,14 +1524,30 @@ mod imp {
         Ok(())
     }
 
+    /// Reopen a held artifact by name. Only a regular file is ever opened:
+    /// the entry is checked with `fstatat(AT_SYMLINK_NOFOLLOW)` first, and the
+    /// open itself is `O_NONBLOCK` and re-checked on the descriptor, so a
+    /// FIFO or device swapped in by a same-user writer is refused instead of
+    /// blocking publication verification, rename-back, or reconciliation.
     pub(super) fn open_named(dir: &File, name: &str) -> Result<File> {
         let name = CString::new(name)?;
-        held_fd::openat(
+        let named =
+            held_fd::fstatat_nofollow(dir.as_raw_fd(), &name).context("reopening held artifact")?;
+        ensure!(
+            named.st_mode & libc::S_IFMT == libc::S_IFREG,
+            "held artifact entry is not a regular file"
+        );
+        let file = held_fd::openat(
             dir.as_raw_fd(),
             &name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
-        .context("reopening held artifact")
+        .context("reopening held artifact")?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "held artifact entry is not a regular file"
+        );
+        Ok(file)
     }
 
     pub(super) fn entry_absent(dir: &File, name: &str) -> Result<bool> {
@@ -3752,6 +3768,49 @@ mod tests {
                 "{mutate}"
             );
         }
+    }
+
+    /// A FIFO swapped in at the destination after the publishing syscall
+    /// (the held inode moved aside, so its link count still proves cleanup)
+    /// must not block verification: publication is reported unknown, and on
+    /// macOS the foreign entry is withdrawn back to the source name.
+    /// Reconciliation of that outcome must also return without blocking.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn post_effect_fifo_substitute_never_blocks_verification_or_reconcile() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(temp.path()).unwrap();
+        let mut artifact = held.create_file_exclusive("temporary").unwrap();
+        artifact.file_mut().write_all(b"exact").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        let root = temp.path().to_path_buf();
+        AFTER_PUBLISH_EFFECT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                use std::os::unix::ffi::OsStrExt as _;
+                std::fs::rename(root.join("published"), root.join("moved-aside")).unwrap();
+                let fifo =
+                    std::ffi::CString::new(root.join("published").as_os_str().as_bytes()).unwrap();
+                // SAFETY: `fifo` is a valid NUL-terminated path for the call.
+                assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            }))
+        });
+        let HeldDirectoryEffectOutcome::AppliedUnknown(recovery) =
+            held.rename_noreplace(artifact, "published").unwrap()
+        else {
+            panic!("a FIFO destination must not verify as the held artifact")
+        };
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                std::fs::symlink_metadata(temp.path().join("published")).is_err(),
+                "the foreign destination must be withdrawn"
+            );
+        }
+        assert!(!matches!(
+            held.reconcile(&recovery),
+            Ok(HeldDirectoryEffectOutcome::AppliedDurable(_))
+        ));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

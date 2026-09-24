@@ -116,11 +116,19 @@ fn progress_index(stage: OnboardingStage) -> usize {
 ///
 /// The layout is height-adaptive and sliced by hand rather than handed to the
 /// constraint solver, whose tie-breaking under pressure could shrink the
-/// footer: the footer always owns the last row, and at short heights the
-/// decorative rows collapse first — the blank line, then the rule — so the
-/// content never has fewer rows than the previous fixed layout (header with
-/// its rule 3, progress 1, footer 1) gave it, except for the deliberate blank
-/// line at comfortable heights.
+/// footer. Allocation order, so the most important rows survive longest:
+///
+/// 1. the footer owns the last row;
+/// 2. one content row is reserved whenever it can coexist with the footer;
+/// 3. header (2) then progress (1) take what is left, so they shrink before
+///    content does;
+/// 4. the rule, then the blank line, appear only from their thresholds;
+/// 5. the rest goes to the content.
+///
+/// With these thresholds the content never has fewer rows than the
+/// pre-redesign fixed layout (`Length(3)` header with its rule, `Length(1)`
+/// progress, `Min(1)` content, `Length(1)` footer) gave it, except for the
+/// deliberate blank line on terminals of 24 rows or more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShellRows {
     header: Rect,
@@ -131,36 +139,55 @@ struct ShellRows {
 }
 
 impl ShellRows {
-    /// Column height from which the blank line below the rule is kept
-    /// (a 16-row terminal).
-    const BLANK_MIN_HEIGHT: u16 = 14;
+    /// Column height from which the blank line below the rule is kept (a
+    /// 24-row terminal). Below it the blank row would cost content a row
+    /// relative to the pre-redesign layout.
+    const BLANK_MIN_HEIGHT: u16 = 22;
     /// Column height from which the rule is kept (a 10-row terminal, whose
-    /// 3 content rows still hold a bordered field or three choices).
+    /// 3 content rows still hold a bordered field or three choices). With
+    /// the rule the content matches the pre-redesign layout exactly.
     const RULE_MIN_HEIGHT: u16 = 8;
 
     fn split(col: Rect) -> Self {
-        let row = |y: u16, height: u16| Rect {
-            x: col.x,
-            y,
-            width: col.width,
-            height,
+        let mut budget = col.height;
+        let mut reserve = |want: u16| {
+            let got = want.min(budget);
+            budget -= got;
+            got
         };
-        let footer_height = col.height.min(1);
-        let footer = row(col.bottom() - footer_height, footer_height);
+        let footer_height = reserve(1);
+        let reserved_content = reserve(1);
+        let header_height = reserve(2);
+        let progress_height = reserve(1);
+        let rule_height = if col.height >= Self::RULE_MIN_HEIGHT {
+            reserve(1)
+        } else {
+            0
+        };
+        let blank_height = if col.height >= Self::BLANK_MIN_HEIGHT {
+            reserve(1)
+        } else {
+            0
+        };
+        let content_height = reserved_content + budget;
+
         let mut y = col.y;
-        let mut take = |want: u16| {
-            let height = want.min(footer.y - y);
-            let rect = row(y, height);
+        let mut take = |height: u16| {
+            let rect = Rect {
+                x: col.x,
+                y,
+                width: col.width,
+                height,
+            };
             y += height;
             rect
         };
-        let header = take(2);
-        let progress = take(1);
-        let rule = (col.height >= Self::RULE_MIN_HEIGHT).then(|| take(1));
-        if col.height >= Self::BLANK_MIN_HEIGHT {
-            take(1);
-        }
-        let content = take(u16::MAX);
+        let header = take(header_height);
+        let progress = take(progress_height);
+        let rule = (rule_height > 0).then(|| take(rule_height));
+        take(blank_height);
+        let content = take(content_height);
+        let footer = take(footer_height);
         Self {
             header,
             progress,
@@ -169,6 +196,51 @@ impl ShellRows {
             footer,
         }
     }
+}
+
+/// Invariants every onboarding golden must hold, asserted on the freshly
+/// rendered buffer inside the shared golden path (never by re-reading fixture
+/// files, which a concurrent regeneration may be rewriting). `◆` is reserved
+/// for the progress row: it appears exactly once, on that row, and never on
+/// the edge-to-edge Welcome scene.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn assert_golden_invariants(screen: &str, buf: &ratatui::buffer::Buffer) {
+    let area = buf.area;
+    let rows: Vec<String> = (area.top()..area.bottom())
+        .map(|y| {
+            (area.left()..area.right())
+                .map(|x| buf[(x, y)].symbol())
+                .collect()
+        })
+        .collect();
+    let hits: Vec<u16> = rows
+        .iter()
+        .zip(area.top()..)
+        .filter(|(row, _)| row.contains(progress::CURRENT_MARK))
+        .map(|(_, y)| y)
+        .collect();
+    let total: usize = rows
+        .iter()
+        .map(|row| row.matches(progress::CURRENT_MARK).count())
+        .sum();
+    if screen.starts_with("welcome") {
+        assert_eq!(
+            total, 0,
+            "{screen}: the Welcome scene draws no progress row"
+        );
+        return;
+    }
+    let progress_row = ShellRows::split(ui::column(area)).progress;
+    let expected: Vec<u16> = if progress_row.height == 0 {
+        Vec::new()
+    } else {
+        vec![progress_row.y]
+    };
+    assert_eq!(
+        hits, expected,
+        "{screen}: `◆` must mark only the progress row"
+    );
+    assert_eq!(total, expected.len(), "{screen}: `◆` must appear once");
 }
 
 /// Deterministic reduced-motion detection shared by the shell.
@@ -1937,6 +2009,11 @@ impl OnboardingShell {
         engine: &Dialog,
         links: &mut crate::tui::links::LinkRegistry,
     ) {
+        // Hit geometry is repopulated by this frame's renderers only. Clear
+        // all of it first — shell and screen — so an early return, a
+        // zero-height content area, or a screen swap can never leave a
+        // previous frame's rectangle clickable.
+        self.clear_hit_geometry();
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -1945,8 +2022,6 @@ impl OnboardingShell {
         // Welcome is an edge-to-edge cinematic scene. Its own prompt is the
         // only action affordance, and this stage never paints a Back button.
         if matches!(self.screen, OnboardingScreen::Welcome) {
-            self.back_rect = Rect::default();
-            self.actions = ActionBar::default();
             welcome::Scene::new(
                 area.width,
                 area.height,
@@ -2048,6 +2123,32 @@ impl OnboardingShell {
         self.actions.render(frame, footer, &buttons);
         if let Some(menu) = self.escape.as_mut() {
             Self::render_escape_menu(frame, area, menu);
+        }
+    }
+
+    /// Forget every clickable rectangle from the previous frame: the shell's
+    /// back button, action bar, list rows, and Escape menu rows, plus the
+    /// active screen's own geometry.
+    fn clear_hit_geometry(&mut self) {
+        self.back_rect = Rect::default();
+        self.actions = ActionBar::default();
+        self.list_row_rects.clear();
+        self.list_area = Rect::default();
+        if let Some(menu) = self.escape.as_mut() {
+            menu.row_rects.clear();
+        }
+        match &mut self.screen {
+            OnboardingScreen::Profile(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::SecureStore(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::ProviderSearch(screen) => screen.set_scrollbar_area(Rect::default()),
+            OnboardingScreen::Authenticate(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::Model(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::AgentAuthoring(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::Welcome
+            | OnboardingScreen::Verify(_)
+            | OnboardingScreen::Lifetime(_)
+            | OnboardingScreen::Complete { .. }
+            | OnboardingScreen::EmbeddedSettings => {}
         }
     }
 

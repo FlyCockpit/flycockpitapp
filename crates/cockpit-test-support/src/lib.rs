@@ -16,17 +16,34 @@ pub fn read_fixture(path: &Path) -> String {
 }
 
 /// Replace a generated test fixture, creating its parent directory first.
+///
+/// The replacement is atomic: the contents go to a temporary file in the
+/// same directory, which is then renamed over `path`. A concurrent reader
+/// (another test comparing or scanning fixtures during a regeneration run)
+/// sees either the old or the new file, never a truncated one.
 pub fn write_fixture(path: &Path, contents: &str) {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap_or_else(|error| {
-            panic!(
-                "create test fixture directory {}: {error}",
-                parent.display()
-            );
+    use std::io::Write as _;
+
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).unwrap_or_else(|error| {
+        panic!(
+            "create test fixture directory {}: {error}",
+            parent.display()
+        );
+    });
+    let mut staged = tempfile::NamedTempFile::new_in(parent).unwrap_or_else(|error| {
+        panic!("stage test fixture {}: {error}", path.display());
+    });
+    staged
+        .write_all(contents.as_bytes())
+        .unwrap_or_else(|error| {
+            panic!("write test fixture {}: {error}", path.display());
         });
-    }
-    std::fs::write(path, contents).unwrap_or_else(|error| {
-        panic!("write test fixture {}: {error}", path.display());
+    staged.persist(path).unwrap_or_else(|error| {
+        panic!("replace test fixture {}: {}", path.display(), error.error);
     });
 }
 

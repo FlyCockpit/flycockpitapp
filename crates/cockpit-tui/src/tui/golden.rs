@@ -320,6 +320,9 @@ pub fn assert_golden(area: &str, screen: &str, width: u16, height: u16, buf: &Bu
         (width, height),
         "buffer size must match the dump size {width}x{height}"
     );
+    if area == "onboarding" {
+        crate::tui::onboarding::assert_golden_invariants(screen, buf);
+    }
     assert_files(
         area,
         screen,

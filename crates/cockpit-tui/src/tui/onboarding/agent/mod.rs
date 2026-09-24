@@ -1791,13 +1791,20 @@ impl AgentAuthoringScreen {
         self.subagents_focus = SubagentsFocus::List;
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
+    /// Forget the previous frame's clickable rows. Runs before any early
+    /// return so an empty area never leaves stale rows clickable.
+    pub(crate) fn clear_hit_geometry(&mut self) {
         self.list_row_rects.clear();
         self.list_row_indices.clear();
         self.model_picker_row_rects.clear();
+        self.actions = chrome::ActionBar::default();
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.clear_hit_geometry();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         match self.phase {
             Phase::SourceIdentity => self.render_source_identity(frame, area),
             Phase::ThirdPartyLocator => self.render_third_party_locator(frame, area),

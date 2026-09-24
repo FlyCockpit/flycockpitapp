@@ -583,7 +583,17 @@ impl AuthScreen {
         }
     }
 
+    /// Forget the previous frame's field rectangles, so a phase change or an
+    /// empty area never leaves a stale field focusable by click.
+    pub(crate) fn clear_hit_geometry(&mut self) {
+        self.provider_id_rect = Rect::default();
+        self.base_rect = Rect::default();
+        self.key_rect = Rect::default();
+        self.callback_rect = Rect::default();
+    }
+
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.clear_hit_geometry();
         match self.phase {
             AuthPhase::Acknowledge => frame.render_widget(Paragraph::new(vec![
                 Line::from(Span::styled("Using subscription credentials from a third-party client may violate the provider's terms of service and could get your account suspended.", Style::new().fg(theme::BAD))),
@@ -606,6 +616,7 @@ impl AuthScreen {
         area: Rect,
         key: &TextField,
     ) -> Rect {
+        self.clear_hit_geometry();
         let rows = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),

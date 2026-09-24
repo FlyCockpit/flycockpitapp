@@ -445,9 +445,14 @@ impl ModelScreen {
         &self.row_rects
     }
 
-    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
+    /// Forget the previous frame's clickable rows and fields.
+    pub(crate) fn clear_hit_geometry(&mut self) {
         self.row_rects.clear();
         self.field_rects.clear();
+    }
+
+    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.clear_hit_geometry();
         match self.phase {
             ModelPhase::DefaultModel => self.render_default(frame, area),
             ModelPhase::Limits => self.render_limits(frame, area),

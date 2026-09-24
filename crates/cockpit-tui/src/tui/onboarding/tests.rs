@@ -1377,66 +1377,96 @@ fn progress_row_sits_between_header_and_rule_in_width_tiers() {
     }
 }
 
-/// Rows the old fixed layout gave the content: the column (terminal minus a
-/// one-row margin top and bottom) minus header+rule 3, progress 1, footer 1.
-fn old_content_rows(height: u16) -> u16 {
-    height.saturating_sub(2).saturating_sub(5)
+/// Rows the pre-redesign layout gave the content, computed by running its
+/// actual ratatui constraints (header with its rule, progress, `Min(1)`
+/// content, footer) on the same column, so the comparison follows the
+/// solver's real behaviour under pressure rather than hand arithmetic.
+fn legacy_content_rows(col: Rect) -> u16 {
+    Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(col)[2]
+        .height
 }
 
 #[test]
-fn chrome_collapses_decorative_rows_first_and_keeps_the_footer_at_short_heights() {
-    // (terminal height, rule kept, blank kept, content rows)
-    let cases = [
-        (24u16, true, true, 16u16),
-        (12, true, false, 5),
-        (10, true, false, 3),
-        (8, false, false, 2),
-    ];
-    for (height, rule, blank, content_rows) in cases {
-        let col = Rect::new(2, 1, 76, height - 2);
+fn chrome_rows_never_give_content_less_than_the_legacy_layout_at_any_height() {
+    for height in 0..=40u16 {
+        let col = ui::column(Rect::new(0, 0, 80, height));
         let rows = ShellRows::split(col);
-        assert_eq!(rows.rule.is_some(), rule, "{height} rows");
-        assert_eq!(rows.header.height, 2, "{height} rows");
-        assert_eq!(rows.progress.height, 1, "{height} rows");
-        assert_eq!(rows.footer, Rect::new(2, col.bottom() - 1, 76, 1));
-        assert_eq!(rows.content.height, content_rows, "{height} rows");
-        assert_eq!(rows.content.bottom(), rows.footer.y, "{height} rows");
-        let chrome_top = rows.rule.unwrap_or(rows.progress).bottom();
-        assert_eq!(
-            rows.content.y - chrome_top,
-            u16::from(blank),
-            "{height} rows"
-        );
-        if height < 24 {
-            assert!(
-                rows.content.height >= old_content_rows(height),
-                "{height} rows: content {} < old {}",
-                rows.content.height,
-                old_content_rows(height)
-            );
-        } else {
-            // The blank line is the one deliberate row traded at comfort.
-            assert_eq!(rows.content.height + 1, old_content_rows(height));
+        let legacy = legacy_content_rows(col);
+        let blank = rows.content.y - rows.rule.unwrap_or(rows.progress).bottom();
+        let context = format!("{height} rows (column {}): {rows:?}", col.height);
+
+        // Contiguous, non-overlapping, and exactly filling the column.
+        assert_eq!(rows.header.y, col.y, "{context}");
+        assert_eq!(rows.progress.y, rows.header.bottom(), "{context}");
+        if let Some(rule) = rows.rule {
+            assert_eq!(rule.y, rows.progress.bottom(), "{context}");
+            assert_eq!(rule.height, 1, "{context}");
         }
-    }
-    // Degenerate columns never overlap the footer or underflow.
-    for height in 0..8u16 {
-        let rows = ShellRows::split(Rect::new(0, 0, 40, height));
-        assert!(rows.content.bottom() <= rows.footer.y.max(rows.content.y));
-        assert_eq!(rows.footer.height, height.min(1));
+        assert_eq!(rows.content.bottom(), rows.footer.y, "{context}");
+        assert_eq!(rows.footer.bottom(), col.bottom(), "{context}");
+
+        // The footer is never cut, and content keeps a row whenever it can
+        // coexist with the footer.
+        assert_eq!(rows.footer.height, col.height.min(1), "{context}");
+        assert_eq!(rows.content.height >= 1, col.height >= 2, "{context}");
+
+        // Decorative rows only from their thresholds.
+        assert_eq!(rows.rule.is_some(), col.height >= 8, "{context}");
+        assert_eq!(blank, u16::from(col.height >= 22), "{context}");
+
+        // Content never loses a row to the redesign, except the one
+        // deliberate blank line on terminals of 24 rows or more. A one-row
+        // column is the exception by design: the legacy solver gave that row
+        // to `Min(1)` content and dropped the footer; the footer now wins.
+        if col.height < 2 {
+            continue;
+        }
+        assert!(
+            rows.content.height + blank >= legacy,
+            "{context}: content {} vs legacy {legacy}",
+            rows.content.height
+        );
+        if blank == 0 {
+            assert!(rows.content.height >= legacy, "{context}");
+        }
     }
 }
 
 #[test]
 fn short_terminals_still_show_the_footer_fields_and_all_secure_choices() {
-    for height in [24u16, 12, 10, 8] {
+    // Sampled heights plus both sides of each threshold: rule (9/10),
+    // the former blank threshold (15/16), and the blank line (23/24).
+    for height in [6u16, 8, 9, 10, 12, 15, 16, 23, 24] {
         let mut shell = shell_at(OnboardingStage::SecureStore);
         let rows = render_rows(&mut shell, 80, height);
         let screen = rows.join("\n");
+        let footer = usize::from(height) - 2;
         assert!(
-            rows[usize::from(height) - 2].contains("[ Continue ]"),
+            rows[footer].contains("[ Continue ]"),
             "{height} rows: footer missing\n{screen}"
         );
+        let rule_rows = rows
+            .iter()
+            .filter(|row| row.trim_start().starts_with('─'))
+            .count();
+        assert_eq!(
+            rule_rows,
+            usize::from(height >= 10),
+            "{height} rows\n{screen}"
+        );
+        let first_choice = rows.iter().position(|row| row.contains("Platform keyring"));
+        if height >= 8 {
+            // Row 3 is progress; then the rule (from 10 rows) and the blank
+            // line (from 24 rows) push the first choice down.
+            let expected = 4 + usize::from(height >= 10) + usize::from(height >= 24);
+            assert_eq!(first_choice, Some(expected), "{height} rows\n{screen}");
+        }
         if height >= 10 {
             for choice in [
                 "Platform keyring",
@@ -1452,7 +1482,7 @@ fn short_terminals_still_show_the_footer_fields_and_all_secure_choices() {
         let rows = render_rows(&mut shell, 80, height);
         let screen = rows.join("\n");
         assert!(
-            rows[usize::from(height) - 2].contains("[ Continue ]"),
+            rows[footer].contains("[ Continue ]"),
             "{height} rows: footer missing\n{screen}"
         );
         if height >= 10 {
@@ -1462,38 +1492,6 @@ fn short_terminals_still_show_the_footer_fields_and_all_secure_choices() {
             );
         }
     }
-}
-
-#[test]
-fn current_step_marker_appears_only_on_the_progress_row_of_every_golden() {
-    // `◆` is reserved for the progress row: no onboarding content may draw
-    // it, so it can never read as a list glyph. Scan every checked-in
-    // onboarding golden (all screens, both sizes).
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/onboarding");
-    let mut scanned = 0;
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if !name.ends_with(".txt") || name.ends_with(".style.txt") {
-            continue;
-        }
-        scanned += 1;
-        let dump = std::fs::read_to_string(&path).unwrap();
-        let hits: Vec<usize> = dump
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| line.contains(progress::CURRENT_MARK))
-            .map(|(index, _)| index)
-            .collect();
-        if name.starts_with("welcome-") {
-            assert!(hits.is_empty(), "{name}: {hits:?}");
-        } else {
-            // Row 3: margin, title, subtitle, progress.
-            assert_eq!(hits, [3], "{name}");
-            assert_eq!(dump.matches(progress::CURRENT_MARK).count(), 1, "{name}");
-        }
-    }
-    assert!(scanned >= 80, "only {scanned} goldens scanned");
 }
 
 #[test]

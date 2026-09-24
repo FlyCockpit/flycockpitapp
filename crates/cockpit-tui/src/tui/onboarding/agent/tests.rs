@@ -1215,3 +1215,97 @@ fn golden_agent_authoring_live_shell_screens() {
         );
     }
 }
+
+fn optimizations_shell() -> super::super::OnboardingShell {
+    let snapshot = cockpit_proto::OnboardingBootstrapSnapshot {
+        run_id: uuid::Uuid::from_u128(1),
+        attempt_id: uuid::Uuid::from_u128(2),
+        revision: 3,
+        stage: cockpit_proto::OnboardingStage::Agent,
+        bootstrap_state: cockpit_proto::OnboardingBootstrapState::Ready,
+        limited_mode: false,
+        lifetime_selection: None,
+        host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+        last_receipt: None,
+    };
+    let mut shell = super::super::OnboardingShell::new(&snapshot, false);
+    shell.screen = super::super::OnboardingScreen::AgentAuthoring(Box::new(golden_screen(
+        Phase::Optimizations,
+    )));
+    shell
+}
+
+fn render_shell(shell: &mut super::super::OnboardingShell, width: u16, height: u16) {
+    let engine = crate::tui::settings::Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    crate::tui::golden::render_frame(width, height, |frame| {
+        shell.render(frame, frame.area(), &engine, &mut links);
+    });
+}
+
+fn shell_auto_prune(shell: &super::super::OnboardingShell) -> bool {
+    match &shell.screen {
+        super::super::OnboardingScreen::AgentAuthoring(screen) => screen.draft.auto_prune,
+        _ => unreachable!("optimizations shell holds the authoring screen"),
+    }
+}
+
+fn shell_auto_prune_row(shell: &super::super::OnboardingShell) -> Rect {
+    match &shell.screen {
+        super::super::OnboardingScreen::AgentAuthoring(screen) => screen.list_row_rects[0],
+        _ => unreachable!("optimizations shell holds the authoring screen"),
+    }
+}
+
+#[test]
+fn shrinking_to_an_empty_content_area_leaves_no_stale_clickable_rows() {
+    let mut engine = crate::tui::settings::Dialog::None;
+
+    // Control: at 80x9 the Auto-prune row is on screen and one click there
+    // toggles it.
+    let mut shell = optimizations_shell();
+    render_shell(&mut shell, 80, 9);
+    let row = shell_auto_prune_row(&shell);
+    let before = shell_auto_prune(&shell);
+    shell.handle_mouse(click_at(Position::new(row.x + 2, row.y)), &mut engine);
+    assert_ne!(
+        shell_auto_prune(&shell),
+        before,
+        "control click must toggle"
+    );
+
+    // Resize to 80x6: the content area has no inner list rows left, so the
+    // old row position is blank margin and must not act.
+    let mut shell = optimizations_shell();
+    render_shell(&mut shell, 80, 9);
+    let row = shell_auto_prune_row(&shell);
+    assert!(row.y < 6, "the stale row must still be on the 6-row screen");
+    render_shell(&mut shell, 80, 6);
+    shell.handle_mouse(click_at(Position::new(row.x + 2, row.y)), &mut engine);
+    assert_eq!(
+        shell_auto_prune(&shell),
+        before,
+        "stale row toggled Auto-prune"
+    );
+}
+
+#[test]
+fn rendering_into_an_empty_area_clears_the_previous_rows() {
+    // The screen's own early return for an empty area must not keep the
+    // previous frame's rows clickable (the shell funnel clears them too, but
+    // the screen renders standalone in other hosts).
+    let mut screen = golden_screen(Phase::Optimizations);
+    render_buffer(&mut screen, 80, 24);
+    let row = screen.list_row_rects[0];
+    let before = screen.draft.auto_prune;
+    crate::tui::golden::render_frame(80, 24, |frame| {
+        let area = frame.area();
+        screen.render(frame, Rect { height: 0, ..area });
+    });
+    screen.handle_mouse(click_at(Position::new(row.x + 2, row.y)));
+    assert_eq!(
+        screen.draft.auto_prune, before,
+        "stale row toggled Auto-prune"
+    );
+    assert!(screen.list_row_rects.is_empty());
+}

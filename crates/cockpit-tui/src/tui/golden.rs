@@ -15,6 +15,9 @@
 //! * colour — the palette resolves its truecolor RGB tokens regardless of
 //!   the ambient `COLORTERM` (`theme::pin_truecolor(true)`), so dumps stay
 //!   byte-identical on truecolor and 256-color terminals alike (#444)
+//! * host platform — dependency remedies render for [`PINNED_HOST_PLATFORM`]
+//!   rather than the machine running the test (macOS would render `brew`,
+//!   Fedora `dnf`)
 //!
 //! Visual reference for future UI work: `reference/example-tui/`.
 
@@ -44,6 +47,10 @@ pub const PINNED_DATETIME: &str = "Jan 15, 12:00";
 
 /// Cloud RNG entropy for `clouds::seed_with(w, h, entropy)` (#428).
 pub const CLOUD_SEED: u64 = 1;
+
+/// Host platform dependency remedies render for while pins are installed.
+pub const PINNED_HOST_PLATFORM: cockpit_core::external_runtime::HostPlatform =
+    cockpit_core::external_runtime::HostPlatform::DebianUbuntu;
 
 /// Settled welcome fly-in frame (`frame >= WELCOME_ANIMATION_FRAMES`).
 pub const PINNED_FRAME: usize = WELCOME_ANIMATION_FRAMES;
@@ -107,6 +114,11 @@ impl Drop for GoldenPins {
 /// `Some(PINNED_HHMM)` while pins are installed.
 pub fn pinned_hhmm() -> Option<&'static str> {
     PINNED_CLOCK.with(Cell::get).then_some(PINNED_HHMM)
+}
+
+/// `Some(PINNED_HOST_PLATFORM)` while pins are installed.
+pub fn pinned_host_platform() -> Option<cockpit_core::external_runtime::HostPlatform> {
+    PINNED_CLOCK.with(Cell::get).then_some(PINNED_HOST_PLATFORM)
 }
 
 /// `Some(PINNED_DATETIME)` while pins are installed.

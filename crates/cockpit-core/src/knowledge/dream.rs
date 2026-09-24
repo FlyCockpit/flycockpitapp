@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use super::{
     Citation, KnowledgeCommitOrigin, KnowledgeConcept, KnowledgeDreamCommit,
-    KnowledgeDreamGitOutcome, KnowledgeDreamWrite, apply_knowledge_dream_writes,
-    apply_registered_knowledge_dream, parse_bundle, validate_knowledge_dream_writes,
+    KnowledgeDreamGitOutcome, KnowledgeDreamWrite, KnowledgeMutationRoot,
+    apply_knowledge_dream_writes, apply_registered_knowledge_dream,
+    validate_knowledge_dream_writes,
 };
 use crate::config::extended::{ExtendedConfig, KnowledgeBaseRegistryEntry, KnowledgeBaseSource};
 use crate::config::providers::{ModelTrust, ProvidersConfig};
@@ -212,8 +213,11 @@ impl DreamSink for LocalGitSink {
     }
 }
 
-fn apply_change_set_to_local_bundle(root: &Path, change_set: &DreamChangeSet) -> Result<()> {
-    let existing = parse_bundle(root)?;
+fn apply_change_set_to_local_bundle(
+    root: &KnowledgeMutationRoot,
+    change_set: &DreamChangeSet,
+) -> Result<()> {
+    let existing = root.parse_bundle()?;
     let by_id: BTreeMap<&str, &KnowledgeConcept> = existing
         .concepts
         .iter()
@@ -695,6 +699,23 @@ mod tests {
         assert!(serialized.contains(table.placeholder()));
     }
 
+    /// The fenced transaction root production dream sinks receive.
+    fn held_root(
+        root: &std::path::Path,
+    ) -> (
+        super::super::SidecarProcessLock,
+        super::super::KnowledgeMutationRoot,
+    ) {
+        let sidecars = super::super::KbSidecars::in_root(root)
+            .canonicalized()
+            .unwrap();
+        let lock = super::super::SidecarProcessLock::try_acquire(&sidecars)
+            .unwrap()
+            .expect("uncontended knowledge fence");
+        let mutation_root = lock.mutation_root().unwrap();
+        (lock, mutation_root)
+    }
+
     #[test]
     fn local_sink_refuses_human_concept_replacement() {
         let root = tempfile::tempdir().unwrap();
@@ -704,7 +725,7 @@ mod tests {
         )
         .unwrap();
         let error = apply_change_set_to_local_bundle(
-            root.path(),
+            &held_root(root.path()).1,
             &DreamChangeSet {
                 knowledge_base_id: "kb".into(),
                 source_session_ids: vec![Uuid::now_v7()],
@@ -732,7 +753,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
 
         apply_change_set_to_local_bundle(
-            root.path(),
+            &held_root(root.path()).1,
             &DreamChangeSet {
                 knowledge_base_id: "kb".into(),
                 source_session_ids: vec![Uuid::now_v7()],
@@ -746,7 +767,7 @@ mod tests {
     fn local_sink_neutralizes_prompt_injection_before_writing() {
         let root = tempfile::tempdir().unwrap();
         apply_change_set_to_local_bundle(
-            root.path(),
+            &held_root(root.path()).1,
             &DreamChangeSet {
                 knowledge_base_id: "kb".into(),
                 source_session_ids: vec![Uuid::now_v7()],

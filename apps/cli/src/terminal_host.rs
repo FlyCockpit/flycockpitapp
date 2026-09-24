@@ -1335,11 +1335,14 @@ fn close_generation_locked(
     state.filter.finish();
 
     // Close PTY writer/master handles (reader is cancelled via closed flag).
+    // The writer thread is joined only after the leader is reaped below: a
+    // frame write blocked on a full PTY input queue (a shell not reading its
+    // input; macOS queues are about 1 KiB) returns only once the terminal's
+    // session leader is gone and the slave side is hung up, so joining first
+    // would wait on a write that nothing here can complete.
     state.input_cancel.store(true, Ordering::Release);
     state.input_tx.take();
-    if let Some(input_thread) = state.input_thread.take() {
-        let _ = input_thread.join();
-    }
+    let input_thread = state.input_thread.take();
     state.master.take();
 
     // Containment terminate + same-generation empty oracle when a lease is
@@ -1370,6 +1373,9 @@ fn close_generation_locked(
             }
         }
         let _ = child.wait();
+    }
+    if let Some(input_thread) = input_thread {
+        let _ = input_thread.join();
     }
     #[cfg(test)]
     {

@@ -9280,7 +9280,7 @@ async fn launch_ticket_with_the_wrong_value_is_denied() {
 /// retains the matching ticket in the launcher process. Every spawn mints
 /// a fresh, well-formed ticket, and the daemon child holds the exact copy
 /// the launcher retained.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_spawn_mints_and_delivers_the_launch_ticket_to_the_child() {
     let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
@@ -9311,13 +9311,13 @@ async fn daemon_spawn_mints_and_delivers_the_launch_ticket_to_the_child() {
             "{}=",
             crate::daemon::peer_authority::DAEMON_LAUNCH_TICKET_ENV
         );
-        // Poll briefly: `/proc/<pid>/environ` shows the parent's environment
-        // in the fork-before-exec window, and the daemon child may also exit
-        // immediately (for example when a sibling daemon already holds the
-        // lifecycle reservation).
+        // Poll briefly: the kernel's view of the child environment shows the
+        // parent's environment in the fork-before-exec window, and the
+        // daemon child may also exit immediately (for example when a sibling
+        // daemon already holds the lifecycle reservation).
         let mut delivered = None;
         for _ in 0..200 {
-            if let Ok(environ) = std::fs::read(format!("/proc/{child}/environ")) {
+            if let Ok(environ) = read_child_environment_block(child) {
                 delivered = environ
                     .split(|byte| *byte == 0)
                     .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
@@ -9339,12 +9339,84 @@ async fn daemon_spawn_mints_and_delivers_the_launch_ticket_to_the_child() {
     }
 }
 
+/// The NUL-separated `KEY=value` environment block the kernel recorded for
+/// `pid` at its last exec: `/proc/<pid>/environ` on Linux, the tail of
+/// `KERN_PROCARGS2` (after argc, the executable path, and argv) on macOS.
+#[cfg(target_os = "linux")]
+fn read_child_environment_block(pid: u32) -> std::io::Result<Vec<u8>> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+}
+
+#[cfg(target_os = "macos")]
+fn read_child_environment_block(pid: u32) -> std::io::Result<Vec<u8>> {
+    const ARGC_WIDTH: usize = std::mem::size_of::<libc::c_int>();
+    let invalid = |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    let mut argmax: libc::c_int = 0;
+    let mut argmax_len = std::mem::size_of_val(&argmax);
+    let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: the output buffer and its length follow the sysctl contract.
+    let rc = unsafe {
+        libc::sysctl(
+            argmax_mib.as_mut_ptr(),
+            argmax_mib.len() as libc::c_uint,
+            (&raw mut argmax).cast(),
+            &mut argmax_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut bytes = vec![0_u8; usize::try_from(argmax).map_err(|_| invalid("KERN_ARGMAX"))?];
+    let mut len = bytes.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    // SAFETY: sysctl writes at most `len` bytes into `bytes`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            bytes.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    bytes.truncate(len);
+    let argc = bytes
+        .get(..ARGC_WIDTH)
+        .and_then(|width| width.try_into().ok())
+        .map(i32::from_ne_bytes)
+        .and_then(|argc| usize::try_from(argc).ok())
+        .ok_or_else(|| invalid("KERN_PROCARGS2 argc"))?;
+    let mut rest = &bytes[ARGC_WIDTH..];
+    // The executable path, its NUL padding, then argc NUL-terminated args.
+    let executable_end = rest
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| invalid("KERN_PROCARGS2 executable path"))?;
+    rest = &rest[executable_end..];
+    let padding = rest.iter().take_while(|byte| **byte == 0).count();
+    rest = &rest[padding..];
+    for _ in 0..argc {
+        let end = rest
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| invalid("KERN_PROCARGS2 argv"))?;
+        rest = &rest[end + 1..];
+    }
+    Ok(rest.to_vec())
+}
+
 /// Hard-kill a spawned daemon child and reap it so a test never leaves a
 /// detached foreground daemon (or a zombie) behind. The detach spawn path
 /// only moves the child into its own process group; it stays a direct
 /// child of this process, so a pid-specific waitpid reaps it without
 /// touching any other test-spawned child.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn kill_daemon_child(pid: u32) {
     let pid = i32::try_from(pid).expect("daemon child pid fits i32");
     // SAFETY: SIGKILL targets exactly the child this test spawned through

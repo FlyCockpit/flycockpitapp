@@ -87,6 +87,20 @@ pub(crate) fn cockpit_state_dir_unchecked() -> Result<PathBuf> {
     }
 }
 
+/// Cockpit's cache directory: `$XDG_CACHE_HOME/cockpit` when a rooted
+/// `XDG_CACHE_HOME` is set (on every platform, like the config, data, and
+/// state roots), otherwise the platform cache location (`~/.cache/cockpit`
+/// on Linux, `~/Library/Caches/cockpit` on macOS, `%LOCALAPPDATA%\cockpit`
+/// on Windows). Holds the CLI log and disposable caches; nothing here is
+/// authoritative state.
+pub fn cockpit_cache_dir() -> Result<PathBuf> {
+    if let Some(base) = xdg_base_override("XDG_CACHE_HOME") {
+        return Ok(base.join("cockpit"));
+    }
+    let base = dirs::cache_dir().context("could not locate user cache dir")?;
+    Ok(base.join("cockpit"))
+}
+
 /// Platform-default global configuration directory.
 ///
 /// A rooted `XDG_CONFIG_HOME` wins on every platform (as `XDG_DATA_HOME` and
@@ -145,6 +159,26 @@ mod tests {
         env.set_var("XDG_CONFIG_HOME", "/tmp/xdg-config-test");
         let path = cockpit_config_dir().unwrap();
         assert_eq!(path, PathBuf::from("/tmp/xdg-config-test/cockpit"));
+    }
+
+    #[test]
+    fn cache_dir_respects_xdg_cache_home_on_every_platform() {
+        let env = crate::test_env::lock();
+        env.set_var("XDG_CACHE_HOME", "/tmp/xdg-cache-test");
+        let path = cockpit_cache_dir().unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/xdg-cache-test/cockpit"));
+    }
+
+    #[test]
+    fn cache_dir_ignores_a_relative_xdg_cache_home() {
+        let env = crate::test_env::lock();
+        env.set_var("XDG_CACHE_HOME", "relative-cache");
+        let path = cockpit_cache_dir().unwrap();
+        assert!(
+            path.has_root(),
+            "relative XDG_CACHE_HOME must be ignored: {}",
+            path.display()
+        );
     }
 
     #[test]

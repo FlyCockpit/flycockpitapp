@@ -611,7 +611,7 @@ thread_local! { static BEFORE_PUBLISH_HOOK: std::cell::RefCell<Option<Box<dyn Fn
 thread_local! { static AFTER_PUBLISH_EFFECT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(test)]
 thread_local! { static FORCE_PUBLISH_NONCOLLISION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 thread_local! { static FORCE_SOURCE_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 thread_local! { static FORCE_POST_CLEANUP_METADATA_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
@@ -629,7 +629,7 @@ fn run_before_publish_hook() {
         hook();
     }
 }
-#[cfg(all(not(test), target_os = "linux"))]
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
 fn run_before_publish_hook() {}
 #[cfg(test)]
 fn run_after_publish_effect_hook() {
@@ -637,13 +637,13 @@ fn run_after_publish_effect_hook() {
         hook();
     }
 }
-#[cfg(all(not(test), any(target_os = "linux", windows)))]
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos", windows)))]
 fn run_after_publish_effect_hook() {}
 #[cfg(test)]
 fn take_forced_failure(flag: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> bool {
     flag.with(|value| value.replace(false))
 }
-#[cfg(all(not(test), any(target_os = "linux", windows)))]
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos", windows)))]
 fn take_forced_publish_failure() -> bool {
     false
 }
@@ -655,7 +655,7 @@ fn take_forced_publish_failure() -> bool {
 fn take_forced_cleanup_failure() -> bool {
     false
 }
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 fn take_forced_cleanup_failure() -> bool {
     take_forced_failure(&FORCE_SOURCE_CLEANUP_FAILURE)
 }
@@ -1166,7 +1166,87 @@ mod imp {
                 }
                 Ok(durable_evidence(Some(to.to_owned()), artifact.evidence))
             }
-            #[cfg(not(target_os = "linux"))]
+            // macOS has no way to name an inode from its descriptor
+            // (`linkat(AT_EMPTY_PATH)` / procfs), so publication renames the
+            // held source name with `renameatx_np(RENAME_EXCL)`. The name is
+            // proven to still denote the held inode immediately before the
+            // rename, and the destination is proven to be the held inode
+            // afterwards. A substitution in between (only possible for a
+            // same-user writer of this owner-only directory, which could
+            // equally create the destination itself) is never reported as a
+            // publication of the held artifact: the substituted entry is
+            // withdrawn back to the source name and the effect is returned
+            // for reconciliation, which then fails closed.
+            #[cfg(target_os = "macos")]
+            {
+                let mut artifact = artifact;
+                run_before_publish_hook();
+                let target = CString::new(to)?;
+                let source = CString::new(artifact.name.as_str())?;
+                if !names_held_inode(&self.dir, &source, &artifact.file) {
+                    return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                        HeldDirectoryRecovery {
+                            destination_name: Some(to.to_owned()),
+                            source_name: artifact.name,
+                            artifact: artifact.evidence,
+                            source_cleanup_required: false,
+                        },
+                    ));
+                }
+                if take_forced_publish_failure() {
+                    return Ok(unknown_recovery(
+                        Some(to.to_owned()),
+                        artifact.name,
+                        artifact.evidence,
+                        false,
+                    ));
+                }
+                if let Err(error) = held_fd::rename_noreplace(
+                    self.dir.as_raw_fd(),
+                    &source,
+                    self.dir.as_raw_fd(),
+                    &target,
+                ) {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(artifact));
+                    }
+                    return Ok(unknown_recovery(
+                        Some(to.to_owned()),
+                        artifact.name,
+                        artifact.evidence,
+                        false,
+                    ));
+                }
+                run_after_publish_effect_hook();
+                if verify_published(self, to, &mut artifact).is_err() {
+                    if !names_held_inode(&self.dir, &target, &artifact.file) {
+                        // Best effort: the outcome is reconciled either way,
+                        // and reconciliation rejects a foreign destination.
+                        let _ = held_fd::rename_noreplace(
+                            self.dir.as_raw_fd(),
+                            &target,
+                            self.dir.as_raw_fd(),
+                            &source,
+                        );
+                    }
+                    return Ok(unknown_recovery(
+                        Some(to.to_owned()),
+                        artifact.name.clone(),
+                        artifact.evidence.clone(),
+                        false,
+                    ));
+                }
+                if sync_failure_forced() || self.dir.sync_all().is_err() {
+                    return Ok(unknown_recovery(
+                        Some(to.to_owned()),
+                        artifact.name,
+                        artifact.evidence,
+                        false,
+                    ));
+                }
+                Ok(durable_evidence(Some(to.to_owned()), artifact.evidence))
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 let _ = (artifact, to);
                 anyhow::bail!(
@@ -1389,7 +1469,20 @@ mod imp {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    /// Whether `name` in `dir` is, without following links, the held inode.
+    #[cfg(target_os = "macos")]
+    fn names_held_inode(dir: &File, name: &std::ffi::CStr, held: &File) -> bool {
+        let Ok(held) = held.metadata() else {
+            return false;
+        };
+        held_fd::fstatat_nofollow(dir.as_raw_fd(), name).is_ok_and(|named| {
+            named.st_mode & libc::S_IFMT == libc::S_IFREG
+                && named.st_dev as u64 == held.dev()
+                && named.st_ino as u64 == held.ino()
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn verify_published(
         dir: &HeldDirectory,
         name: &str,
@@ -1431,14 +1524,30 @@ mod imp {
         Ok(())
     }
 
+    /// Reopen a held artifact by name. Only a regular file is ever opened:
+    /// the entry is checked with `fstatat(AT_SYMLINK_NOFOLLOW)` first, and the
+    /// open itself is `O_NONBLOCK` and re-checked on the descriptor, so a
+    /// FIFO or device swapped in by a same-user writer is refused instead of
+    /// blocking publication verification, rename-back, or reconciliation.
     pub(super) fn open_named(dir: &File, name: &str) -> Result<File> {
         let name = CString::new(name)?;
-        held_fd::openat(
+        let named =
+            held_fd::fstatat_nofollow(dir.as_raw_fd(), &name).context("reopening held artifact")?;
+        ensure!(
+            named.st_mode & libc::S_IFMT == libc::S_IFREG,
+            "held artifact entry is not a regular file"
+        );
+        let file = held_fd::openat(
             dir.as_raw_fd(),
             &name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
-        .context("reopening held artifact")
+        .context("reopening held artifact")?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "held artifact entry is not a regular file"
+        );
+        Ok(file)
     }
 
     pub(super) fn entry_absent(dir: &File, name: &str) -> Result<bool> {
@@ -3463,7 +3572,7 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn post_effect_sync_failure_reopens_and_reconciles_exact_destination() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -3488,7 +3597,7 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn noncollision_publish_failure_retains_source_authority_for_retry() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -3592,7 +3701,42 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    /// macOS publishes by name, so a pre-syscall name swap is caught by the
+    /// held-inode recheck: nothing is published and the planted object is
+    /// never reported as the held artifact.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pre_syscall_name_swap_is_refused_before_publication() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(temp.path()).unwrap();
+        let mut artifact = held.create_file_exclusive("temporary").unwrap();
+        artifact.file_mut().write_all(b"held-exact").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        let root = temp.path().to_path_buf();
+        BEFORE_PUBLISH_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(root.join("temporary"), root.join("attacker-moved")).unwrap();
+                std::fs::write(root.join("temporary"), b"planted").unwrap();
+                std::fs::set_permissions(
+                    root.join("temporary"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }))
+        });
+        assert!(matches!(
+            held.rename_noreplace(artifact, "published").unwrap(),
+            HeldDirectoryEffectOutcome::SecurityAmbiguous(_)
+        ));
+        assert!(!temp.path().join("published").exists());
+        assert_eq!(
+            std::fs::read(temp.path().join("temporary")).unwrap(),
+            b"planted"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn post_effect_same_inode_content_and_mode_races_are_not_routable() {
         for mutate in ["content", "mode"] {
@@ -3626,7 +3770,50 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    /// A FIFO swapped in at the destination after the publishing syscall
+    /// (the held inode moved aside, so its link count still proves cleanup)
+    /// must not block verification: publication is reported unknown, and on
+    /// macOS the foreign entry is withdrawn back to the source name.
+    /// Reconciliation of that outcome must also return without blocking.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn post_effect_fifo_substitute_never_blocks_verification_or_reconcile() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(temp.path()).unwrap();
+        let mut artifact = held.create_file_exclusive("temporary").unwrap();
+        artifact.file_mut().write_all(b"exact").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        let root = temp.path().to_path_buf();
+        AFTER_PUBLISH_EFFECT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                use std::os::unix::ffi::OsStrExt as _;
+                std::fs::rename(root.join("published"), root.join("moved-aside")).unwrap();
+                let fifo =
+                    std::ffi::CString::new(root.join("published").as_os_str().as_bytes()).unwrap();
+                // SAFETY: `fifo` is a valid NUL-terminated path for the call.
+                assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            }))
+        });
+        let HeldDirectoryEffectOutcome::AppliedUnknown(recovery) =
+            held.rename_noreplace(artifact, "published").unwrap()
+        else {
+            panic!("a FIFO destination must not verify as the held artifact")
+        };
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                std::fs::symlink_metadata(temp.path().join("published")).is_err(),
+                "the foreign destination must be withdrawn"
+            );
+        }
+        assert!(!matches!(
+            held.reconcile(&recovery),
+            Ok(HeldDirectoryEffectOutcome::AppliedDurable(_))
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn successful_publish_and_unlink_return_exact_durable_evidence() {
         let temp = tempfile::TempDir::new().unwrap();

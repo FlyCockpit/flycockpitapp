@@ -332,6 +332,22 @@ pub fn fstatat_nofollow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
     Ok(unsafe { stat.assume_init() })
 }
 
+/// `fstatat(dir_fd, name, 0)` — stat a name beneath the held fd, following a
+/// final-component symlink (as `stat(2)` does). An absolute `name` ignores
+/// `dir_fd`. Never opens the entry, so it neither needs read permission nor
+/// blocks on a FIFO.
+pub fn fstatat_follow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `dir_fd` is a live directory fd, `name` outlives the call, and
+    // `stat` is a valid out-pointer.
+    let result = unsafe { libc::fstatat(dir_fd, name.as_ptr(), stat.as_mut_ptr(), 0) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstatat` returned 0, so `stat` is initialised.
+    Ok(unsafe { stat.assume_init() })
+}
+
 /// Atomic no-replace rename relative to held directory fds. Linux uses
 /// `renameat2(RENAME_NOREPLACE)`; macOS uses `renameatx_np(RENAME_EXCL)`. Both
 /// fail (`EEXIST`) rather than overwriting an existing target, so there is no
@@ -395,4 +411,155 @@ pub fn rename_noreplace(
         io::ErrorKind::Unsupported,
         "atomic no-replace rename is unavailable on this platform",
     ))
+}
+
+/// The current absolute spelling of a held directory, read back from the
+/// descriptor itself (Linux/Android `/proc/self/fd/N`, Apple
+/// `fcntl(F_GETPATH)`) and proven to still name that directory.
+///
+/// The spelling is looked up again without following its final component and
+/// must be a directory with the descriptor's device and inode. A directory
+/// that was unlinked, or moved or replaced between the read-back and the
+/// lookup, fails with an error instead of yielding a spelling that names some
+/// other object. Other Unix targets have no descriptor read-back and fail
+/// closed with [`io::ErrorKind::Unsupported`].
+///
+/// The spelling is a snapshot, not a capability. Callers that must keep
+/// operating on the held object use the descriptor (`openat`, `fchdir`);
+/// the spelling is only for consumers that genuinely need a pathname, such as
+/// canonical comparisons or a path handed to another process.
+pub fn verified_directory_path(dir_fd: RawFd) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let spelling = directory_spelling(dir_fd)?;
+    if !spelling.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "held directory has no absolute spelling (read back {})",
+                spelling.display()
+            ),
+        ));
+    }
+    // SAFETY: `dir_fd` is a live descriptor owned by the caller; the
+    // `ManuallyDrop` wrapper only borrows it for `fstat` and never closes it.
+    let held = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(dir_fd) }).metadata()?;
+    let named = std::fs::symlink_metadata(&spelling)?;
+    if !held.is_dir() || !named.is_dir() || named.dev() != held.dev() || named.ino() != held.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} no longer names the held directory", spelling.display()),
+        ));
+    }
+    Ok(spelling)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn directory_spelling(dir_fd: RawFd) -> io::Result<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{dir_fd}"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn directory_spelling(dir_fd: RawFd) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut buffer = vec![0_u8; libc::PATH_MAX as usize];
+    // SAFETY: `dir_fd` is a live descriptor and `buffer` holds the
+    // `MAXPATHLEN` bytes F_GETPATH may write, including the terminator.
+    if unsafe { libc::fcntl(dir_fd, libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let spelling = CStr::from_bytes_until_nul(&buffer)
+        .map_err(|_| io::Error::other("F_GETPATH returned an unterminated path"))?;
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        spelling.to_bytes(),
+    )))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn directory_spelling(_dir_fd: RawFd) -> io::Result<std::path::PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "reading a held directory's spelling back from its descriptor is unavailable on this platform",
+    ))
+}
+
+#[cfg(test)]
+mod verified_directory_path_tests {
+    use super::*;
+    use std::os::fd::AsRawFd as _;
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn reads_back_the_canonical_spelling_of_a_held_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+        let held = File::open(&canonical).unwrap();
+        assert_eq!(
+            verified_directory_path(held.as_raw_fd()).unwrap(),
+            canonical
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn follows_the_held_object_across_a_rename_and_ignores_a_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let before = root.join("before");
+        let after = root.join("after");
+        std::fs::create_dir(&before).unwrap();
+        let held = File::open(&before).unwrap();
+        std::fs::rename(&before, &after).unwrap();
+        // A replacement at the old spelling is a different object; the
+        // read-back reports where the held directory actually is.
+        std::fs::create_dir(&before).unwrap();
+        assert_eq!(verified_directory_path(held.as_raw_fd()).unwrap(), after);
+    }
+
+    #[test]
+    fn refuses_an_unlinked_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doomed = tmp.path().join("doomed");
+        std::fs::create_dir(&doomed).unwrap();
+        let held = File::open(&doomed).unwrap();
+        std::fs::remove_dir(&doomed).unwrap();
+        assert!(verified_directory_path(held.as_raw_fd()).is_err());
+    }
+
+    /// Without a descriptor read-back the call fails closed as
+    /// `Unsupported`, which callers that can proceed on the descriptor alone
+    /// (the knowledge sidecar Git exclusion) distinguish from a failure.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    #[test]
+    fn is_unsupported_without_a_descriptor_read_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let held = File::open(tmp.path()).unwrap();
+        assert_eq!(
+            verified_directory_path(held.as_raw_fd())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
 }

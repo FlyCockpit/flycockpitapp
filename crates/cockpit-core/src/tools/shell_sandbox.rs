@@ -252,6 +252,7 @@ fn push_unique_path(paths: &mut Vec<std::path::PathBuf>, path: std::path::PathBu
 /// siblings. When `/etc` (or another parent) is also writable, bwrap rejects
 /// the conflicting carveout. Omit that profile and rely on the explicit
 /// runtime read roots we already add for confined shells.
+#[cfg(target_os = "linux")]
 fn writable_roots_conflict_with_system_read_carveouts(
     allow_write_roots: &[std::path::PathBuf],
 ) -> bool {
@@ -273,11 +274,18 @@ const SANDBOX_PROFILES_WITHOUT_SYSTEM_READ_LINUX: &[&str] = &[
     "deny-browser-data-linux",
 ];
 
+#[cfg(target_os = "linux")]
 fn apply_sandbox_profiles(sandbox: zerobox::Sandbox, policy: &SandboxPolicy) -> zerobox::Sandbox {
-    #[cfg(target_os = "linux")]
     if writable_roots_conflict_with_system_read_carveouts(&policy.allow_write_roots) {
         return sandbox.profiles(SANDBOX_PROFILES_WITHOUT_SYSTEM_READ_LINUX);
     }
+    sandbox
+}
+
+/// Only Linux's `system-read-linux` profile has carveouts a writable root can
+/// conflict with; every other platform keeps zerobox's default profiles.
+#[cfg(not(target_os = "linux"))]
+fn apply_sandbox_profiles(sandbox: zerobox::Sandbox, _policy: &SandboxPolicy) -> zerobox::Sandbox {
     sandbox
 }
 
@@ -1112,7 +1120,18 @@ mod tests {
         init();
         let env = crate::test_env::lock_async().await;
 
-        let cwd = tempfile::tempdir().unwrap();
+        // The fallback socket `$TMPDIR/cockpit-<uid>/cockpit/<24 hex>/cockpit.sock`
+        // must fit the daemon's `sun_path` budget (71 bytes on macOS), which
+        // leaves about 13 bytes for `$TMPDIR` there. A default temp dir
+        // (`/var/folders/…`, or even `/private/tmp/.tmpXXXXXX`) is too long
+        // and the daemon would correctly fall back to `/tmp` outside the
+        // allowed cwd, so root this test's cwd directly at `/tmp` with a
+        // 10-byte spelling.
+        let cwd = tempfile::Builder::new()
+            .prefix("c")
+            .rand_bytes(4)
+            .tempdir_in("/tmp")
+            .unwrap();
         let state_home = cwd.path().join("xdg-state");
         let data_home = cwd.path().join("xdg-data");
         std::fs::create_dir_all(&state_home).unwrap();

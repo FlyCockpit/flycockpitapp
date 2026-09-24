@@ -472,16 +472,16 @@ pub(crate) trait KbProvider: Send + Sync {
 /// selected and validated its output. It receives only the provider's
 /// transaction root, never a separately resolved KB pathname.
 pub(crate) trait KnowledgeDreamMutation: Send + Sync {
-    fn apply(&self, root: &Path) -> Result<()>;
+    fn apply(&self, root: &KnowledgeMutationRoot) -> Result<()>;
 }
 
 struct ClosureKnowledgeDreamMutation<F>(F);
 
 impl<F> KnowledgeDreamMutation for ClosureKnowledgeDreamMutation<F>
 where
-    F: Fn(&Path) -> Result<()> + Send + Sync,
+    F: Fn(&KnowledgeMutationRoot) -> Result<()> + Send + Sync,
 {
-    fn apply(&self, root: &Path) -> Result<()> {
+    fn apply(&self, root: &KnowledgeMutationRoot) -> Result<()> {
         (self.0)(root)
     }
 }
@@ -494,6 +494,20 @@ struct LocalKb {
     sidecars: KbSidecars,
     embedder: Option<Arc<dyn Embedder>>,
     immutable_snapshot: bool,
+}
+
+/// Where an index build's sidecars live, decided from how they were placed,
+/// never from a live pathname lookup that a rename could make fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidecarPlacement {
+    /// Beside the source, in the directory the process fence retained
+    /// ([`KbSidecars::in_root`]). They must be kept out of that tree's Git
+    /// worktree before either is opened, and failing to do so fails the build.
+    InSourceTree,
+    /// In Flycockpit's private cache, outside every source tree (assistant
+    /// snapshots with synthetic `assistant://` roots, and workspace KBs whose
+    /// derived index is cached privately). There is nothing to ignore.
+    PrivateCache,
 }
 
 #[derive(Debug, Clone)]
@@ -572,6 +586,9 @@ fn sidecar_lock(sidecars: &KbSidecars) -> Arc<tokio::sync::Mutex<()>> {
 /// replaced while path-based sidecar operations are in flight. Windows also
 /// uses a named kernel mutex derived from the canonical pathname.
 struct SidecarProcessLock {
+    /// The root capability selected while the process fence was acquired.
+    /// Source snapshots, generated sidecars, and mutation transactions use
+    /// this exact directory rather than reopen its diagnostic path spelling.
     directory: fs::File,
     root: PathBuf,
     root_identity: String,
@@ -706,13 +723,6 @@ impl SidecarProcessLock {
 }
 
 impl SidecarProcessLock {
-    /// Return the root capability selected while the process fence was
-    /// acquired. Source snapshots and generated sidecars must use this exact
-    /// directory rather than reopen its diagnostic path spelling.
-    fn directory(&self) -> &fs::File {
-        &self.directory
-    }
-
     fn revalidate_root(&self) -> Result<()> {
         let current = cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(&self.root)
             .with_context(|| {
@@ -729,33 +739,422 @@ impl SidecarProcessLock {
         Ok(())
     }
 
-    /// A mutation path bound to the retained directory object.
+    /// The transaction root bound to the retained directory object.
     ///
-    /// Unix exposes open file descriptors as directories. Linux provides that
-    /// view under `/proc/self/fd`; the other supported Unix targets, including
-    /// macOS, provide it under `/dev/fd`. Every Git subprocess and dream
-    /// writer uses this spelling, so a later rename or replacement of the
-    /// diagnostic pathname cannot redirect the transaction to a new KB root.
+    /// Unix reads the directory's spelling back from the retained descriptor
+    /// and proves it still names that object; the root keeps its own
+    /// duplicate of the descriptor for every descriptor-relative operation.
+    /// A root that was unlinked or cannot be read back fails closed.
     #[cfg(unix)]
-    fn mutation_root(&self) -> PathBuf {
+    fn mutation_root(&self) -> Result<KnowledgeMutationRoot> {
         use std::os::fd::AsRawFd as _;
 
-        #[cfg(target_os = "linux")]
-        let descriptor_directory = "/proc/self/fd";
-        #[cfg(not(target_os = "linux"))]
-        let descriptor_directory = "/dev/fd";
-        PathBuf::from(format!(
-            "{descriptor_directory}/{}",
-            self.directory.as_raw_fd()
-        ))
+        let path =
+            cockpit_host::private_fs::held_fd::verified_directory_path(self.directory.as_raw_fd())
+                .with_context(|| {
+                    format!(
+                        "reading back the knowledge base root retained for {}",
+                        self.root.display()
+                    )
+                })?;
+        Ok(KnowledgeMutationRoot {
+            path,
+            directory: self
+                .directory
+                .try_clone()
+                .context("duplicating the retained knowledge base root")?,
+        })
     }
 
-    /// Windows keeps a no-delete lease while operations use the selected
-    /// pathname. Unix always uses the descriptor-bound path above.
-    #[cfg(windows)]
-    fn mutation_root(&self) -> PathBuf {
-        self.root.clone()
+    /// The root for keeping in-tree index sidecars out of Git.
+    ///
+    /// That step needs no pathname for any filesystem operation: Git starts
+    /// inside the retained object (`fchdir`), and the exclusion file is
+    /// opened relative to it (or at the absolute path Git reports). So on a
+    /// Unix without descriptor read-back, where [`Self::mutation_root`] fails
+    /// closed, the fence's selected spelling serves as the root's label for
+    /// diagnostics and the Git launch gate, and indexing keeps working. Where
+    /// read-back exists, this is exactly the verified mutation root, and any
+    /// other read-back failure (an unlinked root) still fails closed.
+    #[cfg(unix)]
+    fn gitignore_root(&self) -> Result<KnowledgeMutationRoot> {
+        use std::os::fd::AsRawFd as _;
+
+        let path = match cockpit_host::private_fs::held_fd::verified_directory_path(
+            self.directory.as_raw_fd(),
+        ) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => self.root.clone(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "reading back the knowledge base root retained for {}",
+                        self.root.display()
+                    )
+                });
+            }
+        };
+        Ok(KnowledgeMutationRoot {
+            path,
+            directory: self
+                .directory
+                .try_clone()
+                .context("duplicating the retained knowledge base root")?,
+        })
     }
+
+    #[cfg(windows)]
+    fn gitignore_root(&self) -> Result<KnowledgeMutationRoot> {
+        self.mutation_root()
+    }
+
+    /// Windows keeps a no-delete lease on the selected spelling for as long
+    /// as this lock lives, so the transaction root is that leased pathname.
+    #[cfg(windows)]
+    fn mutation_root(&self) -> Result<KnowledgeMutationRoot> {
+        Ok(KnowledgeMutationRoot {
+            path: self.root.clone(),
+            directory: self
+                .directory
+                .try_clone()
+                .context("duplicating the retained knowledge base root")?,
+        })
+    }
+}
+
+/// The transaction root of one knowledge mutation: the directory object the
+/// process fence retained, never a pathname looked up again.
+///
+/// On Unix every consumer is bound to that object. Git subprocesses start
+/// inside it (`fchdir` between fork and exec), the OKF bundle is parsed
+/// through it, root-level dream writes and their rollback are `openat`
+/// relative to it, and Git-reported paths inside the repository are opened
+/// relative to it. A rename or replacement of the KB pathname during the
+/// transaction therefore cannot redirect Git or a model write to another
+/// directory. This is the same object binding the former `/proc/self/fd/N`
+/// spelling provided on Linux, and it needs no descriptor-directory view, so
+/// it holds on macOS as well (whose `/dev/fd/N` cannot be traversed).
+///
+/// `path` is the spelling read back from the descriptor and verified to name
+/// it when the root was taken. It is used only where a real pathname is
+/// inherent: comparing the root with Git's reported worktree, sidecar
+/// identities, isolated Git index/hook artifacts that Git itself reopens by
+/// name, and diagnostics. Each of those resolved a real pathname on Linux
+/// before as well (procfs spellings canonicalize to the real path).
+///
+/// Windows has no descriptor-relative namespace for these consumers; the
+/// process lock holds a no-delete lease on the selected spelling for the
+/// whole transaction, so `path` is that spelling and operations use it.
+pub(crate) struct KnowledgeMutationRoot {
+    path: PathBuf,
+    directory: fs::File,
+}
+
+impl KnowledgeMutationRoot {
+    /// The verified spelling (Unix) or leased spelling (Windows).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The retained directory object.
+    pub(crate) fn directory(&self) -> &fs::File {
+        &self.directory
+    }
+
+    fn git_cwd(&self) -> crate::git::GitCwd<'_> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
+            crate::git::GitCwd::Held {
+                path: &self.path,
+                directory: self.directory.as_fd(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            crate::git::GitCwd::Path(&self.path)
+        }
+    }
+
+    /// Parse the OKF bundle through the retained directory.
+    ///
+    /// Each parse enumerates a fresh open of the retained object (`openat`
+    /// of `.` on Unix). Duplicated descriptors share one directory offset,
+    /// so enumerating the retained descriptor itself would make a second
+    /// parse in the same transaction miss every entry the first one read.
+    pub(crate) fn parse_bundle(&self) -> Result<KnowledgeBundle> {
+        #[cfg(unix)]
+        let directory = {
+            use std::os::fd::AsRawFd as _;
+            cockpit_host::private_fs::held_fd::openat(
+                self.directory.as_raw_fd(),
+                c".",
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+            .context("reopening the retained knowledge base root")?
+        };
+        // The process lock's no-delete lease keeps this spelling bound to
+        // the retained object for the whole transaction.
+        #[cfg(not(unix))]
+        let directory = cockpit_config::config::open_config_directory_nofollow(&self.path)?;
+        parse_bundle_from_retained_root(self.path.clone(), &directory)
+    }
+
+    /// Bounded read of one regular file directly beneath the root. Absence is
+    /// `Ok(None)`; a symlink, a non-regular file, or an over-cap file fails.
+    pub(crate) fn read_root_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        validate_knowledge_root_leaf(name)?;
+        let cap = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let file = match cockpit_host::private_fs::held_fd::openat(
+                self.directory.as_raw_fd(),
+                &knowledge_root_leaf_cstring(name)?,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("opening knowledge file {name}"));
+                }
+            };
+            ensure!(
+                file.metadata()?.is_file(),
+                "knowledge file {name} is not a regular file"
+            );
+            cockpit_host::bounded::read_reader_at_most(file, cap, "knowledge file")
+                .map(Some)
+                .with_context(|| format!("reading knowledge file {name}"))
+        }
+        #[cfg(not(unix))]
+        {
+            match cockpit_host::bounded::read_at_most(&self.path.join(name), cap) {
+                Ok(contents) => Ok(Some(contents)),
+                Err(cockpit_host::bounded::BoundedIoError::Io(error))
+                    if error.kind() == io::ErrorKind::NotFound =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(anyhow::Error::from(error))
+                    .with_context(|| format!("reading knowledge file {name}")),
+            }
+        }
+    }
+
+    /// Create or truncate one file directly beneath the root and write
+    /// `contents`, never following a symlink at `name`.
+    pub(crate) fn write_root_file(&self, name: &str, contents: &[u8]) -> Result<()> {
+        validate_knowledge_root_leaf(name)?;
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::fd::AsRawFd as _;
+            cockpit_host::private_fs::held_fd::openat_mode(
+                self.directory.as_raw_fd(),
+                &knowledge_root_leaf_cstring(name)?,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o666,
+            )
+            .with_context(|| format!("opening knowledge file {name} for writing"))?
+        };
+        #[cfg(not(unix))]
+        let mut file = {
+            fs::File::create(self.path.join(name))
+                .with_context(|| format!("opening knowledge file {name} for writing"))?
+        };
+        file.write_all(contents)
+            .with_context(|| format!("writing knowledge file {name}"))
+    }
+
+    /// Remove one file directly beneath the root. Absence is not an error.
+    pub(crate) fn remove_root_file(&self, name: &str) -> Result<()> {
+        validate_knowledge_root_leaf(name)?;
+        #[cfg(unix)]
+        let removed = {
+            use std::os::fd::AsRawFd as _;
+            cockpit_host::private_fs::held_fd::unlinkat(
+                self.directory.as_raw_fd(),
+                &knowledge_root_leaf_cstring(name)?,
+                0,
+            )
+        };
+        #[cfg(not(unix))]
+        let removed = { fs::remove_file(self.path.join(name)) };
+        match removed {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing knowledge file {name}")),
+        }
+    }
+
+    /// Open a path Git reported relative to its starting directory (for
+    /// example `.git/info/exclude`) through the retained root. Git starts
+    /// inside the retained root, so a relative report names a descendant of
+    /// that object; resolving it by `openat` keeps it there. An absolute
+    /// report names a repository outside the root (a `gitdir:` link) and is
+    /// opened as reported, exactly as Git itself does (`openat` ignores the
+    /// directory descriptor for an absolute path).
+    ///
+    /// Always non-blocking, so a FIFO planted at either kind of name cannot
+    /// stall the transaction while the process fence is held; callers check
+    /// the file type before reading.
+    fn open_git_reported(&self, reported: &Path) -> io::Result<fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            cockpit_host::private_fs::held_fd::openat(
+                self.directory.as_raw_fd(),
+                &git_reported_cstring(reported)?,
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            if reported.is_absolute() {
+                return fs::File::open(reported);
+            }
+            fs::File::open(self.path.join(reported))
+        }
+    }
+
+    /// Whether a Git-reported path names a regular file (symlinks followed,
+    /// as Git follows them). A `stat`, never an open: a hook Git can execute
+    /// need not be readable (mode `0111`), and a FIFO is simply not a file.
+    fn git_reported_is_file(&self, reported: &Path) -> io::Result<bool> {
+        #[cfg(unix)]
+        let metadata = {
+            use std::os::fd::AsRawFd as _;
+            cockpit_host::private_fs::held_fd::fstatat_follow(
+                self.directory.as_raw_fd(),
+                &git_reported_cstring(reported)?,
+            )
+            .map(|stat| (stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+        };
+        #[cfg(not(unix))]
+        let metadata = if reported.is_absolute() {
+            fs::metadata(reported)
+        } else {
+            fs::metadata(self.path.join(reported))
+        }
+        .map(|metadata| metadata.is_file());
+        match metadata {
+            Ok(is_file) => Ok(is_file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Bounded UTF-8 read of a Git-reported path; absence is `Ok(None)`.
+    fn read_git_reported_text(&self, reported: &Path) -> Result<Option<String>> {
+        let file = match self.open_git_reported(reported) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            file.metadata()?.is_file(),
+            "{} is not a regular file",
+            reported.display()
+        );
+        let cap = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes;
+        let bytes = cockpit_host::bounded::read_reader_at_most(file, cap, "file")?;
+        Ok(Some(String::from_utf8(bytes).map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidData, error)
+        })?))
+    }
+
+    /// Append to (creating if absent) a Git-reported path.
+    fn append_git_reported(&self, reported: &Path, contents: &[u8]) -> Result<()> {
+        // Non-blocking and type-checked before writing, for the same reason
+        // as `open_git_reported`; relative reports stay on the retained root.
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::fd::AsRawFd as _;
+            let file = cockpit_host::private_fs::held_fd::openat_mode(
+                self.directory.as_raw_fd(),
+                &git_reported_cstring(reported)?,
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_APPEND
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o666,
+            )?;
+            ensure!(
+                file.metadata()?.is_file(),
+                "{} is not a regular file",
+                reported.display()
+            );
+            file
+        };
+        #[cfg(not(unix))]
+        let mut file =
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(if reported.is_absolute() {
+                    reported.to_path_buf()
+                } else {
+                    self.path.join(reported)
+                })?;
+        file.write_all(contents)?;
+        file.sync_data()?;
+        Ok(())
+    }
+
+    /// The canonical pathname of a directory Git reported, resolved through
+    /// the retained root and verified to name the opened object. Git reopens
+    /// artifacts beneath it by name, so a pathname is inherent here.
+    fn git_reported_directory_path(&self, reported: &Path) -> Result<PathBuf> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let directory = self
+                .open_git_reported(reported)
+                .with_context(|| format!("opening {}", reported.display()))?;
+            ensure!(
+                directory.metadata()?.is_dir(),
+                "{} is not a directory",
+                reported.display()
+            );
+            Ok(cockpit_host::private_fs::held_fd::verified_directory_path(
+                directory.as_raw_fd(),
+            )?)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = if reported.is_absolute() {
+                reported.to_path_buf()
+            } else {
+                self.path.join(reported)
+            };
+            Ok(fs::canonicalize(&path)?)
+        }
+    }
+}
+
+/// A Git-reported path as a C string for descriptor-relative calls.
+#[cfg(unix)]
+fn git_reported_cstring(reported: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(reported.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Git path has NUL"))
+}
+
+/// A validated root-level file name as a C string.
+#[cfg(unix)]
+fn knowledge_root_leaf_cstring(name: &str) -> Result<std::ffi::CString> {
+    std::ffi::CString::new(name).context("knowledge file name has NUL")
+}
+
+fn validate_knowledge_root_leaf(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    ensure!(
+        matches!(components.next(), Some(std::path::Component::Normal(leaf)) if leaf == std::ffi::OsStr::new(name))
+            && components.next().is_none(),
+        "knowledge file `{name}` must be a single file at the knowledge-base root"
+    );
+    Ok(())
 }
 
 impl Drop for SidecarProcessLock {
@@ -796,7 +1195,7 @@ async fn snapshot_bundle_with_sidecar_fence(
 ) -> Result<(KnowledgeBundle, SidecarProcessLock)> {
     let process_lock = acquire_process_sidecar_lock(sidecars).await?;
     let bundle =
-        parse_bundle_from_retained_root(sidecars.root().to_path_buf(), process_lock.directory())?;
+        parse_bundle_from_retained_root(sidecars.root().to_path_buf(), &process_lock.directory)?;
     Ok((bundle, process_lock))
 }
 
@@ -836,42 +1235,31 @@ impl SidecarProcessLock {
     }
 }
 
-fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> {
-    // Sidecars were canonicalized for lock identity. Resolve the KB root the
-    // same way before deciding which artifacts are inside a Git worktree.
-    // Assistant snapshot roots are synthetic (`assistant://...`) and simply
-    // remain outside their private cache sidecars.
-    let sidecar_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let sidecar_paths: Vec<_> = [&sidecars.embeddings, &sidecars.index]
-        .into_iter()
-        .filter_map(|path| path.strip_prefix(&sidecar_root).ok())
-        .collect();
-    // Assistant sidecars deliberately live in Flycockpit's private cache, not
-    // in the installed assistant bundle. There is nothing in that source tree
-    // to ignore in this case.
-    if sidecar_paths.is_empty() {
-        return Ok(());
-    }
-    let prefix_probe = crate::git::run_git(root, &["rev-parse", "--show-prefix"])
+/// Keep a knowledge base's own machine state out of its Git worktree.
+///
+/// Only for sidecars that live in the retained source root
+/// ([`KbSidecars::in_root`]); sidecars in Flycockpit's private cache are
+/// outside every source tree and never call this. The rules are derived from
+/// the fixed root-relative sidecar names, not from comparing pathnames, so a
+/// root renamed after its fence was taken cannot make this a silent no-op:
+/// every step is performed on the retained object or fails closed.
+fn ensure_sidecars_gitignored(root: &KnowledgeMutationRoot) -> Result<()> {
+    let sidecar_paths = [Path::new(EMBEDDINGS_FILE), Path::new(INDEX_FILE)];
+    let prefix_probe = knowledge_git(root, &["rev-parse", "--show-prefix"])
         .context("running Git to protect knowledge sidecars")?;
-    let Some(prefix) = git_worktree_prefix(root, prefix_probe)? else {
+    let Some(prefix) = git_worktree_prefix(root.path(), prefix_probe)? else {
         return Ok(());
     };
-    let exclude = crate::git::run_git(root, &["rev-parse", "--git-path", "info/exclude"])
+    let exclude = knowledge_git(root, &["rev-parse", "--git-path", "info/exclude"])
         .context("locating local knowledge repository exclusion file")?;
     if !exclude.success {
         bail!(
             "locating Git exclusion file for local knowledge base {} failed: {}",
-            root.display(),
+            root.path().display(),
             exclude.stderr.trim()
         );
     }
     let exclude_path = PathBuf::from(exclude.stdout.trim());
-    let exclude_path = if exclude_path.is_absolute() {
-        exclude_path
-    } else {
-        root.join(exclude_path)
-    };
     let prefix = prefix.trim().trim_matches('/');
     let root_prefix = if prefix.is_empty() {
         String::new()
@@ -911,7 +1299,7 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
     for path in protected_paths {
         let repository_path = format!("{root_prefix}{path}");
         let repository_pathspec = format!(":(top){repository_path}");
-        let tracked = crate::git::run_git(root, &["ls-files", "--", &repository_pathspec])
+        let tracked = knowledge_git(root, &["ls-files", "--", &repository_pathspec])
             .context("checking whether knowledge sidecar is tracked by Git")?;
         if !tracked.success {
             bail!(
@@ -927,26 +1315,18 @@ fn ensure_sidecars_gitignored(root: &Path, sidecars: &KbSidecars) -> Result<()> 
             );
         }
     }
-    let existing = match crate::resource_limits::read_project_text(&exclude_path) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => String::new(),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading Git exclusion file {}", exclude_path.display()));
-        }
-    };
+    let existing = root
+        .read_git_reported_text(&exclude_path)
+        .with_context(|| format!("reading Git exclusion file {}", exclude_path.display()))?
+        .unwrap_or_default();
     if !existing.contains(&rules) {
-        use std::io::Write as _;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&exclude_path)
-            .with_context(|| format!("opening Git exclusion file {}", exclude_path.display()))?;
+        let mut appended = String::new();
         if !existing.is_empty() && !existing.ends_with('\n') {
-            file.write_all(b"\n")?;
+            appended.push('\n');
         }
-        file.write_all(rules.as_bytes())?;
-        file.sync_data()?;
+        appended.push_str(&rules);
+        root.append_git_reported(&exclude_path, appended.as_bytes())
+            .with_context(|| format!("updating Git exclusion file {}", exclude_path.display()))?;
     }
 
     Ok(())
@@ -1140,7 +1520,7 @@ pub(crate) fn apply_knowledge_dream<F>(
     apply: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: FnOnce(&Path, &fs::File) -> Result<()>,
+    F: FnOnce(&KnowledgeMutationRoot) -> Result<()>,
 {
     apply_knowledge_dream_cancellable(root, merge_policy, dream, &CancellationToken::new(), apply)
 }
@@ -1157,7 +1537,7 @@ fn apply_knowledge_dream_cancellable<F>(
     apply: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: FnOnce(&Path, &fs::File) -> Result<()>,
+    F: FnOnce(&KnowledgeMutationRoot) -> Result<()>,
 {
     apply_knowledge_dream_cancellable_with_staging(
         root,
@@ -1178,7 +1558,7 @@ fn apply_knowledge_dream_cancellable_with_staging<F>(
     apply: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: FnOnce(&Path, &fs::File) -> Result<()>,
+    F: FnOnce(&KnowledgeMutationRoot) -> Result<()>,
 {
     fs::create_dir_all(root)
         .with_context(|| format!("creating local knowledge base {}", root.display()))?;
@@ -1187,7 +1567,7 @@ where
     // the same OKF files concurrently.
     let process_lock = acquire_knowledge_write_process_lock_cancellable(root, cancel)?;
     process_lock.revalidate_root()?;
-    let mutation_root = process_lock.mutation_root();
+    let mutation_root = process_lock.mutation_root()?;
     let prepared = prepare_knowledge_git(
         &mutation_root,
         merge_policy,
@@ -1239,15 +1619,14 @@ where
         PreparedKnowledgeGit::Deferred(_) => unreachable!("deferred preparation returned early"),
     };
 
-    // The supplied path is descriptor-bound on Linux and has been proven to
-    // name the held root everywhere else. The retained descriptor is passed
-    // alongside it so a mutation that needs to traverse descendants can keep
-    // every component-relative operation beneath the admitted root.
+    // The mutation receives the retained root itself: its reads, writes, and
+    // any traversal of descendants stay component-relative beneath the
+    // admitted directory object.
     if cancel.is_cancelled() {
         bail!("knowledge dream write cancelled before applying model output");
     }
     process_lock.revalidate_root()?;
-    let applied = apply(&mutation_root, process_lock.directory());
+    let applied = apply(&mutation_root);
     if let Err(error) = applied {
         if matches!(&prepared, PreparedKnowledgeGit::Active { .. })
             && let Err(cleanup_error) = restore_knowledge_dream_worktree(&mutation_root)
@@ -1325,16 +1704,16 @@ where
 }
 
 fn prepare_knowledge_git(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     merge_policy: KnowledgeBaseMergePolicy,
     knowledge_base_id: &str,
     origin: KnowledgeCommitOrigin,
 ) -> PreparedKnowledgeGit {
-    let probe = match crate::git::run_git(root, &["rev-parse", "--show-toplevel"]) {
+    let probe = match knowledge_git(root, &["rev-parse", "--show-toplevel"]) {
         Ok(probe) => probe,
         Err(error) => return PreparedKnowledgeGit::Skipped(format!("Git is unavailable: {error}")),
     };
-    let root_identity = match fs::canonicalize(root) {
+    let root_identity = match fs::canonicalize(root.path()) {
         Ok(identity) => identity,
         Err(error) => {
             return PreparedKnowledgeGit::Deferred(format!(
@@ -1350,7 +1729,7 @@ fn prepare_knowledge_git(
         // A KB nested in a user project must become a nested repository of
         // its own. Never fetch, checkout, or commit through the enclosing
         // worktree just because Git happened to find it from this path.
-        let initialized = match crate::git::run_git(root, &["init", "-q"]) {
+        let initialized = match knowledge_git(root, &["init", "-q"]) {
             Ok(initialized) => initialized,
             Err(error) => {
                 return PreparedKnowledgeGit::Skipped(format!("Git is unavailable: {error}"));
@@ -1362,7 +1741,7 @@ fn prepare_knowledge_git(
                 initialized.stderr.trim()
             ));
         }
-        let main = match crate::git::run_git(root, &["symbolic-ref", "HEAD", "refs/heads/main"]) {
+        let main = match knowledge_git(root, &["symbolic-ref", "HEAD", "refs/heads/main"]) {
             Ok(main) => main,
             Err(error) => {
                 return PreparedKnowledgeGit::Deferred(format!(
@@ -1378,15 +1757,7 @@ fn prepare_knowledge_git(
         }
     }
 
-    let sidecars = match KbSidecars::in_root(root).canonicalized() {
-        Ok(sidecars) => sidecars,
-        Err(error) => {
-            return PreparedKnowledgeGit::Deferred(format!(
-                "resolving knowledge machine-state paths failed: {error}"
-            ));
-        }
-    };
-    if let Err(error) = ensure_sidecars_gitignored(root, &sidecars) {
+    if let Err(error) = ensure_sidecars_gitignored(root) {
         return PreparedKnowledgeGit::Deferred(format!(
             "protecting knowledge machine state from Git failed: {error}"
         ));
@@ -1509,7 +1880,7 @@ fn prepare_knowledge_git(
 }
 
 fn commit_knowledge_dream(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     branch: &str,
     remote: Option<&str>,
     dream: &KnowledgeDreamCommit,
@@ -1586,15 +1957,15 @@ fn commit_knowledge_dream(
 /// the descriptor-validated publication even when an unrelated process races
 /// the working tree after validation.
 fn commit_exact_knowledge_file(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     branch: &str,
     remote: Option<&str>,
     dream: &KnowledgeDreamCommit,
     relative_path: &Path,
     content: &[u8],
 ) -> Result<KnowledgeDreamGitOutcome> {
-    let blob = match crate::git::run_git_checked_with_input(
-        root,
+    let blob = match crate::git::run_git_checked_with_input_in(
+        root.git_cwd(),
         &["hash-object", "-w", "--stdin"],
         content,
     ) {
@@ -1703,7 +2074,7 @@ fn commit_exact_knowledge_file(
 /// index so neither a hook nor another Git process can add an unvalidated
 /// entry to the human commit. The normal worktree path retains `--only`.
 fn commit_staged_knowledge_dream(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     branch: &str,
     remote: Option<&str>,
     dream: &KnowledgeDreamCommit,
@@ -1791,7 +2162,7 @@ fn commit_staged_knowledge_dream(
             committed.stderr.trim().to_string(),
         );
     }
-    let commit = match crate::git::head_sha(root) {
+    let commit = match knowledge_git_head(root) {
         Ok(commit) => commit,
         Err(error) => {
             return Ok(deferred_after_knowledge_commit(
@@ -1857,7 +2228,7 @@ fn commit_staged_knowledge_dream(
             error.to_string(),
         ));
     }
-    let rebased_commit = match crate::git::head_sha(root) {
+    let rebased_commit = match knowledge_git_head(root) {
         Ok(commit) => commit,
         Err(error) => {
             return Ok(deferred_after_knowledge_commit(
@@ -1900,7 +2271,7 @@ fn commit_staged_knowledge_dream(
 /// clean, so every tracked or untracked non-ignored path created here belongs
 /// to this failed dream attempt (including a hook side effect). Ignored
 /// machine-local sidecars deliberately survive `git clean`.
-fn restore_knowledge_dream_worktree(root: &Path) -> Result<()> {
+fn restore_knowledge_dream_worktree(root: &KnowledgeMutationRoot) -> Result<()> {
     let reset = knowledge_git(root, &["reset", "--hard", "HEAD"])?;
     if !reset.success {
         bail!(
@@ -1922,7 +2293,7 @@ fn restore_knowledge_dream_worktree(root: &Path) -> Result<()> {
 }
 
 fn deferred_knowledge_dream_after_rollback(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     branch: &str,
     operation: &str,
     failure: String,
@@ -1959,18 +2330,15 @@ fn deferred_after_knowledge_commit(
 }
 
 fn knowledge_git_with_index(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     index: &KnowledgeGitCommitIndex<'_>,
     args: &[&str],
 ) -> Result<crate::git::GitOutcome> {
-    match index.environment() {
-        Some(environment) => crate::git::run_git_with_env(root, args, &[environment]),
-        None => crate::git::run_git(root, args),
-    }
-    .with_context(|| format!("running knowledge Git command `git {}`", args.join(" ")))
+    crate::git::run_git_in(root.git_cwd(), args, index.environment().as_slice())
+        .with_context(|| format!("running knowledge Git command `git {}`", args.join(" ")))
 }
 
-fn knowledge_git_dir(root: &Path) -> Result<PathBuf> {
+fn knowledge_git_dir(root: &KnowledgeMutationRoot) -> Result<PathBuf> {
     let git_dir = knowledge_git(root, &["rev-parse", "--git-dir"])?;
     if !git_dir.success {
         bail!(
@@ -1979,12 +2347,7 @@ fn knowledge_git_dir(root: &Path) -> Result<PathBuf> {
         );
     }
     let git_dir = PathBuf::from(git_dir.stdout.trim());
-    let git_dir = if git_dir.is_absolute() {
-        git_dir
-    } else {
-        root.join(git_dir)
-    };
-    fs::canonicalize(&git_dir).with_context(|| {
+    root.git_reported_directory_path(&git_dir).with_context(|| {
         format!(
             "resolving the knowledge Git directory {}",
             git_dir.display()
@@ -1992,7 +2355,10 @@ fn knowledge_git_dir(root: &Path) -> Result<PathBuf> {
     })
 }
 
-fn run_knowledge_pre_commit_hook(root: &Path, index: &KnowledgeGitCommitIndex<'_>) -> Result<()> {
+fn run_knowledge_pre_commit_hook(
+    root: &KnowledgeMutationRoot,
+    index: &KnowledgeGitCommitIndex<'_>,
+) -> Result<()> {
     let KnowledgeGitCommitIndex::ExactFile { .. } = index else {
         return Ok(());
     };
@@ -2004,12 +2370,12 @@ fn run_knowledge_pre_commit_hook(root: &Path, index: &KnowledgeGitCommitIndex<'_
         );
     }
     let hook = PathBuf::from(hook.stdout.trim());
-    let hook = if hook.is_absolute() {
-        hook
-    } else {
-        root.join(hook)
-    };
-    if !hook.is_file() {
+    if !root.git_reported_is_file(&hook).with_context(|| {
+        format!(
+            "inspecting the knowledge pre-commit hook {}",
+            hook.display()
+        )
+    })? {
         return Ok(());
     }
     let outcome = knowledge_git_with_index(root, index, &["hook", "run", "pre-commit"])?;
@@ -2020,7 +2386,7 @@ fn run_knowledge_pre_commit_hook(root: &Path, index: &KnowledgeGitCommitIndex<'_
 }
 
 fn validate_exact_knowledge_git_index(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     index: &KnowledgeGitCommitIndex<'_>,
 ) -> Result<()> {
     let KnowledgeGitCommitIndex::ExactFile {
@@ -2066,7 +2432,7 @@ fn validate_exact_knowledge_git_index(
 }
 
 fn stage_exact_knowledge_file_in_primary_index(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     relative_path: &Path,
     blob: &str,
 ) -> Result<()> {
@@ -2081,8 +2447,8 @@ fn stage_exact_knowledge_file_in_primary_index(
     Ok(())
 }
 
-fn versioned_knowledge_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
-    let bundle = parse_bundle(root)?;
+fn versioned_knowledge_paths(root: &KnowledgeMutationRoot) -> Result<BTreeSet<PathBuf>> {
+    let bundle = root.parse_bundle()?;
     let mut paths = BTreeSet::new();
     if bundle.index_md.is_some() {
         paths.insert(PathBuf::from("index.md"));
@@ -2098,7 +2464,10 @@ fn versioned_knowledge_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
 /// Record the KB's pre-dream source state separately from dream output. This
 /// runs only for a newly initialized repository, before the dream callback,
 /// so ordinary local edits cannot be silently attributed to that dream.
-fn initialize_knowledge_git_history(root: &Path, knowledge_base_id: &str) -> Result<()> {
+fn initialize_knowledge_git_history(
+    root: &KnowledgeMutationRoot,
+    knowledge_base_id: &str,
+) -> Result<()> {
     let paths = versioned_knowledge_paths(root)?;
     if !paths.is_empty() {
         let mut add_args = vec!["add".to_string(), "--".to_string()];
@@ -2186,12 +2555,20 @@ fn dream_outcome_commit(outcome: &KnowledgeDreamGitOutcome) -> Option<String> {
     }
 }
 
-fn knowledge_git(root: &Path, args: &[&str]) -> Result<crate::git::GitOutcome> {
-    crate::git::run_git(root, args)
+fn knowledge_git(root: &KnowledgeMutationRoot, args: &[&str]) -> Result<crate::git::GitOutcome> {
+    crate::git::run_git_in(root.git_cwd(), args, &[])
         .with_context(|| format!("running knowledge Git command `git {}`", args.join(" ")))
 }
 
-fn knowledge_git_branch(root: &Path) -> Result<String> {
+fn knowledge_git_head(root: &KnowledgeMutationRoot) -> Result<String> {
+    let head = knowledge_git(root, &["rev-parse", "HEAD"])?;
+    if !head.success {
+        bail!("`git rev-parse HEAD` failed: {}", head.stderr.trim());
+    }
+    Ok(head.stdout.trim().to_string())
+}
+
+fn knowledge_git_branch(root: &KnowledgeMutationRoot) -> Result<String> {
     let branch = knowledge_git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     if !branch.success {
         bail!("knowledge repository has no writable branch");
@@ -2207,7 +2584,7 @@ fn knowledge_git_branch(root: &Path) -> Result<String> {
 /// review proposal unable to become the base of a later auto or review run.
 /// Older repositories without `main` retain their current checked-out branch
 /// as the explicit fallback rather than guessing at a branch name.
-fn knowledge_git_base_branch(root: &Path, current_branch: &str) -> Result<String> {
+fn knowledge_git_base_branch(root: &KnowledgeMutationRoot, current_branch: &str) -> Result<String> {
     let main = knowledge_git(
         root,
         &["show-ref", "--verify", "--quiet", "refs/heads/main"],
@@ -2218,7 +2595,7 @@ fn knowledge_git_base_branch(root: &Path, current_branch: &str) -> Result<String
     Ok(current_branch.to_string())
 }
 
-fn restore_knowledge_branch(root: &Path, branch: &str) -> Result<()> {
+fn restore_knowledge_branch(root: &KnowledgeMutationRoot, branch: &str) -> Result<()> {
     let checkout = knowledge_git(root, &["checkout", "-q", branch])?;
     if !checkout.success {
         bail!(
@@ -2229,7 +2606,7 @@ fn restore_knowledge_branch(root: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn knowledge_git_remote(root: &Path) -> Result<Option<String>> {
+fn knowledge_git_remote(root: &KnowledgeMutationRoot) -> Result<Option<String>> {
     let remote = knowledge_git(root, &["remote", "get-url", "origin"])?;
     if !remote.success {
         return Ok(None);
@@ -2237,11 +2614,11 @@ fn knowledge_git_remote(root: &Path) -> Result<Option<String>> {
     Ok(Some("origin".to_string()))
 }
 
-fn knowledge_git_has_head(root: &Path) -> Result<bool> {
+fn knowledge_git_has_head(root: &KnowledgeMutationRoot) -> Result<bool> {
     Ok(knowledge_git(root, &["rev-parse", "--verify", "--quiet", "HEAD"])?.success)
 }
 
-fn knowledge_git_worktree_clean(root: &Path) -> Result<bool> {
+fn knowledge_git_worktree_clean(root: &KnowledgeMutationRoot) -> Result<bool> {
     let status = knowledge_git(root, &["status", "--porcelain=v1"])?;
     if !status.success {
         bail!(
@@ -2252,7 +2629,7 @@ fn knowledge_git_worktree_clean(root: &Path) -> Result<bool> {
     Ok(status.stdout.trim().is_empty())
 }
 
-fn knowledge_git_fetch(root: &Path, remote: &str) -> Result<()> {
+fn knowledge_git_fetch(root: &KnowledgeMutationRoot, remote: &str) -> Result<()> {
     let fetched = knowledge_git(root, &["fetch", "--prune", remote])?;
     if !fetched.success {
         bail!(
@@ -2263,7 +2640,11 @@ fn knowledge_git_fetch(root: &Path, remote: &str) -> Result<()> {
     Ok(())
 }
 
-fn knowledge_git_remote_ref(root: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+fn knowledge_git_remote_ref(
+    root: &KnowledgeMutationRoot,
+    remote: &str,
+    branch: &str,
+) -> Result<Option<String>> {
     let reference = format!("refs/remotes/{remote}/{branch}");
     let found = knowledge_git(root, &["rev-parse", "--verify", "--quiet", &reference])?;
     if found.success {
@@ -2274,7 +2655,7 @@ fn knowledge_git_remote_ref(root: &Path, remote: &str, branch: &str) -> Result<O
 }
 
 fn knowledge_git_rebase_remote_branch(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     remote: &str,
     branch: &str,
     has_head: bool,
@@ -2309,7 +2690,11 @@ fn knowledge_git_rebase_remote_branch(
     )
 }
 
-fn knowledge_git_push(root: &Path, remote: &str, branch: &str) -> Result<crate::git::GitOutcome> {
+fn knowledge_git_push(
+    root: &KnowledgeMutationRoot,
+    remote: &str,
+    branch: &str,
+) -> Result<crate::git::GitOutcome> {
     let destination = format!("HEAD:refs/heads/{branch}");
     knowledge_git(root, &["push", remote, &destination])
 }
@@ -2321,7 +2706,7 @@ fn knowledge_git_push(root: &Path, remote: &str, branch: &str) -> Result<crate::
 /// pushed by explicit refspec without checking them out or rebasing them onto
 /// a newly accepted base.
 fn synchronize_pending_knowledge_dream_pushes(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     remote: &str,
     base_branch: &str,
     knowledge_base_id: &str,
@@ -2369,7 +2754,7 @@ fn synchronize_pending_knowledge_dream_pushes(
 }
 
 fn synchronize_pending_knowledge_base_branch(
-    root: &Path,
+    root: &KnowledgeMutationRoot,
     remote: &str,
     branch: &str,
 ) -> Result<()> {
@@ -2391,7 +2776,11 @@ fn synchronize_pending_knowledge_base_branch(
     Ok(())
 }
 
-fn knowledge_git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+fn knowledge_git_is_ancestor(
+    root: &KnowledgeMutationRoot,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool> {
     let check = knowledge_git(root, &["merge-base", "--is-ancestor", ancestor, descendant])?;
     if check.success {
         return Ok(true);
@@ -2489,9 +2878,17 @@ impl KbProvider for LocalKb {
             .clone()
             .context("local knowledge search requires a retained knowledge snapshot")?;
         let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+        // Decided from the registry's placement, not a live lookup: sidecars
+        // beside the source root must be Git-excluded or the search fails.
+        let placement = if self.sidecars.root() == self.root {
+            SidecarPlacement::InSourceTree
+        } else {
+            SidecarPlacement::PrivateCache
+        };
         let (index, _) = KnowledgeIndex::open_snapshot_locked(
             snapshot.clone(),
             sidecars,
+            placement,
             &process_lock,
             embedder,
             Some(query_vector.len()),
@@ -2554,7 +2951,7 @@ impl KbProvider for LocalKb {
             self.entry.merge_policy,
             dream,
             cancel,
-            |root, _| mutation.apply(root),
+            |root| mutation.apply(root),
         )
     }
 
@@ -2617,19 +3014,12 @@ impl KbProvider for RemoteKb {
     }
 }
 
+/// Parse the bundle at a pathname, walking it without following symlinks.
+/// Production readers parse through a retained root
+/// ([`KnowledgeMutationRoot::parse_bundle`] or a fenced snapshot).
+#[cfg(test)]
 pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
     let root = root.as_ref().to_path_buf();
-    // Dream transactions deliberately use a descriptor-bound root on Unix so
-    // no pathname replacement can redirect Git or model writes. The Linux
-    // procfs descriptor spelling is a capability view, not a caller-controlled
-    // symlink path, so duplicate that held directory instead of passing its
-    // magic link through the normal no-follow pathname walker.
-    #[cfg(target_os = "linux")]
-    if root.starts_with("/proc/self/fd/") {
-        let handle = fs::File::open(&root)
-            .with_context(|| format!("duplicating retained knowledge root {}", root.display()))?;
-        return parse_bundle_from_retained_root(root, &handle);
-    }
     let handle = cockpit_config::config::open_config_directory_nofollow(&root)?;
     parse_bundle_from_retained_root(root, &handle)
 }
@@ -3031,8 +3421,15 @@ impl KnowledgeIndex {
         // A replacement of the root can therefore only be observed by the
         // next rebuild; it cannot receive this rebuild's old projection.
         let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await?;
-        Self::open_snapshot_locked(bundle, sidecars, &process_lock, embedder, query_dimensions)
-            .await
+        Self::open_snapshot_locked(
+            bundle,
+            sidecars,
+            SidecarPlacement::InSourceTree,
+            &process_lock,
+            embedder,
+            query_dimensions,
+        )
+        .await
     }
 
     /// Caller must hold the per-KB sidecar lock and the process fence that was
@@ -3043,6 +3440,7 @@ impl KnowledgeIndex {
     async fn open_snapshot_locked(
         bundle: KnowledgeBundle,
         sidecars: KbSidecars,
+        placement: SidecarPlacement,
         process_lock: &SidecarProcessLock,
         embedder: Arc<dyn Embedder>,
         query_dimensions: Option<usize>,
@@ -3053,7 +3451,12 @@ impl KnowledgeIndex {
         // different daemon data directories serialize their paid work against
         // the same external KB. It also serializes the Git exclusion update
         // before either sidecar can be opened.
-        ensure_sidecars_gitignored(&bundle.root, &sidecars)?;
+        match placement {
+            SidecarPlacement::InSourceTree => {
+                ensure_sidecars_gitignored(&process_lock.gitignore_root()?)?;
+            }
+            SidecarPlacement::PrivateCache => {}
+        }
         let index = open_index_connection(&sidecars.index, process_lock)?;
         ensure_index_schema(&index)?;
         rebuild_index(&index, &bundle)?;
@@ -6020,7 +6423,7 @@ pub(crate) async fn apply_registered_knowledge_dream<F>(
     mutation: F,
 ) -> Result<KnowledgeDreamGitOutcome>
 where
-    F: Fn(&Path) -> Result<()> + Send + Sync + 'static,
+    F: Fn(&KnowledgeMutationRoot) -> Result<()> + Send + Sync + 'static,
 {
     if cancel.is_cancelled() {
         bail!("knowledge dream write cancelled before resolving its provider");
@@ -6169,7 +6572,8 @@ pub(crate) async fn apply_human_knowledge_concept_edit(
             &commit,
             &cancel,
             staging,
-            |root, directory| {
+            |root| {
+                let directory = root.directory();
                 let mutation = write_human_knowledge_concept_nofollow(
                     directory,
                     &target.relative_path,
@@ -6177,7 +6581,7 @@ pub(crate) async fn apply_human_knowledge_concept_edit(
                     expected_previous.as_deref(),
                 )?;
                 let applied = (|| {
-                    let bundle = parse_bundle_from_retained_root(root.to_path_buf(), directory)?;
+                    let bundle = root.parse_bundle()?;
                     if !bundle.concepts.iter().any(|concept| {
                         concept.path == target.relative_path
                             && concept.provenance() == Some("human")
@@ -7430,7 +7834,10 @@ fn is_knowledge_dream_concept_path(path: &str) -> bool {
     path.ends_with(".md") && !matches!(path, "index.md" | "log.md")
 }
 
-fn apply_knowledge_dream_writes(root: &Path, writes: &[KnowledgeDreamWrite]) -> Result<()> {
+fn apply_knowledge_dream_writes(
+    root: &KnowledgeMutationRoot,
+    writes: &[KnowledgeDreamWrite],
+) -> Result<()> {
     // Git provides the rollback boundary for a tracked KB.  Git is optional,
     // though, so preserve the exact pre-write file set here as well: a later
     // write failure or a failed OKF validation must not leave a Git-absent KB
@@ -7438,7 +7845,7 @@ fn apply_knowledge_dream_writes(root: &Path, writes: &[KnowledgeDreamWrite]) -> 
     let rollback = KnowledgeDreamWriteRollback::capture(root, writes)?;
     let applied = (|| {
         for write in writes {
-            fs::write(root.join(&write.path), &write.content)
+            root.write_root_file(&write.path, write.content.as_bytes())
                 .with_context(|| format!("writing dream output {}", write.path))?;
         }
         // Validate in the transaction callback so malformed model output is
@@ -7455,7 +7862,7 @@ fn apply_knowledge_dream_writes(root: &Path, writes: &[KnowledgeDreamWrite]) -> 
         Ok(())
     })();
     if let Err(error) = applied {
-        rollback.restore().with_context(|| {
+        rollback.restore(root).with_context(|| {
             format!("dream output apply failed ({error:#}) and restoring the pre-dream write set")
         })?;
         return Err(error);
@@ -7468,47 +7875,30 @@ fn apply_knowledge_dream_writes(root: &Path, writes: &[KnowledgeDreamWrite]) -> 
 /// captures precisely the paths the model is allowed to replace and never
 /// touches derived sidecars or unrelated user files.
 struct KnowledgeDreamWriteRollback {
-    root: PathBuf,
-    originals: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    originals: BTreeMap<String, Option<Vec<u8>>>,
 }
 
 impl KnowledgeDreamWriteRollback {
-    fn capture(root: &Path, writes: &[KnowledgeDreamWrite]) -> Result<Self> {
+    fn capture(root: &KnowledgeMutationRoot, writes: &[KnowledgeDreamWrite]) -> Result<Self> {
         let mut originals = BTreeMap::new();
         for write in writes {
-            let path = PathBuf::from(&write.path);
-            let target = root.join(&path);
-            let contents = match crate::resource_limits::read_for_tool(&target) {
-                Ok(contents) => Some(contents),
-                Err(error) if error.is_not_found() => None,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("capturing pre-dream output {}", write.path));
-                }
-            };
-            originals.insert(path, contents);
+            let contents = root
+                .read_root_file(&write.path)
+                .with_context(|| format!("capturing pre-dream output {}", write.path))?;
+            originals.insert(write.path.clone(), contents);
         }
-        Ok(Self {
-            root: root.to_path_buf(),
-            originals,
-        })
+        Ok(Self { originals })
     }
 
-    fn restore(self) -> Result<()> {
+    fn restore(self, root: &KnowledgeMutationRoot) -> Result<()> {
         for (path, contents) in self.originals {
-            let target = self.root.join(&path);
             match contents {
-                Some(contents) => fs::write(&target, contents)
-                    .with_context(|| format!("restoring pre-dream output {}", path.display()))?,
-                None => match fs::remove_file(&target) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("removing failed dream output {}", path.display())
-                        });
-                    }
-                },
+                Some(contents) => root
+                    .write_root_file(&path, &contents)
+                    .with_context(|| format!("restoring pre-dream output {path}"))?,
+                None => root
+                    .remove_root_file(&path)
+                    .with_context(|| format!("removing failed dream output {path}"))?,
             }
         }
         Ok(())
@@ -9521,8 +9911,8 @@ Inventory facts for warehouse operations.
         // rev-parse remains usable, but ls-files cannot establish whether a
         // generated sidecar is tracked when the repository index is corrupt.
         fs::write(tmp.path().join(".git/index"), b"not a Git index").unwrap();
-        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
-        let error = ensure_sidecars_gitignored(tmp.path(), &sidecars).unwrap_err();
+        let (_lock, root) = held_mutation_root(tmp.path());
+        let error = ensure_sidecars_gitignored(&root).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -9733,10 +10123,17 @@ Inventory facts for warehouse operations.
         assert!(!replacement.embeddings.exists());
 
         // The mutation root must remain anchored to `first.directory`, not
-        // the recycled pathname. This uses the same descriptor-backed path
-        // passed to dream writers and Git on every Unix target.
-        let mutation_root = first.mutation_root();
-        fs::write(mutation_root.join("held-root-marker"), b"held root only").unwrap();
+        // the recycled pathname: dream writers and Git use this same retained
+        // root on every Unix target.
+        let mutation_root = first.mutation_root().unwrap();
+        assert_eq!(
+            mutation_root.path(),
+            fs::canonicalize(&displaced).unwrap(),
+            "the verified spelling follows the held object, not the recycled name"
+        );
+        mutation_root
+            .write_root_file("held-root-marker", b"held root only")
+            .unwrap();
         assert_eq!(
             fs::read(displaced.join("held-root-marker")).unwrap(),
             b"held root only"
@@ -9747,6 +10144,48 @@ Inventory facts for warehouse operations.
             SidecarProcessLock::try_acquire(&replacement)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// A rename-and-replace of the KB pathname in the middle of a dream
+    /// transaction cannot redirect the model write or the Git history: both
+    /// land in the directory object the fence retained, and the replacement
+    /// at the old spelling is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn dream_transaction_stays_on_the_retained_root_across_a_pathname_swap() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("knowledge");
+        write_bundle(&root);
+        let displaced = tmp.path().join("knowledge-displaced");
+        let outcome = apply_knowledge_dream(
+            &root,
+            KnowledgeBaseMergePolicy::Auto,
+            &test_dream("personal"),
+            |held| {
+                fs::rename(&root, &displaced).unwrap();
+                write_bundle(&root);
+                write_dream_concept(held, "held-write", "Lands in the retained root.");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, KnowledgeDreamGitOutcome::Committed { .. }),
+            "{outcome:?}"
+        );
+        assert!(displaced.join("held-write.md").is_file());
+        assert!(!root.join("held-write.md").exists());
+        assert!(
+            !root.join(".git").exists(),
+            "Git must never start in the replacement directory"
+        );
+        let committed =
+            crate::git::run_git_checked(&displaced, &["show", "--name-only", "--format=", "HEAD"])
+                .unwrap();
+        assert!(
+            committed.lines().any(|line| line == "held-write.md"),
+            "{committed}"
         );
     }
 
@@ -10501,7 +10940,17 @@ Inventory facts for warehouse operations.
         crate::git::run_git_checked(root, &["config", "commit.gpgsign", "false"]).unwrap();
     }
 
-    fn write_dream_concept(root: &Path, name: &str, body: &str) {
+    fn write_dream_concept(root: &KnowledgeMutationRoot, name: &str, body: &str) {
+        root.write_root_file(
+            &format!("{name}.md"),
+            format!("---\ntype: memory\n---\n\n{body}\n").as_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// A concept written by some other writer through a plain pathname,
+    /// outside any fenced transaction.
+    fn write_concept_at(root: &Path, name: &str, body: &str) {
         fs::write(
             root.join(format!("{name}.md")),
             format!("---\ntype: memory\n---\n\n{body}\n"),
@@ -10509,13 +10958,122 @@ Inventory facts for warehouse operations.
         .unwrap();
     }
 
+    /// Take the knowledge fence on `root` and return its transaction root,
+    /// as the production dream transaction does.
+    fn held_mutation_root(root: &Path) -> (SidecarProcessLock, KnowledgeMutationRoot) {
+        let sidecars = KbSidecars::in_root(root).canonicalized().unwrap();
+        let lock = SidecarProcessLock::try_acquire(&sidecars)
+            .unwrap()
+            .expect("uncontended knowledge fence");
+        let mutation_root = lock.mutation_root().unwrap();
+        (lock, mutation_root)
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    }
+
+    /// A FIFO at a Git-reported path, relative (inside the retained root) or
+    /// absolute (a `gitdir:` repository elsewhere), is refused without
+    /// blocking while the process fence is held — for reads and appends.
+    #[cfg(unix)]
+    #[test]
+    fn git_reported_fifo_is_refused_without_blocking() {
+        let tmp = TempDir::new().unwrap();
+        let kb = tmp.path().join("kb");
+        fs::create_dir(&kb).unwrap();
+        write_bundle(&kb);
+        let outside = tmp.path().join("outside-exclude");
+        make_fifo(&outside);
+        make_fifo(&kb.join("relative-exclude"));
+        let (_lock, root) = held_mutation_root(&kb);
+        for reported in [outside.as_path(), Path::new("relative-exclude")] {
+            assert!(
+                root.read_git_reported_text(reported).is_err(),
+                "{}",
+                reported.display()
+            );
+            assert!(
+                root.append_git_reported(reported, b"rule\n").is_err(),
+                "{}",
+                reported.display()
+            );
+            assert!(!root.git_reported_is_file(reported).unwrap());
+        }
+    }
+
+    /// Hook presence is a `stat`, as Git's own is: an execute-only hook
+    /// (no read permission) is still found, relative or absolute.
+    #[cfg(unix)]
+    #[test]
+    fn git_reported_is_file_finds_an_execute_only_hook() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let hook = tmp.path().join("pre-commit");
+        fs::write(&hook, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o111)).unwrap();
+        let (_lock, root) = held_mutation_root(tmp.path());
+        assert!(root.git_reported_is_file(Path::new("pre-commit")).unwrap());
+        assert!(root.git_reported_is_file(&hook).unwrap());
+        assert!(!root.git_reported_is_file(Path::new("absent-hook")).unwrap());
+    }
+
+    /// An in-tree index keeps its sidecars out of Git even when the KB root is
+    /// renamed after its fence was taken: the exclusion is applied through
+    /// the retained object (now at its new place in the worktree), never
+    /// skipped because the snapshot's old spelling no longer resolves.
+    /// (Windows leases the root against renames for the fence's lifetime.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_tree_index_excludes_sidecars_after_the_root_is_renamed() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let kb = repo.join("kb");
+        fs::create_dir_all(&kb).unwrap();
+        write_bundle(&kb);
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sidecars = KbSidecars::in_root(&kb).canonicalized().unwrap();
+        let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await.unwrap();
+        fs::rename(&kb, repo.join("moved")).unwrap();
+        // The build itself may refuse the moved root afterwards; the
+        // exclusion must have been written before any sidecar is touched.
+        let _ = KnowledgeIndex::open_snapshot_locked(
+            bundle,
+            sidecars,
+            SidecarPlacement::InSourceTree,
+            &process_lock,
+            mock_embedder(),
+            None,
+        )
+        .await;
+        let exclude = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.contains(&format!("/moved/{INDEX_FILE}\n"))
+                && exclude.contains(&format!("/moved/{EMBEDDINGS_FILE}\n")),
+            "{exclude}"
+        );
+    }
+
     #[test]
     fn invalid_dream_projection_restores_the_prewrite_file_set() {
         let tmp = TempDir::new().unwrap();
         write_bundle(tmp.path());
         let original_index = fs::read_to_string(tmp.path().join("index.md")).unwrap();
+        let (_lock, root) = held_mutation_root(tmp.path());
         let error = apply_knowledge_dream_writes(
-            tmp.path(),
+            &root,
             &[
                 KnowledgeDreamWrite {
                     path: "index.md".to_string(),
@@ -10545,7 +11103,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "first-concept", "First dream output.");
                 Ok(())
             },
@@ -10560,7 +11118,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "second-concept", "Second dream output.");
                 Ok(())
             },
@@ -10593,8 +11151,8 @@ Inventory facts for warehouse operations.
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
             &cancel,
-            |root, _| {
-                fs::write(root.join("must-not-apply.md"), "not reached")?;
+            |root| {
+                root.write_root_file("must-not-apply.md", b"not reached")?;
                 Ok(())
             },
         )
@@ -10634,7 +11192,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "local-concept", "Local dream output.");
 
                 // This commit lands after the writer's pre-apply fetch, so
@@ -10648,7 +11206,7 @@ Inventory facts for warehouse operations.
                 )
                 .unwrap();
                 configure_knowledge_git(&other);
-                write_dream_concept(&other, "remote-concept", "Remote writer output.");
+                write_concept_at(&other, "remote-concept", "Remote writer output.");
                 crate::git::run_git_checked(&other, &["add", "--all"]).unwrap();
                 crate::git::run_git_checked(&other, &["commit", "-q", "-m", "remote advance"])
                     .unwrap();
@@ -10708,7 +11266,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "local-concept", "Local dream output.");
                 let other = tmp.path().join("other-writer");
                 let other_arg = other.to_string_lossy().into_owned();
@@ -10718,7 +11276,7 @@ Inventory facts for warehouse operations.
                 )
                 .unwrap();
                 configure_knowledge_git(&other);
-                write_dream_concept(&other, "remote-concept", "Remote writer output.");
+                write_concept_at(&other, "remote-concept", "Remote writer output.");
                 crate::git::run_git_checked(&other, &["add", "--all"]).unwrap();
                 crate::git::run_git_checked(&other, &["commit", "-q", "-m", "remote advance"])
                     .unwrap();
@@ -10782,7 +11340,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "deferred", "Retained local dream output.");
                 Ok(())
             },
@@ -10801,7 +11359,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "deferred", "Retained local dream output.");
                 Ok(())
             },
@@ -10845,7 +11403,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "deploy", "Local conflicting dream output.");
 
                 let other = tmp.path().join("other-writer");
@@ -10856,7 +11414,7 @@ Inventory facts for warehouse operations.
                 )
                 .unwrap();
                 configure_knowledge_git(&other);
-                write_dream_concept(&other, "deploy", "Remote conflicting dream output.");
+                write_concept_at(&other, "deploy", "Remote conflicting dream output.");
                 crate::git::run_git_checked(&other, &["add", "--all"]).unwrap();
                 crate::git::run_git_checked(&other, &["commit", "-q", "-m", "remote conflict"])
                     .unwrap();
@@ -10877,7 +11435,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("shared"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "must-not-apply", "Deferred re-entry output.");
                 Ok(())
             },
@@ -10901,7 +11459,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("team"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "review-concept", "Needs human review.");
                 Ok(())
             },
@@ -10927,7 +11485,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("team"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "review-only", "Pending review.");
                 Ok(())
             },
@@ -10945,7 +11503,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("team"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "accepted-base", "Accepted-base dream.");
                 Ok(())
             },
@@ -10974,7 +11532,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "obsolete", "To be removed.");
                 Ok(())
             },
@@ -10985,8 +11543,8 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
-                fs::remove_file(root.join("obsolete.md")).unwrap();
+            |root| {
+                root.remove_root_file("obsolete.md").unwrap();
                 Ok(())
             },
         )
@@ -11011,19 +11569,19 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "first", "First dream.");
                 Ok(())
             },
         )
         .unwrap();
-        write_dream_concept(tmp.path(), "manual", "Manual knowledge.");
+        write_concept_at(tmp.path(), "manual", "Manual knowledge.");
 
         let outcome = apply_knowledge_dream(
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "must-not-commit", "Deferred dream.");
                 Ok(())
             },
@@ -11049,7 +11607,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "first", "First dream.");
                 Ok(())
             },
@@ -11065,7 +11623,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "retry", "This commit hook rejects once.");
                 Ok(())
             },
@@ -11085,7 +11643,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "retry", "The ledger retry commits cleanly.");
                 Ok(())
             },
@@ -11107,7 +11665,7 @@ Inventory facts for warehouse operations.
             &root,
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("project"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "isolated", "KB-only history.");
                 Ok(())
             },
@@ -11136,9 +11694,9 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 for name in KB_MACHINE_STATE_GITIGNORE {
-                    let path = root.join(name.trim_end_matches('/'));
+                    let path = root.path().join(name.trim_end_matches('/'));
                     if path.exists() {
                         continue;
                     }
@@ -11209,7 +11767,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |_root, _| Ok(()),
+            |_root| Ok(()),
         )
         .unwrap();
 
@@ -11229,9 +11787,9 @@ Inventory facts for warehouse operations.
             data_files_written: 0,
         };
 
+        let (_lock, root) = held_mutation_root(tmp.path());
         let outcome =
-            commit_exact_knowledge_file(tmp.path(), "main", None, &human, &target, expected)
-                .unwrap();
+            commit_exact_knowledge_file(&root, "main", None, &human, &target, expected).unwrap();
 
         assert!(matches!(
             outcome,
@@ -11258,7 +11816,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |_root, _| Ok(()),
+            |_root| Ok(()),
         )
         .unwrap();
         let hook = tmp.path().join(".git/hooks/pre-commit");
@@ -11279,8 +11837,9 @@ Inventory facts for warehouse operations.
             data_files_written: 0,
         };
 
+        let (_lock, root) = held_mutation_root(tmp.path());
         let outcome = commit_exact_knowledge_file(
-            tmp.path(),
+            &root,
             "main",
             None,
             &human,
@@ -11421,8 +11980,9 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Review,
             &test_dream("personal"),
-            |root, _| {
-                let manual = parse_bundle(root)?
+            |root| {
+                let manual = root
+                    .parse_bundle()?
                     .concepts
                     .into_iter()
                     .find(|concept| concept.id == "manual")
@@ -11524,7 +12084,7 @@ Inventory facts for warehouse operations.
             tmp.path(),
             KnowledgeBaseMergePolicy::Auto,
             &test_dream("personal"),
-            |root, _| {
+            |root| {
                 write_dream_concept(root, "seed", "Seed dream.");
                 Ok(())
             },

@@ -17,7 +17,18 @@ cleanup() { rm -rf "$stage"; }
 trap cleanup EXIT HUP INT TERM
 mkdir "$stage/unpack"
 
-actual=$(sha256sum "$COCKPIT_FIXTURE_ARCHIVE" | awk '{print $1}')
+# GNU coreutils ships sha256sum; macOS ships shasum.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo 'no SHA-256 tool (sha256sum or shasum) is available' >&2
+    return 1
+  fi
+}
+actual=$(sha256_file "$COCKPIT_FIXTURE_ARCHIVE")
 [ "$actual" = "$COCKPIT_FIXTURE_SHA256" ] || { echo 'checksum verification failed' >&2; exit 1; }
 tar -xzf "$COCKPIT_FIXTURE_ARCHIVE" -C "$stage/unpack" || { echo 'archive extraction failed' >&2; exit 1; }
 

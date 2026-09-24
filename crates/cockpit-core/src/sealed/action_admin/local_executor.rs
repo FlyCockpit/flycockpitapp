@@ -143,7 +143,7 @@ impl ExecutableIdentity {
         Ok(())
     }
 
-    #[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
+    #[cfg(test)]
     pub(crate) fn matches(&self, file: &mut std::fs::File) -> Result<bool> {
         let actual = Self::from_open_file(file)?;
         Ok(actual.stable_id == self.stable_id && actual.content_sha256 == self.content_sha256)
@@ -1399,9 +1399,9 @@ fn delete_windows_file_by_handle(file: &std::fs::File) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// An always-present absolute executable for owner-pinning fixtures:
-    /// `/bin/true` on Unix, the system `cmd.exe` on Windows (where `/bin/true`
-    /// is neither present nor an absolute path).
+    /// An always-present absolute executable for owner-pinning fixtures: the
+    /// system `true` on Unix (`/usr/bin/true` on macOS, which has no
+    /// `/bin/true`), the system `cmd.exe` on Windows.
     fn fixed_executable() -> String {
         #[cfg(windows)]
         {
@@ -1415,7 +1415,9 @@ mod tests {
         }
         #[cfg(not(windows))]
         {
-            "/bin/true".to_string()
+            cockpit_test_support::system_true_executable()
+                .to_string_lossy()
+                .into_owned()
         }
     }
 

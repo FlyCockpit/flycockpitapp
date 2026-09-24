@@ -394,7 +394,7 @@ async fn sigkill_then_client_reclaims_detached_daemon_without_manual_restart() {
     assert_success("cold stats client", &first, &home);
     let old_pid = cockpit_host::daemon_lifecycle::read_pid_file(&home.pid_file())
         .expect("cold client published detached daemon pid");
-    let rendezvous = home.pid_file().with_file_name("daemon.json");
+    let rendezvous = home.rendezvous_files().rendezvous;
     assert!(home.socket_path().exists(), "cold daemon socket must exist");
     assert!(rendezvous.exists(), "cold daemon rendezvous must exist");
 

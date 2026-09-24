@@ -112,7 +112,7 @@ fn wait_for_text(session: &mut HermeticCockpit, label: &str, needle: &str) {
 }
 
 fn daemon_generation(session: &HermeticCockpit) -> u64 {
-    let rendezvous = session.home().pid_file().with_file_name("daemon.json");
+    let rendezvous = session.home().rendezvous_files().rendezvous;
     let bytes = std::fs::read(&rendezvous)
         .unwrap_or_else(|error| panic!("read daemon rendezvous {rendezvous:?}: {error}"));
     serde_json::from_slice::<serde_json::Value>(&bytes)

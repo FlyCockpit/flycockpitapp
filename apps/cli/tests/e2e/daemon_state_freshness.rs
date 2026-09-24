@@ -115,8 +115,7 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
     let child = daemon_command
         .spawn()
         .expect("spawn explicit ephemeral daemon process");
-    let ephemeral_guard =
-        EphemeralDaemonGuard::new(child, ephemeral_socket.clone(), home.pid_file());
+    let ephemeral_guard = EphemeralDaemonGuard::new(child, home.rendezvous_files());
     wait_for_daemon_handshake_on_socket(
         &ephemeral_socket,
         &home.pid_file(),
@@ -250,7 +249,7 @@ async fn ephemeral_supervisor_exits_after_last_lifetime_client_disconnects() {
     let child = daemon_command
         .spawn()
         .expect("spawn foreground ephemeral supervisor");
-    let supervisor = EphemeralDaemonGuard::new(child, socket.clone(), pid_file.clone());
+    let supervisor = EphemeralDaemonGuard::new(child, home.rendezvous_files());
     wait_for_daemon_handshake_on_socket(&socket, &pid_file, DAEMON_START_HANDSHAKE_TIMEOUT, || {
         if let Ok(Some(status)) = supervisor.try_wait() {
             panic!("ephemeral supervisor exited before handshake: {status}");
@@ -263,7 +262,7 @@ async fn ephemeral_supervisor_exits_after_last_lifetime_client_disconnects() {
         .await
         .expect("connect lifetime client before any transient command disconnects");
     let rendezvous: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(pid_file.with_file_name("daemon.json"))
+        &std::fs::read(home.rendezvous_files().rendezvous)
             .expect("read ephemeral supervisor rendezvous"),
     )
     .expect("decode ephemeral supervisor rendezvous");
@@ -312,7 +311,7 @@ async fn ephemeral_supervisor_suppresses_reaping_during_worker_roll() {
     let child = daemon_command
         .spawn()
         .expect("spawn foreground ephemeral supervisor");
-    let supervisor = EphemeralDaemonGuard::new(child, socket.clone(), pid_file.clone());
+    let supervisor = EphemeralDaemonGuard::new(child, home.rendezvous_files());
     wait_for_daemon_handshake_on_socket(&socket, &pid_file, DAEMON_START_HANDSHAKE_TIMEOUT, || {
         if let Ok(Some(status)) = supervisor.try_wait() {
             panic!("ephemeral supervisor exited before handshake: {status}");
@@ -325,7 +324,7 @@ async fn ephemeral_supervisor_suppresses_reaping_during_worker_roll() {
         .await
         .expect("connect lifetime client before roll");
     let before: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(pid_file.with_file_name("daemon.json")).expect("read pre-roll rendezvous"),
+        &std::fs::read(home.rendezvous_files().rendezvous).expect("read pre-roll rendezvous"),
     )
     .expect("decode pre-roll rendezvous");
     let output = home
@@ -344,7 +343,7 @@ async fn ephemeral_supervisor_suppresses_reaping_during_worker_roll() {
         .await
         .expect("connect to rolled ephemeral worker");
     let after: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(pid_file.with_file_name("daemon.json")).expect("read post-roll rendezvous"),
+        &std::fs::read(home.rendezvous_files().rendezvous).expect("read post-roll rendezvous"),
     )
     .expect("decode post-roll rendezvous");
     assert_eq!(before["pid"], after["pid"]);
@@ -424,11 +423,6 @@ async fn daemon_refuses_newer_migration_ledger() {
         !daemon.socket_path().exists(),
         "newer-ledger daemon socket survived"
     );
-    let endpoint = daemon
-        .home()
-        .pid_file()
-        .parent()
-        .expect("daemon state dir")
-        .join("daemon.json");
+    let endpoint = daemon.home().rendezvous_files().rendezvous;
     assert!(!endpoint.exists(), "newer-ledger daemon endpoint survived");
 }

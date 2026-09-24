@@ -3636,7 +3636,7 @@ mod tests {
         exited_tx.send(Ok(())).await.unwrap();
         let mut successor = Worker {
             pid: 123,
-            binary: std::fs::canonicalize("/bin/true").unwrap(),
+            binary: std::fs::canonicalize(cockpit_test_support::system_true_executable()).unwrap(),
             child: None,
             exited,
             promotion: None,

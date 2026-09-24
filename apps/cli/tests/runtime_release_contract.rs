@@ -13,6 +13,17 @@ const CARGO_DIST_SHELL_TEMPLATE: &str = include_str!("fixtures/cargo-dist-0.32-i
 const CARGO_DIST_POWERSHELL_TEMPLATE: &str =
     include_str!("fixtures/cargo-dist-0.32-installer.ps1.j2");
 
+/// Lowercase hex SHA-256, computed in-process so the release contract does
+/// not depend on which digest tool the host ships (`sha256sum` on GNU
+/// systems, `shasum` on macOS).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[test]
 fn patcher_matches_pinned_cargo_dist_032_templates() {
     use std::{fs, path::PathBuf, process::Command};
@@ -23,17 +34,14 @@ fn patcher_matches_pinned_cargo_dist_032_templates() {
     fs::create_dir_all(&root).unwrap();
     // Exact upstream v0.32.0 template bytes. Updating either capture requires
     // reviewing cargo-dist's anchors and recording the new upstream digest.
-    let digests = Command::new("sha256sum")
-        .args([
-            "tests/fixtures/cargo-dist-0.32-installer.sh.j2",
-            "tests/fixtures/cargo-dist-0.32-installer.ps1.j2",
-        ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .unwrap();
-    let digests = String::from_utf8(digests.stdout).unwrap();
-    assert!(digests.contains("b3ed5db0b9219a2145f9a5c08f2be4800fe31944709fe7242938f35c6941b96d"));
-    assert!(digests.contains("8c4f2e02811a4acbb6982c50def8282a779952c71d86d9c0615848e0d9ead144"));
+    assert_eq!(
+        sha256_hex(CARGO_DIST_SHELL_TEMPLATE.as_bytes()),
+        "b3ed5db0b9219a2145f9a5c08f2be4800fe31944709fe7242938f35c6941b96d"
+    );
+    assert_eq!(
+        sha256_hex(CARGO_DIST_POWERSHELL_TEMPLATE.as_bytes()),
+        "8c4f2e02811a4acbb6982c50def8282a779952c71d86d9c0615848e0d9ead144"
+    );
     let shell = root.join("installer.sh");
     let powershell = root.join("installer.ps1");
     fs::write(
@@ -234,13 +242,7 @@ fn generated_posix_installer_is_hermetic_and_transactional() {
         out
     }
     fn digest(path: &Path) -> String {
-        let out = Command::new("sha256sum").arg(path).output().unwrap();
-        String::from_utf8(out.stdout)
-            .unwrap()
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .into()
+        sha256_hex(&fs::read(path).unwrap())
     }
     fn run(
         installer: &Path,

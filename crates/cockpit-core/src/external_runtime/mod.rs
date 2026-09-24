@@ -58,7 +58,8 @@ pub use projection::{
     DEPENDENCY_HEADLESS_SCHEMA_VERSION, DependenciesPageState, DependencyProjection,
     DependencyProjectionRow, DependencyStartupPolicy, DependencyViewState,
     current_dependency_context_line, current_startup_dependency_policy,
-    freeze_pending_as_timed_out, project_dependencies, startup_dependency_policy,
+    freeze_pending_as_timed_out, project_dependencies, project_dependencies_for_platform,
+    startup_dependency_policy,
 };
 /// Capability-gated optional runtimes documented by `runtime-prerequisites.toml`.
 /// This is a closed subset of the doctor catalog (git, harnesses, LSP stay out).

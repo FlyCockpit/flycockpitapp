@@ -186,30 +186,90 @@ pub struct GitOutcome {
     pub stderr: String,
 }
 
+/// Where a Git subprocess starts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GitCwd<'a> {
+    /// Resolve the working directory by pathname when Git is spawned.
+    Path(&'a Path),
+    /// Start Git inside an already-held directory: the child `fchdir`s to the
+    /// descriptor between fork and exec, so a rename or replacement of any
+    /// pathname cannot give Git a different starting directory. `path` is
+    /// the directory's verified spelling, used only for the external-runtime
+    /// health gate and diagnostics.
+    #[cfg(unix)]
+    Held {
+        path: &'a Path,
+        directory: std::os::fd::BorrowedFd<'a>,
+    },
+}
+
+impl GitCwd<'_> {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) => path,
+            #[cfg(unix)]
+            Self::Held { path, .. } => path,
+        }
+    }
+
+    /// Git with the external-runtime health gate applied and its starting
+    /// directory bound.
+    fn command(&self) -> Result<Command> {
+        crate::external_runtime::require_live_available_for_launch(
+            crate::external_runtime::ID_GIT,
+            self.path(),
+        )
+        .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
+        let mut command = Command::new("git");
+        match *self {
+            Self::Path(path) => {
+                command.current_dir(path);
+            }
+            #[cfg(unix)]
+            Self::Held { directory, .. } => {
+                use std::os::fd::AsRawFd as _;
+                use std::os::unix::process::CommandExt as _;
+                // The borrow in `self` keeps the descriptor open across every
+                // spawn of this command, and CLOEXEC only closes the child's
+                // copy at exec, after this hook has run.
+                let fd = directory.as_raw_fd();
+                // SAFETY: the hook calls only `fchdir`, which is
+                // async-signal-safe, and reads errno via `last_os_error`.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::fchdir(fd) == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    });
+                }
+            }
+        }
+        Ok(command)
+    }
+}
+
 /// Run `git <args>` in `dir`, returning the captured outcome. A failure to
 /// *launch* git (binary missing) is an `Err`; a non-zero git exit is a
 /// `GitOutcome { success: false, .. }` the caller inspects.
 pub fn run_git(dir: &Path, args: &[&str]) -> Result<GitOutcome> {
-    run_git_with_env(dir, args, &[])
+    run_git_in(GitCwd::Path(dir), args, &[])
 }
 
-/// Run `git <args>` with a tightly-scoped environment override. This is kept
-/// alongside [`run_git`] so callers that need an isolated Git index do not
-/// bypass the external-runtime health gate.
-pub(crate) fn run_git_with_env(
-    dir: &Path,
+/// Run `git <args>` from an explicit [`GitCwd`], with a tightly-scoped
+/// environment override. Kept alongside [`run_git`] so callers that need an
+/// isolated Git index or a held working directory do not bypass the
+/// external-runtime health gate.
+pub(crate) fn run_git_in(
+    cwd: GitCwd<'_>,
     args: &[&str],
     environment: &[(&str, &OsStr)],
 ) -> Result<GitOutcome> {
-    crate::external_runtime::require_live_available_for_launch(
-        crate::external_runtime::ID_GIT,
-        dir,
-    )
-    .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
-    let output = Command::new("git")
+    let output = cwd
+        .command()?
         .args(args)
         .envs(environment.iter().copied())
-        .current_dir(dir)
         .output()
         .with_context(|| format!("launching `git {}`", args.join(" ")))?;
     Ok(GitOutcome {
@@ -255,19 +315,14 @@ pub(crate) fn run_git_checked_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>
 /// Run Git with an exact byte stream on standard input. Callers use this when
 /// the Git object must be derived from already-validated bytes rather than a
 /// path Git would reopen later.
-pub(crate) fn run_git_checked_with_input(
-    dir: &Path,
+pub(crate) fn run_git_checked_with_input_in(
+    cwd: GitCwd<'_>,
     args: &[&str],
     input: &[u8],
 ) -> Result<Vec<u8>> {
-    crate::external_runtime::require_live_available_for_launch(
-        crate::external_runtime::ID_GIT,
-        dir,
-    )
-    .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
-    let mut child = Command::new("git")
+    let mut child = cwd
+        .command()?
         .args(args)
-        .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -513,6 +568,36 @@ mod tests {
             .expect("git launched");
 
         assert!(!out.status.success());
+    }
+
+    /// A held working directory is bound to the directory object, not its
+    /// spelling: after a rename-and-replace Git still starts in the held
+    /// directory and never in the replacement.
+    #[cfg(unix)]
+    #[test]
+    fn held_cwd_follows_the_directory_object_not_its_spelling() {
+        use std::os::fd::AsFd as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("original");
+        let moved = tmp.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let held = std::fs::File::open(&original).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+
+        let init = run_git_in(
+            GitCwd::Held {
+                path: &original,
+                directory: held.as_fd(),
+            },
+            &["init", "-q"],
+            &[],
+        )
+        .unwrap();
+        assert!(init.success, "{}", init.stderr);
+        assert!(moved.join(".git").is_dir());
+        assert!(!original.join(".git").exists());
     }
 
     #[test]

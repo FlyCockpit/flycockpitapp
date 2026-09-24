@@ -1,11 +1,11 @@
  ‹ Back                                                                                                                 
                  The model policy changed · step 6/8                                                                    
                  Policy revision conflict — review the refreshed projection.                                            
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Status ────────────────────────────────────────────────────────────────────────────╮                 
                  │ ◐  Projection refreshed; review the new policy before retrying.                    │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

@@ -1,10 +1,10 @@
  ‹ Back                                                                         
   Verifying provider · step 4/8                                                 
   Checking openai through the Cockpit daemon.                                   
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready         
-  ⠋ Fetching models from the provider…                                          
+  ✓  ✓  ✓  ◆ Provider  ·  ·  ·  ·                                               
+  ────────────────────────────────────────────────────────────────────────────  
                                                                                 
+  ⠋ Fetching models from the provider…                                          
                                                                                 
                                                                                 
                                                                                 

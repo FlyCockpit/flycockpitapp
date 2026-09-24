@@ -1,11 +1,11 @@
  ‹ Back                                                                         
   Let's check what happened · step 6/8                                          
   Create outcome unknown — query the receipt before retrying.                   
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Status ──────────────────────────────────────────────────────────────────╮  
   │ ◐  Create outcome unknown — query the receipt before retrying.           │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

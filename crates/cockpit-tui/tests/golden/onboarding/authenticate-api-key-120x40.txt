@@ -1,8 +1,9 @@
  ‹ Back                                                                                                                 
                  Add your API key · step 4/8                                                                            
                  Paste a key for OpenAI-compatible.                                                                     
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Provider id ───────────────────────────────────────────────────────────────────────╮                 
                  │ my-provider                                                                        │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
@@ -13,7 +14,6 @@
                  │ ••••••••                                                                           │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
                  Found $API_KEY in your environment — press ^E to use it.                                               
-                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

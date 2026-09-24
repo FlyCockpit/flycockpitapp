@@ -1,12 +1,12 @@
  ‹ Back                                                                         
   Verifier panel — Writes & edits · step 6/8                                    
   Writes & edits verifier models and copy counts.                               
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Verifier panel — Writes & edits ─────────────────────────────────────────╮  
   │ ▸ [−] ×1 [+]  Same model  reuses cache                                   │  
   │   [−]  · [+]  vendor/exact-b                                             │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

@@ -28,6 +28,7 @@ mod chrome;
 mod lifetime;
 mod model;
 mod profile;
+mod progress;
 mod search;
 mod secure_store;
 mod ui;
@@ -93,16 +94,7 @@ pub(crate) const WELCOME_ANIMATION_FRAMES: usize = welcome::PROMPT_FRAME;
 /// user-visible checkpoints; `Profile` owns its own slot so a failed
 /// profile-engine mount can never strand the user on the Welcome "press
 /// any key" screen at a later stage (#425).
-const PROGRESS_STEPS: [&str; 8] = [
-    "Welcome",
-    "Name",
-    "Secure store",
-    "Provider",
-    "Model",
-    "Agent",
-    "Lifetime",
-    "Ready",
-];
+use progress::STEPS as PROGRESS_STEPS;
 
 fn progress_index(stage: OnboardingStage) -> usize {
     match stage {
@@ -1917,13 +1909,18 @@ impl OnboardingShell {
             chrome::render_back_button(frame, area, back_visible, back_enabled, self.back_hover);
 
         let col = ui::column(area);
-        let rows = Layout::vertical([
-            Constraint::Length(3), // header
+        // Header, then the progress row, then a rule and one blank line, so
+        // the progress row is visibly chrome and never reads as the first
+        // item of the content's option list.
+        let [header, progress_row, rule, _, content, footer] = Layout::vertical([
+            Constraint::Length(2), // header: title + subtitle
             Constraint::Length(1), // progress
+            Constraint::Length(1), // rule
+            Constraint::Length(1), // breathing room
             Constraint::Min(1),    // content
             Constraint::Length(1), // help + action bar
         ])
-        .split(col);
+        .areas(col);
 
         let title = format!(
             "{} · step {}/{}",
@@ -1941,54 +1938,55 @@ impl OnboardingShell {
             OnboardingScreen::AgentAuthoring(screen) if screen.header_is_failure() => BAD,
             _ => INK,
         };
-        ui::render_header_colored(frame, rows[0], &title, &subtitle, title_color);
-        self.render_progress(frame, rows[1]);
-        self.list_area = rows[2];
+        ui::render_header_colored(frame, header, &title, &subtitle, title_color);
+        self.render_progress(frame, progress_row);
+        ui::render_rule(frame, rule);
+        self.list_area = content;
         match &mut self.screen {
             OnboardingScreen::Welcome => unreachable!("welcome returned above"),
-            OnboardingScreen::Profile(screen) => screen.render(frame, rows[2]),
+            OnboardingScreen::Profile(screen) => screen.render(frame, content),
             OnboardingScreen::SecureStore(screen) => {
                 if matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice) {
-                    Self::render_secure_store(frame, rows[2], screen, &mut self.list_row_rects);
+                    Self::render_secure_store(frame, content, screen, &mut self.list_row_rects);
                 } else {
                     self.list_row_rects.clear();
-                    screen.render_password(frame, rows[2]);
+                    screen.render_password(frame, content);
                 }
             }
             OnboardingScreen::ProviderSearch(screen) => {
                 self.list_area =
-                    Self::render_search(frame, rows[2], screen, &mut self.list_row_rects);
+                    Self::render_search(frame, content, screen, &mut self.list_row_rects);
             }
-            OnboardingScreen::Authenticate(screen) => screen.render(frame, rows[2]),
-            OnboardingScreen::Verify(screen) => screen.render(frame, rows[2]),
+            OnboardingScreen::Authenticate(screen) => screen.render(frame, content),
+            OnboardingScreen::Verify(screen) => screen.render(frame, content),
             OnboardingScreen::AgentAuthoring(screen) => {
-                screen.render(frame, rows[2]);
+                screen.render(frame, content);
             }
             OnboardingScreen::Lifetime(screen) => {
-                Self::render_lifetime(frame, rows[2], screen, &mut self.list_row_rects);
+                Self::render_lifetime(frame, content, screen, &mut self.list_row_rects);
             }
-            OnboardingScreen::Model(screen) => screen.render(frame, rows[2]),
+            OnboardingScreen::Model(screen) => screen.render(frame, content),
             OnboardingScreen::Complete { summary, .. } => {
-                Self::render_complete(frame, rows[2], summary, &mut self.list_row_rects);
+                Self::render_complete(frame, content, summary, &mut self.list_row_rects);
             }
             OnboardingScreen::EmbeddedSettings => {
-                engine.render(frame, rows[2], links);
+                engine.render(frame, content, links);
             }
         }
         let buttons = Self::action_buttons(&self.screen);
         let bar_width = chrome::action_bar_width(&buttons);
-        let help_width = rows[3].width.saturating_sub(bar_width.saturating_add(1));
+        let help_width = footer.width.saturating_sub(bar_width.saturating_add(1));
         ui::render_help(
             frame,
             Rect {
-                x: rows[3].x,
-                y: rows[3].y,
+                x: footer.x,
+                y: footer.y,
                 width: help_width,
                 height: 1,
             },
             self.help_text(),
         );
-        self.actions.render(frame, rows[3], &buttons);
+        self.actions.render(frame, footer, &buttons);
         if let Some(menu) = self.escape.as_mut() {
             Self::render_escape_menu(frame, area, menu);
         }
@@ -2102,33 +2100,11 @@ impl OnboardingShell {
     }
 
     fn render_progress(&self, frame: &mut Frame, area: Rect) {
-        let current = progress_index(self.stage);
-        let mut spans = Vec::new();
-        for (index, step) in PROGRESS_STEPS.iter().enumerate() {
-            let (mark, color) = if index < current {
-                ("●", BRASS)
-            } else if index == current {
-                ("◐", BRASS)
-            } else {
-                ("○", NIGHT)
-            };
-            let mut style = Style::default().fg(color);
-            if index == current {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled(format!("{mark}{step}"), style));
-            if index + 1 < PROGRESS_STEPS.len() {
-                // The eight-step row (Profile got its own slot in #425) must
-                // stay on one line on an 80-column terminal: the marker is
-                // glued to its label and steps are single-space separated,
-                // which leaves the final "Ready" label legible.
-                spans.push(Span::raw(" "));
-            }
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
-            area,
-        );
+        // The row picks its own tier for the width (full, compact, minimal)
+        // and is never wrapped: a wrap into this single row used to cut the
+        // last steps off silently on narrow terminals.
+        let (_, line) = progress::progress_line(progress_index(self.stage), area.width);
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_secure_store(

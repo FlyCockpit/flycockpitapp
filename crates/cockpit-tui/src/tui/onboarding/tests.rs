@@ -225,11 +225,11 @@ fn profile_stage_presents_its_native_screen_and_step() {
         [
             "Welcome",
             "Name",
-            "Secure store",
+            "Secrets",
             "Provider",
             "Model",
             "Agent",
-            "Lifetime",
+            "Background",
             "Ready",
         ]
     );
@@ -1317,6 +1317,103 @@ fn superseding_same_stage_revision_discards_stale_local_search_state() {
 
 // ── Chrome ───────────────────────────────────────────────────────────────
 
+fn render_rows(shell: &mut OnboardingShell, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut links = crate::tui::links::LinkRegistry::default();
+    let engine = Dialog::None;
+    terminal
+        .draw(|frame| shell.render(frame, frame.area(), &engine, &mut links))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn progress_row_sits_between_header_and_rule_in_width_tiers() {
+    // Row layout inside the column (1-row top margin): title, subtitle,
+    // progress, rule, one blank line, then the content.
+    let cases = [
+        (
+            120u16,
+            "✓ Welcome  ✓ Name  ◆ Secrets  · Provider  · Model  · Agent  · Background  · Ready",
+        ),
+        (80, "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"),
+        (60, "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"),
+        (40, "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"),
+        (30, "Step 3 of 8 · Secrets"),
+    ];
+    for (width, progress) in cases {
+        let mut shell = shell_at(OnboardingStage::SecureStore);
+        let rows = render_rows(&mut shell, width, 24);
+        let column = rows[1].find("Secure your secrets").expect("title row");
+        let at = |row: usize| rows[row].get(column..).unwrap_or_default().to_string();
+        assert!(
+            at(1).starts_with("Secure your secrets · step 3/8") || width < 40,
+            "{rows:#?}"
+        );
+        assert_eq!(at(3), progress, "{width} cols: {rows:#?}");
+        assert!(
+            !at(3).contains("step 3/8") || width < 40,
+            "count lives in the title"
+        );
+        let rule = at(4);
+        assert!(
+            !rule.is_empty() && rule.chars().all(|c| c == '─'),
+            "{rows:#?}"
+        );
+        assert!(at(5).is_empty(), "blank line before content: {rows:#?}");
+        assert!(
+            at(6).starts_with("◉ Platform keyring"),
+            "{width}: {rows:#?}"
+        );
+    }
+}
+
+#[test]
+fn every_step_label_names_the_step_its_screen_title_names() {
+    // One name per step: the progress label is the shortened wording of
+    // the step's entry-screen header (title, or subtitle for the profile
+    // question), so the row never disagrees with the header.
+    for (index, stage) in [
+        OnboardingStage::Profile,
+        OnboardingStage::SecureStore,
+        OnboardingStage::Provider,
+        OnboardingStage::Model,
+        OnboardingStage::Agent,
+        OnboardingStage::Lifetime,
+        OnboardingStage::Complete,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut shell = shell_at(stage);
+        if stage == OnboardingStage::Agent {
+            // The app mounts the authoring entry screen asynchronously.
+            shell.present_agent_authoring(agent::golden_sample_projection(), "label".into());
+        }
+        let label = PROGRESS_STEPS[index + 1];
+        let rows = render_rows(&mut shell, 120, 40);
+        let header = format!("{} {}", rows[1], rows[2]).to_lowercase();
+        assert!(
+            header.contains(&label.to_lowercase()),
+            "{stage:?}: label {label:?} absent from header {header:?}"
+        );
+        assert!(
+            rows[3].contains(&format!("◆ {label}")),
+            "{stage:?}: {:?}",
+            rows[3]
+        );
+    }
+}
+
 #[test]
 fn chrome_shows_progress_and_limited_mode_at_both_sizes() {
     for (width, height) in [(60u16, 20u16), (120, 40)] {
@@ -1324,9 +1421,8 @@ fn chrome_shows_progress_and_limited_mode_at_both_sizes() {
         let engine = Dialog::None;
         let rendered = render_string(&mut shell, width, height, &engine);
         assert!(rendered.contains("Secure your secrets"), "{width}x{height}");
-        assert!(rendered.contains("Welcome"), "{width}x{height}");
-        assert!(rendered.contains("Provider"), "{width}x{height}");
-        assert!(rendered.contains("Secure store"), "{width}x{height}");
+        // The current step is always labelled with the name the title uses.
+        assert!(rendered.contains("◆ Secrets"), "{width}x{height}");
 
         let mut limited = snapshot(OnboardingStage::Provider);
         limited.limited_mode = true;
@@ -1352,7 +1448,7 @@ fn provider_authenticate_renders_inside_full_screen_chrome_at_narrow_and_wide_si
         assert!(rendered.contains("API key"), "{rendered}");
         assert!(rendered.contains("[ Reveal ]"), "{rendered}");
         assert!(rendered.contains("[ Continue ]"), "{rendered}");
-        assert!(rendered.contains("◐Provider"), "{rendered}");
+        assert!(rendered.contains("◆ Provider"), "{rendered}");
     }
 }
 

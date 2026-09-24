@@ -31,16 +31,25 @@ pub(super) fn render_header_colored(
     subtitle: &str,
     title_fg: Color,
 ) {
-    let rule = "\u{2500}".repeat(28.min(usize::from(area.width)));
     let lines = vec![
         Line::from(Span::styled(
             title.to_string(),
             Style::new().fg(title_fg).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(subtitle.to_string(), Style::new().fg(FOG))),
-        Line::from(Span::styled(rule, Style::new().fg(BRASS))),
     ];
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The rule that closes the header block (below the progress row). It spans
+/// the readable column so it separates the chrome from the content rather
+/// than underlining any single line.
+pub(super) fn render_rule(frame: &mut Frame, area: Rect) {
+    let rule = "\u{2500}".repeat(usize::from(area.width));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(rule, Style::new().fg(NIGHT)))),
+        area,
+    );
 }
 
 pub(super) fn render_help(frame: &mut Frame, area: Rect, text: &str) {

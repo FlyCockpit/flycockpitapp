@@ -1,8 +1,9 @@
  ‹ Back                                                                                                                 
                  Secure your secrets · step 3/8                                                                         
                  Choose how Cockpit protects your API keys and sealed values.                                           
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ◐Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ◆ Secrets  · Provider  · Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Password ──────────────────────────────────────────────────────────────────────────╮                 
                  │ enter a password                                                                   │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
@@ -10,7 +11,6 @@
                  │ enter a password                                                                   │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
                  This password isn't recoverable — losing it means re-adding every secret.                              
-                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

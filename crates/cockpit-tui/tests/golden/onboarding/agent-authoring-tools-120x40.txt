@@ -1,8 +1,9 @@
  ‹ Back                                                                                                                 
                  Grant tools · step 6/8                                                                                 
                  Required tools are always on. Toggle the rest.                                                         
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Tools  ·  15 of 53 enabled ────────────────────────────────────────────────────────╮                 
                  │ Required                                                                         █ │                 
                  │ ▣ read  —  required                                                              █ │                 
@@ -20,7 +21,7 @@
                  │ ▣ question  —  enabled                                                           █ │                 
                  │ ▣ raise  —  enabled                                                              █ │                 
                  │ ▣ schedule  —  enabled                                                           █ │                 
-                 │ ▣ spawn  —  enabled                                                              █ │                 
+                 │ ▣ spawn  —  enabled                                                              │ │                 
                  │ ▢ worktree_orchestrate  —  disabled                                              │ │                 
                  │ ▣ mcp  —  enabled                                                                │ │                 
                  │ ▢ webfetch  —  disabled                                                          │ │                 
@@ -34,7 +35,6 @@
                  │ ▢ history_search  —  disabled                                                    │ │                 
                  │ ▢ thread_start  —  disabled                                                      │ │                 
                  │ ▢ semantic_search  —  disabled                                                   │ │                 
-                 │ ▢ structured_search  —  disabled                                                 │ │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
                  ↑↓ move   space cycle grant   m set model   enter continue   esc back     [ Continue ]                 
                                                                                                                         

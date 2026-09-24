@@ -1,11 +1,11 @@
  ‹ Back                                                                         
   Subagent helpers · step 6/8                                                   
   Add a bounded helper beneath this subagent, or save it as-is.                 
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Subagents  ·  1 ─────────────────────────────────────────────────────────╮  
   │ ▸ Add nested subagent                                                    │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

@@ -1,12 +1,12 @@
  ‹ Back                                                                                                                 
                  Choose your default model · step 5/8                                                                   
                  Star the model Cockpit should use for new sessions.                                                    
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Models ────────────────────────────────────────────────────────────────────────────╮                 
                  │ ◉ ★ gpt-5.2-codex  openai                                                          │                 
                  │ ○   gpt-5.2  openai                                                                │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

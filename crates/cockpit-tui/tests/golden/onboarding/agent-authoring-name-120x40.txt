@@ -1,8 +1,9 @@
  ‹ Back                                                                                                                 
                  Create your first agent · step 6/8                                                                     
                  An agent is a saved configuration you can fly again and again.                                         
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Name ──────────────────────────────────────────────────────────────────────────────╮                 
                  │ navigator                                                                          │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
@@ -11,7 +12,6 @@
                  │ ◉ Navigator                                                                        │                 
                  │ ○ Custom authored agent                                                            │                 
                  │ ○ Third-party pinned source                                                        │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

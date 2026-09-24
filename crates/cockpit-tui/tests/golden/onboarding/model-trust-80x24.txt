@@ -1,12 +1,12 @@
  ‹ Back                                                                         
   Provider trust · step 5/8                                                     
   Choose the model's data-custody policy.                                       
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ◆ Model  ·  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Trust ───────────────────────────────────────────────────────────────────╮  
   │ ◉ untrusted                                                              │  
   │ ○ trusted                                                                │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

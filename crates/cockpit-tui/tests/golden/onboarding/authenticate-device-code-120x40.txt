@@ -1,8 +1,9 @@
  ‹ Back                                                                                                                 
                  Sign in to your subscription · step 4/8                                                                
                  A device code links this client to your account.                                                       
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  Open this URL in a browser and enter the code:                                                         
                                                                                                                         
                  https://auth.openai.com/codex/device                                                                   
@@ -11,7 +12,6 @@
                  │                                      ABCD-EFGH                                     │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
                  ⠋ Waiting for approval… 00:00                                                                          
-                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

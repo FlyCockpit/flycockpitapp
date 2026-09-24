@@ -1,8 +1,9 @@
  ‹ Back                                                                         
   Tune the agent · step 6/8                                                     
   These settings are independent; the defaults are a sane starting point.       
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Optimizations ───────────────────────────────────────────────────────────╮  
   │ ▸ Auto-prune: [ off ]                                                    │  
   │   Interactive subagents: [ on ]                                          │  
@@ -15,7 +16,6 @@
   │ Auto-prune losslessly drops duplicate context before it forces a summary │  
   │ It starts off because some frontier-model caches are more valuable than  │  
   │ reclaimed context.                                                       │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

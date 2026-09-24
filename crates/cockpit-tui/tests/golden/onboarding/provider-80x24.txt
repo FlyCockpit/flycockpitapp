@@ -1,8 +1,9 @@
  ‹ Back                                                                         
   Let's add a provider · step 4/8                                               
   Pick who you'll fly with.                                                     
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ◆ Provider  ·  ·  ·  ·                                               
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Filter ──────────────────────────────────────────────────────────────────╮  
   │ filter by name                                                           │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
@@ -10,11 +11,10 @@
   ╭ Providers  ·  16 ────────────────────────────────────────────────────────╮  
   │   Codex (ChatGPT Plus/Pro)  (OAuth login)                              █ │  
   │   Grok (SuperGrok) — disabled pending xAI authorization  (OAuth login) █ │  
-  │   GitHub Copilot  (API key)                                            █ │  
+  │   GitHub Copilot  (API key)                                            │ │  
   │   OpenAI-compatible  (API key)                                         │ │  
   │   OpenAI Platform API  (API key)                                       │ │  
   │   Grok (xAI API)  (API key)                                            │ │  
-  │   CrofAI  (API key)                                                    │ │  
   ╰──────────────────────────────────────────────────────────────────────────╯  
   Type a few letters to narrow the list.                                        
                                                                                 

@@ -1,11 +1,11 @@
  ‹ Back                                                                         
   Creating your agent · step 6/8                                                
   Waiting for the authoritative create receipt…                                 
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Status ──────────────────────────────────────────────────────────────────╮  
   │ ◐  Waiting for the authoritative create receipt…                         │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

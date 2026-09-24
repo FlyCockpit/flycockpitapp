@@ -1,12 +1,12 @@
  ‹ Back                                                                                                                 
                  Delegation · step 5/8                                                                                  
                  Choose how this model participates in delegation.                                                      
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Delegation ────────────────────────────────────────────────────────────────────────╮                 
                  │ ▢ spawn as subagent                                                                │                 
                  │ ▣ can spawn subagents                                                              │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

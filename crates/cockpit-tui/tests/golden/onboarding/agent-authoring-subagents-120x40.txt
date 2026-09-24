@@ -1,12 +1,12 @@
  ‹ Back                                                                                                                 
                  Define subagents · step 6/8                                                                            
                  Helpers this agent can delegate to. The runner is ready to keep or edit.                               
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Subagents  ·  1 ───────────────────────────────────────────────────────────────────╮                 
                  │ ▸ runner  ·  unset                                                                 │                 
                  │   Review agent package                                                             │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

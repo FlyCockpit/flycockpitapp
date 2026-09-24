@@ -1,12 +1,12 @@
  ‹ Back                                                                         
   How much does this agent see? · step 6/8                                      
   Untrusted models keep secrets and sealed values out of context.               
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Trust ───────────────────────────────────────────────────────────────────╮  
   │ ○ Confirm vendor/exact-a as unset                                        │  
   │ Click a row twice to confirm its shared trust classification.            │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

@@ -1,11 +1,11 @@
  ‹ Back                                                                         
   Let the sidecar reach the network? · step 6/8                                 
   This remote sidecar needs explicit permission to leave the machine.           
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Trust ───────────────────────────────────────────────────────────────────╮  
   │ ○ Allow remote sidecar egress                                            │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

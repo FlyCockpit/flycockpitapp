@@ -133,9 +133,11 @@ mod tests {
         assert!(!barrier.command().contains("tail -f"));
     }
 
-    #[test]
+    // The barrier owns a Tokio named-pipe server, which registers with the
+    // runtime's I/O driver at construction.
+    #[tokio::test]
     #[cfg(windows)]
-    fn windows_barrier_uses_unique_named_pipe_and_blocks_after_witness() {
+    async fn windows_barrier_uses_unique_named_pipe_and_blocks_after_witness() {
         let root = tempfile::tempdir().expect("tempdir");
         let barrier = ReplayLaunchBarrier::new(root.path());
         assert!(barrier.command().contains("NamedPipeClientStream"));

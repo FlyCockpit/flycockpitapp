@@ -369,8 +369,14 @@ pub fn path_is_project_cockpit_under_root(path: &Path, trust_root: &Path) -> boo
 }
 
 pub fn path_is_project_cockpit_layer(path: &Path, trust_root: &Path) -> bool {
-    let path = lexical_absolute(path);
-    let trust_root = lexical_absolute(trust_root);
+    // An unresolvable spelling cannot be proven outside the trust root, so it
+    // is classified as a project layer (fail closed).
+    let (Some(path), Some(trust_root)) = (
+        trust_comparable_path(path),
+        trust_comparable_path(trust_root),
+    ) else {
+        return true;
+    };
     if path_is_project_cockpit_under_root(&path, &trust_root) {
         return true;
     }
@@ -385,9 +391,31 @@ pub fn path_blocked_by_workspace_trust(path: &Path) -> bool {
     if policy.mode == WorkspaceTrustMode::Trust {
         return false;
     }
-    let path = lexical_absolute(path);
-    let root = lexical_absolute(&policy.root.root);
+    let (Some(path), Some(root)) = (
+        trust_comparable_path(path),
+        trust_comparable_path(&policy.root.root),
+    ) else {
+        return true;
+    };
     path == root || path.starts_with(root)
+}
+
+/// Spell `path` the way trust roots are recorded, so containment is decided
+/// on the filesystem object rather than on one of its many spellings.
+///
+/// Trust roots are canonical (`std::fs::canonicalize`), while candidate
+/// directories arrive in caller spelling (discovered from a cwd, a symlinked
+/// checkout, or — on Windows — an 8.3 short name such as `RUNNER~1` and a
+/// `C:\` rather than verbatim `\\?\C:\` prefix). A purely lexical
+/// comparison of the two never matches on Windows, which silently let an
+/// untrusted or ignore-config workspace's `.cockpit` layer load. Resolving
+/// through the nearest existing ancestor keeps a missing leaf comparable.
+/// `None` means the spelling could not be resolved; callers fail closed.
+fn trust_comparable_path(path: &Path) -> Option<PathBuf> {
+    let lexical = lexical_absolute(path);
+    cockpit_host::path_containment::effective_path(&lexical)
+        .ok()
+        .map(|effective| super::files::normalize_macos_system_path(&effective))
 }
 
 fn canonical_dir_path(path: &Path) -> Result<PathBuf> {

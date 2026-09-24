@@ -189,9 +189,7 @@ fn context_pack_target_scope(
 ) -> Option<String> {
     let abs = crate::tools::common::resolve(target, &ctx.cwd);
     if abs.exists() {
-        return abs
-            .strip_prefix(intel_root(ctx))
-            .ok()
+        return strip_intel_root(&abs, intel_root(ctx))
             .map(|rel| rel.to_string_lossy().replace('\\', "/"))
             .map(|rel| parent_scope_for_file(&rel, ctx))
             .filter(|rel| !rel.is_empty());
@@ -291,7 +289,7 @@ fn resolve_context_path(target: &str, ctx: &ToolCtx, files: &[ContextFileMeta]) 
     }
     let abs = crate::tools::common::resolve(target, &ctx.cwd);
     if abs.is_file()
-        && let Ok(rel) = abs.strip_prefix(intel_root(ctx))
+        && let Some(rel) = strip_intel_root(&abs, intel_root(ctx))
     {
         let rel = rel.to_string_lossy().replace('\\', "/");
         if files

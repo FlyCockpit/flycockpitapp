@@ -230,7 +230,7 @@ async fn recovery_is_repeatable_and_never_creates_a_second_owner() {
         .effective_authority(parent_lease_id)
         .await
         .unwrap();
-    assert!(!authority.allows_path(&h.root().join("a/file.txt")));
+    assert!(!authority.allows_path(&h.effective("a/file.txt")));
 }
 
 #[tokio::test]
@@ -441,7 +441,7 @@ async fn recovering_an_empty_activated_child_completes_the_whole_return() {
         .await
         .unwrap();
     assert!(
-        authority.allows_path(&h.root().join("a/file.txt")),
+        authority.allows_path(&h.effective("a/file.txt")),
         "the reclaimed sub-scope must be writable by the parent again"
     );
 }
@@ -662,7 +662,7 @@ async fn crash_at_parent_excluded_reclaims_authority_once_containment_is_empty()
         .effective_authority(parent_lease_id)
         .await
         .unwrap();
-    assert!(authority.allows_path(&h.root().join("a/file.txt")));
+    assert!(authority.allows_path(&h.effective("a/file.txt")));
 }
 
 #[tokio::test]
@@ -715,7 +715,7 @@ async fn crash_at_parent_excluded_retains_everything_while_containment_is_uncert
         .effective_authority(parent_lease_id)
         .await
         .unwrap();
-    assert!(!authority.allows_path(&h.root().join("a/file.txt")));
+    assert!(!authority.allows_path(&h.effective("a/file.txt")));
 }
 
 #[tokio::test]
@@ -802,7 +802,7 @@ async fn crash_at_parent_restored_only_needs_the_committed_marker() {
         .effective_authority(parent.lease_id())
         .await
         .unwrap();
-    assert!(authority.allows_path(&h.root().join("a/file.txt")));
+    assert!(authority.allows_path(&h.effective("a/file.txt")));
 }
 
 /// Insert a durable containment row for `transfer_id` under the *derived*

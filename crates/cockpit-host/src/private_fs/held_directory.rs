@@ -1695,7 +1695,17 @@ mod imp {
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    /// `FILE_WRITE_DATA` as spelled for a directory.
+    const FILE_ADD_FILE: u32 = 0x2;
     const FILE_SHARE_ALL: u32 = 0x7;
+    /// Access for a probe whose handle becomes a retained
+    /// `HeldSealedArtifact` (open_verified / reconcile's ProvenNotApplied):
+    /// the later `unlink`/`rename_noreplace` retry issues
+    /// `FileDispositionInformation`/`FileRenameInformation` through this very
+    /// handle, and both require `DELETE` on it. Without it every retry fails
+    /// `STATUS_ACCESS_DENIED` and loops as ProvenNotApplied.
+    const RETAINED_ARTIFACT_ACCESS: u32 =
+        GENERIC_READ | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
     // The execution cwd lease deliberately permits normal read/write access
     // but refuses DELETE. Windows requires every existing handle to share
     // DELETE before a directory can be renamed or removed.
@@ -1900,18 +1910,27 @@ mod imp {
                 std::io::Error::last_os_error()
             );
             let mut dir = unsafe { File::from_raw_handle(raw) };
-            for component in components {
+            let components = components.collect::<Vec<_>>();
+            let last_index = components.len().checked_sub(1);
+            for (index, component) in components.into_iter().enumerate() {
                 let Component::Normal(name) = component else {
                     anyhow::bail!("Windows held directory path is not lexical")
                 };
                 let wide = name.encode_wide().collect::<Vec<_>>();
-                dir = open_relative(
-                    &dir,
-                    &wide,
-                    FILE_OPEN,
-                    FILE_DIRECTORY_FILE,
-                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                )?;
+                // The retained private authority is the directory the
+                // publish/delete barriers flush (`FlushFileBuffers(self.dir)`),
+                // and NtFlushBuffersFile refuses a handle without
+                // FILE_WRITE_DATA/FILE_APPEND_DATA (for a directory:
+                // FILE_ADD_FILE), so without it every effect degraded to
+                // AppliedUnknown. Only the final private component gets it;
+                // ancestors and read-only workspace authorities stay
+                // read-only.
+                let access = if require_private && Some(index) == last_index {
+                    GENERIC_READ | FILE_ADD_FILE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+                } else {
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+                };
+                dir = open_relative(&dir, &wide, FILE_OPEN, FILE_DIRECTORY_FILE, access)?;
                 verify_directory_handle(&dir)?;
             }
             verify_directory_handle(&dir)?;
@@ -2202,11 +2221,13 @@ mod imp {
         pub(super) fn create_file_exclusive(&self, name: &str) -> Result<(File, String, String)> {
             self.verify_directory_security()?;
             let wide = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
-            let file = open_relative(
+            // Born private (owner + protected user/SYSTEM DACL at create):
+            // the creating handle deliberately holds no WRITE_DAC/WRITE_OWNER,
+            // and `file_evidence` re-reads and verifies the born descriptor
+            // through this very handle (GENERIC_READ carries READ_CONTROL).
+            let file = create_private_file_relative(
                 &self.dir,
                 &wide,
-                FILE_CREATE,
-                FILE_NON_DIRECTORY_FILE,
                 GENERIC_READ
                     | GENERIC_WRITE
                     | DELETE
@@ -2214,7 +2235,6 @@ mod imp {
                     | FILE_READ_ATTRIBUTES
                     | FILE_WRITE_ATTRIBUTES,
             )?;
-            crate::goal_scratch::set_private_dacl_handle(&file)?;
             let (identity, security) = file_evidence(&file)?;
             Ok((file, identity, security))
         }
@@ -2413,11 +2433,8 @@ mod imp {
         ) -> Result<HeldSealedArtifact> {
             self.verify_directory_security()?;
             let wide = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
-            let RelativeProbe::Present(mut file) = probe_relative(
-                &self.dir,
-                &wide,
-                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            )?
+            let RelativeProbe::Present(mut file) =
+                probe_relative(&self.dir, &wide, RETAINED_ARTIFACT_ACCESS)?
             else {
                 anyhow::bail!("held artifact is absent")
             };
@@ -2466,18 +2483,15 @@ mod imp {
                         let source = std::ffi::OsStr::new(&recovery.source_name)
                             .encode_wide()
                             .collect::<Vec<_>>();
-                        let source_probe = match probe_relative(
-                            &self.dir,
-                            &source,
-                            GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                        ) {
-                            Ok(probe) => probe,
-                            Err(_) => {
-                                return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
-                                    recovery.clone(),
-                                ));
-                            }
-                        };
+                        let source_probe =
+                            match probe_relative(&self.dir, &source, RETAINED_ARTIFACT_ACCESS) {
+                                Ok(probe) => probe,
+                                Err(_) => {
+                                    return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                        recovery.clone(),
+                                    ));
+                                }
+                            };
                         match source_probe {
                             RelativeProbe::Present(mut file) => {
                                 if verify_expected_file(&file, &recovery.artifact).is_err()
@@ -2534,11 +2548,8 @@ mod imp {
                 let wide = std::ffi::OsStr::new(&recovery.source_name)
                     .encode_wide()
                     .collect::<Vec<_>>();
-                let source_probe = match probe_relative(
-                    &self.dir,
-                    &wide,
-                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                ) {
+                let source_probe = match probe_relative(&self.dir, &wide, RETAINED_ARTIFACT_ACCESS)
+                {
                     Ok(probe) => probe,
                     Err(_) => {
                         return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
@@ -2855,6 +2866,92 @@ mod imp {
         share: u32,
         object_attributes: u32,
     ) -> Result<File> {
+        nt_create_relative(
+            parent,
+            name,
+            disposition,
+            kind,
+            access,
+            share,
+            object_attributes,
+            ptr::null_mut(),
+        )
+    }
+
+    /// Create a brand-new regular file beneath the held directory that is
+    /// BORN with the protected current-user-and-SYSTEM-only descriptor
+    /// (explicit owner = the token user). This is the handle-anchored twin of
+    /// `private_fs::create_windows_private_file_exclusive`: the descriptor
+    /// rides in `OBJECT_ATTRIBUTES.SecurityDescriptor`, so the object never
+    /// exists under the token-default DACL/owner. That matters twice over:
+    /// the held directory's own private DACL carries no inheritable ACEs, so
+    /// a create-then-harden sequence would stage the artifact under the
+    /// token default (on an elevated administrator token: owner
+    /// BUILTIN\Administrators, Administrators full control) until the
+    /// harden, and the post-hoc `SetSecurityInfo(OWNER|DACL)` would need
+    /// `WRITE_DAC | WRITE_OWNER` on the creating handle. Naming the token
+    /// user as owner needs no privilege (the user SID is always a valid
+    /// owner for its own token) and is strictly narrower than the default.
+    fn create_private_file_relative(parent: &File, name: &[u16], access: u32) -> Result<File> {
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                value: *const u16,
+                revision: u32,
+                descriptor: *mut *mut c_void,
+                length: *mut u32,
+            ) -> i32;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LocalFree(memory: *mut c_void) -> *mut c_void;
+        }
+        let sid = crate::named_pipe::current_user_sid()?;
+        let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+        let wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated and the out-pointer is valid; the
+        // LocalAlloc'd descriptor is freed exactly once below.
+        ensure!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            } != 0
+                && !descriptor.is_null(),
+            "building born-private held-artifact descriptor failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let created = nt_create_relative(
+            parent,
+            name,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+            access,
+            FILE_SHARE_ALL,
+            OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            descriptor,
+        );
+        // SAFETY: NtCreateFile captured the descriptor into the new object;
+        // the converted buffer is released exactly once.
+        unsafe { LocalFree(descriptor) };
+        created
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn nt_create_relative(
+        parent: &File,
+        name: &[u16],
+        disposition: u32,
+        kind: u32,
+        access: u32,
+        share: u32,
+        object_attributes: u32,
+        security_descriptor: *mut c_void,
+    ) -> Result<File> {
         ensure!(
             !name.is_empty() && name.len() <= (u16::MAX as usize / 2),
             "invalid Windows relative name"
@@ -2870,7 +2967,7 @@ mod imp {
             root_directory: parent.as_raw_handle(),
             object_name: &unicode,
             attributes: object_attributes,
-            security_descriptor: ptr::null_mut(),
+            security_descriptor,
             security_quality_of_service: ptr::null_mut(),
         };
         let mut io = IoStatusBlock {

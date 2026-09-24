@@ -1382,6 +1382,9 @@ mod tests {
         crate::git::run_git_checked(root, &["config", "user.email", "t@t"]).unwrap();
         crate::git::run_git_checked(root, &["config", "user.name", "t"]).unwrap();
         crate::git::run_git_checked(root, &["config", "commit.gpgsign", "false"]).unwrap();
+        // Byte-exact fixture: a host `core.autocrlf=true` (the Windows
+        // runner default) would rewrite checked-out/applied text to CRLF.
+        crate::git::run_git_checked(root, &["config", "core.autocrlf", "false"]).unwrap();
         std::fs::write(root.join("a.txt"), "before\n").unwrap();
         crate::git::run_git_checked(root, &["add", "--", "a.txt"]).unwrap();
         crate::git::run_git_checked(root, &["commit", "-q", "-m", "init"]).unwrap();

@@ -3370,11 +3370,15 @@ mod tests {
 
     #[test]
     fn private_runtime_root_prefers_absolute_xdg_runtime_dir() {
-        let resolved = private_runtime_root_from(
-            Some(OsStr::new("/xdg-runtime")),
-            Some(PathBuf::from("/darwin-temp")),
-        );
-        assert_eq!(resolved, Some(PathBuf::from("/xdg-runtime")));
+        // `/xdg-runtime` is only absolute on Unix; Windows needs a volume.
+        let xdg = if cfg!(windows) {
+            r"C:\xdg-runtime"
+        } else {
+            "/xdg-runtime"
+        };
+        let resolved =
+            private_runtime_root_from(Some(OsStr::new(xdg)), Some(PathBuf::from("/darwin-temp")));
+        assert_eq!(resolved, Some(PathBuf::from(xdg)));
     }
 
     #[cfg(target_os = "macos")]

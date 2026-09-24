@@ -33,8 +33,13 @@ fn hooks_config_parses_and_preserves_source() {
     );
     assert_eq!(
         pre.command[0],
+        // Built per component: the resolver emits the platform spelling of
+        // the lexically normalized path (`\` separators on Windows).
         temp.path()
-            .join("project/.cockpit/hooks/check-tool")
+            .join("project")
+            .join(".cockpit")
+            .join("hooks")
+            .join("check-tool")
             .to_string_lossy()
     );
     assert_eq!(&pre.command[1], "--strict");
@@ -311,9 +316,12 @@ fn hooks_config_origin_is_nonpath_and_stable() {
         .iter()
         .zip(["global", "machine", "project", "explicit"])
     {
+        // Ambient resolution digests the canonical source identity; a temp
+        // path is not canonical on every platform (8.3 short names and the
+        // verbatim `\\?\` prefix on Windows, `/private` on macOS).
         let expected = format!(
             "{expected_kind}:{}:0",
-            source_digest(&hook.source_config_path)
+            source_digest(&std::fs::canonicalize(&hook.source_config_path).unwrap())
         );
         assert_eq!(hook.origin.as_str(), expected);
         let digest = hook.origin.as_str().split(':').nth(1).unwrap();
@@ -436,11 +444,19 @@ fn hooks_config_resolves_relative_command_from_declaring_layer() {
     assert_eq!(registry.hooks.len(), 2);
     assert_eq!(
         registry.hooks[0].command[0],
-        temp.path().join("global/bin/check").to_string_lossy()
+        temp.path()
+            .join("global")
+            .join("bin")
+            .join("check")
+            .to_string_lossy()
     );
     assert_eq!(
         registry.hooks[1].command[0],
-        temp.path().join("project/bin/check").to_string_lossy()
+        temp.path()
+            .join("project")
+            .join("bin")
+            .join("check")
+            .to_string_lossy()
     );
 }
 

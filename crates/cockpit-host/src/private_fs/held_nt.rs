@@ -34,13 +34,18 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Component, Path};
 
 type Handle = *mut core::ffi::c_void;
-const INVALID_HANDLE_VALUE: Handle = isize::MIN as Handle;
+// INVALID_HANDLE_VALUE is `(HANDLE)-1`; `isize::MIN` never matched, so a failed
+// CreateFileW would have been wrapped as the current-process pseudo-handle.
+const INVALID_HANDLE_VALUE: Handle = -1_isize as Handle;
 const STATUS_SUCCESS_MIN: i32 = 0;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
 const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32 as i32;
 const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
-const STATUS_NOT_A_DIRECTORY: i32 = 0xC000_010B_u32 as i32;
+// ntstatus.h: STATUS_NOT_A_DIRECTORY ((NTSTATUS)0xC0000103L). (0xC000010B is
+// STATUS_INVALID_LOGON_TYPE; the old value never matched, so every regular
+// file probe failed closed with the raw 0xc0000103 status.)
+const STATUS_NOT_A_DIRECTORY: i32 = 0xC000_0103_u32 as i32;
 const STATUS_NO_MORE_FILES: i32 = 0x8000_0006_u32 as i32;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_DONT_REPARSE: u32 = 0x1000;

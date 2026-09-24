@@ -55,6 +55,37 @@ pub fn latency_isolated_tempdir() -> tempfile::TempDir {
         .expect("create latency-isolated test tempdir fallback")
 }
 
+/// Launch spelling `(command, args)` for a `#!/usr/bin/env python3` test
+/// fixture script such as a fake stdio MCP server.
+///
+/// Unix executes the (chmod +x) script directly through its shebang. Windows
+/// has no shebang execution, so the script is handed to an absolute Python
+/// interpreter found on `PATH`; the `WindowsApps` App Execution Alias stubs
+/// (which open the Store instead of running Python) are skipped. Panics with
+/// a clear message when no interpreter is available.
+pub fn python_script_launch(script: &Path) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let interpreter = std::env::split_paths(&path)
+            .filter(|dir| {
+                !dir.components()
+                    .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+            })
+            .flat_map(|dir| [dir.join("python.exe"), dir.join("python3.exe")])
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("python fixture requires python.exe on PATH"));
+        (
+            interpreter.to_string_lossy().into_owned(),
+            vec![script.to_string_lossy().into_owned()],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        (script.to_string_lossy().into_owned(), Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod clippy_workflow_gate;
 

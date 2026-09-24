@@ -126,7 +126,7 @@ pub fn command_directory_escape_with_workspace_scratch(
                     if skipped
                         && prog_i > i
                         && let Some(ShellToken::Word(prog)) = tokens.get(prog_i)
-                        && Path::new(prog).is_absolute()
+                        && is_rooted_path_word(prog)
                         && let Some(outside) = literal_path_word_escape(
                             prog,
                             command_cwd,
@@ -199,7 +199,7 @@ pub fn command_directory_escape_with_workspace_scratch(
                 {
                     return Some(outside);
                 }
-                if Path::new(word).is_absolute()
+                if is_rooted_path_word(word)
                     && let Some(outside) = literal_path_word_escape(
                         word,
                         command_cwd,
@@ -471,6 +471,22 @@ fn effective_program_index(tokens: &[ShellToken], mut i: usize) -> (usize, bool)
     }
 }
 
+/// A word the shell resolves from a filesystem root rather than from the
+/// command's cwd. On Unix this is exactly `Path::is_absolute`. On Windows
+/// `is_absolute` additionally demands a drive or UNC prefix, so the
+/// root-anchored `/etc/passwd` / `\Windows\x` and the drive-relative
+/// `C:secret` spellings would otherwise skip the "absolute tokens are always
+/// checked" rule; they name locations outside the cwd just the same.
+fn is_rooted_path_word(word: &str) -> bool {
+    let path = Path::new(word);
+    path.is_absolute()
+        || path.has_root()
+        || matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        )
+}
+
 fn literal_path_word_escape(
     word: &str,
     command_cwd: &Path,
@@ -510,8 +526,7 @@ fn path_word_escape(
     if dynamic_shell_path(word) {
         return None;
     }
-    let path = Path::new(word);
-    let path_like = path.is_absolute()
+    let path_like = is_rooted_path_word(word)
         || word.contains('/')
         || word.contains('\\')
         || word == "."
@@ -755,7 +770,20 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let outside = tmp.path().join("outside");
         std::fs::write(&outside, "secret").unwrap();
+        // The gate reports the syscall-effective (canonical) spelling: on
+        // Windows a `\\?\` verbatim path with 8.3 short names (`RUNNER~1`)
+        // expanded, on macOS `/private/var/...`.
+        let outside = std::fs::canonicalize(&outside).unwrap();
         (tmp, root, cwd, outside)
+    }
+
+    /// Expected report for a root-anchored operand such as `/etc/passwd`:
+    /// its syscall-effective spelling as resolved from the command cwd
+    /// (`/private/etc/...` on macOS; `\\?\<cwd drive>:\etc\...` on
+    /// Windows, where the root-anchored word lands on the cwd's drive).
+    fn expected_rooted(cwd: &Path, word: &str) -> PathBuf {
+        crate::tools::sandbox::effective_native_path(&crate::tools::common::resolve(word, cwd))
+            .unwrap()
     }
 
     #[test]
@@ -775,7 +803,13 @@ mod tests {
         );
         assert!(
             command_directory_escape_with_workspace_scratch(
-                &format!("cat {}", scratch_file.display()),
+                // A shell word: `\\` is an escape character to the shell
+                // tokenizer, so spell a Windows path with `/` separators as
+                // a bash user would.
+                &format!(
+                    "cat {}",
+                    scratch_file.display().to_string().replace('\\', "/")
+                ),
                 &cwd,
                 &root,
                 None,
@@ -858,11 +892,7 @@ mod tests {
         // still surfaces the absolute path inside the value.
         assert_eq!(
             command_directory_escape("dd if=/etc/passwd", &cwd, &root, None).as_deref(),
-            Some(Path::new(if cfg!(target_os = "macos") {
-                "/private/etc/passwd"
-            } else {
-                "/etc/passwd"
-            }))
+            Some(expected_rooted(&cwd, "/etc/passwd").as_path())
         );
     }
 
@@ -1022,11 +1052,7 @@ mod tests {
         // go unchecked.
         assert_eq!(
             command_directory_escape("env /etc/passwd", &cwd, &root, None).as_deref(),
-            Some(Path::new(if cfg!(target_os = "macos") {
-                "/private/etc/passwd"
-            } else {
-                "/etc/passwd"
-            }))
+            Some(expected_rooted(&cwd, "/etc/passwd").as_path())
         );
     }
 
@@ -1234,11 +1260,7 @@ mod tests {
         let (_tmp, root, cwd, _outside) = boundary_fixture();
         assert_eq!(
             command_directory_escape("echo x > /etc/cron.d/x", &cwd, &root, None).as_deref(),
-            Some(Path::new(if cfg!(target_os = "macos") {
-                "/private/etc/cron.d/x"
-            } else {
-                "/etc/cron.d/x"
-            }))
+            Some(expected_rooted(&cwd, "/etc/cron.d/x").as_path())
         );
     }
 

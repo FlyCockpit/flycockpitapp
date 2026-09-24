@@ -798,7 +798,13 @@ fn check_policy(
         ));
     }
 
-    let target = std::fs::canonicalize(resolved).unwrap_or_else(|_| normalize_lexical(resolved));
+    // Resolve through the nearest existing ancestor so a missing leaf is
+    // compared in the same canonical space as `cwd_resolved` (on Windows a
+    // `\\?\` verbatim path; on macOS `/private/var`). A lexical fallback for
+    // a missing file never matched that spelling and misreported it as an
+    // escape.
+    let target = cockpit_host::path_containment::effective_path(resolved)
+        .unwrap_or_else(|_| normalize_lexical(resolved));
     if !target.starts_with(&policy.cwd_resolved) {
         return Some(skip(
             policy_tool_for(resolved),

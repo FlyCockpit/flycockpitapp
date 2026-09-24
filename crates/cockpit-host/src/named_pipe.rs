@@ -191,9 +191,11 @@ fn is_lower_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-/// Protected owner-only DACL for a local named pipe. The sole ACE grants the
-/// daemon's OS user exact data/synchronize rights plus the instance-creation
-/// bit needed to re-arm the listener. No non-owner principal receives
+/// Protected owner-only DACL for a local named pipe, explicitly owned by the
+/// daemon's OS user. The sole ACE grants that user exactly the rights a
+/// server-side `CreateNamedPipeW(PIPE_ACCESS_DUPLEX)` requests (file generic
+/// read + write, which carries the instance-creation bit needed to re-arm the
+/// listener). No non-owner principal receives
 /// `FILE_CREATE_PIPE_INSTANCE` (or any other pipe right). This does not
 /// distinguish processes running as the owner; the OS user is the boundary.
 /// The server separately rejects remote clients when it creates an instance.
@@ -214,14 +216,24 @@ impl OwnerOnlyPipeSecurity {
     pub fn for_current_user() -> Result<Self> {
         let sid = current_user_sid()?;
         // The daemon creates the first and every subsequent server instance as
-        // this same user. Named-pipe instance creation is DACL-checked against
-        // FILE_CREATE_PIPE_INSTANCE (the FILE_APPEND_DATA bit), so that right
-        // must be explicit on the owner's sole ACE. There are no non-owner ACEs.
-        // Ordinary client helpers still request only read, write, and
-        // synchronize below; they never receive generic write. Do not replace
-        // this with Generic Write: its other generic rights are not part of
-        // either the client or server contract.
-        Self::from_sddl(&format!("D:P(A;;0x00100007;;;{sid})"))
+        // this same user. Creating a subsequent instance of an existing pipe is
+        // an access check of the server's whole desired access against this
+        // DACL: kernel32 `CreateNamedPipeW(PIPE_ACCESS_DUPLEX)` requests
+        // GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, which NPFS maps through
+        // the file generic mapping and checks together with
+        // FILE_CREATE_PIPE_INSTANCE (the FILE_APPEND_DATA bit). The former
+        // `0x00100007` ACE (read data | write data | append | synchronize)
+        // lacked READ_CONTROL and the attribute/EA bits of FILE_GENERIC_READ /
+        // FILE_GENERIC_WRITE, so every re-arm failed ERROR_ACCESS_DENIED.
+        // 0x0012019F = FILE_GENERIC_READ (0x00120089) | FILE_GENERIC_WRITE
+        // (0x00120116), which already includes FILE_APPEND_DATA. It is
+        // still a single same-user ACE: no non-owner ACEs, no DELETE,
+        // WRITE_DAC, WRITE_OWNER, or FILE_ALL_ACCESS. Ordinary client helpers
+        // keep requesting only read data, write data, and synchronize below.
+        // The explicit `O:` owner keeps the pipe owned by the user even on an
+        // elevated administrator token (whose default owner is
+        // BUILTIN\Administrators); naming the token user needs no privilege.
+        Self::from_sddl(&format!("O:{sid}D:P(A;;0x0012019f;;;{sid})"))
     }
 
     fn from_sddl(sddl: &str) -> Result<Self> {
@@ -588,10 +600,12 @@ pub async fn connect_client_pipe(
     Ok(client)
 }
 
-/// Open the ordinary client side with exactly the DACL rights in
-/// [`OwnerOnlyPipeSecurity`]. Tokio's `ClientOptions` requests generic read
-/// and generic write, and generic write would not match this deliberately
-/// narrow DACL (nor should it, because it carries pipe-instance creation).
+/// Open the ordinary client side with only read data, write data, and
+/// synchronize. Tokio's `ClientOptions` requests generic read and generic
+/// write; a client never needs generic write's other bits (it carries
+/// pipe-instance creation), so the client handle stays least-privilege even
+/// though the owner-only [`OwnerOnlyPipeSecurity`] ACE also grants the
+/// server-side re-arm rights to the same user.
 #[cfg(windows)]
 fn open_pipe_client_handle(
     pipe: &PipeName,

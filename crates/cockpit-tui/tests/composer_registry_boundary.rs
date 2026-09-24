@@ -792,7 +792,11 @@ fn app_is_the_only_production_registered_composer_owner_and_constructor() {
     let mut constructors = Vec::new();
     let mut violations = Vec::new();
     for path in rust_files(&root) {
-        let relative = path.strip_prefix(&root).unwrap().to_string_lossy();
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         let source = std::fs::read_to_string(&path).unwrap();
         let inventory = inspect_production(&source, &relative);
         constructors.extend(inventory.constructors);

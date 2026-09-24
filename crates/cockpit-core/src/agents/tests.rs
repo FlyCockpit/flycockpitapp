@@ -140,7 +140,7 @@ fn project_agents_dir(cwd: &Path) -> std::path::PathBuf {
 fn write_large_agent(path: &Path, size: u64) {
     fs::write(path, "---\ndescription: too large\n---\nbody\n").unwrap();
     fs::OpenOptions::new()
-        .append(true)
+        .write(true)
         .open(path)
         .unwrap()
         .set_len(size)

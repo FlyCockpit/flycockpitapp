@@ -826,8 +826,8 @@ for line in sys.stdin:
         ServerConfig {
             transport: Transport::Stdio,
             endpoint: None,
-            command: Some(script.to_string_lossy().into_owned()),
-            args: vec![],
+            command: Some(cockpit_test_support::python_script_launch(&script).0),
+            args: cockpit_test_support::python_script_launch(&script).1,
             env: BTreeMap::new(),
             env_credential_refs: BTreeMap::new(),
             auth: Default::default(),
@@ -1190,8 +1190,8 @@ for line in sys.stdin:
             ServerConfig {
                 transport: Transport::Stdio,
                 endpoint: None,
-                command: Some(script.to_string_lossy().into_owned()),
-                args: vec![],
+                command: Some(cockpit_test_support::python_script_launch(&script).0),
+                args: cockpit_test_support::python_script_launch(&script).1,
                 env: BTreeMap::new(),
                 env_credential_refs: BTreeMap::new(),
                 auth: Default::default(),
@@ -1363,8 +1363,8 @@ for line in sys.stdin:
             ServerConfig {
                 transport: Transport::Stdio,
                 endpoint: None,
-                command: Some(script.to_string_lossy().into_owned()),
-                args: vec![],
+                command: Some(cockpit_test_support::python_script_launch(&script).0),
+                args: cockpit_test_support::python_script_launch(&script).1,
                 env: BTreeMap::new(),
                 env_credential_refs: BTreeMap::new(),
                 auth: Default::default(),

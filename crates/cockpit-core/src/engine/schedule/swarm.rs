@@ -1122,10 +1122,8 @@ mod tests {
             crate::engine::model::Model::for_provider(&cfg, "selfhosted", "worker", table.clone())
                 .unwrap(),
         );
-        let trusted_custody = crate::engine::model_roles::inherited_custody_for_model(
-            &cfg,
-            &trusted_parent,
-        );
+        let trusted_custody =
+            crate::engine::model_roles::inherited_custody_for_model(&cfg, &trusted_parent);
         assert_eq!(
             trusted_custody.custody(),
             crate::config::providers::ModelCustody::Trusted
@@ -1139,10 +1137,8 @@ mod tests {
             crate::engine::model::Model::for_provider(&cfg, "cloud", "worker", table.clone())
                 .unwrap(),
         );
-        let untrusted_custody = crate::engine::model_roles::inherited_custody_for_model(
-            &cfg,
-            &untrusted_child,
-        );
+        let untrusted_custody =
+            crate::engine::model_roles::inherited_custody_for_model(&cfg, &untrusted_child);
         assert_eq!(
             untrusted_custody.custody(),
             crate::config::providers::ModelCustody::Untrusted

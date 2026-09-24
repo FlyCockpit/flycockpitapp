@@ -1142,14 +1142,21 @@ impl crate::engine::agent::hooks::CommandRunner for PanicRunner {
 }
 
 /// A process-env that resolves any bare executable so the injected runner runs.
+/// Like every real Windows host it reports a parent `SystemRoot`; without one
+/// the hook runner fails open before ever consulting the injected runner.
 struct ResolveEnv;
 
 impl crate::engine::agent::hooks::ProcessEnv for ResolveEnv {
     fn resolve_executable(&self, name: &str) -> Option<std::path::PathBuf> {
-        Some(std::path::PathBuf::from("/fake/bin").join(name))
+        let bin = if cfg!(windows) {
+            "C:\\fake\\bin"
+        } else {
+            "/fake/bin"
+        };
+        Some(std::path::PathBuf::from(bin).join(name))
     }
     fn system_root(&self) -> Option<String> {
-        None
+        cfg!(windows).then(|| "C:\\Windows".to_string())
     }
 }
 

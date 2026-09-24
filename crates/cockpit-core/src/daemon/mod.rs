@@ -4119,29 +4119,40 @@ mod tests {
 
     #[test]
     fn deny_collapse_ignores_relative_and_empty_paths() {
+        // Host-absolute fixtures already in canonical deny form, so no
+        // canonical alias is added: `/deny` has no drive on Windows (it is
+        // root-relative, not absolute), and a drive path canonicalizes to a
+        // distinct `\\?\` verbatim spelling there.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let abs = |path: &str| {
+            path.split('/')
+                .filter(|part| !part.is_empty())
+                .fold(base.clone(), |acc, part| acc.join(part))
+        };
         let mut paths = Vec::new();
-        push_unique_deny_path(&mut paths, PathBuf::from("/deny/root"));
+        push_unique_deny_path(&mut paths, abs("/deny/root"));
         push_unique_deny_path(&mut paths, PathBuf::new());
         push_unique_deny_path(&mut paths, PathBuf::from("relative"));
         push_unique_deny_path(&mut paths, PathBuf::from("relative/nested"));
         push_unique_deny_path(&mut paths, PathBuf::from("relative"));
-        push_unique_deny_path(&mut paths, PathBuf::from("/deny/root/nested"));
+        push_unique_deny_path(&mut paths, abs("/deny/root/nested"));
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("/deny/root"),
+                abs("/deny/root"),
                 PathBuf::from("relative"),
                 PathBuf::from("relative/nested"),
             ],
             "only absolute paths collapse; an empty path is dropped, not a universal prefix"
         );
-        push_unique_deny_path(&mut paths, PathBuf::from("/deny"));
+        push_unique_deny_path(&mut paths, abs("/deny"));
         assert_eq!(
             paths,
             vec![
                 PathBuf::from("relative"),
                 PathBuf::from("relative/nested"),
-                PathBuf::from("/deny"),
+                abs("/deny"),
             ],
             "an absolute ancestor replaces only the absolute entries it covers"
         );

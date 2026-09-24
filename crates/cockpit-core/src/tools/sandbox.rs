@@ -398,7 +398,17 @@ pub async fn check_gitignore_read(
 
     // The matching/glob root: the enclosing git worktree (so recorded globs
     // re-match the same way config-resolved globs do), else the session cwd.
+    // The root must be spelled in the same resolved space as `resolved`:
+    // `git rev-parse` prints `C:/...` and the session cwd is the user's
+    // spelling, while `resolved` is canonical (a `\\?\` verbatim path on
+    // Windows). A root in a different spelling makes every relative glob
+    // below degrade to an absolute, never-matching one.
     let root = crate::git::find_worktree_root(resolved).unwrap_or_else(|| ctx.cwd.clone());
+    let root = if effective.is_ok() {
+        effective_native_path(&root).unwrap_or(root)
+    } else {
+        root
+    };
 
     // Effective allowlist = persisted per-layer config ∪ session set.
     let mut allow = crate::config::extended::resolve_gitignore_allow(&ctx.cwd);
@@ -1160,7 +1170,8 @@ mod tests {
         let checked = check_native_access(&ctx, &attached_note, SandboxPathAccess::Read)
             .await
             .expect("attached local knowledge reads without a path approval");
-        assert_eq!(checked, attached_note);
+        // The gate returns the syscall-effective (canonical) spelling.
+        assert_eq!(checked, std::fs::canonicalize(&attached_note).unwrap());
 
         ctx.approver = None;
         let write = check_native_access(&ctx, &attached_note, SandboxPathAccess::ReadWrite)
@@ -1379,7 +1390,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(checked.starts_with(&package));
+        // The gate returns the syscall-effective (canonical) spelling; on
+        // Windows that is the `\\?\` verbatim form of the package root.
+        assert!(checked.starts_with(std::fs::canonicalize(&package).unwrap()));
 
         let err = check_native_access(
             &ctx,
@@ -1498,10 +1511,31 @@ mod tests {
         let err = check_native_access(&ctx, &target, SandboxPathAccess::Read)
             .await
             .unwrap_err();
+        // Unix resolves `missing/..` physically, so the traversal through a
+        // nonexistent component cannot be proven and is refused as such.
+        #[cfg(not(windows))]
         assert!(
             err.to_string().contains("unresolved parent traversal in"),
             "unresolved parent traversal must remain rejected: {err}"
         );
+        // Win32 path normalization collapses `missing\..` lexically before any
+        // file-system lookup (exactly as the eventual open will), so the
+        // effective target is `<outside>\secret.txt`: it must still be
+        // refused as outside the boundary, naming the collapsed target.
+        #[cfg(windows)]
+        {
+            let collapsed = std::fs::canonicalize(outside.path())
+                .unwrap()
+                .join("secret.txt");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!(
+                    "`{}` is outside the session boundary and cannot be approved in this context",
+                    collapsed.display()
+                )),
+                "parent traversal out of the boundary must remain rejected: {err}"
+            );
+        }
     }
 
     #[test]

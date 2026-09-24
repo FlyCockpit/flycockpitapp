@@ -309,7 +309,7 @@ async fn a_second_transfer_waits_while_a_sibling_execution_permit_overlaps() {
     assert_eq!(permit.lease_id, parent.lease_id());
     assert_eq!(
         permit.influence_root,
-        h.root().join("a").display().to_string()
+        h.effective("a").display().to_string()
     );
 
     // A transfer of another subtree under `a` must not activate.

@@ -494,7 +494,7 @@ impl ReviewCage {
                     .collect(),
                 viewed_skills: HashSet::new(),
                 viewed_package_roots: HashSet::new(),
-                preauthorized_package_roots: roots.into_iter().map(lexical_normalize).collect(),
+                preauthorized_package_roots: roots.into_iter().map(cage_root).collect(),
                 preauthorized_skills_roots: Vec::new(),
                 auto_deny_approvals: true,
                 max_dispatches: SKILLS_REVIEW_MAX_DISPATCHES,
@@ -537,10 +537,11 @@ impl ReviewCage {
     }
 
     pub fn record_skill_package_view(&self, name: &str, package_root: &Path) {
+        let viewed_root = lexical_normalize(package_root);
+        let package_root = cage_root(package_root);
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        let package_root = lexical_normalize(package_root);
         state.viewed_skills.insert(name.to_string());
-        state.viewed_package_roots.insert(package_root.clone());
+        state.viewed_package_roots.insert(viewed_root);
         if !state
             .preauthorized_package_roots
             .iter()
@@ -569,7 +570,9 @@ impl ReviewCage {
     }
 
     pub fn preauthorizes_package_path(&self, path: &Path) -> bool {
-        let path = lexical_normalize(path);
+        let Some(path) = cage_candidate(path) else {
+            return false;
+        };
         self.state
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -586,7 +589,7 @@ impl ReviewCage {
     /// and only with the host-configured scan/mutation roots — an in-cage
     /// agent cannot name arbitrary paths into the boundary this way.
     pub fn preauthorize_skills_root(&self, root: &Path) {
-        let root = lexical_normalize(root);
+        let root = cage_root(root);
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         if !state
             .preauthorized_skills_roots
@@ -599,7 +602,9 @@ impl ReviewCage {
 
     /// True when `path` is a preauthorized skills root or lives under one.
     pub fn preauthorizes_skills_root_path(&self, path: &Path) -> bool {
-        let path = lexical_normalize(path);
+        let Some(path) = cage_candidate(path) else {
+            return false;
+        };
         self.state
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -642,6 +647,25 @@ fn sorted_csv(values: &HashSet<String>) -> String {
     let mut values: Vec<&str> = values.iter().map(String::as_str).collect();
     values.sort_unstable();
     values.join(", ")
+}
+
+/// Spell a cage admission root in the same syscall-effective form the
+/// native-access gate checks candidates in (`check_native_access` compares the
+/// canonicalized target). Comparing a lexical root against a canonical
+/// candidate never matches when the spellings differ — on Windows the
+/// canonical form is a `\\?\` verbatim path (and 8.3 short names such as
+/// `RUNNER~1` are expanded), on macOS `/var` is `/private/var` — so every
+/// caged package would be denied. A root whose existing prefix cannot be
+/// resolved keeps its lexical spelling, which can only fail to match.
+fn cage_root(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    cockpit_host::path_containment::effective_path(path).unwrap_or_else(|_| lexical_normalize(path))
+}
+
+/// Candidate side of [`cage_root`]: a path that cannot be resolved to its
+/// syscall-effective form (dangling symlink, unresolved `..`) is not admitted.
+fn cage_candidate(path: &Path) -> Option<PathBuf> {
+    cockpit_host::path_containment::effective_path(path).ok()
 }
 
 fn lexical_normalize(path: impl AsRef<Path>) -> PathBuf {

@@ -1984,14 +1984,9 @@ mod tests {
 
         // 4. Only the separately host-authorized coordinator may take the
         //    trusted child, and it is the sole minter of a custody grant.
-        let (trusted, grant) = resolve_trusted_child_model(
-            "reasoning",
-            "deepthink",
-            &providers,
-            &session,
-            None,
-        )
-        .unwrap();
+        let (trusted, grant) =
+            resolve_trusted_child_model("reasoning", "deepthink", &providers, &session, None)
+                .unwrap();
         assert_eq!(trusted.model_id_ref(), "trusted-reasoning");
         assert_eq!(grant.provider(), "minimax");
         assert_eq!(grant.model(), "trusted-reasoning");
@@ -2662,13 +2657,7 @@ mod tests {
     fn trusted_child_capture_requires_local_location() {
         let providers = trusted_child_providers(Some(ModelLocation::Remote));
         let session = session_model(&providers);
-        match resolve_trusted_child_model(
-            "reasoning",
-            "deepthink",
-            &providers,
-            &session,
-            None,
-        ) {
+        match resolve_trusted_child_model("reasoning", "deepthink", &providers, &session, None) {
             Err(SelectorResolution::InvalidLiteral(message)) => {
                 assert!(
                     message.contains("local"),
@@ -2693,14 +2682,9 @@ mod tests {
     fn trusted_child_local_is_capture_capable() {
         let providers = trusted_child_providers(Some(ModelLocation::Local));
         let session = session_model(&providers);
-        let (model, grant) = resolve_trusted_child_model(
-            "reasoning",
-            "deepthink",
-            &providers,
-            &session,
-            None,
-        )
-        .expect("a trusted host-local child must mint a grant");
+        let (model, grant) =
+            resolve_trusted_child_model("reasoning", "deepthink", &providers, &session, None)
+                .expect("a trusted host-local child must mint a grant");
         assert_eq!(model.provider_id(), "minimax");
         assert_eq!(model.model_id_ref(), "trusted-reasoning");
         assert_eq!(grant.provider(), "minimax");
@@ -2716,14 +2700,8 @@ mod tests {
             let providers = trusted_child_providers(location);
             let session = session_model(&providers);
             assert!(
-                resolve_trusted_child_model(
-                    "reasoning",
-                    "deepthink",
-                    &providers,
-                    &session,
-                    None,
-                )
-                .is_err(),
+                resolve_trusted_child_model("reasoning", "deepthink", &providers, &session, None,)
+                    .is_err(),
                 "a trusted child at {location:?} must fail closed (no grant minted)"
             );
         }
@@ -2759,14 +2737,8 @@ mod tests {
             });
         let session = session_model(&providers);
         assert!(
-            resolve_trusted_child_model(
-                "reasoning",
-                "deepthink",
-                &providers,
-                &session,
-                None,
-            )
-            .is_err(),
+            resolve_trusted_child_model("reasoning", "deepthink", &providers, &session, None,)
+                .is_err(),
             "an untrusted child must never receive a trusted custody grant"
         );
     }
@@ -2777,28 +2749,17 @@ mod tests {
     fn trusted_child_custody_ignores_harness_mode() {
         let providers = trusted_child_providers(Some(ModelLocation::Local));
         let session = session_model(&providers);
-        let (model, grant) = resolve_trusted_child_model(
-            "reasoning",
-            "deepthink",
-            &providers,
-            &session,
-            None,
-        )
-        .expect("a local trusted child must route");
+        let (model, grant) =
+            resolve_trusted_child_model("reasoning", "deepthink", &providers, &session, None)
+                .expect("a local trusted child must route");
         assert_eq!(grant.provider(), model.provider_id());
         assert_eq!(grant.model(), model.model_id_ref());
 
         let providers = trusted_child_providers(Some(ModelLocation::Remote));
         let session = session_model(&providers);
         assert!(
-            resolve_trusted_child_model(
-                "reasoning",
-                "deepthink",
-                &providers,
-                &session,
-                None,
-            )
-            .is_err(),
+            resolve_trusted_child_model("reasoning", "deepthink", &providers, &session, None,)
+                .is_err(),
             "a trusted Remote child must fail closed"
         );
     }

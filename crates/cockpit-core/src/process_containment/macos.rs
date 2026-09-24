@@ -28,9 +28,7 @@ use super::unix::{UnixHost, UnixProcessTreeAdapter, impl_unix_host_adapter};
 /// Historical fail-open reason used by injectable Unsupported fixtures.
 pub const MACOS_UNSUPPORTED_REASON: &str = "macos_no_unprivileged_descendant_container";
 
-pub use super::unix::{
-    MACOS_PROCESS_TREE_UNAVAILABLE_ON_HOST,
-};
+pub use super::unix::MACOS_PROCESS_TREE_UNAVAILABLE_ON_HOST;
 #[cfg(test)]
 use super::unix::PROCESS_GROUP_EMPTY_MEMBERSHIP_UNPROVEN;
 

@@ -540,6 +540,8 @@ fn map_package_error(error: anyhow::Error) -> AuthoredPackageRejection {
     } else if message.contains("interactiveSubagents")
         || message.contains("private subagent")
         || message.contains("subagents/")
+        // Package child paths are rendered with the host separator.
+        || message.contains("subagents\\")
         || message.contains("maxDescendantDepth")
         || message.contains("delegation")
         || message.contains("cycle")

@@ -7,14 +7,14 @@
 use std::io::Cursor;
 
 use anyhow::{Result, anyhow, bail, ensure};
+#[cfg(test)]
+use image::ImageFormat;
 use image::codecs::png::{CompressionType, FilterType};
 use image::imageops::FilterType as ResizeFilter;
 use image::metadata::Orientation;
-#[cfg(test)]
-use image::ImageFormat;
 use image::{
-    ColorType, DynamicImage, ExtendedColorType, ImageDecoder as _, ImageEncoder,
-    ImageReader, Limits,
+    ColorType, DynamicImage, ExtendedColorType, ImageDecoder as _, ImageEncoder, ImageReader,
+    Limits,
 };
 
 /// Pixel crop rectangle in **oriented-image** coordinates.

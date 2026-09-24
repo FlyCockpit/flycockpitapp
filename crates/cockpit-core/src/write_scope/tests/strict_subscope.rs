@@ -126,10 +126,10 @@ async fn validation_uses_effective_authority_not_the_base_scope() {
         .unwrap();
 
     // The base still contains `a/inner`...
-    assert!(authority.base().contains_path(&h.root().join("a/inner")));
+    assert!(authority.base().contains_path(&h.effective("a/inner")));
     // ...but the effective authority does not.
-    assert!(!authority.allows_path(&h.root().join("a/inner")));
-    assert!(authority.allows_path(&h.root().join("b/file.txt")));
+    assert!(!authority.allows_path(&h.effective("a/inner")));
+    assert!(authority.allows_path(&h.effective("b/file.txt")));
 }
 
 #[test]

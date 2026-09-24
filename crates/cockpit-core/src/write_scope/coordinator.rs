@@ -980,10 +980,20 @@ impl WriteScopeCoordinator {
     ) -> Result<AcquiredExecution, WriteScopeError> {
         // 1. Reserve the execution-wide permit first, so it already exists if
         //    anything below fails and a recovery pass has to find it.
-        let reachable_ancestor = request
-            .reachable_ancestor
-            .clone()
-            .unwrap_or_else(|| request.sub_scope.path().to_path_buf());
+        // A widened ancestor is compared against canonical scopes and permit
+        // roots, so it must be in the same syscall-effective spelling: a
+        // lexical spelling (on Windows: not `\\?\` verbatim, 8.3 short names;
+        // on macOS: `/var` vs `/private/var`) would never overlap and the
+        // drain check would fail open. An unresolvable ancestor fails closed.
+        let reachable_ancestor =
+            match request.reachable_ancestor.as_deref() {
+                Some(ancestor) => cockpit_host::path_containment::effective_path(ancestor)
+                    .map_err(|error| WriteScopeError::InvalidScope {
+                        requested: ancestor.display().to_string(),
+                        reason: format!("reachable ancestor does not resolve: {error}"),
+                    })?,
+                None => request.sub_scope.path().to_path_buf(),
+            };
         let footprint = PermitFootprint::for_execution(
             request.sub_scope.path().to_path_buf(),
             reachable_ancestor,

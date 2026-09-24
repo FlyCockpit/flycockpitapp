@@ -1343,7 +1343,12 @@ fn production_cli_has_one_structural_lifecycle_runner_inventory() {
     let mut runners = Vec::new();
     let mut violations = Vec::new();
     for path in rust_files(&source_root) {
-        let relative = path.strip_prefix(&source_root).unwrap().to_string_lossy();
+        // Inventory keys are `/`-separated on every host.
+        let relative = path
+            .strip_prefix(&source_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         let source = std::fs::read_to_string(&path).unwrap();
         let inventory = inspect(&source, &relative);
         runners.extend(inventory.runners);
@@ -1379,7 +1384,7 @@ fn core_runner_is_the_only_raw_owner() {
         }
         outside_owner_violations.extend(owned_session_occurrences_in_source(
             &std::fs::read_to_string(&path).unwrap(),
-            &relative.display().to_string(),
+            &relative.display().to_string().replace('\\', "/"),
         ));
     }
     assert!(

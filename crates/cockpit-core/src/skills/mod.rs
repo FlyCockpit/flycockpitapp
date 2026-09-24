@@ -984,6 +984,20 @@ fn resolve_dir_entry(entry: &str, cwd: &Path, ancestor_walk: bool, out: &mut Vec
         return;
     }
 
+    // A root-anchored (`\skills`, `/skills`) or drive-relative (`D:skills`)
+    // entry on Windows is not `is_absolute`, but it does not name a path
+    // relative to each ancestor either: every join resolves to the same
+    // location. Anchor it once against the cwd's drive instead of walking.
+    if rel.has_root()
+        || matches!(
+            rel.components().next(),
+            Some(std::path::Component::Prefix(_))
+        )
+    {
+        out.push(cwd.join(&rel));
+        return;
+    }
+
     if !ancestor_walk {
         out.push(cwd.join(&rel));
         return;
@@ -1092,9 +1106,9 @@ fn run_bang_command(cmd: &str, cwd: &Path, redact: &RedactionTable) -> String {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             // Trim the trailing newline command stdout usually carries so
-            // the substitution reads inline-naturally; scrub before the
-            // output enters context.
-            scrub_bang_output(redact, stdout.trim_end_matches('\n'))
+            // the substitution reads inline-naturally (a Windows shell ends
+            // its lines with CRLF); scrub before the output enters context.
+            scrub_bang_output(redact, stdout.trim_end_matches(['\r', '\n']))
         }
         Ok(out) => {
             let code = out
@@ -1319,7 +1333,7 @@ mod tests {
         let path = sub.join("SKILL.md");
         std::fs::write(&path, "---\nname: large\ndescription: too large\n---\n").unwrap();
         std::fs::OpenOptions::new()
-            .append(true)
+            .write(true)
             .open(&path)
             .unwrap()
             .set_len(size)
@@ -2187,7 +2201,9 @@ mod tests {
         let manifest =
             trusted_package_target_for_path(&package.join("SKILL.md"), tmp.path(), &cfg).unwrap();
         assert_eq!(manifest.name, "target");
-        assert_eq!(manifest.package_root, package);
+        // Package roots are rebased onto the canonical workspace root (the
+        // `\\?\` verbatim form on Windows, `/private/var` on macOS).
+        assert_eq!(manifest.package_root, package.canonicalize().unwrap());
         assert!(manifest.is_manifest);
         assert_eq!(manifest.relative_path, Path::new("SKILL.md"));
 

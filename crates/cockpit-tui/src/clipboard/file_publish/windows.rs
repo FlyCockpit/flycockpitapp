@@ -1,7 +1,6 @@
 //! Windows atomic no-clobber publish: a handle-relative temp create, then
-//! `SetFileInformationByHandle(FileRenameInfoEx)` with
-//! `RootDirectory` set to the held parent directory handle and no
-//! `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` bit. `MoveFileExW` and path-based
+//! `NtSetInformationFile(FileRenameInformation)` with `RootDirectory` set to
+//! the held parent directory handle and `ReplaceIfExists = FALSE`. `MoveFileExW` and path-based
 //! check/rename are never used.
 
 use std::io;
@@ -12,7 +11,8 @@ use std::path::Path;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile,
+    NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
@@ -21,10 +21,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FileRenameInfoEx,
-    FlushFileBuffers, GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
-    WriteFile,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FlushFileBuffers,
+    GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle, WriteFile,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -188,47 +187,75 @@ fn write_all_and_flush(file: &std::fs::File, bytes: &[u8]) -> io::Result<()> {
 
 /// Publish the open temp handle under `dest_name`, resolved relative to
 /// the held parent handle, with no replace-if-exists bit set.
+///
+/// This issues `NtSetInformationFile(FileRenameInformation)` directly rather
+/// than `SetFileInformationByHandle(FileRenameInfo[Ex])`. The Win32 wrapper
+/// does not pass `FILE_RENAME_INFO` through verbatim: it re-encodes
+/// `FileName` via the DOS-to-NT path converter (as Wine's reimplementation
+/// documents), which turns a bare component such as `out.txt` into an
+/// absolute `\??\<cwd>\out.txt` NT name, and an absolute name combined with
+/// a non-NULL `RootDirectory` is rejected. On the Windows runner every
+/// handle-relative publish failed with `ERROR_INVALID_PARAMETER`. The NT call
+/// passes the single component through verbatim,
+/// resolved only beneath the held parent — the same primitive the
+/// `cockpit-host` held-directory publisher uses. `ReplaceIfExists = FALSE`
+/// keeps it no-clobber on every filesystem (the `Ex` flag form is NTFS-only);
+/// a collision is `STATUS_OBJECT_NAME_COLLISION`, which maps to
+/// `ERROR_ALREADY_EXISTS`.
 fn publish_no_replace(
     temp: &std::fs::File,
     parent: HANDLE,
     dest_name: &std::ffi::OsStr,
 ) -> io::Result<()> {
-    let dest_wide = wide(dest_name);
-    let name_bytes = ((dest_wide.len() - 1) * std::mem::size_of::<u16>()) as u32;
-    let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    // `FileNameLength` excludes the terminator, but Windows requires the
-    // variable-length buffer passed to FileRenameInfoEx to include one.
-    let total_bytes = header_bytes + name_bytes as usize + std::mem::size_of::<u16>();
+    let mut dest_wide = wide(dest_name);
+    dest_wide.pop(); // FileNameLength-delimited, never NUL-terminated.
+    if dest_wide.is_empty()
+        || dest_wide.contains(&(b'\\' as u16))
+        || dest_wide.contains(&(b'/' as u16))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "publish destination must be a single path component",
+        ));
+    }
+    let name_bytes = dest_wide.len() * std::mem::size_of::<u16>();
+    let header_bytes = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+    let total_bytes =
+        (header_bytes + name_bytes).max(std::mem::size_of::<FILE_RENAME_INFORMATION>());
     let word_bytes = std::mem::size_of::<usize>();
     let mut storage = vec![0usize; total_bytes.div_ceil(word_bytes)];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: `storage` is pointer-aligned and large enough for the fixed
-    // header plus the UTF-16 destination bytes and terminator. `parent` is
-    // the live, retained directory handle; `temp` was opened with `DELETE`
-    // access.
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: `storage` is zeroed, pointer-aligned, and large enough for the
+    // fixed header plus the UTF-16 destination bytes. `parent` is the live,
+    // retained directory handle; `temp` was opened with `DELETE` access.
     unsafe {
-        (*info).Anonymous.Flags = 0; // No `FILE_RENAME_FLAG_REPLACE_IF_EXISTS`.
+        (*info).Anonymous.ReplaceIfExists = false;
         (*info).RootDirectory = parent;
-        (*info).FileNameLength = name_bytes;
+        (*info).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(
             dest_wide.as_ptr(),
             std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
             dest_wide.len(),
         );
     }
-    // SAFETY: `info` points to a live, correctly sized rename-info buffer.
-    let renamed = unsafe {
-        SetFileInformationByHandle(
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: `info` points to a live, correctly sized rename record and
+    // `io_status` is a valid out-parameter for the synchronous call.
+    let status = unsafe {
+        NtSetInformationFile(
             temp.as_raw_handle() as HANDLE,
-            FileRenameInfoEx,
-            info.cast(),
+            &mut io_status,
+            info.cast_const().cast(),
             total_bytes as u32,
+            FileRenameInformation,
         )
     };
-    if renamed != 0 {
+    if status >= 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        // SAFETY: total for NTSTATUS values; no pointer dereference.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(code as i32))
     }
 }
 
@@ -273,7 +300,7 @@ pub(super) fn publish(
     }
 
     match publish_no_replace(&temp, parent_handle, dest_name) {
-        // `SetFileInformationByHandle(FileRenameInfoEx)` completing without
+        // `NtSetInformationFile(FileRenameInformation)` completing without
         // error is NTFS-transactional for the rename itself; unlike POSIX
         // there is no separate directory-fsync step that can fail
         // independently afterward, so there is no partial state to

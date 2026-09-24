@@ -1666,7 +1666,12 @@ fn filesystem_read_authority_is_explicit_and_path_discovery_is_worker_only() {
             } else if path.extension().and_then(|value| value.to_str()) == Some("rs")
                 && !is_explicit_cfg_test_module(&path)
             {
-                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/");
                 if relative.ends_with("tests.rs") || relative.contains("_tests.rs") {
                     continue;
                 }
@@ -1758,7 +1763,11 @@ fn production_process_and_network_authority_is_exactly_allowlisted() {
             }
             let source = fs::read_to_string(&path).unwrap();
             let production = production_source(&source);
-            let relative = path.strip_prefix(repo_root()).unwrap().to_string_lossy();
+            let relative = path
+                .strip_prefix(repo_root())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             let production_lines = production.lines().collect::<Vec<_>>();
             for (line_number, authority) in filesystem_authority_sites(&production) {
                 let line = production_lines
@@ -2020,7 +2029,11 @@ fn production_filesystem_mutations_have_device_ui_owners() {
             }
             let source = fs::read_to_string(&path).unwrap();
             let production = production_source(&source);
-            let relative = path.strip_prefix(repo_root()).unwrap().to_string_lossy();
+            let relative = path
+                .strip_prefix(repo_root())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             for (line_number, line) in production.lines().enumerate() {
                 let trimmed = line.trim_start();
                 if trimmed.starts_with("//") {

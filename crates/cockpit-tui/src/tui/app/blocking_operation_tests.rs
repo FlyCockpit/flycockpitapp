@@ -935,7 +935,8 @@ fn doctor_snapshot_is_point_in_time() {
 #[tokio::test]
 async fn cancelled_app_with_live_export_owner_reaps_before_drop_returns() {
     let tmp = tempfile::tempdir().unwrap();
-    let partial = tmp.path().join(".cancelled-app.partial");
+    let partial =
+        crate::tui::async_action::export_partial_path(tmp.path(), ".cancelled-app.partial");
     let worker_partial = partial.clone();
     let (owned_tx, owned_rx) = tokio::sync::oneshot::channel();
     let mut app = App::new(None, false);
@@ -943,7 +944,7 @@ async fn cancelled_app_with_live_export_owner_reaps_before_drop_returns() {
         AsyncActionKind::Blocking("export.transcript"),
         AsyncActionPolicy::AllowConcurrent,
         move |owner| async move {
-            std::fs::write(&worker_partial, b"partial").unwrap();
+            crate::tui::async_action::write_owned_partial(&worker_partial);
             owner.own_export_temp(worker_partial);
             owned_tx.send(()).unwrap();
             std::future::pending::<Result<AsyncActionPayload, String>>().await

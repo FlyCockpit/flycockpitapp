@@ -1403,6 +1403,7 @@ pub fn normalize_paths(args: &mut Value, schema: &Value, root: &Path) -> PathNor
                 // Runs after schema repair and before sandbox confinement.
                 if !may_create
                     && Path::new(&current).is_relative()
+                    && !Path::new(&current).has_root()
                     && let Some(stripped) = strip_relative_trailing_garbage(&current, root)
                 {
                     map.insert(key.clone(), Value::String(stripped));
@@ -1470,7 +1471,11 @@ enum AbsPathVerdict {
 /// failing that it is `Unsalvageable`.
 fn normalize_one_abs_path(value: &str, root: &Path, may_create: bool) -> AbsPathVerdict {
     let raw = Path::new(value);
-    if !raw.is_absolute() {
+    // Root-anchored counts as absolute here: on Windows a fabricated Unix
+    // spelling like `/home/user/repo/src/x.rs` has a root but no drive
+    // prefix, so it is not `is_absolute`, yet it is exactly the fabricated-
+    // prefix failure mode (and never resolves under the cwd).
+    if !(raw.is_absolute() || raw.has_root()) {
         // Relative paths already anchor on cwd via `common::resolve`; the
         // fabricated-prefix failure mode is absolute-only.
         return AbsPathVerdict::Untouched;
@@ -1608,7 +1613,7 @@ fn strip_relative_trailing_garbage(value: &str, root: &Path) -> Option<String> {
     let canonical_root = std::fs::canonicalize(root).ok()?;
     // Existing-original identity wins: never rewrite a relative path that already
     // resolves to an existing, confined file — even with literal garbage in it.
-    if relative_exists_confined(&canonical_root, value) {
+    if relative_exists_confined(root, &canonical_root, value) {
         return None;
     }
     // Candidate generation is capped; a longer raw value is left untouched.
@@ -1652,7 +1657,7 @@ fn strip_relative_trailing_garbage(value: &str, root: &Path) -> Option<String> {
         {
             continue;
         }
-        let joined = canonical_root.join(&cand);
+        let joined = root.join(&cand);
         if !crate::tools::sandbox::within_root(&canonical_root, &joined) {
             continue;
         }
@@ -1675,14 +1680,21 @@ fn strip_relative_trailing_garbage(value: &str, root: &Path) -> Option<String> {
 /// Whether relative `value` resolves to an existing path at/under the already
 /// canonicalized `root`. A `..` component disqualifies it (never interpreted).
 /// Confinement reuses the shared sandbox check so it cannot drift.
-fn relative_exists_confined(canonical_root: &Path, value: &str) -> bool {
+///
+/// The value is joined onto the tool's own `root` spelling — exactly how the
+/// tool will open it (`common::resolve`) — not onto `canonical_root`: on
+/// Windows the canonical root is a `\\?\` verbatim path, inside which `/` is
+/// not a separator and Win32 name normalization (e.g. a trailing space) does
+/// not apply, so `canonical_root.join("src/x.rs")` names nothing. Confinement
+/// is still decided on the canonicalized result.
+fn relative_exists_confined(root: &Path, canonical_root: &Path, value: &str) -> bool {
     if Path::new(value)
         .components()
         .any(|c| matches!(c, Component::ParentDir))
     {
         return false;
     }
-    crate::tools::sandbox::within_root(canonical_root, &canonical_root.join(value))
+    crate::tools::sandbox::within_root(canonical_root, &root.join(value))
 }
 
 /// `value` with a trailing Unicode-whitespace run immediately followed by the

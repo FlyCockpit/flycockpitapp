@@ -452,6 +452,13 @@ struct PtyObserver {
     parser: vt100::Parser,
     osc52: Osc52Observer,
     frames: FrameBoundaryObserver,
+    /// The screen exactly as it stood when the child last finished a frame
+    /// (its frame-ending cursor command), or `None` before the first frame
+    /// and after the child's output ends. The live parser can sit in the
+    /// middle of a frame whose diff arrived in several PTY reads — a new
+    /// screen's header already drawn over the previous screen's body — so
+    /// screen predicates are evaluated against this completed frame.
+    completed_frame: Option<vt100::Screen>,
 }
 
 /// Recognizes the child's full-redraw frame boundaries in the raw byte
@@ -482,10 +489,13 @@ impl FrameBoundaryObserver {
     const SHOW_CURSOR: &'static [u8] = b"\x1b[?25h";
     const LONGEST: usize = 6;
 
-    fn feed(&mut self, bytes: &[u8]) {
+    /// Scan `bytes` and return the offsets (exclusive ends, within `bytes`)
+    /// at which a frame-ending cursor command completes.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<usize> {
         let carried = self.tail.len();
         let mut window = std::mem::take(&mut self.tail);
         window.extend_from_slice(bytes);
+        let mut frame_ends = Vec::new();
         for end in 1..=window.len() {
             // Count only sequences that end inside the new bytes; ones that
             // ended inside the carried tail were counted by the last feed.
@@ -497,10 +507,12 @@ impl FrameBoundaryObserver {
                 self.clears += 1;
             } else if prefix.ends_with(Self::HIDE_CURSOR) || prefix.ends_with(Self::SHOW_CURSOR) {
                 self.frame_completed_after_clear = self.clears;
+                frame_ends.push(end - carried);
             }
         }
         let keep = window.len().min(Self::LONGEST - 1);
         self.tail = window[window.len() - keep..].to_vec();
+        frame_ends
     }
 
     fn position(&self) -> (u64, u64) {
@@ -526,19 +538,36 @@ impl PtyObserver {
             parser: vt100::Parser::new(rows, cols, 0),
             osc52: Osc52Observer::new(),
             frames: FrameBoundaryObserver::default(),
+            completed_frame: None,
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
         self.osc52.feed(bytes);
-        self.parser.process(bytes);
-        // After the parser: once a boundary is visible, its frame's cells
-        // already are (both are read under the same observer lock).
-        self.frames.feed(bytes);
+        // Feed the parser up to each frame boundary and capture the screen
+        // there, so `completed_frame` never includes a later frame's first
+        // bytes. Boundary and cells are read under the same observer lock.
+        let mut fed = 0;
+        for end in self.frames.feed(bytes) {
+            self.parser.process(&bytes[fed..end]);
+            fed = end;
+            self.completed_frame = Some(self.parser.screen().clone());
+        }
+        self.parser.process(&bytes[fed..]);
+    }
+
+    /// The screen predicates should read: the last completed frame while the
+    /// child is drawing frames, otherwise the live screen (before the first
+    /// frame, and after output ended so post-exit text is visible).
+    fn settled_screen(&self) -> &vt100::Screen {
+        self.completed_frame
+            .as_ref()
+            .unwrap_or_else(|| self.parser.screen())
     }
 
     fn finish(&mut self) {
         self.osc52.finish();
+        self.completed_frame = None;
     }
 }
 
@@ -1268,6 +1297,9 @@ impl HermeticCockpit {
         }
     }
 
+    /// Wait until `pred` holds for a whole frame the child finished drawing
+    /// (see `PtyObserver::settled_screen`), never for a half-painted grid
+    /// that mixes a new screen's header with the previous screen's body.
     pub fn wait_until_screen(
         &mut self,
         label: &str,
@@ -1277,7 +1309,7 @@ impl HermeticCockpit {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(2);
         loop {
-            let snapshot = self.snapshot();
+            let snapshot = self.settled_snapshot();
             if pred(&snapshot) {
                 return Ok(());
             }
@@ -1299,6 +1331,16 @@ impl HermeticCockpit {
         };
         let observer = pty.observer.lock().expect("pty observer lock");
         ScreenSnapshot::from_screen(observer.parser.screen())
+    }
+
+    /// Snapshot of the last frame the child finished drawing (the live
+    /// screen before the first frame and after the child's output ended).
+    pub fn settled_snapshot(&self) -> ScreenSnapshot {
+        let Some(pty) = &self.pty else {
+            return ScreenSnapshot::empty();
+        };
+        let observer = pty.observer.lock().expect("pty observer lock");
+        ScreenSnapshot::from_screen(observer.settled_screen())
     }
 
     pub fn osc52(&self) -> Osc52Observer {
@@ -1399,6 +1441,8 @@ impl HermeticCockpit {
             .expect("resize PTY");
         if let Ok(mut observer) = pty.observer.lock() {
             observer.parser.screen_mut().set_size(rows, cols);
+            // A frame drawn at the old size no longer describes the grid.
+            observer.completed_frame = None;
         }
         pty.cols = cols;
         pty.rows = rows;

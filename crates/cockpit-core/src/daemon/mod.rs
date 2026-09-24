@@ -5392,87 +5392,113 @@ mod tests {
         );
     }
 
-    /// A persisted session must not, by itself, keep an ephemeral daemon alive
-    /// after an explicit stop. We stand up a real ephemeral
-    /// daemon, write a persisted `sessions` row into the very DB the daemon
-    /// opened (the exact effect the first user message has via
-    /// `persist_if_needed`), then trigger an explicit `StopDaemon`. The daemon
-    /// must drain and reap — removing its socket + pid — within the grace.
-    #[tokio::test]
-    async fn owned_ephemeral_reaps_on_stop_even_with_persisted_session() {
-        use crate::daemon::ephemeral_guard::stop_daemon_blocking;
-        use crate::session::Session;
-
-        let harness = DaemonTestHarness::new();
-        harness.initialize_vault_authority();
-        let _env =
-            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
-        let drain_grace = Duration::from_millis(300);
-
-        let eph = harness.ephemeral_paths("eph-with-session");
+    /// Boot a real ephemeral daemon over the harness DB with a persisted
+    /// launch ticket (so same-uid socket clients exchange owner credentials,
+    /// as for a detached spawn), then persist a `sessions` row into that DB —
+    /// the effect the first user message has via `persist_if_needed`.
+    async fn ephemeral_owner_with_persisted_session(
+        harness: &DaemonTestHarness,
+        name: &str,
+    ) -> (DaemonPaths, tokio::task::JoinHandle<Result<()>>) {
+        let eph = harness.ephemeral_paths(name);
+        let launch_ticket = peer_authority::mint_launch_ticket();
+        peer_authority::persist_launch_ticket(&eph.socket, &launch_ticket)
+            .expect("persist daemon launch ticket");
         let eph_clone = eph.clone();
         let daemon_db = harness.db.clone();
         let eph_task = tokio::spawn(async move {
             run_foreground_inner_with_boot_db(
                 eph_clone,
-                drain_grace,
+                Duration::from_millis(300),
                 false,
                 crate::daemon::terminal::test_host_factory(),
                 Some(daemon_db),
             )
             .await
         });
-
         wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
         assert!(eph.pid_file.exists(), "ephemeral pid file written");
+        let session = crate::session::Session::create_for_test(
+            harness.db.clone(),
+            std::env::temp_dir(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .expect("persist a session row");
+        assert!(session.is_persisted(), "row is persisted");
+        (eph, eph_task)
+    }
 
-        // Persist a `sessions` row into the daemon's DB — the same DB effect
-        // the first user message has. This is what the (suspected) lingering
-        // bug pinned on; it must NOT keep the owned daemon alive.
-        {
-            let session = Session::create_for_test(
-                harness.db.clone(),
-                std::env::temp_dir(),
-                "Build",
-                crate::session::test_redaction_key_resolver(),
-            )
-            .expect("persist a session row");
-            assert!(session.is_persisted(), "row is persisted");
-        }
+    fn assert_ephemeral_owner_retired(eph: &DaemonPaths) {
+        assert!(!eph.socket.exists(), "ephemeral socket removed on teardown");
+        assert!(!eph.pid_file.exists(), "ephemeral pid removed on teardown");
+    }
 
-        // Explicit administrative stop bound to the published receipt. Run it
-        // off the runtime thread because this helper uses a blocking connect.
-        let socket = eph.socket.clone();
-        let pid_file = eph.pid_file.clone();
-        tokio::task::spawn_blocking(move || {
-            let Some(receipt) = read_daemon_pid_record(&pid_file) else {
-                panic!("ephemeral daemon did not publish a PID receipt");
-            };
-            stop_daemon_blocking(&socket, &pid_file, &receipt)
-        })
-        .await
-        .unwrap();
+    /// A persisted session must not keep an ephemeral daemon alive after an
+    /// explicit, authenticated owner `StopDaemon`. Another lifetime client
+    /// stays attached throughout, so last-client teardown cannot be what
+    /// stops it: the stop itself must be acknowledged and drain the owner
+    /// within the original bound.
+    #[tokio::test]
+    async fn owned_ephemeral_reaps_on_stop_even_with_persisted_session() {
+        let harness = DaemonTestHarness::new();
+        harness.initialize_vault_authority();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+        let (eph, eph_task) =
+            ephemeral_owner_with_persisted_session(&harness, "eph-stop-with-session").await;
 
-        // The daemon must drain and exit — despite the persisted session.
-        // This unauthenticated raw-socket stop is answered with an owner
-        // authorization denial, so teardown comes from the stopper being the
-        // owner's last client: it drains once the last-client handoff grace
-        // elapses, then within the original bound.
+        let bystander = cockpit_client::DaemonClient::connect(&eph.socket)
+            .await
+            .expect("attach a lifetime client that stays connected");
+        let stopper = cockpit_client::DaemonClient::connect(&eph.socket)
+            .await
+            .expect("attach the owner stopper");
+        let response = stopper
+            .request(proto::Request::StopDaemon { grace_secs: None })
+            .await
+            .expect("deliver StopDaemon over the wire")
+            .expect("an authenticated owner stop is acknowledged, not refused");
+        assert!(matches!(response, proto::Response::Ack));
+
+        let reaped = tokio::time::timeout(Duration::from_secs(3), eph_task)
+            .await
+            .expect("ephemeral daemon did not reap on StopDaemon with a persisted session");
+        reaped.expect("join").expect("run_foreground_inner ok");
+        assert_ephemeral_owner_retired(&eph);
+        drop(stopper);
+        drop(bystander);
+    }
+
+    /// A persisted session must not keep an ephemeral daemon alive after its
+    /// last client leaves either: it drains once the last-client handoff
+    /// grace elapses with nobody attached.
+    #[tokio::test]
+    async fn owned_ephemeral_reaps_after_last_client_even_with_persisted_session() {
+        let harness = DaemonTestHarness::new();
+        harness.initialize_vault_authority();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+        let (eph, eph_task) =
+            ephemeral_owner_with_persisted_session(&harness, "eph-last-client-with-session").await;
+
+        let client = cockpit_client::DaemonClient::connect(&eph.socket)
+            .await
+            .expect("attach the only lifetime client");
+        client
+            .request_ok(proto::Request::DaemonStatus)
+            .await
+            .expect("the owner serves its client");
+        drop(client);
+
         let reaped = tokio::time::timeout(
             server::LAST_CLIENT_HANDOFF_GRACE + Duration::from_secs(3),
             eph_task,
         )
         .await
-        .expect("ephemeral daemon did not reap on StopDaemon with a persisted session");
+        .expect("ephemeral daemon did not reap after its last client left");
         reaped.expect("join").expect("run_foreground_inner ok");
-        assert!(
-            !eph.socket.exists(),
-            "ephemeral socket removed on explicit teardown"
-        );
-        assert!(
-            !eph.pid_file.exists(),
-            "ephemeral pid removed on explicit teardown"
-        );
+        assert_ephemeral_owner_retired(&eph);
     }
 
     fn test_paths(dir: &tempfile::TempDir) -> DaemonPaths {

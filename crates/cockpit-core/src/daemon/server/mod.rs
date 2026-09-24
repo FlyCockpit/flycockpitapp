@@ -5560,7 +5560,7 @@ impl LockedServices {
     fn request_locked_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
         self.closing.store(true, Ordering::Release);
-        self.client_presence.send_modify(|_| {});
+        self.wake_locked_run_loop();
     }
 
     fn track_client(self: &Arc<Self>) -> LockedClientGuard {
@@ -5633,6 +5633,9 @@ impl LockedServices {
     fn release_ready_transition(&self) {
         self.ready_transition_inflight
             .store(false, Ordering::Release);
+        // The locked run loop defers teardown while a transition is in
+        // flight; wake it so an owner abandoned meanwhile still reaps.
+        self.wake_locked_run_loop();
     }
 
     async fn rollback_failed_ready_handoff(&self) -> Result<()> {
@@ -5640,7 +5643,17 @@ impl LockedServices {
         let _ = self.ready_signal.send(false);
         self.mark_ready_construction_failed().await?;
         self.closing.store(false, Ordering::Release);
+        // Reopening admission changes the loop's teardown predicate (the
+        // last-client handoff grace applies again); wake it to re-evaluate.
+        self.wake_locked_run_loop();
         Ok(())
+    }
+
+    /// Wake `run_locked_until_ready` to re-evaluate its teardown predicate
+    /// after lifecycle state it reads (`closing`, the ready-transition
+    /// permit) changed without a client-presence edge.
+    fn wake_locked_run_loop(&self) {
+        self.client_presence.send_modify(|_| {});
     }
 
     async fn onboarding_snapshot_present(

@@ -1263,7 +1263,6 @@ where
         .map_err(|_| protocol_handshake_error("daemon lifetime confirmation timed out"))?
 }
 
-#[cfg(any(unix, windows))]
 /// Marker beneath a handshake error when the daemon accepted the connection
 /// and then closed it (EOF) before completing the handshake. That is the
 /// signature of an owner that began draining after it was discovered, which
@@ -1294,6 +1293,7 @@ fn protocol_handshake_closed(reason: &'static str) -> anyhow::Error {
     anyhow::Error::new(DaemonClosedDuringHandshake).context(protocol_handshake_payload(reason))
 }
 
+#[cfg(any(unix, windows))]
 fn protocol_handshake_payload(reason: &'static str) -> proto::ErrorPayload {
     proto::ErrorPayload {
         code: proto::ErrorCode::ProtocolVersion,
@@ -1303,6 +1303,7 @@ fn protocol_handshake_payload(reason: &'static str) -> proto::ErrorPayload {
     }
 }
 
+#[cfg(any(unix, windows))]
 fn protocol_handshake_error(reason: &'static str) -> anyhow::Error {
     anyhow::Error::new(protocol_handshake_payload(reason))
 }

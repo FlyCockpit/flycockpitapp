@@ -1282,6 +1282,8 @@ async fn probe_or_spawn_with_spawn_authorization(
 ) -> Result<ConnectedDaemon> {
     use crate::daemon::{DaemonPaths, discover, spawn_detached_ephemeral};
 
+    // One recovery budget for every departing-owner wait in this resolution.
+    let mut departing_owner_deadline = None;
     match mode {
         LifecycleMode::AttachOrPersistent
         | LifecycleMode::AttachOrEphemeral
@@ -1294,18 +1296,25 @@ async fn probe_or_spawn_with_spawn_authorization(
                     {
                         return promote_ephemeral_owner(&discovered.paths, lifecycle_request).await;
                     }
-                    let observed_pid =
-                        cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
+                    let owner = DiscoveredOwner::capture(&discovered.paths);
                     let attached =
                         attach_running_with_skew_check(discovered.paths.clone(), None).await;
                     match attached {
                         Ok(connected) => return Ok(connected),
                         // The owner answered discovery and then closed the
-                        // attach: it is draining. Wait for it to exit, then
-                        // re-run discovery under the start lock below, which
-                        // spawns a replacement instead of stranding the caller.
+                        // attach. Wait until that exact owner has released
+                        // its endpoint (or answers again / was replaced),
+                        // then re-run discovery under the start lock below,
+                        // which attaches or spawns instead of stranding the
+                        // caller.
                         Err(error) if is_departing_owner_attach_error(&error) => {
-                            await_departing_owner_exit(observed_pid, error).await?;
+                            await_departing_owner(
+                                &discovered.paths,
+                                owner,
+                                &mut departing_owner_deadline,
+                                error,
+                            )
+                            .await?;
                         }
                         Err(error) => return Err(error),
                     }
@@ -1372,7 +1381,6 @@ async fn probe_or_spawn_with_spawn_authorization(
     .context("joining daemon start-lock acquisition")??;
 
     let mut after_lock = discover().await;
-    let mut departed_owner_retried = false;
     loop {
         if !matches!(
             discover_attach_plan(after_lock.status, after_lock.hello.is_some()),
@@ -1381,16 +1389,22 @@ async fn probe_or_spawn_with_spawn_authorization(
         {
             break;
         }
-        let observed_pid =
-            cockpit_host::daemon_lifecycle::read_pid_file(&after_lock.paths.pid_file);
+        let owner = DiscoveredOwner::capture(&after_lock.paths);
         match attach_running_with_skew_check(after_lock.paths.clone(), None).await {
             Ok(connected) => return Ok(connected),
-            // Holding the start lock, a draining owner is retried exactly
-            // once: after it exits, a fresh discovery normally reports no
-            // owner and falls through to spawn.
-            Err(error) if !departed_owner_retried && is_departing_owner_attach_error(&error) => {
-                departed_owner_retried = true;
-                await_departing_owner_exit(observed_pid, error).await?;
+            // Holding the start lock, a departing owner is awaited within the
+            // shared recovery budget: once it has released its endpoint a
+            // fresh discovery normally reports no owner and falls through to
+            // spawn; if it answers again (a transient close), the attach is
+            // retried. An exhausted budget returns the attach error.
+            Err(error) if is_departing_owner_attach_error(&error) => {
+                await_departing_owner(
+                    &after_lock.paths,
+                    owner,
+                    &mut departing_owner_deadline,
+                    error,
+                )
+                .await?;
                 after_lock = discover().await;
             }
             Err(error) => return Err(error),
@@ -1535,11 +1549,25 @@ async fn connect_shared_running(
     })
 }
 
-/// Upper bound for a discovered owner that closed an attach mid-handshake to
-/// finish draining and exit before the resolver re-runs discovery. An owner
-/// that is still alive after this is not treated as departing; the original
-/// attach error is returned (fail closed).
-const DEPARTING_OWNER_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Evidence for the exact owner a resolver is about to attach to, captured
+/// before the attach so that owner can still be identified if it closes the
+/// attach and exits: its pid receipt (with process start identity) and a
+/// restart-release witness pinned to that receipt, never a bare numeric pid.
+struct DiscoveredOwner {
+    receipt: Option<cockpit_host::daemon_lifecycle::DaemonPidReceipt>,
+    release: crate::daemon::RestartReleaseWitness,
+}
+
+impl DiscoveredOwner {
+    fn capture(paths: &crate::daemon::DaemonPaths) -> Self {
+        let receipt = cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file);
+        let release = crate::daemon::capture_restart_release(
+            paths,
+            receipt.as_ref().map(|receipt| receipt.pid),
+        );
+        Self { receipt, release }
+    }
+}
 
 /// Whether an attach to a discovered, hello-answering owner failed because
 /// that owner is going away (closed mid-handshake, or its listener is already
@@ -1561,28 +1589,74 @@ fn is_departing_owner_attach_error(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Wait (bounded) for the owner that refused an attach to exit. Returns the
-/// original attach error when the owner cannot be identified or is still
-/// alive at the deadline, so a live-but-refusing daemon is never masked.
-async fn await_departing_owner_exit(observed_pid: Option<u32>, error: anyhow::Error) -> Result<()> {
-    let Some(pid) = observed_pid else {
+/// First and ceiling intervals for re-probing a departing owner's endpoint.
+const DEPARTING_OWNER_REPROBE_START: Duration = Duration::from_millis(50);
+const DEPARTING_OWNER_REPROBE_CEILING: Duration = Duration::from_millis(500);
+
+/// Wait for the owner that closed an attach to settle, so the caller can
+/// re-run discovery. Returns `Ok(())` when either
+///
+/// * that exact owner (pinned by [`DiscoveredOwner`]) exited and released its
+///   receipt, socket, and lifetime lock — discovery then spawns or attaches a
+///   successor; or
+/// * a hello-answering owner is published again at the endpoint — the same
+///   receipt means the close was transient (e.g. a locked→ready transition
+///   refusing admission for a moment) and the attach should be retried; a
+///   different receipt means the owner was already replaced.
+///
+/// Returns the original attach error (fail closed) when the owner cannot be
+/// identified, or when the resolution's recovery budget — the codebase's
+/// restart-release policy, shared across every wait in one resolution —
+/// runs out.
+async fn await_departing_owner(
+    paths: &crate::daemon::DaemonPaths,
+    owner: DiscoveredOwner,
+    deadline: &mut Option<tokio::time::Instant>,
+    error: anyhow::Error,
+) -> Result<()> {
+    let deadline = *deadline.get_or_insert_with(|| {
+        tokio::time::Instant::now() + crate::daemon::restart_release_timeout(None)
+    });
+    let Some(receipt) = owner.receipt else {
         return Err(error);
     };
-    tracing::info!(
-        pid,
-        error = %error,
-        "discovered daemon owner closed the attach; waiting for it to exit before rediscovery"
-    );
-    let deadline = tokio::time::Instant::now() + DEPARTING_OWNER_EXIT_TIMEOUT;
-    let mut backoff = Duration::from_millis(5);
-    while cockpit_host::daemon_lifecycle::process_exists(pid) {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(error);
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_millis(100));
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(error);
     }
-    Ok(())
+    tracing::info!(
+        pid = receipt.pid,
+        error = %error,
+        "discovered daemon owner closed the attach; waiting for it to settle before rediscovery"
+    );
+    let release = crate::daemon::wait_for_restart_release(paths, owner.release, remaining);
+    tokio::pin!(release);
+    let mut reprobe = DEPARTING_OWNER_REPROBE_START;
+    loop {
+        tokio::select! {
+            released = &mut release => {
+                return if released { Ok(()) } else { Err(error) };
+            }
+            () = tokio::time::sleep(reprobe) => {}
+        }
+        reprobe = (reprobe * 2).min(DEPARTING_OWNER_REPROBE_CEILING);
+        // Hello-only probe: it never takes a lifetime reference, so it
+        // cannot itself keep a last-client owner alive.
+        let probe = crate::daemon::discover().await;
+        if probe.paths.socket == paths.socket
+            && matches!(
+                discover_attach_plan(probe.status, probe.hello.is_some()),
+                DiscoverAttachPlan::AttachRunning
+            )
+        {
+            let current = cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file);
+            tracing::info!(
+                same_owner = current.as_ref() == Some(&receipt),
+                "daemon endpoint answers again; retrying the attach"
+            );
+            return Ok(());
+        }
+    }
 }
 
 async fn attach_running_with_skew_check(

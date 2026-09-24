@@ -389,6 +389,62 @@ async fn locked_owner_holds_the_last_client_handoff_grace() {
     drop(tmp);
 }
 
+/// A locked owner whose last client leaves while a ready transition is in
+/// flight must still reap once that transition rolls back: the rollback and
+/// the permit release change the loop's teardown predicate without any
+/// client-presence edge, so they have to wake the loop themselves.
+#[cfg(unix)]
+#[tokio::test]
+async fn locked_owner_abandoned_during_a_rolled_back_transition_still_reaps() {
+    let (tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let socket = locked.paths.socket.clone();
+    let listener = crate::daemon::bind_private_socket(&socket).expect("bind control listener");
+    let reveal = crate::daemon::leak_reveal_socket::bind_reveal_socket(&locked.paths)
+        .expect("bind leak-reveal socket");
+    let loop_locked = locked.clone();
+    let mut run = tokio::spawn(async move {
+        super::run_locked_until_ready(loop_locked, listener, reveal)
+            .await
+            .expect("locked run loop")
+    });
+
+    // Ready construction is attempted from the secure-store stage.
+    advance_to_secure_store(&locked).await;
+    let client = cockpit_client::DaemonClient::connect(&socket)
+        .await
+        .expect("lifetime client attaches to the locked daemon");
+
+    // A ready transition takes the permit and closes admission.
+    assert!(locked.try_acquire_ready_transition());
+    let permit = super::ReadyTransitionPermit::new(locked.clone());
+    locked.begin_locked_to_ready_transition().await;
+
+    // The last client leaves mid-transition: the loop must defer teardown.
+    drop(client);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !run.is_finished(),
+        "teardown is deferred while the ready transition is in flight"
+    );
+
+    // Construction fails and rolls back; nobody is attached any more.
+    permit
+        .rollback()
+        .await
+        .expect("ready-transition rollback commits");
+    let outcome = tokio::time::timeout(
+        super::LAST_CLIENT_HANDOFF_GRACE + std::time::Duration::from_secs(5),
+        &mut run,
+    )
+    .await
+    .expect("an owner abandoned during a rolled-back transition must still reap")
+    .expect("locked run loop task joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Shutdown));
+    drop(locked);
+    drop(tmp);
+}
+
 /// The profile stage precedes the secure-store choice (#391), so its display
 /// name write is the one ordinary config mutation that must complete while
 /// locked. The admission is scoped to exactly that: the Profile stage. Every

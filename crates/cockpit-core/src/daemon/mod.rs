@@ -1439,6 +1439,47 @@ pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool)
     }
 }
 
+/// How long a starting owner keeps retrying a `Busy` lifetime lock before
+/// treating it as a live incumbent. Release observers (a departing-owner wait,
+/// restart-release checks) take the lock nonblockingly for a few syscalls to
+/// prove it is free; an incumbent owner holds it for its whole life. Without
+/// this window such a probe landing on a new owner's single acquisition would
+/// make a legitimate successor exit `Busy`.
+pub(crate) const LIFETIME_PROBE_CONTENTION_WINDOW: Duration = Duration::from_millis(50);
+const LIFETIME_PROBE_CONTENTION_POLL: Duration = Duration::from_millis(5);
+
+/// Startup lifetime acquisition: one attempt, then bounded retries across
+/// [`LIFETIME_PROBE_CONTENTION_WINDOW`] while the lock reports `Busy`. Any
+/// other error, or `Busy` past the window, is returned as-is.
+pub(crate) fn acquire_daemon_lifetime_for_startup(
+    pid_file: &Path,
+) -> std::result::Result<
+    cockpit_host::daemon_lifecycle::DaemonLifetimeGuard,
+    cockpit_host::daemon_lifecycle::AcquireDaemonLifetimeError,
+> {
+    acquire_daemon_lifetime_within(pid_file, LIFETIME_PROBE_CONTENTION_WINDOW)
+}
+
+fn acquire_daemon_lifetime_within(
+    pid_file: &Path,
+    window: Duration,
+) -> std::result::Result<
+    cockpit_host::daemon_lifecycle::DaemonLifetimeGuard,
+    cockpit_host::daemon_lifecycle::AcquireDaemonLifetimeError,
+> {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        match cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(pid_file) {
+            Err(cockpit_host::daemon_lifecycle::AcquireDaemonLifetimeError::Busy)
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(LIFETIME_PROBE_CONTENTION_POLL);
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 pub fn daemon_pid(paths: &DaemonPaths) -> Option<u32> {
     read_pid_file(&paths.pid_file)
 }
@@ -3025,10 +3066,10 @@ async fn run_foreground_inner_with_boot_db_impl(
     let (pid_receipt, mut metadata_guard) = if supervised_worker {
         (None, None)
     } else {
-        let daemon_lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(
-            &paths.pid_file,
-        )
-        .with_context(|| format!("acquiring daemon lifetime for {}", paths.pid_file.display()))?;
+        let daemon_lifetime =
+            acquire_daemon_lifetime_for_startup(&paths.pid_file).with_context(|| {
+                format!("acquiring daemon lifetime for {}", paths.pid_file.display())
+            })?;
         let pid_receipt = reclaim_stale_and_reserve(
             &paths.pid_file,
             &paths.socket,
@@ -4949,6 +4990,38 @@ mod tests {
         assert_eq!(mode(&rb), 0o600);
         drop(la);
         drop(lb);
+    }
+
+    /// A release observer's momentary try-lock must not make a legitimate
+    /// new owner exit `Busy`: startup rides out brief contention, while a
+    /// real incumbent still wins promptly.
+    #[cfg(unix)]
+    #[test]
+    fn startup_lifetime_acquire_rides_out_a_transient_release_probe() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let pid_file = dir.path().join("daemon.pid");
+        let probe = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&pid_file)
+            .expect("a release observer holds the lock momentarily");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(probe);
+        });
+        let owner = acquire_daemon_lifetime_for_startup(&pid_file)
+            .expect("a transient probe must not make a legitimate owner fail Busy");
+        releaser.join().expect("probe thread");
+
+        let started = std::time::Instant::now();
+        let contender = acquire_daemon_lifetime_for_startup(&pid_file)
+            .expect_err("a live incumbent keeps the lifetime");
+        assert!(matches!(
+            contender,
+            cockpit_host::daemon_lifecycle::AcquireDaemonLifetimeError::Busy
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an incumbent is reported promptly, after the bounded window"
+        );
+        drop(owner);
     }
 
     fn attach_lifetime_client(presence: &tokio::sync::watch::Sender<server::ClientPresence>) {

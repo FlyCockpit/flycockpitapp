@@ -4538,6 +4538,31 @@ impl App {
         result
     }
 
+    /// Draw one complete frame — cells, OSC 8 hyperlinks, cursor shape —
+    /// inside a synchronized update (DEC private mode 2026). Supporting
+    /// terminals present the whole frame atomically instead of painting a
+    /// new screen's header over the previous screen's body while the diff is
+    /// still arriving; terminals without mode 2026 ignore the unknown private
+    /// mode. The end marker is always attempted, even when the draw fails, so
+    /// the terminal is never left holding back output.
+    fn draw_synchronized_frame(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        crossterm::queue!(stdout(), crossterm::terminal::BeginSynchronizedUpdate)?;
+        let drawn = self.draw_frame_contents(terminal);
+        let ended = crossterm::execute!(stdout(), crossterm::terminal::EndSynchronizedUpdate);
+        drawn?;
+        ended?;
+        Ok(())
+    }
+
+    fn draw_frame_contents(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        self.link_registry.begin_frame();
+        terminal.draw(|frame| self.render(frame))?;
+        self.after_completed_draw();
+        crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
+        self.sync_cursor_shape();
+        Ok(())
+    }
+
     pub(super) async fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let mut input = TerminalInput::new();
         input.install_native_paste_adapter();
@@ -4574,11 +4599,7 @@ impl App {
             if take_redraw_request(&mut needs_redraw) {
                 #[cfg(test)]
                 EVENT_LOOP_DRAW_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-                self.link_registry.begin_frame();
-                terminal.draw(|frame| self.render(frame))?;
-                self.after_completed_draw();
-                crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
-                self.sync_cursor_shape();
+                self.draw_synchronized_frame(terminal)?;
             }
 
             let agent_notify = self

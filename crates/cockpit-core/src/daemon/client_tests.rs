@@ -563,6 +563,59 @@ async fn departing_owner_wait_without_a_receipt_waits_for_the_lifetime_lock() {
     .expect("once the lifetime lock is free the resolver rediscovers");
 }
 
+/// With a kernel handle pinned to the owner's verified process, its exit
+/// already proves the lifetime lock was released, so the wait does not probe
+/// the lock (a successful try-lock would briefly contend with a successor
+/// that is acquiring it right now). Here a successor holds the lock without
+/// having published yet; the wait still returns and rediscovery decides.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_does_not_probe_the_lock_after_a_pinned_exit() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let departing = publish_verified_test_owner(&paths);
+    let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
+    stop_fixture_owner(departing);
+    std::fs::remove_file(&paths.pid_file).expect("departing owner retires its receipt");
+    let successor_lifetime =
+        cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+            .expect("a starting successor holds the lifetime lock");
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect("a pinned exit is enough; the lock is not probed");
+    drop(successor_lifetime);
+}
+
+/// A one-shot exit event (kqueue `NOTE_EXIT` is delivered once) observed
+/// while the lifetime lock is still held must not be lost: the exit is
+/// latched and only the lock is polled afterwards, so the wait returns once
+/// the lock drops instead of spinning to the deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_latches_a_one_shot_exit_observation() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    std::fs::create_dir_all(paths.pid_file.parent().expect("runtime dir"))
+        .expect("create runtime dir");
+    let lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+        .expect("the lifetime lock is still held when the exit is observed");
+    // Exactly one positive exit observation, then none.
+    let owner = DiscoveredOwner::scripted(None, vec![true]);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        drop(lifetime);
+    });
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(10))
+        .await
+        .expect("the latched exit plus a free lock ends the wait");
+    releaser.join().expect("lock releaser");
+}
+
 /// Once the captured owner has been replaced, the wait returns whatever
 /// discovery currently makes of the successor — here a published owner whose
 /// socket does not answer yet — and lets rediscovery produce the outcome,

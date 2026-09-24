@@ -1558,6 +1558,13 @@ struct DiscoveredOwner {
         windows
     ))]
     process: Option<cockpit_host::daemon_lifecycle::VerifiedDaemonProcess>,
+    /// Latched exit observation. Some kernel witnesses are one-shot (kqueue
+    /// delivers `NOTE_EXIT` once), so the first positive observation is kept.
+    exited: bool,
+    /// Test-only scripted exit observations, standing in for a one-shot
+    /// kernel witness.
+    #[cfg(test)]
+    scripted_exits: Option<std::collections::VecDeque<bool>>,
 }
 
 impl DiscoveredOwner {
@@ -1586,6 +1593,73 @@ impl DiscoveredOwner {
                 windows
             ))]
             process,
+            exited: false,
+            #[cfg(test)]
+            scripted_exits: None,
+        }
+    }
+
+    /// Test-only owner whose exit observations follow `exits` (then `false`
+    /// forever), like a one-shot kernel exit event.
+    #[cfg(test)]
+    fn scripted(
+        receipt: Option<cockpit_host::daemon_lifecycle::DaemonPidReceipt>,
+        exits: Vec<bool>,
+    ) -> Self {
+        Self {
+            receipt,
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "freebsd",
+                windows
+            ))]
+            process: None,
+            exited: false,
+            scripted_exits: Some(exits.into()),
+        }
+    }
+
+    /// Observe whether the captured owner has exited, latching the first
+    /// positive observation: once exited, always exited.
+    fn observe_exited(&mut self) -> bool {
+        if !self.exited {
+            self.exited = self.poll_exited();
+        }
+        self.exited
+    }
+
+    /// Whether an observed exit already proves the daemon lifetime lock was
+    /// released: true with a kernel handle pinned to the receipt's verified
+    /// process, because process exit closes its lock descriptor (or abandons
+    /// its mutex) before the handle signals completion. Otherwise the lock
+    /// itself must be probed.
+    fn exit_proves_lifetime_release(&self) -> bool {
+        #[cfg(test)]
+        if self.scripted_exits.is_some() {
+            return false;
+        }
+        self.receipt.is_some() && self.has_pinned_process()
+    }
+
+    fn has_pinned_process(&self) -> bool {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        {
+            self.process.is_some()
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        )))]
+        {
+            false
         }
     }
 
@@ -1597,7 +1671,11 @@ impl DiscoveredOwner {
     /// platform has no handle), the owner is gone once its pid no longer
     /// exists or names a process with a different start identity. With no
     /// receipt there is no owner process to wait for.
-    fn has_exited(&self) -> bool {
+    fn poll_exited(&mut self) -> bool {
+        #[cfg(test)]
+        if let Some(script) = self.scripted_exits.as_mut() {
+            return script.pop_front().unwrap_or(false);
+        }
         let Some(receipt) = self.receipt.as_ref() else {
             return true;
         };
@@ -1694,7 +1772,7 @@ const DEPARTING_OWNER_REPROBE_CEILING: Duration = Duration::from_millis(500);
 /// holds on every platform.
 async fn await_departing_owner(
     paths: &crate::daemon::DaemonPaths,
-    owner: DiscoveredOwner,
+    mut owner: DiscoveredOwner,
     budget: &mut DepartingOwnerBudget,
     error: anyhow::Error,
 ) -> Result<()> {
@@ -1731,7 +1809,13 @@ async fn await_departing_owner(
             tracing::info!("a successor daemon owner was published; rediscovering");
             return Ok(());
         }
-        if owner.has_exited() && daemon_lifetime_released(&probe.paths) {
+        // The lock is probed only when the exit does not already prove its
+        // release (no receipt, or no pinned handle): a successful try-lock
+        // briefly contends with a starting owner, so it runs only when it is
+        // load-bearing.
+        if owner.observe_exited()
+            && (owner.exit_proves_lifetime_release() || daemon_lifetime_released(&probe.paths))
+        {
             tracing::info!(
                 "departing daemon owner exited and released its lifetime; rediscovering"
             );

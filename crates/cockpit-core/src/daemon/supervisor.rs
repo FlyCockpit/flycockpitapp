@@ -887,8 +887,8 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             )
         }
     } else {
-        let lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
-            .with_context(|| {
+        let lifetime =
+            super::acquire_daemon_lifetime_for_startup(&paths.pid_file).with_context(|| {
                 format!("acquiring supervisor lifetime {}", paths.pid_file.display())
             })?;
         let database_owner = crate::db::SupervisorDatabaseOwner::acquire_default()

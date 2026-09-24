@@ -92,6 +92,22 @@ fn publish_test_ephemeral_owner(paths: &crate::daemon::DaemonPaths) -> std::proc
     child
 }
 
+/// Publish a receipt for a live, daemon-shaped process (the spawn harness
+/// held in `daemon worker`) so a pinned release witness can verify it.
+fn publish_verified_test_owner(paths: &crate::daemon::DaemonPaths) -> std::process::Child {
+    let binary = crate::daemon::discover_daemon_spawn_harness_executable()
+        .expect("daemon spawn harness is built with the test binary");
+    let child = std::process::Command::new(&binary)
+        .args(["daemon", "worker"])
+        .env("COCKPIT_WORKER_WATCH_TEST_HOLD", "1")
+        .spawn()
+        .expect("spawn daemon-shaped owner fixture");
+    cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, child.id(), &binary)
+        .expect("publish owner receipt");
+    crate::daemon::write_endpoint_record(paths).expect("publish owner endpoint record");
+    child
+}
+
 async fn send_daemon_hello(
     daemon: &mut ProtoStream<UnixStream>,
     daemon_version: impl Into<String>,
@@ -322,6 +338,416 @@ async fn negotiation_rejects_a_daemon_that_does_not_send_a_hello() {
     server.abort();
 }
 
+/// A daemon that accepts and then closes before its hello (an owner that
+/// began draining after discovery) keeps the fail-closed typed protocol
+/// error, and is additionally marked as a mid-handshake close so a lifecycle
+/// resolver can wait for the owner to exit and rediscover instead of
+/// stranding the caller. A timed-out or incompatible hello never carries
+/// that marker.
+#[tokio::test]
+async fn negotiation_marks_a_daemon_that_closes_before_its_hello() {
+    let (_dir, socket, listener) = bind_test_socket();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+    let error = match DaemonClient::connect(&socket).await {
+        Ok(_) => panic!("a daemon that closes before its hello must fail the connect"),
+        Err(error) => error,
+    };
+    assert!(cockpit_client::is_daemon_closed_during_handshake(&error));
+    assert!(is_protocol_version_mismatch(&error));
+    let payload = error
+        .downcast_ref::<proto::ErrorPayload>()
+        .expect("a mid-handshake close keeps the typed protocol error");
+    assert!(
+        payload
+            .message
+            .contains("closed the connection before its hello")
+    );
+    assert_eq!(error.to_string(), payload.to_string());
+    server.await.unwrap();
+
+    let (_dir, socket, listener) = bind_test_socket();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut daemon = ProtoStream::new(stream);
+        send_daemon_hello(&mut daemon, "0.1.incompatible", proto::PROTOCOL_VERSION + 1).await;
+    });
+    let error = match DaemonClient::connect(&socket).await {
+        Ok(_) => panic!("an incompatible daemon hello must reject the connection"),
+        Err(error) => error,
+    };
+    assert!(!cockpit_client::is_daemon_closed_during_handshake(&error));
+    server.await.unwrap();
+}
+
+/// Draining-owner recovery is scoped: only a mid-handshake close or a gone
+/// listener counts as a departing owner.
+#[test]
+fn departing_owner_recovery_requires_a_close_or_a_gone_listener() {
+    assert!(is_departing_owner_attach_error(&anyhow::Error::new(
+        std::io::Error::from(std::io::ErrorKind::ConnectionRefused)
+    )));
+    assert!(is_departing_owner_attach_error(
+        &anyhow::Error::new(cockpit_client::DaemonClosedDuringHandshake)
+            .context("daemon protocol handshake failed")
+    ));
+    assert!(!is_departing_owner_attach_error(&anyhow::Error::new(
+        proto::ErrorPayload {
+            code: proto::ErrorCode::ProtocolVersion,
+            message: "daemon protocol handshake failed: daemon hello timed out".into(),
+        }
+    )));
+}
+
+async fn isolated_canonical_paths(
+    env: &crate::test_env::TestEnvGuard,
+) -> crate::daemon::DaemonPaths {
+    let runtime = env.path().expect("isolated runtime root").join("runtime");
+    env.set_var("XDG_RUNTIME_DIR", &runtime);
+    canonical_ephemeral_paths()
+}
+
+/// Serve a daemon hello to every connection on `listener` until aborted.
+fn serve_hellos(listener: UnixListener, version: &'static str) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(&mut daemon, version, proto::PROTOCOL_VERSION).await;
+        }
+    })
+}
+
+fn stop_fixture_owner(mut child: std::process::Child) {
+    child.kill().expect("stop fixture owner");
+    child.wait().expect("reap fixture owner");
+}
+
+async fn await_departing_within(
+    paths: &crate::daemon::DaemonPaths,
+    owner: DiscoveredOwner,
+    budget: &mut DepartingOwnerBudget,
+    bound: Duration,
+) -> Result<()> {
+    tokio::time::timeout(
+        bound,
+        await_departing_owner(paths, owner, budget, anyhow!("attach closed")),
+    )
+    .await
+    .expect("the departing-owner wait is bounded by its budget")
+}
+
+/// An owner that exited and retired its endpoint lets the resolver
+/// rediscover (and spawn) — observed through the handle pinned to the
+/// receipt captured before the attach.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_returns_once_the_pinned_owner_retired() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let owner_child = publish_verified_test_owner(&paths);
+    let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
+    assert!(
+        owner.receipt.is_some(),
+        "the receipt is captured before the attach"
+    );
+    stop_fixture_owner(owner_child);
+    std::fs::remove_file(&paths.pid_file).expect("owner retires its receipt");
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(10))
+        .await
+        .expect("a retired owner allows rediscovery");
+}
+
+/// A crashed owner (SIGKILL mid-drain) leaves its receipt and socket behind.
+/// That stale endpoint must not turn into a hard attach failure: once the
+/// pinned process is gone and the endpoint no longer answers, the resolver
+/// rediscovers, where the spawn path reclaims the stale metadata.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_recovers_from_a_crash_that_left_its_endpoint() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let owner_child = publish_verified_test_owner(&paths);
+    let listener = UnixListener::bind(&paths.socket).expect("bind fixture owner socket");
+    let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
+    // Crash: the process dies and its listener closes, but the receipt and
+    // the socket path stay published.
+    stop_fixture_owner(owner_child);
+    drop(listener);
+    assert!(paths.pid_file.exists() && paths.socket.exists());
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(10))
+        .await
+        .expect("a crashed owner with a stale endpoint allows rediscovery");
+}
+
+/// A successor published by another starter before this waiter looks again
+/// ends the wait (its receipt differs from the captured one): the resolver
+/// attaches to it instead of failing.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_returns_when_a_replacement_is_published_first() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let departing = publish_verified_test_owner(&paths);
+    let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
+    stop_fixture_owner(departing);
+    std::fs::remove_file(&paths.pid_file).expect("departing owner retires its receipt");
+    // Another starter publishes a healthy successor at the same endpoint.
+    let successor = publish_verified_test_owner(&paths);
+    let listener = UnixListener::bind(&paths.socket).expect("bind successor socket");
+    let server = serve_hellos(listener, "0.1.successor");
+    assert_ne!(
+        cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file),
+        owner.receipt,
+        "the successor has its own receipt"
+    );
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(10))
+        .await
+        .expect("a published successor ends the wait");
+    server.abort();
+    stop_fixture_owner(successor);
+}
+
+/// The owner may retire its receipt and socket before its process — and the
+/// daemon lifetime lock — is gone. With no receipt captured, the wait must
+/// not report the owner gone while the lock is held (a spawn would fail
+/// Busy); it fails closed at the budget, and returns once the lock drops.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_without_a_receipt_waits_for_the_lifetime_lock() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    std::fs::create_dir_all(paths.pid_file.parent().expect("runtime dir"))
+        .expect("create runtime dir");
+    let lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+        .expect("a departing owner still holds its lifetime lock");
+
+    let owner = DiscoveredOwner::capture(&paths);
+    assert!(owner.receipt.is_none(), "the receipt was already retired");
+    let mut budget = DepartingOwnerBudget {
+        deadline: Some(tokio::time::Instant::now() + Duration::from_millis(300)),
+        ..DepartingOwnerBudget::default()
+    };
+    let error = await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect_err("a held lifetime lock means the owner has not departed");
+    assert_eq!(error.to_string(), "attach closed");
+
+    drop(lifetime);
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(
+        &paths,
+        DiscoveredOwner::capture(&paths),
+        &mut budget,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("once the lifetime lock is free the resolver rediscovers");
+}
+
+/// A pinned exit alone does not end the wait: a successor started outside
+/// start.lock may already hold the lifetime lock without having published
+/// its receipt, and rediscovering then would spawn a contender that fails
+/// Busy. The wait keeps going while the lock is held and nothing new is
+/// published, and returns once the successor publishes.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_holds_while_an_unpublished_successor_owns_the_lock() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let departing = publish_verified_test_owner(&paths);
+    let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
+    stop_fixture_owner(departing);
+    std::fs::remove_file(&paths.pid_file).expect("departing owner retires its receipt");
+    let successor_lifetime =
+        cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+            .expect("a starting successor holds the lifetime lock");
+
+    let mut budget = DepartingOwnerBudget {
+        deadline: Some(tokio::time::Instant::now() + Duration::from_millis(300)),
+        ..DepartingOwnerBudget::default()
+    };
+    let error = await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect_err(
+            "an exited owner with its lock held by an unpublished successor is not settled",
+        );
+    assert_eq!(error.to_string(), "attach closed");
+
+    // Once the successor publishes its receipt the wait ends and
+    // rediscovery attaches to it (or waits for its endpoint).
+    let owner = DiscoveredOwner::capture(&paths);
+    assert!(owner.receipt.is_none(), "nothing is published yet");
+    let successor = publish_verified_test_owner(&paths);
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect("a published successor ends the wait");
+    drop(successor_lifetime);
+    stop_fixture_owner(successor);
+}
+
+/// A one-shot exit event (kqueue `NOTE_EXIT` is delivered once) observed
+/// while the lifetime lock is still held must not be lost: the exit is
+/// latched and only the lock is polled afterwards, so the wait returns once
+/// the lock drops instead of spinning to the deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_latches_a_one_shot_exit_observation() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    std::fs::create_dir_all(paths.pid_file.parent().expect("runtime dir"))
+        .expect("create runtime dir");
+    let lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+        .expect("the lifetime lock is still held when the exit is observed");
+    // Exactly one positive exit observation, then none.
+    let owner = DiscoveredOwner::scripted(None, vec![true]);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        drop(lifetime);
+    });
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(10))
+        .await
+        .expect("the latched exit plus a free lock ends the wait");
+    releaser.join().expect("lock releaser");
+}
+
+/// Once the captured owner has been replaced, the wait returns whatever
+/// discovery currently makes of the successor — here a published owner whose
+/// socket does not answer yet — and lets rediscovery produce the outcome,
+/// instead of spinning to the deadline and reporting the stale attach error.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_returns_for_a_successor_that_is_not_attachable() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let departing = publish_verified_test_owner(&paths);
+    let owner = DiscoveredOwner::capture(&paths);
+    stop_fixture_owner(departing);
+    std::fs::remove_file(&paths.pid_file).expect("departing owner retires its receipt");
+    // The successor is published but does not answer on the endpoint.
+    let successor = publish_verified_test_owner(&paths);
+    let probe = crate::daemon::discover().await;
+    assert!(
+        !matches!(
+            discover_attach_plan(probe.status, probe.hello.is_some()),
+            DiscoverAttachPlan::AttachRunning | DiscoverAttachPlan::Spawn
+        ),
+        "the successor is neither attachable nor absent: {:?}",
+        probe.status
+    );
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect("a published successor ends the wait whatever its plan");
+    stop_fixture_owner(successor);
+}
+
+/// A live owner that neither retires nor answers again fails closed with the
+/// original attach error once the shared budget is spent — and the wait never
+/// signals it.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_fails_closed_when_the_owner_stays_alive() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let mut owner_child = publish_verified_test_owner(&paths);
+    let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
+    let mut budget = DepartingOwnerBudget {
+        deadline: Some(tokio::time::Instant::now() + Duration::from_millis(300)),
+        ..DepartingOwnerBudget::default()
+    };
+    let error = await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect_err("a live, silent owner is not departing");
+    assert_eq!(error.to_string(), "attach closed");
+    assert!(
+        owner_child
+            .try_wait()
+            .expect("poll fixture owner")
+            .is_none(),
+        "the wait never signals the owner"
+    );
+    stop_fixture_owner(owner_child);
+}
+
+/// A transient close must not be waited out: as soon as the same owner
+/// answers a hello again the resolver retries the attach.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_returns_when_the_same_owner_answers_again() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let mut owner_child = publish_verified_test_owner(&paths);
+    let listener = UnixListener::bind(&paths.socket).expect("bind fixture owner socket");
+    let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
+    let server = serve_hellos(listener, "0.1.answers-again");
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect("the resolver retries the attach");
+    assert!(
+        owner_child
+            .try_wait()
+            .expect("poll fixture owner")
+            .is_none(),
+        "the owner is still the same live process"
+    );
+    server.abort();
+    stop_fixture_owner(owner_child);
+}
+
+/// An owner whose identity cannot be verified (no pinned handle — e.g. its
+/// executable was replaced in place) still gets the transient-close retry:
+/// the wait re-probes instead of failing at once.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_reprobes_an_owner_without_a_pinned_handle() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    // `/bin/sleep` is not daemon-shaped, so no verified handle is pinned.
+    let owner_child = publish_test_ephemeral_owner(&paths);
+    let listener = UnixListener::bind(&paths.socket).expect("bind fixture owner socket");
+    let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(owner.process.is_none(), "the identity is not verified");
+    let server = serve_hellos(listener, "0.1.unverified");
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect("an unverified owner that answers again is retried");
+    server.abort();
+    stop_fixture_owner(owner_child);
+}
+
 #[tokio::test]
 async fn negotiated_client_round_trips_attach() {
     let (_dir, socket, listener) = bind_test_socket();
@@ -412,11 +838,16 @@ async fn one_shot_daemon_uses_the_ephemeral_socket_owner_and_reaps_metadata() {
     assert!(matches!(response, Response::LockedBootstrapHello(_)));
 
     let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while paths.socket.exists() || paths.pid_file.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
+    // The owner holds the last-client handoff grace before draining, then
+    // must retire within the original bound.
+    tokio::time::timeout(
+        crate::daemon::server::LAST_CLIENT_HANDOFF_GRACE + std::time::Duration::from_secs(2),
+        async {
+            while paths.socket.exists() || paths.pid_file.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .expect("ephemeral socket owner must reap after its last one-shot client disconnects");
     assert!(

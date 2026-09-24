@@ -1244,6 +1244,45 @@ fn sync_snapshot_rebuilds_native_screens_on_stage_change() {
     assert!(matches!(shell.screen, OnboardingScreen::ProviderSearch(_)));
 }
 
+/// The daemon serves the locked bootstrap before its host probes settle, so
+/// the secure-store screen first renders probing rows; the settled snapshot
+/// arrives at the same onboarding revision and must still update the mounted
+/// screen (and a stale probing refresh must not regress it).
+#[test]
+fn secure_store_renders_probing_rows_then_updates_at_the_same_revision() {
+    let engine = Dialog::None;
+    let mut shell = shell_at(OnboardingStage::SecureStore);
+    assert!(shell.secure_store_capabilities_probing());
+    let rendered = render_string(&mut shell, 90, 24, &engine);
+    assert!(
+        rendered.contains("Platform keyring  —  checking…"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("unavailable"), "{rendered}");
+
+    let mut settled = snapshot(OnboardingStage::SecureStore);
+    settled.host_capabilities =
+        secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
+    settled.host_capabilities.generation = 1;
+    assert!(
+        !shell.sync_snapshot(&settled),
+        "a capability-only update keeps the mounted screen"
+    );
+    assert!(!shell.secure_store_capabilities_probing());
+    let rendered = render_string(&mut shell, 90, 24, &engine);
+    assert!(
+        rendered.contains("Platform keyring  —  recommended"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("checking…"), "{rendered}");
+
+    assert!(!shell.sync_snapshot(&snapshot(OnboardingStage::SecureStore)));
+    assert!(
+        !shell.secure_store_capabilities_probing(),
+        "a stale probing projection never clobbers settled rows"
+    );
+}
+
 #[test]
 fn latched_transition_clears_only_when_revision_advances() {
     let mut shell = shell_at(OnboardingStage::Welcome);

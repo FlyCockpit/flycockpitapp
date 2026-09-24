@@ -6,7 +6,9 @@ use anyhow::Result;
 
 use crate::daemon::proto::{self, Request, Response};
 use crate::daemon::{self, DaemonPaths};
-use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
+use cockpit_client::{
+    DaemonClient, is_daemon_closed_during_handshake, is_protocol_version_mismatch,
+};
 
 pub const DEFAULT_SKEW_RESTART_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
@@ -129,7 +131,12 @@ pub async fn restart_skewed_daemon_if_idle_with_cooldown(
 async fn read_skew_kind(socket: &Path) -> Result<SkewKind> {
     let client = match DaemonClient::connect(socket).await {
         Ok(client) => client,
-        Err(error) if is_protocol_version_mismatch(&error) => {
+        // A draining owner closes mid-handshake; that is not version skew and
+        // must not trigger a restart attempt against a departing process.
+        Err(error)
+            if is_protocol_version_mismatch(&error)
+                && !is_daemon_closed_during_handshake(&error) =>
+        {
             return Ok(SkewKind::IncompatibleProtocol);
         }
         Err(error) => return Err(error),
@@ -163,7 +170,10 @@ async fn attempt_restart_if_idle(
     let release = daemon::capture_restart_release(paths, old_pid);
     let client = match DaemonClient::connect(&paths.socket).await {
         Ok(client) => client,
-        Err(error) if is_protocol_version_mismatch(&error) => {
+        Err(error)
+            if is_protocol_version_mismatch(&error)
+                && !is_daemon_closed_during_handshake(&error) =>
+        {
             return Ok(SkewRestartOutcome::NoticeOnly {
                 reason: skew_reason,
             });

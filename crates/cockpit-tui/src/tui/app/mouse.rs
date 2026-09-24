@@ -3310,6 +3310,7 @@ mod terminal_mode_guard_tests {
         assert_eq!(
             observed.commands(),
             vec![
+                TerminalCleanupCommand::EndSynchronizedUpdate,
                 TerminalCleanupCommand::DisableMouseCapture,
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::PopKeyboardEnhancementFlags,
@@ -3342,6 +3343,7 @@ mod terminal_mode_guard_tests {
         assert_eq!(
             observed.commands(),
             vec![
+                TerminalCleanupCommand::EndSynchronizedUpdate,
                 TerminalCleanupCommand::DisableMouseCapture,
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
@@ -3363,6 +3365,7 @@ mod terminal_mode_guard_tests {
         assert_eq!(
             observed.commands(),
             vec![
+                TerminalCleanupCommand::EndSynchronizedUpdate,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
                 TerminalCleanupCommand::RestoreTerminalTitle { pushed: true },
                 TerminalCleanupCommand::RestoreRatatui,
@@ -3385,6 +3388,7 @@ mod terminal_mode_guard_tests {
         assert_eq!(
             observed.commands(),
             vec![
+                TerminalCleanupCommand::EndSynchronizedUpdate,
                 TerminalCleanupCommand::DisableMouseCapture,
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::PopKeyboardEnhancementFlags,
@@ -3392,6 +3396,55 @@ mod terminal_mode_guard_tests {
                 TerminalCleanupCommand::RestoreTerminalTitle { pushed: false },
                 TerminalCleanupCommand::RestoreRatatui,
             ]
+        );
+    }
+
+    /// A panic unwinding through a frame still ends the synchronized update,
+    /// so the terminal never keeps holding back output (the panic message,
+    /// the restored screen, later shell output).
+    #[test]
+    fn synchronized_frame_ends_on_normal_finish_and_on_unwind() {
+        use std::io::Write;
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct SharedOut(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedOut {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        const BEGIN: &[u8] = b"\x1b[?2026h";
+        const END: &[u8] = b"\x1b[?2026l";
+
+        let out = SharedOut::default();
+        let frame = super::SynchronizedFrame::begin(out.clone()).unwrap();
+        out.clone().write_all(b"cells").unwrap();
+        frame.finish().unwrap();
+        let bytes = out.0.lock().unwrap().clone();
+        assert!(bytes.starts_with(BEGIN) && bytes.ends_with(END));
+        assert_eq!(bytes.windows(END.len()).filter(|w| *w == END).count(), 1);
+
+        let out = SharedOut::default();
+        let unwound = std::panic::catch_unwind({
+            let out = out.clone();
+            move || {
+                let _frame = super::SynchronizedFrame::begin(out.clone()).unwrap();
+                let mut out = out;
+                out.write_all(b"half a frame").unwrap();
+                panic!("render panicked mid-frame");
+            }
+        });
+        assert!(unwound.is_err());
+        let bytes = out.0.lock().unwrap().clone();
+        assert!(bytes.starts_with(BEGIN));
+        assert!(
+            bytes.ends_with(END),
+            "an unwinding frame must still end synchronized mode"
         );
     }
 
@@ -3407,6 +3460,7 @@ mod terminal_mode_guard_tests {
         assert_eq!(
             observed.commands(),
             vec![
+                TerminalCleanupCommand::EndSynchronizedUpdate,
                 TerminalCleanupCommand::DisableBracketedPaste,
                 TerminalCleanupCommand::RestoreDefaultCursorShape,
                 TerminalCleanupCommand::RestoreTerminalTitle { pushed: false },

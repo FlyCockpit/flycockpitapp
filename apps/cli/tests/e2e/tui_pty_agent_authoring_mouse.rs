@@ -70,7 +70,8 @@ fn unset_trust_confirm_label(screen: &str) -> String {
 }
 
 fn click_text(session: &mut HermeticCockpit, needle: &str) {
-    let snapshot = session.snapshot();
+    // Target the last completed frame: the live grid may be mid-repaint.
+    let snapshot = session.settled_snapshot();
     let (start, end) = snapshot
         .find_text_span(needle)
         .unwrap_or_else(|| panic!("expected `{needle}` on screen:\n{}", snapshot.contents()));
@@ -119,10 +120,10 @@ fn mouse_confirm_runner_subagent_trust(session: &mut HermeticCockpit) {
             "runner grants advance reaches trust or skips its pre-confirmed safe route to optimizations",
         );
     if session
-        .snapshot()
+        .settled_snapshot()
         .contains("How much does this subagent see?")
     {
-        let trust_row = unset_trust_confirm_label(&session.snapshot().contents());
+        let trust_row = unset_trust_confirm_label(&session.settled_snapshot().contents());
         click_text_twice(session, &trust_row);
         click_text(session, "[ Continue ]");
         session
@@ -171,7 +172,7 @@ fn mouse_through_agent_authoring(session: &mut HermeticCockpit) {
         })
         .expect("model grants advance reaches trust");
 
-    let trust_row = unset_trust_confirm_label(&session.snapshot().contents());
+    let trust_row = unset_trust_confirm_label(&session.settled_snapshot().contents());
     click_text_twice(session, &trust_row);
     click_text(session, "[ Continue ]");
     session

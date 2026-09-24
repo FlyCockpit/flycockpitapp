@@ -1439,6 +1439,47 @@ pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool)
     }
 }
 
+/// How long a starting owner keeps retrying a `Busy` lifetime lock before
+/// treating it as a live incumbent. Release observers (a departing-owner wait,
+/// restart-release checks) take the lock nonblockingly for a few syscalls to
+/// prove it is free; an incumbent owner holds it for its whole life. Without
+/// this window such a probe landing on a new owner's single acquisition would
+/// make a legitimate successor exit `Busy`.
+pub(crate) const LIFETIME_PROBE_CONTENTION_WINDOW: Duration = Duration::from_millis(50);
+const LIFETIME_PROBE_CONTENTION_POLL: Duration = Duration::from_millis(5);
+
+/// Startup lifetime acquisition: one attempt, then bounded retries across
+/// [`LIFETIME_PROBE_CONTENTION_WINDOW`] while the lock reports `Busy`. Any
+/// other error, or `Busy` past the window, is returned as-is.
+pub(crate) fn acquire_daemon_lifetime_for_startup(
+    pid_file: &Path,
+) -> std::result::Result<
+    cockpit_host::daemon_lifecycle::DaemonLifetimeGuard,
+    cockpit_host::daemon_lifecycle::AcquireDaemonLifetimeError,
+> {
+    acquire_daemon_lifetime_within(pid_file, LIFETIME_PROBE_CONTENTION_WINDOW)
+}
+
+fn acquire_daemon_lifetime_within(
+    pid_file: &Path,
+    window: Duration,
+) -> std::result::Result<
+    cockpit_host::daemon_lifecycle::DaemonLifetimeGuard,
+    cockpit_host::daemon_lifecycle::AcquireDaemonLifetimeError,
+> {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        match cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(pid_file) {
+            Err(cockpit_host::daemon_lifecycle::AcquireDaemonLifetimeError::Busy)
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(LIFETIME_PROBE_CONTENTION_POLL);
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 pub fn daemon_pid(paths: &DaemonPaths) -> Option<u32> {
     read_pid_file(&paths.pid_file)
 }
@@ -3025,10 +3066,10 @@ async fn run_foreground_inner_with_boot_db_impl(
     let (pid_receipt, mut metadata_guard) = if supervised_worker {
         (None, None)
     } else {
-        let daemon_lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(
-            &paths.pid_file,
-        )
-        .with_context(|| format!("acquiring daemon lifetime for {}", paths.pid_file.display()))?;
+        let daemon_lifetime =
+            acquire_daemon_lifetime_for_startup(&paths.pid_file).with_context(|| {
+                format!("acquiring daemon lifetime for {}", paths.pid_file.display())
+            })?;
         let pid_receipt = reclaim_stale_and_reserve(
             &paths.pid_file,
             &paths.socket,
@@ -3351,9 +3392,11 @@ async fn run_foreground_inner_with_boot_db_impl(
         let reaper_ctx = ctx.clone();
         let client_presence = ctx.client_presence();
         Some(ForegroundTask::new(tokio::spawn(async move {
-            ephemeral_last_client_reaper(client_presence, move || {
-                reaper_ctx.reap_ephemeral_last_client()
-            })
+            ephemeral_last_client_reaper(
+                client_presence,
+                server::LAST_CLIENT_HANDOFF_GRACE,
+                move || reaper_ctx.reap_ephemeral_last_client(),
+            )
             .await;
         })))
     };
@@ -3690,20 +3733,53 @@ async fn recover_paused_sessions(
 }
 
 /// Wait for an ephemeral owner to acquire its first lifetime client and then
-/// request teardown as soon as the reference count returns to zero. The gate
-/// prevents a freshly spawned daemon from racing its creator's initial
-/// handshake or a hello-only reachability probe.
+/// request teardown once the reference count has stayed at zero for the
+/// `handoff_grace`. The first-client gate prevents a freshly spawned daemon
+/// from racing its creator's initial handshake or a hello-only reachability
+/// probe; the grace is the handoff lease that keeps a one-shot RPC connection
+/// (a skew probe, a fixture or CLI command) from reaping the owner in the
+/// window before the next retained client attaches. Any client that attaches
+/// inside the grace cancels it; an abandoned owner still exits once the grace
+/// elapses with no client.
 #[cfg(any(unix, windows, test))]
 async fn ephemeral_last_client_reaper(
     mut presence: tokio::sync::watch::Receiver<server::ClientPresence>,
+    handoff_grace: Duration,
     mut try_reap: impl FnMut() -> server::EphemeralReapDecision,
 ) {
+    // Start of the current idle period, keyed by the attach epoch that
+    // ended it. Live-work retries and spurious presence wakeups keep the
+    // lease; any attach (even one coalesced with its own detach) restarts it.
+    let mut idle_since: Option<(u64, tokio::time::Instant)> = None;
     loop {
         let observed = *presence.borrow_and_update();
         if observed.has_lifetime_client && observed.count == 0 {
+            let idle_start = match idle_since {
+                Some((epoch, start)) if epoch == observed.attach_epoch => start,
+                _ => {
+                    let start = tokio::time::Instant::now();
+                    idle_since = Some((observed.attach_epoch, start));
+                    start
+                }
+            };
+            let idle_deadline = idle_start + handoff_grace;
+            if tokio::time::Instant::now() < idle_deadline {
+                tokio::select! {
+                    changed = presence.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    () = tokio::time::sleep_until(idle_deadline) => {}
+                }
+                continue;
+            }
             match try_reap() {
                 server::EphemeralReapDecision::Shutdown => {
-                    tracing::info!("ephemeral daemon lost its final client; beginning teardown");
+                    tracing::info!(
+                        grace_ms = handoff_grace.as_millis() as u64,
+                        "ephemeral daemon lost its final client; beginning teardown"
+                    );
                     return;
                 }
                 server::EphemeralReapDecision::Persistent => {
@@ -3728,6 +3804,7 @@ async fn ephemeral_last_client_reaper(
                 }
             }
         }
+        idle_since = None;
         if presence.changed().await.is_err() {
             return;
         }
@@ -4915,6 +4992,133 @@ mod tests {
         drop(lb);
     }
 
+    /// A release observer's momentary try-lock must not make a legitimate
+    /// new owner exit `Busy`: startup rides out brief contention, while a
+    /// real incumbent still wins promptly.
+    #[cfg(unix)]
+    #[test]
+    fn startup_lifetime_acquire_rides_out_a_transient_release_probe() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let pid_file = dir.path().join("daemon.pid");
+        let probe = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&pid_file)
+            .expect("a release observer holds the lock momentarily");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(probe);
+        });
+        let owner = acquire_daemon_lifetime_for_startup(&pid_file)
+            .expect("a transient probe must not make a legitimate owner fail Busy");
+        releaser.join().expect("probe thread");
+
+        let started = std::time::Instant::now();
+        let contender = acquire_daemon_lifetime_for_startup(&pid_file)
+            .expect_err("a live incumbent keeps the lifetime");
+        assert!(matches!(
+            contender,
+            cockpit_host::daemon_lifecycle::AcquireDaemonLifetimeError::Busy
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an incumbent is reported promptly, after the bounded window"
+        );
+        drop(owner);
+    }
+
+    fn attach_lifetime_client(presence: &tokio::sync::watch::Sender<server::ClientPresence>) {
+        presence.send_modify(|presence| {
+            presence.count += 1;
+            presence.has_lifetime_client = true;
+            presence.attach_epoch = presence.attach_epoch.wrapping_add(1);
+        });
+    }
+
+    fn detach_lifetime_client(presence: &tokio::sync::watch::Sender<server::ClientPresence>) {
+        presence.send_modify(|presence| presence.count -= 1);
+    }
+
+    /// A one-shot client closing must not reap the owner before the caller's
+    /// retained connection attaches; an abandoned owner still reaps once the
+    /// handoff grace elapses.
+    #[tokio::test(start_paused = true)]
+    async fn last_client_reaper_holds_the_handoff_grace_before_teardown() {
+        let grace = server::LAST_CLIENT_HANDOFF_GRACE;
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reaper_reaped = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            grace,
+            move || {
+                reaper_reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
+
+        // One-shot probe: attach, detach.
+        attach_lifetime_client(&presence_tx);
+        detach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace / 2).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::SeqCst),
+            "the owner must survive the gap between a one-shot client and its successor"
+        );
+
+        // Retained successor attaches inside the grace and stays well past it.
+        attach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace * 4).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::SeqCst),
+            "an attached client cancels the pending teardown"
+        );
+
+        // Successor leaves: the owner is abandoned and reaps after the grace.
+        detach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace - Duration::from_millis(1)).await;
+        assert!(!reaped.load(std::sync::atomic::Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_millis(10), task)
+            .await
+            .expect("an abandoned owner reaps once the grace elapses")
+            .expect("reaper task joins");
+        assert!(reaped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// An attach that coalesces with its own detach inside one watch
+    /// observation still restarts the grace (the attach epoch moved).
+    #[tokio::test(start_paused = true)]
+    async fn last_client_reaper_restarts_grace_on_coalesced_attach_and_detach() {
+        let grace = server::LAST_CLIENT_HANDOFF_GRACE;
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reaper_reaped = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            grace,
+            move || {
+                reaper_reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
+
+        attach_lifetime_client(&presence_tx);
+        detach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace * 3 / 4).await;
+        // Coalesced: both edges land before the reaper observes the watch.
+        attach_lifetime_client(&presence_tx);
+        detach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace * 3 / 4).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::SeqCst),
+            "a fresh attach restarts the handoff lease even when coalesced"
+        );
+        tokio::time::timeout(grace, task)
+            .await
+            .expect("the restarted grace still expires")
+            .expect("reaper task joins");
+        assert!(reaped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn ephemeral_reaps_when_first_lifetime_client_disconnect_precedes_reaper() {
         let (presence_tx, presence_rx) =
@@ -4922,10 +5126,14 @@ mod tests {
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let reaped_c = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
-            reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
-            server::EphemeralReapDecision::Shutdown
-        }));
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            Duration::ZERO,
+            move || {
+                reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
         presence_tx.send_modify(|presence| {
             presence.count = 1;
             presence.has_lifetime_client = true;
@@ -4946,13 +5154,17 @@ mod tests {
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ephemeral_for_reaper = ephemeral.clone();
         let reaped_for_reaper = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
-            if !ephemeral_for_reaper.load(std::sync::atomic::Ordering::SeqCst) {
-                return server::EphemeralReapDecision::Persistent;
-            }
-            reaped_for_reaper.store(true, std::sync::atomic::Ordering::SeqCst);
-            server::EphemeralReapDecision::Shutdown
-        }));
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            Duration::ZERO,
+            move || {
+                if !ephemeral_for_reaper.load(std::sync::atomic::Ordering::SeqCst) {
+                    return server::EphemeralReapDecision::Persistent;
+                }
+                reaped_for_reaper.store(true, std::sync::atomic::Ordering::SeqCst);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
 
         presence_tx.send_modify(|presence| {
             presence.count = 1;
@@ -4974,13 +5186,17 @@ mod tests {
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reaper_live = live.clone();
         let reaper_reaped = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
-            if reaper_live.load(std::sync::atomic::Ordering::Acquire) {
-                return server::EphemeralReapDecision::WaitingForLiveWork;
-            }
-            reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
-            server::EphemeralReapDecision::Shutdown
-        }));
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            Duration::ZERO,
+            move || {
+                if reaper_live.load(std::sync::atomic::Ordering::Acquire) {
+                    return server::EphemeralReapDecision::WaitingForLiveWork;
+                }
+                reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
 
         presence_tx.send_modify(|presence| {
             presence.count = 1;
@@ -5016,14 +5232,18 @@ mod tests {
         let reaper_decision = decision.clone();
         let reaper_ephemeral = ephemeral.clone();
         let reaper_reaped = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
-            let _decision = crate::sync::lock_or_recover(&reaper_decision);
-            if !reaper_ephemeral.load(std::sync::atomic::Ordering::Acquire) {
-                return server::EphemeralReapDecision::Persistent;
-            }
-            reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
-            server::EphemeralReapDecision::Shutdown
-        }));
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            Duration::ZERO,
+            move || {
+                let _decision = crate::sync::lock_or_recover(&reaper_decision);
+                if !reaper_ephemeral.load(std::sync::atomic::Ordering::Acquire) {
+                    return server::EphemeralReapDecision::Persistent;
+                }
+                reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
 
         presence_tx.send_modify(|presence| {
             presence.count = 1;
@@ -5093,13 +5313,15 @@ mod tests {
             .expect("connect detached socket client");
         drop(client);
 
-        tokio::time::timeout(Duration::from_secs(3), daemon_task)
-            .await
-            .expect(
-                "connected client drop before an application request must reap the ephemeral owner",
-            )
-            .expect("daemon task joins")
-            .expect("daemon drain completes after detached client disconnect");
+        // Teardown follows the last-client handoff grace, then the original bound.
+        tokio::time::timeout(
+            server::LAST_CLIENT_HANDOFF_GRACE + Duration::from_secs(3),
+            daemon_task,
+        )
+        .await
+        .expect("connected client drop before an application request must reap the ephemeral owner")
+        .expect("daemon task joins")
+        .expect("daemon drain completes after detached client disconnect");
         assert!(!paths.socket.exists(), "last client removes the socket");
         assert!(
             !paths.pid_file.exists(),
@@ -5227,11 +5449,15 @@ mod tests {
         );
 
         drop(client_b);
-        tokio::time::timeout(Duration::from_secs(3), daemon_task)
-            .await
-            .expect("last socket client must drain and reap the ephemeral owner")
-            .expect("daemon task joins")
-            .expect("daemon drain cancels attached session work cleanly");
+        // Teardown follows the last-client handoff grace, then the original bound.
+        tokio::time::timeout(
+            server::LAST_CLIENT_HANDOFF_GRACE + Duration::from_secs(3),
+            daemon_task,
+        )
+        .await
+        .expect("last socket client must drain and reap the ephemeral owner")
+        .expect("daemon task joins")
+        .expect("daemon drain cancels attached session work cleanly");
         assert!(!paths.socket.exists(), "last client removes the socket");
         assert!(
             !paths.pid_file.exists(),
@@ -5239,80 +5465,113 @@ mod tests {
         );
     }
 
-    /// A persisted session must not, by itself, keep an ephemeral daemon alive
-    /// after an explicit stop. We stand up a real ephemeral
-    /// daemon, write a persisted `sessions` row into the very DB the daemon
-    /// opened (the exact effect the first user message has via
-    /// `persist_if_needed`), then trigger an explicit `StopDaemon`. The daemon
-    /// must drain and reap — removing its socket + pid — within the grace.
-    #[tokio::test]
-    async fn owned_ephemeral_reaps_on_stop_even_with_persisted_session() {
-        use crate::daemon::ephemeral_guard::stop_daemon_blocking;
-        use crate::session::Session;
-
-        let harness = DaemonTestHarness::new();
-        harness.initialize_vault_authority();
-        let _env =
-            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
-        let drain_grace = Duration::from_millis(300);
-
-        let eph = harness.ephemeral_paths("eph-with-session");
+    /// Boot a real ephemeral daemon over the harness DB with a persisted
+    /// launch ticket (so same-uid socket clients exchange owner credentials,
+    /// as for a detached spawn), then persist a `sessions` row into that DB —
+    /// the effect the first user message has via `persist_if_needed`.
+    async fn ephemeral_owner_with_persisted_session(
+        harness: &DaemonTestHarness,
+        name: &str,
+    ) -> (DaemonPaths, tokio::task::JoinHandle<Result<()>>) {
+        let eph = harness.ephemeral_paths(name);
+        let launch_ticket = peer_authority::mint_launch_ticket();
+        peer_authority::persist_launch_ticket(&eph.socket, &launch_ticket)
+            .expect("persist daemon launch ticket");
         let eph_clone = eph.clone();
         let daemon_db = harness.db.clone();
         let eph_task = tokio::spawn(async move {
             run_foreground_inner_with_boot_db(
                 eph_clone,
-                drain_grace,
+                Duration::from_millis(300),
                 false,
                 crate::daemon::terminal::test_host_factory(),
                 Some(daemon_db),
             )
             .await
         });
-
         wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
         assert!(eph.pid_file.exists(), "ephemeral pid file written");
+        let session = crate::session::Session::create_for_test(
+            harness.db.clone(),
+            std::env::temp_dir(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .expect("persist a session row");
+        assert!(session.is_persisted(), "row is persisted");
+        (eph, eph_task)
+    }
 
-        // Persist a `sessions` row into the daemon's DB — the same DB effect
-        // the first user message has. This is what the (suspected) lingering
-        // bug pinned on; it must NOT keep the owned daemon alive.
-        {
-            let session = Session::create_for_test(
-                harness.db.clone(),
-                std::env::temp_dir(),
-                "Build",
-                crate::session::test_redaction_key_resolver(),
-            )
-            .expect("persist a session row");
-            assert!(session.is_persisted(), "row is persisted");
-        }
+    fn assert_ephemeral_owner_retired(eph: &DaemonPaths) {
+        assert!(!eph.socket.exists(), "ephemeral socket removed on teardown");
+        assert!(!eph.pid_file.exists(), "ephemeral pid removed on teardown");
+    }
 
-        // Explicit administrative stop bound to the published receipt. Run it
-        // off the runtime thread because this helper uses a blocking connect.
-        let socket = eph.socket.clone();
-        let pid_file = eph.pid_file.clone();
-        tokio::task::spawn_blocking(move || {
-            let Some(receipt) = read_daemon_pid_record(&pid_file) else {
-                panic!("ephemeral daemon did not publish a PID receipt");
-            };
-            stop_daemon_blocking(&socket, &pid_file, &receipt)
-        })
-        .await
-        .unwrap();
+    /// A persisted session must not keep an ephemeral daemon alive after an
+    /// explicit, authenticated owner `StopDaemon`. Another lifetime client
+    /// stays attached throughout, so last-client teardown cannot be what
+    /// stops it: the stop itself must be acknowledged and drain the owner
+    /// within the original bound.
+    #[tokio::test]
+    async fn owned_ephemeral_reaps_on_stop_even_with_persisted_session() {
+        let harness = DaemonTestHarness::new();
+        harness.initialize_vault_authority();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+        let (eph, eph_task) =
+            ephemeral_owner_with_persisted_session(&harness, "eph-stop-with-session").await;
 
-        // The daemon must drain and exit — despite the persisted session.
+        let bystander = cockpit_client::DaemonClient::connect(&eph.socket)
+            .await
+            .expect("attach a lifetime client that stays connected");
+        let stopper = cockpit_client::DaemonClient::connect(&eph.socket)
+            .await
+            .expect("attach the owner stopper");
+        let response = stopper
+            .request(proto::Request::StopDaemon { grace_secs: None })
+            .await
+            .expect("deliver StopDaemon over the wire")
+            .expect("an authenticated owner stop is acknowledged, not refused");
+        assert!(matches!(response, proto::Response::Ack));
+
         let reaped = tokio::time::timeout(Duration::from_secs(3), eph_task)
             .await
             .expect("ephemeral daemon did not reap on StopDaemon with a persisted session");
         reaped.expect("join").expect("run_foreground_inner ok");
-        assert!(
-            !eph.socket.exists(),
-            "ephemeral socket removed on explicit teardown"
-        );
-        assert!(
-            !eph.pid_file.exists(),
-            "ephemeral pid removed on explicit teardown"
-        );
+        assert_ephemeral_owner_retired(&eph);
+        drop(stopper);
+        drop(bystander);
+    }
+
+    /// A persisted session must not keep an ephemeral daemon alive after its
+    /// last client leaves either: it drains once the last-client handoff
+    /// grace elapses with nobody attached.
+    #[tokio::test]
+    async fn owned_ephemeral_reaps_after_last_client_even_with_persisted_session() {
+        let harness = DaemonTestHarness::new();
+        harness.initialize_vault_authority();
+        let _env =
+            crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(&harness.state_home).await;
+        let (eph, eph_task) =
+            ephemeral_owner_with_persisted_session(&harness, "eph-last-client-with-session").await;
+
+        let client = cockpit_client::DaemonClient::connect(&eph.socket)
+            .await
+            .expect("attach the only lifetime client");
+        client
+            .request_ok(proto::Request::DaemonStatus)
+            .await
+            .expect("the owner serves its client");
+        drop(client);
+
+        let reaped = tokio::time::timeout(
+            server::LAST_CLIENT_HANDOFF_GRACE + Duration::from_secs(3),
+            eph_task,
+        )
+        .await
+        .expect("ephemeral daemon did not reap after its last client left");
+        reaped.expect("join").expect("run_foreground_inner ok");
+        assert_ephemeral_owner_retired(&eph);
     }
 
     fn test_paths(dir: &tempfile::TempDir) -> DaemonPaths {

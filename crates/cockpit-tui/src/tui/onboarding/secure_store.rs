@@ -72,6 +72,14 @@ impl SecureStoreScreen {
         }
     }
 
+    /// The daemon publishes the locked bootstrap before its host probes
+    /// settle; until then the snapshot is the probing placeholder
+    /// (generation 0, no rows). Every placement is shown as still being
+    /// checked rather than unavailable, and none can be chosen yet.
+    pub(crate) fn probing(&self) -> bool {
+        self.capabilities.generation == 0 && self.capabilities.features.is_empty()
+    }
+
     pub(crate) fn take_submission(&mut self) -> Option<SecureStoreSubmission> {
         self.submitted.take()
     }
@@ -305,6 +313,14 @@ impl SecureStoreScreen {
             descriptions[self.cursor],
             Style::new().fg(FOG),
         ))];
+        if self.probing() {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Checking what this machine supports…",
+                Style::new().fg(FOG).add_modifier(Modifier::ITALIC),
+            )));
+            return lines;
+        }
         if !self.row_enabled(self.cursor) {
             let id = if self.cursor == 0 {
                 "secret_store.keyring"
@@ -342,6 +358,7 @@ impl SecureStoreScreen {
                     ("Passphrase-protected file", "works without a keyring"),
                     ("Machine-bound encrypted file", "tied to this machine"),
                 ];
+                let probing = self.probing();
                 for (index, (title, available_tagline)) in choices.into_iter().enumerate() {
                     let enabled = self.row_enabled(index);
                     let recommended = enabled && index == self.recommended_choice();
@@ -353,7 +370,9 @@ impl SecureStoreScreen {
                     } else {
                         Style::default().fg(INK)
                     };
-                    let tag_style = if !enabled {
+                    let tag_style = if probing {
+                        Style::default().fg(FOG).add_modifier(Modifier::ITALIC)
+                    } else if !enabled {
                         Style::default().fg(DISABLED).add_modifier(Modifier::ITALIC)
                     } else if recommended {
                         Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
@@ -365,7 +384,9 @@ impl SecureStoreScreen {
                         Span::styled(title, row_style),
                         Span::styled("  —  ", Style::default().fg(NIGHT)),
                         Span::styled(
-                            if enabled {
+                            if probing {
+                                "checking…"
+                            } else if enabled {
                                 if recommended {
                                     "recommended"
                                 } else {
@@ -486,6 +507,9 @@ impl SecureStoreScreen {
 
     pub(crate) fn help_text(&self) -> &'static str {
         match self.phase {
+            SecureStoreInputPhase::Choice if self.probing() => {
+                "checking secure storage on this machine…   esc quit"
+            }
             SecureStoreInputPhase::Choice => "↑↓ move   click choose   enter choose   esc quit",
             SecureStoreInputPhase::Passphrase | SecureStoreInputPhase::Confirmation => {
                 "type password   tab switch   ctrl-r reveal   enter save   esc back"
@@ -560,6 +584,73 @@ mod tests {
             OnboardingSecurePlacement::MachineBoundFile
         );
         assert!(submission.passphrase.is_none());
+    }
+
+    fn line_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The locked daemon serves onboarding before its host probes settle:
+    /// the probing placeholder renders every placement as being checked (not
+    /// unavailable), accepts no choice, and the settled snapshot then enables
+    /// the rows and lands the cursor on the recommended placement.
+    #[test]
+    fn probing_rows_render_as_checking_then_update_when_the_snapshot_settles() {
+        let mut screen =
+            SecureStoreScreen::new(cockpit_proto::HostCapabilitySnapshot::unpublished());
+        assert!(screen.probing());
+        let rows = line_text(&screen.lines());
+        assert_eq!(rows.matches("checking…").count(), 3, "{rows}");
+        assert!(!rows.contains("unavailable"), "{rows}");
+        assert!(line_text(&screen.detail_lines()).contains("Checking what this machine supports"),);
+        assert!((0..3).all(|index| !screen.row_enabled(index)));
+        screen.handle_key(key(KeyCode::Enter));
+        assert!(screen.take_submission().is_none());
+        assert_eq!(screen.phase, SecureStoreInputPhase::Choice);
+
+        let mut settled = capabilities(FeatureCapabilityState::Available);
+        settled.generation = 1;
+        screen.set_capabilities(settled);
+        assert!(!screen.probing());
+        let rows = line_text(&screen.lines());
+        assert!(!rows.contains("checking…"), "{rows}");
+        assert!(rows.contains("recommended"), "{rows}");
+        assert_eq!(
+            screen.cursor_placement(),
+            Some(OnboardingSecurePlacement::Automatic)
+        );
+        screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            screen
+                .take_submission()
+                .map(|submission| submission.placement),
+            Some(OnboardingSecurePlacement::Automatic)
+        );
+    }
+
+    /// A settled snapshot without a keyring moves the cursor off the
+    /// keyring row it was parked on while probing.
+    #[test]
+    fn settled_snapshot_without_keyring_moves_cursor_to_the_file_vault() {
+        let mut screen =
+            SecureStoreScreen::new(cockpit_proto::HostCapabilitySnapshot::unpublished());
+        let mut settled = capabilities(FeatureCapabilityState::Missing);
+        settled.generation = 1;
+        screen.set_capabilities(settled);
+        assert_eq!(
+            screen.cursor_placement(),
+            Some(OnboardingSecurePlacement::PassphraseFile)
+        );
+        assert!(line_text(&screen.lines()).contains("unavailable"));
     }
 
     #[test]

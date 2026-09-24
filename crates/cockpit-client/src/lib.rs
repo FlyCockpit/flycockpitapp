@@ -1081,7 +1081,7 @@ where
     {
         Ok(Ok(Some(line))) => line,
         Ok(Ok(None)) => {
-            return Err(protocol_handshake_error(
+            return Err(protocol_handshake_closed(
                 "daemon closed the connection before its hello",
             ));
         }
@@ -1142,7 +1142,7 @@ where
         loop {
             let frame = proto_stream.recv().await?;
             let Some(frame) = frame else {
-                return Err(protocol_handshake_error(
+                return Err(protocol_handshake_closed(
                     "daemon closed before peer credential exchange",
                 ));
             };
@@ -1221,7 +1221,7 @@ where
         loop {
             let frame = proto_stream.recv().await?;
             let Some(frame) = frame else {
-                return Err(protocol_handshake_error(
+                return Err(protocol_handshake_closed(
                     "daemon closed before lifetime confirmation",
                 ));
             };
@@ -1263,14 +1263,49 @@ where
         .map_err(|_| protocol_handshake_error("daemon lifetime confirmation timed out"))?
 }
 
+/// Marker beneath a handshake error when the daemon accepted the connection
+/// and then closed it (EOF) before completing the handshake. That is the
+/// signature of an owner that began draining after it was discovered, which
+/// a lifecycle resolver may recover from by waiting for the owner to exit and
+/// re-running discovery. The outer error keeps the fail-closed
+/// [`proto::ErrorCode::ProtocolVersion`] payload and message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonClosedDuringHandshake;
+
+impl std::fmt::Display for DaemonClosedDuringHandshake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon closed the connection during the handshake")
+    }
+}
+
+impl std::error::Error for DaemonClosedDuringHandshake {}
+
+/// Whether `error` is a handshake that the daemon ended by closing the
+/// connection (see [`DaemonClosedDuringHandshake`]).
+pub fn is_daemon_closed_during_handshake(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DaemonClosedDuringHandshake>()
+        .is_some()
+}
+
 #[cfg(any(unix, windows))]
-fn protocol_handshake_error(reason: &'static str) -> anyhow::Error {
-    anyhow::Error::new(proto::ErrorPayload {
+fn protocol_handshake_closed(reason: &'static str) -> anyhow::Error {
+    anyhow::Error::new(DaemonClosedDuringHandshake).context(protocol_handshake_payload(reason))
+}
+
+#[cfg(any(unix, windows))]
+fn protocol_handshake_payload(reason: &'static str) -> proto::ErrorPayload {
+    proto::ErrorPayload {
         code: proto::ErrorCode::ProtocolVersion,
         message: format!(
             "daemon protocol handshake failed: {reason}; run `cockpit daemon restart`"
         ),
-    })
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn protocol_handshake_error(reason: &'static str) -> anyhow::Error {
+    anyhow::Error::new(protocol_handshake_payload(reason))
 }
 
 #[cfg(any(unix, windows))]

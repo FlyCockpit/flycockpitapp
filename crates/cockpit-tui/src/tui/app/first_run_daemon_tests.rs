@@ -559,6 +559,24 @@ fn advance_real_first_run_to_provider(app: &mut App) {
     // deterministic choice. The submission is the real sensitive intent: the
     // locked daemon materializes a real vault for the chosen placement and
     // hands itself off to its ready services before replying.
+    //
+    // The locked daemon serves onboarding before its host probes settle, so
+    // the secure-store screen first shows probing rows; the TUI's capability
+    // poll applies the settled snapshot (generation > 0) at the same
+    // revision.
+    pump_onboarding(
+        app,
+        |app| {
+            app.onboarding_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.host_capabilities.generation > 0)
+                && app
+                    .onboarding_shell
+                    .as_ref()
+                    .is_some_and(|shell| !shell.secure_store_capabilities_probing())
+        },
+        "the deferred host probes to publish the settled capability snapshot",
+    );
     assert!(
         !capability_available(app, "secret_store.keyring"),
         "the hermetic fixture must never report the host keyring"

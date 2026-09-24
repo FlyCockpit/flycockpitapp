@@ -4396,6 +4396,7 @@ impl DaemonContext {
         self.client_presence.send_modify(|presence| {
             presence.count += 1;
             presence.has_lifetime_client = true;
+            presence.attach_epoch = presence.attach_epoch.wrapping_add(1);
         });
         ClientGuard { ctx: self.clone() }
     }
@@ -4432,7 +4433,21 @@ impl DeferredClientLifetime {
 pub(crate) struct ClientPresence {
     pub(crate) count: usize,
     pub(crate) has_lifetime_client: bool,
+    /// Monotonic count of lifetime-client attaches. A last-client reaper
+    /// keys its handoff grace on this, so an attach that coalesces with its
+    /// own detach inside one watch observation still restarts the grace.
+    pub(crate) attach_epoch: u64,
 }
+
+/// Handoff lease for last-client teardown. A reference-counted owner (an
+/// ephemeral daemon, or any owner whose first-run onboarding is incomplete)
+/// keeps serving this long after its client count reaches zero before it
+/// drains. Short-lived RPC connections — a version-skew probe, a CLI command,
+/// a test fixture — are routinely followed by the caller's retained lifecycle
+/// connection; without the lease the owner would begin draining in that gap
+/// and the retained connect would hit a closing socket. Any attach inside the
+/// grace cancels it, and an abandoned owner still exits once it elapses.
+pub(crate) const LAST_CLIENT_HANDOFF_GRACE: Duration = Duration::from_secs(3);
 
 /// Decrements the daemon's connected-client count when a client task
 /// ends, regardless of how it ends.
@@ -4738,7 +4753,7 @@ async fn apply_locked_onboarding_profile(
 ) -> Result<Response> {
     let current = locked
         .onboarding
-        .snapshot(locked.host_capabilities.clone())
+        .snapshot(locked.host_capabilities())
         .await?
         .context("onboarding run is absent")?;
     anyhow::ensure!(
@@ -4802,7 +4817,7 @@ async fn handle_locked_in_process_request(
             Request::GetOnboardingBootstrapSnapshot => Ok(Response::OnboardingBootstrapSnapshot(
                 locked
                     .onboarding
-                    .snapshot(locked.host_capabilities.clone())
+                    .snapshot(locked.host_capabilities())
                     .await?,
             )),
             Request::BeginOrReopenOnboarding(request) => {
@@ -4812,7 +4827,7 @@ async fn handle_locked_in_process_request(
                 let outcome = async {
                     let (snapshot, receipt) = locked
                         .onboarding
-                        .begin_or_reopen(request, locked.host_capabilities.clone())
+                        .begin_or_reopen(request, locked.host_capabilities())
                         .await?;
                     Ok(Response::OnboardingTransition(
                         cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
@@ -4856,7 +4871,7 @@ async fn handle_locked_in_process_request(
                 let outcome = async {
                     let current = locked
                         .onboarding
-                        .snapshot(locked.host_capabilities.clone())
+                        .snapshot(locked.host_capabilities())
                         .await?
                         .context("onboarding run is absent")?;
                     // Admission covers every pre-vault stage; the authority's
@@ -4876,7 +4891,7 @@ async fn handle_locked_in_process_request(
                     );
                     let (snapshot, receipt) = locked
                         .onboarding
-                        .apply_transition(request, locked.host_capabilities.clone())
+                        .apply_transition(request, locked.host_capabilities())
                         .await?;
                     Ok(Response::OnboardingTransition(
                         cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
@@ -5035,6 +5050,184 @@ pub(crate) fn registered_in_process_endpoint(
     }
 }
 
+/// Wall-clock bound on the locked bootstrap's deferred host probe run. The
+/// catalog executor bounds each process probe (2s version, 5s functional)
+/// and the keyring probe carries its own deadline; this outer bound only
+/// catches a probe path with no deadline of its own. On expiry the probe set
+/// settles fail-closed rather than leaving onboarding probing forever.
+pub(crate) const LOCKED_HOST_PROBE_DEADLINE: Duration = Duration::from_secs(45);
+
+/// Extra time a caller waiting on the locked probes allows past the probe
+/// deadline for the settled publication itself.
+const LOCKED_HOST_PROBE_SETTLE_MARGIN: Duration = Duration::from_secs(5);
+
+/// Generation of the settled locked-bootstrap snapshot. Generation 0 is the
+/// probing placeholder ([`cockpit_proto::HostCapabilitySnapshot::unpublished`]),
+/// so the first settled publication is strictly newer for every client-side
+/// generation-monotonic apply.
+const LOCKED_HOST_CAPABILITY_GENERATION: u64 = 1;
+
+pub(crate) type LockedProbeFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::host_capabilities::SharedHostProbes> + Send>,
+>;
+
+pub(crate) type LockedProbeRunner = Box<
+    dyn FnOnce(crate::host_capabilities::HostCapabilityProbeInputs) -> LockedProbeFuture + Send,
+>;
+
+/// How the locked bootstrap collects its host probes: the production shared
+/// probe collector, or (tests) an injected runner with its own deadline.
+pub(crate) struct LockedProbePlan {
+    runner: LockedProbeRunner,
+    deadline: Duration,
+}
+
+impl LockedProbePlan {
+    pub(crate) fn production() -> Self {
+        Self {
+            runner: Box::new(
+                |inputs: crate::host_capabilities::HostCapabilityProbeInputs| -> LockedProbeFuture {
+                    Box::pin(async move {
+                        crate::host_capabilities::collect_shared_host_probes(&inputs, false).await
+                    })
+                },
+            ),
+            deadline: LOCKED_HOST_PROBE_DEADLINE,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn injected(runner: LockedProbeRunner, deadline: Duration) -> Self {
+        Self { runner, deadline }
+    }
+}
+
+/// Settled locked-bootstrap probe results.
+pub(crate) struct SettledLockedProbes {
+    pub(crate) snapshot: cockpit_proto::HostCapabilitySnapshot,
+    /// The keyring probe the vault materialization consumes; the same
+    /// construct that produced the snapshot's keyring row.
+    pub(crate) keyring: crate::secure_key::KeyringProbeResult,
+}
+
+struct PendingLockedProbes {
+    inputs: crate::host_capabilities::HostCapabilityProbeInputs,
+    plan: LockedProbePlan,
+}
+
+/// Deferred, background host probes for the locked bootstrap.
+///
+/// The locked service is served with the probing placeholder; `start` runs
+/// the probe set once in the background and publishes exactly one settled
+/// snapshot (generation [`LOCKED_HOST_CAPABILITY_GENERATION`]). A probe run
+/// that fails or exceeds its deadline settles fail-closed. Consumers that
+/// must decide on availability (`apply_secure_intent`) await `settled`.
+pub(crate) struct LockedHostProbes {
+    state: Arc<watch::Sender<Option<Arc<SettledLockedProbes>>>>,
+    pending: StdMutex<Option<PendingLockedProbes>>,
+    settle_wait: Duration,
+}
+
+impl LockedHostProbes {
+    fn new(
+        inputs: crate::host_capabilities::HostCapabilityProbeInputs,
+        plan: LockedProbePlan,
+    ) -> Self {
+        let settle_wait = plan
+            .deadline
+            .saturating_add(LOCKED_HOST_PROBE_SETTLE_MARGIN);
+        let (state, _) = watch::channel(None);
+        Self {
+            state: Arc::new(state),
+            pending: StdMutex::new(Some(PendingLockedProbes { inputs, plan })),
+            settle_wait,
+        }
+    }
+
+    /// Start the probe run in the background. Idempotent: only the first call
+    /// spawns.
+    pub(crate) fn start(&self) {
+        let Some(PendingLockedProbes { inputs, plan }) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let state = self.state.clone();
+        let platform = inputs.platform;
+        let LockedProbePlan { runner, deadline } = plan;
+        tokio::spawn(async move {
+            let mut probe = tokio::spawn(runner(inputs));
+            let probes = match tokio::time::timeout(deadline, &mut probe).await {
+                Ok(Ok(probes)) => probes,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "locked host capability probe task failed");
+                    crate::host_capabilities::failed_shared_host_probes(
+                        platform,
+                        &format!("host capability probe task failed: {error}"),
+                    )
+                }
+                Err(_) => {
+                    probe.abort();
+                    tracing::warn!(
+                        deadline_ms = deadline.as_millis() as u64,
+                        "locked host capability probes exceeded their deadline"
+                    );
+                    crate::host_capabilities::failed_shared_host_probes(
+                        platform,
+                        &format!(
+                            "host capability probing did not finish within {}ms",
+                            deadline.as_millis()
+                        ),
+                    )
+                }
+            };
+            let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                LOCKED_HOST_CAPABILITY_GENERATION,
+                &probes,
+                cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+            );
+            state.send_replace(Some(Arc::new(SettledLockedProbes {
+                snapshot,
+                keyring: probes.keyring,
+            })));
+        });
+    }
+
+    /// Current projection: the probing placeholder until settled.
+    pub(crate) fn current_snapshot(&self) -> cockpit_proto::HostCapabilitySnapshot {
+        self.state
+            .borrow()
+            .as_ref()
+            .map(|settled| settled.snapshot.clone())
+            .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished)
+    }
+
+    /// Await the settled probes, starting them if boot has not. Bounded: a
+    /// run that cannot settle within the probe deadline plus a margin is an
+    /// error, which callers treat as unavailable (fail closed).
+    pub(crate) async fn settled(&self) -> Result<Arc<SettledLockedProbes>> {
+        self.start();
+        let mut receiver = self.state.subscribe();
+        let settled = tokio::time::timeout(
+            self.settle_wait,
+            receiver.wait_for(|settled| settled.is_some()),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "host capability probes did not settle within {}ms",
+                self.settle_wait.as_millis()
+            )
+        })?
+        .map_err(|_| anyhow::anyhow!("host capability probe publisher closed"))?;
+        let settled: Option<Arc<SettledLockedProbes>> = settled.clone();
+        settled.context("host capability probes settled without a result")
+    }
+}
+
 /// Vault-free construction boundary published while a fresh installation is
 /// waiting for an explicit secure-store choice. This type cannot construct or
 /// expose any provider, OAuth, credential, session, MCP, redaction, or
@@ -5043,10 +5236,12 @@ pub(crate) struct LockedServices {
     pub(crate) db: Db,
     pub(crate) onboarding: crate::onboarding::OnboardingAuthority,
     paths: DaemonPaths,
-    pub(crate) host_capabilities: cockpit_proto::HostCapabilitySnapshot,
+    /// Deferred host-capability probes. The locked service is published
+    /// with a probing (generation 0) snapshot; the probes settle in the
+    /// background and publish generation 1.
+    pub(crate) host_probes: LockedHostProbes,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
     config_source: crate::daemon::config_source::ConfigSource,
-    keyring_probe: crate::secure_key::KeyringProbeResult,
     kek_dir: PathBuf,
     peer_credential_registry: Arc<crate::daemon::peer_authority::PeerCredentialRegistry>,
     approved_client_executable: PathBuf,
@@ -5262,6 +5457,7 @@ impl LockedServices {
         db: Db,
         terminal_factory: crate::daemon::terminal::TerminalHostFactory,
         config_source: crate::daemon::config_source::ConfigSource,
+        probe_plan: LockedProbePlan,
     ) -> Result<Self> {
         let daemon_boot = config_source
             .load_boot()
@@ -5289,34 +5485,29 @@ impl LockedServices {
         );
         db.configure_secret_vault_dir(kek_dir.clone())
             .context("publishing daemon vault directory authority")?;
-        let keyring_probe = match daemon_boot.secret_store_backend {
-            crate::config::extended::DaemonSecretStoreBackend::Auto => {
-                tokio::task::spawn_blocking(crate::secure_key::probe_platform_keyring)
-                    .await
-                    .context("daemon keyring probe task failed")?
-            }
-            crate::config::extended::DaemonSecretStoreBackend::File => {
-                crate::secure_key::KeyringProbeResult {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut probes = crate::host_capabilities::HostCapabilityProbeInputs::production(cwd);
+        probes.container_probe_paths = daemon_boot.container_probe_paths;
+        if matches!(
+            daemon_boot.secret_store_backend,
+            crate::config::extended::DaemonSecretStoreBackend::File
+        ) {
+            probes.keyring = crate::host_capabilities::KeyringProbeSource::Injected {
+                result: crate::secure_key::KeyringProbeResult {
                     state: cockpit_proto::FeatureCapabilityState::Missing,
                     reason: "file-backed vault selected by daemon configuration".into(),
                     fix_command: None,
                     remedy_text: None,
-                }
-            }
-        };
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut probes = crate::host_capabilities::HostCapabilityProbeInputs::production(cwd);
-        probes.container_probe_paths = daemon_boot.container_probe_paths;
-        probes.keyring = crate::host_capabilities::KeyringProbeSource::Injected {
-            result: keyring_probe.clone(),
-            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        };
-        let collected = crate::host_capabilities::collect_shared_host_probes(&probes, false).await;
-        let host_capabilities = crate::host_capabilities::build_host_capability_snapshot(
-            1,
-            &collected,
-            cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
-        );
+                },
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            };
+        }
+        // Host probes (platform keyring store construction, sandbox,
+        // container, external-runtime catalog, FFmpeg functional probes) are
+        // not boot: they are deferred so the locked hello is served as soon
+        // as DB/config boot finishes. `boot_with_db` starts them only when
+        // the locked graph is actually returned.
+        let host_probes = LockedHostProbes::new(probes, probe_plan);
         let peer_credential_registry =
             Arc::new(crate::daemon::peer_authority::PeerCredentialRegistry::default());
         peer_credential_registry.record_launch_provenance_from_environment();
@@ -5330,10 +5521,9 @@ impl LockedServices {
             onboarding: crate::onboarding::OnboardingAuthority::new(db.clone()),
             db,
             paths,
-            host_capabilities,
+            host_probes,
             terminal_factory,
             config_source,
-            keyring_probe,
             kek_dir,
             peer_credential_registry,
             approved_client_executable: std::env::current_exe()
@@ -5351,6 +5541,13 @@ impl LockedServices {
         })
     }
 
+    /// The locked bootstrap's current host-capability projection: the
+    /// probing placeholder (generation 0, no rows) until the deferred probes
+    /// settle, then the settled snapshot.
+    pub(crate) fn host_capabilities(&self) -> cockpit_proto::HostCapabilitySnapshot {
+        self.host_probes.current_snapshot()
+    }
+
     fn locked_admission_denied(&self) -> bool {
         self.closing.load(Ordering::Acquire) || self.ready.load(Ordering::Acquire)
     }
@@ -5363,13 +5560,14 @@ impl LockedServices {
     fn request_locked_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
         self.closing.store(true, Ordering::Release);
-        self.client_presence.send_modify(|_| {});
+        self.wake_locked_run_loop();
     }
 
     fn track_client(self: &Arc<Self>) -> LockedClientGuard {
         self.client_presence.send_modify(|presence| {
             presence.count += 1;
             presence.has_lifetime_client = true;
+            presence.attach_epoch = presence.attach_epoch.wrapping_add(1);
         });
         LockedClientGuard {
             locked: self.clone(),
@@ -5413,7 +5611,7 @@ impl LockedServices {
 
     async fn mark_ready_construction_failed(&self) -> Result<()> {
         self.onboarding
-            .mark_ready_construction_failed(self.host_capabilities.clone())
+            .mark_ready_construction_failed(self.host_capabilities())
             .await
             .context("recording ready-construction failure")?;
         Ok(())
@@ -5435,6 +5633,9 @@ impl LockedServices {
     fn release_ready_transition(&self) {
         self.ready_transition_inflight
             .store(false, Ordering::Release);
+        // The locked run loop defers teardown while a transition is in
+        // flight; wake it so an owner abandoned meanwhile still reaps.
+        self.wake_locked_run_loop();
     }
 
     async fn rollback_failed_ready_handoff(&self) -> Result<()> {
@@ -5442,7 +5643,17 @@ impl LockedServices {
         let _ = self.ready_signal.send(false);
         self.mark_ready_construction_failed().await?;
         self.closing.store(false, Ordering::Release);
+        // Reopening admission changes the loop's teardown predicate (the
+        // last-client handoff grace applies again); wake it to re-evaluate.
+        self.wake_locked_run_loop();
         Ok(())
+    }
+
+    /// Wake `run_locked_until_ready` to re-evaluate its teardown predicate
+    /// after lifecycle state it reads (`closing`, the ready-transition
+    /// permit) changed without a client-presence edge.
+    fn wake_locked_run_loop(&self) {
+        self.client_presence.send_modify(|_| {});
     }
 
     async fn onboarding_snapshot_present(
@@ -5456,7 +5667,7 @@ impl LockedServices {
             anyhow::bail!("injected onboarding snapshot failure");
         }
         self.onboarding
-            .snapshot(self.host_capabilities.clone())
+            .snapshot(self.host_capabilities())
             .await?
             .context("onboarding run is absent")
     }
@@ -5568,13 +5779,31 @@ impl LockedServices {
         if self.vault_authority_exists().unwrap_or(true) {
             return Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
         }
+        // Placement availability is decided by the settled probes, never by
+        // the probing placeholder: await a pending probe (bounded) instead
+        // of reporting the placement unavailable, and fail closed when the
+        // probes cannot settle.
+        let probes = match self.host_probes.settled().await {
+            Ok(probes) => probes,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "onboarding secure intent rejected: host capability probes did not settle"
+                );
+                return Err(
+                    cockpit_proto::SensitiveOnboardingIntentError::PlacementUnavailable(
+                        cockpit_proto::SecurePlacementFailureReason::CapabilityUnavailable,
+                    ),
+                );
+            }
+        };
         let db = self.db.clone();
-        let keyring_probe = self.keyring_probe.clone();
+        let keyring_probe = probes.keyring.clone();
         let kek_dir = self.kek_dir.clone();
         self.onboarding
             .apply_secure_intent_with(
                 request,
-                self.host_capabilities.clone(),
+                probes.snapshot.clone(),
                 false,
                 move |placement, passphrase| {
                     let options =
@@ -5709,21 +5938,48 @@ pub(crate) async fn boot_with_db(
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
     config_source: crate::daemon::config_source::ConfigSource,
 ) -> Result<BootServices> {
+    boot_with_db_and_probe_plan(
+        paths,
+        db,
+        timer,
+        terminal_factory,
+        config_source,
+        LockedProbePlan::production(),
+    )
+    .await
+}
+
+pub(crate) async fn boot_with_db_and_probe_plan(
+    paths: DaemonPaths,
+    db: Db,
+    timer: &mut crate::startup::PhaseTimer,
+    terminal_factory: crate::daemon::terminal::TerminalHostFactory,
+    config_source: crate::daemon::config_source::ConfigSource,
+    probe_plan: LockedProbePlan,
+) -> Result<BootServices> {
     reconcile_crash_interrupted_tools(&db).await?;
-    let locked = LockedServices::prepare(paths, db, terminal_factory, config_source).await?;
+    let locked =
+        LockedServices::prepare(paths, db, terminal_factory, config_source, probe_plan).await?;
     timer.phase("locked_services");
     let vault_authority_exists = locked.vault_authority_exists()?;
+    // The checkpoint reconciliation only projects the snapshot; the probing
+    // placeholder is sufficient and keeps boot off the host probes.
     locked
         .onboarding
-        .reconcile_materializing_secure_intent(
-            vault_authority_exists,
-            locked.host_capabilities.clone(),
-        )
+        .reconcile_materializing_secure_intent(vault_authority_exists, locked.host_capabilities())
         .await
         .context("reconciling locked onboarding bootstrap checkpoint")?;
     if !vault_authority_exists {
+        // Only the locked graph needs the locked probe set. Start it now, in
+        // the background: the caller binds and publishes the socket without
+        // waiting, and the onboarding snapshot moves from probing
+        // (generation 0) to the settled generation when the probes land.
+        locked.host_probes.start();
         return Ok(BootServices::Locked(locked));
     }
+    // The ready graph runs its own boot probes (`boot_ready_with_db`); the
+    // locked probe set is never started on this path, so a ready boot pays
+    // for host probing once.
     Ok(BootServices::Ready(locked.into_ready().await?))
 }
 
@@ -6736,13 +6992,16 @@ fn locked_bootstrap_hello_minimal() -> Response {
 async fn locked_bootstrap_hello(locked: &LockedServices) -> Result<Response> {
     let snapshot = locked
         .onboarding
-        .snapshot(locked.host_capabilities.clone())
+        .snapshot(locked.host_capabilities())
         .await?;
     Ok(Response::LockedBootstrapHello(
         cockpit_proto::LockedBootstrapHello {
             protocol_version: cockpit_proto::PROTOCOL_VERSION,
             bootstrap_available: true,
-            host_capabilities: locked.host_capabilities.clone(),
+            host_capabilities: snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.host_capabilities.clone())
+                .unwrap_or_else(|| locked.host_capabilities()),
             snapshot,
         },
     ))
@@ -6899,7 +7158,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
             Request::GetOnboardingBootstrapSnapshot => Ok(Response::OnboardingBootstrapSnapshot(
                 locked
                     .onboarding
-                    .snapshot(locked.host_capabilities.clone())
+                    .snapshot(locked.host_capabilities())
                     .await?,
             )),
             Request::BeginOrReopenOnboarding(request) => {
@@ -6909,7 +7168,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                 let outcome = async {
                     let (snapshot, receipt) = locked
                         .onboarding
-                        .begin_or_reopen(request, locked.host_capabilities.clone())
+                        .begin_or_reopen(request, locked.host_capabilities())
                         .await?;
                     Ok(Response::OnboardingTransition(
                         cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
@@ -6950,7 +7209,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                 let outcome = async {
                     let snapshot = locked
                         .onboarding
-                        .snapshot(locked.host_capabilities.clone())
+                        .snapshot(locked.host_capabilities())
                         .await?
                         .context("onboarding run is absent")?;
                     // Same pre-vault admission contract as the in-process
@@ -6968,7 +7227,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                     );
                     let (snapshot, receipt) = locked
                         .onboarding
-                        .apply_transition(request, locked.host_capabilities.clone())
+                        .apply_transition(request, locked.host_capabilities())
                         .await?;
                     Ok(Response::OnboardingTransition(
                         cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
@@ -7025,16 +7284,39 @@ pub(crate) async fn run_locked_until_ready(
     let mut locked_clients = tokio::task::JoinSet::new();
     let mut ready_signal = locked.subscribe_ready_handoff();
     let mut client_presence = locked.client_presence();
+    // Start of the current last-client idle period, keyed by the attach
+    // epoch that ended it (see `LAST_CLIENT_HANDOFF_GRACE`).
+    let mut idle_since: Option<(u64, tokio::time::Instant)> = None;
     loop {
         let observed = *client_presence.borrow_and_update();
+        let closing = locked.closing.load(Ordering::Acquire);
+        // A lifetime client left: keep serving for the handoff grace so a
+        // one-shot probe's close cannot tear the owner down before its
+        // caller's retained connection attaches.
+        let idle_deadline = if observed.has_lifetime_client && observed.count == 0 && !closing {
+            let start = match idle_since {
+                Some((epoch, start)) if epoch == observed.attach_epoch => start,
+                _ => {
+                    let start = tokio::time::Instant::now();
+                    idle_since = Some((observed.attach_epoch, start));
+                    start
+                }
+            };
+            Some(start + LAST_CLIENT_HANDOFF_GRACE)
+        } else {
+            idle_since = None;
+            None
+        };
+        let idle_grace_elapsed =
+            idle_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
         // An acknowledged StopDaemon tears down every attached locked client
         // — an onboarding wizard stays blocked in recv and never drains the
         // presence count — with the same abort semantics the ready handoff
         // uses. `closing` alone still waits for the count: a ready
         // transition also sets it while clients remain attached.
         if (locked.stop_requested.load(Ordering::Acquire)
-            || ((observed.has_lifetime_client || locked.closing.load(Ordering::Acquire))
-                && observed.count == 0))
+            || (closing && observed.count == 0)
+            || idle_grace_elapsed)
             && !locked.ready_transition_inflight.load(Ordering::Acquire)
         {
             locked.closing.store(true, Ordering::Release);
@@ -7065,6 +7347,17 @@ pub(crate) async fn run_locked_until_ready(
                     anyhow::bail!("locked client lifetime publisher closed");
                 }
             }
+            // Wake once the handoff grace elapses. An elapsed deadline that
+            // is held off by an in-flight ready transition waits for the
+            // next event instead of spinning.
+            () = async {
+                match idle_deadline {
+                    Some(deadline) if !idle_grace_elapsed => {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                    _ => std::future::pending::<()>().await,
+                }
+            } => {}
             accepted = accept_daemon_stream(&mut listener) => {
                 let stream = accepted?;
                 if validate_peer_owner(&stream).is_err() {

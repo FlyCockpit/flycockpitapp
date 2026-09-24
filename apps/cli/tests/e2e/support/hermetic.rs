@@ -452,10 +452,46 @@ struct PtyObserver {
     parser: vt100::Parser,
     osc52: Osc52Observer,
     frames: FrameBoundaryObserver,
+    /// The screen exactly as it stood when the child last finished a frame
+    /// (its frame-ending cursor command), or `None` before the first frame
+    /// and after the child's output ends. The live parser can sit in the
+    /// middle of a frame whose diff arrived in several PTY reads — a new
+    /// screen's header already drawn over the previous screen's body — so
+    /// screen predicates are evaluated against this completed frame.
+    completed_frame: Option<vt100::Screen>,
+    /// When output that is not part of a completed frame last arrived, if
+    /// any arrived after the latest frame boundary. Bytes past a boundary are
+    /// either a frame still being written (a burst that ends in its own
+    /// boundary within moments) or output that will never end in one — e.g.
+    /// a program the TUI handed the terminal to, which may enter its own
+    /// alternate screen and so is indistinguishable from the TUI resuming.
+    /// After the TUI has handed the terminal off (see `handed_off`), such
+    /// output that has been quiet for `UNFRAMED_QUIET` is a settled state and
+    /// the live screen is authoritative again.
+    unframed_since_boundary: Option<Instant>,
+    /// Sticky: the TUI left the alternate screen after drawing frames — it
+    /// tore down or handed the terminal to another program, whose output may
+    /// never carry a frame boundary. Only then may quiet unframed output
+    /// replace the captured frame; a TUI that never hands off keeps strict
+    /// completed-frame semantics, so a stalled mid-frame write can never be
+    /// read as a settled screen.
+    handed_off: bool,
 }
+
+/// After a hand-off, how long output past the last frame boundary must stay
+/// quiet before the live screen, not the captured frame, is what screen
+/// predicates read. Far longer than any pause inside one frame, far shorter
+/// than any screen-wait timeout.
+const UNFRAMED_QUIET: Duration = Duration::from_secs(1);
 
 /// Recognizes the child's full-redraw frame boundaries in the raw byte
 /// stream.
+///
+/// The TUI wraps every frame in a synchronized update (`ESC [ ? 2026 h` …
+/// `ESC [ ? 2026 l`), so the end marker is an exact, explicit frame boundary
+/// and nothing inside the bracket counts as one. Cursor commands are the
+/// boundary only for output outside a synchronized frame (a fallback for
+/// programs that do not delimit their frames).
 ///
 /// The TUI renders through ratatui's crossterm backend. When the terminal
 /// size changes, `Terminal::try_draw` autoresizes first, which clears the
@@ -474,18 +510,42 @@ struct FrameBoundaryObserver {
     /// Value of `clears` when the most recent frame-ending cursor command
     /// was seen.
     frame_completed_after_clear: u64,
+    /// The child left the alternate screen (TUI teardown or suspension, e.g.
+    /// handing the terminal to an editor). Output there is not ratatui
+    /// frames, so no frame boundary is reported until the child re-enters
+    /// the alternate screen and clears it for its next full frame.
+    outside_frames: bool,
+    /// Re-entered the alternate screen; waiting for its first full clear.
+    reentered: bool,
+    /// Inside a synchronized-update frame (`?2026h` seen, `?2026l` not yet).
+    in_sync: bool,
+}
+
+/// A frame-mode event at an offset (exclusive end, within the fed bytes).
+enum FrameEvent {
+    /// A synchronized-update end (or, outside one, a frame-ending cursor
+    /// command) completed a frame.
+    Completed(usize),
+    /// The child left framed output; any captured frame is stale.
+    Left(usize),
 }
 
 impl FrameBoundaryObserver {
     const CLEAR_ALL: &'static [u8] = b"\x1b[2J";
     const HIDE_CURSOR: &'static [u8] = b"\x1b[?25l";
     const SHOW_CURSOR: &'static [u8] = b"\x1b[?25h";
-    const LONGEST: usize = 6;
+    const ENTER_ALTERNATE: &'static [u8] = b"\x1b[?1049h";
+    const LEAVE_ALTERNATE: &'static [u8] = b"\x1b[?1049l";
+    const BEGIN_SYNC: &'static [u8] = b"\x1b[?2026h";
+    const END_SYNC: &'static [u8] = b"\x1b[?2026l";
+    const LONGEST: usize = 8;
 
-    fn feed(&mut self, bytes: &[u8]) {
+    /// Scan `bytes` and return the frame-mode events it completes, in order.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<FrameEvent> {
         let carried = self.tail.len();
         let mut window = std::mem::take(&mut self.tail);
         window.extend_from_slice(bytes);
+        let mut events = Vec::new();
         for end in 1..=window.len() {
             // Count only sequences that end inside the new bytes; ones that
             // ended inside the carried tail were counted by the last feed.
@@ -495,12 +555,36 @@ impl FrameBoundaryObserver {
             let prefix = &window[..end];
             if prefix.ends_with(Self::CLEAR_ALL) {
                 self.clears += 1;
-            } else if prefix.ends_with(Self::HIDE_CURSOR) || prefix.ends_with(Self::SHOW_CURSOR) {
+                if self.reentered {
+                    self.reentered = false;
+                    self.outside_frames = false;
+                }
+            } else if prefix.ends_with(Self::LEAVE_ALTERNATE) {
+                self.outside_frames = true;
+                self.reentered = false;
+                events.push(FrameEvent::Left(end - carried));
+            } else if prefix.ends_with(Self::ENTER_ALTERNATE) {
+                self.reentered = self.outside_frames;
+            } else if prefix.ends_with(Self::BEGIN_SYNC) {
+                self.in_sync = true;
+            } else if prefix.ends_with(Self::END_SYNC) {
+                self.in_sync = false;
                 self.frame_completed_after_clear = self.clears;
+                if !self.outside_frames {
+                    events.push(FrameEvent::Completed(end - carried));
+                }
+            } else if (prefix.ends_with(Self::HIDE_CURSOR) || prefix.ends_with(Self::SHOW_CURSOR))
+                && !self.in_sync
+            {
+                self.frame_completed_after_clear = self.clears;
+                if !self.outside_frames {
+                    events.push(FrameEvent::Completed(end - carried));
+                }
             }
         }
         let keep = window.len().min(Self::LONGEST - 1);
         self.tail = window[window.len() - keep..].to_vec();
+        events
     }
 
     fn position(&self) -> (u64, u64) {
@@ -526,19 +610,68 @@ impl PtyObserver {
             parser: vt100::Parser::new(rows, cols, 0),
             osc52: Osc52Observer::new(),
             frames: FrameBoundaryObserver::default(),
+            completed_frame: None,
+            unframed_since_boundary: None,
+            handed_off: false,
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
         self.osc52.feed(bytes);
-        self.parser.process(bytes);
-        // After the parser: once a boundary is visible, its frame's cells
-        // already are (both are read under the same observer lock).
-        self.frames.feed(bytes);
+        // Feed the parser up to each frame boundary and capture the screen
+        // there, so `completed_frame` never includes a later frame's first
+        // bytes. Boundary and cells are read under the same observer lock.
+        let mut fed = 0;
+        for event in self.frames.feed(bytes) {
+            let end = match event {
+                FrameEvent::Completed(end) | FrameEvent::Left(end) => end,
+            };
+            self.parser.process(&bytes[fed..end]);
+            fed = end;
+            self.completed_frame = match event {
+                FrameEvent::Completed(_) => Some(self.parser.screen().clone()),
+                // Outside the alternate screen, predicates read the live
+                // screen until the next framed redraw.
+                FrameEvent::Left(_) => {
+                    if self.completed_frame.is_some() {
+                        self.handed_off = true;
+                    }
+                    None
+                }
+            };
+        }
+        self.parser.process(&bytes[fed..]);
+        if fed < bytes.len() {
+            self.unframed_since_boundary = Some(Instant::now());
+        } else if fed > 0 {
+            self.unframed_since_boundary = None;
+        }
+    }
+
+    /// The screen predicates should read: the last completed frame while the
+    /// child is drawing frames; otherwise the live screen — before the first
+    /// frame, outside the alternate screen, after a hand-off once output past
+    /// the last frame boundary has been quiet for `UNFRAMED_QUIET` (so a
+    /// nested program's output can never be hidden behind a stale frame), and
+    /// after output ended so post-exit text is visible.
+    fn settled_screen(&self) -> &vt100::Screen {
+        // A synchronized frame that is still open is never settled, however
+        // long it stalls: its end marker is the only proof it is complete.
+        let unframed_settled = self.handed_off
+            && !self.frames.in_sync
+            && self
+                .unframed_since_boundary
+                .is_some_and(|since| since.elapsed() >= UNFRAMED_QUIET);
+        match self.completed_frame.as_ref() {
+            Some(frame) if !unframed_settled => frame,
+            _ => self.parser.screen(),
+        }
     }
 
     fn finish(&mut self) {
         self.osc52.finish();
+        self.completed_frame = None;
+        self.unframed_since_boundary = None;
     }
 }
 
@@ -1268,6 +1401,9 @@ impl HermeticCockpit {
         }
     }
 
+    /// Wait until `pred` holds for a whole frame the child finished drawing
+    /// (see `PtyObserver::settled_screen`), never for a half-painted grid
+    /// that mixes a new screen's header with the previous screen's body.
     pub fn wait_until_screen(
         &mut self,
         label: &str,
@@ -1277,7 +1413,7 @@ impl HermeticCockpit {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(2);
         loop {
-            let snapshot = self.snapshot();
+            let snapshot = self.settled_snapshot();
             if pred(&snapshot) {
                 return Ok(());
             }
@@ -1299,6 +1435,16 @@ impl HermeticCockpit {
         };
         let observer = pty.observer.lock().expect("pty observer lock");
         ScreenSnapshot::from_screen(observer.parser.screen())
+    }
+
+    /// Snapshot of the last frame the child finished drawing (the live
+    /// screen before the first frame and after the child's output ended).
+    pub fn settled_snapshot(&self) -> ScreenSnapshot {
+        let Some(pty) = &self.pty else {
+            return ScreenSnapshot::empty();
+        };
+        let observer = pty.observer.lock().expect("pty observer lock");
+        ScreenSnapshot::from_screen(observer.settled_screen())
     }
 
     pub fn osc52(&self) -> Osc52Observer {
@@ -1399,6 +1545,8 @@ impl HermeticCockpit {
             .expect("resize PTY");
         if let Ok(mut observer) = pty.observer.lock() {
             observer.parser.screen_mut().set_size(rows, cols);
+            // A frame drawn at the old size no longer describes the grid.
+            observer.completed_frame = None;
         }
         pty.cols = cols;
         pty.rows = rows;
@@ -1930,5 +2078,144 @@ mod generation_tests {
         std::fs::write(&pid_file, original_bytes).expect("restore owned daemon receipt");
         session.reap();
         session.assert_reaped();
+    }
+}
+
+#[cfg(test)]
+mod frame_observer_tests {
+    use super::*;
+
+    fn visible(observer: &PtyObserver) -> String {
+        observer.settled_screen().contents()
+    }
+
+    /// A frame whose diff is still arriving is invisible: predicates read the
+    /// last frame the child finished (frame boundary = its cursor command).
+    #[test]
+    fn settled_screen_excludes_a_frame_still_being_drawn() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1Hfirst screen\x1b[?25l");
+        observer.feed(b"\x1b[1;1Hsecond header");
+        assert!(visible(&observer).contains("first screen"));
+        assert!(!visible(&observer).contains("second header"));
+        observer.feed(b"\x1b[?25l");
+        assert!(visible(&observer).contains("second header"));
+    }
+
+    /// Leaving the alternate screen (TUI teardown, or handing the terminal to
+    /// an editor) drops the captured frame, so unframed output is visible;
+    /// framed capture resumes after the child re-enters and clears.
+    #[test]
+    fn leaving_the_alternate_screen_exposes_unframed_output() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1Htui frame\x1b[?25l");
+        observer.feed(b"\x1b[?1049l\x1b[?25hplain editor text");
+        assert!(
+            visible(&observer).contains("plain editor text"),
+            "unframed output must be visible outside the alternate screen: {}",
+            visible(&observer)
+        );
+        // Cursor commands outside framed mode never freeze a frame.
+        observer.feed(b"\x1b[?25l more");
+        assert!(visible(&observer).contains("more"));
+
+        observer.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1Hback in tui\x1b[?25l");
+        assert!(visible(&observer).contains("back in tui"));
+        observer.feed(b"\x1b[1;1Hpartial");
+        assert!(
+            !visible(&observer).contains("partial"),
+            "framed capture resumes after re-entering and clearing"
+        );
+    }
+
+    /// A program the TUI hands the terminal to may enter its own alternate
+    /// screen and clear it, which is byte-for-byte what the TUI does when it
+    /// resumes, and may draw with cursor commands of its own. Its later
+    /// output without a cursor command must still become visible: a stale
+    /// captured frame can never hide settled output.
+    #[test]
+    fn a_nested_program_in_its_own_alternate_screen_cannot_hide_output() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1Htui frame\x1b[?25l");
+        // The TUI suspends; the editor enters its own alternate screen.
+        observer.feed(b"\x1b[?1049l");
+        observer.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1Heditor view\x1b[?25h");
+        assert!(visible(&observer).contains("editor view"));
+        observer.feed(b"\x1b[2;1Heditor typed text");
+        std::thread::sleep(UNFRAMED_QUIET + Duration::from_millis(50));
+        assert!(
+            visible(&observer).contains("editor typed text"),
+            "settled output past the last boundary is visible: {}",
+            visible(&observer)
+        );
+        // The editor leaves; the TUI resumes and draws a frame.
+        observer.feed(b"\x1b[?1049l\x1b[?1049h\x1b[2J\x1b[1;1Htui again\x1b[?25l");
+        assert!(visible(&observer).contains("tui again"));
+        assert!(!visible(&observer).contains("editor"));
+    }
+
+    /// A synchronized frame is complete only at its end marker: cursor
+    /// commands inside the bracket (ratatui emits them mid-frame) are not
+    /// boundaries, and the frame stays hidden until `?2026l` arrives.
+    #[test]
+    fn a_synchronized_frame_completes_only_at_its_end_marker() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[?2026h\x1b[2J\x1b[1;1Hfirst\x1b[?25l\x1b[?2026l");
+        assert!(visible(&observer).contains("first"));
+        observer.feed(b"\x1b[?2026h\x1b[1;1Hsecond\x1b[?25l\x1b[2;1Hstill drawing");
+        assert!(
+            !visible(&observer).contains("second"),
+            "a cursor command inside a synchronized frame is not a boundary"
+        );
+        observer.feed(b"\x1b[?202");
+        observer.feed(b"6l");
+        assert!(visible(&observer).contains("second"));
+        assert!(visible(&observer).contains("still drawing"));
+    }
+
+    /// A TUI that never handed the terminal off keeps strict frame semantics:
+    /// a frame whose write stalls (however long) is never read half-painted.
+    #[test]
+    fn a_stalled_frame_stays_hidden_without_a_hand_off() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[?2026h\x1b[2J\x1b[1;1Hold frame\x1b[?2026l");
+        observer.feed(b"\x1b[?2026h\x1b[1;1Hhalf painted");
+        std::thread::sleep(UNFRAMED_QUIET + Duration::from_millis(50));
+        assert!(visible(&observer).contains("old frame"));
+        assert!(!visible(&observer).contains("half painted"));
+    }
+
+    /// After a hand-off (an editor round-trip), a synchronized frame that
+    /// stalls past the quiet window is still never read half-painted: the
+    /// fallback applies only to output outside an open synchronized frame.
+    #[test]
+    fn a_stalled_synchronized_frame_stays_hidden_after_a_hand_off() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[?2026h\x1b[2J\x1b[1;1Htui frame\x1b[?2026l");
+        // Editor round-trip: leave, editor output, TUI resumes and redraws.
+        observer.feed(b"\x1b[?1049leditor text\x1b[?1049h\x1b[2J");
+        observer.feed(b"\x1b[?2026h\x1b[1;1Hresumed frame\x1b[?2026l");
+        assert!(visible(&observer).contains("resumed frame"));
+        // A later frame stalls mid-draw for longer than the quiet window.
+        observer.feed(b"\x1b[?2026h\x1b[1;1Hhalf painted");
+        std::thread::sleep(UNFRAMED_QUIET + Duration::from_millis(50));
+        assert!(visible(&observer).contains("resumed frame"));
+        assert!(!visible(&observer).contains("half painted"));
+        observer.feed(b"\x1b[?2026l");
+        assert!(visible(&observer).contains("half painted"));
+    }
+
+    /// A frame split across reads stays invisible while its remainder is
+    /// still arriving (well inside the quiet window).
+    #[test]
+    fn a_frame_split_across_reads_stays_invisible_until_it_completes() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1Hold frame\x1b[?25l");
+        observer.feed(b"\x1b[1;1Hnew hea");
+        observer.feed(b"der\x1b[2;1Hnew body\x1b[?2");
+        assert!(visible(&observer).contains("old frame"));
+        observer.feed(b"5l");
+        assert!(visible(&observer).contains("new header"));
+        assert!(visible(&observer).contains("new body"));
     }
 }

@@ -105,6 +105,25 @@ fn keyboard_input(session: &mut HermeticCockpit, bytes: &[u8]) {
     session.checkpoint_input_with_redraw();
 }
 
+/// The locked daemon serves onboarding before its host probes settle, so the
+/// secure-store screen first renders every placement as `checking…` and
+/// accepts no choice. Wait for the settled capability rows before choosing a
+/// placement; input sent while probing is intentionally ignored.
+fn wait_for_settled_secure_store(session: &mut HermeticCockpit) {
+    session
+        .wait_until_screen(
+            "settled secure-store capability rows",
+            ASYNC_STAGE_TIMEOUT,
+            |screen| {
+                screen.contains("step 3/8")
+                    && screen.contains("Secure your secrets")
+                    && screen.contains("Machine-bound encrypted file  —  ")
+                    && !screen.contains("checking…")
+            },
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+}
+
 fn wait_for_text(session: &mut HermeticCockpit, label: &str, needle: &str) {
     session
         .wait_until_screen(label, ASYNC_STAGE_TIMEOUT, |screen| screen.contains(needle))
@@ -359,6 +378,7 @@ fn complete_cold_first_run(input: WalkthroughInput) {
     session.write_str("Ada");
     activate(&mut session, input, "[ Continue ]");
     wait_for_text(&mut session, "secure-store screen", "Secure your secrets");
+    wait_for_settled_secure_store(&mut session);
     match input {
         WalkthroughInput::Keyboard => {
             if session.snapshot().contents().contains("◉ Platform keyring") {
@@ -528,6 +548,7 @@ fn tui_pty_cold_first_run_mouse_walkthrough_to_provider_catalog() {
             |screen| screen.contains("step 3/8") && screen.contains("Secure your secrets"),
         )
         .expect("Profile Continue reaches Secure store");
+    wait_for_settled_secure_store(&mut session);
 
     click_text_twice(&mut session, "Machine-bound encrypted file");
     session

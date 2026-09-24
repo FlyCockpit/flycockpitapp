@@ -2375,20 +2375,37 @@ struct LiveApprovalsBytes {
 /// concurrent replacement leaves at the path. `Ok(None)` for a missing
 /// live path (the healthy first-run state); open/read failures fail the
 /// load closed as corrupt.
+///
+/// Unix opens the live name `O_NOFOLLOW | O_NONBLOCK` and requires a regular
+/// file: a symlink planted at `approvals.json` is refused rather than
+/// followed (policy would otherwise be read from, and owner-only enforcement
+/// applied to, an object outside the approvals directory), and a FIFO is
+/// refused rather than blocking the load. The write path already refuses
+/// both, so a store that loads is always one it can publish over.
 fn read_live_approvals_bytes(
     path: &Path,
 ) -> std::result::Result<Option<LiveApprovalsBytes>, ApprovalsLoadError> {
-    let mut file = match std::fs::File::open(path) {
+    let corrupt = |error: String| {
+        ApprovalsLoadError::Corrupt(CorruptApprovalsStore {
+            path: path.to_path_buf(),
+            preserved: None,
+            error,
+        })
+    };
+    let mut file = match open_live_approvals(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(ApprovalsLoadError::Corrupt(CorruptApprovalsStore {
-                path: path.to_path_buf(),
-                preserved: None,
-                error: error.to_string(),
-            }));
-        }
+        Err(error) => return Err(corrupt(error.to_string())),
     };
+    match file.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(corrupt(
+                "the live approvals store is not a regular file".into(),
+            ));
+        }
+        Err(error) => return Err(corrupt(error.to_string())),
+    }
     let mut bytes = Vec::new();
     let read = {
         use std::io::Read as _;
@@ -2402,6 +2419,20 @@ fn read_live_approvals_bytes(
         }));
     }
     Ok(Some(LiveApprovalsBytes { file, bytes }))
+}
+
+#[cfg(unix)]
+fn open_live_approvals(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_live_approvals(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// Locked half of [`load_approvals`]: assumes the caller holds the
@@ -5962,6 +5993,38 @@ mod tests {
                 let name = std::ffi::CString::new(at.as_os_str().as_bytes()).unwrap();
                 // SAFETY: `name` is a valid NUL-terminated path for the call.
                 assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+        }
+    }
+
+    /// The load path never follows a symlink planted at the live store nor
+    /// blocks on a FIFO there: both fail the load closed as corrupt, and the
+    /// symlink's target is neither read as policy nor re-permissioned.
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_a_non_regular_live_store_without_following_or_blocking() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for kind in [NonRegularSubstitute::Symlink, NonRegularSubstitute::Fifo] {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let live = dir.path().join(APPROVALS_FILE);
+            plant_non_regular_substitute(&live, kind, elsewhere.path());
+            let target = elsewhere.path().join("attacker-policy.json");
+            if matches!(kind, NonRegularSubstitute::Symlink) {
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            for result in [load_approvals(dir.path()), probe_approvals(dir.path())] {
+                assert!(
+                    matches!(result, Err(ApprovalsLoadError::Corrupt(_))),
+                    "{kind:?}: a non-regular live store must fail the load closed"
+                );
+            }
+            if matches!(kind, NonRegularSubstitute::Symlink) {
+                let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+                assert_eq!(
+                    mode, 0o644,
+                    "the symlink target must not be re-permissioned"
+                );
             }
         }
     }

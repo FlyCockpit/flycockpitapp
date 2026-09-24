@@ -44,6 +44,7 @@ pub(crate) mod config_watch;
 pub mod connector;
 #[cfg(feature = "remote")]
 pub mod control_replay;
+pub mod daemon_log;
 pub(crate) mod diagnostics_probe;
 pub(crate) mod dream_scheduler;
 pub(crate) mod editor_maintenance;
@@ -1804,6 +1805,10 @@ fn spawn_detached_child(
         .ok_or_else(|| anyhow::anyhow!("daemon pid file has no parent directory"))?;
     let log_file = spawn_notify::prepare_daemon_log(state_dir)?;
     let log_path = state_dir.join(DAEMON_LOG_FILE);
+    // Separate this launch from earlier runs before the child can write, so
+    // a spawn failure's log tail never shows a previous run's errors even
+    // when the supervisor dies before writing its own marker.
+    daemon_log::write_run_marker(&log_file, daemon_log::DaemonLogRole::Launcher);
     let stderr = log_file
         .try_clone()
         .context("cloning daemon.log handle for stderr")?;
@@ -2899,7 +2904,11 @@ async fn run_foreground_inner_with_boot_db_impl(
     macro_rules! boot_dbg {
         ($phase:literal) => {
             if std::env::var("COCKPIT_BOOT_DBG").is_ok() {
-                eprintln!("BOOT-DBG {} at {:?}", $phase, boot_dbg_start.elapsed());
+                $crate::daemon::daemon_log::daemon_eprintln!(
+                    "BOOT-DBG {} at {:?}",
+                    $phase,
+                    boot_dbg_start.elapsed()
+                );
             }
         };
     }

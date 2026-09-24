@@ -37,7 +37,10 @@ pub async fn run(args: StatsArgs) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("daemon rejected stats rollup request: {error}"))?;
     let rollup = match response {
         Response::StatsRollup { rollup } => rollup,
-        other => anyhow::bail!("daemon returned unexpected response to stats rollup: {other:?}"),
+        other => anyhow::bail!(
+            "daemon returned unexpected response to stats rollup: {}",
+            other.wire_tag()
+        ),
     };
 
     match args.format {

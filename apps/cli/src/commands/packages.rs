@@ -79,7 +79,10 @@ async fn list() -> Result<()> {
         .context("requesting package list from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected package list: {error}"))?;
     let Response::Packages { packages_json } = response else {
-        bail!("daemon returned unexpected response to package list: {response:?}");
+        bail!(
+            "daemon returned unexpected response to package list: {}",
+            response.wire_tag()
+        );
     };
     let packages: Vec<PackageRowView> =
         serde_json::from_str(&packages_json).context("parsing package list")?;
@@ -136,7 +139,10 @@ async fn add(args: PackagesAddArgs) -> Result<()> {
         .context("requesting package add from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected package add: {error}"))?;
     let Response::PackageAdded { package_json } = response else {
-        bail!("daemon returned unexpected response to package add: {response:?}");
+        bail!(
+            "daemon returned unexpected response to package add: {}",
+            response.wire_tag()
+        );
     };
     let row: PackageRowView =
         serde_json::from_str(&package_json).context("parsing added package")?;
@@ -172,7 +178,10 @@ async fn import(args: PackagesImportArgs) -> Result<()> {
         .context("requesting package import from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected package import: {error}"))?;
     let Response::PackageImported { summary_json } = response else {
-        bail!("daemon returned unexpected response to package import: {response:?}");
+        bail!(
+            "daemon returned unexpected response to package import: {}",
+            response.wire_tag()
+        );
     };
     let summary: PackageImportSummaryView =
         serde_json::from_str(&summary_json).context("parsing package import summary")?;
@@ -199,7 +208,10 @@ async fn prune(args: PackagesPruneArgs) -> Result<()> {
         .context("requesting package prune from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected package prune: {error}"))?;
     let Response::PackagesPruned { report_json } = response else {
-        bail!("daemon returned unexpected response to package prune: {response:?}");
+        bail!(
+            "daemon returned unexpected response to package prune: {}",
+            response.wire_tag()
+        );
     };
     let report: PackagePruneReportView =
         serde_json::from_str(&report_json).context("parsing package prune report")?;

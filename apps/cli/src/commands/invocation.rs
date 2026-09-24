@@ -31,7 +31,8 @@ async fn status(args: InvocationStatusArgs) -> Result<()> {
                         print_status(args.format, &status)
                     }
                     Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
-                        "unexpected response: {other:?}"
+                        "unexpected response: {}",
+                        other.wire_tag()
                     ))
                     .into()),
                     Ok(Err(error)) => Err(map_daemon_error(&error).into()),
@@ -64,7 +65,8 @@ async fn cancel(args: InvocationCancelArgs) -> Result<()> {
                         print_cancel(args.format, &result)
                     }
                     Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
-                        "unexpected response: {other:?}"
+                        "unexpected response: {}",
+                        other.wire_tag()
                     ))
                     .into()),
                     Ok(Err(error)) => Err(map_daemon_error(&error).into()),

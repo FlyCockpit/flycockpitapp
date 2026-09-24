@@ -30,7 +30,7 @@ async fn list(args: ScheduleListArgs) -> Result<()> {
         })
         .await?;
     let Response::ScheduledJobs { jobs } = response else {
-        bail!("unexpected schedule list response: {response:?}");
+        bail!("unexpected schedule list response: {}", response.wire_tag());
     };
     if jobs.is_empty() {
         println!("no scheduled jobs");
@@ -50,7 +50,10 @@ async fn create(args: ScheduleCreateArgs) -> Result<()> {
         })
         .await?;
     let Response::ScheduledJob { job } = response else {
-        bail!("unexpected schedule create response: {response:?}");
+        bail!(
+            "unexpected schedule create response: {}",
+            response.wire_tag()
+        );
     };
     println!("{}", format_job(&job));
     Ok(())
@@ -89,7 +92,10 @@ async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
         })
         .await?;
     let Response::ScheduledJob { job } = response else {
-        bail!("unexpected schedule enable response: {response:?}");
+        bail!(
+            "unexpected schedule enable response: {}",
+            response.wire_tag()
+        );
     };
     println!("{}", format_job(&job));
     Ok(())
@@ -103,7 +109,7 @@ async fn run_now(id: &str) -> Result<()> {
         })
         .await?;
     let Response::ScheduledJobRunQueued { id } = response else {
-        bail!("unexpected schedule run response: {response:?}");
+        bail!("unexpected schedule run response: {}", response.wire_tag());
     };
     println!("{id}: queued");
     Ok(())

@@ -28,7 +28,8 @@ async fn daemon_catalog(
         .map_err(|error| anyhow::anyhow!("daemon rejected provider catalog request: {error}"))?;
     let Response::ProviderCatalogSnapshot { config, .. } = response else {
         anyhow::bail!(
-            "daemon returned unexpected response to provider catalog request: {response:?}"
+            "daemon returned unexpected response to provider catalog request: {}",
+            response.wire_tag()
         );
     };
     Ok(ProvidersConfig {

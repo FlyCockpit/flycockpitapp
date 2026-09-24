@@ -43,7 +43,10 @@ async fn delete(session: &str, yes: bool) -> Result<()> {
     {
         Ok(Response::StorageCleanupPreview { preview }) => preview,
         Ok(other) => {
-            bail!("daemon returned unexpected response to session-delete preview: {other:?}")
+            bail!(
+                "daemon returned unexpected response to session-delete preview: {}",
+                other.wire_tag()
+            )
         }
         Err(error) => bail!("{error}"),
     };
@@ -69,7 +72,10 @@ async fn delete(session: &str, yes: bool) -> Result<()> {
         Ok(Response::StorageCleanupCompleted { bytes_freed }) => {
             println!("deleted session {session_id} and reclaimed {bytes_freed} bytes");
         }
-        Ok(other) => bail!("daemon returned unexpected response to session delete: {other:?}"),
+        Ok(other) => bail!(
+            "daemon returned unexpected response to session delete: {}",
+            other.wire_tag()
+        ),
         Err(error) => bail!("{error}"),
     }
     Ok(())
@@ -131,7 +137,10 @@ async fn list(args: SessionListArgs) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("daemon rejected session list request: {error}"))?;
     let sessions = match response {
         Response::Sessions { sessions } => sessions,
-        other => bail!("daemon returned unexpected response to session list: {other:?}"),
+        other => bail!(
+            "daemon returned unexpected response to session list: {}",
+            other.wire_tag()
+        ),
     };
     if sessions.is_empty() {
         println!("no sessions");
@@ -177,7 +186,10 @@ async fn media_egress_list(session: &str, json_mode: bool) -> Result<()> {
         .context("requesting media-egress verdicts from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected media-egress list: {error}"))?;
     let Response::MediaEgressVerdicts { verdicts, .. } = response else {
-        bail!("daemon returned unexpected response to media-egress list: {response:?}");
+        bail!(
+            "daemon returned unexpected response to media-egress list: {}",
+            response.wire_tag()
+        );
     };
     if json_mode {
         return emit_json(&json!({
@@ -221,7 +233,10 @@ async fn media_egress_revoke(session: &str, purpose: &str, digest: &str) -> Resu
             println!("revoked remembered media-egress verdict for {digest}");
             Ok(())
         }
-        Ok(other) => bail!("daemon returned unexpected response to media-egress revoke: {other:?}"),
+        Ok(other) => bail!(
+            "daemon returned unexpected response to media-egress revoke: {}",
+            other.wire_tag()
+        ),
         Err(error) => bail!("{error}"),
     }
 }
@@ -251,7 +266,10 @@ async fn show(session: &str, json_mode: bool) -> Result<()> {
         compactions_json, ..
     } = response
     else {
-        bail!("daemon returned unexpected response to session show: {response:?}");
+        bail!(
+            "daemon returned unexpected response to session show: {}",
+            response.wire_tag()
+        );
     };
     let compactions: Vec<CompactionView> =
         serde_json::from_str(&compactions_json).context("parsing session compactions")?;
@@ -384,7 +402,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
                         );
                     }
                 }
-                other => bail!("unexpected attach response: {other:?}"),
+                other => bail!("unexpected attach response: {}", other.wire_tag()),
             }
             client
                 .request_ok(Request::ResolveInterrupt {

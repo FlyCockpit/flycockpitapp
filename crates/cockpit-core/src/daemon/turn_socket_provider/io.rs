@@ -162,7 +162,9 @@ async fn drive_udp(
                 if let Some(relay) = drain_events(&mut client)? {
                     return Ok(relay);
                 }
-                eprintln!("[coturn-conformance] TURN UDP client closed before Allocate succeeded");
+                crate::daemon::daemon_log::daemon_eprintln!(
+                    "[coturn-conformance] TURN UDP client closed before Allocate succeeded"
+                );
                 return Err(ConnectError::AllocationFailed);
             }
             TurnPollRet::WaitUntil(t) => t,
@@ -329,7 +331,7 @@ async fn drive_stream<C: TurnClientApi>(
                     return Ok(relay);
                 }
                 let transport = if tls.is_some() { "TLS" } else { "TCP" };
-                eprintln!(
+                crate::daemon::daemon_log::daemon_eprintln!(
                     "[coturn-conformance] TURN {transport} stream closed before Allocate succeeded"
                 );
                 return Err(ConnectError::AllocationFailed);
@@ -373,7 +375,7 @@ fn drain_events<C: TurnClientApi>(
                 }));
             }
             TurnEvent::AllocationCreateFailed(family) => {
-                eprintln!(
+                crate::daemon::daemon_log::daemon_eprintln!(
                     "[coturn-conformance] TURN server rejected Allocate for relay address family {family:?}"
                 );
                 return Err(ConnectError::AllocationFailed);

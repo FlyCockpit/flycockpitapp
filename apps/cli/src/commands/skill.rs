@@ -29,7 +29,10 @@ async fn curator_request(
         .map_err(|error| anyhow::anyhow!("daemon rejected curator request: {error}"))?;
     match response {
         Response::Curator { result } => Ok(result),
-        other => bail!("daemon returned unexpected response to curator: {other:?}"),
+        other => bail!(
+            "daemon returned unexpected response to curator: {}",
+            other.wire_tag()
+        ),
     }
 }
 

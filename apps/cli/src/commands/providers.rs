@@ -78,7 +78,10 @@ async fn login(args: ProviderLoginArgs) -> Result<()> {
         ..
     } = started
     else {
-        bail!("daemon returned unexpected response to provider OAuth begin: {started:?}");
+        bail!(
+            "daemon returned unexpected response to provider OAuth begin: {}",
+            started.wire_tag()
+        );
     };
     println!("Open this URL and approve access:\n{authorize_url}");
     let device_code_flow = user_code.is_some();
@@ -120,7 +123,10 @@ async fn login(args: ProviderLoginArgs) -> Result<()> {
             ..
         }
     ) {
-        bail!("daemon returned unexpected response to provider OAuth completion: {completed:?}");
+        bail!(
+            "daemon returned unexpected response to provider OAuth completion: {}",
+            completed.wire_tag()
+        );
     }
     println!("signed in `{}`", args.provider);
     Ok(())
@@ -187,7 +193,10 @@ async fn logout(args: ProviderLogoutArgs) -> Result<()> {
             println!("`{}` was already signed out", args.provider)
         }
         other => {
-            bail!("daemon returned unexpected response to provider logout request: {other:?}")
+            bail!(
+                "daemon returned unexpected response to provider logout request: {}",
+                other.wire_tag()
+            )
         }
     }
     Ok(())
@@ -288,7 +297,10 @@ async fn usage(args: ProvidersUsageArgs) -> Result<()> {
         .map_err(|error| anyhow!("provider usage RPC failed: {error}"))?
         .map_err(|error| anyhow!("daemon rejected provider usage request: {error}"))?;
     let Response::ProviderUsageSnapshot { snapshots } = response else {
-        bail!("daemon returned unexpected response to provider usage request: {response:?}");
+        bail!(
+            "daemon returned unexpected response to provider usage request: {}",
+            response.wire_tag()
+        );
     };
     for (idx, row) in snapshots.iter().enumerate() {
         if idx > 0 {

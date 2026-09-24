@@ -573,7 +573,7 @@ fn watch_supervisor_liveness() -> Result<()> {
                 // and shell process group first so none outlives this
                 // worker's exit.
                 let killed = cockpit_host::process::kill_direct_child_process_groups();
-                eprintln!(
+                super::daemon_log::daemon_eprintln!(
                     "supervised worker pid {}: supervisor exited; killed {killed} child process group(s); terminating with it",
                     std::process::id()
                 );
@@ -746,6 +746,7 @@ pub fn admin_socket(paths: &DaemonPaths) -> Result<PathBuf> {
 pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool) -> Result<()> {
     use cockpit_host::daemon_lifecycle::{ForegroundMetadataGuard, reclaim_stale_and_reserve};
 
+    super::daemon_log::set_process_role(super::daemon_log::DaemonLogRole::Supervisor);
     super::validate_bind_socket_paths(&paths)?;
     let executable = std::env::current_exe()
         .and_then(std::fs::canonicalize)
@@ -758,6 +759,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
         .context("daemon pid file has no parent")?;
     let log = super::spawn_notify::prepare_daemon_log(state_dir)?;
     let log_path = state_dir.join(super::DAEMON_LOG_FILE);
+    super::daemon_log::write_run_marker(&log, super::daemon_log::DaemonLogRole::Supervisor);
 
     let inherited = inherited_reexec_state()?;
 

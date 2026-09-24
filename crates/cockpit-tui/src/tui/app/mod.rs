@@ -3678,7 +3678,12 @@ impl StartupFirstPaintTiming {
         }
     }
 
-    fn log_after_draw(&mut self) {
+    /// Log the launch-to-first-paint metric once. The first frame is drawn
+    /// only after the startup chain settled the first screen, so this
+    /// measures the time to the first *correct* screen; `screen` names it and
+    /// `settled` is false only when the pre-paint deadline forced an early
+    /// paint.
+    fn log_after_draw(&mut self, screen: &'static str, settled: bool) {
         if self.logged {
             return;
         }
@@ -3693,6 +3698,8 @@ impl StartupFirstPaintTiming {
             target: cockpit_core::startup::TARGET,
             event = "first-paint",
             launch_to_first_paint_ms = format_args!("{launch_to_first_paint_ms:.1}"),
+            screen,
+            settled,
             "startup"
         );
         #[cfg(test)]
@@ -4491,6 +4498,17 @@ impl App {
         // terminal viewport by default. GOALS §1d: alt screen during
         // the session for the clean full-screen experience; on exit
         // we leave alt screen and print the tail to stdout.
+        // Flicker-free startup: ask the daemon (spawning it if needed)
+        // whether onboarding is needed before the alternate screen exists,
+        // so the first frame is already the correct screen.
+        self.settle_first_screen_before_paint(
+            async {
+                cockpit_config::extended::load_global_daemon_lifetime_policy()
+                    .map_err(|error| error.to_string())
+            },
+            &mut startup_layout::TerminalStartupNotice,
+        )
+        .await;
         let mut terminal = ratatui::try_init()?;
         install_synchronized_update_panic_hook();
         let mut terminal_mode_guard = TerminalModeGuard::with_sink_and_title_state(
@@ -4819,7 +4837,14 @@ impl App {
     {
         cockpit_core::startup::mark_interactive_first_paint();
         let first_paint = !self.first_paint_completed;
-        self.startup_first_paint_timing.log_after_draw();
+        let screen = if self.onboarding_shell.is_some() {
+            "onboarding"
+        } else {
+            "chat"
+        };
+        let settled = self.first_screen_settled();
+        self.startup_first_paint_timing
+            .log_after_draw(screen, settled);
         self.first_paint_completed = true;
         if first_paint {
             tracing::info!(target: cockpit_core::startup::TARGET, event = "input-ready", "startup");

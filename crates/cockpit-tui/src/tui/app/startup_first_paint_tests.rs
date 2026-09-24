@@ -378,51 +378,57 @@ pub(super) async fn run_startup_trace_case(
         Some(std::time::Instant::now()),
         lifecycle,
     );
+    // The daemon side of the lifecycle channel answers the one request the
+    // pre-paint startup chain makes.
+    let owner_socket = runtime.join("fake-owner.sock");
+    let lifecycle_host = tokio::spawn(async move {
+        let request = requests.recv().await.expect("one lifecycle request");
+        assert_eq!(
+            request.intent,
+            if background_agents {
+                LifecycleIntent::AttachOrPersistent
+            } else {
+                LifecycleIntent::AttachOrEphemeral
+            }
+        );
+        request
+            .reply
+            .send(Ok(cockpit_client::LifecycleResolution {
+                endpoint,
+                process_watch: None,
+                lifetime_client: None,
+                owns_daemon: background_agents,
+                ephemeral_owner: resolution_ephemeral,
+                socket: owner_socket,
+                startup_notice: None,
+                promoted_from_ephemeral: false,
+            }))
+            .unwrap();
+        requests
+    });
+    let mut notice = RecordingStartupNotice::default();
+    app.settle_first_screen_before_paint(async move { Ok(background_agents) }, &mut notice)
+        .await;
+    let mut requests = lifecycle_host.await.expect("lifecycle host task");
+    assert!(app.first_screen_settled());
+    assert!(
+        app.startup_background.workspace_ready,
+        "an onboarded home settles its workspace decision before the first paint"
+    );
+    assert!(app.onboarding_shell.is_none());
+    assert_eq!(
+        notice.shown, notice.cleared,
+        "a shown notice is always cleared"
+    );
+
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
-
-    let policy_notify = app.async_actions.notifier();
-    let policy_completion = policy_notify.notified();
-    app.after_completed_draw_with_policy(async move { Ok(background_agents) });
-    policy_completion.await;
-    assert!(app.drain_async_actions());
-
-    let request = requests.recv().await.expect("one lifecycle request");
-    assert_eq!(
-        request.intent,
-        if background_agents {
-            LifecycleIntent::AttachOrPersistent
-        } else {
-            LifecycleIntent::AttachOrEphemeral
-        }
+    let first_frame = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        !first_frame.contains("press any button to continue"),
+        "an onboarded home's first frame must never be onboarding"
     );
-    let lifecycle_notify = app.async_actions.notifier();
-    let lifecycle_completion = lifecycle_notify.notified();
-    request
-        .reply
-        .send(Ok(cockpit_client::LifecycleResolution {
-            endpoint,
-            process_watch: None,
-            lifetime_client: None,
-            owns_daemon: background_agents,
-            ephemeral_owner: resolution_ephemeral,
-            socket: runtime.join("fake-owner.sock"),
-            startup_notice: None,
-            promoted_from_ephemeral: false,
-        }))
-        .unwrap();
-    lifecycle_completion.await;
-    assert!(app.drain_async_actions());
-
-    let onboarding_notify = app.async_actions.notifier();
-    let onboarding_completion = onboarding_notify.notified();
-    onboarding_completion.await;
-    assert!(app.drain_async_actions());
-
-    let workspace_notify = app.async_actions.notifier();
-    let workspace_completion = workspace_notify.notified();
-    workspace_completion.await;
-    assert!(app.drain_async_actions());
+    app.after_completed_draw_with_policy(std::future::pending::<Result<bool, String>>());
     assert!(
         requests.try_recv().is_err(),
         "startup requested a second owner"
@@ -489,14 +495,16 @@ async fn startup_trace_harness_orders_default_and_configured_false_without_real_
         ),
     ] {
         let mut cursor = 0;
+        // The first paint follows the settled startup chain: it measures
+        // the time to the first correct screen.
         for event in [
             "shell-constructed",
-            "first-paint",
-            "input-ready",
             "lifetime-policy-ready",
             "lifecycle-ready",
             "onboarding-ready",
             "trust-ready",
+            "first-paint",
+            "input-ready",
         ] {
             let relative = trace[cursor..]
                 .find(event)
@@ -513,6 +521,10 @@ async fn startup_trace_harness_orders_default_and_configured_false_without_real_
             assert!(trace.contains("outcome=\"reused\""));
         }
         assert!(!trace.contains("fake-owner.sock"));
+        assert!(
+            trace.contains("screen=\"chat\"") && trace.contains("settled=true"),
+            "first-paint must name the settled first screen: {trace}"
+        );
         eprintln!("startup-trace-{case}:{trace}");
     }
 }
@@ -1165,4 +1177,75 @@ async fn every_shell_entry_keeps_lifecycle_pending_behind_policy() {
         assert!(!app.startup_background.workspace_ready);
         assert!(app.agent_runner.is_none());
     }
+}
+
+#[derive(Default)]
+pub(super) struct RecordingStartupNotice {
+    pub(super) shown: usize,
+    pub(super) cleared: usize,
+}
+
+impl super::startup_layout::StartupNotice for RecordingStartupNotice {
+    fn show(&mut self) {
+        self.shown += 1;
+    }
+
+    fn clear(&mut self) {
+        self.cleared += 1;
+    }
+}
+
+/// The pre-paint startup prints its one "Starting cockpit…" line only once
+/// settling has taken longer than the notice delay, and clears it before the
+/// caller enters the alternate screen; a startup that settles quickly prints
+/// nothing.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn slow_first_screen_prints_one_starting_line_and_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let (lifecycle, mut requests) = cockpit_client::LifecycleClient::channel(2);
+    let mut app = App::new_composed_with_session_mode(
+        Some(tmp.path()),
+        false,
+        cockpit_proto::SessionEntryMode::Code,
+        super::StartupWorkspaceTrust::Decided,
+        Some(std::time::Instant::now()),
+        lifecycle,
+    );
+    // The lifecycle host answers only after twice the notice delay, with a
+    // failure: the chain then settles on a visible, retryable error.
+    let host = tokio::spawn(async move {
+        let request = requests.recv().await.expect("lifecycle request");
+        tokio::time::sleep(super::startup_layout::STARTING_NOTICE_DELAY * 2).await;
+        let _ = request.reply.send(Err("fixture daemon unavailable".into()));
+        requests
+    });
+    let mut notice = RecordingStartupNotice::default();
+    app.settle_first_screen_before_paint(async { Ok(true) }, &mut notice)
+        .await;
+    assert_eq!((notice.shown, notice.cleared), (1, 1));
+    assert!(app.first_screen_settled());
+    assert!(app.startup_background.retry.is_some());
+    drop(host.await);
+
+    // A chain that settles within the delay prints nothing.
+    let (lifecycle, mut requests) = cockpit_client::LifecycleClient::channel(2);
+    let mut app = App::new_composed_with_session_mode(
+        Some(tmp.path()),
+        false,
+        cockpit_proto::SessionEntryMode::Code,
+        super::StartupWorkspaceTrust::Decided,
+        Some(std::time::Instant::now()),
+        lifecycle,
+    );
+    let host = tokio::spawn(async move {
+        let request = requests.recv().await.expect("lifecycle request");
+        let _ = request.reply.send(Err("fixture daemon unavailable".into()));
+        requests
+    });
+    let mut notice = RecordingStartupNotice::default();
+    app.settle_first_screen_before_paint(async { Ok(true) }, &mut notice)
+        .await;
+    assert_eq!((notice.shown, notice.cleared), (0, 0));
+    drop(host.await);
 }

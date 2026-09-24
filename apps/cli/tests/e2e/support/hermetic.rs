@@ -459,6 +459,10 @@ struct PtyObserver {
     /// screen's header already drawn over the previous screen's body — so
     /// screen predicates are evaluated against this completed frame.
     completed_frame: Option<vt100::Screen>,
+    /// The very first synchronized-update frame the child completed, kept
+    /// for the rest of the run. The TUI draws every frame inside a
+    /// synchronized update, so this is exactly what the user saw first.
+    first_synchronized_frame: Option<vt100::Screen>,
     /// When output that is not part of a completed frame last arrived, if
     /// any arrived after the latest frame boundary. Bytes past a boundary are
     /// either a frame still being written (a burst that ends in its own
@@ -524,8 +528,9 @@ struct FrameBoundaryObserver {
 /// A frame-mode event at an offset (exclusive end, within the fed bytes).
 enum FrameEvent {
     /// A synchronized-update end (or, outside one, a frame-ending cursor
-    /// command) completed a frame.
-    Completed(usize),
+    /// command) completed a frame. The flag is set for a synchronized-update
+    /// end, the TUI's own frame boundary.
+    Completed(usize, bool),
     /// The child left framed output; any captured frame is stale.
     Left(usize),
 }
@@ -571,14 +576,14 @@ impl FrameBoundaryObserver {
                 self.in_sync = false;
                 self.frame_completed_after_clear = self.clears;
                 if !self.outside_frames {
-                    events.push(FrameEvent::Completed(end - carried));
+                    events.push(FrameEvent::Completed(end - carried, true));
                 }
             } else if (prefix.ends_with(Self::HIDE_CURSOR) || prefix.ends_with(Self::SHOW_CURSOR))
                 && !self.in_sync
             {
                 self.frame_completed_after_clear = self.clears;
                 if !self.outside_frames {
-                    events.push(FrameEvent::Completed(end - carried));
+                    events.push(FrameEvent::Completed(end - carried, false));
                 }
             }
         }
@@ -611,6 +616,7 @@ impl PtyObserver {
             osc52: Osc52Observer::new(),
             frames: FrameBoundaryObserver::default(),
             completed_frame: None,
+            first_synchronized_frame: None,
             unframed_since_boundary: None,
             handed_off: false,
         }
@@ -624,12 +630,17 @@ impl PtyObserver {
         let mut fed = 0;
         for event in self.frames.feed(bytes) {
             let end = match event {
-                FrameEvent::Completed(end) | FrameEvent::Left(end) => end,
+                FrameEvent::Completed(end, _) | FrameEvent::Left(end) => end,
             };
             self.parser.process(&bytes[fed..end]);
             fed = end;
+            if matches!(event, FrameEvent::Completed(_, true))
+                && self.first_synchronized_frame.is_none()
+            {
+                self.first_synchronized_frame = Some(self.parser.screen().clone());
+            }
             self.completed_frame = match event {
-                FrameEvent::Completed(_) => Some(self.parser.screen().clone()),
+                FrameEvent::Completed(..) => Some(self.parser.screen().clone()),
                 // Outside the alternate screen, predicates read the live
                 // screen until the next framed redraw.
                 FrameEvent::Left(_) => {
@@ -1435,6 +1446,17 @@ impl HermeticCockpit {
         };
         let observer = pty.observer.lock().expect("pty observer lock");
         ScreenSnapshot::from_screen(observer.parser.screen())
+    }
+
+    /// The first frame the TUI drew (its first completed synchronized
+    /// update), or `None` before it has drawn one.
+    pub fn first_frame_snapshot(&self) -> Option<ScreenSnapshot> {
+        let pty = self.pty.as_ref()?;
+        let observer = pty.observer.lock().expect("pty observer lock");
+        observer
+            .first_synchronized_frame
+            .as_ref()
+            .map(ScreenSnapshot::from_screen)
     }
 
     /// Snapshot of the last frame the child finished drawing (the live

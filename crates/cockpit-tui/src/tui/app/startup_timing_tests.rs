@@ -11,13 +11,13 @@ fn startup_timing_first_paint_logged_exactly_once() {
     reset_startup_first_paint_log_count();
 
     if take_redraw_request(&mut needs_redraw) {
-        timing.log_after_draw();
+        timing.log_after_draw("chat", true);
     }
     assert_eq!(startup_first_paint_log_count(), 1);
 
     needs_redraw = true;
     if take_redraw_request(&mut needs_redraw) {
-        timing.log_after_draw();
+        timing.log_after_draw("chat", true);
     }
     assert_eq!(
         startup_first_paint_log_count(),
@@ -33,13 +33,13 @@ fn startup_timing_no_launch_instant_skips_first_paint_log() {
     reset_startup_first_paint_log_count();
 
     if take_redraw_request(&mut needs_redraw) {
-        timing.log_after_draw();
+        timing.log_after_draw("chat", true);
     }
     assert_eq!(startup_first_paint_log_count(), 0);
 
     needs_redraw = true;
     if take_redraw_request(&mut needs_redraw) {
-        timing.log_after_draw();
+        timing.log_after_draw("chat", true);
     }
     assert_eq!(startup_first_paint_log_count(), 0);
 }

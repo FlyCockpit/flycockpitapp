@@ -4,7 +4,7 @@ use cockpit_config::providers::AuthKind;
 #[cfg(test)]
 mod tests {
     #[tokio::test(flavor = "current_thread")]
-    async fn coverage_postpaint_integration_uses_existing_upstream_firstpaint_seam() {
+    async fn coverage_phases_complete_before_the_first_correct_paint() {
         let namespace = tempfile::tempdir().expect("isolated startup trace root");
         let workspace = namespace.path().join("workspace");
         let runtime = namespace.path().join("runtime");
@@ -16,12 +16,14 @@ mod tests {
         .await;
 
         let mut cursor = 0usize;
+        // The first paint waits for the daemon's onboarding (and workspace)
+        // answer, so the daemon's coverage phases precede it.
         for event in [
-            "first-paint",
             "coverage-phase-start",
             "coverage-phase-complete",
             "daemon-ready",
             "first-model-request",
+            "first-paint",
         ] {
             let relative = trace[cursor..]
                 .find(event)
@@ -39,6 +41,44 @@ mod tests {
 fn onboarding_ready_construction_retry_required(error: &cockpit_proto::ErrorPayload) -> bool {
     error.code == cockpit_proto::ErrorCode::Internal
         && error.message.contains("retry ready construction")
+}
+
+/// How long the pre-screen startup may run silently before it prints its one
+/// "Starting cockpit…" line on the normal terminal.
+pub(super) const STARTING_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Upper bound for deciding the first screen before paint. Generous: it
+/// covers a cold daemon spawn (the lifecycle request budget) plus the
+/// onboarding and workspace reads. Past it the TUI opens anyway.
+pub(super) const FIRST_SCREEN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The one-line pre-screen notice. Production writes to the normal terminal
+/// (before the alternate screen exists); tests record the calls.
+pub(super) trait StartupNotice {
+    fn show(&mut self);
+    fn clear(&mut self);
+}
+
+/// `Starting cockpit…` on the normal terminal, erased again before the
+/// alternate screen is entered so it never lingers in scrollback.
+pub(super) struct TerminalStartupNotice;
+
+pub(super) const STARTING_NOTICE_TEXT: &str = "Starting cockpit…";
+
+impl StartupNotice for TerminalStartupNotice {
+    fn show(&mut self) {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = write!(out, "{STARTING_NOTICE_TEXT}");
+        let _ = out.flush();
+    }
+
+    fn clear(&mut self) {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\r\x1b[2K");
+        let _ = out.flush();
+    }
 }
 
 /// Upper bound for one onboarding authority operation to reach a serving
@@ -2849,6 +2889,17 @@ impl App {
         if !self.first_paint_completed {
             return;
         }
+        self.begin_startup_background_tasks(policy);
+    }
+
+    /// Start the startup authority chain (lifetime policy, lifecycle,
+    /// onboarding bootstrap, workspace). Idempotent. Production starts it
+    /// before the first frame ([`Self::settle_first_screen_before_paint`]);
+    /// the post-paint hook remains the fallback for a shell that did not.
+    fn begin_startup_background_tasks<F>(&mut self, policy: F)
+    where
+        F: std::future::Future<Output = Result<bool, String>> + Send + 'static,
+    {
         if self.startup_background.started {
             return;
         }
@@ -2884,6 +2935,82 @@ impl App {
                 )
             },
         );
+    }
+
+    /// Whether the startup chain has settled what the first frame shows:
+    /// the onboarding shell (or a startup modal) is mounted, or the chain
+    /// has no step left in flight (the chat UI, a limited-mode run, or a
+    /// visible startup failure with its retry).
+    pub(super) fn first_screen_settled(&self) -> bool {
+        use crate::tui::async_action::AsyncActionKind;
+        const STARTUP_CHAIN: [AsyncActionKind; 5] = [
+            AsyncActionKind::Blocking("startup.lifetime-policy"),
+            AsyncActionKind::Internal("startup.lifecycle"),
+            AsyncActionKind::DaemonRpc("onboarding.bootstrap"),
+            AsyncActionKind::DaemonRpc("onboarding.ready_retry"),
+            AsyncActionKind::DaemonRpc("startup.workspace"),
+        ];
+        self.exit_requested
+            || self.onboarding_shell.is_some()
+            || self.startup_modal_on_top().is_some()
+            || !STARTUP_CHAIN
+                .iter()
+                .any(|kind| self.async_actions.has_pending_kind(kind))
+    }
+
+    /// Decide the first screen before the terminal enters the alternate
+    /// screen: run the startup chain (lifetime policy, daemon lifecycle —
+    /// spawning the daemon if needed —, the onboarding bootstrap, and for an
+    /// onboarded home the workspace decision) through the ordinary reducers
+    /// until [`Self::first_screen_settled`]. The first frame is then
+    /// onboarding or chat, never one replaced by the other.
+    ///
+    /// Nothing is drawn meanwhile. If settling takes longer than
+    /// [`STARTING_NOTICE_DELAY`], `notice` shows one plain line on the normal
+    /// terminal and clears it before the caller enters the alternate screen.
+    /// Bounded by [`FIRST_SCREEN_DEADLINE`]: past it the TUI opens anyway and
+    /// the chain continues behind the first frame, as a failure fallback.
+    pub(super) async fn settle_first_screen_before_paint<F>(
+        &mut self,
+        policy: F,
+        notice: &mut dyn StartupNotice,
+    ) where
+        F: std::future::Future<Output = Result<bool, String>> + Send + 'static,
+    {
+        let started = tokio::time::Instant::now();
+        let notice_at = started + STARTING_NOTICE_DELAY;
+        let deadline = started + FIRST_SCREEN_DEADLINE;
+        let notify = self.async_actions.notifier();
+        self.begin_startup_background_tasks(policy);
+        let mut shown = false;
+        loop {
+            self.drain_async_actions();
+            if self.first_screen_settled() {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                tracing::warn!(
+                    target: cockpit_core::startup::TARGET,
+                    event = "first-screen-deadline",
+                    deadline_s = FIRST_SCREEN_DEADLINE.as_secs(),
+                    "startup"
+                );
+                break;
+            }
+            if !shown && now >= notice_at {
+                notice.show();
+                shown = true;
+            }
+            let wake = if shown { deadline } else { notice_at };
+            tokio::select! {
+                () = notify.notified() => {}
+                () = tokio::time::sleep_until(wake) => {}
+            }
+        }
+        if shown {
+            notice.clear();
+        }
     }
 
     /// True while the post-paint startup machine has not yet accepted a workspace.

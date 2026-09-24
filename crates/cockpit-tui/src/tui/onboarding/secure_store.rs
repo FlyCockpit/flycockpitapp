@@ -40,6 +40,9 @@ pub(crate) struct SecureStoreScreen {
     confirmation: zeroize::Zeroizing<String>,
     pub(crate) submitted: Option<SecureStoreSubmission>,
     pub(crate) status: Option<String>,
+    /// Neutral progress of an in-flight submission (set by the app each
+    /// frame). A validation `status` takes precedence over it.
+    pub(crate) progress: Option<String>,
     revealed: bool,
     password_rect: Rect,
     confirmation_rect: Rect,
@@ -55,6 +58,7 @@ impl SecureStoreScreen {
             confirmation: zeroize::Zeroizing::new(String::new()),
             submitted: None,
             status: None,
+            progress: None,
             revealed: false,
             password_rect: Rect::default(),
             confirmation_rect: Rect::default(),
@@ -408,6 +412,12 @@ impl SecureStoreScreen {
         if let Some(status) = self.status.as_deref() {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(status.to_string(), BAD)));
+        } else if let Some(progress) = self.progress.as_deref() {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                progress.to_string(),
+                Style::default().fg(FOG).add_modifier(Modifier::ITALIC),
+            )));
         }
         lines
     }
@@ -439,6 +449,7 @@ impl SecureStoreScreen {
         let note = self
             .status
             .as_deref()
+            .or(self.progress.as_deref())
             .unwrap_or("This password isn't recoverable — losing it means re-adding every secret.");
         let style = if self.status.is_some() {
             Style::new().fg(BAD).add_modifier(Modifier::BOLD)

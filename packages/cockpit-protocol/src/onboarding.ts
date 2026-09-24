@@ -180,10 +180,19 @@ export const onboardingTransitionResultSchema = z
   .strict();
 export type OnboardingTransitionResult = z.infer<typeof onboardingTransitionResultSchema>;
 
+/** Ready-service construction phase of a locked daemon owner. */
+export const lockedReadyConstructionSchema = z.enum([
+  "awaiting_secure_store",
+  "constructing",
+  "failed",
+]);
+export type LockedReadyConstruction = z.infer<typeof lockedReadyConstructionSchema>;
+
 export const lockedBootstrapHelloSchema = z
   .object({
     protocol_version: z.number().int().nonnegative(),
     bootstrap_available: z.boolean(),
+    ready_construction: lockedReadyConstructionSchema,
     host_capabilities: onboardingHostCapabilitiesSchema,
     snapshot: onboardingBootstrapSnapshotSchema.optional(),
   })

@@ -43364,7 +43364,6 @@ async fn locked_services_never_admit_ordinary_payload_before_coverage() {
             .ready
             .as_ref()
             .expect("constructed ready services")
-            .context
             .redaction_generation
             .load(std::sync::atomic::Ordering::Acquire)
             > 0,

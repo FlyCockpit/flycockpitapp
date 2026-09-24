@@ -1171,7 +1171,13 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             Ok(successor) => successor,
                             Err(error) => {
                                 let reason = format!("staging successor readiness: {error:#}");
-                                tracing::warn!(%reason, "worker handover aborted; predecessor remains serving");
+                                tracing::warn!(
+                                    reason = %format!(
+                                        "staging successor readiness: {}",
+                                        super::spawn_notify::error_without_log_tail(&error)
+                                    ),
+                                    "worker handover aborted; predecessor remains serving"
+                                );
                                 last_handover = Some(format!("aborted: {reason}"));
                                 reply_admin(&mut stream, &AdminResponse::Error {
                                     version: ADMIN_PROTOCOL_VERSION,
@@ -1629,9 +1635,11 @@ where
         match spawn(*generation).await {
             Ok(worker) => return Some(worker),
             Err(error) => {
+                // daemon.log already holds the failed worker's lines; never
+                // copy its tail back into the log (nested tails).
                 tracing::error!(
                     generation = *generation,
-                    %error,
+                    error = %super::spawn_notify::error_without_log_tail(&error),
                     "worker respawn failed before readiness; retrying"
                 );
             }

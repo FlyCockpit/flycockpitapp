@@ -3078,6 +3078,11 @@ pub struct App {
     /// reopen the surface; only explicit re-entry (the no-provider send
     /// guard) clears the flag.
     pub(super) onboarding_dismissed: bool,
+    /// Progress of the in-flight secure-store submission (its daemon handoff
+    /// to ready services), shown on the secure-store screen. `Some` exactly
+    /// while an `onboarding.secure_intent` action is in flight.
+    pub(super) onboarding_secure_intent_progress:
+        Option<(Instant, startup_layout::OnboardingHandoffProgress)>,
     /// An open `/side` side conversation, or `None` in the main session. While
     /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
     /// shows the side indicator with `/side end` guidance, and the fork is
@@ -4442,6 +4447,7 @@ impl App {
             pending_setup_wizard: None,
             pending_provider_add_template: None,
             onboarding_dismissed: false,
+            onboarding_secure_intent_progress: None,
             side_conversation: None,
             daemon_draining: false,
             predict_setting,

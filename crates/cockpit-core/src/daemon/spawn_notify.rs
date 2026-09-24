@@ -356,6 +356,29 @@ pub(crate) fn last_log_lines(log_path: &Path, n: usize) -> String {
         .join("\n")
 }
 
+/// A spawn/readiness failure that carries the current run's `daemon.log`
+/// tail for the person reading the error. The tail is presentation only: a
+/// daemon process that writes this error back into `daemon.log` must log
+/// [`error_without_log_tail`] instead, or each later failure's tail would
+/// re-embed the previous tail (nested, ever-growing copies in one run).
+#[derive(Debug)]
+pub(crate) struct DaemonLogTailError {
+    reason: String,
+    tail: String,
+}
+
+impl std::fmt::Display for DaemonLogTailError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}\n--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{}",
+            self.reason, self.tail
+        )
+    }
+}
+
+impl std::error::Error for DaemonLogTailError {}
+
 pub(crate) fn error_with_log_tail(
     reason: impl std::fmt::Display,
     log_path: &Path,
@@ -364,8 +387,25 @@ pub(crate) fn error_with_log_tail(
     if tail.trim().is_empty() {
         anyhow::anyhow!("{reason}")
     } else {
-        anyhow::anyhow!("{reason}\n--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{tail}")
+        anyhow::Error::new(DaemonLogTailError {
+            reason: reason.to_string(),
+            tail,
+        })
     }
+}
+
+/// The error chain as `{error:#}` would print it, with every embedded
+/// `daemon.log` tail reduced to its reason. For logging into `daemon.log`
+/// itself, where the tail lines are already present.
+pub(crate) fn error_without_log_tail(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(|cause| match cause.downcast_ref::<DaemonLogTailError>() {
+            Some(tailed) => tailed.reason.clone(),
+            None => cause.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 pub(crate) fn report_to_error(report: SpawnReport, log_path: &Path) -> anyhow::Error {
@@ -389,9 +429,7 @@ fn attach_log_tail(error: anyhow::Error, log_path: &Path) -> anyhow::Error {
     if tail.trim().is_empty() {
         error
     } else {
-        error.context(format!(
-            "{reason}\n--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{tail}"
-        ))
+        error.context(DaemonLogTailError { reason, tail })
     }
 }
 

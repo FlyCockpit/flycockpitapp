@@ -768,9 +768,10 @@ impl DaemonClient {
         }
     }
 
-    /// Apply the one Rust-only onboarding secure intent through the dedicated
-    /// zeroizing local channel. The passphrase never enters the ordinary
-    /// request queue, serde, logs, or a clonable client command.
+    /// Ask a locked owner whose ready construction failed to start it again.
+    /// The daemon owns the construction and answers at once with the current
+    /// snapshot; readiness is observed through the locked hello's
+    /// `ready_construction` phase. Valid only against a locked owner.
     pub async fn retry_onboarding_ready_construction(
         &self,
     ) -> Result<std::result::Result<proto::OnboardingBootstrapSnapshot, ErrorPayload>> {
@@ -791,6 +792,10 @@ impl DaemonClient {
         }
     }
 
+    /// Apply the one Rust-only onboarding secure intent through the dedicated
+    /// zeroizing local channel. The passphrase never enters the ordinary
+    /// request queue, serde, logs, or a clonable client command. `Applied`
+    /// means the choice committed; ready services follow asynchronously.
     pub async fn apply_onboarding_secure_intent(
         &self,
         endpoint: &ClientEndpoint,

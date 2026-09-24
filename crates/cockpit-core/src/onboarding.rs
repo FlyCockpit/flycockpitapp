@@ -176,6 +176,42 @@ impl OnboardingAuthority {
         Ok((snapshot, receipt))
     }
 
+    /// Idempotent replay of an already committed secure-store intent. Once
+    /// the vault authority exists a fresh materialization is impossible, but
+    /// the same submission (same run, attempt, and client operation id) may
+    /// legitimately arrive again after its response was lost. It resolves to
+    /// the committed receipt and the current snapshot instead of an opaque
+    /// rejection. Anything else (another operation id, an uncommitted
+    /// receipt) returns `None` and the caller keeps its fail-closed denial.
+    pub async fn committed_secure_intent_replay(
+        &self,
+        request: &ApplyOnboardingSecureIntent,
+        host_capabilities: HostCapabilitySnapshot,
+    ) -> Result<Option<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)>> {
+        if request.client_operation_id.is_empty() {
+            return Ok(None);
+        }
+        let Some(row) = self
+            .db
+            .onboarding_receipt(
+                request.run_id,
+                request.attempt_id,
+                request.client_operation_id.clone(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let committed = receipt(row);
+        if committed.status != OnboardingReceiptStatus::Committed {
+            return Ok(None);
+        }
+        let Some(snapshot) = self.snapshot(host_capabilities).await? else {
+            return Ok(None);
+        };
+        Ok(Some((snapshot, committed)))
+    }
+
     /// Apply an intent through the only secret-bearing onboarding boundary.
     ///
     /// The durable record is written before the callback runs, but the

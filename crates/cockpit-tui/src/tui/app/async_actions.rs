@@ -1315,15 +1315,15 @@ impl App {
                     }
                     self.apply_onboarding_bootstrap_snapshot(snapshot);
                 }
+                // A recovery refresh follows the failure that triggered it;
+                // its generic "unavailable" must not hide that cause.
                 Err(error) => {
-                    self.show_toast(
-                        format!("Onboarding authority unavailable: {error}"),
-                        crate::tui::app::ToastKind::Error,
-                    );
+                    self.show_followup_error_toast(format!(
+                        "Onboarding authority unavailable: {error}"
+                    ));
                 }
-                Ok(_) => self.show_toast(
+                Ok(_) => self.show_followup_error_toast(
                     "Onboarding authority returned an invalid projection",
-                    crate::tui::app::ToastKind::Error,
                 ),
             },
             // Settled host-capability poll for the probing secure-store
@@ -1392,6 +1392,10 @@ impl App {
                 let pending_request_id = self
                     .pending_startup_onboarding_operations
                     .remove(&result.id);
+                if label == "onboarding.secure_intent" {
+                    // The one in-flight submission settled (either way).
+                    self.onboarding_secure_intent_progress = None;
+                }
                 match result.payload {
                     Ok(AsyncActionPayload::StartupOnboardingTransition(completion)) => {
                         let verdict = evaluate_onboarding_transition_correlation(

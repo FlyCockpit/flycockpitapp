@@ -109,15 +109,15 @@ pub use host_capabilities::{
 pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use onboarding::{
     ApplyOnboardingProfile, ApplyOnboardingSecureIntent, ApplyOnboardingTransition,
-    BeginOrReopenOnboarding, LockedBootstrapHello, MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES,
-    OnboardingBootstrapEvent, OnboardingBootstrapSnapshot, OnboardingBootstrapState,
-    OnboardingReceiptQuery, OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage,
-    OnboardingStageSettlement, OnboardingTransitionKind, OnboardingTransitionReceipt,
-    OnboardingTransitionResult, SecurePlacementFailureReason, SensitiveOnboardingIntentError,
-    SensitiveOnboardingIntentFrame, SensitiveOnboardingIntentResponse,
-    SensitiveOnboardingPassphrase, decode_sensitive_onboarding_intent,
-    decode_sensitive_onboarding_response, encode_sensitive_onboarding_intent,
-    encode_sensitive_onboarding_response,
+    BeginOrReopenOnboarding, LockedBootstrapHello, LockedReadyConstruction,
+    MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES, OnboardingBootstrapEvent,
+    OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingReceiptQuery,
+    OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage, OnboardingStageSettlement,
+    OnboardingTransitionKind, OnboardingTransitionReceipt, OnboardingTransitionResult,
+    SecurePlacementFailureReason, SensitiveOnboardingIntentError, SensitiveOnboardingIntentFrame,
+    SensitiveOnboardingIntentResponse, SensitiveOnboardingPassphrase,
+    decode_sensitive_onboarding_intent, decode_sensitive_onboarding_response,
+    encode_sensitive_onboarding_intent, encode_sensitive_onboarding_response,
 };
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,

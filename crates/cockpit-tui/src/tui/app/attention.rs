@@ -15,6 +15,27 @@ impl App {
         });
     }
 
+    /// Error toast for a follow-up failure (a recovery refresh, a
+    /// background re-read) that must not replace a still-visible error that
+    /// states the cause more specifically, e.g. the transition failure that
+    /// triggered the refresh. The suppressed text is still logged.
+    pub(super) fn show_followup_error_toast(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        let now = Instant::now();
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| matches!(toast.kind, ToastKind::Error) && toast.expires_at > now)
+        {
+            tracing::warn!(
+                followup = %text,
+                "follow-up error kept behind a more specific visible error"
+            );
+            return;
+        }
+        self.show_toast(text, ToastKind::Error);
+    }
+
     /// Spawn/boot failures stay on the status line until the user can act.
     /// Unlike [`Self::show_toast`], this does not expire on a timer.
     pub(super) fn show_blocking_toast(&mut self, text: impl Into<String>, kind: ToastKind) {

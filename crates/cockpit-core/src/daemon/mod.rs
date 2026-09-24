@@ -2973,6 +2973,14 @@ async fn run_foreground_inner_with_boot_db_impl(
     }
     timer.phase("global_config_dir");
     let supervised_worker = supervisor::is_worker_process();
+    if supervised_worker {
+        // Each worker generation starts its own `daemon.log` run: a
+        // readiness failure's tail then shows only this worker's lines,
+        // never an earlier generation's failure (with its own tail) that
+        // the supervisor already logged.
+        daemon_log::set_process_role(daemon_log::DaemonLogRole::Worker);
+        daemon_log::write_run_marker(std::io::stderr(), daemon_log::DaemonLogRole::Worker);
+    }
     let mut inherited_listeners = supervisor::take_worker_listeners(&paths)?;
     // A staged rolling successor proves only its inherited process identity on
     // fd 4.  In particular, it must not open the tenant database before fd 6:
@@ -3126,9 +3134,14 @@ async fn run_foreground_inner_with_boot_db_impl(
         None => server::boot(paths.clone(), terminal_factory).await?,
     };
     let mut published_listeners = None;
+    // A context published by the locked bootstrap's daemon-owned ready
+    // construction already ran pre-publication recovery inside that
+    // construction (while the locked owner kept answering hellos).
+    let mut recovered_by_construction = false;
     let ctx = match services {
         server::BootServices::Ready(ready) => std::sync::Arc::new(ready.context),
         server::BootServices::Locked(locked) => {
+            let locked = std::sync::Arc::new(locked);
             // Locked bootstrap is itself a fully booted, authenticated local
             // service. Publish only after DB/non-secret construction, then
             // keep ordinary recovery and dispatch unreachable until the
@@ -3163,17 +3176,31 @@ async fn run_foreground_inner_with_boot_db_impl(
                 supervisor::report_worker_ready()?;
                 supervisor::wait_for_worker_promotion()?;
             }
+            // A shutdown signal never cancels the locked run loop directly:
+            // that would drop an in-flight ready construction mid-way (after
+            // the vault committed) and leave the installation needing a
+            // retry. The first signal is an acknowledged locked stop, which
+            // waits for construction to settle; only a repeated signal forces
+            // an immediate exit.
+            let force_exit = std::sync::Arc::new(tokio::sync::Notify::new());
+            // Register the signal streams before spawning, so no signal can
+            // arrive between the spawn and the forwarder's first poll.
+            let signals = BootstrapShutdownSignals::new();
+            let mut signal_forwarder = ForegroundTask::new(tokio::spawn(
+                forward_locked_bootstrap_signals(locked.clone(), force_exit.clone(), signals),
+            ));
             let locked_outcome = tokio::select! {
                 result = server::run_locked_until_ready(
-                    std::sync::Arc::new(locked),
+                    locked.clone(),
                     listener,
                     reveal_listener,
-                ) => result?,
-                () = wait_for_bootstrap_shutdown_signal() => {
-                    anyhow::bail!("daemon bootstrap interrupted by shutdown signal")
-                }
+                ) => result,
+                () = force_exit.notified() => Err(anyhow::anyhow!(
+                    "daemon bootstrap force-stopped by a repeated shutdown signal"
+                )),
             };
-            let (ready, listener, reveal_listener) = match locked_outcome {
+            signal_forwarder.abort_and_join().await;
+            let (ready, listener, reveal_listener) = match locked_outcome? {
                 server::LockedRunOutcome::Ready(ready, listener, reveal_listener) => {
                     (ready, listener, reveal_listener)
                 }
@@ -3187,7 +3214,8 @@ async fn run_foreground_inner_with_boot_db_impl(
                 }
             };
             published_listeners = Some((listener, reveal_listener));
-            std::sync::Arc::new(ready.context)
+            recovered_by_construction = true;
+            ready
         }
     };
     boot_dbg!("after_ctx_boot");
@@ -3195,7 +3223,9 @@ async fn run_foreground_inner_with_boot_db_impl(
     // socket nor its reveal sibling may be observable while durable authority
     // is still being reconciled.
     boot_dbg!("before_recover");
-    server::recover_before_socket_publish(&ctx).await?;
+    if !recovered_by_construction {
+        server::recover_before_socket_publish(&ctx).await?;
+    }
     timer.phase("boot");
     boot_dbg!("after_recover");
 
@@ -3659,21 +3689,86 @@ async fn prepare_worker_handover(
 
 /// Locked bootstrap exists before `DaemonContext` and therefore before its
 /// shutdown actor. Still honor the platform shutdown signal while waiting for
-/// vault intent so a first-run daemon can never become an unkillable owner.
-async fn wait_for_bootstrap_shutdown_signal() {
+/// vault intent so a first-run daemon can never become an unkillable owner:
+/// the first SIGINT/SIGTERM (or Ctrl-C/console-close) is an acknowledged
+/// locked stop that lets an in-flight ready construction settle first; a
+/// repeated signal requests an immediate forced exit.
+#[cfg(any(unix, windows))]
+async fn forward_locked_bootstrap_signals(
+    locked: std::sync::Arc<server::LockedServices>,
+    force_exit: std::sync::Arc<tokio::sync::Notify>,
+    mut signals: BootstrapShutdownSignals,
+) {
+    if !signals.recv().await {
+        return;
+    }
+    tracing::info!(
+        "shutdown signal during locked bootstrap; stopping once any in-flight ready construction settles"
+    );
+    locked.request_locked_stop();
+    if !signals.recv().await {
+        return;
+    }
+    tracing::warn!("repeated shutdown signal during locked bootstrap; forcing exit");
+    force_exit.notify_one();
+}
+
+/// SIGINT/SIGTERM (Ctrl-C/console-close on Windows) streams registered once,
+/// so a repeated signal is never lost between two waits.
+#[cfg(any(unix, windows))]
+struct BootstrapShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut int = signal(SignalKind::interrupt()).ok();
-        let mut term = signal(SignalKind::terminate()).ok();
-        tokio::select! {
-            _ = async { if let Some(signal) = int.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
-            _ = async { if let Some(signal) = term.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+}
+
+#[cfg(any(unix, windows))]
+impl BootstrapShutdownSignals {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                interrupt: signal(SignalKind::interrupt()).ok(),
+                terminate: signal(SignalKind::terminate()).ok(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                ctrl_c: tokio::signal::windows::ctrl_c().ok(),
+            }
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    /// Wait for the next shutdown signal. `false` means no signal source is
+    /// available, so no signal can ever arrive.
+    async fn recv(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            let Self {
+                interrupt,
+                terminate,
+            } = self;
+            if interrupt.is_none() && terminate.is_none() {
+                return false;
+            }
+            tokio::select! {
+                _ = async { if let Some(signal) = interrupt.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(signal) = terminate.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+            }
+            true
+        }
+        #[cfg(windows)]
+        {
+            match self.ctrl_c.as_mut() {
+                Some(ctrl_c) => ctrl_c.recv().await.is_some(),
+                None => false,
+            }
+        }
     }
 }
 

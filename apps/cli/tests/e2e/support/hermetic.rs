@@ -655,7 +655,10 @@ impl PtyObserver {
     /// nested program's output can never be hidden behind a stale frame), and
     /// after output ended so post-exit text is visible.
     fn settled_screen(&self) -> &vt100::Screen {
+        // A synchronized frame that is still open is never settled, however
+        // long it stalls: its end marker is the only proof it is complete.
         let unframed_settled = self.handed_off
+            && !self.frames.in_sync
             && self
                 .unframed_since_boundary
                 .is_some_and(|since| since.elapsed() >= UNFRAMED_QUIET);
@@ -2180,6 +2183,26 @@ mod frame_observer_tests {
         std::thread::sleep(UNFRAMED_QUIET + Duration::from_millis(50));
         assert!(visible(&observer).contains("old frame"));
         assert!(!visible(&observer).contains("half painted"));
+    }
+
+    /// After a hand-off (an editor round-trip), a synchronized frame that
+    /// stalls past the quiet window is still never read half-painted: the
+    /// fallback applies only to output outside an open synchronized frame.
+    #[test]
+    fn a_stalled_synchronized_frame_stays_hidden_after_a_hand_off() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[?2026h\x1b[2J\x1b[1;1Htui frame\x1b[?2026l");
+        // Editor round-trip: leave, editor output, TUI resumes and redraws.
+        observer.feed(b"\x1b[?1049leditor text\x1b[?1049h\x1b[2J");
+        observer.feed(b"\x1b[?2026h\x1b[1;1Hresumed frame\x1b[?2026l");
+        assert!(visible(&observer).contains("resumed frame"));
+        // A later frame stalls mid-draw for longer than the quiet window.
+        observer.feed(b"\x1b[?2026h\x1b[1;1Hhalf painted");
+        std::thread::sleep(UNFRAMED_QUIET + Duration::from_millis(50));
+        assert!(visible(&observer).contains("resumed frame"));
+        assert!(!visible(&observer).contains("half painted"));
+        observer.feed(b"\x1b[?2026l");
+        assert!(visible(&observer).contains("half painted"));
     }
 
     /// A frame split across reads stays invisible while its remainder is

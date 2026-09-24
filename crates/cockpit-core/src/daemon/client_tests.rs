@@ -563,13 +563,13 @@ async fn departing_owner_wait_without_a_receipt_waits_for_the_lifetime_lock() {
     .expect("once the lifetime lock is free the resolver rediscovers");
 }
 
-/// With a kernel handle pinned to the owner's verified process, its exit
-/// already proves the lifetime lock was released, so the wait does not probe
-/// the lock (a successful try-lock would briefly contend with a successor
-/// that is acquiring it right now). Here a successor holds the lock without
-/// having published yet; the wait still returns and rediscovery decides.
+/// A pinned exit alone does not end the wait: a successor started outside
+/// start.lock may already hold the lifetime lock without having published
+/// its receipt, and rediscovering then would spawn a contender that fails
+/// Busy. The wait keeps going while the lock is held and nothing new is
+/// published, and returns once the successor publishes.
 #[tokio::test(flavor = "current_thread")]
-async fn departing_owner_wait_does_not_probe_the_lock_after_a_pinned_exit() {
+async fn departing_owner_wait_holds_while_an_unpublished_successor_owns_the_lock() {
     let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let paths = isolated_canonical_paths(&env).await;
     let departing = publish_verified_test_owner(&paths);
@@ -584,11 +584,29 @@ async fn departing_owner_wait_does_not_probe_the_lock_after_a_pinned_exit() {
     let successor_lifetime =
         cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
             .expect("a starting successor holds the lifetime lock");
+
+    let mut budget = DepartingOwnerBudget {
+        deadline: Some(tokio::time::Instant::now() + Duration::from_millis(300)),
+        ..DepartingOwnerBudget::default()
+    };
+    let error = await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect_err(
+            "an exited owner with its lock held by an unpublished successor is not settled",
+        );
+    assert_eq!(error.to_string(), "attach closed");
+
+    // Once the successor publishes its receipt the wait ends and
+    // rediscovery attaches to it (or waits for its endpoint).
+    let owner = DiscoveredOwner::capture(&paths);
+    assert!(owner.receipt.is_none(), "nothing is published yet");
+    let successor = publish_verified_test_owner(&paths);
     let mut budget = DepartingOwnerBudget::default();
     await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
         .await
-        .expect("a pinned exit is enough; the lock is not probed");
+        .expect("a published successor ends the wait");
     drop(successor_lifetime);
+    stop_fixture_owner(successor);
 }
 
 /// A one-shot exit event (kqueue `NOTE_EXIT` is delivered once) observed

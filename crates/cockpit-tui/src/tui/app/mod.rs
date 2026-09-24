@@ -1004,13 +1004,65 @@ mod primary_paste_tests;
 #[cfg(test)]
 mod selection_copy_state_tests;
 
+/// One synchronized-update frame (DEC private mode 2026) on `out`. The end
+/// marker is sent by [`SynchronizedFrame::finish`] on the normal path and,
+/// best-effort, by `Drop` on every other exit — an early return or a panic
+/// unwinding through the draw — so the terminal is never left holding back
+/// output in synchronized mode.
+struct SynchronizedFrame<W: Write> {
+    out: W,
+    ended: bool,
+}
+
+impl<W: Write> SynchronizedFrame<W> {
+    fn begin(mut out: W) -> std::io::Result<Self> {
+        crossterm::queue!(out, crossterm::terminal::BeginSynchronizedUpdate)?;
+        Ok(Self { out, ended: false })
+    }
+
+    /// End the frame and flush it, reporting a write failure.
+    fn finish(mut self) -> std::io::Result<()> {
+        self.ended = true;
+        crossterm::execute!(self.out, crossterm::terminal::EndSynchronizedUpdate)
+    }
+}
+
+impl<W: Write> Drop for SynchronizedFrame<W> {
+    fn drop(&mut self) {
+        if !self.ended {
+            let _ = crossterm::execute!(self.out, crossterm::terminal::EndSynchronizedUpdate);
+        }
+    }
+}
+
+/// Chain a panic hook in front of ratatui's restore hook that first ends any
+/// synchronized update, so a panic mid-frame never leaves the terminal
+/// holding back the restored screen and the panic message. Installed once
+/// per process; the unwinding frame guard's `Drop` sends the same marker.
+fn install_synchronized_update_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = crossterm::execute!(stdout(), crossterm::terminal::EndSynchronizedUpdate);
+            previous(info);
+        }));
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalCleanupCommand {
+    /// Always first: a frame interrupted mid-draw (a panic unwinding past
+    /// its guard, or a hook running before it) must not leave the terminal
+    /// in synchronized-update mode while it is restored. Harmless outside one.
+    EndSynchronizedUpdate,
     DisableMouseCapture,
     DisableBracketedPaste,
     PopKeyboardEnhancementFlags,
     RestoreDefaultCursorShape,
-    RestoreTerminalTitle { pushed: bool },
+    RestoreTerminalTitle {
+        pushed: bool,
+    },
     RestoreRatatui,
 }
 
@@ -1065,6 +1117,9 @@ struct CrosstermTerminalModeSink;
 impl TerminalModeSink for CrosstermTerminalModeSink {
     fn apply(&mut self, command: TerminalCleanupCommand) -> Result<()> {
         match command {
+            TerminalCleanupCommand::EndSynchronizedUpdate => {
+                crossterm::execute!(stdout(), crossterm::terminal::EndSynchronizedUpdate)?;
+            }
             TerminalCleanupCommand::DisableMouseCapture => {
                 disable_mouse_capture_with_motion()?;
             }
@@ -1146,6 +1201,10 @@ impl<S: TerminalModeSink> TerminalModeGuard<S> {
         }
         self.restored = true;
         let mut first_error = None;
+        self.apply_cleanup_command(
+            TerminalCleanupCommand::EndSynchronizedUpdate,
+            &mut first_error,
+        );
         if self.mouse_capture_enabled {
             self.apply_cleanup_command(
                 TerminalCleanupCommand::DisableMouseCapture,
@@ -4427,6 +4486,7 @@ impl App {
         // the session for the clean full-screen experience; on exit
         // we leave alt screen and print the tail to stdout.
         let mut terminal = ratatui::try_init()?;
+        install_synchronized_update_panic_hook();
         let mut terminal_mode_guard = TerminalModeGuard::with_sink_and_title_state(
             CrosstermTerminalModeSink,
             self.terminal_title.pushed_for_cleanup.clone(),
@@ -4546,9 +4606,9 @@ impl App {
     /// mode. The end marker is always attempted, even when the draw fails, so
     /// the terminal is never left holding back output.
     fn draw_synchronized_frame(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        crossterm::queue!(stdout(), crossterm::terminal::BeginSynchronizedUpdate)?;
+        let frame = SynchronizedFrame::begin(stdout())?;
         let drawn = self.draw_frame_contents(terminal);
-        let ended = crossterm::execute!(stdout(), crossterm::terminal::EndSynchronizedUpdate);
+        let ended = frame.finish();
         drawn?;
         ended?;
         Ok(())

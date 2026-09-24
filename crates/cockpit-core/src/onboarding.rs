@@ -449,11 +449,11 @@ impl OnboardingAuthority {
     }
 
     pub async fn mark_ready_construction_recovered(&self) -> Result<()> {
-        let current = self
-            .db
-            .onboarding_snapshot()
-            .await?
-            .context("no onboarding run exists")?;
+        // No onboarding run means no checkpoint to heal (e.g. an installation
+        // provisioned without the interactive first run).
+        let Some(current) = self.db.onboarding_snapshot().await? else {
+            return Ok(());
+        };
         if current.bootstrap_state != DbBootstrapState::Failed {
             return Ok(());
         }

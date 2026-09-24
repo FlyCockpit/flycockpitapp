@@ -746,6 +746,12 @@ async fn stored_ready_handoff_rolls_back_when_notified_lifecycle_consumer_is_can
     .expect("cancelled handoff must release ready resources and locked services");
 }
 
+/// Budget for a full ready construction in the served-owner tests. Generous:
+/// construction builds the whole ready graph and runs under a loaded shared
+/// test host.
+#[cfg(unix)]
+const READY_CONSTRUCTION_TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Test-process peer identity, as the kernel reports it for a socket this
 /// process connects.
 #[cfg(unix)]
@@ -886,7 +892,7 @@ async fn abandoned_secure_intent_response_never_discards_ready_construction() {
             .await
             .is_none()
     );
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), served.run)
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
         .await
         .expect("ready construction must complete without its requesting client")
         .expect("locked run loop joined");
@@ -974,7 +980,7 @@ async fn locked_owner_answers_hellos_with_constructing_phase_during_construction
     assert!(!served.run.is_finished());
 
     release.send(()).expect("release construction");
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), served.run)
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
         .await
         .expect("construction completes after release")
         .expect("locked run loop joined");
@@ -1010,7 +1016,7 @@ async fn stop_during_ready_construction_settles_before_exit() {
         "a stop must not cancel an in-flight ready construction"
     );
     release.send(()).expect("release construction");
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), served.run)
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
         .await
         .expect("stop completes once construction settles")
         .expect("locked run loop joined");
@@ -1091,7 +1097,7 @@ async fn ready_construction_retry_is_idempotent_and_daemon_owned() {
         super::ReadyConstructionStart::AlreadyInProgress
     );
     release.send(()).expect("release construction");
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), served.run)
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
         .await
         .expect("retried construction completes")
         .expect("locked run loop joined");

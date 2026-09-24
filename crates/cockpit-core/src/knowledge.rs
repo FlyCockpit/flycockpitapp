@@ -496,6 +496,20 @@ struct LocalKb {
     immutable_snapshot: bool,
 }
 
+/// Where an index build's sidecars live, decided from how they were placed,
+/// never from a live pathname lookup that a rename could make fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidecarPlacement {
+    /// Beside the source, in the directory the process fence retained
+    /// ([`KbSidecars::in_root`]). They must be kept out of that tree's Git
+    /// worktree before either is opened, and failing to do so fails the build.
+    InSourceTree,
+    /// In Flycockpit's private cache, outside every source tree (assistant
+    /// snapshots with synthetic `assistant://` roots, and workspace KBs whose
+    /// derived index is cached privately). There is nothing to ignore.
+    PrivateCache,
+}
+
 #[derive(Debug, Clone)]
 struct KbSidecars {
     embeddings: PathBuf,
@@ -752,6 +766,48 @@ impl SidecarProcessLock {
         })
     }
 
+    /// The root for keeping in-tree index sidecars out of Git.
+    ///
+    /// That step needs no pathname for any filesystem operation: Git starts
+    /// inside the retained object (`fchdir`), and the exclusion file is
+    /// opened relative to it (or at the absolute path Git reports). So on a
+    /// Unix without descriptor read-back, where [`Self::mutation_root`] fails
+    /// closed, the fence's selected spelling serves as the root's label for
+    /// diagnostics and the Git launch gate, and indexing keeps working. Where
+    /// read-back exists, this is exactly the verified mutation root, and any
+    /// other read-back failure (an unlinked root) still fails closed.
+    #[cfg(unix)]
+    fn gitignore_root(&self) -> Result<KnowledgeMutationRoot> {
+        use std::os::fd::AsRawFd as _;
+
+        let path = match cockpit_host::private_fs::held_fd::verified_directory_path(
+            self.directory.as_raw_fd(),
+        ) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => self.root.clone(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "reading back the knowledge base root retained for {}",
+                        self.root.display()
+                    )
+                });
+            }
+        };
+        Ok(KnowledgeMutationRoot {
+            path,
+            directory: self
+                .directory
+                .try_clone()
+                .context("duplicating the retained knowledge base root")?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn gitignore_root(&self) -> Result<KnowledgeMutationRoot> {
+        self.mutation_root()
+    }
+
     /// Windows keeps a no-delete lease on the selected spelling for as long
     /// as this lock lives, so the transaction root is that leased pathname.
     #[cfg(windows)]
@@ -936,36 +992,53 @@ impl KnowledgeMutationRoot {
     /// inside the retained root, so a relative report names a descendant of
     /// that object; resolving it by `openat` keeps it there. An absolute
     /// report names a repository outside the root (a `gitdir:` link) and is
-    /// opened as reported, exactly as Git itself does.
+    /// opened as reported, exactly as Git itself does (`openat` ignores the
+    /// directory descriptor for an absolute path).
+    ///
+    /// Always non-blocking, so a FIFO planted at either kind of name cannot
+    /// stall the transaction while the process fence is held; callers check
+    /// the file type before reading.
     fn open_git_reported(&self, reported: &Path) -> io::Result<fs::File> {
-        if reported.is_absolute() {
-            return fs::File::open(reported);
-        }
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd as _;
-            use std::os::unix::ffi::OsStrExt as _;
-            let relative = std::ffi::CString::new(reported.as_os_str().as_bytes())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Git path has NUL"))?;
-            // Non-blocking so a FIFO planted at the name cannot stall the
-            // transaction; callers check the file type before reading.
             cockpit_host::private_fs::held_fd::openat(
                 self.directory.as_raw_fd(),
-                &relative,
+                &git_reported_cstring(reported)?,
                 libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         }
         #[cfg(not(unix))]
         {
+            if reported.is_absolute() {
+                return fs::File::open(reported);
+            }
             fs::File::open(self.path.join(reported))
         }
     }
 
     /// Whether a Git-reported path names a regular file (symlinks followed,
-    /// as Git follows them).
+    /// as Git follows them). A `stat`, never an open: a hook Git can execute
+    /// need not be readable (mode `0111`), and a FIFO is simply not a file.
     fn git_reported_is_file(&self, reported: &Path) -> io::Result<bool> {
-        match self.open_git_reported(reported) {
-            Ok(file) => Ok(file.metadata()?.is_file()),
+        #[cfg(unix)]
+        let metadata = {
+            use std::os::fd::AsRawFd as _;
+            cockpit_host::private_fs::held_fd::fstatat_follow(
+                self.directory.as_raw_fd(),
+                &git_reported_cstring(reported)?,
+            )
+            .map(|stat| (stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+        };
+        #[cfg(not(unix))]
+        let metadata = if reported.is_absolute() {
+            fs::metadata(reported)
+        } else {
+            fs::metadata(self.path.join(reported))
+        }
+        .map(|metadata| metadata.is_file());
+        match metadata {
+            Ok(is_file) => Ok(is_file),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
@@ -992,23 +1065,27 @@ impl KnowledgeMutationRoot {
 
     /// Append to (creating if absent) a Git-reported path.
     fn append_git_reported(&self, reported: &Path, contents: &[u8]) -> Result<()> {
+        // Non-blocking and type-checked before writing, for the same reason
+        // as `open_git_reported`; relative reports stay on the retained root.
         #[cfg(unix)]
-        let mut file = if reported.is_absolute() {
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(reported)?
-        } else {
+        let mut file = {
             use std::os::fd::AsRawFd as _;
-            use std::os::unix::ffi::OsStrExt as _;
-            let relative = std::ffi::CString::new(reported.as_os_str().as_bytes())
-                .context("Git path has NUL")?;
-            cockpit_host::private_fs::held_fd::openat_mode(
+            let file = cockpit_host::private_fs::held_fd::openat_mode(
                 self.directory.as_raw_fd(),
-                &relative,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
+                &git_reported_cstring(reported)?,
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_APPEND
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
                 0o666,
-            )?
+            )?;
+            ensure!(
+                file.metadata()?.is_file(),
+                "{} is not a regular file",
+                reported.display()
+            );
+            file
         };
         #[cfg(not(unix))]
         let mut file =
@@ -1054,6 +1131,14 @@ impl KnowledgeMutationRoot {
             Ok(fs::canonicalize(&path)?)
         }
     }
+}
+
+/// A Git-reported path as a C string for descriptor-relative calls.
+#[cfg(unix)]
+fn git_reported_cstring(reported: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(reported.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Git path has NUL"))
 }
 
 /// A validated root-level file name as a C string.
@@ -1150,22 +1235,16 @@ impl SidecarProcessLock {
     }
 }
 
-fn ensure_sidecars_gitignored(root: &KnowledgeMutationRoot, sidecars: &KbSidecars) -> Result<()> {
-    // Sidecars were canonicalized for lock identity. Resolve the KB root the
-    // same way before deciding which artifacts are inside a Git worktree.
-    // Assistant snapshot roots are synthetic (`assistant://...`) and simply
-    // remain outside their private cache sidecars.
-    let sidecar_root = fs::canonicalize(root.path()).unwrap_or_else(|_| root.path().to_path_buf());
-    let sidecar_paths: Vec<_> = [&sidecars.embeddings, &sidecars.index]
-        .into_iter()
-        .filter_map(|path| path.strip_prefix(&sidecar_root).ok())
-        .collect();
-    // Assistant sidecars deliberately live in Flycockpit's private cache, not
-    // in the installed assistant bundle. There is nothing in that source tree
-    // to ignore in this case.
-    if sidecar_paths.is_empty() {
-        return Ok(());
-    }
+/// Keep a knowledge base's own machine state out of its Git worktree.
+///
+/// Only for sidecars that live in the retained source root
+/// ([`KbSidecars::in_root`]); sidecars in Flycockpit's private cache are
+/// outside every source tree and never call this. The rules are derived from
+/// the fixed root-relative sidecar names, not from comparing pathnames, so a
+/// root renamed after its fence was taken cannot make this a silent no-op:
+/// every step is performed on the retained object or fails closed.
+fn ensure_sidecars_gitignored(root: &KnowledgeMutationRoot) -> Result<()> {
+    let sidecar_paths = [Path::new(EMBEDDINGS_FILE), Path::new(INDEX_FILE)];
     let prefix_probe = knowledge_git(root, &["rev-parse", "--show-prefix"])
         .context("running Git to protect knowledge sidecars")?;
     let Some(prefix) = git_worktree_prefix(root.path(), prefix_probe)? else {
@@ -1678,15 +1757,7 @@ fn prepare_knowledge_git(
         }
     }
 
-    let sidecars = match KbSidecars::in_root(root.path()).canonicalized() {
-        Ok(sidecars) => sidecars,
-        Err(error) => {
-            return PreparedKnowledgeGit::Deferred(format!(
-                "resolving knowledge machine-state paths failed: {error}"
-            ));
-        }
-    };
-    if let Err(error) = ensure_sidecars_gitignored(root, &sidecars) {
+    if let Err(error) = ensure_sidecars_gitignored(root) {
         return PreparedKnowledgeGit::Deferred(format!(
             "protecting knowledge machine state from Git failed: {error}"
         ));
@@ -2807,9 +2878,17 @@ impl KbProvider for LocalKb {
             .clone()
             .context("local knowledge search requires a retained knowledge snapshot")?;
         let process_lock = acquire_process_sidecar_lock(&sidecars).await?;
+        // Decided from the registry's placement, not a live lookup: sidecars
+        // beside the source root must be Git-excluded or the search fails.
+        let placement = if self.sidecars.root() == self.root {
+            SidecarPlacement::InSourceTree
+        } else {
+            SidecarPlacement::PrivateCache
+        };
         let (index, _) = KnowledgeIndex::open_snapshot_locked(
             snapshot.clone(),
             sidecars,
+            placement,
             &process_lock,
             embedder,
             Some(query_vector.len()),
@@ -3342,8 +3421,15 @@ impl KnowledgeIndex {
         // A replacement of the root can therefore only be observed by the
         // next rebuild; it cannot receive this rebuild's old projection.
         let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await?;
-        Self::open_snapshot_locked(bundle, sidecars, &process_lock, embedder, query_dimensions)
-            .await
+        Self::open_snapshot_locked(
+            bundle,
+            sidecars,
+            SidecarPlacement::InSourceTree,
+            &process_lock,
+            embedder,
+            query_dimensions,
+        )
+        .await
     }
 
     /// Caller must hold the per-KB sidecar lock and the process fence that was
@@ -3354,6 +3440,7 @@ impl KnowledgeIndex {
     async fn open_snapshot_locked(
         bundle: KnowledgeBundle,
         sidecars: KbSidecars,
+        placement: SidecarPlacement,
         process_lock: &SidecarProcessLock,
         embedder: Arc<dyn Embedder>,
         query_dimensions: Option<usize>,
@@ -3364,12 +3451,11 @@ impl KnowledgeIndex {
         // different daemon data directories serialize their paid work against
         // the same external KB. It also serializes the Git exclusion update
         // before either sidecar can be opened.
-        // Assistant snapshot roots are synthetic (`assistant://...`) and keep
-        // their sidecars in Flycockpit's private cache, outside any source
-        // tree: there is nothing to ignore. Every other snapshot is rooted at
-        // the directory the process fence retained.
-        if fs::canonicalize(&bundle.root).is_ok_and(|root| root == sidecars.root()) {
-            ensure_sidecars_gitignored(&process_lock.mutation_root()?, &sidecars)?;
+        match placement {
+            SidecarPlacement::InSourceTree => {
+                ensure_sidecars_gitignored(&process_lock.gitignore_root()?)?;
+            }
+            SidecarPlacement::PrivateCache => {}
         }
         let index = open_index_connection(&sidecars.index, process_lock)?;
         ensure_index_schema(&index)?;
@@ -9825,9 +9911,8 @@ Inventory facts for warehouse operations.
         // rev-parse remains usable, but ls-files cannot establish whether a
         // generated sidecar is tracked when the repository index is corrupt.
         fs::write(tmp.path().join(".git/index"), b"not a Git index").unwrap();
-        let sidecars = KbSidecars::in_root(tmp.path()).canonicalized().unwrap();
         let (_lock, root) = held_mutation_root(tmp.path());
-        let error = ensure_sidecars_gitignored(&root, &sidecars).unwrap_err();
+        let error = ensure_sidecars_gitignored(&root).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -10882,6 +10967,103 @@ Inventory facts for warehouse operations.
             .expect("uncontended knowledge fence");
         let mutation_root = lock.mutation_root().unwrap();
         (lock, mutation_root)
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    }
+
+    /// A FIFO at a Git-reported path, relative (inside the retained root) or
+    /// absolute (a `gitdir:` repository elsewhere), is refused without
+    /// blocking while the process fence is held — for reads and appends.
+    #[cfg(unix)]
+    #[test]
+    fn git_reported_fifo_is_refused_without_blocking() {
+        let tmp = TempDir::new().unwrap();
+        let kb = tmp.path().join("kb");
+        fs::create_dir(&kb).unwrap();
+        write_bundle(&kb);
+        let outside = tmp.path().join("outside-exclude");
+        make_fifo(&outside);
+        make_fifo(&kb.join("relative-exclude"));
+        let (_lock, root) = held_mutation_root(&kb);
+        for reported in [outside.as_path(), Path::new("relative-exclude")] {
+            assert!(
+                root.read_git_reported_text(reported).is_err(),
+                "{}",
+                reported.display()
+            );
+            assert!(
+                root.append_git_reported(reported, b"rule\n").is_err(),
+                "{}",
+                reported.display()
+            );
+            assert!(!root.git_reported_is_file(reported).unwrap());
+        }
+    }
+
+    /// Hook presence is a `stat`, as Git's own is: an execute-only hook
+    /// (no read permission) is still found, relative or absolute.
+    #[cfg(unix)]
+    #[test]
+    fn git_reported_is_file_finds_an_execute_only_hook() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        write_bundle(tmp.path());
+        let hook = tmp.path().join("pre-commit");
+        fs::write(&hook, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o111)).unwrap();
+        let (_lock, root) = held_mutation_root(tmp.path());
+        assert!(root.git_reported_is_file(Path::new("pre-commit")).unwrap());
+        assert!(root.git_reported_is_file(&hook).unwrap());
+        assert!(!root.git_reported_is_file(Path::new("absent-hook")).unwrap());
+    }
+
+    /// An in-tree index keeps its sidecars out of Git even when the KB root is
+    /// renamed after its fence was taken: the exclusion is applied through
+    /// the retained object (now at its new place in the worktree), never
+    /// skipped because the snapshot's old spelling no longer resolves.
+    /// (Windows leases the root against renames for the fence's lifetime.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_tree_index_excludes_sidecars_after_the_root_is_renamed() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let kb = repo.join("kb");
+        fs::create_dir_all(&kb).unwrap();
+        write_bundle(&kb);
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sidecars = KbSidecars::in_root(&kb).canonicalized().unwrap();
+        let (bundle, process_lock) = snapshot_bundle_with_sidecar_fence(&sidecars).await.unwrap();
+        fs::rename(&kb, repo.join("moved")).unwrap();
+        // The build itself may refuse the moved root afterwards; the
+        // exclusion must have been written before any sidecar is touched.
+        let _ = KnowledgeIndex::open_snapshot_locked(
+            bundle,
+            sidecars,
+            SidecarPlacement::InSourceTree,
+            &process_lock,
+            mock_embedder(),
+            None,
+        )
+        .await;
+        let exclude = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.contains(&format!("/moved/{INDEX_FILE}\n"))
+                && exclude.contains(&format!("/moved/{EMBEDDINGS_FILE}\n")),
+            "{exclude}"
+        );
     }
 
     #[test]

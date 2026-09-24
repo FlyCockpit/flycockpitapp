@@ -332,6 +332,22 @@ pub fn fstatat_nofollow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
     Ok(unsafe { stat.assume_init() })
 }
 
+/// `fstatat(dir_fd, name, 0)` — stat a name beneath the held fd, following a
+/// final-component symlink (as `stat(2)` does). An absolute `name` ignores
+/// `dir_fd`. Never opens the entry, so it neither needs read permission nor
+/// blocks on a FIFO.
+pub fn fstatat_follow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `dir_fd` is a live directory fd, `name` outlives the call, and
+    // `stat` is a valid out-pointer.
+    let result = unsafe { libc::fstatat(dir_fd, name.as_ptr(), stat.as_mut_ptr(), 0) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstatat` returned 0, so `stat` is initialised.
+    Ok(unsafe { stat.assume_init() })
+}
+
 /// Atomic no-replace rename relative to held directory fds. Linux uses
 /// `renameat2(RENAME_NOREPLACE)`; macOS uses `renameatx_np(RENAME_EXCL)`. Both
 /// fail (`EEXIST`) rather than overwriting an existing target, so there is no
@@ -478,6 +494,12 @@ mod verified_directory_path_tests {
     use super::*;
     use std::os::fd::AsRawFd as _;
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn reads_back_the_canonical_spelling_of_a_held_directory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -489,6 +511,12 @@ mod verified_directory_path_tests {
         );
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn follows_the_held_object_across_a_rename_and_ignores_a_replacement() {
         let tmp = tempfile::tempdir().unwrap();
@@ -512,5 +540,26 @@ mod verified_directory_path_tests {
         let held = File::open(&doomed).unwrap();
         std::fs::remove_dir(&doomed).unwrap();
         assert!(verified_directory_path(held.as_raw_fd()).is_err());
+    }
+
+    /// Without a descriptor read-back the call fails closed as
+    /// `Unsupported`, which callers that can proceed on the descriptor alone
+    /// (the knowledge sidecar Git exclusion) distinguish from a failure.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    #[test]
+    fn is_unsupported_without_a_descriptor_read_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let held = File::open(tmp.path()).unwrap();
+        assert_eq!(
+            verified_directory_path(held.as_raw_fd())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 }

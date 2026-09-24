@@ -2,13 +2,17 @@
 //!
 //! The row sits between the screen header and a separating rule, so it must
 //! never read as the first item of the option list below it. It therefore
-//! uses its own glyph vocabulary, disjoint from every selection glyph the
-//! onboarding screens draw (radio `◉`/`○`, checkbox `▣`/`▢`, and the `›`/`▸`
-//! list cursors):
+//! never uses a selection glyph the onboarding screens draw (radio `◉`/`○`,
+//! checkbox `▣`/`▢`, and the `›`/`▸` list cursors):
 //!
 //! * completed step: a muted `✓`;
 //! * current step: `◆` plus its label, in the accent style;
 //! * pending step: a dim `·`.
+//!
+//! `◆` is reserved for the row: no onboarding content draws it. `✓` and `·`
+//! are deliberately *not* exclusive — `✓` keeps its universal "done" meaning
+//! and also marks verified models and a created agent in the content, and `·`
+//! is the text separator — so neither is ever the row's only state cue.
 //!
 //! The glyphs alone distinguish the three states, so the row stays legible
 //! without colour (`NO_COLOR`, monochrome terminals, colour-blind users).
@@ -171,14 +175,14 @@ mod tests {
 
     #[test]
     fn every_step_fits_its_tier_at_each_supported_terminal_width() {
-        for current in 0..STEPS.len() {
+        for (current, label) in STEPS.iter().enumerate() {
             // Full needs the wide (120-column) layout; the 80-column
             // column must still carry the current label in compact form.
             assert_eq!(progress_line(current, 86).0, ProgressTier::Full);
             for width in [76, 56, 36] {
                 let (tier, line) = progress_line(current, width);
                 assert_eq!(tier, ProgressTier::Compact, "step {current} @ {width}");
-                assert!(text(&line).contains(STEPS[current]));
+                assert!(text(&line).contains(label));
             }
         }
     }
@@ -215,9 +219,12 @@ mod tests {
     #[test]
     fn progress_glyphs_never_reuse_a_selection_glyph() {
         use crate::tui::chrome::{CHECK_OFF, CHECK_ON, RADIO_OFF, RADIO_ON};
-        // Radio/checkbox glyphs, the half-filled marker the old row used,
-        // and the list cursors the onboarding screens draw (`›` in search
-        // and the Escape menu, `▸` in agent authoring).
+        // Selection glyphs only: radio/checkbox glyphs, the half-filled
+        // marker the old row used, and the list cursors the onboarding
+        // screens draw (`›` in search and the Escape menu, `▸` in agent
+        // authoring). `✓` and `·` are intentionally shared with content
+        // (see the module docs); `◆` exclusivity is pinned by the shell's
+        // golden scan in `onboarding::tests`.
         let selection = [
             RADIO_ON.trim(),
             RADIO_OFF.trim(),

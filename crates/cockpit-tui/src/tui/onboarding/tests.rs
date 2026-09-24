@@ -1377,6 +1377,125 @@ fn progress_row_sits_between_header_and_rule_in_width_tiers() {
     }
 }
 
+/// Rows the old fixed layout gave the content: the column (terminal minus a
+/// one-row margin top and bottom) minus header+rule 3, progress 1, footer 1.
+fn old_content_rows(height: u16) -> u16 {
+    height.saturating_sub(2).saturating_sub(5)
+}
+
+#[test]
+fn chrome_collapses_decorative_rows_first_and_keeps_the_footer_at_short_heights() {
+    // (terminal height, rule kept, blank kept, content rows)
+    let cases = [
+        (24u16, true, true, 16u16),
+        (12, true, false, 5),
+        (10, true, false, 3),
+        (8, false, false, 2),
+    ];
+    for (height, rule, blank, content_rows) in cases {
+        let col = Rect::new(2, 1, 76, height - 2);
+        let rows = ShellRows::split(col);
+        assert_eq!(rows.rule.is_some(), rule, "{height} rows");
+        assert_eq!(rows.header.height, 2, "{height} rows");
+        assert_eq!(rows.progress.height, 1, "{height} rows");
+        assert_eq!(rows.footer, Rect::new(2, col.bottom() - 1, 76, 1));
+        assert_eq!(rows.content.height, content_rows, "{height} rows");
+        assert_eq!(rows.content.bottom(), rows.footer.y, "{height} rows");
+        let chrome_top = rows.rule.unwrap_or(rows.progress).bottom();
+        assert_eq!(
+            rows.content.y - chrome_top,
+            u16::from(blank),
+            "{height} rows"
+        );
+        if height < 24 {
+            assert!(
+                rows.content.height >= old_content_rows(height),
+                "{height} rows: content {} < old {}",
+                rows.content.height,
+                old_content_rows(height)
+            );
+        } else {
+            // The blank line is the one deliberate row traded at comfort.
+            assert_eq!(rows.content.height + 1, old_content_rows(height));
+        }
+    }
+    // Degenerate columns never overlap the footer or underflow.
+    for height in 0..8u16 {
+        let rows = ShellRows::split(Rect::new(0, 0, 40, height));
+        assert!(rows.content.bottom() <= rows.footer.y.max(rows.content.y));
+        assert_eq!(rows.footer.height, height.min(1));
+    }
+}
+
+#[test]
+fn short_terminals_still_show_the_footer_fields_and_all_secure_choices() {
+    for height in [24u16, 12, 10, 8] {
+        let mut shell = shell_at(OnboardingStage::SecureStore);
+        let rows = render_rows(&mut shell, 80, height);
+        let screen = rows.join("\n");
+        assert!(
+            rows[usize::from(height) - 2].contains("[ Continue ]"),
+            "{height} rows: footer missing\n{screen}"
+        );
+        if height >= 10 {
+            for choice in [
+                "Platform keyring",
+                "Passphrase-protected file",
+                "Machine-bound encrypted file",
+            ] {
+                assert!(screen.contains(choice), "{height} rows: {choice}\n{screen}");
+            }
+        }
+
+        let mut shell = shell_at(OnboardingStage::Profile);
+        shell.paste("Ada");
+        let rows = render_rows(&mut shell, 80, height);
+        let screen = rows.join("\n");
+        assert!(
+            rows[usize::from(height) - 2].contains("[ Continue ]"),
+            "{height} rows: footer missing\n{screen}"
+        );
+        if height >= 10 {
+            assert!(
+                screen.contains("Ada"),
+                "{height} rows: boxed name text\n{screen}"
+            );
+        }
+    }
+}
+
+#[test]
+fn current_step_marker_appears_only_on_the_progress_row_of_every_golden() {
+    // `◆` is reserved for the progress row: no onboarding content may draw
+    // it, so it can never read as a list glyph. Scan every checked-in
+    // onboarding golden (all screens, both sizes).
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/onboarding");
+    let mut scanned = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.ends_with(".txt") || name.ends_with(".style.txt") {
+            continue;
+        }
+        scanned += 1;
+        let dump = std::fs::read_to_string(&path).unwrap();
+        let hits: Vec<usize> = dump
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(progress::CURRENT_MARK))
+            .map(|(index, _)| index)
+            .collect();
+        if name.starts_with("welcome-") {
+            assert!(hits.is_empty(), "{name}: {hits:?}");
+        } else {
+            // Row 3: margin, title, subtitle, progress.
+            assert_eq!(hits, [3], "{name}");
+            assert_eq!(dump.matches(progress::CURRENT_MARK).count(), 1, "{name}");
+        }
+    }
+    assert!(scanned >= 80, "only {scanned} goldens scanned");
+}
+
 #[test]
 fn every_step_label_names_the_step_its_screen_title_names() {
     // One name per step: the progress label is the shortened wording of

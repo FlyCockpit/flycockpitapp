@@ -109,6 +109,68 @@ fn progress_index(stage: OnboardingStage) -> usize {
     }
 }
 
+/// The full-screen shell's row layout: header (title + subtitle), the
+/// progress row, a rule, one blank line, the content, and the help/action
+/// footer. The rule and blank line close the chrome so the progress row never
+/// reads as the first item of the content's option list.
+///
+/// The layout is height-adaptive and sliced by hand rather than handed to the
+/// constraint solver, whose tie-breaking under pressure could shrink the
+/// footer: the footer always owns the last row, and at short heights the
+/// decorative rows collapse first — the blank line, then the rule — so the
+/// content never has fewer rows than the previous fixed layout (header with
+/// its rule 3, progress 1, footer 1) gave it, except for the deliberate blank
+/// line at comfortable heights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellRows {
+    header: Rect,
+    progress: Rect,
+    rule: Option<Rect>,
+    content: Rect,
+    footer: Rect,
+}
+
+impl ShellRows {
+    /// Column height from which the blank line below the rule is kept
+    /// (a 16-row terminal).
+    const BLANK_MIN_HEIGHT: u16 = 14;
+    /// Column height from which the rule is kept (a 10-row terminal, whose
+    /// 3 content rows still hold a bordered field or three choices).
+    const RULE_MIN_HEIGHT: u16 = 8;
+
+    fn split(col: Rect) -> Self {
+        let row = |y: u16, height: u16| Rect {
+            x: col.x,
+            y,
+            width: col.width,
+            height,
+        };
+        let footer_height = col.height.min(1);
+        let footer = row(col.bottom() - footer_height, footer_height);
+        let mut y = col.y;
+        let mut take = |want: u16| {
+            let height = want.min(footer.y - y);
+            let rect = row(y, height);
+            y += height;
+            rect
+        };
+        let header = take(2);
+        let progress = take(1);
+        let rule = (col.height >= Self::RULE_MIN_HEIGHT).then(|| take(1));
+        if col.height >= Self::BLANK_MIN_HEIGHT {
+            take(1);
+        }
+        let content = take(u16::MAX);
+        Self {
+            header,
+            progress,
+            rule,
+            content,
+            footer,
+        }
+    }
+}
+
 /// Deterministic reduced-motion detection shared by the shell.
 pub(crate) fn reduced_motion_enabled() -> bool {
     reduced_motion_for(
@@ -1909,18 +1971,13 @@ impl OnboardingShell {
             chrome::render_back_button(frame, area, back_visible, back_enabled, self.back_hover);
 
         let col = ui::column(area);
-        // Header, then the progress row, then a rule and one blank line, so
-        // the progress row is visibly chrome and never reads as the first
-        // item of the content's option list.
-        let [header, progress_row, rule, _, content, footer] = Layout::vertical([
-            Constraint::Length(2), // header: title + subtitle
-            Constraint::Length(1), // progress
-            Constraint::Length(1), // rule
-            Constraint::Length(1), // breathing room
-            Constraint::Min(1),    // content
-            Constraint::Length(1), // help + action bar
-        ])
-        .areas(col);
+        let ShellRows {
+            header,
+            progress: progress_row,
+            rule,
+            content,
+            footer,
+        } = ShellRows::split(col);
 
         let title = format!(
             "{} · step {}/{}",
@@ -1940,7 +1997,9 @@ impl OnboardingShell {
         };
         ui::render_header_colored(frame, header, &title, &subtitle, title_color);
         self.render_progress(frame, progress_row);
-        ui::render_rule(frame, rule);
+        if let Some(rule) = rule {
+            ui::render_rule(frame, rule);
+        }
         self.list_area = content;
         match &mut self.screen {
             OnboardingScreen::Welcome => unreachable!("welcome returned above"),

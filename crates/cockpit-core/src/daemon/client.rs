@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
+use cockpit_client::DaemonClient;
 
 use crate::daemon::proto::{self, Request};
 
@@ -1294,12 +1294,18 @@ async fn probe_or_spawn_with_spawn_authorization(
                     {
                         return promote_ephemeral_owner(&discovered.paths, lifecycle_request).await;
                     }
+                    let observed_pid =
+                        cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
                     let attached =
                         attach_running_with_skew_check(discovered.paths.clone(), None).await;
                     match attached {
                         Ok(connected) => return Ok(connected),
-                        Err(error) if is_protocol_version_mismatch(&error) => {
-                            return Err(error);
+                        // The owner answered discovery and then closed the
+                        // attach: it is draining. Wait for it to exit, then
+                        // re-run discovery under the start lock below, which
+                        // spawns a replacement instead of stranding the caller.
+                        Err(error) if is_departing_owner_attach_error(&error) => {
+                            await_departing_owner_exit(observed_pid, error).await?;
                         }
                         Err(error) => return Err(error),
                     }
@@ -1365,13 +1371,36 @@ async fn probe_or_spawn_with_spawn_authorization(
     .await
     .context("joining daemon start-lock acquisition")??;
 
-    let after_lock = discover().await;
+    let mut after_lock = discover().await;
+    let mut departed_owner_retried = false;
+    loop {
+        if !matches!(
+            discover_attach_plan(after_lock.status, after_lock.hello.is_some()),
+            DiscoverAttachPlan::AttachRunning
+        ) || (matches!(mode, LifecycleMode::PromoteToPersistent) && after_lock.paths.ephemeral)
+        {
+            break;
+        }
+        let observed_pid =
+            cockpit_host::daemon_lifecycle::read_pid_file(&after_lock.paths.pid_file);
+        match attach_running_with_skew_check(after_lock.paths.clone(), None).await {
+            Ok(connected) => return Ok(connected),
+            // Holding the start lock, a draining owner is retried exactly
+            // once: after it exits, a fresh discovery normally reports no
+            // owner and falls through to spawn.
+            Err(error) if !departed_owner_retried && is_departing_owner_attach_error(&error) => {
+                departed_owner_retried = true;
+                await_departing_owner_exit(observed_pid, error).await?;
+                after_lock = discover().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     match discover_attach_plan(after_lock.status, after_lock.hello.is_some()) {
         DiscoverAttachPlan::AttachRunning => {
-            if matches!(mode, LifecycleMode::PromoteToPersistent) && after_lock.paths.ephemeral {
-                return promote_ephemeral_owner(&after_lock.paths, lifecycle_request).await;
-            }
-            return attach_running_with_skew_check(after_lock.paths, None).await;
+            // Only the ephemeral-promotion case reaches here; plain attaches
+            // were resolved by the loop above.
+            return promote_ephemeral_owner(&after_lock.paths, lifecycle_request).await;
         }
         DiscoverAttachPlan::FailIncompatible => {
             if let Some(hello) = after_lock.hello {
@@ -1504,6 +1533,56 @@ async fn connect_shared_running(
         startup_notice,
         promoted_from_ephemeral: false,
     })
+}
+
+/// Upper bound for a discovered owner that closed an attach mid-handshake to
+/// finish draining and exit before the resolver re-runs discovery. An owner
+/// that is still alive after this is not treated as departing; the original
+/// attach error is returned (fail closed).
+const DEPARTING_OWNER_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether an attach to a discovered, hello-answering owner failed because
+/// that owner is going away (closed mid-handshake, or its listener is already
+/// gone) rather than because it is incompatible or misbehaving.
+fn is_departing_owner_attach_error(error: &anyhow::Error) -> bool {
+    if cockpit_client::is_daemon_closed_during_handshake(error) {
+        return true;
+    }
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        })
+    })
+}
+
+/// Wait (bounded) for the owner that refused an attach to exit. Returns the
+/// original attach error when the owner cannot be identified or is still
+/// alive at the deadline, so a live-but-refusing daemon is never masked.
+async fn await_departing_owner_exit(observed_pid: Option<u32>, error: anyhow::Error) -> Result<()> {
+    let Some(pid) = observed_pid else {
+        return Err(error);
+    };
+    tracing::info!(
+        pid,
+        error = %error,
+        "discovered daemon owner closed the attach; waiting for it to exit before rediscovery"
+    );
+    let deadline = tokio::time::Instant::now() + DEPARTING_OWNER_EXIT_TIMEOUT;
+    let mut backoff = Duration::from_millis(5);
+    while cockpit_host::daemon_lifecycle::process_exists(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(error);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 async fn attach_running_with_skew_check(

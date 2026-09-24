@@ -4396,6 +4396,7 @@ impl DaemonContext {
         self.client_presence.send_modify(|presence| {
             presence.count += 1;
             presence.has_lifetime_client = true;
+            presence.attach_epoch = presence.attach_epoch.wrapping_add(1);
         });
         ClientGuard { ctx: self.clone() }
     }
@@ -4432,7 +4433,21 @@ impl DeferredClientLifetime {
 pub(crate) struct ClientPresence {
     pub(crate) count: usize,
     pub(crate) has_lifetime_client: bool,
+    /// Monotonic count of lifetime-client attaches. A last-client reaper
+    /// keys its handoff grace on this, so an attach that coalesces with its
+    /// own detach inside one watch observation still restarts the grace.
+    pub(crate) attach_epoch: u64,
 }
+
+/// Handoff lease for last-client teardown. A reference-counted owner (an
+/// ephemeral daemon, or any owner whose first-run onboarding is incomplete)
+/// keeps serving this long after its client count reaches zero before it
+/// drains. Short-lived RPC connections — a version-skew probe, a CLI command,
+/// a test fixture — are routinely followed by the caller's retained lifecycle
+/// connection; without the lease the owner would begin draining in that gap
+/// and the retained connect would hit a closing socket. Any attach inside the
+/// grace cancels it, and an abandoned owner still exits once it elapses.
+pub(crate) const LAST_CLIENT_HANDOFF_GRACE: Duration = Duration::from_secs(3);
 
 /// Decrements the daemon's connected-client count when a client task
 /// ends, regardless of how it ends.
@@ -5552,6 +5567,7 @@ impl LockedServices {
         self.client_presence.send_modify(|presence| {
             presence.count += 1;
             presence.has_lifetime_client = true;
+            presence.attach_epoch = presence.attach_epoch.wrapping_add(1);
         });
         LockedClientGuard {
             locked: self.clone(),
@@ -7255,16 +7271,39 @@ pub(crate) async fn run_locked_until_ready(
     let mut locked_clients = tokio::task::JoinSet::new();
     let mut ready_signal = locked.subscribe_ready_handoff();
     let mut client_presence = locked.client_presence();
+    // Start of the current last-client idle period, keyed by the attach
+    // epoch that ended it (see `LAST_CLIENT_HANDOFF_GRACE`).
+    let mut idle_since: Option<(u64, tokio::time::Instant)> = None;
     loop {
         let observed = *client_presence.borrow_and_update();
+        let closing = locked.closing.load(Ordering::Acquire);
+        // A lifetime client left: keep serving for the handoff grace so a
+        // one-shot probe's close cannot tear the owner down before its
+        // caller's retained connection attaches.
+        let idle_deadline = if observed.has_lifetime_client && observed.count == 0 && !closing {
+            let start = match idle_since {
+                Some((epoch, start)) if epoch == observed.attach_epoch => start,
+                _ => {
+                    let start = tokio::time::Instant::now();
+                    idle_since = Some((observed.attach_epoch, start));
+                    start
+                }
+            };
+            Some(start + LAST_CLIENT_HANDOFF_GRACE)
+        } else {
+            idle_since = None;
+            None
+        };
+        let idle_grace_elapsed =
+            idle_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
         // An acknowledged StopDaemon tears down every attached locked client
         // — an onboarding wizard stays blocked in recv and never drains the
         // presence count — with the same abort semantics the ready handoff
         // uses. `closing` alone still waits for the count: a ready
         // transition also sets it while clients remain attached.
         if (locked.stop_requested.load(Ordering::Acquire)
-            || ((observed.has_lifetime_client || locked.closing.load(Ordering::Acquire))
-                && observed.count == 0))
+            || (closing && observed.count == 0)
+            || idle_grace_elapsed)
             && !locked.ready_transition_inflight.load(Ordering::Acquire)
         {
             locked.closing.store(true, Ordering::Release);
@@ -7295,6 +7334,17 @@ pub(crate) async fn run_locked_until_ready(
                     anyhow::bail!("locked client lifetime publisher closed");
                 }
             }
+            // Wake once the handoff grace elapses. An elapsed deadline that
+            // is held off by an in-flight ready transition waits for the
+            // next event instead of spinning.
+            () = async {
+                match idle_deadline {
+                    Some(deadline) if !idle_grace_elapsed => {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                    _ => std::future::pending::<()>().await,
+                }
+            } => {}
             accepted = accept_daemon_stream(&mut listener) => {
                 let stream = accepted?;
                 if validate_peer_owner(&stream).is_err() {

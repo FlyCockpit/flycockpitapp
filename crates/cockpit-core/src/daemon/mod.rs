@@ -3351,9 +3351,11 @@ async fn run_foreground_inner_with_boot_db_impl(
         let reaper_ctx = ctx.clone();
         let client_presence = ctx.client_presence();
         Some(ForegroundTask::new(tokio::spawn(async move {
-            ephemeral_last_client_reaper(client_presence, move || {
-                reaper_ctx.reap_ephemeral_last_client()
-            })
+            ephemeral_last_client_reaper(
+                client_presence,
+                server::LAST_CLIENT_HANDOFF_GRACE,
+                move || reaper_ctx.reap_ephemeral_last_client(),
+            )
             .await;
         })))
     };
@@ -3690,20 +3692,53 @@ async fn recover_paused_sessions(
 }
 
 /// Wait for an ephemeral owner to acquire its first lifetime client and then
-/// request teardown as soon as the reference count returns to zero. The gate
-/// prevents a freshly spawned daemon from racing its creator's initial
-/// handshake or a hello-only reachability probe.
+/// request teardown once the reference count has stayed at zero for the
+/// `handoff_grace`. The first-client gate prevents a freshly spawned daemon
+/// from racing its creator's initial handshake or a hello-only reachability
+/// probe; the grace is the handoff lease that keeps a one-shot RPC connection
+/// (a skew probe, a fixture or CLI command) from reaping the owner in the
+/// window before the next retained client attaches. Any client that attaches
+/// inside the grace cancels it; an abandoned owner still exits once the grace
+/// elapses with no client.
 #[cfg(any(unix, windows, test))]
 async fn ephemeral_last_client_reaper(
     mut presence: tokio::sync::watch::Receiver<server::ClientPresence>,
+    handoff_grace: Duration,
     mut try_reap: impl FnMut() -> server::EphemeralReapDecision,
 ) {
+    // Start of the current idle period, keyed by the attach epoch that
+    // ended it. Live-work retries and spurious presence wakeups keep the
+    // lease; any attach (even one coalesced with its own detach) restarts it.
+    let mut idle_since: Option<(u64, tokio::time::Instant)> = None;
     loop {
         let observed = *presence.borrow_and_update();
         if observed.has_lifetime_client && observed.count == 0 {
+            let idle_start = match idle_since {
+                Some((epoch, start)) if epoch == observed.attach_epoch => start,
+                _ => {
+                    let start = tokio::time::Instant::now();
+                    idle_since = Some((observed.attach_epoch, start));
+                    start
+                }
+            };
+            let idle_deadline = idle_start + handoff_grace;
+            if tokio::time::Instant::now() < idle_deadline {
+                tokio::select! {
+                    changed = presence.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    () = tokio::time::sleep_until(idle_deadline) => {}
+                }
+                continue;
+            }
             match try_reap() {
                 server::EphemeralReapDecision::Shutdown => {
-                    tracing::info!("ephemeral daemon lost its final client; beginning teardown");
+                    tracing::info!(
+                        grace_ms = handoff_grace.as_millis() as u64,
+                        "ephemeral daemon lost its final client; beginning teardown"
+                    );
                     return;
                 }
                 server::EphemeralReapDecision::Persistent => {
@@ -3728,6 +3763,7 @@ async fn ephemeral_last_client_reaper(
                 }
             }
         }
+        idle_since = None;
         if presence.changed().await.is_err() {
             return;
         }
@@ -4915,6 +4951,101 @@ mod tests {
         drop(lb);
     }
 
+    fn attach_lifetime_client(presence: &tokio::sync::watch::Sender<server::ClientPresence>) {
+        presence.send_modify(|presence| {
+            presence.count += 1;
+            presence.has_lifetime_client = true;
+            presence.attach_epoch = presence.attach_epoch.wrapping_add(1);
+        });
+    }
+
+    fn detach_lifetime_client(presence: &tokio::sync::watch::Sender<server::ClientPresence>) {
+        presence.send_modify(|presence| presence.count -= 1);
+    }
+
+    /// A one-shot client closing must not reap the owner before the caller's
+    /// retained connection attaches; an abandoned owner still reaps once the
+    /// handoff grace elapses.
+    #[tokio::test(start_paused = true)]
+    async fn last_client_reaper_holds_the_handoff_grace_before_teardown() {
+        let grace = server::LAST_CLIENT_HANDOFF_GRACE;
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reaper_reaped = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            grace,
+            move || {
+                reaper_reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
+
+        // One-shot probe: attach, detach.
+        attach_lifetime_client(&presence_tx);
+        detach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace / 2).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::SeqCst),
+            "the owner must survive the gap between a one-shot client and its successor"
+        );
+
+        // Retained successor attaches inside the grace and stays well past it.
+        attach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace * 4).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::SeqCst),
+            "an attached client cancels the pending teardown"
+        );
+
+        // Successor leaves: the owner is abandoned and reaps after the grace.
+        detach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace - Duration::from_millis(1)).await;
+        assert!(!reaped.load(std::sync::atomic::Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_millis(10), task)
+            .await
+            .expect("an abandoned owner reaps once the grace elapses")
+            .expect("reaper task joins");
+        assert!(reaped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// An attach that coalesces with its own detach inside one watch
+    /// observation still restarts the grace (the attach epoch moved).
+    #[tokio::test(start_paused = true)]
+    async fn last_client_reaper_restarts_grace_on_coalesced_attach_and_detach() {
+        let grace = server::LAST_CLIENT_HANDOFF_GRACE;
+        let (presence_tx, presence_rx) =
+            tokio::sync::watch::channel(server::ClientPresence::default());
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reaper_reaped = reaped.clone();
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            grace,
+            move || {
+                reaper_reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
+
+        attach_lifetime_client(&presence_tx);
+        detach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace * 3 / 4).await;
+        // Coalesced: both edges land before the reaper observes the watch.
+        attach_lifetime_client(&presence_tx);
+        detach_lifetime_client(&presence_tx);
+        tokio::time::sleep(grace * 3 / 4).await;
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::SeqCst),
+            "a fresh attach restarts the handoff lease even when coalesced"
+        );
+        tokio::time::timeout(grace, task)
+            .await
+            .expect("the restarted grace still expires")
+            .expect("reaper task joins");
+        assert!(reaped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn ephemeral_reaps_when_first_lifetime_client_disconnect_precedes_reaper() {
         let (presence_tx, presence_rx) =
@@ -4922,10 +5053,14 @@ mod tests {
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let reaped_c = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
-            reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
-            server::EphemeralReapDecision::Shutdown
-        }));
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            Duration::ZERO,
+            move || {
+                reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
         presence_tx.send_modify(|presence| {
             presence.count = 1;
             presence.has_lifetime_client = true;
@@ -4946,13 +5081,17 @@ mod tests {
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ephemeral_for_reaper = ephemeral.clone();
         let reaped_for_reaper = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
-            if !ephemeral_for_reaper.load(std::sync::atomic::Ordering::SeqCst) {
-                return server::EphemeralReapDecision::Persistent;
-            }
-            reaped_for_reaper.store(true, std::sync::atomic::Ordering::SeqCst);
-            server::EphemeralReapDecision::Shutdown
-        }));
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            Duration::ZERO,
+            move || {
+                if !ephemeral_for_reaper.load(std::sync::atomic::Ordering::SeqCst) {
+                    return server::EphemeralReapDecision::Persistent;
+                }
+                reaped_for_reaper.store(true, std::sync::atomic::Ordering::SeqCst);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
 
         presence_tx.send_modify(|presence| {
             presence.count = 1;
@@ -4974,13 +5113,17 @@ mod tests {
         let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reaper_live = live.clone();
         let reaper_reaped = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
-            if reaper_live.load(std::sync::atomic::Ordering::Acquire) {
-                return server::EphemeralReapDecision::WaitingForLiveWork;
-            }
-            reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
-            server::EphemeralReapDecision::Shutdown
-        }));
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            Duration::ZERO,
+            move || {
+                if reaper_live.load(std::sync::atomic::Ordering::Acquire) {
+                    return server::EphemeralReapDecision::WaitingForLiveWork;
+                }
+                reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
 
         presence_tx.send_modify(|presence| {
             presence.count = 1;
@@ -5016,14 +5159,18 @@ mod tests {
         let reaper_decision = decision.clone();
         let reaper_ephemeral = ephemeral.clone();
         let reaper_reaped = reaped.clone();
-        let task = tokio::spawn(ephemeral_last_client_reaper(presence_rx, move || {
-            let _decision = crate::sync::lock_or_recover(&reaper_decision);
-            if !reaper_ephemeral.load(std::sync::atomic::Ordering::Acquire) {
-                return server::EphemeralReapDecision::Persistent;
-            }
-            reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
-            server::EphemeralReapDecision::Shutdown
-        }));
+        let task = tokio::spawn(ephemeral_last_client_reaper(
+            presence_rx,
+            Duration::ZERO,
+            move || {
+                let _decision = crate::sync::lock_or_recover(&reaper_decision);
+                if !reaper_ephemeral.load(std::sync::atomic::Ordering::Acquire) {
+                    return server::EphemeralReapDecision::Persistent;
+                }
+                reaper_reaped.store(true, std::sync::atomic::Ordering::Release);
+                server::EphemeralReapDecision::Shutdown
+            },
+        ));
 
         presence_tx.send_modify(|presence| {
             presence.count = 1;
@@ -5093,13 +5240,15 @@ mod tests {
             .expect("connect detached socket client");
         drop(client);
 
-        tokio::time::timeout(Duration::from_secs(3), daemon_task)
-            .await
-            .expect(
-                "connected client drop before an application request must reap the ephemeral owner",
-            )
-            .expect("daemon task joins")
-            .expect("daemon drain completes after detached client disconnect");
+        // Teardown follows the last-client handoff grace, then the original bound.
+        tokio::time::timeout(
+            server::LAST_CLIENT_HANDOFF_GRACE + Duration::from_secs(3),
+            daemon_task,
+        )
+        .await
+        .expect("connected client drop before an application request must reap the ephemeral owner")
+        .expect("daemon task joins")
+        .expect("daemon drain completes after detached client disconnect");
         assert!(!paths.socket.exists(), "last client removes the socket");
         assert!(
             !paths.pid_file.exists(),
@@ -5227,11 +5376,15 @@ mod tests {
         );
 
         drop(client_b);
-        tokio::time::timeout(Duration::from_secs(3), daemon_task)
-            .await
-            .expect("last socket client must drain and reap the ephemeral owner")
-            .expect("daemon task joins")
-            .expect("daemon drain cancels attached session work cleanly");
+        // Teardown follows the last-client handoff grace, then the original bound.
+        tokio::time::timeout(
+            server::LAST_CLIENT_HANDOFF_GRACE + Duration::from_secs(3),
+            daemon_task,
+        )
+        .await
+        .expect("last socket client must drain and reap the ephemeral owner")
+        .expect("daemon task joins")
+        .expect("daemon drain cancels attached session work cleanly");
         assert!(!paths.socket.exists(), "last client removes the socket");
         assert!(
             !paths.pid_file.exists(),
@@ -5301,9 +5454,16 @@ mod tests {
         .unwrap();
 
         // The daemon must drain and exit — despite the persisted session.
-        let reaped = tokio::time::timeout(Duration::from_secs(3), eph_task)
-            .await
-            .expect("ephemeral daemon did not reap on StopDaemon with a persisted session");
+        // This unauthenticated raw-socket stop is answered with an owner
+        // authorization denial, so teardown comes from the stopper being the
+        // owner's last client: it drains once the last-client handoff grace
+        // elapses, then within the original bound.
+        let reaped = tokio::time::timeout(
+            server::LAST_CLIENT_HANDOFF_GRACE + Duration::from_secs(3),
+            eph_task,
+        )
+        .await
+        .expect("ephemeral daemon did not reap on StopDaemon with a persisted session");
         reaped.expect("join").expect("run_foreground_inner ok");
         assert!(
             !eph.socket.exists(),

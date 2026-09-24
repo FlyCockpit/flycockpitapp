@@ -327,6 +327,68 @@ async fn acknowledged_locked_stop_tears_down_attached_wizard_clients() {
     drop(tmp);
 }
 
+/// A locked first-run owner must survive the gap between a one-shot client
+/// (a version-skew probe, a CLI command, a fixture) closing and its caller's
+/// retained connection attaching, and must still tear down once that
+/// retained client leaves and the handoff grace elapses with nobody attached.
+#[cfg(unix)]
+#[tokio::test]
+async fn locked_owner_holds_the_last_client_handoff_grace() {
+    let (tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let socket = locked.paths.socket.clone();
+    let listener = crate::daemon::bind_private_socket(&socket).expect("bind control listener");
+    let reveal = crate::daemon::leak_reveal_socket::bind_reveal_socket(&locked.paths)
+        .expect("bind leak-reveal socket");
+    let loop_locked = locked.clone();
+    let mut run = tokio::spawn(async move {
+        super::run_locked_until_ready(loop_locked, listener, reveal)
+            .await
+            .expect("locked run loop")
+    });
+
+    // One-shot client: a lifetime reference that closes immediately.
+    let probe = cockpit_client::DaemonClient::connect(&socket)
+        .await
+        .expect("one-shot client attaches to the locked daemon");
+    drop(probe);
+    tokio::time::sleep(super::LAST_CLIENT_HANDOFF_GRACE / 3).await;
+    assert!(
+        !run.is_finished(),
+        "the locked owner must not drain inside the handoff grace"
+    );
+
+    // The retained successor attaches inside the grace and outlives it.
+    let retained = cockpit_client::DaemonClient::connect(&socket)
+        .await
+        .expect("retained client attaches inside the handoff grace");
+    tokio::time::sleep(super::LAST_CLIENT_HANDOFF_GRACE + std::time::Duration::from_millis(500))
+        .await;
+    assert!(
+        !run.is_finished(),
+        "an attached client keeps the locked owner serving"
+    );
+    let status = retained
+        .request(Request::DaemonStatus)
+        .await
+        .expect("retained client transport stays live")
+        .expect("retained client is still served");
+    assert!(matches!(status, Response::LockedBootstrapHello(..)));
+
+    // Abandoned: the owner still exits once the grace elapses.
+    drop(retained);
+    let outcome = tokio::time::timeout(
+        super::LAST_CLIENT_HANDOFF_GRACE + std::time::Duration::from_secs(5),
+        &mut run,
+    )
+    .await
+    .expect("an abandoned locked owner drains after the handoff grace")
+    .expect("locked run loop task joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Shutdown));
+    drop(locked);
+    drop(tmp);
+}
+
 /// The profile stage precedes the secure-store choice (#391), so its display
 /// name write is the one ordinary config mutation that must complete while
 /// locked. The admission is scoped to exactly that: the Profile stage. Every

@@ -322,6 +322,93 @@ async fn negotiation_rejects_a_daemon_that_does_not_send_a_hello() {
     server.abort();
 }
 
+/// A daemon that accepts and then closes before its hello (an owner that
+/// began draining after discovery) keeps the fail-closed typed protocol
+/// error, and is additionally marked as a mid-handshake close so a lifecycle
+/// resolver can wait for the owner to exit and rediscover instead of
+/// stranding the caller. A timed-out or incompatible hello never carries
+/// that marker.
+#[tokio::test]
+async fn negotiation_marks_a_daemon_that_closes_before_its_hello() {
+    let (_dir, socket, listener) = bind_test_socket();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+    let error = match DaemonClient::connect(&socket).await {
+        Ok(_) => panic!("a daemon that closes before its hello must fail the connect"),
+        Err(error) => error,
+    };
+    assert!(cockpit_client::is_daemon_closed_during_handshake(&error));
+    assert!(is_protocol_version_mismatch(&error));
+    let payload = error
+        .downcast_ref::<proto::ErrorPayload>()
+        .expect("a mid-handshake close keeps the typed protocol error");
+    assert!(
+        payload
+            .message
+            .contains("closed the connection before its hello")
+    );
+    assert_eq!(error.to_string(), payload.to_string());
+    server.await.unwrap();
+
+    let (_dir, socket, listener) = bind_test_socket();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut daemon = ProtoStream::new(stream);
+        send_daemon_hello(&mut daemon, "0.1.incompatible", proto::PROTOCOL_VERSION + 1).await;
+    });
+    let error = match DaemonClient::connect(&socket).await {
+        Ok(_) => panic!("an incompatible daemon hello must reject the connection"),
+        Err(error) => error,
+    };
+    assert!(!cockpit_client::is_daemon_closed_during_handshake(&error));
+    server.await.unwrap();
+}
+
+/// Draining-owner recovery is scoped: only a mid-handshake close or a gone
+/// listener counts as a departing owner, and the resolver only proceeds once
+/// that owner has actually exited. A live owner (or an unidentifiable one)
+/// returns the original attach error.
+#[tokio::test]
+async fn departing_owner_recovery_requires_a_close_and_an_exited_owner() {
+    assert!(is_departing_owner_attach_error(&anyhow::Error::new(
+        std::io::Error::from(std::io::ErrorKind::ConnectionRefused)
+    )));
+    assert!(is_departing_owner_attach_error(
+        &anyhow::Error::new(cockpit_client::DaemonClosedDuringHandshake)
+            .context("daemon protocol handshake failed")
+    ));
+    assert!(!is_departing_owner_attach_error(&anyhow::Error::new(
+        proto::ErrorPayload {
+            code: proto::ErrorCode::ProtocolVersion,
+            message: "daemon protocol handshake failed: daemon hello timed out".into(),
+        }
+    )));
+
+    let unidentified = await_departing_owner_exit(None, anyhow!("attach closed"))
+        .await
+        .expect_err("an owner without a pid cannot be proven departed");
+    assert_eq!(unidentified.to_string(), "attach closed");
+
+    let mut exited = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn a short-lived process");
+    let exited_pid = exited.id();
+    exited.wait().expect("reap the short-lived process");
+    await_departing_owner_exit(Some(exited_pid), anyhow!("attach closed"))
+        .await
+        .expect("an exited owner allows rediscovery");
+}
+
+#[tokio::test(start_paused = true)]
+async fn departing_owner_recovery_fails_closed_when_the_owner_stays_alive() {
+    let error = await_departing_owner_exit(Some(std::process::id()), anyhow!("attach closed"))
+        .await
+        .expect_err("a live owner is not departing");
+    assert_eq!(error.to_string(), "attach closed");
+}
+
 #[tokio::test]
 async fn negotiated_client_round_trips_attach() {
     let (_dir, socket, listener) = bind_test_socket();

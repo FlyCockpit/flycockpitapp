@@ -7377,12 +7377,20 @@ pub(crate) async fn run_locked_until_ready(
     }
 }
 
+/// Daemon-wide retention policy from the global config layer. Retention is
+/// installation state, so no project layer (and in particular not one found
+/// by walking up from the daemon's inherited working directory) participates.
 pub(super) fn retention_config() -> RetentionConfig {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    ConfigSource::production()
-        .load(&cwd)
-        .map(|(_, extended)| extended.retention)
-        .unwrap_or_default()
+    match ConfigSource::production().load_global() {
+        Ok(extended) => extended.retention,
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "global retention config unavailable; using the default retention policy"
+            );
+            RetentionConfig::default()
+        }
+    }
 }
 
 fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {

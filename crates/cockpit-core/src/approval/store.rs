@@ -2656,8 +2656,14 @@ fn create_staged_private(dir: &std::fs::File) -> std::io::Result<StagedPrivate> 
     ))
 }
 
-/// Whether `name` beneath the held directory still refers to `file`'s inode.
+/// Whether `name` beneath the held directory is a regular file that is
+/// `file`'s inode. Compared by `fstatat(AT_SYMLINK_NOFOLLOW)` — the entry is
+/// never opened — so a substituted symlink, FIFO, device, or directory is a
+/// mismatch (`Ok(false)`) that reaches the caller's rollback, never an open
+/// error or a blocking open. Absence is also a mismatch.
 #[cfg(unix)]
+// `st_dev`/`st_ino` widths differ across Unix targets (`u64` on Linux).
+#[allow(clippy::unnecessary_cast)]
 fn same_object_in_dir(
     file: &std::fs::File,
     dir: &std::fs::File,
@@ -2666,15 +2672,10 @@ fn same_object_in_dir(
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::MetadataExt as _;
     let held = file.metadata()?;
-    match cockpit_host::private_fs::held_fd::openat(
-        dir.as_raw_fd(),
-        name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-    ) {
-        Ok(named) => {
-            let named = named.metadata()?;
-            Ok(held.dev() == named.dev() && held.ino() == named.ino())
-        }
+    match cockpit_host::private_fs::held_fd::fstatat_nofollow(dir.as_raw_fd(), name) {
+        Ok(named) => Ok((named.st_mode & libc::S_IFMT) == libc::S_IFREG
+            && named.st_dev as u64 == held.dev()
+            && named.st_ino as u64 == held.ino()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
@@ -2689,7 +2690,9 @@ fn open_live_in_dir(
     match cockpit_host::private_fs::held_fd::openat(
         dir.as_raw_fd(),
         name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        // Non-blocking: the live name is unverified, and a FIFO planted
+        // there must not stall the write while the store lock is held.
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
     ) {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -3354,46 +3357,59 @@ fn store_approvals(dir: &Path, lock: &std::fs::File, file: &ApprovalsFile) -> Re
             });
         }
     }
-    match same_object_in_dir(&staged.file, lock, &dest) {
+    let verified = match same_object_in_dir(&staged.file, lock, &dest) {
         Ok(true) => {
             if let PublishKind::Exchanged { tmp } = published {
                 discard_consumed_tmp(lock, &tmp, &staged.file);
             }
+            lock.sync_all()
+                .with_context(|| format!("syncing {}", dir.display()))?;
+            return Ok(());
         }
-        Ok(false) => match published {
-            PublishKind::Exchanged { tmp } => {
-                rollback_exchanged_publish(lock, &dest, &tmp).context(
-                    "restoring the previous approvals store after a substituted publish",
-                )?;
-                anyhow::bail!(
-                    "the approvals store write would have installed an entry that is \
-                         not the staged object this process wrote and synced; the previous \
-                         store was restored"
-                );
-            }
-            PublishKind::RenamedDirect { tmp } => {
-                rollback_renamed_publish(lock, &dest, &tmp)
-                    .context("withdrawing a substituted first approvals store publish")?;
-                anyhow::bail!(
-                    "the approvals store write would have installed an entry that is \
-                         not the staged object this process wrote and synced; it was \
-                         withdrawn and the store remains absent"
-                );
-            }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            PublishKind::LinkedDirect => anyhow::bail!(
-                "the approvals store write did not install the staged object this \
-                     process wrote and synced; the live path was left as found"
-            ),
-        },
-        Err(error) => {
-            return Err(anyhow::Error::from(error))
-                .with_context(|| format!("verifying the published store in {}", dir.display()));
+        Ok(false) => Ok(()),
+        Err(error) => Err(error),
+    };
+    // The installed entry is not proven to be the staged object: either it is
+    // something else (substituted before the rename), or it could not be
+    // checked. Both undo the publish, so an unverified entry is never left
+    // installed as the live store.
+    let outcome = match verified {
+        Ok(()) => {
+            "would have installed an entry that is not the staged object this \
+                   process wrote and synced"
         }
-    }
-    lock.sync_all()
-        .with_context(|| format!("syncing {}", dir.display()))?;
-    Ok(())
+        Err(_) => {
+            "could not prove the installed entry is the staged object this \
+                   process wrote and synced"
+        }
+    };
+    let undo = match published {
+        PublishKind::Exchanged { tmp } => rollback_exchanged_publish(lock, &dest, &tmp)
+            .context("restoring the previous approvals store after an unproven publish")
+            .map(|()| "the previous store was restored"),
+        PublishKind::RenamedDirect { tmp } => rollback_renamed_publish(lock, &dest, &tmp)
+            .context("withdrawing an unproven first approvals store publish")
+            .map(|()| "it was withdrawn and the store remains absent"),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        PublishKind::LinkedDirect => Ok("the live path was left as found"),
+    };
+    let failure = match (verified, undo) {
+        (Ok(()), Ok(restored)) => {
+            anyhow::anyhow!("the approvals store write {outcome}; {restored}")
+        }
+        (Ok(()), Err(undo)) => undo.context(format!("the approvals store write {outcome}")),
+        (Err(error), Ok(restored)) => anyhow::Error::from(error).context(format!(
+            "verifying the published store in {}: the approvals store write {outcome}; \
+             {restored}",
+            dir.display()
+        )),
+        (Err(error), Err(undo)) => anyhow::Error::from(error).context(format!(
+            "verifying the published store in {}: the approvals store write {outcome}, \
+             and undoing it failed: {undo:#}",
+            dir.display()
+        )),
+    };
+    Err(failure)
 }
 
 /// Non-unix publish: exclusive named temp + rename. Windows cannot replace
@@ -5921,6 +5937,122 @@ mod tests {
             file.commands_reject.is_empty(),
             "later reads must not consume attacker-supplied policy"
         );
+    }
+
+    /// A non-regular substitute for the staged name: a symlink to attacker
+    /// policy elsewhere, or a FIFO (whose blocking open would stall the write
+    /// forever while the store lock is held).
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum NonRegularSubstitute {
+        Symlink,
+        Fifo,
+    }
+
+    #[cfg(unix)]
+    fn plant_non_regular_substitute(at: &Path, kind: NonRegularSubstitute, elsewhere: &Path) {
+        match kind {
+            NonRegularSubstitute::Symlink => {
+                let target = elsewhere.join("attacker-policy.json");
+                std::fs::write(&target, br#"{"commands_reject":["pwned"]}"#).unwrap();
+                std::os::unix::fs::symlink(&target, at).unwrap();
+            }
+            NonRegularSubstitute::Fifo => {
+                use std::os::unix::ffi::OsStrExt as _;
+                let name = std::ffi::CString::new(at.as_os_str().as_bytes()).unwrap();
+                // SAFETY: `name` is a valid NUL-terminated path for the call.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+        }
+    }
+
+    /// Replace path with a non-regular substitute: the post-act proof is a
+    /// no-open `fstatat` comparison, so a symlink or FIFO installed by the
+    /// exchange is a mismatch that is rolled back — never an unhandled
+    /// verification error that leaves it live, and never a blocking open.
+    #[cfg(unix)]
+    #[test]
+    fn store_publish_rolls_back_a_non_regular_exchange_substitute() {
+        for kind in [NonRegularSubstitute::Symlink, NonRegularSubstitute::Fifo] {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let lock = lock_approvals(dir.path()).unwrap();
+            std::fs::write(dir.path().join(APPROVALS_FILE), b"{}").unwrap();
+            let dir_path = dir.path().to_path_buf();
+            let elsewhere_path = elsewhere.path().to_path_buf();
+            BEFORE_PUBLISH_RENAME_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let staged = find_staged_store_temp(&dir_path);
+                    std::fs::remove_file(&staged).unwrap();
+                    plant_non_regular_substitute(&staged, kind, &elsewhere_path);
+                }));
+            });
+
+            let error = store_approvals(
+                dir.path(),
+                &lock,
+                &ApprovalsFile {
+                    commands_reject: BTreeSet::from(["never-reported-success".to_string()]),
+                    ..ApprovalsFile::default()
+                },
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("previous store was restored"),
+                "{kind:?}: {message}"
+            );
+            let live = std::fs::symlink_metadata(dir.path().join(APPROVALS_FILE)).unwrap();
+            assert!(
+                live.file_type().is_file(),
+                "{kind:?}: live store must be a regular file"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join(APPROVALS_FILE)).unwrap(),
+                b"{}".as_slice(),
+                "{kind:?}: the previous store must be restored"
+            );
+        }
+    }
+
+    /// First publish (no `O_TMPFILE`) with a non-regular staged substitute:
+    /// the no-replace rename installs it, and it must be withdrawn.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[test]
+    fn first_store_publish_withdraws_a_non_regular_staging_substitute() {
+        for kind in [NonRegularSubstitute::Symlink, NonRegularSubstitute::Fifo] {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let lock = lock_approvals(dir.path()).unwrap();
+            let dir_path = dir.path().to_path_buf();
+            let elsewhere_path = elsewhere.path().to_path_buf();
+            BEFORE_PUBLISH_RENAME_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let staged = find_staged_store_temp(&dir_path);
+                    std::fs::remove_file(&staged).unwrap();
+                    plant_non_regular_substitute(&staged, kind, &elsewhere_path);
+                }));
+            });
+
+            let error = store_approvals(
+                dir.path(),
+                &lock,
+                &ApprovalsFile {
+                    commands_reject: BTreeSet::from(["never-reported-success".to_string()]),
+                    ..ApprovalsFile::default()
+                },
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("the store remains absent"),
+                "{kind:?}: {message}"
+            );
+            assert!(
+                std::fs::symlink_metadata(dir.path().join(APPROVALS_FILE)).is_err(),
+                "{kind:?}: a substituted first publish must not stay installed"
+            );
+        }
     }
 
     /// First write without `O_TMPFILE` (macOS): the named staging entry is

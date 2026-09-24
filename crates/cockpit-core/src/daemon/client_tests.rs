@@ -450,6 +450,11 @@ async fn departing_owner_wait_returns_once_the_pinned_owner_retired() {
     let paths = isolated_canonical_paths(&env).await;
     let owner_child = publish_verified_test_owner(&paths);
     let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
     assert!(
         owner.receipt.is_some(),
         "the receipt is captured before the attach"
@@ -473,6 +478,11 @@ async fn departing_owner_wait_recovers_from_a_crash_that_left_its_endpoint() {
     let owner_child = publish_verified_test_owner(&paths);
     let listener = UnixListener::bind(&paths.socket).expect("bind fixture owner socket");
     let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
     // Crash: the process dies and its listener closes, but the receipt and
     // the socket path stay published.
     stop_fixture_owner(owner_child);
@@ -493,6 +503,11 @@ async fn departing_owner_wait_returns_when_a_replacement_is_published_first() {
     let paths = isolated_canonical_paths(&env).await;
     let departing = publish_verified_test_owner(&paths);
     let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
     stop_fixture_owner(departing);
     std::fs::remove_file(&paths.pid_file).expect("departing owner retires its receipt");
     // Another starter publishes a healthy successor at the same endpoint.
@@ -512,6 +527,72 @@ async fn departing_owner_wait_returns_when_a_replacement_is_published_first() {
     stop_fixture_owner(successor);
 }
 
+/// The owner may retire its receipt and socket before its process — and the
+/// daemon lifetime lock — is gone. With no receipt captured, the wait must
+/// not report the owner gone while the lock is held (a spawn would fail
+/// Busy); it fails closed at the budget, and returns once the lock drops.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_without_a_receipt_waits_for_the_lifetime_lock() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    std::fs::create_dir_all(paths.pid_file.parent().expect("runtime dir"))
+        .expect("create runtime dir");
+    let lifetime = cockpit_host::daemon_lifecycle::acquire_daemon_lifetime(&paths.pid_file)
+        .expect("a departing owner still holds its lifetime lock");
+
+    let owner = DiscoveredOwner::capture(&paths);
+    assert!(owner.receipt.is_none(), "the receipt was already retired");
+    let mut budget = DepartingOwnerBudget {
+        deadline: Some(tokio::time::Instant::now() + Duration::from_millis(300)),
+        ..DepartingOwnerBudget::default()
+    };
+    let error = await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect_err("a held lifetime lock means the owner has not departed");
+    assert_eq!(error.to_string(), "attach closed");
+
+    drop(lifetime);
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(
+        &paths,
+        DiscoveredOwner::capture(&paths),
+        &mut budget,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("once the lifetime lock is free the resolver rediscovers");
+}
+
+/// Once the captured owner has been replaced, the wait returns whatever
+/// discovery currently makes of the successor — here a published owner whose
+/// socket does not answer yet — and lets rediscovery produce the outcome,
+/// instead of spinning to the deadline and reporting the stale attach error.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_returns_for_a_successor_that_is_not_attachable() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let departing = publish_verified_test_owner(&paths);
+    let owner = DiscoveredOwner::capture(&paths);
+    stop_fixture_owner(departing);
+    std::fs::remove_file(&paths.pid_file).expect("departing owner retires its receipt");
+    // The successor is published but does not answer on the endpoint.
+    let successor = publish_verified_test_owner(&paths);
+    let probe = crate::daemon::discover().await;
+    assert!(
+        !matches!(
+            discover_attach_plan(probe.status, probe.hello.is_some()),
+            DiscoverAttachPlan::AttachRunning | DiscoverAttachPlan::Spawn
+        ),
+        "the successor is neither attachable nor absent: {:?}",
+        probe.status
+    );
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect("a published successor ends the wait whatever its plan");
+    stop_fixture_owner(successor);
+}
+
 /// A live owner that neither retires nor answers again fails closed with the
 /// original attach error once the shared budget is spent — and the wait never
 /// signals it.
@@ -521,6 +602,11 @@ async fn departing_owner_wait_fails_closed_when_the_owner_stays_alive() {
     let paths = isolated_canonical_paths(&env).await;
     let mut owner_child = publish_verified_test_owner(&paths);
     let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
     let mut budget = DepartingOwnerBudget {
         deadline: Some(tokio::time::Instant::now() + Duration::from_millis(300)),
         ..DepartingOwnerBudget::default()
@@ -548,6 +634,11 @@ async fn departing_owner_wait_returns_when_the_same_owner_answers_again() {
     let mut owner_child = publish_verified_test_owner(&paths);
     let listener = UnixListener::bind(&paths.socket).expect("bind fixture owner socket");
     let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(
+        owner.process.is_some(),
+        "the verified owner is pinned by a kernel handle"
+    );
     let server = serve_hellos(listener, "0.1.answers-again");
     let mut budget = DepartingOwnerBudget::default();
     await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))

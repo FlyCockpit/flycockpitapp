@@ -1616,6 +1616,19 @@ impl DiscoveredOwner {
     }
 }
 
+/// One nonblocking observation of the daemon lifetime lock at `paths`: true
+/// only when no owner holds it (acquired and released at once), which is the
+/// condition a replacement spawn actually needs. An owner keeps the lock
+/// until its process exits, after it has already retired its receipt and
+/// socket. A missing lock location means no owner can hold it.
+fn daemon_lifetime_released(paths: &crate::daemon::DaemonPaths) -> bool {
+    match cockpit_host::daemon_lifecycle::capture_daemon_lifetime_release(&paths.pid_file) {
+        Ok(witness) => witness.released().unwrap_or(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 /// The departing-owner recovery budget for one lifecycle resolution: a single
 /// absolute deadline (the codebase's restart-release policy) shared by every
 /// wait, and a re-probe interval that keeps backing off across retries.
@@ -1665,14 +1678,20 @@ const DEPARTING_OWNER_REPROBE_CEILING: Duration = Duration::from_millis(500);
 ///
 /// * a hello-answering owner is published at the endpoint — the same owner
 ///   after a transient close (e.g. admission refused during a locked→ready
-///   transition), or a successor another starter already published; or
-/// * the endpoint no longer answers (not running / stale receipt or socket
-///   left by a crash) and the captured owner process has exited.
+///   transition), or a successor another starter already published;
+/// * a different receipt is published than the one captured (a successor
+///   exists, whatever discovery currently makes of it); or
+/// * the captured owner process has exited and the daemon lifetime lock is
+///   free — including when no receipt was captured, because the owner can
+///   retire its receipt and socket before its process (and lock) is gone.
 ///
-/// Returns the original attach error (fail closed) only once the shared
-/// recovery budget runs out. No blocking waiter is started, so abandoning a
-/// wait never strands a thread, and the absolute deadline holds on every
-/// platform.
+/// Once the old owner is out of the way, rediscovery produces the real
+/// outcome for every plan (spawn, attach, or e.g. an incompatible-protocol
+/// error), so this wait keeps polling only while the captured owner is alive
+/// and not answering. It returns the original attach error (fail closed) only
+/// once the shared recovery budget runs out. No blocking waiter is started,
+/// so abandoning a wait never strands a thread, and the absolute deadline
+/// holds on every platform.
 async fn await_departing_owner(
     paths: &crate::daemon::DaemonPaths,
     owner: DiscoveredOwner,
@@ -1698,21 +1717,25 @@ async fn await_departing_owner(
         // Hello-only probe: it never takes a lifetime reference, so it
         // cannot itself keep a last-client owner alive.
         let probe = crate::daemon::discover().await;
-        match discover_attach_plan(probe.status, probe.hello.is_some()) {
-            DiscoverAttachPlan::AttachRunning => {
-                let current =
-                    cockpit_host::daemon_lifecycle::read_daemon_pid_record(&probe.paths.pid_file);
-                tracing::info!(
-                    same_owner = current.is_some() && current == owner.receipt,
-                    "daemon endpoint answers again; retrying the attach"
-                );
-                return Ok(());
-            }
-            DiscoverAttachPlan::Spawn if owner.has_exited() => {
-                tracing::info!("departing daemon owner exited; rediscovering");
-                return Ok(());
-            }
-            _ => {}
+        let plan = discover_attach_plan(probe.status, probe.hello.is_some());
+        let published =
+            cockpit_host::daemon_lifecycle::read_daemon_pid_record(&probe.paths.pid_file);
+        if matches!(plan, DiscoverAttachPlan::AttachRunning) {
+            tracing::info!(
+                same_owner = published.is_some() && published == owner.receipt,
+                "daemon endpoint answers again; retrying the attach"
+            );
+            return Ok(());
+        }
+        if published.is_some() && published != owner.receipt {
+            tracing::info!("a successor daemon owner was published; rediscovering");
+            return Ok(());
+        }
+        if owner.has_exited() && daemon_lifetime_released(&probe.paths) {
+            tracing::info!(
+                "departing daemon owner exited and released its lifetime; rediscovering"
+            );
+            return Ok(());
         }
     }
 }

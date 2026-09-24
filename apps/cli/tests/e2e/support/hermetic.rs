@@ -459,7 +459,22 @@ struct PtyObserver {
     /// screen's header already drawn over the previous screen's body — so
     /// screen predicates are evaluated against this completed frame.
     completed_frame: Option<vt100::Screen>,
+    /// When output that is not part of a completed frame last arrived, if
+    /// any arrived after the latest frame boundary. Bytes past a boundary are
+    /// either a frame still being written (a burst that ends in its own
+    /// boundary within moments) or output that will never end in one — e.g.
+    /// a program the TUI handed the terminal to, which may enter its own
+    /// alternate screen and so is indistinguishable from the TUI resuming.
+    /// Once such output has been quiet for `UNFRAMED_QUIET`, it is a settled
+    /// state and the live screen is authoritative again.
+    unframed_since_boundary: Option<Instant>,
 }
+
+/// How long output past the last frame boundary must stay quiet before the
+/// live screen, not the captured frame, is what screen predicates read. Far
+/// longer than the gap between PTY reads of one ratatui frame (written with a
+/// single flush), far shorter than any screen-wait timeout.
+const UNFRAMED_QUIET: Duration = Duration::from_millis(250);
 
 /// Recognizes the child's full-redraw frame boundaries in the raw byte
 /// stream.
@@ -567,6 +582,7 @@ impl PtyObserver {
             osc52: Osc52Observer::new(),
             frames: FrameBoundaryObserver::default(),
             completed_frame: None,
+            unframed_since_boundary: None,
         }
     }
 
@@ -590,21 +606,33 @@ impl PtyObserver {
             };
         }
         self.parser.process(&bytes[fed..]);
+        if fed < bytes.len() {
+            self.unframed_since_boundary = Some(Instant::now());
+        } else if fed > 0 {
+            self.unframed_since_boundary = None;
+        }
     }
 
     /// The screen predicates should read: the last completed frame while the
-    /// child is drawing frames, otherwise the live screen (before the first
-    /// frame, outside the alternate screen, and after output ended so
-    /// post-exit text is visible).
+    /// child is drawing frames; otherwise the live screen — before the first
+    /// frame, outside the alternate screen, once output past the last frame
+    /// boundary has been quiet for `UNFRAMED_QUIET` (so a nested program's
+    /// output can never be hidden behind a stale frame), and after output
+    /// ended so post-exit text is visible.
     fn settled_screen(&self) -> &vt100::Screen {
-        self.completed_frame
-            .as_ref()
-            .unwrap_or_else(|| self.parser.screen())
+        let unframed_settled = self
+            .unframed_since_boundary
+            .is_some_and(|since| since.elapsed() >= UNFRAMED_QUIET);
+        match self.completed_frame.as_ref() {
+            Some(frame) if !unframed_settled => frame,
+            _ => self.parser.screen(),
+        }
     }
 
     fn finish(&mut self) {
         self.osc52.finish();
         self.completed_frame = None;
+        self.unframed_since_boundary = None;
     }
 }
 
@@ -2059,5 +2087,45 @@ mod frame_observer_tests {
             !visible(&observer).contains("partial"),
             "framed capture resumes after re-entering and clearing"
         );
+    }
+
+    /// A program the TUI hands the terminal to may enter its own alternate
+    /// screen and clear it, which is byte-for-byte what the TUI does when it
+    /// resumes, and may draw with cursor commands of its own. Its later
+    /// output without a cursor command must still become visible: a stale
+    /// captured frame can never hide settled output.
+    #[test]
+    fn a_nested_program_in_its_own_alternate_screen_cannot_hide_output() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1Htui frame\x1b[?25l");
+        // The TUI suspends; the editor enters its own alternate screen.
+        observer.feed(b"\x1b[?1049l");
+        observer.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1Heditor view\x1b[?25h");
+        assert!(visible(&observer).contains("editor view"));
+        observer.feed(b"\x1b[2;1Heditor typed text");
+        std::thread::sleep(UNFRAMED_QUIET + Duration::from_millis(50));
+        assert!(
+            visible(&observer).contains("editor typed text"),
+            "settled output past the last boundary is visible: {}",
+            visible(&observer)
+        );
+        // The editor leaves; the TUI resumes and draws a frame.
+        observer.feed(b"\x1b[?1049l\x1b[?1049h\x1b[2J\x1b[1;1Htui again\x1b[?25l");
+        assert!(visible(&observer).contains("tui again"));
+        assert!(!visible(&observer).contains("editor"));
+    }
+
+    /// A frame split across reads stays invisible while its remainder is
+    /// still arriving (well inside the quiet window).
+    #[test]
+    fn a_frame_split_across_reads_stays_invisible_until_it_completes() {
+        let mut observer = PtyObserver::new(4, 40);
+        observer.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1Hold frame\x1b[?25l");
+        observer.feed(b"\x1b[1;1Hnew hea");
+        observer.feed(b"der\x1b[2;1Hnew body\x1b[?2");
+        assert!(visible(&observer).contains("old frame"));
+        observer.feed(b"5l");
+        assert!(visible(&observer).contains("new header"));
+        assert!(visible(&observer).contains("new body"));
     }
 }

@@ -847,14 +847,14 @@ impl KnowledgeMutationRoot {
     /// Bounded read of one regular file directly beneath the root. Absence is
     /// `Ok(None)`; a symlink, a non-regular file, or an over-cap file fails.
     pub(crate) fn read_root_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        let leaf = knowledge_root_leaf(name)?;
+        validate_knowledge_root_leaf(name)?;
         let cap = crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd as _;
             let file = match cockpit_host::private_fs::held_fd::openat(
                 self.directory.as_raw_fd(),
-                &leaf,
+                &knowledge_root_leaf_cstring(name)?,
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             ) {
                 Ok(file) => file,
@@ -873,7 +873,6 @@ impl KnowledgeMutationRoot {
         }
         #[cfg(not(unix))]
         {
-            let _ = leaf;
             match cockpit_host::bounded::read_at_most(&self.path.join(name), cap) {
                 Ok(contents) => Ok(Some(contents)),
                 Err(cockpit_host::bounded::BoundedIoError::Io(error))
@@ -890,13 +889,13 @@ impl KnowledgeMutationRoot {
     /// Create or truncate one file directly beneath the root and write
     /// `contents`, never following a symlink at `name`.
     pub(crate) fn write_root_file(&self, name: &str, contents: &[u8]) -> Result<()> {
-        let leaf = knowledge_root_leaf(name)?;
+        validate_knowledge_root_leaf(name)?;
         #[cfg(unix)]
         let mut file = {
             use std::os::fd::AsRawFd as _;
             cockpit_host::private_fs::held_fd::openat_mode(
                 self.directory.as_raw_fd(),
-                &leaf,
+                &knowledge_root_leaf_cstring(name)?,
                 libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o666,
             )
@@ -904,7 +903,6 @@ impl KnowledgeMutationRoot {
         };
         #[cfg(not(unix))]
         let mut file = {
-            let _ = leaf;
             fs::File::create(self.path.join(name))
                 .with_context(|| format!("opening knowledge file {name} for writing"))?
         };
@@ -914,17 +912,18 @@ impl KnowledgeMutationRoot {
 
     /// Remove one file directly beneath the root. Absence is not an error.
     pub(crate) fn remove_root_file(&self, name: &str) -> Result<()> {
-        let leaf = knowledge_root_leaf(name)?;
+        validate_knowledge_root_leaf(name)?;
         #[cfg(unix)]
         let removed = {
             use std::os::fd::AsRawFd as _;
-            cockpit_host::private_fs::held_fd::unlinkat(self.directory.as_raw_fd(), &leaf, 0)
+            cockpit_host::private_fs::held_fd::unlinkat(
+                self.directory.as_raw_fd(),
+                &knowledge_root_leaf_cstring(name)?,
+                0,
+            )
         };
         #[cfg(not(unix))]
-        let removed = {
-            let _ = leaf;
-            fs::remove_file(self.path.join(name))
-        };
+        let removed = { fs::remove_file(self.path.join(name)) };
         match removed {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1057,16 +1056,10 @@ impl KnowledgeMutationRoot {
     }
 }
 
-/// A single root-level file name, as a C string on Unix.
+/// A validated root-level file name as a C string.
 #[cfg(unix)]
-fn knowledge_root_leaf(name: &str) -> Result<std::ffi::CString> {
-    validate_knowledge_root_leaf(name)?;
+fn knowledge_root_leaf_cstring(name: &str) -> Result<std::ffi::CString> {
     std::ffi::CString::new(name).context("knowledge file name has NUL")
-}
-
-#[cfg(not(unix))]
-fn knowledge_root_leaf(name: &str) -> Result<()> {
-    validate_knowledge_root_leaf(name)
 }
 
 fn validate_knowledge_root_leaf(name: &str) -> Result<()> {

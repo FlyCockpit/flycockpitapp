@@ -234,8 +234,9 @@ impl SecureStoreScreen {
         }
     }
 
-    fn confirm_selection(&mut self, cursor: usize) {
-        let (placement, capability_id) = match cursor {
+    /// The placement and gating capability of a choice row.
+    fn row_choice(index: usize) -> (cockpit_proto::OnboardingSecurePlacement, &'static str) {
+        match index {
             0 => (
                 cockpit_proto::OnboardingSecurePlacement::Automatic,
                 "secret_store.keyring",
@@ -248,7 +249,17 @@ impl SecureStoreScreen {
                 cockpit_proto::OnboardingSecurePlacement::MachineBoundFile,
                 "secret_store.file",
             ),
-        };
+        }
+    }
+
+    /// Placement under the cursor while choosing (test observation seam).
+    #[cfg(test)]
+    pub(crate) fn cursor_placement(&self) -> Option<cockpit_proto::OnboardingSecurePlacement> {
+        (self.phase == SecureStoreInputPhase::Choice).then(|| Self::row_choice(self.cursor).0)
+    }
+
+    fn confirm_selection(&mut self, cursor: usize) {
+        let (placement, capability_id) = Self::row_choice(cursor);
         let Some(capability) = self.capabilities.feature(capability_id) else {
             return;
         };
@@ -480,5 +491,83 @@ impl SecureStoreScreen {
                 "type password   tab switch   ctrl-r reveal   enter save   esc back"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cockpit_proto::{FeatureCapabilityRow, FeatureCapabilityState, OnboardingSecurePlacement};
+
+    fn capabilities(keyring: FeatureCapabilityState) -> cockpit_proto::HostCapabilitySnapshot {
+        let mut snapshot = cockpit_proto::HostCapabilitySnapshot::unpublished();
+        snapshot.features = [
+            ("secret_store.keyring", keyring),
+            ("secret_store.file", FeatureCapabilityState::Available),
+        ]
+        .into_iter()
+        .map(|(id, state)| FeatureCapabilityRow {
+            id: id.into(),
+            state,
+            reason: "test".into(),
+            fix_command: None,
+            remedy_text: None,
+            dependency_ids: Vec::new(),
+        })
+        .collect();
+        snapshot
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A headless host without a keyring: the cursor starts on the
+    /// passphrase file, Enter there only opens passphrase entry (no RPC), and
+    /// one Down reaches the machine-bound file, whose Enter submits.
+    #[test]
+    fn keyring_unavailable_defaults_to_passphrase_and_one_down_submits_machine_bound() {
+        let mut screen = SecureStoreScreen::new(capabilities(FeatureCapabilityState::Missing));
+        assert_eq!(
+            screen.cursor_placement(),
+            Some(OnboardingSecurePlacement::PassphraseFile)
+        );
+
+        screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(screen.phase, SecureStoreInputPhase::Passphrase);
+        assert!(screen.take_submission().is_none());
+        screen.handle_key(key(KeyCode::Esc));
+        assert_eq!(screen.phase, SecureStoreInputPhase::Choice);
+
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            screen.cursor_placement(),
+            Some(OnboardingSecurePlacement::MachineBoundFile)
+        );
+        // Wrapping skips the disabled keyring row.
+        screen.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            screen.cursor_placement(),
+            Some(OnboardingSecurePlacement::PassphraseFile)
+        );
+        screen.handle_key(key(KeyCode::Down));
+        screen.handle_key(key(KeyCode::Enter));
+        let submission = screen
+            .take_submission()
+            .expect("machine-bound Enter submits the intent");
+        assert_eq!(
+            submission.placement,
+            OnboardingSecurePlacement::MachineBoundFile
+        );
+        assert!(submission.passphrase.is_none());
+    }
+
+    #[test]
+    fn keyring_available_defaults_to_the_platform_keyring() {
+        let screen = SecureStoreScreen::new(capabilities(FeatureCapabilityState::Available));
+        assert_eq!(
+            screen.cursor_placement(),
+            Some(OnboardingSecurePlacement::Automatic)
+        );
     }
 }

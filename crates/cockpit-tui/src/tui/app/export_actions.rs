@@ -742,11 +742,23 @@ mod tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.agent_runner = Some(Ok(runner(session_id, tx)));
         app.export_transcript_json("first", &exports);
-        let first = rx.recv().await.unwrap();
+        let mut first = rx.recv().await.unwrap();
         app.export_debug_bundle(session_id, "second", &exports);
         tokio::task::yield_now().await;
         app.drain_async_actions();
         let second = rx.recv().await.unwrap();
+        // Replacing aborts the superseded task, but on a multi-thread runtime
+        // `JoinHandle::abort` only schedules the cancellation: the task's
+        // future (and with it the pending request's response receiver) is
+        // dropped by a worker thread, possibly after the replacement's own
+        // request was already delivered. Await that drop, bounded, before
+        // asserting the superseded response can no longer be delivered.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            first.response_tx.closed(),
+        )
+        .await
+        .expect("replacement must drop the superseded export's response receiver");
         assert!(
             first
                 .response_tx

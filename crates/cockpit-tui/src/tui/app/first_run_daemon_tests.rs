@@ -92,6 +92,36 @@ fn stage(app: &App) -> Option<OnboardingStage> {
         .map(|snapshot| snapshot.stage)
 }
 
+/// Move the secure-store cursor onto `placement` by observing the screen,
+/// never by counting relative key presses (disabled rows are skipped, so the
+/// starting row depends on the published capabilities), then submit it and
+/// assert the sensitive intent was actually dispatched.
+fn submit_secure_placement(app: &mut App, placement: cockpit_proto::OnboardingSecurePlacement) {
+    let cursor = |app: &App| {
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.test_secure_store_cursor_placement())
+    };
+    for _ in 0..3 {
+        if cursor(app) == Some(placement) {
+            break;
+        }
+        shell_key(app, KeyCode::Down);
+    }
+    assert_eq!(
+        cursor(app),
+        Some(placement),
+        "the secure-store choice must be able to select {placement:?}"
+    );
+    let pending_before = app.pending_startup_onboarding_operations.len();
+    shell_key(app, KeyCode::Enter);
+    assert!(
+        app.pending_startup_onboarding_operations.len() > pending_before,
+        "Enter on {placement:?} must dispatch the sensitive secure intent; toast={:?}",
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+    );
+}
+
 fn capability_available(app: &App, id: &str) -> bool {
     app.onboarding_snapshot
         .as_ref()
@@ -107,8 +137,15 @@ fn pump_once(app: &mut App) {
     let _ = app.service_onboarding_shell();
 }
 
+/// Upper bound for one onboarding stage crossing. Real vault
+/// materialization and the ready-service handoff can take well over ten
+/// seconds on a loaded CI runner; the loop still returns as soon as the
+/// condition holds.
+const ONBOARDING_PUMP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn pump_onboarding(app: &mut App, mut ready: impl FnMut(&App) -> bool, context: &str) {
-    for _ in 0..900 {
+    let deadline = std::time::Instant::now() + ONBOARDING_PUMP_DEADLINE;
+    while std::time::Instant::now() < deadline {
         pump_once(app);
         if ready(app) {
             return;
@@ -139,6 +176,10 @@ fn real_daemon_onboarding(cwd: &std::path::Path) -> RealDaemonOnboarding {
     let env = TestEnvGuard::isolate_cockpit_home_at(cwd);
     env.set_current_dir(cwd)
         .expect("enter the isolated onboarding workspace");
+    // The in-process daemon runs production (non-`cfg(test)`) code: without
+    // this switch its capability probe would touch the developer's real OS
+    // keyring, and the published snapshot would differ by host.
+    env.set_var("COCKPIT_TEST_NO_KEYRING", "1");
     // The profile wizard prefills its name field from USER/USERNAME; clear
     // both so the typed "Ada" is exactly the committed name (the guard
     // snapshots and restores them on drop).
@@ -512,23 +553,24 @@ fn advance_real_first_run_to_provider(app: &mut App) {
         "the repeated profile save and ordinary Advance to return to the secure-store choice",
     );
 
-    // Secure store: choose a placement the daemon actually reports as
-    // available (keyring availability is host-dependent). Prefer the
-    // passphrase-free machine-bound file vault for determinism. The
-    // submission is the real sensitive intent: the locked daemon
-    // materializes a real vault for the chosen placement and hands itself
-    // off to its ready services before replying.
-    let keyring = capability_available(app, "secret_store.keyring");
-    let file = capability_available(app, "secret_store.file");
+    // Secure store: the fixture disables the host keyring
+    // (`COCKPIT_TEST_NO_KEYRING`), so the published snapshot is identical on
+    // every host and the passphrase-free machine-bound file vault is the
+    // deterministic choice. The submission is the real sensitive intent: the
+    // locked daemon materializes a real vault for the chosen placement and
+    // hands itself off to its ready services before replying.
     assert!(
-        keyring || file,
-        "the daemon must expose at least one secure-store placement"
+        !capability_available(app, "secret_store.keyring"),
+        "the hermetic fixture must never report the host keyring"
     );
-    if file {
-        shell_key(app, KeyCode::Down);
-        shell_key(app, KeyCode::Down);
-    }
-    shell_key(app, KeyCode::Enter);
+    assert!(
+        capability_available(app, "secret_store.file"),
+        "the daemon must expose the file vault placement"
+    );
+    submit_secure_placement(
+        app,
+        cockpit_proto::OnboardingSecurePlacement::MachineBoundFile,
+    );
     pump_onboarding(
         app,
         |app| {

@@ -1122,6 +1122,10 @@ async fn lifecycle_restart_command_preserves_parked_session_and_starts_when_abse
 async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without_reexecute() {
     let (_provider, daemon, attached, interrupt_id, mut launch_barrier) =
         create_parked_session_with_blocked_replay().await;
+    // This test exists to prove real bwrap containment across a crash; fail
+    // in seconds with the daemon's own diagnosis when the host cannot run it.
+    #[cfg(target_os = "linux")]
+    require_host_sandbox(&daemon).await;
 
     restart_daemon_gracefully(&daemon).await;
     let client = daemon.client().await;
@@ -1148,22 +1152,51 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
     {
         let launched = launch_barrier.wait_for_launch();
         tokio::pin!(launched);
+        let deadline = tokio::time::sleep(LIFECYCLE_STEP_DEADLINE);
+        tokio::pin!(deadline);
         loop {
             tokio::select! {
                 () = &mut launched => break,
+                () = &mut deadline => panic!(
+                    "replayed host operation did not reach its launch barrier within {}s; \
+                     interrupt row: {:?}; log tail:\n{}",
+                    LIFECYCLE_STEP_DEADLINE.as_secs(),
+                    interrupt_row(&daemon.db_path(), interrupt_id).state,
+                    log_tail(daemon.home())
+                ),
                 event = client.next_event_unbounded() => {
-                    if let DaemonEvent::InterruptRaised {
-                        session_id,
-                        interrupt_id: launch_interrupt,
-                        ..
-                    } = event.expect("daemon event while crossing host-operation launch barrier")
-                        && session_id == attached.session_id
-                    {
-                        let approve = offered_approval_option(&daemon.db_path(), launch_interrupt);
-                        client
-                            .answer_interrupt_option(launch_interrupt, approve)
-                            .await
-                            .expect("approve launch-barrier operation");
+                    match event.expect("daemon event while crossing host-operation launch barrier") {
+                        DaemonEvent::InterruptRaised {
+                            session_id,
+                            interrupt_id: launch_interrupt,
+                            ..
+                        } if session_id == attached.session_id => {
+                            let approve =
+                                offered_approval_option(&daemon.db_path(), launch_interrupt);
+                            client
+                                .answer_interrupt_option(launch_interrupt, approve)
+                                .await
+                                .expect("approve launch-barrier operation");
+                        }
+                        // A terminal tool event before the launch byte means
+                        // the replay failed (e.g. the sandbox refused to
+                        // start) instead of launching: fail now, not at the
+                        // runner's timeout.
+                        DaemonEvent::ToolEnd {
+                            session_id,
+                            call_id,
+                            ..
+                        }
+                        | DaemonEvent::ToolError {
+                            session_id,
+                            call_id,
+                            ..
+                        } if session_id == attached.session_id => panic!(
+                            "replayed tool {call_id} reached a terminal event before its launch \
+                             barrier; log tail:\n{}",
+                            log_tail(daemon.home())
+                        ),
+                        _ => {}
                     }
                 }
             }
@@ -1181,12 +1214,20 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         .attach(daemon.project_path(), Some(attached.session_id), None, true)
         .await
         .expect("reattach session");
+    let reconcile_deadline = tokio::time::Instant::now() + LIFECYCLE_STEP_DEADLINE;
     loop {
-        match client
-            .next_event_unbounded()
+        let event = tokio::time::timeout_at(reconcile_deadline, client.next_event_unbounded())
             .await
-            .expect("daemon event while awaiting interrupted reconciliation")
-        {
+            .unwrap_or_else(|_| {
+                panic!(
+                    "restarted daemon did not reconcile interrupt {interrupt_id} to interrupted \
+                     within {}s; interrupt row state: {}; log tail:\n{}",
+                    LIFECYCLE_STEP_DEADLINE.as_secs(),
+                    interrupt_row(&daemon.db_path(), interrupt_id).state,
+                    log_tail(daemon.home())
+                )
+            });
+        match event.expect("daemon event while awaiting interrupted reconciliation") {
             DaemonEvent::InterruptInterrupted {
                 session_id,
                 interrupt_id: reconciled_interrupt_id,
@@ -1223,6 +1264,49 @@ async fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without
         open_tool_recovery_decision(&daemon.db_path(), attached.session_id).is_none(),
         "skip must settle the recovery decision"
     );
+}
+
+/// Upper bound for one step of the SIGKILL lifecycle test. Each wait returns
+/// as soon as its event arrives; the bound turns a divergence into a labelled
+/// failure with the daemon log instead of a silent runner timeout.
+const LIFECYCLE_STEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Require the daemon-published `sandbox.host` capability (bubblewrap plus
+/// unprivileged user namespaces). A host without it — e.g. Ubuntu 23.10+
+/// with `kernel.apparmor_restrict_unprivileged_userns=1` — fails immediately
+/// with the daemon's reason and fix command.
+#[cfg(target_os = "linux")]
+async fn require_host_sandbox(daemon: &SpawnedDaemon) {
+    let client = daemon.client().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match client
+            .host_capability("sandbox.host")
+            .await
+            .expect("read daemon host capabilities")
+        {
+            Some(capability) if capability.available => return,
+            Some(capability) => panic!(
+                "this test requires a working bubblewrap sandbox (bwrap + unprivileged user \
+                 namespaces), but the daemon reports sandbox.host {}: {}; fix: {}",
+                capability.state,
+                capability.reason,
+                capability
+                    .fix_command
+                    .or(capability.remedy_text)
+                    .unwrap_or_else(
+                        || "install bubblewrap and allow unprivileged user namespaces".to_string()
+                    )
+            ),
+            None if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            None => panic!(
+                "daemon never published the sandbox.host capability; log tail:\n{}",
+                log_tail(daemon.home())
+            ),
+        }
+    }
 }
 
 fn open_tool_recovery_decision(db_path: &Path, session_id: Uuid) -> Option<Uuid> {

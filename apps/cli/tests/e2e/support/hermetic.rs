@@ -451,6 +451,61 @@ struct PtyHandles {
 struct PtyObserver {
     parser: vt100::Parser,
     osc52: Osc52Observer,
+    frames: FrameBoundaryObserver,
+}
+
+/// Recognizes the child's full-redraw frame boundaries in the raw byte
+/// stream.
+///
+/// The TUI renders through ratatui's crossterm backend. When the terminal
+/// size changes, `Terminal::try_draw` autoresizes first, which clears the
+/// whole screen (`ESC [ 2 J`) and resets its diff buffers, then writes the
+/// complete frame and ends every draw with its cursor command (`ESC [ ? 25 l`
+/// to hide or `ESC [ ? 25 h` to show). A cursor command that follows the most
+/// recent full clear therefore proves a whole post-resize frame reached the
+/// parser, not merely its first bytes (the clear itself leaves a blank grid).
+#[derive(Default)]
+struct FrameBoundaryObserver {
+    /// Trailing bytes of the previous chunk, so a sequence split across two
+    /// PTY reads is still recognized exactly once.
+    tail: Vec<u8>,
+    /// Full-screen clears seen so far.
+    clears: u64,
+    /// Value of `clears` when the most recent frame-ending cursor command
+    /// was seen.
+    frame_completed_after_clear: u64,
+}
+
+impl FrameBoundaryObserver {
+    const CLEAR_ALL: &'static [u8] = b"\x1b[2J";
+    const HIDE_CURSOR: &'static [u8] = b"\x1b[?25l";
+    const SHOW_CURSOR: &'static [u8] = b"\x1b[?25h";
+    const LONGEST: usize = 6;
+
+    fn feed(&mut self, bytes: &[u8]) {
+        let carried = self.tail.len();
+        let mut window = std::mem::take(&mut self.tail);
+        window.extend_from_slice(bytes);
+        for end in 1..=window.len() {
+            // Count only sequences that end inside the new bytes; ones that
+            // ended inside the carried tail were counted by the last feed.
+            if end <= carried {
+                continue;
+            }
+            let prefix = &window[..end];
+            if prefix.ends_with(Self::CLEAR_ALL) {
+                self.clears += 1;
+            } else if prefix.ends_with(Self::HIDE_CURSOR) || prefix.ends_with(Self::SHOW_CURSOR) {
+                self.frame_completed_after_clear = self.clears;
+            }
+        }
+        let keep = window.len().min(Self::LONGEST - 1);
+        self.tail = window[window.len() - keep..].to_vec();
+    }
+
+    fn position(&self) -> (u64, u64) {
+        (self.clears, self.frame_completed_after_clear)
+    }
 }
 
 #[cfg(any(
@@ -470,12 +525,16 @@ impl PtyObserver {
         Self {
             parser: vt100::Parser::new(rows, cols, 0),
             osc52: Osc52Observer::new(),
+            frames: FrameBoundaryObserver::default(),
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
         self.osc52.feed(bytes);
         self.parser.process(bytes);
+        // After the parser: once a boundary is visible, its frame's cells
+        // already are (both are read under the same observer lock).
+        self.frames.feed(bytes);
     }
 
     fn finish(&mut self) {
@@ -1371,18 +1430,133 @@ impl HermeticCockpit {
         }
     }
 
-    /// After injecting bytes, force a same-size SIGWINCH so the child must
-    /// redraw. Input bytes are written to the PTY before the resize, so the
-    /// kernel buffer contains them first. The redraw is the observable
-    /// render boundary used by no-op comparisons.
+    /// Full-clear/frame-completion position of the child's output.
+    fn frame_position(&self) -> (u64, u64) {
+        self.pty
+            .as_ref()
+            .and_then(|pty| {
+                pty.observer
+                    .lock()
+                    .ok()
+                    .map(|observer| observer.frames.position())
+            })
+            .unwrap_or((0, 0))
+    }
+
+    /// Unread bytes in the child's terminal input queue, read with
+    /// `FIONREAD` on a transient, non-controlling handle to the PTY slave
+    /// (closed again immediately so the child's hangup semantics and the
+    /// reader's EOF detection are unaffected). `None` when the slave cannot
+    /// be observed.
+    fn child_unread_input_bytes(&self) -> Option<usize> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = self.pty.as_ref()?.master.tty_name()?;
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let mut unread: libc::c_int = 0;
+        // SAFETY: `slave` is an open descriptor for the duration of the call
+        // and `unread` is a valid `c_int` out-pointer, as FIONREAD requires.
+        let rc = unsafe { libc::ioctl(slave.as_raw_fd(), libc::FIONREAD, &mut unread) };
+        (rc == 0).then(|| usize::try_from(unread).unwrap_or(0))
+    }
+
+    /// Wait until the child has read every byte injected so far.
+    ///
+    /// crossterm's Unix event source (0.29) polls the tty and its SIGWINCH
+    /// pipe through edge-triggered mio. When one wake reports both, and the
+    /// signal is handled first, it returns the `Resize` without reading the
+    /// tty, and the unread input stays stranded until the *next* input byte
+    /// raises a new edge. A resize barrier sent while injected bytes are
+    /// still unread can therefore make those bytes (and any follow-up input
+    /// that races the next barrier) disappear from the child's view. The
+    /// barrier must never overlap unread input.
+    ///
+    /// Linux hands master writes to the slave line discipline
+    /// asynchronously, so an empty queue observed immediately after a write
+    /// may predate the bytes' arrival: the queue must be seen empty after it
+    /// was seen non-empty, or stay empty for the arrival grace.
+    fn wait_for_child_to_read_input(&self, timeout: Duration) {
+        const ARRIVAL_GRACE: Duration = Duration::from_millis(25);
+        let started = Instant::now();
+        let mut seen_unread = false;
+        loop {
+            match self.child_unread_input_bytes() {
+                None => return,
+                Some(0) if seen_unread || started.elapsed() >= ARRIVAL_GRACE => return,
+                Some(0) => {}
+                Some(_) => seen_unread = true,
+            }
+            if started.elapsed() >= timeout {
+                panic!(
+                    "the PTY child did not read its injected input within {timeout:?} \
+                     ({:?} bytes unread)",
+                    self.child_unread_input_bytes()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Wait until the child has cleared the screen after `clears_before`
+    /// clears (ratatui's autoresize) and then finished the frame drawn on
+    /// that cleared screen.
+    fn wait_for_full_redraw(&mut self, clears_before: u64, label: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut delay = Duration::from_millis(2);
+        loop {
+            let (clears, completed) = self.frame_position();
+            if clears > clears_before && completed == clears {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {label} (clears={clears} before={clears_before} \
+                     frame_completed_after_clear={completed} output_bytes={})",
+                    self.output_bytes()
+                );
+            }
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_millis(20));
+        }
+    }
+
+    /// After injecting bytes, force two genuine size changes so the child
+    /// must redraw twice. A same-size `TIOCSWINSZ` is a no-op: Linux
+    /// (`tty_do_resize`) and the BSDs/macOS only raise SIGWINCH when the
+    /// window size actually changes, so the barrier toggles one column away
+    /// and back. Each leg waits for the child's complete autoresize redraw
+    /// (full clear, then the frame's closing cursor command), never merely
+    /// its first output bytes: the first bytes of a resize redraw are the
+    /// full clear, and a snapshot taken there sees a blank or half-painted
+    /// grid. After the restore leg the parser therefore holds one whole
+    /// frame at the original size. SIGWINCH is out of band, so this is a
+    /// render boundary, and it is only sent once the child has read the
+    /// injected bytes (see [`Self::wait_for_child_to_read_input`]); reading
+    /// is not handling, so callers that need an input effect must still wait
+    /// for its semantic screen change. The bound is generous for loaded CI
+    /// runners; each wait returns as soon as its condition holds.
     pub fn checkpoint_input_with_redraw(&mut self) {
-        let prev = self.output_bytes();
+        const REDRAW_TIMEOUT: Duration = Duration::from_secs(30);
         let (cols, rows) = self.pty_size().expect("PTY size");
+        let toggled = if cols > 1 { cols - 1 } else { cols + 1 };
+        self.wait_for_child_to_read_input(REDRAW_TIMEOUT);
+        let (clears, _) = self.frame_position();
+        self.resize(toggled, rows);
+        self.wait_for_full_redraw(
+            clears,
+            "full redraw after toggling the PTY width away from its size",
+            REDRAW_TIMEOUT,
+        );
+        let (clears, _) = self.frame_position();
         self.resize(cols, rows);
-        self.wait_for_output_progress(
-            prev,
-            "same-size resize redraw after injected input",
-            Duration::from_secs(2),
+        self.wait_for_full_redraw(
+            clears,
+            "full redraw after restoring the PTY width",
+            REDRAW_TIMEOUT,
         );
     }
 

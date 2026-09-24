@@ -14,7 +14,7 @@ use cockpit_host::private_fs::{
     write_private_file, write_private_file_exclusive,
 };
 
-use super::error::SecureKeyError;
+use super::error::{KekFailureCause, SecureKeyError};
 use super::key_material::{KEY_BYTE_LEN, SecureKeyBytes, TempSecret};
 use super::native_store::{KeyringNativeStore, NativeKeyStore};
 
@@ -145,6 +145,7 @@ impl Argon2WorkMemory {
         blocks
             .try_reserve_exact(block_count)
             .map_err(|error| SecureKeyError::KekUnavailable {
+                cause: KekFailureCause::Internal,
                 reason: format!("allocating passphrase KDF workspace: {error}"),
                 fix_command: None,
             })?;
@@ -233,6 +234,7 @@ impl fmt::Debug for dyn KekStore {
 pub fn file_kek_supported() -> Result<(), SecureKeyError> {
     if cfg!(windows) && !PRIVATE_FS_POLICY.windows_dacl_enforced {
         return Err(SecureKeyError::KekUnavailable {
+            cause: KekFailureCause::FileVaultUnsupported,
             reason: "Windows file KEK requires an owner-only DACL (PRIVATE_FS_POLICY.windows_dacl_enforced)"
                 .into(),
             fix_command: Some(
@@ -242,6 +244,7 @@ pub fn file_kek_supported() -> Result<(), SecureKeyError> {
     }
     if !cfg!(unix) && !cfg!(windows) {
         return Err(SecureKeyError::KekUnavailable {
+            cause: KekFailureCause::FileVaultUnsupported,
             reason: "file KEK is unsupported on this platform".into(),
             fix_command: None,
         });
@@ -266,6 +269,7 @@ impl FileKekStore {
     pub fn new(dir: PathBuf) -> Result<Self, SecureKeyError> {
         file_kek_supported()?;
         ensure_private_dir(&dir).map_err(|e| SecureKeyError::KekUnavailable {
+            cause: KekFailureCause::VaultStorage,
             reason: format!("cannot create private KEK directory: {e}"),
             fix_command: None,
         })?;
@@ -294,6 +298,7 @@ impl KekStore for FileKekStore {
         file_kek_supported()?;
         let path = kek_file_path(&self.dir, version);
         write_private_file(&path, bytes).map_err(|e| SecureKeyError::KekUnavailable {
+            cause: KekFailureCause::VaultStorage,
             reason: format!("writing file KEK: {e}"),
             fix_command: None,
         })
@@ -309,6 +314,7 @@ impl KekStore for FileKekStore {
                 )
             } else {
                 SecureKeyError::KekUnavailable {
+                    cause: KekFailureCause::VaultStorage,
                     reason: format!("writing file KEK exclusively: {e}"),
                     fix_command: None,
                 }
@@ -322,6 +328,7 @@ impl KekStore for FileKekStore {
             Ok(Some(bytes)) => Ok(TempSecret::from_vec(bytes)),
             Ok(None) => Err(SecureKeyError::NotFound("file KEK missing".into())),
             Err(e) => Err(SecureKeyError::KekUnavailable {
+                cause: KekFailureCause::VaultStorage,
                 reason: format!("reading file KEK: {e}"),
                 fix_command: None,
             }),
@@ -436,6 +443,7 @@ fn derive_passphrase_kek(
             &mut memory,
         )
         .map_err(|error| SecureKeyError::KekUnavailable {
+            cause: KekFailureCause::Passphrase,
             reason: format!("deriving passphrase vault KEK: {error}"),
             fix_command: None,
         })?;

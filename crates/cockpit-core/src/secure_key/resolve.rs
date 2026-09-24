@@ -12,7 +12,7 @@ use cockpit_proto::{SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot
 
 use crate::db::Db;
 
-use super::error::SecureKeyError;
+use super::error::{KekFailureCause, SecureKeyError};
 use super::kek_store::{
     FileKekStore, KekStore, KeyringKekStore, Passphrase, PassphraseKdfParams, PassphraseKekStore,
     file_kek_supported,
@@ -87,6 +87,7 @@ pub fn first_run_secret_store_capabilities(
         Err(SecureKeyError::KekUnavailable {
             reason,
             fix_command,
+            ..
         }) => FirstRunSecretStoreCapabilities {
             keyring: keyring.clone(),
             file_vault_available: false,
@@ -119,6 +120,8 @@ pub struct EffectiveSecretStore {
 
 #[derive(Debug, Clone)]
 pub struct KekUnavailable {
+    /// Typed failure class; boundaries branch on this, never on `reason`.
+    pub cause: KekFailureCause,
     pub reason: String,
     pub fix_command: Option<String>,
     pub intent: SecretStoreIntent,
@@ -136,6 +139,7 @@ impl KekUnavailable {
 
     pub fn into_error(self) -> SecureKeyError {
         SecureKeyError::KekUnavailable {
+            cause: self.cause,
             reason: self.reason,
             fix_command: self.fix_command,
         }
@@ -306,6 +310,7 @@ pub fn resolve_secret_store_with_intent(
             && !keyring_available(keyring_probe) =>
         {
             Err(KekUnavailable {
+                cause: KekFailureCause::KeyringUnavailable,
                 reason: keyring_probe.reason.clone(),
                 fix_command: keyring_probe
                     .fix_command
@@ -317,6 +322,7 @@ pub fn resolve_secret_store_with_intent(
         None if let Some(placement) = first_run_intent.placement() => Ok(placement),
         None if keyring_available(keyring_probe) => Ok(SecretVaultPlacement::Keyring),
         None if keyring_probe_failed(keyring_probe) => Err(KekUnavailable {
+            cause: KekFailureCause::KeyringUnavailable,
             reason: keyring_probe.reason.clone(),
             fix_command: keyring_probe
                 .fix_command
@@ -331,6 +337,7 @@ pub fn resolve_secret_store_with_intent(
                 Ok(SecretVaultPlacement::Keyring)
             }
             SecretVaultPlacement::Keyring => Err(KekUnavailable {
+                cause: KekFailureCause::KeyringUnavailable,
                 reason: keyring_probe.reason.clone(),
                 fix_command: keyring_probe
                     .fix_command
@@ -386,6 +393,7 @@ pub fn ensure_secret_vault_with_options(
         Err(error) => Err(error),
     }
     .map_err(|e| KekUnavailable {
+        cause: KekFailureCause::LocalState,
         reason: format!("installation identity: {e}"),
         fix_command: None,
         intent: SecretStoreIntent::Unconfigured,
@@ -394,6 +402,7 @@ pub fn ensure_secret_vault_with_options(
     let mut authority = db
         .blocking_write_for_sync_maintenance(load_authority_conn)
         .map_err(|e| KekUnavailable {
+            cause: KekFailureCause::LocalState,
             reason: format!("reading secret vault authority: {e}"),
             fix_command: None,
             intent: SecretStoreIntent::Unconfigured,
@@ -404,6 +413,7 @@ pub fn ensure_secret_vault_with_options(
         && options.first_run_intent != FirstRunSecretStoreIntent::FilePassphrase
     {
         return Err(KekUnavailable {
+            cause: KekFailureCause::InvalidRequest,
             reason: "a passphrase may be supplied only with the FilePassphrase first-run intent"
                 .into(),
             fix_command: None,
@@ -415,6 +425,7 @@ pub fn ensure_secret_vault_with_options(
         && options.passphrase.is_none()
     {
         return Err(KekUnavailable {
+            cause: KekFailureCause::InvalidRequest,
             reason: "first-run passphrase vault initialization requires a passphrase".into(),
             fix_command: None,
             intent: SecretStoreIntent::Database,
@@ -436,6 +447,7 @@ pub fn ensure_secret_vault_with_options(
         authority = db
             .blocking_write_for_sync_maintenance(load_authority_conn)
             .map_err(|e| KekUnavailable {
+                cause: KekFailureCause::LocalState,
                 reason: format!("reloading secret vault authority after resume: {e}"),
                 fix_command: None,
                 intent: SecretStoreIntent::Unconfigured,
@@ -448,6 +460,7 @@ pub fn ensure_secret_vault_with_options(
         && options.passphrase.is_some()
     {
         return Err(KekUnavailable {
+            cause: KekFailureCause::InvalidRequest,
             reason: "a passphrase was supplied for a vault that is not passphrase-backed".into(),
             fix_command: None,
             intent: SecretStoreIntent::Unconfigured,
@@ -493,6 +506,7 @@ pub fn ensure_secret_vault_with_options(
             Err(error) if error.to_string().contains("already") => {
                 SecretVault::open(db.clone(), kek_store, installation).map_err(|e| {
                     KekUnavailable {
+                        cause: KekFailureCause::of(&e),
                         reason: e.to_string(),
                         fix_command: None,
                         intent: placement_intent(placement),
@@ -501,6 +515,7 @@ pub fn ensure_secret_vault_with_options(
             }
             Err(error) => {
                 return Err(KekUnavailable {
+                    cause: KekFailureCause::of(&error),
                     reason: error.to_string(),
                     fix_command: None,
                     intent: placement_intent(placement),
@@ -509,6 +524,7 @@ pub fn ensure_secret_vault_with_options(
         }
     } else {
         SecretVault::open(db.clone(), kek_store, installation).map_err(|e| KekUnavailable {
+            cause: KekFailureCause::of(&e),
             reason: e.to_string(),
             fix_command: match &e {
                 SecureKeyError::KekUnavailable { fix_command, .. } => fix_command.clone(),
@@ -521,6 +537,7 @@ pub fn ensure_secret_vault_with_options(
     let authority = db
         .blocking_write_for_sync_maintenance(load_authority_conn)
         .map_err(|e| KekUnavailable {
+            cause: KekFailureCause::LocalState,
             reason: format!("reading secret vault authority: {e}"),
             fix_command: None,
             intent: placement_intent(placement),
@@ -545,6 +562,7 @@ fn resume_open_kek_migrate(
     let open = db
         .blocking_write_for_sync_maintenance(list_open_sagas_conn)
         .map_err(|e| KekUnavailable {
+            cause: KekFailureCause::LocalState,
             reason: format!("listing secret vault sagas: {e}"),
             fix_command: None,
             intent: SecretStoreIntent::Unconfigured,
@@ -606,6 +624,7 @@ fn resume_open_kek_migrate(
         &super::migrate::VaultFault::default(),
     )
     .map_err(|e| KekUnavailable {
+        cause: KekFailureCause::of(&e),
         reason: format!("resuming KEK migrate: {e}"),
         fix_command: match &e {
             SecureKeyError::KekUnavailable { fix_command, .. } => fix_command.clone(),
@@ -638,14 +657,17 @@ fn kek_store_for_placement(
             if first_run {
                 file_kek_supported().map_err(|e| match e {
                     SecureKeyError::KekUnavailable {
+                        cause,
                         reason,
                         fix_command,
                     } => KekUnavailable {
+                        cause,
                         reason,
                         fix_command,
                         intent: SecretStoreIntent::Database,
                     },
                     other => KekUnavailable {
+                        cause: KekFailureCause::of(&other),
                         reason: other.to_string(),
                         fix_command: None,
                         intent: SecretStoreIntent::Database,
@@ -655,6 +677,7 @@ fn kek_store_for_placement(
             FileKekStore::new(kek_dir.to_path_buf())
                 .map(|s| Arc::new(s) as Arc<dyn KekStore>)
                 .map_err(|e| KekUnavailable {
+                    cause: KekFailureCause::of(&e),
                     reason: e.to_string(),
                     fix_command: None,
                     intent: SecretStoreIntent::Database,
@@ -682,6 +705,7 @@ fn kek_store_for_vault(
     match (placement, file_kek_mode) {
         (SecretVaultPlacement::Database, Some(SecretVaultFileKekMode::Passphrase)) => {
             let passphrase = passphrase.take().ok_or_else(|| KekUnavailable {
+                cause: KekFailureCause::Passphrase,
                 reason: "this passphrase vault requires the passphrase after every daemon restart"
                     .into(),
                 fix_command: None,
@@ -693,16 +717,19 @@ fn kek_store_for_vault(
                 let row = db
                     .blocking_write_for_sync_maintenance(load_passphrase_kdf_conn)
                     .map_err(|error| KekUnavailable {
+                        cause: KekFailureCause::LocalState,
                         reason: format!("loading passphrase vault KDF parameters: {error}"),
                         fix_command: None,
                         intent: SecretStoreIntent::Database,
                     })?
                     .ok_or_else(|| KekUnavailable {
+                        cause: KekFailureCause::Corrupt,
                         reason: "passphrase vault KDF parameters are missing".into(),
                         fix_command: None,
                         intent: SecretStoreIntent::Database,
                     })?;
                 let params = PassphraseKdfParams::from_db(row).map_err(|error| KekUnavailable {
+                    cause: KekFailureCause::of(&error),
                     reason: error.to_string(),
                     fix_command: None,
                     intent: SecretStoreIntent::Database,
@@ -712,12 +739,14 @@ fn kek_store_for_vault(
             store
                 .map(|store| Arc::new(store) as Arc<dyn KekStore>)
                 .map_err(|error| KekUnavailable {
+                    cause: KekFailureCause::of(&error),
                     reason: error.to_string(),
                     fix_command: None,
                     intent: SecretStoreIntent::Database,
                 })
         }
         (SecretVaultPlacement::Database, None) => Err(KekUnavailable {
+            cause: KekFailureCause::Corrupt,
             reason: "database vault authority is missing its durable file KEK mode".into(),
             fix_command: None,
             intent: SecretStoreIntent::Database,

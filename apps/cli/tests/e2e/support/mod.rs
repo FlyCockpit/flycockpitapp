@@ -565,9 +565,14 @@ struct OwnedSandboxDescendant {
 
 #[cfg(target_os = "linux")]
 impl OwnedSandboxDescendants {
+    /// Wait (bounded) for every pinned descendant to exit. A descendant that
+    /// outlives its SIGKILLed owner past the deadline is a containment
+    /// failure, reported with its identity instead of hanging the runner.
     pub fn assert_exited(self) {
         use std::os::fd::AsRawFd as _;
 
+        const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + EXIT_DEADLINE;
         for process in &self.processes {
             let mut pollfd = libc::pollfd {
                 fd: process.pidfd.as_raw_fd(),
@@ -575,11 +580,22 @@ impl OwnedSandboxDescendants {
                 revents: 0,
             };
             loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let timeout_ms =
+                    libc::c_int::try_from(remaining.as_millis()).unwrap_or(libc::c_int::MAX);
                 // SAFETY: `pollfd` points to one initialized entry whose fd is
                 // an owned pidfd retained by `process` for the whole call. A
                 // pidfd becoming readable is the kernel completion signal for
-                // this exact process; the enclosing test runner owns hangs.
-                let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+                // this exact process.
+                let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+                if ready == 0 {
+                    panic!(
+                        "owned sandbox descendant {} ({}) was still alive {}s after its daemon was killed",
+                        process.pid,
+                        process.command,
+                        EXIT_DEADLINE.as_secs()
+                    );
+                }
                 if ready > 0 && pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
                     panic!(
                         "waiting for owned sandbox descendant {} ({}) returned invalid pidfd readiness {:#x}",

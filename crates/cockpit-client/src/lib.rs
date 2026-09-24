@@ -816,36 +816,7 @@ impl DaemonClient {
         match proto::decode_sensitive_onboarding_response(&response).map_err(anyhow::Error::msg)? {
             proto::SensitiveOnboardingIntentResponse::Applied(result) => Ok(Ok(result)),
             proto::SensitiveOnboardingIntentResponse::Rejected(reason) => {
-                let (code, message) = match reason {
-                    proto::SensitiveOnboardingIntentError::Unauthorized => (
-                        proto::ErrorCode::Authorization,
-                        "onboarding secure intent was not authorized",
-                    ),
-                    proto::SensitiveOnboardingIntentError::InvalidRequest => (
-                        proto::ErrorCode::BadRequest,
-                        "onboarding secure intent was invalid",
-                    ),
-                    proto::SensitiveOnboardingIntentError::RevisionConflict => (
-                        proto::ErrorCode::Conflict,
-                        "onboarding secure intent revision conflicted",
-                    ),
-                    proto::SensitiveOnboardingIntentError::PlacementUnavailable => (
-                        proto::ErrorCode::BadRequest,
-                        "selected onboarding secure placement is unavailable",
-                    ),
-                    proto::SensitiveOnboardingIntentError::MaterializationFailed => (
-                        proto::ErrorCode::Internal,
-                        "selected onboarding secure placement could not be materialized",
-                    ),
-                    proto::SensitiveOnboardingIntentError::ReadyConstructionFailed => (
-                        proto::ErrorCode::Internal,
-                        "onboarding vault materialized but ready construction failed; retry ready construction",
-                    ),
-                };
-                Ok(Err(ErrorPayload {
-                    code,
-                    message: message.into(),
-                }))
+                Ok(Err(sensitive_onboarding_rejection_payload(reason)))
             }
         }
     }
@@ -1623,10 +1594,95 @@ fn load_owner_capability(socket: &Path) -> Option<proto::OwnerCapabilityToken> {
         Some(proto::OwnerCapabilityToken::new(token.to_string()))
     }
 }
+
+/// Map a fixed sensitive-onboarding rejection to the caller-facing payload.
+/// Placement failures carry their typed reason so the user sees the real
+/// cause and remedy instead of a generic "unavailable".
+fn sensitive_onboarding_rejection_payload(
+    reason: proto::SensitiveOnboardingIntentError,
+) -> ErrorPayload {
+    let (code, message) = match reason {
+        proto::SensitiveOnboardingIntentError::Unauthorized => (
+            proto::ErrorCode::Authorization,
+            "onboarding secure intent was not authorized".to_string(),
+        ),
+        proto::SensitiveOnboardingIntentError::InvalidRequest => (
+            proto::ErrorCode::BadRequest,
+            "onboarding secure intent was invalid".to_string(),
+        ),
+        proto::SensitiveOnboardingIntentError::RevisionConflict => (
+            proto::ErrorCode::Conflict,
+            "onboarding secure intent revision conflicted".to_string(),
+        ),
+        proto::SensitiveOnboardingIntentError::PlacementUnavailable(reason) => (
+            proto::ErrorCode::BadRequest,
+            format!(
+                "selected onboarding secure placement is unavailable: {}",
+                reason.description()
+            ),
+        ),
+        proto::SensitiveOnboardingIntentError::MaterializationFailed(reason) => (
+            proto::ErrorCode::Internal,
+            format!(
+                "selected onboarding secure placement could not be materialized: {}",
+                reason.description()
+            ),
+        ),
+        proto::SensitiveOnboardingIntentError::ReadyConstructionFailed => (
+            proto::ErrorCode::Internal,
+            "onboarding vault materialized but ready construction failed; retry ready construction"
+                .to_string(),
+        ),
+    };
+    ErrorPayload { code, message }
+}
+
 #[cfg(test)]
 #[cfg(any(unix, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sensitive_onboarding_placement_rejections_surface_their_typed_reason() {
+        for reason in proto::SecurePlacementFailureReason::ALL {
+            let unavailable = sensitive_onboarding_rejection_payload(
+                proto::SensitiveOnboardingIntentError::PlacementUnavailable(reason),
+            );
+            assert_eq!(unavailable.code, proto::ErrorCode::BadRequest);
+            assert!(
+                unavailable.message.ends_with(reason.description()),
+                "{reason:?}: {}",
+                unavailable.message
+            );
+            let failed = sensitive_onboarding_rejection_payload(
+                proto::SensitiveOnboardingIntentError::MaterializationFailed(reason),
+            );
+            assert_eq!(failed.code, proto::ErrorCode::Internal);
+            assert!(
+                failed.message.ends_with(reason.description()),
+                "{reason:?}: {}",
+                failed.message
+            );
+        }
+        let locked = sensitive_onboarding_rejection_payload(
+            proto::SensitiveOnboardingIntentError::PlacementUnavailable(
+                proto::SecurePlacementFailureReason::KeyringLocked,
+            ),
+        );
+        assert!(
+            locked.message.contains("keyring is locked"),
+            "{}",
+            locked.message
+        );
+        // The ready-construction retry discriminator the TUI relies on stays stable.
+        assert!(
+            sensitive_onboarding_rejection_payload(
+                proto::SensitiveOnboardingIntentError::ReadyConstructionFailed
+            )
+            .message
+            .contains("retry ready construction")
+        );
+    }
     #[cfg(unix)]
     use tokio::net::UnixListener;
 

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
-use super::error::SecureKeyError;
+use super::error::{KekFailureCause, SecureKeyError};
 use super::kek_store::KekStore;
 use super::key_material::SecureKeyBytes;
 use super::platform::KeyringProbeResult;
@@ -57,6 +57,7 @@ impl VaultFault {
 pub fn reject_keyring_if_unavailable(probe: &KeyringProbeResult) -> Result<(), SecureKeyError> {
     if probe.state != FeatureCapabilityState::Available {
         return Err(SecureKeyError::KekUnavailable {
+            cause: KekFailureCause::KeyringUnavailable,
             reason: probe.reason.clone(),
             fix_command: probe
                 .fix_command

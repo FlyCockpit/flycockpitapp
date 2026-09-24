@@ -401,57 +401,131 @@ fn departing_owner_recovery_requires_a_close_or_a_gone_listener() {
     )));
 }
 
-/// The departing-owner wait is pinned to the receipt captured before the
-/// attach (never a bare pid): an owner without a receipt fails closed, and an
-/// owner that exited and released its endpoint lets the resolver rediscover.
-#[tokio::test(flavor = "current_thread")]
-async fn departing_owner_wait_is_pinned_to_the_captured_receipt() {
-    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+async fn isolated_canonical_paths(
+    env: &crate::test_env::TestEnvGuard,
+) -> crate::daemon::DaemonPaths {
     let runtime = env.path().expect("isolated runtime root").join("runtime");
     env.set_var("XDG_RUNTIME_DIR", &runtime);
-    let paths = canonical_ephemeral_paths();
-
-    let mut deadline = None;
-    let unidentified = await_departing_owner(
-        &paths,
-        DiscoveredOwner::capture(&paths),
-        &mut deadline,
-        anyhow!("attach closed"),
-    )
-    .await
-    .expect_err("an owner without a receipt cannot be proven departed");
-    assert_eq!(unidentified.to_string(), "attach closed");
-
-    let mut owner_child = publish_verified_test_owner(&paths);
-    std::fs::write(&paths.socket, b"").expect("publish fixture socket path");
-    let owner = DiscoveredOwner::capture(&paths);
-    owner_child.kill().expect("stop fixture owner");
-    owner_child.wait().expect("reap fixture owner");
-    std::fs::remove_file(&paths.pid_file).expect("owner retires its receipt");
-    std::fs::remove_file(&paths.socket).expect("owner retires its socket");
-    let mut deadline = None;
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        await_departing_owner(&paths, owner, &mut deadline, anyhow!("attach closed")),
-    )
-    .await
-    .expect("an exited owner is observed through its pinned witness")
-    .expect("a released owner allows rediscovery");
+    canonical_ephemeral_paths()
 }
 
-/// A live owner that neither releases its endpoint nor answers again fails
-/// closed with the original attach error once the recovery budget is spent.
+/// Serve a daemon hello to every connection on `listener` until aborted.
+fn serve_hellos(listener: UnixListener, version: &'static str) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(&mut daemon, version, proto::PROTOCOL_VERSION).await;
+        }
+    })
+}
+
+fn stop_fixture_owner(mut child: std::process::Child) {
+    child.kill().expect("stop fixture owner");
+    child.wait().expect("reap fixture owner");
+}
+
+async fn await_departing_within(
+    paths: &crate::daemon::DaemonPaths,
+    owner: DiscoveredOwner,
+    budget: &mut DepartingOwnerBudget,
+    bound: Duration,
+) -> Result<()> {
+    tokio::time::timeout(
+        bound,
+        await_departing_owner(paths, owner, budget, anyhow!("attach closed")),
+    )
+    .await
+    .expect("the departing-owner wait is bounded by its budget")
+}
+
+/// An owner that exited and retired its endpoint lets the resolver
+/// rediscover (and spawn) — observed through the handle pinned to the
+/// receipt captured before the attach.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_returns_once_the_pinned_owner_retired() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let owner_child = publish_verified_test_owner(&paths);
+    let owner = DiscoveredOwner::capture(&paths);
+    assert!(
+        owner.receipt.is_some(),
+        "the receipt is captured before the attach"
+    );
+    stop_fixture_owner(owner_child);
+    std::fs::remove_file(&paths.pid_file).expect("owner retires its receipt");
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(10))
+        .await
+        .expect("a retired owner allows rediscovery");
+}
+
+/// A crashed owner (SIGKILL mid-drain) leaves its receipt and socket behind.
+/// That stale endpoint must not turn into a hard attach failure: once the
+/// pinned process is gone and the endpoint no longer answers, the resolver
+/// rediscovers, where the spawn path reclaims the stale metadata.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_recovers_from_a_crash_that_left_its_endpoint() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let owner_child = publish_verified_test_owner(&paths);
+    let listener = UnixListener::bind(&paths.socket).expect("bind fixture owner socket");
+    let owner = DiscoveredOwner::capture(&paths);
+    // Crash: the process dies and its listener closes, but the receipt and
+    // the socket path stay published.
+    stop_fixture_owner(owner_child);
+    drop(listener);
+    assert!(paths.pid_file.exists() && paths.socket.exists());
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(10))
+        .await
+        .expect("a crashed owner with a stale endpoint allows rediscovery");
+}
+
+/// A successor published by another starter before this waiter looks again
+/// ends the wait (its receipt differs from the captured one): the resolver
+/// attaches to it instead of failing.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_returns_when_a_replacement_is_published_first() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    let departing = publish_verified_test_owner(&paths);
+    let owner = DiscoveredOwner::capture(&paths);
+    stop_fixture_owner(departing);
+    std::fs::remove_file(&paths.pid_file).expect("departing owner retires its receipt");
+    // Another starter publishes a healthy successor at the same endpoint.
+    let successor = publish_verified_test_owner(&paths);
+    let listener = UnixListener::bind(&paths.socket).expect("bind successor socket");
+    let server = serve_hellos(listener, "0.1.successor");
+    assert_ne!(
+        cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file),
+        owner.receipt,
+        "the successor has its own receipt"
+    );
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(10))
+        .await
+        .expect("a published successor ends the wait");
+    server.abort();
+    stop_fixture_owner(successor);
+}
+
+/// A live owner that neither retires nor answers again fails closed with the
+/// original attach error once the shared budget is spent — and the wait never
+/// signals it.
 #[tokio::test(flavor = "current_thread")]
 async fn departing_owner_wait_fails_closed_when_the_owner_stays_alive() {
     let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
-    let runtime = env.path().expect("isolated runtime root").join("runtime");
-    env.set_var("XDG_RUNTIME_DIR", &runtime);
-    let paths = canonical_ephemeral_paths();
+    let paths = isolated_canonical_paths(&env).await;
     let mut owner_child = publish_verified_test_owner(&paths);
-
     let owner = DiscoveredOwner::capture(&paths);
-    let mut deadline = Some(tokio::time::Instant::now() + Duration::from_millis(300));
-    let error = await_departing_owner(&paths, owner, &mut deadline, anyhow!("attach closed"))
+    let mut budget = DepartingOwnerBudget {
+        deadline: Some(tokio::time::Instant::now() + Duration::from_millis(300)),
+        ..DepartingOwnerBudget::default()
+    };
+    let error = await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
         .await
         .expect_err("a live, silent owner is not departing");
     assert_eq!(error.to_string(), "attach closed");
@@ -462,40 +536,23 @@ async fn departing_owner_wait_fails_closed_when_the_owner_stays_alive() {
             .is_none(),
         "the wait never signals the owner"
     );
-    owner_child.kill().expect("stop fixture owner");
-    owner_child.wait().expect("reap fixture owner");
+    stop_fixture_owner(owner_child);
 }
 
-/// A transient close (the owner refuses admission for a moment, e.g. during a
-/// locked→ready transition) must not be waited out: as soon as the same owner
+/// A transient close must not be waited out: as soon as the same owner
 /// answers a hello again the resolver retries the attach.
 #[tokio::test(flavor = "current_thread")]
 async fn departing_owner_wait_returns_when_the_same_owner_answers_again() {
     let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
-    let runtime = env.path().expect("isolated runtime root").join("runtime");
-    env.set_var("XDG_RUNTIME_DIR", &runtime);
-    let paths = canonical_ephemeral_paths();
+    let paths = isolated_canonical_paths(&env).await;
     let mut owner_child = publish_verified_test_owner(&paths);
     let listener = UnixListener::bind(&paths.socket).expect("bind fixture owner socket");
     let owner = DiscoveredOwner::capture(&paths);
-    let server = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(&mut daemon, "0.1.answers-again", proto::PROTOCOL_VERSION).await;
-        }
-    });
-
-    let mut deadline = None;
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        await_departing_owner(&paths, owner, &mut deadline, anyhow!("attach closed")),
-    )
-    .await
-    .expect("an owner that answers again is not waited out")
-    .expect("the resolver retries the attach");
+    let server = serve_hellos(listener, "0.1.answers-again");
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect("the resolver retries the attach");
     assert!(
         owner_child
             .try_wait()
@@ -504,8 +561,29 @@ async fn departing_owner_wait_returns_when_the_same_owner_answers_again() {
         "the owner is still the same live process"
     );
     server.abort();
-    owner_child.kill().expect("stop fixture owner");
-    owner_child.wait().expect("reap fixture owner");
+    stop_fixture_owner(owner_child);
+}
+
+/// An owner whose identity cannot be verified (no pinned handle — e.g. its
+/// executable was replaced in place) still gets the transient-close retry:
+/// the wait re-probes instead of failing at once.
+#[tokio::test(flavor = "current_thread")]
+async fn departing_owner_wait_reprobes_an_owner_without_a_pinned_handle() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let paths = isolated_canonical_paths(&env).await;
+    // `/bin/sleep` is not daemon-shaped, so no verified handle is pinned.
+    let owner_child = publish_test_ephemeral_owner(&paths);
+    let listener = UnixListener::bind(&paths.socket).expect("bind fixture owner socket");
+    let owner = DiscoveredOwner::capture(&paths);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    assert!(owner.process.is_none(), "the identity is not verified");
+    let server = serve_hellos(listener, "0.1.unverified");
+    let mut budget = DepartingOwnerBudget::default();
+    await_departing_within(&paths, owner, &mut budget, Duration::from_secs(5))
+        .await
+        .expect("an unverified owner that answers again is retried");
+    server.abort();
+    stop_fixture_owner(owner_child);
 }
 
 #[tokio::test]

@@ -1283,7 +1283,7 @@ async fn probe_or_spawn_with_spawn_authorization(
     use crate::daemon::{DaemonPaths, discover, spawn_detached_ephemeral};
 
     // One recovery budget for every departing-owner wait in this resolution.
-    let mut departing_owner_deadline = None;
+    let mut departing_owner_budget = DepartingOwnerBudget::default();
     match mode {
         LifecycleMode::AttachOrPersistent
         | LifecycleMode::AttachOrEphemeral
@@ -1311,7 +1311,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                             await_departing_owner(
                                 &discovered.paths,
                                 owner,
-                                &mut departing_owner_deadline,
+                                &mut departing_owner_budget,
                                 error,
                             )
                             .await?;
@@ -1398,13 +1398,8 @@ async fn probe_or_spawn_with_spawn_authorization(
             // spawn; if it answers again (a transient close), the attach is
             // retried. An exhausted budget returns the attach error.
             Err(error) if is_departing_owner_attach_error(&error) => {
-                await_departing_owner(
-                    &after_lock.paths,
-                    owner,
-                    &mut departing_owner_deadline,
-                    error,
-                )
-                .await?;
+                await_departing_owner(&after_lock.paths, owner, &mut departing_owner_budget, error)
+                    .await?;
                 after_lock = discover().await;
             }
             Err(error) => return Err(error),
@@ -1551,21 +1546,90 @@ async fn connect_shared_running(
 
 /// Evidence for the exact owner a resolver is about to attach to, captured
 /// before the attach so that owner can still be identified if it closes the
-/// attach and exits: its pid receipt (with process start identity) and a
-/// restart-release witness pinned to that receipt, never a bare numeric pid.
+/// attach and exits: its full pid receipt (with process start identity) and,
+/// where the platform has one, a kernel handle pinned to that verified
+/// process — never a bare numeric pid.
 struct DiscoveredOwner {
     receipt: Option<cockpit_host::daemon_lifecycle::DaemonPidReceipt>,
-    release: crate::daemon::RestartReleaseWitness,
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
+    process: Option<cockpit_host::daemon_lifecycle::VerifiedDaemonProcess>,
 }
 
 impl DiscoveredOwner {
     fn capture(paths: &crate::daemon::DaemonPaths) -> Self {
         let receipt = cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file);
-        let release = crate::daemon::capture_restart_release(
-            paths,
-            receipt.as_ref().map(|receipt| receipt.pid),
-        );
-        Self { receipt, release }
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        let process = receipt.as_ref().and_then(|receipt| {
+            match cockpit_host::daemon_lifecycle::acquire_verified_daemon_process(receipt) {
+                cockpit_host::daemon_lifecycle::VerifiedProcessOutcome::Verified(process) => {
+                    Some(process)
+                }
+                cockpit_host::daemon_lifecycle::VerifiedProcessOutcome::Identity(_) => None,
+            }
+        });
+        Self {
+            receipt,
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "freebsd",
+                windows
+            ))]
+            process,
+        }
+    }
+
+    /// One nonblocking observation: has the captured owner process exited?
+    ///
+    /// With a pinned kernel handle this is the handle's own completion state.
+    /// Without one (the owner was already gone at capture, its identity could
+    /// not be verified — e.g. its executable was replaced in place — or the
+    /// platform has no handle), the owner is gone once its pid no longer
+    /// exists or names a process with a different start identity. With no
+    /// receipt there is no owner process to wait for.
+    fn has_exited(&self) -> bool {
+        let Some(receipt) = self.receipt.as_ref() else {
+            return true;
+        };
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ))]
+        if let Some(process) = self.process.as_ref() {
+            return process.has_exited().unwrap_or(false);
+        }
+        !cockpit_host::daemon_lifecycle::process_exists(receipt.pid)
+            || cockpit_host::daemon_lifecycle::process_start_identity(receipt.pid)
+                .is_ok_and(|start| start != receipt.process_start)
+    }
+}
+
+/// The departing-owner recovery budget for one lifecycle resolution: a single
+/// absolute deadline (the codebase's restart-release policy) shared by every
+/// wait, and a re-probe interval that keeps backing off across retries.
+struct DepartingOwnerBudget {
+    deadline: Option<tokio::time::Instant>,
+    reprobe: Duration,
+}
+
+impl Default for DepartingOwnerBudget {
+    fn default() -> Self {
+        Self {
+            deadline: None,
+            reprobe: DEPARTING_OWNER_REPROBE_START,
+        }
     }
 }
 
@@ -1594,67 +1658,61 @@ const DEPARTING_OWNER_REPROBE_START: Duration = Duration::from_millis(50);
 const DEPARTING_OWNER_REPROBE_CEILING: Duration = Duration::from_millis(500);
 
 /// Wait for the owner that closed an attach to settle, so the caller can
-/// re-run discovery. Returns `Ok(())` when either
+/// re-run discovery (which, under `start.lock`, is authoritative and
+/// hello-verified: it attaches to a live owner or spawns through the lifetime
+/// lock, never bypassing one). Polls, with nonblocking observations only,
+/// until either
 ///
-/// * that exact owner (pinned by [`DiscoveredOwner`]) exited and released its
-///   receipt, socket, and lifetime lock — discovery then spawns or attaches a
-///   successor; or
-/// * a hello-answering owner is published again at the endpoint — the same
-///   receipt means the close was transient (e.g. a locked→ready transition
-///   refusing admission for a moment) and the attach should be retried; a
-///   different receipt means the owner was already replaced.
+/// * a hello-answering owner is published at the endpoint — the same owner
+///   after a transient close (e.g. admission refused during a locked→ready
+///   transition), or a successor another starter already published; or
+/// * the endpoint no longer answers (not running / stale receipt or socket
+///   left by a crash) and the captured owner process has exited.
 ///
-/// Returns the original attach error (fail closed) when the owner cannot be
-/// identified, or when the resolution's recovery budget — the codebase's
-/// restart-release policy, shared across every wait in one resolution —
-/// runs out.
+/// Returns the original attach error (fail closed) only once the shared
+/// recovery budget runs out. No blocking waiter is started, so abandoning a
+/// wait never strands a thread, and the absolute deadline holds on every
+/// platform.
 async fn await_departing_owner(
     paths: &crate::daemon::DaemonPaths,
     owner: DiscoveredOwner,
-    deadline: &mut Option<tokio::time::Instant>,
+    budget: &mut DepartingOwnerBudget,
     error: anyhow::Error,
 ) -> Result<()> {
-    let deadline = *deadline.get_or_insert_with(|| {
+    let deadline = *budget.deadline.get_or_insert_with(|| {
         tokio::time::Instant::now() + crate::daemon::restart_release_timeout(None)
     });
-    let Some(receipt) = owner.receipt else {
-        return Err(error);
-    };
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(error);
-    }
     tracing::info!(
-        pid = receipt.pid,
+        pid = owner.receipt.as_ref().map(|receipt| receipt.pid),
+        socket = %paths.socket.display(),
         error = %error,
         "discovered daemon owner closed the attach; waiting for it to settle before rediscovery"
     );
-    let release = crate::daemon::wait_for_restart_release(paths, owner.release, remaining);
-    tokio::pin!(release);
-    let mut reprobe = DEPARTING_OWNER_REPROBE_START;
     loop {
-        tokio::select! {
-            released = &mut release => {
-                return if released { Ok(()) } else { Err(error) };
-            }
-            () = tokio::time::sleep(reprobe) => {}
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(error);
         }
-        reprobe = (reprobe * 2).min(DEPARTING_OWNER_REPROBE_CEILING);
+        tokio::time::sleep(budget.reprobe.min(deadline - now)).await;
+        budget.reprobe = (budget.reprobe * 2).min(DEPARTING_OWNER_REPROBE_CEILING);
         // Hello-only probe: it never takes a lifetime reference, so it
         // cannot itself keep a last-client owner alive.
         let probe = crate::daemon::discover().await;
-        if probe.paths.socket == paths.socket
-            && matches!(
-                discover_attach_plan(probe.status, probe.hello.is_some()),
-                DiscoverAttachPlan::AttachRunning
-            )
-        {
-            let current = cockpit_host::daemon_lifecycle::read_daemon_pid_record(&paths.pid_file);
-            tracing::info!(
-                same_owner = current.as_ref() == Some(&receipt),
-                "daemon endpoint answers again; retrying the attach"
-            );
-            return Ok(());
+        match discover_attach_plan(probe.status, probe.hello.is_some()) {
+            DiscoverAttachPlan::AttachRunning => {
+                let current =
+                    cockpit_host::daemon_lifecycle::read_daemon_pid_record(&probe.paths.pid_file);
+                tracing::info!(
+                    same_owner = current.is_some() && current == owner.receipt,
+                    "daemon endpoint answers again; retrying the attach"
+                );
+                return Ok(());
+            }
+            DiscoverAttachPlan::Spawn if owner.has_exited() => {
+                tracing::info!("departing daemon owner exited; rediscovering");
+                return Ok(());
+            }
+            _ => {}
         }
     }
 }

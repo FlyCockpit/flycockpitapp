@@ -114,7 +114,6 @@ pub struct AgentAuthoringScreen {
     list_row_indices: Vec<usize>,
     model_picker_row_rects: Vec<Rect>,
     list_nav: ui::ListNav,
-    actions: chrome::ActionBar,
     mouse_selected: Option<usize>,
     tool_model_picker: Option<usize>,
     tool_model_cursor: usize,
@@ -160,7 +159,6 @@ impl AgentAuthoringScreen {
             list_row_indices: Vec::new(),
             model_picker_row_rects: Vec::new(),
             list_nav: ui::ListNav::new(),
-            actions: chrome::ActionBar::default(),
             mouse_selected: None,
             tool_model_picker: None,
             tool_model_cursor: 0,
@@ -720,7 +718,8 @@ impl AgentAuthoringScreen {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         let pos = Position::new(mouse.column, mouse.row);
         if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
-            self.actions.track(pos);
+            // Hover is owned by the host's action bar (the onboarding shell
+            // renders this screen's buttons); nothing here tracks it.
             return true;
         }
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -738,12 +737,6 @@ impl AgentAuthoringScreen {
                 return true;
             }
             return false;
-        }
-        if let Some(button) = self.actions.clicked(pos) {
-            if let Some(action) = self.action_bar_click(button) {
-                self.pending_action = Some(action);
-            }
-            return true;
         }
         if self.tool_model_picker.is_some()
             && let Some(index) = self
@@ -1797,7 +1790,6 @@ impl AgentAuthoringScreen {
         self.list_row_rects.clear();
         self.list_row_indices.clear();
         self.model_picker_row_rects.clear();
-        self.actions = chrome::ActionBar::default();
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {

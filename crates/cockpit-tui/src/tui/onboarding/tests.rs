@@ -924,6 +924,8 @@ fn provider_catalog_scrollbar_drag_changes_the_viewport_and_consumes_gesture() {
 
     let down = shell.handle_mouse(click(scrollbar.x, scrollbar.y), &mut engine);
     assert!(down.consumed);
+    // Every pointer event in a live terminal is followed by a redraw.
+    render_string(&mut shell, 80, 12, &engine);
     let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
         panic!("expected search screen");
     };
@@ -933,6 +935,7 @@ fn provider_catalog_scrollbar_drag_changes_the_viewport_and_consumes_gesture() {
     let bottom = scrollbar.bottom().saturating_sub(1);
     let drag = shell.handle_mouse(drag_left(scrollbar.x, bottom), &mut engine);
     assert!(drag.consumed);
+    render_string(&mut shell, 80, 12, &engine);
     let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
         panic!("expected search screen");
     };
@@ -944,6 +947,7 @@ fn provider_catalog_scrollbar_drag_changes_the_viewport_and_consumes_gesture() {
 
     let release = shell.handle_mouse(release_left(scrollbar.x, bottom), &mut engine);
     assert!(release.consumed);
+    render_string(&mut shell, 80, 12, &engine);
     let after_release = shell.handle_mouse(drag_left(scrollbar.x, scrollbar.y), &mut engine);
     assert!(!after_release.consumed);
     let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
@@ -951,6 +955,138 @@ fn provider_catalog_scrollbar_drag_changes_the_viewport_and_consumes_gesture() {
     };
     assert!(!screen.dragging_scrollbar());
     assert_eq!(screen.offset(), dragged_offset);
+}
+
+fn moved(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Moved,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn render_buffer(shell: &mut OnboardingShell, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut links = crate::tui::links::LinkRegistry::default();
+    let engine = Dialog::None;
+    terminal
+        .draw(|frame| shell.render(frame, frame.area(), &engine, &mut links))
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn find_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Position {
+    let area = buffer.area;
+    for y in area.top()..area.bottom() {
+        let row: String = (area.left()..area.right())
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        if let Some(byte) = row.find(needle) {
+            let x = row[..byte].chars().count() as u16;
+            return Position::new(area.x + x, y);
+        }
+    }
+    panic!("{needle:?} not rendered");
+}
+
+#[test]
+fn action_bar_hover_survives_the_geometry_clear_and_paints() {
+    // Continue must be enabled: hover only tracks enabled buttons.
+    let mut secure = snapshot(OnboardingStage::SecureStore);
+    secure.host_capabilities =
+        secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
+    let mut shell = OnboardingShell::new(&secure, false);
+    let mut engine = Dialog::None;
+    let idle = render_buffer(&mut shell, 80, 24);
+    let button = find_text(&idle, "[ Continue ]");
+    let label = Position::new(button.x + 2, button.y);
+    assert_eq!(idle[(label.x, label.y)].bg, ratatui::style::Color::Reset);
+
+    let outcome = shell.handle_mouse(moved(label.x, label.y), &mut engine);
+    assert!(outcome.consumed);
+    let hovered = render_buffer(&mut shell, 80, 24);
+    assert_ne!(
+        hovered[(label.x, label.y)].bg,
+        ratatui::style::Color::Reset,
+        "the hovered button must paint its hover chip"
+    );
+    // Hover persists across further frames until the pointer leaves.
+    let again = render_buffer(&mut shell, 80, 24);
+    assert_eq!(again[(label.x, label.y)].bg, hovered[(label.x, label.y)].bg);
+    shell.handle_mouse(moved(40, 12), &mut engine);
+    let left = render_buffer(&mut shell, 80, 24);
+    assert_eq!(left[(label.x, label.y)].bg, ratatui::style::Color::Reset);
+}
+
+#[test]
+fn provider_scrollbar_drag_survives_redraws_between_pointer_events() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 20, &engine);
+    let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
+        panic!("expected search screen");
+    };
+    let scrollbar = screen.scrollbar_area();
+    assert!(scrollbar.height >= 3, "need room to drag: {scrollbar:?}");
+    let offset = |shell: &OnboardingShell| match &shell.screen {
+        OnboardingScreen::ProviderSearch(screen) => screen.offset(),
+        _other => panic!("expected search screen"),
+    };
+
+    assert!(
+        shell
+            .handle_mouse(click(scrollbar.x, scrollbar.y), &mut engine)
+            .consumed
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    let middle = scrollbar.y + scrollbar.height / 2;
+    assert!(
+        shell
+            .handle_mouse(drag_left(scrollbar.x, middle), &mut engine)
+            .consumed
+    );
+    let at_middle = offset(&shell);
+    assert!(at_middle > 0, "the first drag must move the viewport");
+    render_string(&mut shell, 80, 20, &engine);
+    let bottom = scrollbar.bottom() - 1;
+    assert!(
+        shell
+            .handle_mouse(drag_left(scrollbar.x, bottom), &mut engine)
+            .consumed,
+        "a redraw must not cancel the drag"
+    );
+    assert!(offset(&shell) > at_middle, "the viewport keeps moving");
+}
+
+#[test]
+fn shrinking_the_secure_store_leaves_no_stale_choice_rows() {
+    // Shell-routed class guard for a non-agent screen: after a shrink, the
+    // position of a choice row that moved away must not act. At 80x24 the
+    // machine-bound row sits on row 8; at 80x8 that is the bottom margin
+    // (content is rows 4-5, the footer row 6).
+    let mut secure = snapshot(OnboardingStage::SecureStore);
+    secure.host_capabilities =
+        secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
+    let mut shell = OnboardingShell::new(&secure, false);
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 24, &engine);
+    let stale = shell.list_row_rects[2];
+    assert_eq!(stale.y, 8, "{:?}", shell.list_row_rects);
+    render_string(&mut shell, 80, 8, &engine);
+    assert!(
+        !shell
+            .list_row_rects
+            .iter()
+            .any(|rect| rect.contains(Position::new(stale.x + 2, stale.y))),
+        "{:?}",
+        shell.list_row_rects
+    );
+    let before = shell.test_secure_store_cursor_placement();
+    let outcome = shell.handle_mouse(click(stale.x + 2, stale.y), &mut engine);
+    // A stale hit would move the cursor to the machine-bound row.
+    assert!(outcome.action.is_none());
+    assert_eq!(shell.test_secure_store_cursor_placement(), before);
 }
 
 #[test]
@@ -1421,9 +1557,12 @@ fn chrome_rows_never_give_content_less_than_the_legacy_layout_at_any_height() {
         assert_eq!(blank, u16::from(col.height >= 22), "{context}");
 
         // Content never loses a row to the redesign, except the one
-        // deliberate blank line on terminals of 24 rows or more. A one-row
-        // column is the exception by design: the legacy solver gave that row
-        // to `Min(1)` content and dropped the footer; the footer now wins.
+        // deliberate blank line on terminals of 24 rows or more.
+        //
+        // Accepted deferral (coordinator decision): at a one-row column (a
+        // 3-row terminal) the footer owns the only row, so content has 0
+        // rows where the legacy solver gave that row to `Min(1)` content and
+        // dropped the footer. Footer > content there, explicitly.
         if col.height < 2 {
             continue;
         }

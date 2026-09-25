@@ -34,7 +34,15 @@ pub fn write_fixture(path: &Path, contents: &str) {
             parent.display()
         );
     });
-    let mut staged = tempfile::NamedTempFile::new_in(parent).unwrap_or_else(|error| {
+    // tempfile stages private (0600) files by default; a fixture must keep the
+    // mode a plain write would give it (0666 masked by the umask).
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut staged = builder.tempfile_in(parent).unwrap_or_else(|error| {
         panic!("stage test fixture {}: {error}", path.display());
     });
     staged
@@ -394,7 +402,34 @@ pub fn workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::Arc;
+
+    #[test]
+    fn write_fixture_replaces_contents_with_the_default_file_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("golden.txt");
+        write_fixture(&fixture, "old");
+        write_fixture(&fixture, "new");
+        assert_eq!(read_fixture(&fixture), "new");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from("golden.txt")]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let plain = dir.path().join("plain.txt");
+            std::fs::write(&plain, "plain").unwrap();
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode(&fixture),
+                mode(&plain),
+                "fixture mode must match a plain write"
+            );
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct AllowedMutation {

@@ -310,15 +310,32 @@ pub(crate) fn action_button_at(rects: &[Rect], pos: Position) -> Option<usize> {
 
 #[derive(Default)]
 pub(crate) struct ActionBar {
+    // Per-frame geometry: rebuilt by every render, cleared between frames.
     rects: Vec<Rect>,
     enabled: Vec<bool>,
+    // Cross-frame interaction state: survives geometry clears and is only
+    // invalidated when its target button no longer exists or is disabled.
     hover: Option<usize>,
 }
 
 impl ActionBar {
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect, buttons: &[ActionButton<'_>]) {
+        if self
+            .hover
+            .is_some_and(|index| !buttons.get(index).is_some_and(|button| button.enabled))
+        {
+            self.hover = None;
+        }
         self.rects = render_action_bar(frame, area, buttons, self.hover);
         self.enabled = buttons.iter().map(|button| button.enabled).collect();
+    }
+
+    /// Forget the previous frame's button rectangles so nothing stays
+    /// clickable until the next render lays the bar out again. Hover is
+    /// interaction state, not geometry, and is kept.
+    pub(crate) fn clear_geometry(&mut self) {
+        self.rects.clear();
+        self.enabled.clear();
     }
 
     pub(crate) fn track(&mut self, pos: Position) {

@@ -1274,13 +1274,19 @@ fn shrinking_to_an_empty_content_area_leaves_no_stale_clickable_rows() {
         "control click must toggle"
     );
 
-    // Resize to 80x6: the content area has no inner list rows left, so the
-    // old row position is blank margin and must not act.
+    // Resize to 80x3: the column is one row, which the footer owns, so the
+    // content area is empty and the screen takes its early-return path. The
+    // old row must not stay clickable.
     let mut shell = optimizations_shell();
     render_shell(&mut shell, 80, 9);
     let row = shell_auto_prune_row(&shell);
-    assert!(row.y < 6, "the stale row must still be on the 6-row screen");
-    render_shell(&mut shell, 80, 6);
+    render_shell(&mut shell, 80, 3);
+    match &shell.screen {
+        super::super::OnboardingScreen::AgentAuthoring(screen) => {
+            assert!(screen.list_row_rects.is_empty(), "stale rows survived");
+        }
+        _ => unreachable!("optimizations shell holds the authoring screen"),
+    }
     shell.handle_mouse(click_at(Position::new(row.x + 2, row.y)), &mut engine);
     assert_eq!(
         shell_auto_prune(&shell),

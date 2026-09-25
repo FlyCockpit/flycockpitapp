@@ -2042,6 +2042,10 @@ impl OnboardingShell {
                 if matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice)
         );
         let back_enabled = self.back_enabled();
+        if !(back_visible && back_enabled) {
+            // The hovered target no longer exists in this layout.
+            self.back_hover = false;
+        }
         self.back_rect =
             chrome::render_back_button(frame, area, back_visible, back_enabled, self.back_hover);
 
@@ -2129,9 +2133,16 @@ impl OnboardingShell {
     /// Forget every clickable rectangle from the previous frame: the shell's
     /// back button, action bar, list rows, and Escape menu rows, plus the
     /// active screen's own geometry.
+    ///
+    /// Only per-frame geometry is cleared. Cross-frame interaction state —
+    /// action-bar and Escape-menu hover, the back button's hover, a provider
+    /// scrollbar drag, field focus, a pending double-click selection — is
+    /// kept, and is invalidated only where the new layout shows its target
+    /// is gone (see `ActionBar::render`, `set_scrollbar_area`, and the back
+    /// button below).
     fn clear_hit_geometry(&mut self) {
         self.back_rect = Rect::default();
-        self.actions = ActionBar::default();
+        self.actions.clear_geometry();
         self.list_row_rects.clear();
         self.list_area = Rect::default();
         if let Some(menu) = self.escape.as_mut() {
@@ -2140,7 +2151,7 @@ impl OnboardingShell {
         match &mut self.screen {
             OnboardingScreen::Profile(screen) => screen.clear_hit_geometry(),
             OnboardingScreen::SecureStore(screen) => screen.clear_hit_geometry(),
-            OnboardingScreen::ProviderSearch(screen) => screen.set_scrollbar_area(Rect::default()),
+            OnboardingScreen::ProviderSearch(screen) => screen.clear_hit_geometry(),
             OnboardingScreen::Authenticate(screen) => screen.clear_hit_geometry(),
             OnboardingScreen::Model(screen) => screen.clear_hit_geometry(),
             OnboardingScreen::AgentAuthoring(screen) => screen.clear_hit_geometry(),

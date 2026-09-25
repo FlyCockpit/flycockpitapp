@@ -310,6 +310,14 @@ impl ProviderSearchScreen {
         self.clamp_viewport();
     }
 
+    /// Forget the previous frame's scrollbar rectangle. An in-progress drag
+    /// is interaction state and survives; it is cancelled only when the next
+    /// layout has no scrollbar ([`Self::set_scrollbar_area`] with an empty
+    /// area) or the button is released.
+    pub(crate) fn clear_hit_geometry(&mut self) {
+        self.scrollbar_area = Rect::default();
+    }
+
     pub(crate) fn set_scrollbar_area(&mut self, area: Rect) {
         self.scrollbar_area = area;
         if area.is_empty() {

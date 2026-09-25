@@ -85,6 +85,22 @@ impl ButtonRegistry {
         &self.targets
     }
 
+    /// Derive hover from the last reported pointer position against this
+    /// frame's targets (`None`: no owned pointer, so nothing hovers). A press
+    /// is left alone.
+    pub fn resolve_hover(&mut self, pointer: Option<ratatui::layout::Position>) {
+        self.hover = pointer.and_then(|pos| {
+            self.hit(pos.x, pos.y)
+                .filter(|target| target.enabled)
+                .map(|target| target.id.clone())
+        });
+    }
+
+    /// End a press in progress (its release can no longer arrive).
+    pub fn clear_pressed(&mut self) {
+        self.pressed = None;
+    }
+
     pub fn clear_hover_and_pressed(&mut self) {
         self.hover = None;
         self.pressed = None;

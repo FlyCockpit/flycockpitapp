@@ -265,6 +265,19 @@ impl LinkPointerGesture {
         self.pending_activation = None;
     }
 
+    /// Whether a press is held (test inspection).
+    #[cfg(test)]
+    pub fn has_pending_press(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// End the pointer capture of a press in progress (its release can no
+    /// longer arrive) without touching a completed click: a scheduled
+    /// activation waiting out its multi-click window still fires.
+    pub fn end_press(&mut self) {
+        self.pending = None;
+    }
+
     pub fn cancel(&mut self) {
         self.pending = None;
         self.tombstone_activation();

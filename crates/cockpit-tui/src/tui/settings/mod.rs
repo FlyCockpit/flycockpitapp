@@ -5797,23 +5797,64 @@ impl Dialog {
         Some(settings.handle_pointer(mouse))
     }
 
-    pub(crate) fn clear_settings_pointer_hover(&self) {
+    /// Resolve every settings hover — page targets, header, registered
+    /// buttons, help row — from `pointer` (the app's last reported position
+    /// when settings owns it, else `None`) against the frame just drawn.
+    /// Returns whether a rendered settings dialog is present (it then owns
+    /// surface hover over other chat affordances).
+    pub(crate) fn resolve_settings_hover(&mut self, pointer: Option<Position>) -> bool {
+        let Dialog::Settings(settings) = self else {
+            return false;
+        };
+        if settings.pointer_surface.area.get().is_none() {
+            return false;
+        }
+        match pointer {
+            Some(pos) => {
+                let _ = settings.handle_pointer(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: pos.x,
+                    row: pos.y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                });
+            }
+            None => settings.forget_pointer(),
+        }
+        true
+    }
+
+    /// Every settings hover, for change detection.
+    pub(crate) fn settings_hover_snapshot(&self) -> Option<String> {
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        Some(format!(
+            "{:?}|{:?}|{:?}|{:?}",
+            settings.pointer_surface.hover.borrow(),
+            settings.pointer_surface.header_hover.get(),
+            settings.pointer_surface.buttons.borrow().hover(),
+            settings.cx.pointer_surface.help_row_pointer.get(),
+        ))
+    }
+
+    /// The pointer position is unknown (resize, focus loss, mouse capture
+    /// off): no settings hover survives.
+    pub(crate) fn forget_settings_pointer(&mut self) {
         if let Dialog::Settings(settings) = self {
-            *settings.pointer_surface.hover.borrow_mut() = None;
+            settings.forget_pointer();
         }
     }
-    /// End every settings pointer interaction: hover, header hover, the
-    /// pressed semantic target, the button registry's own press (so press →
-    /// resize → release cannot activate), the help-row pointer, and the page's
-    /// transients.
-    pub(crate) fn cancel_settings_pointer_transients(&mut self) {
+
+    /// End the settings pointer captures — the pressed semantic target and
+    /// the button registry's press (so press → resize → release cannot
+    /// activate) — and the page's pointer-owned confirmations. Committed
+    /// actions (an external-editor edit, an OAuth copy, a setup operation)
+    /// are not captures and complete on their own.
+    pub(crate) fn end_settings_pointer_captures(&mut self) {
         if let Dialog::Settings(settings) = self {
             for surface in [&settings.pointer_surface, &settings.cx.pointer_surface] {
-                *surface.hover.borrow_mut() = None;
-                surface.header_hover.set(None);
                 *surface.pressed.borrow_mut() = None;
-                surface.buttons.borrow_mut().clear_hover_and_pressed();
-                surface.help_row_pointer.set(None);
+                surface.buttons.borrow_mut().clear_pressed();
             }
             settings.page.cancel_pointer_transients();
         }
@@ -8468,6 +8509,16 @@ impl SettingsDialog {
         #[cfg(test)]
         self.settle_test_effects();
         close
+    }
+
+    /// Clear every pointer-derived hover (the position is unknown).
+    fn forget_pointer(&mut self) {
+        for surface in [&self.pointer_surface, &self.cx.pointer_surface] {
+            *surface.hover.borrow_mut() = None;
+            surface.header_hover.set(None);
+            surface.buttons.borrow_mut().resolve_hover(None);
+            surface.help_row_pointer.set(None);
+        }
     }
 
     fn handle_pointer(&mut self, mouse: MouseEvent) -> SettingsPointerOutcome {

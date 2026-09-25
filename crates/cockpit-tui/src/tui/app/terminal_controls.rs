@@ -246,11 +246,7 @@ impl App {
             disable_mouse_capture_with_motion().is_ok()
         };
         if exec_ok {
-            self.mouse_capture = new_value;
-            self.invalidate_primary_paste();
-            if !new_value {
-                self.forget_pointer();
-            }
+            self.commit_mouse_capture(new_value);
             let state = if new_value { "on" } else { "off" };
             self.show_toast(
                 format!("/mouse: capture {state} (this session only)"),
@@ -285,15 +281,18 @@ impl App {
             disable_mouse_capture_with_motion()
         };
         if res.is_ok() {
-            self.mouse_capture = want;
-            self.invalidate_primary_paste();
-            if !want {
-                self.link_pointer_gesture.cancel();
-                self.forget_pointer();
-                self.hovered_suggestion = None;
-                self.link_registry.clear_hover();
-                self.dialog.clear_settings_pointer_hover();
-            }
+            self.commit_mouse_capture(want);
+        }
+    }
+
+    /// The one path for a live mouse-capture change, shared by `/mouse` and
+    /// the settings toggle. Turning capture off ends every capture and
+    /// forgets the pointer, so no hover or held press outlives it.
+    fn commit_mouse_capture(&mut self, enabled: bool) {
+        self.mouse_capture = enabled;
+        self.invalidate_primary_paste();
+        if !enabled {
+            self.end_mouse_capture();
         }
     }
 

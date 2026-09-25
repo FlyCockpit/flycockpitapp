@@ -759,7 +759,40 @@ impl AgentAuthoringScreen {
         }
     }
 
+    /// The consecutive-click boundary of a pending confirmation, applied to
+    /// every pointer event the screen's host sees (the onboarding shell calls
+    /// it for all of them, including those it handles itself). Motion, drags
+    /// and releases between the two clicks keep the arm; any press that is
+    /// not on the armed target — a blank area, another row, chrome, a right
+    /// or middle click — and any wheel or horizontal scroll disarm it.
+    pub(crate) fn note_pointer_event(&mut self, mouse: &MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {}
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = Position::new(mouse.column, mouse.row);
+                let on_armed_target = self
+                    .list_row_rects
+                    .iter()
+                    .position(|rect| rect.contains(pos))
+                    .map(|index| self.list_row_indices.get(index).copied().unwrap_or(index))
+                    .and_then(|logical| self.confirm_target_at(logical))
+                    .is_some_and(|target| self.is_armed(&target));
+                if !on_armed_target {
+                    self.disarm();
+                }
+            }
+            _ => self.disarm(),
+        }
+    }
+
+    /// Drop a pending first click because the pointer interaction ended
+    /// (resize, focus loss) — the two clicks can no longer be consecutive.
+    pub(crate) fn cancel_pending_confirmation(&mut self) {
+        self.disarm();
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        self.note_pointer_event(&mouse);
         let pos = Position::new(mouse.column, mouse.row);
         if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
             // Hover is owned by the host's action bar (the onboarding shell

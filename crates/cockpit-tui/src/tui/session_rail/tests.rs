@@ -122,8 +122,14 @@ fn golden_rail(
     } else {
         None
     };
-    rail.hovered_card = hovered;
-    rail.pointer_position = pointer;
+    // Card hover derives from the pointer: hovering card 1 means the pointer
+    // is over it (the card's title row at (5, 9) in this 120x40 layout).
+    let pointer = pointer.or(match hovered {
+        Some(1) => Some((5, 9)),
+        Some(other) => panic!("no fixture pointer for card {other}"),
+        None => None,
+    });
+    rail.set_pointer(pointer);
     rail.set_visible(visible);
     crate::tui::golden::render_frame(120, 40, |frame| {
         let persistent = visible.then_some(Rect::new(0, 0, 30, 40));

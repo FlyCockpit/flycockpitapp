@@ -124,8 +124,18 @@ pub(super) enum GestureInput {
     ViewChange { now: Duration },
     /// Terminal generation changed (the underlying buffer was replaced).
     TerminalChange { now: Duration },
-    /// Explicit cancellation (Esc, focus loss, context menu, etc.).
+    /// Explicit cancellation (Esc, context menu, etc.).
     Cancel { now: Duration },
+    /// The pointer capture ends without cancelling anything the user already
+    /// completed: a held press or an in-progress drag is dropped (its release
+    /// can no longer arrive), while a scheduled link activation, a pending or
+    /// in-flight copy, and the click sequence stay intact. `clear_selection`
+    /// is set when the coordinate space changed (a resize), so a selection
+    /// painted at old coordinates is removed.
+    EndCapture {
+        clear_selection: bool,
+        now: Duration,
+    },
     /// A delayed activation timer fired at `now` carrying the token it was
     /// scheduled with. The reducer checks it against the current token and
     /// generation; a mismatch makes it inert.
@@ -664,6 +674,18 @@ pub(super) fn reduce(
             s.dragging = false;
             s.reset_sequence();
             effects.push(GestureEffect::ClearSelection);
+            (s, effects)
+        }
+
+        GestureInput::EndCapture {
+            clear_selection,
+            now: _,
+        } => {
+            s.pending_press = None;
+            s.dragging = false;
+            if *clear_selection {
+                effects.push(GestureEffect::ClearSelection);
+            }
             (s, effects)
         }
 

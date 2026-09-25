@@ -1,4 +1,6 @@
+use super::pointer::Layer;
 use super::*;
+use ratatui::layout::Position;
 
 fn resolve_inner_scroll_target(
     regions: &[AffordanceScrollRegion],
@@ -43,21 +45,28 @@ impl App {
     /// - left-up → finalize drag-select (selection persists for copy).
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
+        // A layer may have opened or mounted since the last pointer event
+        // (by key, daemon event or async completion): end the captures the
+        // old owner can no longer release before routing this event.
+        self.sync_pointer_owner();
         self.observe_pointer(mouse.column, mouse.row);
-        if let Some(prompt) = self.daemon_restart_prompt.as_mut() {
-            let restart = point_in(prompt.restart_rect, mouse.column, mouse.row);
-            let quit = point_in(prompt.quit_rect, mouse.column, mouse.row);
-            if matches!(mouse.kind, MouseEventKind::Moved) {
-                if restart {
-                    prompt.focus = DaemonRestartFocus::Restart;
-                } else if quit {
-                    prompt.focus = DaemonRestartFocus::Quit;
-                }
-            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                if restart {
-                    self.accept_daemon_restart();
-                } else if quit {
-                    self.quit_after_daemon_stop();
+        let owner = self.pointer_owner_at(Position::new(mouse.column, mouse.row));
+        if owner == Layer::DaemonRestartPrompt {
+            if let Some(prompt) = self.daemon_restart_prompt.as_mut() {
+                let restart = point_in(prompt.restart_rect, mouse.column, mouse.row);
+                let quit = point_in(prompt.quit_rect, mouse.column, mouse.row);
+                if matches!(mouse.kind, MouseEventKind::Moved) {
+                    if restart {
+                        prompt.focus = DaemonRestartFocus::Restart;
+                    } else if quit {
+                        prompt.focus = DaemonRestartFocus::Quit;
+                    }
+                } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if restart {
+                        self.accept_daemon_restart();
+                    } else if quit {
+                        self.quit_after_daemon_stop();
+                    }
                 }
             }
             return;
@@ -86,89 +95,98 @@ impl App {
             self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
             self.close_composer_picker_on_outside_press(mouse.column, mouse.row);
         }
-        if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
-            if self.pending_workspace_trust.is_none() {
-                self.dialog.handle_workspace_trust_pointer(mouse);
-                if let Some((root, mode)) = self.dialog.take_workspace_trust_choice() {
-                    self.apply_workspace_trust_choice(root, mode);
-                }
-            }
-            return;
-        }
-        // The full-screen onboarding shell owns the whole screen while
-        // active: its native surfaces consume their events, engine screens
-        // route pointer input to the embedded settings dialog, and nothing
-        // underneath (chat rows, links, footer) reacts.
-        if self.startup_modal_on_top() != Some(StartupModal::WorkspaceTrust)
-            && self.onboarding_shell.is_some()
-        {
-            let outcome = self
-                .onboarding_shell
-                .as_mut()
-                .expect("shell presence checked above")
-                .handle_mouse(mouse, &mut self.dialog);
-            if outcome.consumed {
-                self.apply_onboarding_shell_action(outcome.action);
-                return;
-            }
-            let engine_screen = self.onboarding_shell.as_ref().is_some_and(|shell| {
-                shell.screen_kind()
-                    == crate::tui::onboarding::OnboardingScreenKind::EmbeddedSettings
-            });
-            if engine_screen {
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-                if matches!(mouse.kind, MouseEventKind::Moved) && !self.mouse_capture {
-                    return;
-                }
-                let _ = self.dialog.handle_settings_pointer(mouse);
-            }
-            return;
-        }
-        // The keys overlay is visually topmost and therefore owns pointer
-        // input before links or settings targets underneath it.
-        if let Some(overlay) = self.keys_overlay.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => overlay.scroll_up(),
-                MouseEventKind::ScrollDown => overlay.scroll_down(),
-                MouseEventKind::Down(_) => {
-                    self.invalidate_mouse_gesture(
-                        MouseGestureInvalidation::Cancel,
-                        self.event_loop_monotonic_now,
-                    );
-                }
-                _ => {}
-            }
-            return;
-        }
-        // A visible context menu is the next modal layer. It must preempt a
-        // settings dialog that may still be rendered underneath it.
-        if let Some(menu) = self.context_menu.clone() {
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    self.invalidate_mouse_gesture(
-                        MouseGestureInvalidation::Cancel,
-                        self.event_loop_monotonic_now,
-                    );
-                    let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
-                    if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
-                        self.context_menu = None;
-                        self.execute_context_menu_action(action, menu.clicked_chat_row);
-                    } else {
-                        self.context_menu = None;
+        // Route to the layer that owns the pointer here — the topmost one in
+        // the layer stack, the same order render paints in.
+        match owner {
+            Layer::DaemonRestartPrompt | Layer::Surface => {}
+            Layer::KeysOverlay => {
+                if let Some(overlay) = self.keys_overlay.as_mut() {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => overlay.scroll_up(),
+                        MouseEventKind::ScrollDown => overlay.scroll_down(),
+                        MouseEventKind::Down(_) => {
+                            self.invalidate_mouse_gesture(
+                                MouseGestureInvalidation::Cancel,
+                                self.event_loop_monotonic_now,
+                            );
+                        }
+                        _ => {}
                     }
                 }
-                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                    self.invalidate_mouse_gesture(
-                        MouseGestureInvalidation::Cancel,
-                        self.event_loop_monotonic_now,
-                    );
-                    self.context_menu = None;
-                }
-                _ => {}
+                return;
             }
-            return;
+            Layer::ContextMenu => {
+                if let Some(menu) = self.context_menu.clone() {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            self.invalidate_mouse_gesture(
+                                MouseGestureInvalidation::Cancel,
+                                self.event_loop_monotonic_now,
+                            );
+                            let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
+                            if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
+                                self.context_menu = None;
+                                self.execute_context_menu_action(action, menu.clicked_chat_row);
+                            } else {
+                                self.context_menu = None;
+                            }
+                        }
+                        MouseEventKind::Down(_)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown => {
+                            self.invalidate_mouse_gesture(
+                                MouseGestureInvalidation::Cancel,
+                                self.event_loop_monotonic_now,
+                            );
+                            self.context_menu = None;
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            // The review boxes are keyboard panels: the cells they paint
+            // take the pointer so nothing hidden under them reacts.
+            Layer::PinsReview | Layer::RulesReview => return,
+            Layer::WorkspaceTrust => {
+                if self.pending_workspace_trust.is_none() {
+                    self.dialog.handle_workspace_trust_pointer(mouse);
+                    if let Some((root, mode)) = self.dialog.take_workspace_trust_choice() {
+                        self.apply_workspace_trust_choice(root, mode);
+                    }
+                }
+                return;
+            }
+            // The full-screen onboarding shell owns the whole screen while
+            // it is the base: its native surfaces consume their events,
+            // engine screens route pointer input to the embedded settings
+            // dialog, and nothing underneath (chat rows, links, footer)
+            // reacts.
+            Layer::Onboarding => {
+                let outcome = self
+                    .onboarding_shell
+                    .as_mut()
+                    .expect("the onboarding layer has a shell")
+                    .handle_mouse(mouse, &mut self.dialog);
+                if outcome.consumed {
+                    self.apply_onboarding_shell_action(outcome.action);
+                    return;
+                }
+                let engine_screen = self.onboarding_shell.as_ref().is_some_and(|shell| {
+                    shell.screen_kind()
+                        == crate::tui::onboarding::OnboardingScreenKind::EmbeddedSettings
+                });
+                if engine_screen {
+                    self.hovered_suggestion = None;
+                    self.hovered_control_chip = None;
+                    self.hovered_affordance = None;
+                    if matches!(mouse.kind, MouseEventKind::Moved) && !self.mouse_capture {
+                        return;
+                    }
+                    let _ = self.dialog.handle_settings_pointer(mouse);
+                }
+                return;
+            }
         }
         if self.composer_controls.picker_scroll_drag {
             match mouse.kind {
@@ -205,58 +223,9 @@ impl App {
             }
         }
         if matches!(mouse.kind, MouseEventKind::Moved) {
-            if !pointer_in_composer_picker
-                && self.session_rail_owns_pointer(mouse.column, mouse.row)
-            {
-                self.link_registry.clear_hover();
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-                if self.mouse_capture {
-                    let _ = self.session_rail.handle_mouse(mouse);
-                }
-                return;
-            }
-            self.session_rail.clear_hover();
-            if self.mouse_capture {
-                let _ = self.button_registry.handle_mouse(mouse);
-                let hovered_picker_row = self
-                    .button_registry
-                    .hit(mouse.column, mouse.row)
-                    .and_then(|target| match &target.dispatch {
-                        crate::tui::button::ButtonDispatch::ComposerPickerRow { index } => {
-                            Some(*index)
-                        }
-                        _ => None,
-                    });
-                if let Some(index) = hovered_picker_row {
-                    self.hover_composer_picker_row(index);
-                }
-                self.update_queue_pointer(mouse);
-                let _link_hover_changed = self.link_registry.update_hover(mouse.column, mouse.row);
-            } else {
-                self.queue_hover = None;
-                self.link_registry.clear_hover();
-            }
-            if self.link_registry.hovered().is_some() {
-                self.dialog.clear_settings_pointer_hover();
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-                return;
-            }
-            if self.mouse_capture && self.dialog.handle_settings_pointer(mouse).is_some() {
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-                return;
-            }
-            self.update_hovered_affordance(&mouse);
-            if self.link_registry.hovered().is_some() {
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-            }
+            // Hover follows the pointer through the one surface resolver the
+            // redraw-time pass uses too.
+            self.resolve_surface_hover(Some(Position::new(mouse.column, mouse.row)), true);
             return;
         }
         if !self.mouse_capture {
@@ -974,11 +943,15 @@ impl App {
         (clamped_col, clamped_row)
     }
 
-    fn transcript_hover_suppressed(&self) -> bool {
-        self.dialog.is_active()
+    /// Whether the transcript is not what the pointer is over: a layer above
+    /// the base owns the pointer (the layer stack), or a panel inside the
+    /// surface layer occludes the transcript (the surface's own z-order:
+    /// dialogs, the question dialog, the composer picker, body overlays, an
+    /// embedded pane).
+    fn transcript_hover_suppressed(&self, mouse: &MouseEvent) -> bool {
+        self.pointer_owner_at(Position::new(mouse.column, mouse.row)) != Layer::Surface
+            || self.dialog.is_active()
             || self.question_dialog.is_some()
-            || self.context_menu.is_some()
-            || self.keys_overlay.is_some()
             || self.composer_controls.picker.is_some()
             || matches!(
                 self.overlay,
@@ -1051,7 +1024,7 @@ impl App {
 
     fn control_chip_at_mouse(&self, mouse: &MouseEvent) -> Option<super::render::ControlChip> {
         if !self.mouse_capture
-            || self.transcript_hover_suppressed()
+            || self.transcript_hover_suppressed(mouse)
             || !self.mouse_in_chat_area(mouse)
         {
             return None;
@@ -1064,7 +1037,7 @@ impl App {
 
     fn affordance_target_at_mouse(&self, mouse: &MouseEvent) -> Option<AffordanceTarget> {
         if !self.mouse_capture
-            || self.transcript_hover_suppressed()
+            || self.transcript_hover_suppressed(mouse)
             || !self.mouse_in_chat_area(mouse)
         {
             return None;
@@ -1097,7 +1070,7 @@ impl App {
             .is_some_and(|area| point_in(area, mouse.column, mouse.row))
     }
 
-    fn update_hovered_affordance(&mut self, mouse: &MouseEvent) {
+    pub(super) fn update_hovered_affordance(&mut self, mouse: &MouseEvent) {
         self.hovered_suggestion = self.suggestion_target_at_mouse(mouse);
         if self.hovered_suggestion.is_some() {
             self.hovered_control_chip = None;
@@ -1563,112 +1536,6 @@ impl App {
         });
     }
 
-    /// End every pointer capture and press in progress, so no later event
-    /// can continue or complete a gesture whose owner lost it. This is the
-    /// complete list of capture/press state in the TUI:
-    /// - chat: link gesture + pending link activation, the transcript
-    ///   selection/copy gesture and pending performance-chip press (via
-    ///   `invalidate_mouse_gesture`);
-    /// - app chrome: the registered-button press (`button_registry`) and the
-    ///   session rail's confirm-button press;
-    /// - the pane-divider drag and the composer picker scrollbar drag;
-    /// - settings: hover, header hover, the pressed target and the button
-    ///   registry press, the help-row pointer, and the page's transients;
-    /// - onboarding: the provider scrollbar drag.
-    ///
-    /// Called when an app-level modal takes the pointer (the daemon restart
-    /// prompt) and, via [`Self::end_pointer_interactions`], on resize and focus
-    /// loss.
-    pub(super) fn end_pointer_captures(&mut self, reason: MouseGestureInvalidation) {
-        self.link_pointer_gesture.cancel();
-        self.link_registry.invalidate_pointer_generation();
-        self.pending_link_activation = None;
-        self.button_registry.clear_hover_and_pressed();
-        self.session_rail.cancel_pointer_transients();
-        self.dragging_divider = false;
-        self.end_composer_picker_scroll_drag();
-        self.dialog.cancel_settings_pointer_transients();
-        if let Some(shell) = self.onboarding_shell.as_mut() {
-            shell.cancel_pointer_capture();
-        }
-        self.invalidate_mouse_gesture(reason, self.event_loop_monotonic_now);
-    }
-
-    /// The terminal was resized or lost focus: every capture ends, and the
-    /// last reported pointer position is forgotten everywhere it is kept
-    /// (after a resize it names a different cell; after focus loss it is
-    /// unknown), so nothing hovers until the pointer is reported again.
-    pub(super) fn end_pointer_interactions(&mut self, end: PointerInteractionEnd) {
-        let reason = match end {
-            PointerInteractionEnd::Resize => MouseGestureInvalidation::ViewChange,
-            PointerInteractionEnd::FocusLost => MouseGestureInvalidation::Cancel,
-        };
-        self.end_pointer_captures(reason);
-        self.forget_pointer();
-    }
-
-    /// Record the last reported pointer position with every surface that
-    /// derives hover from it. Called for every mouse event before routing,
-    /// so a surface stays current even when another layer consumes the
-    /// event.
-    pub(super) fn observe_pointer(&mut self, column: u16, row: u16) {
-        let pointer = Some(ratatui::layout::Position::new(column, row));
-        self.dialog.observe_settings_pointer(pointer);
-        if let Some(shell) = self.onboarding_shell.as_mut() {
-            shell.observe_pointer(pointer);
-        }
-    }
-
-    /// The pointer position is unknown (resize, focus loss, mouse capture
-    /// turned off): no surface may derive hover from an old one.
-    pub(super) fn forget_pointer(&mut self) {
-        self.dialog.observe_settings_pointer(None);
-        if let Some(shell) = self.onboarding_shell.as_mut() {
-            shell.observe_pointer(None);
-            shell.end_pointer_interactions();
-        }
-        self.session_rail.clear_hover();
-        self.hovered_affordance = None;
-    }
-
-    /// The layer that receives pointer input — the same precedence
-    /// [`Self::handle_mouse`] routes by. The single source for "who owns the
-    /// pointer": hover renderers below the owner paint no hover.
-    pub(super) fn pointer_owner(&self) -> PointerOwner {
-        if self.daemon_restart_prompt.is_some() {
-            PointerOwner::DaemonRestartPrompt
-        } else if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
-            PointerOwner::WorkspaceTrust
-        } else if self.onboarding_shell.is_some() {
-            PointerOwner::Onboarding
-        } else if self.keys_overlay.is_some() {
-            PointerOwner::KeysOverlay
-        } else if self.context_menu.is_some() {
-            PointerOwner::ContextMenu
-        } else {
-            PointerOwner::Surface
-        }
-    }
-
-    /// Tell every hover renderer whether it owns the pointer this frame.
-    pub(super) fn distribute_pointer_ownership(&mut self) {
-        let owner = self.pointer_owner();
-        if let Some(shell) = self.onboarding_shell.as_mut() {
-            shell.set_pointer_owned(owner == PointerOwner::Onboarding);
-        }
-        self.dialog
-            .set_settings_pointer_owned(owner == PointerOwner::Surface);
-    }
-
-    /// Show the daemon restart prompt. It is modal and takes the pointer, so
-    /// every capture underneath ends now (its release would never arrive).
-    pub(super) fn open_daemon_restart_prompt(&mut self) {
-        if self.daemon_restart_prompt.is_none() {
-            self.end_pointer_captures(MouseGestureInvalidation::Cancel);
-        }
-        self.daemon_restart_prompt = Some(super::DaemonRestartPrompt::default());
-    }
-
     pub(super) fn invalidate_mouse_gesture(
         &mut self,
         reason: MouseGestureInvalidation,
@@ -1969,7 +1836,7 @@ impl App {
         self.reduce_mouse_gesture(input);
     }
 
-    fn reduce_mouse_gesture(
+    pub(super) fn reduce_mouse_gesture(
         &mut self,
         input: mouse_gesture::GestureInput,
     ) -> Vec<mouse_gesture::GestureEffect> {

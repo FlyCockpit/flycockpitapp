@@ -389,7 +389,13 @@ impl SessionRail {
         spans: &[(usize, usize, usize)],
         cards: &[(SessionSummary, super::Tier)],
     ) {
-        let Some(index) = self.hovered_card else {
+        // Hover derives from the reported pointer against this frame's card
+        // hits (recorded just above), never a card index kept from an older
+        // frame's list.
+        let Some(index) = self
+            .pointer_position
+            .and_then(|(x, y)| super::hit_card(&self.card_hits, x, y))
+        else {
             return;
         };
         let Some((_, start, end)) = spans.iter().copied().find(|(i, _, _)| *i == index) else {

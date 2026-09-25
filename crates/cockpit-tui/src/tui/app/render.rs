@@ -1225,6 +1225,9 @@ impl App {
     }
 
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {
+        // Ownership changes made by agent events or async completions since
+        // the last input end the captures of the old owner.
+        self.sync_pointer_owner();
         self.distribute_pointer_ownership();
         let geom = self.geometry();
         // The chat header records its layout when it renders this frame;
@@ -1298,10 +1301,13 @@ impl App {
             frame.render_widget(ratatui::widgets::Clear, popover_body);
         }
 
-        if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
+        let base = self.base_layer();
+        if base == super::pointer::Layer::WorkspaceTrust {
             self.dialog
                 .render(frame, popover_body, &mut self.link_registry);
-        } else if let Some(shell) = self.onboarding_shell.as_mut() {
+        } else if base == super::pointer::Layer::Onboarding
+            && let Some(shell) = self.onboarding_shell.as_mut()
+        {
             // Full-screen onboarding shell: it replaces the entire chat UI,
             // drawing its own chrome and delegating engine-stage content to
             // the embedded settings dialog.
@@ -1488,47 +1494,54 @@ impl App {
             render_toast(frame, toast_row, &toast);
         }
 
-        // `/pins` review checklist overlay (`pinned-messages`): a compact
-        // bottom-anchored box listing the session's pinned messages, drawn
-        // over the chat while review mode is open. The transcript jumps to
-        // the highlighted pin underneath.
-        if self.pins_review.is_some() {
-            self.render_pins_review(frame, rects.body);
-        }
-        if self.rules_review.is_some() {
-            self.render_rules_review(frame, rects.body);
-        }
-
-        // Context menu overlay renders LAST so it sits on top of
-        // every other pane. The Clear widget inside the renderer
-        // wipes the cells under the overlay so the chat / status
-        // line don't bleed through.
-        if let Some(menu) = self.context_menu.as_ref() {
-            crate::tui::context_menu::render_context_menu(frame, frame.area(), menu);
-        }
-
-        // Which-key overlay (`which-key-overlay.md`): a centred, scrollable,
-        // informational popover over the chat body. Rendered last so it sits
-        // on top without covering the session rail. Take/restore
-        // to satisfy the borrow checker (its render is `&mut self`), like the
-        // other panes. It's only ever open when no required-decision dialog is
-        // up (the leader is guarded; `/keys` can't be typed during a dialog),
-        // so it never obscures a required decision.
-        if self.keys_overlay.is_some() {
-            let keys_rect = crate::tui::chrome::place_popover(
-                chat_body,
-                chat_body.width.saturating_sub(4).clamp(1, 76),
-                chat_body.height.saturating_sub(2).clamp(1, 24),
-                chat_body,
-                crate::tui::chrome::PopoverSide::Center,
-            );
-            let mut overlay = self.keys_overlay.take();
-            if let Some(o) = overlay.as_mut() {
-                o.render(frame, keys_rect);
+        // Floating layers, painted bottom-up in the order of the layer stack
+        // — the same stack that routes the pointer and the keys, so the layer
+        // painted on top is the layer that gets the input.
+        self.pins_review_rect = None;
+        self.rules_review_rect = None;
+        for layer in self.layer_stack().into_iter().rev() {
+            match layer {
+                // `/pins` review checklist (`pinned-messages`): a compact
+                // bottom-anchored box listing the session's pinned messages.
+                // The transcript jumps to the highlighted pin underneath.
+                super::pointer::Layer::PinsReview => {
+                    self.pins_review_rect = self.render_pins_review(frame, rects.body);
+                }
+                super::pointer::Layer::RulesReview => {
+                    self.rules_review_rect = self.render_rules_review(frame, rects.body);
+                }
+                // The context menu's renderer clears the cells under it so
+                // the chat and status line don't bleed through.
+                super::pointer::Layer::ContextMenu => {
+                    if let Some(menu) = self.context_menu.as_ref() {
+                        crate::tui::context_menu::render_context_menu(frame, frame.area(), menu);
+                    }
+                }
+                // Which-key overlay (`which-key-overlay.md`): a centred,
+                // scrollable, informational popover over the chat body,
+                // clear of the session rail.
+                super::pointer::Layer::KeysOverlay => {
+                    let keys_rect = crate::tui::chrome::place_popover(
+                        chat_body,
+                        chat_body.width.saturating_sub(4).clamp(1, 76),
+                        chat_body.height.saturating_sub(2).clamp(1, 24),
+                        chat_body,
+                        crate::tui::chrome::PopoverSide::Center,
+                    );
+                    let mut overlay = self.keys_overlay.take();
+                    if let Some(o) = overlay.as_mut() {
+                        o.render(frame, keys_rect);
+                    }
+                    self.keys_overlay = overlay;
+                }
+                super::pointer::Layer::DaemonRestartPrompt => {
+                    self.render_daemon_restart_prompt(frame);
+                }
+                super::pointer::Layer::WorkspaceTrust
+                | super::pointer::Layer::Onboarding
+                | super::pointer::Layer::Surface => {}
             }
-            self.keys_overlay = overlay;
         }
-        self.render_daemon_restart_prompt(frame);
         self.button_registry.end_frame();
     }
 
@@ -1661,10 +1674,8 @@ impl App {
 
     /// Render the `/pins` review checklist as a bottom-anchored overlay box
     /// over the chat body.
-    fn render_pins_review(&self, frame: &mut ratatui::Frame, body: Rect) {
-        let Some(review) = self.pins_review.as_ref() else {
-            return;
-        };
+    fn render_pins_review(&self, frame: &mut ratatui::Frame, body: Rect) -> Option<Rect> {
+        let review = self.pins_review.as_ref()?;
         let inner_w = body.width.saturating_sub(2);
         let lines = review.render_lines(inner_w);
         // Box height: content + top/bottom border, capped to the body.
@@ -1681,12 +1692,11 @@ impl App {
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        Some(rect)
     }
 
-    fn render_rules_review(&self, frame: &mut ratatui::Frame, body: Rect) {
-        let Some(review) = self.rules_review.as_ref() else {
-            return;
-        };
+    fn render_rules_review(&self, frame: &mut ratatui::Frame, body: Rect) -> Option<Rect> {
+        let review = self.rules_review.as_ref()?;
         let inner_w = body.width.saturating_sub(2);
         let lines = review.render_lines(inner_w);
         let want = (lines.len() as u16) + 2;
@@ -1702,6 +1712,7 @@ impl App {
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        Some(rect)
     }
 
     /// Composer chrome is brass while focused and night while a picker is

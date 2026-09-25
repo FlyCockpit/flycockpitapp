@@ -4591,10 +4591,11 @@ impl SettingsPage for CategoryPage {
     }
 
     fn cancel_pointer_transients(&mut self) {
+        // Pointer-owned confirmations only. An external-editor edit is a
+        // committed action (it owns an operation id and a pending edit) and
+        // settles through its own completion, like the agents page's.
         self.reset.disarm();
         self.shadowed_global = None;
-        self.external_edit_ops.cancel();
-        self.pending_external_edit = None;
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

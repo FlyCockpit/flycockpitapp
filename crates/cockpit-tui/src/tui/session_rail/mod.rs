@@ -287,7 +287,6 @@ pub struct SessionRail {
     confirm_buttons: crate::tui::button::ButtonRegistry,
     pointer_capture: bool,
     visible: bool,
-    hovered_card: Option<usize>,
     pointer_position: Option<(u16, u16)>,
     toggle_area: Option<Rect>,
     new_session_area: Option<Rect>,
@@ -348,7 +347,6 @@ impl SessionRail {
             confirm_buttons: crate::tui::button::ButtonRegistry::default(),
             pointer_capture: false,
             visible: true,
-            hovered_card: None,
             pointer_position: None,
             toggle_area: None,
             new_session_area: None,
@@ -517,15 +515,56 @@ impl SessionRail {
     }
 
     pub fn clear_hover(&mut self) {
-        self.hovered_card = None;
-        self.pointer_position = None;
+        self.set_pointer(None);
     }
 
-    /// End the rail's pointer interactions: hover and any confirm-button
-    /// press in progress.
-    pub fn cancel_pointer_transients(&mut self) {
-        self.clear_hover();
-        self.confirm_buttons.clear_hover_and_pressed();
+    /// The pointer as the app reports it for this surface: the last reported
+    /// position when the rail's layer owns it, else `None`. Every hover the
+    /// rail paints (cards, their actions, the chrome chips, confirm buttons)
+    /// derives from this against the frame being painted.
+    /// The pointer the rail paints hover from.
+    pub fn pointer(&self) -> Option<(u16, u16)> {
+        self.pointer_position
+    }
+
+    pub fn set_pointer(&mut self, pointer: Option<(u16, u16)>) {
+        self.pointer_position = pointer;
+        self.confirm_buttons
+            .resolve_hover(pointer.map(|(x, y)| ratatui::layout::Position::new(x, y)));
+    }
+
+    /// Register one confirm button at `rect` and press it (test setup).
+    #[cfg(test)]
+    pub(crate) fn test_press_confirm_button(&mut self, rect: ratatui::layout::Rect) {
+        use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
+        self.confirm_buttons.begin_frame(true, 1);
+        self.confirm_buttons.register(
+            rect,
+            ButtonSpec::new(
+                ButtonId::SessionsConfirmArchive,
+                "Archive",
+                ButtonDispatch::SessionsConfirmArchive,
+            ),
+        );
+        self.confirm_buttons
+            .handle_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            });
+        assert!(self.confirm_buttons.pressed().is_some());
+    }
+
+    /// Whether a confirm button is pressed (test inspection).
+    #[cfg(test)]
+    pub(crate) fn test_confirm_pressed(&self) -> bool {
+        self.confirm_buttons.pressed().is_some()
+    }
+
+    /// End the rail's pointer capture: a confirm-button press in progress.
+    pub fn cancel_pointer_capture(&mut self) {
+        self.confirm_buttons.clear_pressed();
     }
 
     pub fn set_pointer_capture(&mut self, capture: bool) {
@@ -1296,7 +1335,6 @@ impl SessionRail {
         }
         if matches!(mouse.kind, MouseEventKind::Moved) {
             self.pointer_position = Some((mouse.column, mouse.row));
-            self.hovered_card = hit_card(&self.card_hits, mouse.column, mouse.row);
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self

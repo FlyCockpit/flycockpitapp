@@ -527,7 +527,7 @@ impl App {
         }
     }
 
-    fn apply_provisional_global_event(&mut self, event: TurnEvent) {
+    pub(super) fn apply_provisional_global_event(&mut self, event: TurnEvent) {
         match event {
             TurnEvent::DaemonLinkReconnecting {
                 restarting,

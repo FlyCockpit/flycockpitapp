@@ -10024,3 +10024,47 @@ fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
     assert!(mcp.contains("expected_request_intent_hash"));
     assert!(source.contains("provider_view_matches_mutation"));
 }
+
+#[test]
+fn ending_pointer_captures_keeps_a_committed_external_edit() {
+    // An external-editor edit is a committed action: the end of pointer
+    // captures (resize, focus loss, an ownership change) must not cancel it.
+    let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+    guard.set_var("EDITOR", "true");
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    open_category_on(&mut dialog, Category::Profile, SettingId::Name);
+    dialog.handle_key(press(KeyCode::Enter));
+    let _ = render_settings_rows(&dialog, 80, 20);
+    click_settings_action(
+        &mut dialog,
+        &pointer_actions::SettingsPointerAction::Category(
+            pointer_actions::CategoryAction::ExternalEditBegin(
+                SettingId::Name,
+                pointer_actions::CategoryExternalSource::Inline,
+            ),
+        ),
+    );
+    let (operation, _) = dialog
+        .take_pending_category_external_edit()
+        .expect("the edit is in flight");
+    let mut dialog = Dialog::Settings(Box::new(dialog));
+    dialog.end_settings_pointer_captures();
+    let Dialog::Settings(settings) = &mut dialog else {
+        unreachable!()
+    };
+    assert!(matches!(
+        settings.test_page(),
+        TestPageRef::Category(page)
+            if page.pending_external_edit.as_ref().is_some_and(|pending| pending.operation_id == operation)
+    ));
+    settings.finish_category_external_edit(
+        operation,
+        pointer_actions::ExternalEditOutcome::Saved,
+        None,
+    );
+    assert!(matches!(
+        settings.test_page(),
+        TestPageRef::Category(page) if page.pending_external_edit.is_none()
+    ));
+}

@@ -777,3 +777,54 @@ fn response_performance_chip_gesture_cancels_on_drag_release_outside_and_stale_g
         other => panic!("stale generation must cancel: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn resize_and_focus_loss_end_the_drag_but_keep_a_completed_copy() {
+    for (event, selection_survives) in [
+        (crossterm::event::Event::FocusLost, true),
+        (crossterm::event::Event::Resize(40, 10), false),
+    ] {
+        let mut app = app_with_hello_grid();
+        app.arm_controllable_mouse_copy = true;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 0));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, 0));
+        assert_eq!(app.pending_mouse_copies.len(), 1);
+        let runner = app.controllable_mouse_copy.take().unwrap();
+        app.handle_terminal_event(event.clone());
+        assert_eq!(
+            app.selection.is_some(),
+            selection_survives,
+            "{event:?}: only a resize voids the selection's coordinates"
+        );
+        assert_eq!(
+            app.pending_mouse_copies.len(),
+            1,
+            "{event:?}: the completed copy stays in flight"
+        );
+        runner.release(MouseCopyResult::Confirmed);
+        tokio::task::yield_now().await;
+        app.drain_async_actions();
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Copied 5 chars to clipboard."),
+            "{event:?}: the completed copy reports"
+        );
+    }
+}
+
+#[test]
+fn resize_and_focus_loss_end_an_in_progress_drag() {
+    for event in [
+        crossterm::event::Event::FocusLost,
+        crossterm::event::Event::Resize(40, 10),
+    ] {
+        let mut app = app_with_hello_grid();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 0));
+        assert!(app.mouse_gesture_state.dragging);
+        app.handle_terminal_event(event.clone());
+        assert!(!app.mouse_gesture_state.dragging, "{event:?}: drag ended");
+        assert!(app.mouse_gesture_state.pending_press.is_none(), "{event:?}");
+    }
+}

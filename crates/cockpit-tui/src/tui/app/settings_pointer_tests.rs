@@ -589,34 +589,6 @@ fn app_with_rendered_settings(tmp: &std::path::Path) -> App {
 }
 
 #[test]
-fn settings_records_every_reported_pointer_position_through_the_app() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let mut app = app_with_rendered_settings(tmp.path());
-
-    // Inside the dialog, a move is recorded…
-    app.handle_mouse(mouse(MouseEventKind::Moved, 10, 5));
-    assert_eq!(
-        app.dialog.test_help_row_pointer(),
-        Some(ratatui::layout::Position::new(10, 5))
-    );
-    // …and so is every other kind of event, inside or outside the dialog,
-    // including ones another layer consumes: the pointer is where the
-    // terminal last reported it, never an older interior position.
-    for (kind, column, row) in [
-        (MouseEventKind::ScrollDown, 11, 6),
-        (MouseEventKind::Drag(MouseButton::Left), 12, 7),
-        (MouseEventKind::Moved, 200, 200),
-    ] {
-        app.handle_mouse(mouse(kind, column, row));
-        assert_eq!(
-            app.dialog.test_help_row_pointer(),
-            Some(ratatui::layout::Position::new(column, row)),
-            "{kind:?}"
-        );
-    }
-}
-
-#[test]
 fn settings_pointer_and_press_end_on_resize_focus_loss_and_capture_off() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     for event in [
@@ -638,26 +610,4 @@ fn settings_pointer_and_press_end_on_resize_focus_loss_and_capture_off() {
     app.handle_mouse(mouse(MouseEventKind::Moved, 10, 5));
     app.set_mouse_capture_live(false);
     assert!(app.dialog.test_help_row_pointer().is_none());
-}
-
-#[test]
-fn settings_does_not_own_the_pointer_under_an_app_overlay() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let mut app = app_with_rendered_settings(tmp.path());
-    assert_eq!(app.pointer_owner(), super::PointerOwner::Surface);
-    app.distribute_pointer_ownership();
-    assert!(app.dialog.test_settings_pointer_owned());
-    app.keys_overlay = Some(KeysOverlay::open(KeyContext::Composer));
-    assert_eq!(app.pointer_owner(), super::PointerOwner::KeysOverlay);
-    app.distribute_pointer_ownership();
-    assert!(
-        !app.dialog.test_settings_pointer_owned(),
-        "the settings help row must not hover under the keys overlay"
-    );
-    app.keys_overlay = None;
-    app.open_daemon_restart_prompt();
-    assert_eq!(
-        app.pointer_owner(),
-        super::PointerOwner::DaemonRestartPrompt
-    );
 }

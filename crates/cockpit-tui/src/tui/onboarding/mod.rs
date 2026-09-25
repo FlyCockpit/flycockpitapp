@@ -1711,6 +1711,11 @@ impl OnboardingShell {
     ) -> PointerOutcome {
         let pos = Position::new(mouse.column, mouse.row);
         self.pointer = Some(pos);
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            // Every pointer event crosses the confirmation boundary, including
+            // those the shell consumes (chrome, the Escape menu, blank areas).
+            screen.note_pointer_event(&mouse);
+        }
         if let Some(menu) = self.escape.as_mut() {
             return match menu.handle_mouse(mouse) {
                 EscapeMenuPointer::Chosen(choice) => {
@@ -2233,6 +2238,9 @@ impl OnboardingShell {
     pub(crate) fn end_pointer_interactions(&mut self) {
         self.cancel_pointer_capture();
         self.pointer = None;
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            screen.cancel_pending_confirmation();
+        }
     }
 
     /// Record the last reported pointer position (`None` when it is unknown,

@@ -55,6 +55,7 @@ mod mouse_gesture;
 mod overlay_actions;
 mod panes;
 mod pins;
+mod pointer;
 mod prediction;
 mod primary_paste;
 mod render;
@@ -3118,6 +3119,14 @@ pub struct App {
     pub(super) pins_review: Option<crate::tui::pins_overlay::PinsReview>,
     /// Active `/rules` review panel.
     pub(super) rules_review: Option<crate::tui::rules_overlay::RulesReview>,
+    /// Cells the `/pins` and `/rules` review boxes painted last frame: the
+    /// region where those floating layers take the pointer.
+    pub(super) pins_review_rect: Option<Rect>,
+    pub(super) rules_review_rect: Option<Rect>,
+    /// Last reported pointer position (see `app/pointer.rs`).
+    pub(super) pointer: Option<ratatui::layout::Position>,
+    /// Top layer seen by the last ownership sync.
+    pub(super) last_top_layer: Option<pointer::Layer>,
     /// Count of pinned messages in this session (`pinned-messages`). Drives
     /// the below-input indicator (hidden at zero). Refreshed from the DB on
     /// every pin/unpin and on attach.
@@ -3504,18 +3513,6 @@ pub(super) struct SelectionSpan {
     pub row: u16,
     pub start_col: u16,
     pub end_col: u16,
-}
-
-/// Which layer receives pointer input (see [`App::pointer_owner`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PointerOwner {
-    DaemonRestartPrompt,
-    WorkspaceTrust,
-    Onboarding,
-    KeysOverlay,
-    ContextMenu,
-    /// No overlay: the chat surface, or a settings dialog, owns it.
-    Surface,
 }
 
 /// Why [`App::end_pointer_interactions`] runs.
@@ -4470,6 +4467,10 @@ impl App {
             fork_pick: None,
             copy_pick: None,
             pins_review: None,
+            pins_review_rect: None,
+            rules_review_rect: None,
+            pointer: None,
+            last_top_layer: None,
             rules_review: None,
             pin_count: 0,
             pin_control_rows: Vec::new(),
@@ -4634,8 +4635,7 @@ impl App {
     }
 
     fn draw_frame_contents(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        self.link_registry.begin_frame();
-        terminal.draw(|frame| self.render(frame))?;
+        self.draw_resolving_pointer(terminal)?;
         self.after_completed_draw();
         crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
         self.sync_cursor_shape();
@@ -5348,6 +5348,8 @@ mod local_cmd_tests;
 #[cfg(test)]
 #[cfg(test)]
 mod new_session_swap_tests;
+#[cfg(test)]
+mod pointer_tests;
 #[cfg(test)]
 mod prediction_lifecycle_tests;
 #[cfg(test)]

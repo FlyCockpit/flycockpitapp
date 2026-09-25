@@ -6804,14 +6804,10 @@ impl SettingsPage for ProvidersPage {
     }
 
     fn cancel_pointer_transients(&mut self) {
+        // Pointer-owned confirmations only. A Copilot setup operation and an
+        // OAuth copy effect are committed actions; they settle through their
+        // own completions.
         match self {
-            ProvidersPage::CopilotSetup { state, .. } => state.operation.cancel(),
-            ProvidersPage::OAuthSetup { state, .. } => state.cancel_copy_effect(),
-            ProvidersPage::Add(state) => {
-                if let Some(oauth) = state.oauth_auth.as_mut() {
-                    oauth.cancel_copy_effect();
-                }
-            }
             ProvidersPage::List { delete_pending, .. } => *delete_pending = false,
             ProvidersPage::Edit(state) => state.delete_pending = false,
             _ => {}

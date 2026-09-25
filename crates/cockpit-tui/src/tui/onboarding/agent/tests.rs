@@ -1456,46 +1456,43 @@ fn an_arm_does_not_pass_to_the_child_that_shifts_into_its_slot() {
 }
 
 #[test]
-fn an_arm_does_not_survive_a_projection_replacement() {
-    let mut screen = two_pending_trust_screen();
+fn a_projection_replacement_with_identical_content_still_drops_the_arm() {
+    // Same routes, same order: only the draft instance distinguishes the
+    // replaced draft from the old one.
+    let projection = {
+        let mut projection = sample_projection("same-content");
+        projection.policy.routes[1].confirmation_required = true;
+        projection.policy.routes[1].trust = AgentPolicyTrustClassification::Unset;
+        projection
+    };
+    let mut screen = AgentAuthoringScreen::new(projection.clone(), "op".into());
+    screen.draft.route_grants[1].enabled = true;
+    screen.phase = Phase::ModelTrust;
     render_buffer(&mut screen, 120, 40);
     click_first_list_row(&mut screen);
-    // The daemon replaces the projection; the route order changes, so index
-    // 0 now names a different model.
-    let mut projection = sample_projection("replaced");
-    projection.policy.routes.swap(0, 1);
-    projection.policy.routes[0].confirmation_required = true;
-    projection.policy.routes[0].trust = AgentPolicyTrustClassification::Unset;
+    assert!(!screen.draft.trust_confirmations[0]);
+
     screen.replace_projection(projection);
-    for grant in &mut screen.draft.route_grants {
-        grant.enabled = true;
-    }
+    screen.draft.route_grants[1].enabled = true;
     screen.phase = Phase::ModelTrust;
     render_buffer(&mut screen, 120, 40);
     click_first_list_row(&mut screen);
     assert!(
-        !screen
-            .draft
-            .trust_confirmations
-            .iter()
-            .any(|confirmed| *confirmed),
-        "an arm from the replaced projection confirmed a model on one click"
+        !screen.draft.trust_confirmations[0],
+        "an arm from before the replacement confirmed the rebuilt draft on one click"
     );
 }
 
 #[test]
 fn publisher_trust_follows_the_concrete_locator() {
+    // Content keying alone: the locator changes with no key, click or
+    // navigation in between that would disarm on its own.
     let mut screen = AgentAuthoringScreen::new(sample_projection("locator"), "op".into());
     screen.draft.third_party_locator = "registry/a@1".into();
     screen.phase = Phase::ThirdPartyTrust;
     render_buffer(&mut screen, 120, 40);
     click_first_list_row(&mut screen);
-    // Back to the locator, change it, and continue.
-    screen.handle_key(key(KeyCode::Esc));
-    assert_eq!(screen.phase, Phase::ThirdPartyLocator);
-    screen.third_party_field.set("registry/b@2");
-    screen.handle_key(key(KeyCode::Enter));
-    assert_eq!(screen.phase, Phase::ThirdPartyTrust);
+    screen.draft.third_party_locator = "registry/b@2".into();
     render_buffer(&mut screen, 120, 40);
     click_first_list_row(&mut screen);
     assert!(
@@ -1506,7 +1503,7 @@ fn publisher_trust_follows_the_concrete_locator() {
     // A confirmed trust does not carry over to a changed locator either.
     click_first_list_row(&mut screen);
     assert!(screen.draft.third_party_trust_confirmed);
-    screen.handle_key(key(KeyCode::Esc));
+    screen.phase = Phase::ThirdPartyLocator;
     screen.third_party_field.set("registry/c@3");
     screen.handle_key(key(KeyCode::Enter));
     assert!(!screen.draft.third_party_trust_confirmed);
@@ -1529,4 +1526,160 @@ fn a_keyboard_confirm_clears_the_pending_arm_on_the_same_target() {
     render_buffer(&mut screen, 120, 40);
     screen.handle_mouse(click_at(Position::new(row.x, row.y)));
     assert!(!screen.draft.third_party_trust_confirmed);
+}
+
+fn mouse_at(
+    kind: crossterm::event::MouseEventKind,
+    x: u16,
+    y: u16,
+) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+/// A full click (press then release) on the first trust row.
+fn full_click_first_row(screen: &mut AgentAuthoringScreen) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let row = screen.list_row_rects[0];
+    screen.handle_mouse(mouse_at(
+        MouseEventKind::Down(MouseButton::Left),
+        row.x,
+        row.y,
+    ));
+    screen.handle_mouse(mouse_at(
+        MouseEventKind::Up(MouseButton::Left),
+        row.x,
+        row.y,
+    ));
+}
+
+#[test]
+fn motion_drags_and_releases_between_the_two_clicks_keep_the_arm() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mut screen = two_pending_trust_screen();
+    render_buffer(&mut screen, 120, 40);
+    full_click_first_row(&mut screen);
+    let row = screen.list_row_rects[0];
+    screen.handle_mouse(mouse_at(MouseEventKind::Moved, row.x + 5, row.y + 3));
+    screen.handle_mouse(mouse_at(
+        MouseEventKind::Drag(MouseButton::Left),
+        row.x + 1,
+        row.y,
+    ));
+    screen.handle_mouse(mouse_at(
+        MouseEventKind::Up(MouseButton::Right),
+        row.x,
+        row.y,
+    ));
+    screen.handle_mouse(mouse_at(MouseEventKind::Moved, row.x, row.y));
+    full_click_first_row(&mut screen);
+    assert!(
+        screen.draft.trust_confirmations[0],
+        "two consecutive clicks on the same row must confirm"
+    );
+}
+
+#[test]
+fn any_other_press_or_scroll_between_the_two_clicks_disarms() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let interruptions: [(&str, MouseEventKind, bool); 5] = [
+        ("blank click", MouseEventKind::Down(MouseButton::Left), true),
+        (
+            "right click on the row",
+            MouseEventKind::Down(MouseButton::Right),
+            false,
+        ),
+        (
+            "middle click on the row",
+            MouseEventKind::Down(MouseButton::Middle),
+            false,
+        ),
+        ("horizontal scroll", MouseEventKind::ScrollLeft, false),
+        ("wheel", MouseEventKind::ScrollDown, false),
+    ];
+    for (name, kind, blank) in interruptions {
+        let mut screen = two_pending_trust_screen();
+        render_buffer(&mut screen, 120, 40);
+        full_click_first_row(&mut screen);
+        let row = screen.list_row_rects[0];
+        let (x, y) = if blank { (row.x, 38) } else { (row.x, row.y) };
+        screen.handle_mouse(mouse_at(kind, x, y));
+        screen.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), x, y));
+        render_buffer(&mut screen, 120, 40);
+        full_click_first_row(&mut screen);
+        assert!(
+            !screen.draft.trust_confirmations[0],
+            "{name} between the clicks must disarm"
+        );
+    }
+}
+
+fn trust_shell() -> super::super::OnboardingShell {
+    let mut shell = optimizations_shell();
+    shell.screen =
+        super::super::OnboardingScreen::AgentAuthoring(Box::new(two_pending_trust_screen()));
+    shell
+}
+
+fn shell_trust_confirmed(shell: &super::super::OnboardingShell) -> bool {
+    match &shell.screen {
+        super::super::OnboardingScreen::AgentAuthoring(screen) => {
+            screen.draft.trust_confirmations[0]
+        }
+        _ => unreachable!("trust shell holds the authoring screen"),
+    }
+}
+
+fn shell_first_row(shell: &super::super::OnboardingShell) -> Rect {
+    match &shell.screen {
+        super::super::OnboardingScreen::AgentAuthoring(screen) => screen.list_row_rects[0],
+        _ => unreachable!("trust shell holds the authoring screen"),
+    }
+}
+
+fn shell_full_click(shell: &mut super::super::OnboardingShell, x: u16, y: u16) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mut engine = crate::tui::settings::Dialog::None;
+    shell.handle_mouse(
+        mouse_at(MouseEventKind::Down(MouseButton::Left), x, y),
+        &mut engine,
+    );
+    shell.handle_mouse(
+        mouse_at(MouseEventKind::Up(MouseButton::Left), x, y),
+        &mut engine,
+    );
+}
+
+#[test]
+fn a_shell_chrome_click_or_a_resize_between_the_two_clicks_disarms() {
+    // A click the shell consumes itself (its blank margin) never reaches the
+    // screen's row handler, but still crosses the confirmation boundary.
+    let mut shell = trust_shell();
+    render_shell(&mut shell, 120, 40);
+    let row = shell_first_row(&shell);
+    shell_full_click(&mut shell, row.x, row.y);
+    shell_full_click(&mut shell, 119, 39);
+    render_shell(&mut shell, 120, 40);
+    shell_full_click(&mut shell, row.x, row.y);
+    assert!(!shell_trust_confirmed(&shell), "a chrome click must disarm");
+
+    // Resize / focus loss end the pointer interaction and the arm with it.
+    let mut shell = trust_shell();
+    render_shell(&mut shell, 120, 40);
+    shell_full_click(&mut shell, row.x, row.y);
+    shell.end_pointer_interactions();
+    render_shell(&mut shell, 120, 40);
+    shell_full_click(&mut shell, row.x, row.y);
+    assert!(!shell_trust_confirmed(&shell), "a resize must disarm");
+
+    // Control: two consecutive clicks through the shell confirm.
+    let mut shell = trust_shell();
+    render_shell(&mut shell, 120, 40);
+    shell_full_click(&mut shell, row.x, row.y);
+    shell_full_click(&mut shell, row.x, row.y);
+    assert!(shell_trust_confirmed(&shell));
 }

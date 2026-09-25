@@ -448,6 +448,79 @@ impl App {
         }
     }
 
+    /// Keys for the floating layer on top of the stack (the daemon restart
+    /// prompt is routed ahead of everything in [`Self::handle_key`]).
+    fn route_floating_layer_key(&mut self, layer: super::pointer::Layer, key: KeyEvent) {
+        use super::pointer::Layer;
+        match layer {
+            // Which-key overlay (`which-key-overlay.md`): fully modal. The
+            // key goes to it (scroll / Esc / q / leader-again close). TUI-only
+            // — never touches the agent or history.
+            Layer::KeysOverlay => {
+                if let Some(overlay) = self.keys_overlay.as_mut()
+                    && overlay.handle_key(key)
+                {
+                    self.keys_overlay = None;
+                }
+            }
+            // Context menu: arrows / j-k move the focus, Enter executes, Esc
+            // dismisses, any other printable key dismisses without executing
+            // (so the user can resume typing without a stray menu).
+            Layer::ContextMenu => {
+                let Some(menu) = self.context_menu.clone() else {
+                    return;
+                };
+                match key.code {
+                    KeyCode::Esc => {
+                        self.context_menu = None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if let Some(m) = self.context_menu.as_mut() {
+                            m.move_cursor(-1);
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some(m) = self.context_menu.as_mut() {
+                            m.move_cursor(1);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        self.context_menu = None;
+                        if let Some(action) = menu.focused_action() {
+                            self.execute_context_menu_action(action, menu.clicked_chat_row);
+                        }
+                    }
+                    _ if !is_modifier_only(&key) => {
+                        self.context_menu = None;
+                    }
+                    _ => {}
+                }
+            }
+            // `/rules` review: ↑/↓/j/k scan, `d` / Space revoke, `p` promote,
+            // Esc closes.
+            Layer::RulesReview => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.rules_review_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.rules_review_down(),
+                KeyCode::Char('d') | KeyCode::Char(' ') => self.rules_review_revoke_selected(),
+                KeyCode::Char('p') => self.rules_review_promote_selected(),
+                KeyCode::Esc => self.close_rules_review(),
+                _ => {}
+            },
+            // `/pins` review (`pinned-messages`): ↑/↓/j/k scan the checklist
+            // (jumping the transcript to each pin), `d` / Space unpin, Esc
+            // closes and refocuses the composer.
+            Layer::PinsReview => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.pins_review_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.pins_review_down(),
+                KeyCode::Char('d') | KeyCode::Char(' ') => self.pins_review_unpin_selected(),
+                KeyCode::Esc => self.close_pins_review(),
+                _ => {}
+            },
+            Layer::DaemonRestartPrompt => self.handle_daemon_restart_prompt_key(key),
+            Layer::WorkspaceTrust | Layer::Onboarding | Layer::Surface => {}
+        }
+    }
+
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
         if self.daemon_restart_prompt.is_some() {
@@ -726,11 +799,16 @@ impl App {
         }
 
         // Full-screen onboarding owns Ctrl-C / Ctrl-Shift-C (quit) and every
-        // other key while it is open, so this must sit ahead of the chat
-        // interrupt/exit chords.
-        if self.startup_modal_on_top() != Some(StartupModal::WorkspaceTrust)
-            && self.onboarding_shell.is_some()
-        {
+        // other key while it is the top of the layer stack, so this must sit
+        // ahead of the chat interrupt/exit chords. A floating layer painted
+        // over it (which-key overlay, context menu, a review box) keeps the
+        // keys — and so can always be closed — until it is gone.
+        if self.base_layer() == super::pointer::Layer::Onboarding {
+            let key_owner = self.key_owner();
+            if key_owner.is_floating() {
+                self.route_floating_layer_key(key_owner, key);
+                return false;
+            }
             return self.handle_onboarding_shell_key(key);
         }
 
@@ -787,16 +865,13 @@ impl App {
             self.last_user_interaction = Instant::now();
         }
 
-        // Which-key overlay (`which-key-overlay.md`). When open it is fully
-        // modal: route the key to it (scroll / Esc / q / leader-again close)
-        // and always consume so nothing leaks underneath. The leader key also
-        // closes it (toggle). TUI-only — never touches the agent or history.
-        if self.keys_overlay.is_some() {
-            if let Some(overlay) = self.keys_overlay.as_mut()
-                && overlay.handle_key(key)
-            {
-                self.keys_overlay = None;
-            }
+        // A floating layer on top of the surface (which-key overlay, context
+        // menu, `/rules` or `/pins` review) takes every key while it is the
+        // top of the layer stack — the same stack that orders painting and
+        // routes the pointer. Nothing leaks underneath.
+        let key_owner = self.key_owner();
+        if key_owner.is_floating() {
+            self.route_floating_layer_key(key_owner, key);
             return false;
         }
 
@@ -835,40 +910,6 @@ impl App {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.commit_stop(),
                 _ => self.cancel_stop(),
-            }
-            return false;
-        }
-
-        // Context menu intercepts keys while open. Arrows / j-k move
-        // the focus, Enter executes, Esc dismisses, any other
-        // printable key dismisses without executing (so the user can
-        // resume typing into the composer without a stray menu).
-        if let Some(menu) = self.context_menu.clone() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.context_menu = None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if let Some(m) = self.context_menu.as_mut() {
-                        m.move_cursor(-1);
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if let Some(m) = self.context_menu.as_mut() {
-                        m.move_cursor(1);
-                    }
-                }
-                KeyCode::Enter => {
-                    self.context_menu = None;
-                    if let Some(action) = menu.focused_action() {
-                        self.execute_context_menu_action(action, menu.clicked_chat_row);
-                    }
-                }
-                _ if !is_modifier_only(&key) => {
-                    // Any other typed key dismisses without action.
-                    self.context_menu = None;
-                }
-                _ => {}
             }
             return false;
         }
@@ -913,33 +954,6 @@ impl App {
                 KeyCode::BackTab => self.copy_pick_cycle_target(-1),
                 KeyCode::Enter => self.open_copy_pick_format_menu(),
                 KeyCode::Esc => self.cancel_copy_pick(),
-                _ => {}
-            }
-            return false;
-        }
-
-        // `/pins` review mode (`pinned-messages`): modal while open.
-        // ↑/↓/j/k scan the checklist (jumping the transcript to each pin),
-        // `d` / Space (check) unpin the highlighted pin, Esc closes and
-        // refocuses the composer.
-        if self.pins_review.is_some() {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => self.pins_review_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.pins_review_down(),
-                KeyCode::Char('d') | KeyCode::Char(' ') => self.pins_review_unpin_selected(),
-                KeyCode::Esc => self.close_pins_review(),
-                _ => {}
-            }
-            return false;
-        }
-
-        if self.rules_review.is_some() {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => self.rules_review_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.rules_review_down(),
-                KeyCode::Char('d') | KeyCode::Char(' ') => self.rules_review_revoke_selected(),
-                KeyCode::Char('p') => self.rules_review_promote_selected(),
-                KeyCode::Esc => self.close_rules_review(),
                 _ => {}
             }
             return false;

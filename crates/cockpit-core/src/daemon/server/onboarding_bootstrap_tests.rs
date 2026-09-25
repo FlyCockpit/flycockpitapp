@@ -6,7 +6,7 @@ use cockpit_proto::{
 };
 
 use super::{
-    BootServices, LockedProbeFuture, LockedProbePlan, LockedServices, boot_with_db_and_probe_plan,
+    LockedProbeFuture, LockedProbePlan, LockedServices, boot_with_db_and_probe_plan,
     handle_locked_in_process_request,
 };
 
@@ -49,10 +49,11 @@ async fn locked_services_with_probe_plan(
     )
     .await
     .expect("vault-free boot");
-    match services {
-        BootServices::Locked(locked) => (tmp, locked),
-        BootServices::Ready(_) => panic!("fresh boot must not materialize a default vault"),
-    }
+    assert!(
+        !services.vault_committed(),
+        "fresh boot must not materialize a default vault"
+    );
+    (tmp, services)
 }
 
 async fn advance_to_secure_store(
@@ -418,7 +419,9 @@ async fn locked_owner_abandoned_during_a_rolled_back_transition_still_reaps() {
     // A ready transition takes the permit and closes admission.
     assert!(locked.try_acquire_ready_transition());
     let permit = super::ReadyTransitionPermit::new(locked.clone());
-    locked.begin_locked_to_ready_transition().await;
+    locked
+        .closing
+        .store(true, std::sync::atomic::Ordering::Release);
 
     // The last client leaves mid-transition: the loop must defer teardown.
     drop(client);
@@ -429,10 +432,7 @@ async fn locked_owner_abandoned_during_a_rolled_back_transition_still_reaps() {
     );
 
     // Construction fails and rolls back; nobody is attached any more.
-    permit
-        .rollback()
-        .await
-        .expect("ready-transition rollback commits");
+    permit.rollback();
     let outcome = tokio::time::timeout(
         super::LAST_CLIENT_HANDOFF_GRACE + std::time::Duration::from_secs(5),
         &mut run,
@@ -651,8 +651,11 @@ async fn ready_transition_keeps_the_acquired_permit_until_return_publication() {
     drop(ready);
 }
 
+/// An abandoned constructed graph (never handed to a lifecycle owner) rolls
+/// back in memory at once: the permit is released, admission reopens, and
+/// the phase reports the retryable failure. Nothing durable is written.
 #[tokio::test]
-async fn dropped_ready_construction_retains_permit_through_rollback() {
+async fn dropped_ready_construction_rolls_back_in_memory_and_releases_the_permit() {
     let (_tmp, locked, _) = ready_construction().await;
     let constructed = locked
         .finish_ready_transition()
@@ -661,16 +664,20 @@ async fn dropped_ready_construction_retains_permit_through_rollback() {
 
     drop(constructed);
     assert!(
-        locked
+        !locked
             .ready_transition_inflight
             .load(std::sync::atomic::Ordering::Acquire),
-        "a detached rollback must retain exclusive transition ownership"
+        "an abandoned attempt releases its permit"
     );
-    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!locked.closing.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Failed
+    );
 }
 
 #[tokio::test]
-async fn stored_ready_handoff_without_lifecycle_receiver_rolls_back_under_permit() {
+async fn stored_ready_handoff_without_lifecycle_receiver_rolls_back() {
     let (_tmp, locked, _) = ready_construction().await;
     let constructed = locked
         .finish_ready_transition()
@@ -679,12 +686,16 @@ async fn stored_ready_handoff_without_lifecycle_receiver_rolls_back_under_permit
 
     constructed.publish_stored();
     assert!(
-        locked
+        !locked
             .ready_transition_inflight
             .load(std::sync::atomic::Ordering::Acquire),
-        "failed lifecycle delivery must retain exclusive transition ownership"
+        "undeliverable publication rolls back and releases the permit"
     );
-    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Failed
+    );
+    assert!(!locked.ready.load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -863,6 +874,7 @@ async fn send_secure_intent_on_wire(
     Some(cockpit_proto::decode_sensitive_onboarding_response(&response).expect("decode response"))
 }
 
+#[cfg(unix)]
 async fn wait_for_phase(locked: &LockedServices, phase: cockpit_proto::LockedReadyConstruction) {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while locked.ready_construction_phase() != phase {
@@ -941,10 +953,11 @@ async fn locked_owner_answers_hellos_with_constructing_phase_during_construction
     )
     .await;
 
-    // A brand-new connection completes its hello while construction is held.
+    // A brand-new bootstrap connection completes its hello while
+    // construction is held (a ready-services `connect` would wait).
     let client = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        cockpit_client::DaemonClient::connect(&served.locked.paths.socket),
+        cockpit_client::DaemonClient::connect_bootstrap(&served.locked.paths.socket),
     )
     .await
     .expect("hello must not wait for ready construction")
@@ -1046,38 +1059,144 @@ async fn stop_during_ready_construction_settles_before_exit() {
     drop(served.tmp);
 }
 
-/// A retry is idempotent and daemon-owned: it answers at once, a duplicate
-/// while construction runs is admitted without starting a second
-/// construction, and the owner then publishes ready services.
+/// Commit the secure-store choice directly (no construction started yet).
+async fn commit_secure_store(
+    locked: &super::LockedServices,
+    secure: &cockpit_proto::OnboardingBootstrapSnapshot,
+    client_operation_id: &str,
+) -> cockpit_proto::OnboardingTransitionResult {
+    locked
+        .apply_secure_intent(ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: client_operation_id.into(),
+            placement: OnboardingSecurePlacement::MachineBoundFile,
+            passphrase: None,
+        })
+        .await
+        .expect("commit secure intent without starting construction")
+}
+
+/// The production signal forwarder drives the stop: the first SIGTERM is an
+/// acknowledged locked stop that lets an in-flight construction settle (the
+/// owner keeps running while it is held), a repeated signal is the explicit
+/// force, and once released the settled construction ends in `Shutdown`.
+/// Signals are process-wide, so the scenario runs in an isolated child
+/// process of this test binary.
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_signals_stop_after_construction_settles_and_repeat_forces() {
+    const CHILD: &str = "COCKPIT_LOCKED_SIGNAL_FORWARDER_CHILD";
+    const OK: &str = "locked-signal-forwarder-child-ok";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .args([
+                "--exact",
+                "daemon::server::onboarding_bootstrap_tests::shutdown_signals_stop_after_construction_settles_and_repeat_forces",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("run the isolated signal scenario");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "child failed:\n{stdout}\n{stderr}");
+        assert!(
+            stderr.contains(OK) || stdout.contains(OK),
+            "child did not run the scenario:\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+    let served = serve_locked_owner().await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    commit_secure_store(&served.locked, &secure, "signal-intent").await;
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *served.locked.construction_gate.lock().unwrap() = Some(gate);
+    served
+        .locked
+        .start_ready_construction()
+        .expect("construction admitted");
+    let force = std::sync::Arc::new(tokio::sync::Notify::new());
+    let signals = crate::daemon::BootstrapShutdownSignals::new();
+    let forwarder = tokio::spawn(crate::daemon::forward_locked_bootstrap_signals(
+        served.locked.clone(),
+        force.clone(),
+        signals,
+    ));
+    // SAFETY: raising a signal this process handles (tokio streams above).
+    assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !served
+            .locked
+            .stop_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first signal requests the locked stop");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), force.notified())
+            .await
+            .is_err(),
+        "one signal is never a force"
+    );
+    assert!(
+        !served.run.is_finished(),
+        "a signalled stop waits for the in-flight construction"
+    );
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(5), force.notified())
+        .await
+        .expect("a repeated signal is the explicit force");
+    forwarder.await.expect("forwarder joined");
+    release.send(()).expect("release construction");
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
+        .await
+        .expect("the stop completes once construction settles")
+        .expect("locked run loop joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Shutdown));
+    eprintln!("{OK}");
+}
+
+/// A real construction failure (an injected error on the production path,
+/// not a hand-set phase) rolls back to the retryable `failed` phase; the
+/// retry is idempotent and daemon-owned: it answers at once, a duplicate
+/// while construction runs starts nothing, and the owner then publishes
+/// ready services.
 #[cfg(unix)]
 #[tokio::test]
 async fn ready_construction_retry_is_idempotent_and_daemon_owned() {
     let served = serve_locked_owner().await;
     let secure = advance_to_secure_store(&served.locked).await;
+    commit_secure_store(&served.locked, &secure, "retry-intent").await;
     served
         .locked
-        .apply_secure_intent(ApplyOnboardingSecureIntent {
-            run_id: secure.run_id,
-            attempt_id: secure.attempt_id,
-            expected_revision: secure.revision,
-            client_operation_id: "retry-intent".into(),
-            placement: OnboardingSecurePlacement::MachineBoundFile,
-            passphrase: None,
-        })
-        .await
-        .expect("commit secure intent without starting construction");
-    // An earlier construction failed and rolled back.
-    served
-        .locked
-        .mark_ready_construction_failed()
-        .await
-        .expect("record failed construction");
-    served
-        .locked
-        .set_ready_construction_phase(super::READY_CONSTRUCTION_FAILED);
+        .fail_next_construction
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        served
+            .locked
+            .start_ready_construction()
+            .expect("first attempt admitted"),
+        super::ReadyConstructionStart::Started
+    );
+    wait_for_phase(
+        &served.locked,
+        cockpit_proto::LockedReadyConstruction::Failed,
+    )
+    .await;
+    assert!(
+        !served.run.is_finished(),
+        "a failed construction keeps the owner serving"
+    );
+
     let (release, gate) = tokio::sync::oneshot::channel();
     *served.locked.construction_gate.lock().unwrap() = Some(gate);
-
     let first = super::retry_locked_ready_construction(&served.locked)
         .await
         .expect("retry admitted");
@@ -1102,80 +1221,187 @@ async fn ready_construction_retry_is_idempotent_and_daemon_owned() {
         .expect("retried construction completes")
         .expect("locked run loop joined");
     assert!(matches!(outcome, super::LockedRunOutcome::Ready(..)));
-    let snapshot = served
-        .locked
-        .onboarding
-        .snapshot(served.locked.host_capabilities())
-        .await
-        .expect("read onboarding checkpoint")
-        .expect("onboarding run exists");
-    assert_eq!(
-        snapshot.bootstrap_state,
-        cockpit_proto::OnboardingBootstrapState::Ready
-    );
     drop(served.locked);
     drop(served.tmp);
 }
 
-/// A secure intent that already committed replays idempotently by its exact
-/// client operation id (a response lost in transit); any other submission
-/// after the vault exists keeps the fixed denial.
+/// A retry whose snapshot read fails after it admitted construction reports
+/// the error to its caller, but the spawned construction it started is not
+/// the caller's: it still completes and publishes ready services.
+#[cfg(unix)]
 #[tokio::test]
-async fn committed_secure_intent_replays_by_operation_id_only() {
+async fn failed_retry_snapshot_cannot_cancel_the_spawned_construction() {
+    let served = serve_locked_owner().await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    commit_secure_store(&served.locked, &secure, "retry-snapshot-intent").await;
+    served
+        .locked
+        .fail_next_construction
+        .store(true, std::sync::atomic::Ordering::Release);
+    served
+        .locked
+        .start_ready_construction()
+        .expect("first attempt admitted");
+    wait_for_phase(
+        &served.locked,
+        cockpit_proto::LockedReadyConstruction::Failed,
+    )
+    .await;
+    served
+        .locked
+        .fail_next_retry_snapshot
+        .store(true, std::sync::atomic::Ordering::Release);
+    let error = super::retry_locked_ready_construction(&served.locked)
+        .await
+        .expect_err("the injected snapshot failure reaches the caller");
+    assert!(
+        error.message.contains("injected retry snapshot failure"),
+        "{}",
+        error.message
+    );
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
+        .await
+        .expect("construction completes despite the failed retry response")
+        .expect("locked run loop joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Ready(..)));
+    drop(served.locked);
+    drop(served.tmp);
+}
+
+/// A secure intent that already committed replays idempotently — but only
+/// the exact operation: same ids, the `secure_store` operation kind, and the
+/// same request parameters. A different placement under the same id, the id
+/// of a different (begin) operation, or a still-pending secure-store receipt
+/// never replays as `Applied`.
+#[tokio::test]
+async fn committed_secure_intent_replays_only_the_exact_operation() {
     let (_tmp, locked, committed) = ready_construction().await;
+    let intent = |client_operation_id: &str, placement| ApplyOnboardingSecureIntent {
+        run_id: committed.receipt.run_id,
+        attempt_id: committed.receipt.attempt_id,
+        expected_revision: committed.receipt.consumed_revision,
+        client_operation_id: client_operation_id.into(),
+        placement,
+        passphrase: None,
+    };
     let replay = locked
-        .apply_secure_intent(ApplyOnboardingSecureIntent {
-            run_id: committed.receipt.run_id,
-            attempt_id: committed.receipt.attempt_id,
-            expected_revision: committed.receipt.consumed_revision,
-            client_operation_id: "construct-ready".into(),
-            placement: OnboardingSecurePlacement::MachineBoundFile,
-            passphrase: None,
-        })
+        .apply_secure_intent_span(intent(
+            "construct-ready",
+            OnboardingSecurePlacement::MachineBoundFile,
+        ))
         .await
         .expect("replay of the committed operation");
     assert_eq!(replay.receipt, committed.receipt);
     assert_eq!(replay.snapshot.stage, OnboardingStage::Provider);
-    let other = locked
+
+    for (label, request) in [
+        (
+            "another client operation",
+            intent("another-click", OnboardingSecurePlacement::MachineBoundFile),
+        ),
+        (
+            "different parameters",
+            intent("construct-ready", OnboardingSecurePlacement::Keyring),
+        ),
+        // `commit-profile` is an ordinary transition receipt in this run.
+        (
+            "an ordinary transition's id",
+            intent(
+                "commit-profile",
+                OnboardingSecurePlacement::MachineBoundFile,
+            ),
+        ),
+    ] {
+        assert!(
+            matches!(
+                locked.apply_secure_intent_span(request).await,
+                Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest)
+            ),
+            "{label} must not replay"
+        );
+    }
+}
+
+/// A pending secure-store receipt (materialization not yet settled) is not
+/// evidence of a commit: its operation does not replay as `Applied`.
+#[tokio::test]
+async fn pending_secure_intent_receipt_does_not_replay() {
+    let (_tmp, locked) = fresh_locked_services().await;
+    let secure = advance_to_secure_store(&locked).await;
+    let current = locked
+        .db
+        .onboarding_snapshot()
+        .await
+        .expect("snapshot")
+        .expect("run exists");
+    locked
+        .db
+        .onboarding_secure_intent_pending(
+            current,
+            "pending-intent".into(),
+            cockpit_db::onboarding::OnboardingSecurePlacement::MachineBoundFile,
+            false,
+            0,
+        )
+        .await
+        .expect("record the pending intent");
+    let replay = locked
+        .onboarding
+        .committed_secure_intent_replay(
+            &ApplyOnboardingSecureIntent {
+                run_id: secure.run_id,
+                attempt_id: secure.attempt_id,
+                expected_revision: secure.revision,
+                client_operation_id: "pending-intent".into(),
+                placement: OnboardingSecurePlacement::MachineBoundFile,
+                passphrase: None,
+            },
+            locked.host_capabilities(),
+        )
+        .await
+        .expect("replay lookup");
+    assert!(
+        replay.is_none(),
+        "a pending receipt is not a committed replay"
+    );
+}
+
+/// A client operation id of the maximum wire length completes end to end:
+/// the daemon's own follow-up operation ids are fixed-width in a reserved
+/// namespace, never derived by appending to the client id.
+#[tokio::test]
+async fn maximum_length_secure_intent_operation_id_completes() {
+    let (_tmp, locked) = fresh_locked_services().await;
+    let secure = advance_to_secure_store(&locked).await;
+    let id = "x".repeat(128);
+    let result = commit_secure_store(&locked, &secure, &id).await;
+    assert_eq!(result.snapshot.stage, OnboardingStage::Provider);
+    assert_eq!(
+        result.receipt.status,
+        cockpit_proto::OnboardingReceiptStatus::Committed
+    );
+    let reserved = locked
         .apply_secure_intent(ApplyOnboardingSecureIntent {
-            run_id: committed.receipt.run_id,
-            attempt_id: committed.receipt.attempt_id,
-            expected_revision: committed.snapshot.revision,
-            client_operation_id: "another-click".into(),
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: "cockpit-internal:bootstrap-reconcile:1".into(),
             placement: OnboardingSecurePlacement::MachineBoundFile,
             passphrase: None,
         })
         .await;
-    assert!(matches!(
-        other,
-        Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest)
-    ));
+    assert!(reserved.is_err(), "the internal namespace is reserved");
 }
 
-/// The user's stuck install: the vault committed, ready construction was
-/// interrupted, and the checkpoint says `stage = provider, bootstrap_state =
-/// failed`. Every later daemon boots straight into ready services (the vault
-/// exists), where a ready-construction retry is invalid, so a client that
-/// trusted the stale `failed` state looped on a refused retry. A ready boot
-/// is itself the successful construction and must clear the stale state.
+/// D1: a boot with a committed vault comes up as the locked bootstrap owner
+/// right after DB/config initialization — its hello reports `constructing`,
+/// never `awaiting_secure_store` — and publishes ready services once the
+/// daemon-owned construction completes. There is no durable `failed` state
+/// to heal: the vault alone makes every boot reconstruct.
+#[cfg(unix)]
 #[tokio::test]
-async fn ready_boot_with_committed_vault_clears_a_stale_failed_checkpoint() {
+async fn vault_present_boot_serves_the_bootstrap_hello_then_publishes_ready() {
     let (tmp, locked, _) = ready_construction().await;
-    locked
-        .mark_ready_construction_failed()
-        .await
-        .expect("record the interrupted construction");
-    let stuck = locked
-        .onboarding
-        .snapshot(locked.host_capabilities())
-        .await
-        .expect("read stuck checkpoint")
-        .expect("onboarding run exists");
-    assert_eq!(stuck.stage, OnboardingStage::Provider);
-    assert_eq!(
-        stuck.bootstrap_state,
-        cockpit_proto::OnboardingBootstrapState::Failed
-    );
     let config_dir = tmp.path().to_path_buf();
     drop(locked);
 
@@ -1187,41 +1413,84 @@ async fn ready_boot_with_committed_vault_clears_a_stale_failed_checkpoint() {
     extended.daemon.boot.secret_store_backend =
         crate::config::extended::DaemonSecretStoreBackend::File;
     extended.daemon.boot.secret_store_path = Some(config_dir.join("secret-vault"));
-    let mut timer = crate::startup::PhaseTimer::start("stuck_install_reboot");
-    let services = boot_with_db_and_probe_plan(
-        crate::daemon::DaemonPaths {
-            socket: config_dir.join("cockpit.sock"),
-            pid_file: config_dir.join("cockpit.pid"),
-            ephemeral: true,
-        },
-        db,
-        &mut timer,
-        crate::daemon::terminal::test_host_factory(),
-        crate::daemon::config_source::ConfigSource::fixed(
-            crate::config::providers::ProvidersConfig::default(),
-            extended,
-        ),
-        LockedProbePlan::production(),
+    let mut timer = crate::startup::PhaseTimer::start("vault_present_reboot");
+    let locked = std::sync::Arc::new(
+        boot_with_db_and_probe_plan(
+            crate::daemon::DaemonPaths {
+                socket: config_dir.join("cockpit.sock"),
+                pid_file: config_dir.join("cockpit.pid"),
+                ephemeral: true,
+            },
+            db,
+            &mut timer,
+            crate::daemon::terminal::test_host_factory(),
+            crate::daemon::config_source::ConfigSource::fixed(
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+            LockedProbePlan::production(),
+        )
+        .await
+        .expect("reboot the onboarded installation"),
+    );
+    assert!(locked.vault_committed());
+    assert_eq!(
+        locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Constructing,
+        "a vault-present owner never reports awaiting_secure_store"
+    );
+    let listener =
+        crate::daemon::bind_private_socket(&locked.paths.socket).expect("bind control listener");
+    let reveal = crate::daemon::leak_reveal_socket::bind_reveal_socket(&locked.paths)
+        .expect("bind leak-reveal socket");
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *locked.construction_gate.lock().unwrap() = Some(gate);
+    let loop_locked = locked.clone();
+    let run = tokio::spawn(async move {
+        super::run_locked_until_ready(loop_locked, listener, reveal)
+            .await
+            .expect("locked run loop")
+    });
+    locked
+        .start_ready_construction()
+        .expect("boot starts ready construction");
+    // The bootstrap surface answers while ready services are still held.
+    let phase = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cockpit_client::probe_owner_hello_phase(&locked.paths.socket),
     )
     .await
-    .expect("reboot the stuck installation");
-    let BootServices::Ready(ready) = services else {
-        panic!("a committed vault boots ready services");
-    };
-    let snapshot = ready
-        .context
-        .onboarding
-        .snapshot(cockpit_proto::HostCapabilitySnapshot::unpublished())
-        .await
-        .expect("read healed checkpoint")
-        .expect("onboarding run exists");
-    assert_eq!(snapshot.stage, OnboardingStage::Provider);
+    .expect("the hello does not wait for ready services")
+    .expect("hello read");
     assert_eq!(
-        snapshot.bootstrap_state,
-        cockpit_proto::OnboardingBootstrapState::Ready,
-        "a ready boot must clear the stale failed checkpoint"
+        phase,
+        Some(cockpit_proto::LockedReadyConstruction::Constructing)
     );
-    drop(ready);
+    let bootstrap = cockpit_client::DaemonClient::connect_bootstrap(&locked.paths.socket)
+        .await
+        .expect("bootstrap connection during construction");
+    let snapshot = match bootstrap
+        .request(Request::GetOnboardingBootstrapSnapshot)
+        .await
+        .expect("snapshot transport")
+    {
+        // Unauthenticated peers get the minimal surface; the phase is the
+        // contract here, the snapshot read is owner-only.
+        Ok(response) => Some(response),
+        Err(error) => {
+            assert_eq!(error.code, ErrorCode::BootstrapLocked);
+            None
+        }
+    };
+    drop(snapshot);
+    release.send(()).expect("release construction");
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, run)
+        .await
+        .expect("construction completes")
+        .expect("locked run loop joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Ready(..)));
+    drop(bootstrap);
+    drop(locked);
     drop(tmp);
 }
 

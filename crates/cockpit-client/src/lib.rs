@@ -544,7 +544,12 @@ impl LifecycleClient {
         client
     }
 
-    pub async fn resolve(&self, intent: LifecycleIntent) -> Result<LifecycleResolution, String> {
+    /// Resolve an owner through the lifecycle host without waiting for
+    /// ready services.
+    pub async fn resolve_bootstrap(
+        &self,
+        intent: LifecycleIntent,
+    ) -> Result<LifecycleResolution, String> {
         let (reply, receive) = oneshot::channel();
         let spawn_authority = LifecycleSpawnAuthority::new();
         let mut cancellation = LifecycleRequestCancellation::new(Arc::clone(&spawn_authority));
@@ -584,9 +589,45 @@ impl LifecycleClient {
     /// Resolve using the lifetime selected for this presentation capability.
     /// The configured lifetime applies only if this request must create a new
     /// owner; the lifecycle host still attaches to an existing owner first.
+    /// The resolution is to ready services (see [`Self::resolve`]).
     pub async fn resolve_default(&self) -> Result<LifecycleResolution, String> {
-        let intent = LifecycleIntent::from_u8(self.default_intent.load(Ordering::Acquire));
-        self.resolve(intent).await
+        self.resolve(self.default_intent()).await
+    }
+
+    /// [`Self::resolve_default`] without waiting for ready services: the
+    /// resolution may be a locked owner whose ready construction is still
+    /// running. For first-screen decisions and onboarding, which observe the
+    /// owner's phase themselves.
+    pub async fn resolve_default_bootstrap(&self) -> Result<LifecycleResolution, String> {
+        self.resolve_bootstrap(self.default_intent()).await
+    }
+
+    fn default_intent(&self) -> LifecycleIntent {
+        LifecycleIntent::from_u8(self.default_intent.load(Ordering::Acquire))
+    }
+
+    /// Resolve an owner and, when it is a locked owner whose daemon-owned
+    /// ready construction is still running, wait (client-side, without
+    /// blocking the lifecycle host) for its ready services; the returned
+    /// lifetime client is then a ready connection.
+    pub async fn resolve(&self, intent: LifecycleIntent) -> Result<LifecycleResolution, String> {
+        let mut resolution = self.resolve_bootstrap(intent).await?;
+        let constructing = match resolution.lifetime_client.as_ref() {
+            Some(client) => matches!(
+                client.owner_phase().await,
+                Ok(OwnerPhase::Bootstrap(
+                    proto::LockedReadyConstruction::Constructing
+                ))
+            ),
+            None => false,
+        };
+        if constructing {
+            let ready = DaemonClient::connect_endpoint(&resolution.endpoint)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            resolution.lifetime_client = Some(ready);
+        }
+        Ok(resolution)
     }
 }
 
@@ -645,6 +686,61 @@ pub fn reset_connect_call_count() {
 #[cfg(feature = "test-support")]
 pub fn connect_call_count() -> usize {
     CONNECT_CALLS.with(std::cell::Cell::get)
+}
+
+/// What a connection needs from the daemon owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRequirement {
+    /// Ready services: wait while the owner's ready construction runs.
+    Ready,
+    /// Any serving owner, including the locked bootstrap surface.
+    Bootstrap,
+}
+
+/// Owner state observed through `DaemonStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerPhase {
+    Ready,
+    Bootstrap(proto::LockedReadyConstruction),
+}
+
+/// Upper bound a ready-services connection waits for a running ready
+/// construction. It matches the daemon's own construction deadline (after
+/// which the attempt fails into the retryable phase), plus a margin.
+pub const READY_SERVICES_WAIT: Duration = Duration::from_secs(630);
+const READY_SERVICES_POLL: Duration = Duration::from_millis(250);
+
+/// Read only the owner's hello at `socket` (never a lifetime reference) and
+/// report its ready-construction phase: `None` for ready services. Used by
+/// the supervisor to decide whether a draining worker is still constructing.
+#[cfg(any(unix, windows))]
+pub async fn probe_owner_hello_phase(
+    socket: &Path,
+) -> Result<Option<proto::LockedReadyConstruction>> {
+    let stream = connect_wire(socket).await?;
+    let mut proto = ProtoStream::new(stream);
+    let (_, phase) = negotiate_hello(&mut proto).await?;
+    Ok(phase)
+}
+
+/// Marker beneath a handshake error whose hello parsed but named a protocol
+/// this client does not speak: an incompatible owner, which no amount of
+/// waiting resolves (unlike a hello timeout or a retiring owner's close).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncompatibleDaemonProtocol;
+
+impl std::fmt::Display for IncompatibleDaemonProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon hello names an incompatible protocol")
+    }
+}
+
+impl std::error::Error for IncompatibleDaemonProtocol {}
+
+/// Whether `error` is an incompatible-protocol hello (see
+/// [`IncompatibleDaemonProtocol`]): terminal, never retried as transport.
+pub fn is_incompatible_daemon_protocol(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<IncompatibleDaemonProtocol>().is_some()
 }
 
 /// Whether a daemon connection failed because the peer's wire protocol is
@@ -713,14 +809,65 @@ impl DaemonClient {
     /// hello-only discovery probe and gives an ephemeral daemon its lifetime
     /// reference before the caller can be cancelled, dropped, or hand a live
     /// owner off to another client.
+    ///
+    /// The connection is to *ready services*: when the owner's hello reports
+    /// that its daemon-owned ready construction is still running, this waits
+    /// (hello-only probes, never a lifetime reference) until ready services
+    /// answer, bounded by [`READY_SERVICES_WAIT`]. A locked owner that is
+    /// awaiting the secure-store choice, or whose construction failed, is
+    /// returned as is; its requests then report why they are refused. Use
+    /// [`Self::connect_bootstrap`] to talk to the locked bootstrap surface
+    /// while construction runs.
     pub async fn connect(socket: &Path) -> Result<Self> {
+        Self::connect_with(socket, ServiceRequirement::Ready).await
+    }
+
+    /// Connect to whatever owner answers, including a locked owner whose
+    /// ready construction is still running (onboarding, first-screen
+    /// decisions, status, and stop paths).
+    pub async fn connect_bootstrap(socket: &Path) -> Result<Self> {
+        Self::connect_with(socket, ServiceRequirement::Bootstrap).await
+    }
+
+    pub async fn connect_with(socket: &Path, requirement: ServiceRequirement) -> Result<Self> {
         #[cfg(feature = "test-support")]
         CONNECT_CALLS.with(|calls| calls.set(calls.get() + 1));
         #[cfg(any(unix, windows))]
         {
-            let stream = connect_wire(socket).await?;
-            let mut proto = ProtoStream::new(stream);
-            let negotiated = negotiate_hello(&mut proto).await?;
+            let deadline = tokio::time::Instant::now() + READY_SERVICES_WAIT;
+            let mut observed_construction = false;
+            let (mut proto, negotiated) = loop {
+                let attempt = async {
+                    let stream = connect_wire(socket).await?;
+                    let mut proto = ProtoStream::new(stream);
+                    let (negotiated, phase) = negotiate_hello(&mut proto).await?;
+                    Ok::<_, anyhow::Error>((proto, negotiated, phase))
+                }
+                .await;
+                match attempt {
+                    Ok((_, _, Some(proto::LockedReadyConstruction::Constructing)))
+                        if requirement == ServiceRequirement::Ready =>
+                    {
+                        // Hello-only probe: dropped before the lifetime
+                        // confirmation, so it never counts as a client.
+                        observed_construction = true;
+                    }
+                    Ok((proto, negotiated, _)) => break (proto, negotiated),
+                    // Once construction was observed, the ready handoff
+                    // (locked connections retired, the ready accept loop
+                    // starting) is transient; anything else is terminal.
+                    Err(error)
+                        if observed_construction && !is_incompatible_daemon_protocol(&error) => {}
+                    Err(error) => return Err(error),
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "the Cockpit daemon did not finish preparing its services within {}s",
+                        READY_SERVICES_WAIT.as_secs()
+                    ));
+                }
+                tokio::time::sleep(READY_SERVICES_POLL).await;
+            };
             let mut initial_events = confirm_client_lifetime(&mut proto).await?;
             let (exchange_events, owner_capability) =
                 exchange_peer_credential(&mut proto, socket).await?;
@@ -740,12 +887,43 @@ impl DaemonClient {
         }
     }
 
+    /// [`Self::connect`] for any endpoint. In-process owners publish their
+    /// endpoint only once ready services exist, so they never wait here.
     pub async fn connect_endpoint(endpoint: &ClientEndpoint) -> Result<Self> {
+        Self::connect_endpoint_with(endpoint, ServiceRequirement::Ready).await
+    }
+
+    /// [`Self::connect_bootstrap`] for any endpoint.
+    pub async fn connect_endpoint_bootstrap(endpoint: &ClientEndpoint) -> Result<Self> {
+        Self::connect_endpoint_with(endpoint, ServiceRequirement::Bootstrap).await
+    }
+
+    pub async fn connect_endpoint_with(
+        endpoint: &ClientEndpoint,
+        requirement: ServiceRequirement,
+    ) -> Result<Self> {
         match endpoint {
-            ClientEndpoint::Wire(socket) => Self::connect(socket).await,
+            ClientEndpoint::Wire(socket) => Self::connect_with(socket, requirement).await,
             ClientEndpoint::InProcess(endpoint) => {
                 Ok(Self::from_in_process(endpoint.connect().await?))
             }
+        }
+    }
+
+    /// Whether this connection's owner serves ready services, or is a locked
+    /// owner and in which ready-construction phase. The single funnel every
+    /// readiness decision uses.
+    pub async fn owner_phase(&self) -> Result<OwnerPhase> {
+        match self.request(Request::DaemonStatus).await? {
+            Ok(Response::DaemonStatus { .. }) => Ok(OwnerPhase::Ready),
+            Ok(Response::LockedBootstrapHello(hello)) => {
+                Ok(OwnerPhase::Bootstrap(hello.ready_construction))
+            }
+            Ok(other) => Err(anyhow!(
+                "unexpected daemon status response: {}",
+                other.wire_tag()
+            )),
+            Err(error) => Err(anyhow::Error::new(error)),
         }
     }
 
@@ -1077,7 +1255,12 @@ async fn connect_named_pipe(identity: &Path) -> Result<NamedPipeClient> {
 }
 
 #[cfg(any(unix, windows))]
-async fn negotiate_hello<S>(proto_stream: &mut ProtoStream<S>) -> Result<proto::NegotiatedProtocol>
+async fn negotiate_hello<S>(
+    proto_stream: &mut ProtoStream<S>,
+) -> Result<(
+    proto::NegotiatedProtocol,
+    Option<proto::LockedReadyConstruction>,
+)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -1111,7 +1294,9 @@ where
         ));
     };
 
-    proto::NegotiatedProtocol::from_hello(&hello).map_err(anyhow::Error::new)
+    let negotiated = proto::NegotiatedProtocol::from_hello(&hello)
+        .map_err(|payload| anyhow::Error::new(IncompatibleDaemonProtocol).context(payload))?;
+    Ok((negotiated, hello.ready_construction))
 }
 
 /// Exchange a peer-bound credential after lifetime confirmation. Socket peers

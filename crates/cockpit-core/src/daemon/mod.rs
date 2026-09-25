@@ -1171,6 +1171,7 @@ pub async fn discover() -> DaemonProbe {
                 Some(proto::DaemonHello {
                     daemon_version: record.daemon_version,
                     protocol_version: record.protocol_version,
+                    ready_construction: None,
                 }),
             );
         }
@@ -1238,6 +1239,7 @@ pub fn discover_blocking() -> DaemonProbe {
                 Some(proto::DaemonHello {
                     daemon_version: record.daemon_version,
                     protocol_version: record.protocol_version,
+                    ready_construction: None,
                 }),
             );
         }
@@ -1272,6 +1274,7 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
                     Some(proto::DaemonHello {
                         daemon_version: record.daemon_version,
                         protocol_version: record.protocol_version,
+                        ready_construction: None,
                     }),
                 );
             }
@@ -2317,9 +2320,15 @@ fn spawn_owned_in_process_daemon(
                                 return Ok(());
                             }
                         };
+                        let services = match server::in_process_boot_services(services).await {
+                            Ok(services) => services,
+                            Err(error) => {
+                                let _ = booted.send(Err(error));
+                                return Ok(());
+                            }
+                        };
                         let ctx = match services {
-                            server::BootServices::Ready(ready) => {
-                                let ctx = std::sync::Arc::new(ready.context);
+                            server::BootServices::Ready(ctx) => {
                                 let endpoint = server::register_in_process_context(ctx.clone());
                                 let force = ctx.shutdown_signal().clone();
                                 if booted
@@ -2332,7 +2341,7 @@ fn spawn_owned_in_process_daemon(
                             }
                             server::BootServices::Locked(locked) => {
                                 let (endpoint, mut ready) =
-                                    server::locked_in_process_endpoint(std::sync::Arc::new(locked));
+                                    server::locked_in_process_endpoint(locked);
                                 let force = shutdown::ShutdownSignal::new();
                                 if booted
                                     .send(Ok(InProcessBootReady {
@@ -2664,9 +2673,15 @@ fn spawn_owned_production_first_run_test_daemon(
                                     return Ok(());
                                 }
                             };
+                        let services = match server::in_process_boot_services(services).await {
+                            Ok(services) => services,
+                            Err(error) => {
+                                let _ = booted.send(Err(anyhow::anyhow!("{error:#}")));
+                                return Ok(());
+                            }
+                        };
                         match services {
-                            server::BootServices::Ready(ready) => {
-                                let ctx = std::sync::Arc::new(ready.context);
+                            server::BootServices::Ready(ctx) => {
                                 let _endpoint = server::register_in_process_context(ctx.clone());
                                 let force = ctx.shutdown_signal().clone();
                                 if booted
@@ -2687,7 +2702,7 @@ fn spawn_owned_production_first_run_test_daemon(
                             }
                             server::BootServices::Locked(locked) => {
                                 let (endpoint, mut ready) =
-                                    server::locked_in_process_endpoint(std::sync::Arc::new(locked));
+                                    server::locked_in_process_endpoint(locked);
                                 server::register_locked_in_process_context(&paths.socket, endpoint);
                                 let force = shutdown::ShutdownSignal::new();
                                 if booted
@@ -3133,15 +3148,9 @@ async fn run_foreground_inner_with_boot_db_impl(
         }
         None => server::boot(paths.clone(), terminal_factory).await?,
     };
-    let mut published_listeners = None;
-    // A context published by the locked bootstrap's daemon-owned ready
-    // construction already ran pre-publication recovery inside that
-    // construction (while the locked owner kept answering hellos).
-    let mut recovered_by_construction = false;
-    let ctx = match services {
-        server::BootServices::Ready(ready) => std::sync::Arc::new(ready.context),
-        server::BootServices::Locked(locked) => {
-            let locked = std::sync::Arc::new(locked);
+    let (ctx, listener, reveal_listener) = {
+        {
+            let locked = std::sync::Arc::new(services);
             // Locked bootstrap is itself a fully booted, authenticated local
             // service. Publish only after DB/non-secret construction, then
             // keep ordinary recovery and dispatch unreachable until the
@@ -3176,12 +3185,25 @@ async fn run_foreground_inner_with_boot_db_impl(
                 supervisor::report_worker_ready()?;
                 supervisor::wait_for_worker_promotion()?;
             }
-            // A shutdown signal never cancels the locked run loop directly:
-            // that would drop an in-flight ready construction mid-way (after
-            // the vault committed) and leave the installation needing a
-            // retry. The first signal is an acknowledged locked stop, which
-            // waits for construction to settle; only a repeated signal forces
-            // an immediate exit.
+            // Worker readiness means "serving the bootstrap surface"; ready
+            // services are tracked separately (the hello phase). With a
+            // committed vault, start the daemon-owned ready construction now
+            // — after promotion, so a rolling successor never reconciles or
+            // attaches durable state while its predecessor still serves.
+            if locked.vault_committed()
+                && let Err(error) = locked.start_ready_construction()
+            {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "ready construction could not start at boot; the locked owner reports it as failed"
+                );
+            }
+            // The first shutdown signal is an acknowledged locked stop, which
+            // waits for an in-flight ready construction to settle instead of
+            // dropping it mid-way. A repeated signal is the user's explicit
+            // force: the process exits at once, and because construction's
+            // only durable effects are idempotent recovery steps behind a
+            // committed vault, the next boot simply constructs again.
             let force_exit = std::sync::Arc::new(tokio::sync::Notify::new());
             // Register the signal streams before spawning, so no signal can
             // arrive between the spawn and the forwarder's first poll.
@@ -3213,64 +3235,16 @@ async fn run_foreground_inner_with_boot_db_impl(
                     return Ok(());
                 }
             };
-            published_listeners = Some((listener, reveal_listener));
-            recovered_by_construction = true;
-            ready
+            (ready, listener, reveal_listener)
         }
     };
     boot_dbg!("after_ctx_boot");
-    // Recovery is part of the socket-publication barrier. Neither the control
-    // socket nor its reveal sibling may be observable while durable authority
-    // is still being reconciled.
-    boot_dbg!("before_recover");
-    if !recovered_by_construction {
-        server::recover_before_socket_publish(&ctx).await?;
-    }
+    // Pre-publication recovery ran inside the ready construction, while the
+    // locked owner served only its bootstrap allowlist: no ordinary request
+    // could observe durable authority before it was reconciled.
     timer.phase("boot");
     boot_dbg!("after_recover");
 
-    // Complete both fallible publication operations before any owned
-    // background task exists. The metadata guard retracts a published endpoint
-    // if the subsequent control bind fails.
-    let (listener, reveal_listener) = match published_listeners {
-        Some(listeners) => listeners,
-        None => {
-            if let Some(pid_receipt) = pid_receipt.as_ref() {
-                if uses_supplied_boot_db {
-                    write_endpoint_record_with_receipt_and_canonical(&paths, &paths, pid_receipt)?;
-                } else {
-                    write_endpoint_record(&paths)?;
-                }
-                if let Some(metadata_guard) = metadata_guard.as_mut() {
-                    metadata_guard.track_endpoint_record(endpoint_record);
-                }
-            }
-            // Prepare both required endpoints before publishing control readiness.
-            // Unix reveal binding is observable but harmless until control appears;
-            // Windows binds an undiscoverable random control pipe first, derives the
-            // reveal sibling from that immutable name, and writes control identity
-            // only after the sibling is ready.
-            #[cfg(unix)]
-            let listeners = match inherited_listeners.take() {
-                Some(listeners) => listeners,
-                None => publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?,
-            };
-            #[cfg(windows)]
-            let listeners = match inherited_listeners.take() {
-                Some(listeners) => listeners,
-                None => prepare_and_publish_socket_pair(&paths)?,
-            };
-            // A promoted standby reported only its identity before boot; the
-            // supervisor completes the roll on this second report.
-            if standby_promoted_before_recovery {
-                supervisor::report_promoted_worker_serving()?;
-            } else {
-                supervisor::report_worker_ready()?;
-                supervisor::wait_for_worker_promotion()?;
-            }
-            listeners
-        }
-    };
     // A staged rolling successor has reported boot readiness but remains
     // paused above until the predecessor has exited.  Do not attach paused
     // sessions before that promotion gate: attachment itself starts a local
@@ -3713,8 +3687,9 @@ async fn forward_locked_bootstrap_signals(
     force_exit.notify_one();
 }
 
-/// SIGINT/SIGTERM (Ctrl-C/console-close on Windows) streams registered once,
-/// so a repeated signal is never lost between two waits.
+/// Shutdown-signal streams registered once, so a repeated signal is never
+/// lost between two waits: SIGINT/SIGTERM on Unix; Ctrl-C, Ctrl-Break,
+/// console close, and system shutdown on Windows.
 #[cfg(any(unix, windows))]
 struct BootstrapShutdownSignals {
     #[cfg(unix)]
@@ -3723,6 +3698,12 @@ struct BootstrapShutdownSignals {
     terminate: Option<tokio::signal::unix::Signal>,
     #[cfg(windows)]
     ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    #[cfg(windows)]
+    ctrl_break: Option<tokio::signal::windows::CtrlBreak>,
+    #[cfg(windows)]
+    ctrl_close: Option<tokio::signal::windows::CtrlClose>,
+    #[cfg(windows)]
+    ctrl_shutdown: Option<tokio::signal::windows::CtrlShutdown>,
 }
 
 #[cfg(any(unix, windows))]
@@ -3738,8 +3719,12 @@ impl BootstrapShutdownSignals {
         }
         #[cfg(windows)]
         {
+            use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
             Self {
-                ctrl_c: tokio::signal::windows::ctrl_c().ok(),
+                ctrl_c: ctrl_c().ok(),
+                ctrl_break: ctrl_break().ok(),
+                ctrl_close: ctrl_close().ok(),
+                ctrl_shutdown: ctrl_shutdown().ok(),
             }
         }
     }
@@ -3764,10 +3749,30 @@ impl BootstrapShutdownSignals {
         }
         #[cfg(windows)]
         {
-            match self.ctrl_c.as_mut() {
-                Some(ctrl_c) => ctrl_c.recv().await.is_some(),
-                None => false,
+            let Self {
+                ctrl_c,
+                ctrl_break,
+                ctrl_close,
+                ctrl_shutdown,
+            } = self;
+            if ctrl_c.is_none()
+                && ctrl_break.is_none()
+                && ctrl_close.is_none()
+                && ctrl_shutdown.is_none()
+            {
+                return false;
             }
+            // Console close and system shutdown give the process only a few
+            // seconds before Windows terminates it: the stop is requested
+            // like any other, and an interrupted construction is simply
+            // reconstructed by the next boot.
+            tokio::select! {
+                _ = async { if let Some(s) = ctrl_c.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(s) = ctrl_break.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(s) = ctrl_close.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(s) = ctrl_shutdown.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+            }
+            true
         }
     }
 }
@@ -4696,6 +4701,7 @@ mod tests {
             Some(proto::DaemonHello {
                 daemon_version: "0.0.old".to_string(),
                 protocol_version: 0,
+                ready_construction: None,
             })
         );
         listener.join().expect("listener thread");
@@ -4729,6 +4735,7 @@ mod tests {
             Some(proto::DaemonHello {
                 daemon_version: "future-daemon".to_string(),
                 protocol_version: proto::PROTOCOL_VERSION + 1,
+                ready_construction: None,
             })
         );
         let message = proto::incompatible_daemon_protocol_message(proto::PROTOCOL_VERSION + 1);
@@ -5586,14 +5593,33 @@ mod tests {
         });
         wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
         assert!(eph.pid_file.exists(), "ephemeral pid file written");
+        // The socket publishes with the bootstrap surface; the ready
+        // construction then runs against this same DB. Persist the session
+        // row only once ready services serve (a ready-requirement connect
+        // waits for them), as the first user message would: a synchronous
+        // write racing construction on this current-thread runtime would
+        // block the very task holding the writer.
+        let ready_probe = cockpit_client::DaemonClient::connect(&eph.socket)
+            .await
+            .expect("ready services serve before the session row is persisted");
+        // A private, empty project root: the shared temp dir is unbounded
+        // and walking it (workspace-root discovery, test redaction coverage)
+        // made these tests take minutes on a busy host.
+        let project_root = harness
+            .state_home
+            .parent()
+            .expect("harness root")
+            .join(format!("project-{name}"));
+        std::fs::create_dir_all(&project_root).expect("private project root");
         let session = crate::session::Session::create_for_test(
             harness.db.clone(),
-            std::env::temp_dir(),
+            project_root,
             "Build",
             crate::session::test_redaction_key_resolver(),
         )
         .expect("persist a session row");
         assert!(session.is_persisted(), "row is persisted");
+        drop(ready_probe);
         (eph, eph_task)
     }
 

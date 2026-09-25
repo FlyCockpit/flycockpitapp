@@ -804,7 +804,11 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             };
             // SAFETY: the inherited descriptor uniquely owns the admin listener.
             let admin = unsafe { resume_admin(inherited.admin_fd)? };
-            let worker = resume_worker(inherited.worker_pid, &inherited.worker_binary)?;
+            let worker = resume_worker(
+                inherited.worker_pid,
+                &inherited.worker_binary,
+                &paths.socket,
+            )?;
             // SAFETY: this is the uniquely inherited descriptor retained by
             // the pre-exec supervisor owner.
             let database_owner = unsafe {
@@ -859,7 +863,11 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             let endpoint_owner = WindowsEndpointOwner;
             remove_if_present(&admin_path)?;
             let admin = bind_admin(&admin_path)?;
-            let worker = resume_worker(inherited.worker_pid, &inherited.worker_binary)?;
+            let worker = resume_worker(
+                inherited.worker_pid,
+                &inherited.worker_binary,
+                &paths.socket,
+            )?;
             let database_owner = acquire_database_owner_until(deadline)?;
             let generations = WorkerGenerations::resume_after_reexec(
                 &database_owner,
@@ -1351,7 +1359,9 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                         )
                         .await
                         {
-                            let reason = format!("{error:#}");
+                            // Log/return sinks here end up in daemon.log:
+                            // never copy a captured tail back into it.
+                            let reason = super::spawn_notify::error_without_log_tail(&error);
                             let recovery_binary = successor.binary.clone();
                             let _ = terminate_worker(&mut successor, false);
                             reap_worker_after_exit(successor);
@@ -1655,6 +1665,10 @@ pub async fn run(_paths: DaemonPaths, _no_sandbox: bool, _resume_all_sessions: b
 struct Worker {
     pid: u32,
     binary: PathBuf,
+    /// The public control socket this worker serves, used to read its hello
+    /// phase while draining (a worker still constructing ready services is
+    /// not force-killed at the ordinary drain grace).
+    control_socket: Option<PathBuf>,
     #[cfg(windows)]
     receipt: cockpit_host::daemon_lifecycle::DaemonPidReceipt,
     #[cfg(windows)]
@@ -1985,6 +1999,7 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
     Ok(Worker {
         pid,
         binary: std::fs::canonicalize(&request.binary)?,
+        control_socket: Some(request.paths.socket.clone()),
         #[cfg(windows)]
         receipt,
         #[cfg(windows)]
@@ -1998,13 +2013,14 @@ fn spawn_ready_worker_blocking(request: OwnedWorkerSpawnRequest) -> Result<Worke
     })
 }
 
-fn resume_worker(pid: u32, binary: &Path) -> Result<Worker> {
+fn resume_worker(pid: u32, binary: &Path, control_socket: &Path) -> Result<Worker> {
     let receipt = worker_receipt(pid, binary)?;
     #[cfg(windows)]
     let exit_status = verified_worker_process(&receipt)?;
     Ok(Worker {
         pid,
         binary: std::fs::canonicalize(binary)?,
+        control_socket: Some(control_socket.to_path_buf()),
         #[cfg(windows)]
         receipt: receipt.clone(),
         #[cfg(windows)]
@@ -2083,6 +2099,26 @@ async fn drain_and_reap_worker(worker: &mut Worker, reconnect: bool) -> Result<(
     Ok(())
 }
 
+const DRAIN_CONSTRUCTION_RECHECK: Duration = Duration::from_secs(5);
+
+/// Whether the worker's own hello says its ready construction is running
+/// (a hello-only read of the public control socket; never a client).
+async fn worker_reports_construction(worker: &Worker) -> bool {
+    let Some(socket) = worker.control_socket.as_deref() else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            cockpit_client::probe_owner_hello_phase(socket),
+        )
+        .await,
+        Ok(Ok(Some(
+            cockpit_proto::LockedReadyConstruction::Constructing
+        )))
+    )
+}
+
 async fn await_drained_worker_exit(worker: &mut Worker, reconnect: bool) -> Result<()> {
     await_drained_worker_exit_with_timeout(worker, reconnect, super::shutdown::SHUTDOWN_DRAIN_GRACE)
         .await
@@ -2094,15 +2130,32 @@ async fn await_drained_worker_exit_with_timeout(
     timeout: Duration,
 ) -> Result<()> {
     terminate_worker(worker, reconnect)?;
-    let exit = match tokio::time::timeout(timeout, worker.exited.recv()).await {
-        Ok(exit) => exit,
-        Err(_) => {
-            tracing::warn!(
-                pid = worker.pid,
-                "worker exceeded the daemon drain grace; forcing shutdown"
-            );
-            force_kill_worker(worker)?;
-            worker.exited.recv().await
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + timeout;
+    // A worker still running its daemon-owned ready construction honors the
+    // stop only once construction settles; it is never force-killed for
+    // that. The extension is bounded by construction's own deadline.
+    let construction_bound = started + timeout + super::server::READY_CONSTRUCTION_TIMEOUT;
+    let exit = loop {
+        match tokio::time::timeout_at(deadline, worker.exited.recv()).await {
+            Ok(exit) => break exit,
+            Err(_) => {
+                let now = tokio::time::Instant::now();
+                if now < construction_bound && worker_reports_construction(worker).await {
+                    tracing::info!(
+                        pid = worker.pid,
+                        "draining worker is still constructing ready services; extending the drain"
+                    );
+                    deadline = (now + DRAIN_CONSTRUCTION_RECHECK).min(construction_bound);
+                    continue;
+                }
+                tracing::warn!(
+                    pid = worker.pid,
+                    "worker exceeded the daemon drain grace; forcing shutdown"
+                );
+                force_kill_worker(worker)?;
+                break worker.exited.recv().await;
+            }
         }
     };
     match exit {
@@ -3337,6 +3390,86 @@ mod tests {
         child.wait().unwrap();
     }
 
+    /// Serve the hello a locked owner sends while its ready construction
+    /// runs, on every connection.
+    #[cfg(unix)]
+    fn serve_constructing_hellos(socket: &Path) -> tokio::task::JoinHandle<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let hello = cockpit_proto::Envelope::response(
+                uuid::Uuid::nil(),
+                cockpit_proto::Response::LockedBootstrapHello(
+                    cockpit_proto::LockedBootstrapHello {
+                        protocol_version: cockpit_proto::PROTOCOL_VERSION,
+                        bootstrap_available: true,
+                        ready_construction: cockpit_proto::LockedReadyConstruction::Constructing,
+                        host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
+                        snapshot: None,
+                    },
+                ),
+            );
+            let line = format!("{}\n", serde_json::to_string(&hello).unwrap());
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(line.as_bytes()).await;
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    async fn drain_worker_that_outlives_the_grace(
+        control_socket: Option<PathBuf>,
+    ) -> std::process::ExitStatus {
+        let binary = super::super::discover_daemon_spawn_harness_executable().unwrap();
+        let child = std::process::Command::new(&binary)
+            .args(["daemon", "worker"])
+            .env("COCKPIT_WORKER_DRAIN_TEST_IGNORE_TERM_MS", "1500")
+            .spawn()
+            .unwrap();
+        let receipt = worker_receipt(child.id(), &binary).unwrap();
+        let mut worker = Worker {
+            pid: child.id(),
+            binary: std::fs::canonicalize(&binary).unwrap(),
+            control_socket,
+            exited: watch_worker(&receipt).unwrap(),
+            child: Some(child),
+            promotion: None,
+            serving: None,
+        };
+        // Let the child install its SIGTERM disposition first.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        await_drained_worker_exit_with_timeout(&mut worker, false, Duration::from_millis(200))
+            .await
+            .unwrap();
+        worker.child.as_mut().unwrap().wait().unwrap()
+    }
+
+    /// A worker whose hello reports ready construction in progress is not
+    /// force-killed at the ordinary drain grace: the drain extends (bounded)
+    /// until it exits on its own. Without that report the same worker is
+    /// SIGKILLed at the grace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_extends_for_a_worker_still_constructing_ready_services() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let server = serve_constructing_hellos(&socket);
+        let constructing = drain_worker_that_outlives_the_grace(Some(socket)).await;
+        assert!(
+            constructing.success(),
+            "a constructing worker must finish, not be force-killed: {constructing:?}"
+        );
+        server.abort();
+
+        let unreported = drain_worker_that_outlives_the_grace(None).await;
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            unreported.signal(),
+            Some(libc::SIGKILL),
+            "without a construction report the grace still force-kills"
+        );
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn resumed_worker_clean_exit_is_recognized_after_windows_reexec() {
@@ -3350,6 +3483,7 @@ mod tests {
         let mut worker = Worker {
             pid: child.id(),
             binary: std::fs::canonicalize(&binary).unwrap(),
+            control_socket: None,
             receipt: receipt.clone(),
             exit_status: verified_worker_process(&receipt).unwrap(),
             child: None,
@@ -3645,6 +3779,7 @@ mod tests {
         let mut successor = Worker {
             pid: 123,
             binary: std::fs::canonicalize(cockpit_test_support::system_true_executable()).unwrap(),
+            control_socket: None,
             child: None,
             exited,
             promotion: None,

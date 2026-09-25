@@ -118,6 +118,14 @@ macro_rules! daemon_eprintln {
 }
 pub(crate) use daemon_eprintln;
 
+/// An error line for a daemon process's own stderr, which is `daemon.log`:
+/// the full cause chain with every embedded `daemon.log` tail reduced to its
+/// reason, so a failure never copies log lines back into the log (nested,
+/// ever-growing tails within one run).
+pub fn error_text_for_daemon_log(error: &anyhow::Error) -> String {
+    super::spawn_notify::error_without_log_tail(error)
+}
+
 /// Keep only the lines of `text` that belong to the current run: the last
 /// run-marker line and everything after it. When the text holds no marker
 /// (an older log, or the marker scrolled out of the read window), every line

@@ -974,6 +974,12 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
         format!("error: {}", usage.message())
     } else if let Some(required) = err.downcast_ref::<commands::InteractiveOnboardingRequired>() {
         format!("error: {}", required.message())
+    } else if cockpit_core::daemon::daemon_log::process_role().is_some() {
+        // A supervisor or worker's stderr is daemon.log itself.
+        format!(
+            "Error: {}",
+            cockpit_core::daemon::daemon_log::error_text_for_daemon_log(err)
+        )
     } else {
         format!("Error: {err:?}")
     }

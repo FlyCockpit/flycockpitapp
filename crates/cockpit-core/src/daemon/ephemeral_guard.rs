@@ -428,7 +428,7 @@ async fn request_owned_graceful_stop_async(
     after_connect: impl FnOnce(),
     after_ack: impl FnOnce(),
 ) -> anyhow::Result<()> {
-    let client = cockpit_client::DaemonClient::connect(&cleanup.paths.socket)
+    let client = cockpit_client::DaemonClient::connect_bootstrap(&cleanup.paths.socket)
         .await
         .context("connecting exact owned daemon")?;
     after_connect();

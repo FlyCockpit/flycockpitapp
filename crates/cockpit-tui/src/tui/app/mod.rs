@@ -4501,14 +4501,29 @@ impl App {
         // Flicker-free startup: ask the daemon (spawning it if needed)
         // whether onboarding is needed before the alternate screen exists,
         // so the first frame is already the correct screen.
-        self.settle_first_screen_before_paint(
-            async {
-                cockpit_config::extended::load_global_daemon_lifetime_policy()
-                    .map_err(|error| error.to_string())
-            },
-            &mut startup_layout::TerminalStartupNotice,
-        )
-        .await;
+        let mut pre_paint = startup_layout::TerminalPrePaint::enter();
+        match self
+            .settle_first_screen_before_paint(
+                async {
+                    cockpit_config::extended::load_global_daemon_lifetime_policy()
+                        .map_err(|error| error.to_string())
+                },
+                &mut pre_paint,
+            )
+            .await
+        {
+            startup_layout::FirstScreenOutcome::Decided => pre_paint.hand_off(),
+            startup_layout::FirstScreenOutcome::Cancelled => {
+                drop(pre_paint);
+                self.exit_requested = true;
+                return Ok(());
+            }
+            startup_layout::FirstScreenOutcome::Failed(error) => {
+                drop(pre_paint);
+                self.exit_requested = true;
+                anyhow::bail!("Cockpit could not start: {error}");
+            }
+        }
         let mut terminal = ratatui::try_init()?;
         install_synchronized_update_panic_hook();
         let mut terminal_mode_guard = TerminalModeGuard::with_sink_and_title_state(

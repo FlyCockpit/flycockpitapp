@@ -1225,6 +1225,7 @@ impl App {
     }
 
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {
+        self.sync_startup_services_status();
         let geom = self.geometry();
         // The chat header records its layout when it renders this frame;
         // reset first so pill activation cannot target a stale frame.

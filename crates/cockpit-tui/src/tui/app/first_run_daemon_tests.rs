@@ -1166,11 +1166,17 @@ fn failed_checkpoint_resolution_never_retries_against_a_ready_daemon() {
                     .expect("connect the ready daemon");
                 assert_eq!(
                     super::startup_layout::onboarding_daemon_phase(&client).await,
-                    Ok(super::startup_layout::OnboardingDaemonPhase::Ready),
+                    Ok(cockpit_client::OwnerPhase::Ready),
                 );
-                super::startup_layout::resolve_failed_ready_construction(&lifecycle, None, client)
-                    .await
-                    .expect("a ready daemon resolves to its snapshot, never a refused retry")
+                super::startup_layout::resolve_ready_onboarding_owner(
+                    &lifecycle,
+                    None,
+                    client,
+                    tokio::time::Instant::now()
+                        + super::startup_layout::ONBOARDING_HANDOFF_DEADLINE,
+                )
+                .await
+                .expect("a ready daemon resolves to its snapshot, never a refused retry")
             });
             let snapshot = snapshot.expect("onboarding run exists");
             assert_eq!(snapshot.stage, OnboardingStage::Provider);

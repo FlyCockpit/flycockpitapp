@@ -47,7 +47,7 @@ pub(super) fn evaluate_onboarding_transition_correlation(
     if pending_request_id != Some(completion.request_id.as_str()) {
         return Rejected("pending request correlation lost");
     }
-    if label != "onboarding.ready_retry" && completion.receipt.is_none() {
+    if completion.receipt.is_none() {
         return Rejected("commit receipt missing");
     }
     if let Some(receipt) = completion.receipt.as_ref() {
@@ -1084,6 +1084,29 @@ impl App {
             AsyncActionKind::Internal("runner.attach") => {
                 self.apply_runner_attach_result(result.id, result.payload);
             }
+            AsyncActionKind::Internal("startup.services") => match result.payload {
+                Ok(AsyncActionPayload::StartupServicesReady { generation, result })
+                    if generation == self.startup_background.generation && !self.exit_requested =>
+                {
+                    self.clear_startup_services_status();
+                    match result {
+                        Ok(Some(client)) => {
+                            // The locked connection retained at startup was
+                            // retired by the ready handoff; keep the ready
+                            // owner's lifetime reference instead.
+                            if let Some(selected) = self.startup_lifecycle.as_mut() {
+                                selected.lifetime_client = Some(client);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => self.show_toast(
+                            format!("Cockpit services could not start: {error}"),
+                            crate::tui::app::ToastKind::Error,
+                        ),
+                    }
+                }
+                Ok(_) | Err(_) => self.clear_startup_services_status(),
+            },
             AsyncActionKind::Internal("startup.lifecycle") => match result.payload {
                 Ok(AsyncActionPayload::StartupLifecycleResolved {
                     generation,
@@ -1123,6 +1146,7 @@ impl App {
                     }
                     self.startup_lifecycle = Some(lifecycle);
                     self.start_onboarding_bootstrap_fetch();
+                    self.start_startup_services_wait();
                 }
                 Ok(AsyncActionPayload::StartupLifecycleResolved {
                     generation,
@@ -1386,8 +1410,7 @@ impl App {
                 | "onboarding.model"
                 | "onboarding.profile"
                 | "onboarding.lifetime"
-                | "onboarding.secure_intent"
-                | "onboarding.ready_retry"),
+                | "onboarding.secure_intent"),
             ) => {
                 let pending_request_id = self
                     .pending_startup_onboarding_operations
@@ -4469,7 +4492,6 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "onboarding.bootstrap"
                 | "onboarding.profile"
                 | "onboarding.model"
-                | "onboarding.ready_retry"
                 | "onboarding.secure_intent"
                 | "onboarding.transition"
                 | "paste.image_path_admission"

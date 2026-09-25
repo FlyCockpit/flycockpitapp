@@ -314,25 +314,6 @@ pub(super) async fn run_startup_trace_case(
                 while let Some(request) = request_rx.recv().await {
                     let response = match request.request {
                         cockpit_proto::Request::GetOnboardingBootstrapSnapshot => {
-                            tracing::info!(
-                                target: cockpit_core::startup::TARGET,
-                                event = "coverage-phase-start",
-                                scope_class = "daemon_global",
-                                correlation = "opaque-test-correlation",
-                                "startup"
-                            );
-                            tracing::info!(
-                                target: cockpit_core::startup::TARGET,
-                                event = "coverage-phase-complete",
-                                scope_class = "daemon_global",
-                                correlation = "opaque-test-correlation",
-                                "startup"
-                            );
-                            tracing::info!(
-                                target: cockpit_core::startup::TARGET,
-                                event = "daemon-ready",
-                                "startup"
-                            );
                             Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(Some(
                                 cockpit_proto::OnboardingBootstrapSnapshot {
                                     run_id: uuid::Uuid::from_u128(1),
@@ -348,12 +329,22 @@ pub(super) async fn run_startup_trace_case(
                                 },
                             )))
                         }
+                        // A ready owner (the `startup.services` wait).
+                        cockpit_proto::Request::DaemonStatus => {
+                            Ok(cockpit_proto::Response::DaemonStatus {
+                                pid: 1,
+                                uptime_secs: 0,
+                                active_sessions: 0,
+                                socket_path: String::new(),
+                                daemon_version: cockpit_proto::DAEMON_VERSION.to_string(),
+                                protocol_version: cockpit_proto::PROTOCOL_VERSION,
+                                paused_sessions: 0,
+                                pending_recovery_sessions: Vec::new(),
+                                database_path: String::new(),
+                                schema_version: 0,
+                            })
+                        }
                         cockpit_proto::Request::GetWorkspaceTrust { .. } => {
-                            tracing::info!(
-                                target: cockpit_core::startup::TARGET,
-                                event = "first-model-request",
-                                "startup"
-                            );
                             Ok(cockpit_proto::Response::WorkspaceTrust {
                                 mode: Some(cockpit_proto::WorkspaceTrustMode::IgnoreConfig),
                                 config_generation: 1,
@@ -406,9 +397,14 @@ pub(super) async fn run_startup_trace_case(
             .unwrap();
         requests
     });
-    let mut notice = RecordingStartupNotice::default();
-    app.settle_first_screen_before_paint(async move { Ok(background_agents) }, &mut notice)
+    let mut notice = RecordingPrePaint::default();
+    let outcome = app
+        .settle_first_screen_before_paint(async move { Ok(background_agents) }, &mut notice)
         .await;
+    assert!(matches!(
+        outcome,
+        super::startup_layout::FirstScreenOutcome::Decided
+    ));
     let mut requests = lifecycle_host.await.expect("lifecycle host task");
     assert!(app.first_screen_settled());
     assert!(
@@ -416,9 +412,9 @@ pub(super) async fn run_startup_trace_case(
         "an onboarded home settles its workspace decision before the first paint"
     );
     assert!(app.onboarding_shell.is_none());
-    assert_eq!(
-        notice.shown, notice.cleared,
-        "a shown notice is always cleared"
+    assert!(
+        notice.lines.is_empty() || notice.cleared > 0,
+        "a shown status line is always cleared"
     );
 
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
@@ -1180,72 +1176,117 @@ async fn every_shell_entry_keeps_lifecycle_pending_behind_policy() {
 }
 
 #[derive(Default)]
-pub(super) struct RecordingStartupNotice {
-    pub(super) shown: usize,
+pub(super) struct RecordingPrePaint {
+    pub(super) lines: Vec<String>,
     pub(super) cleared: usize,
+    /// Report Ctrl-C once this much (paused-clock) time has passed.
+    pub(super) cancel_after: Option<std::time::Duration>,
+    pub(super) started: Option<tokio::time::Instant>,
 }
 
-impl super::startup_layout::StartupNotice for RecordingStartupNotice {
-    fn show(&mut self) {
-        self.shown += 1;
+impl super::startup_layout::PrePaintTerminal for RecordingPrePaint {
+    fn show(&mut self, line: &str) {
+        self.lines.push(line.to_string());
     }
 
     fn clear(&mut self) {
         self.cleared += 1;
     }
+
+    fn cancel_requested(&mut self) -> bool {
+        let started = *self.started.get_or_insert_with(tokio::time::Instant::now);
+        self.cancel_after
+            .is_some_and(|after| started.elapsed() >= after)
+    }
 }
 
-/// The pre-paint startup prints its one "Starting cockpit…" line only once
-/// settling has taken longer than the notice delay, and clears it before the
-/// caller enters the alternate screen; a startup that settles quickly prints
+/// Never a guessed first screen. A slow startup shows one status line
+/// naming the pending step (and, past the slow threshold, how to quit); a
+/// startup that fails before deciding a screen reports the failure instead
+/// of painting chat; Ctrl-C quits before any frame; a quick outcome prints
 /// nothing.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn slow_first_screen_prints_one_starting_line_and_clears_it() {
+async fn pre_paint_startup_reports_progress_and_never_paints_a_guess() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let app_with = |lifecycle| {
+        App::new_composed_with_session_mode(
+            Some(tmp.path()),
+            false,
+            cockpit_proto::SessionEntryMode::Code,
+            super::StartupWorkspaceTrust::Decided,
+            Some(std::time::Instant::now()),
+            lifecycle,
+        )
+    };
+
+    // Slow, then failed: the status line names the step, the outcome is the
+    // failure (never a painted chat), and the line is cleared.
     let (lifecycle, mut requests) = cockpit_client::LifecycleClient::channel(2);
-    let mut app = App::new_composed_with_session_mode(
-        Some(tmp.path()),
-        false,
-        cockpit_proto::SessionEntryMode::Code,
-        super::StartupWorkspaceTrust::Decided,
-        Some(std::time::Instant::now()),
-        lifecycle,
-    );
-    // The lifecycle host answers only after twice the notice delay, with a
-    // failure: the chain then settles on a visible, retryable error.
+    let mut app = app_with(lifecycle);
     let host = tokio::spawn(async move {
         let request = requests.recv().await.expect("lifecycle request");
         tokio::time::sleep(super::startup_layout::STARTING_NOTICE_DELAY * 2).await;
         let _ = request.reply.send(Err("fixture daemon unavailable".into()));
         requests
     });
-    let mut notice = RecordingStartupNotice::default();
-    app.settle_first_screen_before_paint(async { Ok(true) }, &mut notice)
+    let mut terminal = RecordingPrePaint::default();
+    let outcome = app
+        .settle_first_screen_before_paint(async { Ok(true) }, &mut terminal)
         .await;
-    assert_eq!((notice.shown, notice.cleared), (1, 1));
-    assert!(app.first_screen_settled());
-    assert!(app.startup_background.retry.is_some());
+    let super::startup_layout::FirstScreenOutcome::Failed(error) = outcome else {
+        panic!("a failed startup must not decide a screen: {outcome:?}");
+    };
+    assert!(error.contains("fixture daemon unavailable"), "{error}");
+    assert_eq!(
+        terminal.lines.first().map(String::as_str),
+        Some("Starting cockpit… starting the daemon")
+    );
+    assert!(terminal.cleared >= 1);
+    assert!(!app.first_screen_settled());
     drop(host.await);
 
-    // A chain that settles within the delay prints nothing.
-    let (lifecycle, mut requests) = cockpit_client::LifecycleClient::channel(2);
-    let mut app = App::new_composed_with_session_mode(
-        Some(tmp.path()),
-        false,
-        cockpit_proto::SessionEntryMode::Code,
-        super::StartupWorkspaceTrust::Decided,
-        Some(std::time::Instant::now()),
-        lifecycle,
+    // Very slow: the line turns into the slow notice; Ctrl-C quits.
+    let (lifecycle, requests) = cockpit_client::LifecycleClient::channel(2);
+    let mut app = app_with(lifecycle);
+    let mut terminal = RecordingPrePaint {
+        cancel_after: Some(super::startup_layout::STARTING_SLOW_AFTER * 2),
+        ..RecordingPrePaint::default()
+    };
+    let outcome = app
+        .settle_first_screen_before_paint(async { Ok(true) }, &mut terminal)
+        .await;
+    assert!(matches!(
+        outcome,
+        super::startup_layout::FirstScreenOutcome::Cancelled
+    ));
+    assert!(
+        terminal
+            .lines
+            .iter()
+            .any(|line| line == "Still starting cockpit… starting the daemon (Ctrl-C to quit)"),
+        "{:?}",
+        terminal.lines
     );
+    assert!(!app.first_screen_settled());
+    drop(requests);
+
+    // Quick failure: no status line at all.
+    let (lifecycle, mut requests) = cockpit_client::LifecycleClient::channel(2);
+    let mut app = app_with(lifecycle);
     let host = tokio::spawn(async move {
         let request = requests.recv().await.expect("lifecycle request");
         let _ = request.reply.send(Err("fixture daemon unavailable".into()));
         requests
     });
-    let mut notice = RecordingStartupNotice::default();
-    app.settle_first_screen_before_paint(async { Ok(true) }, &mut notice)
+    let mut terminal = RecordingPrePaint::default();
+    let outcome = app
+        .settle_first_screen_before_paint(async { Ok(true) }, &mut terminal)
         .await;
-    assert_eq!((notice.shown, notice.cleared), (0, 0));
+    assert!(matches!(
+        outcome,
+        super::startup_layout::FirstScreenOutcome::Failed(_)
+    ));
+    assert!(terminal.lines.is_empty());
     drop(host.await);
 }

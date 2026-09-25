@@ -2051,9 +2051,6 @@ impl OnboardingShell {
             OnboardingBootstrapState::Materializing => {
                 parts.push("Preparing the secure store…".to_string());
             }
-            OnboardingBootstrapState::Failed => {
-                parts.push("Onboarding bootstrap failed; retrying ready construction…".to_string());
-            }
             _ => {}
         }
         if !base.is_empty() {

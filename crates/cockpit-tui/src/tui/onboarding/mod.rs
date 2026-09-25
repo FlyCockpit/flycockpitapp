@@ -619,6 +619,9 @@ pub struct OnboardingShell {
     /// first one and after focus is lost). Hover is never stored: every
     /// render derives it from this position against that frame's layout.
     pointer: Option<Position>,
+    /// Whether the shell, rather than an app-level modal over it, owns the
+    /// pointer this frame (set by the app before each render).
+    pointer_owned: bool,
     actions: ActionBar,
 }
 
@@ -644,6 +647,7 @@ impl OnboardingShell {
             list_area: Rect::default(),
             back_rect: Rect::default(),
             pointer: None,
+            pointer_owned: true,
             actions: ActionBar::default(),
         }
     }
@@ -702,6 +706,18 @@ impl OnboardingShell {
     #[cfg(test)]
     pub(crate) fn test_pointer_captured(&self) -> bool {
         matches!(&self.screen, OnboardingScreen::ProviderSearch(screen) if screen.dragging_scrollbar())
+    }
+
+    /// Whether the shell owns the pointer this frame.
+    #[cfg(test)]
+    pub(crate) fn test_pointer_owned(&self) -> bool {
+        self.pointer_owned
+    }
+
+    /// The last reported pointer position the shell holds.
+    #[cfg(test)]
+    pub(crate) fn test_pointer(&self) -> Option<Position> {
+        self.pointer
     }
 
     /// The provider scrollbar rect of the last render, if any.
@@ -2047,7 +2063,7 @@ impl OnboardingShell {
         let chrome_pointer = if self.escape.is_some() {
             None
         } else {
-            self.pointer
+            self.owned_pointer()
         };
 
         // Welcome is an edge-to-edge cinematic scene. Its own prompt is the
@@ -2061,8 +2077,9 @@ impl OnboardingShell {
                 self.welcome_cloud_seed,
             )
             .render(frame, area);
+            let pointer = self.owned_pointer();
             if let Some(menu) = self.escape.as_mut() {
-                Self::render_escape_menu(frame, area, menu, self.pointer);
+                Self::render_escape_menu(frame, area, menu, pointer);
             }
             return;
         }
@@ -2155,8 +2172,9 @@ impl OnboardingShell {
             self.help_text(),
         );
         self.actions.render(frame, footer, &buttons, chrome_pointer);
+        let pointer = self.owned_pointer();
         if let Some(menu) = self.escape.as_mut() {
-            Self::render_escape_menu(frame, area, menu, self.pointer);
+            Self::render_escape_menu(frame, area, menu, pointer);
         }
     }
 
@@ -2198,8 +2216,9 @@ impl OnboardingShell {
 
     /// End any pointer capture in progress (the provider scrollbar drag).
     /// Called at every boundary where the gesture's owner can no longer see
-    /// its release or its target: a modal opening, a frame with no layout,
-    /// a terminal resize, and focus loss. Switching screens drops the
+    /// its release or its target: the Escape menu or an app-level modal
+    /// opening, a frame with no layout, a terminal resize, and focus loss
+    /// (see [`Self::end_pointer_interactions`]). Switching screens drops the
     /// capture with the screen.
     pub(crate) fn cancel_pointer_capture(&mut self) {
         if let OnboardingScreen::ProviderSearch(screen) = &mut self.screen {
@@ -2207,17 +2226,32 @@ impl OnboardingShell {
         }
     }
 
-    /// The terminal was resized: every captured gesture ends. The pointer
-    /// position is kept, so hover re-derives against the new layout.
-    pub(crate) fn handle_resize(&mut self) {
-        self.cancel_pointer_capture();
-    }
-
-    /// The terminal lost focus: every captured gesture ends and the pointer
-    /// position is unknown until the next mouse event, so nothing hovers.
-    pub(crate) fn handle_focus_lost(&mut self) {
+    /// The terminal was resized or lost focus: every captured gesture ends,
+    /// and the pointer position is unknown until the next mouse event (after
+    /// a resize its old coordinates name a different cell), so nothing
+    /// hovers until the pointer is reported again.
+    pub(crate) fn end_pointer_interactions(&mut self) {
         self.cancel_pointer_capture();
         self.pointer = None;
+    }
+
+    /// Record the last reported pointer position (`None` when it is unknown,
+    /// e.g. mouse capture was turned off). The app reports every mouse event
+    /// here, including those another layer consumes.
+    pub(crate) fn observe_pointer(&mut self, pointer: Option<Position>) {
+        self.pointer = pointer;
+    }
+
+    /// Whether the shell owns the pointer this frame. The app clears this
+    /// while an app-level modal (the daemon restart prompt) sits on top, so
+    /// nothing in the shell paints hover under it.
+    pub(crate) fn set_pointer_owned(&mut self, owned: bool) {
+        self.pointer_owned = owned;
+    }
+
+    /// The pointer as the shell's hover renderers may use it this frame.
+    fn owned_pointer(&self) -> Option<Position> {
+        self.pointer.filter(|_| self.pointer_owned)
     }
 
     fn screen_title(&self) -> &'static str {

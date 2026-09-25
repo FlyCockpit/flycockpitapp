@@ -249,7 +249,7 @@ impl App {
             self.mouse_capture = new_value;
             self.invalidate_primary_paste();
             if !new_value {
-                self.hovered_affordance = None;
+                self.forget_pointer();
             }
             let state = if new_value { "on" } else { "off" };
             self.show_toast(
@@ -275,7 +275,7 @@ impl App {
         self.set_mouse_capture_live(want);
     }
 
-    fn set_mouse_capture_live(&mut self, want: bool) {
+    pub(super) fn set_mouse_capture_live(&mut self, want: bool) {
         if want == self.mouse_capture {
             return;
         }
@@ -289,7 +289,7 @@ impl App {
             self.invalidate_primary_paste();
             if !want {
                 self.link_pointer_gesture.cancel();
-                self.hovered_affordance = None;
+                self.forget_pointer();
                 self.hovered_suggestion = None;
                 self.link_registry.clear_hover();
                 self.dialog.clear_settings_pointer_hover();

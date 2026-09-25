@@ -569,7 +569,7 @@ impl App {
                 if let Some(pane) = self.session_setup_inline.as_mut() {
                     pane.set_error("Daemon stopped; choose Restart or Quit.");
                 }
-                self.daemon_restart_prompt = Some(super::DaemonRestartPrompt::default());
+                self.open_daemon_restart_prompt();
             }
             TurnEvent::DaemonLinkResynced { .. } => {}
             TurnEvent::DaemonLinkTerminal { .. } => {
@@ -766,7 +766,7 @@ impl App {
                 if let Some(pane) = self.session_setup_inline.as_mut() {
                     pane.set_error("Daemon stopped; choose Restart or Quit.");
                 }
-                self.daemon_restart_prompt = Some(super::DaemonRestartPrompt::default());
+                self.open_daemon_restart_prompt();
             }
             TurnEvent::DaemonLinkReconnected { active_model_state } => {
                 self.daemon_restart_prompt = None;

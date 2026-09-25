@@ -20,5 +20,5 @@
                                                                                 
                                                                                 
                                                                                 
-  esc cancel   ^c quit                              [ Cancel ] [ Approve now ]  
+  enter approve now   esc cancel   ^c quit          [ Cancel ] [ Approve now ]  
                                                                                 

@@ -1374,22 +1374,142 @@ fn an_armed_row_does_not_pass_to_the_model_that_takes_its_position() {
 }
 
 #[test]
-fn an_armed_row_does_not_survive_a_phase_change() {
+fn an_armed_row_does_not_survive_leaving_and_reentering_its_phase() {
     let mut screen = two_pending_trust_screen();
     render_buffer(&mut screen, 120, 40);
-    let first_row = screen.list_row_rects[0];
-    screen.handle_mouse(click_at(Position::new(first_row.x, first_row.y)));
-    // Leave and re-enter the trust phase.
-    screen.phase = Phase::ModelGrants;
+    let row = screen.list_row_rects[0];
+    screen.handle_mouse(click_at(Position::new(row.x, row.y)));
+    // Leave the trust phase and come back to the same phase and target.
+    screen.handle_key(key(KeyCode::Esc));
+    assert_eq!(screen.phase, Phase::ModelGrants);
+    screen.handle_key(key(KeyCode::Enter));
+    assert_eq!(screen.phase, Phase::ModelTrust);
     render_buffer(&mut screen, 120, 40);
+    let row = screen.list_row_rects[0];
+    screen.handle_mouse(click_at(Position::new(row.x, row.y)));
+    assert!(
+        !screen.draft.trust_confirmations[0],
+        "the pre-navigation arm confirmed on one click after re-entry"
+    );
+}
+
+/// Put the child draft being edited into model trust with route 0 pending.
+fn child_trust_phase(screen: &mut AgentAuthoringScreen) {
+    let child = screen.editing_child.as_mut().expect("child editor");
+    child.route_grants[0].enabled = true;
+    child.trust_confirmations[0] = false;
+    screen.phase = Phase::SubagentEdit(SubagentPhase::ModelTrust);
+    render_buffer(screen, 120, 40);
+}
+
+fn click_first_list_row(screen: &mut AgentAuthoringScreen) {
+    let row = screen.list_row_rects[0];
+    screen.handle_mouse(click_at(Position::new(row.x, row.y)));
+}
+
+fn child_route_zero_confirmed(screen: &AgentAuthoringScreen) -> bool {
+    screen
+        .editing_child
+        .as_ref()
+        .expect("child editor")
+        .trust_confirmations[0]
+}
+
+#[test]
+fn an_arm_in_a_cancelled_child_does_not_pass_to_the_next_added_child() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("recycle-add"), "op".into());
+    screen.begin_add_subagent();
+    child_trust_phase(&mut screen);
+    click_first_list_row(&mut screen);
+    assert!(!child_route_zero_confirmed(&screen));
+    // Cancel, then add again: the new child reuses the old child's path.
+    screen.cancel_subagent_edit();
+    screen.begin_add_subagent();
+    child_trust_phase(&mut screen);
+    click_first_list_row(&mut screen);
+    assert!(
+        !child_route_zero_confirmed(&screen),
+        "the cancelled child's arm confirmed trust for a new child"
+    );
+}
+
+#[test]
+fn an_arm_does_not_pass_to_the_child_that_shifts_into_its_slot() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("recycle-delete"), "op".into());
+    screen.begin_add_subagent();
+    screen.commit_subagent_edit();
+    assert_eq!(screen.draft.children.len(), 2);
+    screen.begin_edit_subagent(0);
+    child_trust_phase(&mut screen);
+    click_first_list_row(&mut screen);
+    screen.cancel_subagent_edit();
+    // Delete child 0: child 1 shifts into slot 0.
+    screen.cursor = 0;
+    screen.delete_selected_subagent();
+    screen.begin_edit_subagent(0);
+    child_trust_phase(&mut screen);
+    click_first_list_row(&mut screen);
+    assert!(
+        !child_route_zero_confirmed(&screen),
+        "the deleted child's arm confirmed trust for the child in its slot"
+    );
+}
+
+#[test]
+fn an_arm_does_not_survive_a_projection_replacement() {
+    let mut screen = two_pending_trust_screen();
+    render_buffer(&mut screen, 120, 40);
+    click_first_list_row(&mut screen);
+    // The daemon replaces the projection; the route order changes, so index
+    // 0 now names a different model.
+    let mut projection = sample_projection("replaced");
+    projection.policy.routes.swap(0, 1);
+    projection.policy.routes[0].confirmation_required = true;
+    projection.policy.routes[0].trust = AgentPolicyTrustClassification::Unset;
+    screen.replace_projection(projection);
+    for grant in &mut screen.draft.route_grants {
+        grant.enabled = true;
+    }
+    screen.phase = Phase::ModelTrust;
+    render_buffer(&mut screen, 120, 40);
+    click_first_list_row(&mut screen);
+    assert!(
+        !screen
+            .draft
+            .trust_confirmations
+            .iter()
+            .any(|confirmed| *confirmed),
+        "an arm from the replaced projection confirmed a model on one click"
+    );
+}
+
+#[test]
+fn publisher_trust_follows_the_concrete_locator() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("locator"), "op".into());
+    screen.draft.third_party_locator = "registry/a@1".into();
     screen.phase = Phase::ThirdPartyTrust;
     render_buffer(&mut screen, 120, 40);
-    let publisher = screen.list_row_rects[0];
-    screen.handle_mouse(click_at(Position::new(publisher.x, publisher.y)));
+    click_first_list_row(&mut screen);
+    // Back to the locator, change it, and continue.
+    screen.handle_key(key(KeyCode::Esc));
+    assert_eq!(screen.phase, Phase::ThirdPartyLocator);
+    screen.third_party_field.set("registry/b@2");
+    screen.handle_key(key(KeyCode::Enter));
+    assert_eq!(screen.phase, Phase::ThirdPartyTrust);
+    render_buffer(&mut screen, 120, 40);
+    click_first_list_row(&mut screen);
     assert!(
         !screen.draft.third_party_trust_confirmed,
-        "an arm from the model-trust phase confirmed publisher trust"
+        "trust armed for one source confirmed a different source"
     );
+
+    // A confirmed trust does not carry over to a changed locator either.
+    click_first_list_row(&mut screen);
+    assert!(screen.draft.third_party_trust_confirmed);
+    screen.handle_key(key(KeyCode::Esc));
+    screen.third_party_field.set("registry/c@3");
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(!screen.draft.third_party_trust_confirmed);
 }
 
 #[test]

@@ -3,7 +3,7 @@
 use super::search::{ProviderSearchScreen, filter_catalog, onboarding_catalog};
 use super::*;
 use crate::tui::onboarding::auth::AuthPhase;
-use crate::tui::settings::{OAuthBeginResult, OAuthFlowRequest, OAuthPublicBegin};
+use crate::tui::settings::{OAuthBeginResult, OAuthFlowOp, OAuthFlowRequest, OAuthPublicBegin};
 use cockpit_config::providers::ProvidersConfig;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
@@ -1276,29 +1276,98 @@ fn a_frame_with_no_layout_ends_a_scrollbar_drag() {
 }
 
 #[test]
-fn resize_and_focus_loss_end_a_scrollbar_drag() {
+fn ending_pointer_interactions_ends_a_scrollbar_drag() {
     let (mut shell, _) = dragging_provider_shell();
-    shell.handle_resize();
-    assert!(!search_screen(&shell).dragging_scrollbar());
-
-    let (mut shell, _) = dragging_provider_shell();
-    shell.handle_focus_lost();
+    shell.end_pointer_interactions();
     assert!(!search_screen(&shell).dragging_scrollbar());
 }
 
 #[test]
-fn focus_loss_forgets_the_pointer_so_nothing_hovers() {
+fn ending_pointer_interactions_forgets_the_pointer_so_nothing_hovers() {
     let mut shell = available_secure_store_shell();
     let mut engine = Dialog::None;
     let idle = render_buffer(&mut shell, 80, 24);
     let button = find_text(&idle, "[ Continue ]");
     shell.handle_mouse(moved(button.x + 2, button.y), &mut engine);
-    shell.handle_focus_lost();
+    shell.end_pointer_interactions();
     let after = render_buffer(&mut shell, 80, 24);
     assert_eq!(
         after[(button.x + 2, button.y)].bg,
         ratatui::style::Color::Reset
     );
+}
+
+#[test]
+fn an_app_modal_over_the_shell_owns_the_pointer() {
+    let mut shell = available_secure_store_shell();
+    let mut engine = Dialog::None;
+    let idle = render_buffer(&mut shell, 80, 24);
+    let button = find_text(&idle, "[ Continue ]");
+    shell.handle_mouse(moved(button.x + 2, button.y), &mut engine);
+    shell.set_pointer_owned(false);
+    let under_modal = render_buffer(&mut shell, 80, 24);
+    assert_eq!(
+        under_modal[(button.x + 2, button.y)].bg,
+        ratatui::style::Color::Reset,
+        "chrome under an app-level modal must not hover"
+    );
+    shell.set_pointer_owned(true);
+    let owned = render_buffer(&mut shell, 80, 24);
+    assert_ne!(
+        owned[(button.x + 2, button.y)].bg,
+        ratatui::style::Color::Reset
+    );
+}
+
+/// Rows of `buffer` that paint the Escape menu's hover background.
+fn escape_menu_hover_rows(buffer: &ratatui::buffer::Buffer) -> Vec<u16> {
+    let area = buffer.area;
+    (area.top()..area.bottom())
+        .filter(|y| {
+            (area.left()..area.right()).any(|x| buffer[(x, *y)].bg == crate::tui::theme::HOVER_BG)
+        })
+        .collect()
+}
+
+#[test]
+fn escape_menu_row_hover_follows_the_pointer_when_the_menu_moves_or_clips() {
+    let mut shell = shell_at(OnboardingStage::SecureStore);
+    let mut engine = Dialog::None;
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let opened = render_buffer(&mut shell, 80, 24);
+    let row = find_text(&opened, "Cancel setup for now");
+    shell.handle_mouse(moved(row.x + 2, row.y), &mut engine);
+    let hovered = render_buffer(&mut shell, 80, 24);
+    assert_eq!(escape_menu_hover_rows(&hovered), [row.y]);
+
+    // A shorter terminal recentres the menu: the row moves away from the
+    // pointer, and only a row actually under the pointer may hover.
+    let moved_menu = render_buffer(&mut shell, 80, 16);
+    let moved_row = find_text(&moved_menu, "Cancel setup for now");
+    assert_ne!(moved_row.y, row.y, "the menu must move");
+    let rows = escape_menu_hover_rows(&moved_menu);
+    assert!(rows.iter().all(|y| *y == row.y), "{rows:?}");
+    assert!(!rows.contains(&moved_row.y));
+
+    // Too short to show the rows at all: nothing hovers.
+    let clipped = render_buffer(&mut shell, 80, 6);
+    assert!(escape_menu_hover_rows(&clipped).is_empty());
+}
+
+#[test]
+fn shrinking_the_window_leaves_no_stale_choice_rows() {
+    // Non-zero-area relayout: at 80x24 the machine-bound row is on row 8; at
+    // 80x8 that row is the bottom margin (content is rows 4-5, footer 6).
+    let mut shell = available_secure_store_shell();
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 24, &engine);
+    let stale = shell.list_row_rects[2];
+    assert_eq!(stale.y, 8, "{:?}", shell.list_row_rects);
+    render_string(&mut shell, 80, 8, &engine);
+    let before = shell.test_secure_store_cursor_placement();
+    let outcome = shell.handle_mouse(click(stale.x + 2, stale.y), &mut engine);
+    assert!(outcome.action.is_none());
+    assert_eq!(shell.test_secure_store_cursor_placement(), before);
 }
 
 #[test]
@@ -1375,6 +1444,63 @@ fn authenticate_oauth_device_polling_escape_stays_on_authenticate() {
     shell.set_auth_phase_for_golden(AuthPhase::DevicePolling);
     let action = shell.handle_key(key(KeyCode::Esc), &mut engine);
     assert!(matches!(action, Some(OnboardingShellAction::OAuth(_))));
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::Authenticate);
+}
+
+#[test]
+fn authenticate_oauth_device_polling_enter_approves_now_without_the_button() {
+    // "Approve now" stays keyboard-reachable when a narrow footer hides it.
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    shell.present_authenticate(cockpit_core::providers::template_by_id("codex-oauth").unwrap());
+    let OAuthFlowRequest {
+        client_flow_id,
+        operation_id,
+        ..
+    } = match shell.handle_key(key(KeyCode::Enter), &mut engine) {
+        Some(OnboardingShellAction::OAuth(request)) => request,
+        other => panic!("acknowledge must queue OAuth, got {other:?}"),
+    };
+    let begin = shell
+        .apply_onboarding_oauth_acknowledgement(client_flow_id, operation_id, Ok(()))
+        .expect("successful acknowledgement must queue begin");
+    shell.apply_onboarding_oauth_begin(
+        begin.client_flow_id,
+        begin.operation_id,
+        OAuthBeginResult::Public(Ok(OAuthPublicBegin {
+            flow_id: "remote-flow".into(),
+            authorize_url: "https://auth.openai.com/codex/device".into(),
+            user_code: Some("WXYZ-1234".into()),
+        })),
+    );
+    // Enter on the idle device screen presents the code and starts polling;
+    // settle that presentation so the flow has no request in flight.
+    let present = match shell.handle_key(key(KeyCode::Enter), &mut engine) {
+        Some(OnboardingShellAction::OAuth(request)) => request,
+        other => panic!("device idle Enter must present, got {other:?}"),
+    };
+    shell.apply_onboarding_oauth_present(
+        present.client_flow_id,
+        present.operation_id,
+        Ok(crate::tui::settings::OAuthPresentationResult {
+            copied: false,
+            copy_unverified: false,
+            opened: true,
+            advance_flow: false,
+        }),
+    );
+    assert!(matches!(
+        &shell.screen,
+        OnboardingScreen::Authenticate(screen) if screen.auth_phase() == AuthPhase::DevicePolling
+    ));
+    let rendered = render_string(&mut shell, 28, 24, &engine);
+    assert!(!rendered.contains("Approve now ]"), "{rendered}");
+    let action = shell.handle_key(key(KeyCode::Enter), &mut engine);
+    assert!(
+        matches!(&action, Some(OnboardingShellAction::OAuth(request))
+            if matches!(request.op, OAuthFlowOp::Poll { .. })),
+        "{action:?}"
+    );
     assert_eq!(shell.screen_kind(), OnboardingScreenKind::Authenticate);
 }
 

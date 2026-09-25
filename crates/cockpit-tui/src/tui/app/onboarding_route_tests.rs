@@ -313,25 +313,103 @@ fn app_dragging_onboarding_scrollbar(tmp: &std::path::Path) -> App {
     app
 }
 
+fn arm_every_capture(app: &mut App) {
+    app.dragging_divider = true;
+    app.composer_controls.picker_scroll_drag = true;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: 10,
+        row: 5,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    });
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .unwrap()
+            .test_pointer()
+            .is_some()
+    );
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .unwrap()
+            .test_pointer_captured()
+    );
+}
+
+fn assert_every_capture_ended(app: &App, context: &str) {
+    let shell = app.onboarding_shell.as_ref().unwrap();
+    assert!(
+        !shell.test_pointer_captured(),
+        "{context}: onboarding scrollbar drag"
+    );
+    assert!(!app.dragging_divider, "{context}: divider drag");
+    assert!(
+        !app.composer_controls.picker_scroll_drag,
+        "{context}: composer picker scrollbar drag"
+    );
+}
+
 #[test]
-fn focus_loss_and_resize_end_onboarding_and_divider_pointer_captures() {
+fn resize_and_focus_loss_end_captures_and_forget_the_pointer_by_their_own_reason() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
 
-    for event in [
-        crossterm::event::Event::FocusLost,
-        crossterm::event::Event::Resize(100, 30),
-    ] {
-        let mut app = app_dragging_onboarding_scrollbar(tmp.path());
-        app.dragging_divider = true;
-        app.handle_terminal_event(event.clone());
-        assert!(
-            !app.onboarding_shell
-                .as_ref()
-                .unwrap()
-                .test_pointer_captured(),
-            "{event:?} must end the onboarding scrollbar drag"
-        );
-        assert!(!app.dragging_divider, "{event:?} must end the divider drag");
-    }
+    // Resize: a view change — the transcript gesture's view generation moves.
+    let mut app = app_dragging_onboarding_scrollbar(tmp.path());
+    arm_every_capture(&mut app);
+    let view = app.mouse_gesture_state.view_generation;
+    app.handle_terminal_event(crossterm::event::Event::Resize(100, 30));
+    assert_every_capture_ended(&app, "Resize");
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .unwrap()
+            .test_pointer()
+            .is_none()
+    );
+    assert_eq!(
+        app.mouse_gesture_state.view_generation,
+        view.wrapping_add(1)
+    );
+
+    // Focus loss: a cancel — no view change.
+    let mut app = app_dragging_onboarding_scrollbar(tmp.path());
+    arm_every_capture(&mut app);
+    let view = app.mouse_gesture_state.view_generation;
+    app.handle_terminal_event(crossterm::event::Event::FocusLost);
+    assert_every_capture_ended(&app, "FocusLost");
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .unwrap()
+            .test_pointer()
+            .is_none()
+    );
+    assert_eq!(app.mouse_gesture_state.view_generation, view);
+}
+
+#[test]
+fn opening_the_daemon_restart_prompt_ends_every_capture_and_takes_hover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = app_dragging_onboarding_scrollbar(tmp.path());
+    arm_every_capture(&mut app);
+    app.open_daemon_restart_prompt();
+    assert_every_capture_ended(&app, "daemon restart prompt");
+    assert_eq!(
+        app.pointer_owner(),
+        super::PointerOwner::DaemonRestartPrompt
+    );
+    app.distribute_pointer_ownership();
+    // The shell keeps the reported position but does not own the pointer, so
+    // it paints no hover (see onboarding's
+    // `an_app_modal_over_the_shell_owns_the_pointer`).
+    let shell = app.onboarding_shell.as_ref().unwrap();
+    assert!(shell.test_pointer().is_some());
+    assert!(!shell.test_pointer_owned());
+
+    app.daemon_restart_prompt = None;
+    app.distribute_pointer_ownership();
+    assert!(app.onboarding_shell.as_ref().unwrap().test_pointer_owned());
 }

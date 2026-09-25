@@ -241,8 +241,20 @@ pub(crate) fn action_bar_width(buttons: &[ActionButton<'_>]) -> u16 {
 }
 
 /// Right-aligned layout of an action bar in `area`: one rect per button, in
-/// button order. A button that does not fit (the bar is clipped on the right)
-/// gets an empty rect, so it is neither painted nor hit-testable.
+/// button order.
+///
+/// A button is laid out only if it fits *whole*. When the bar is wider than
+/// `area` it is left-aligned and filled in order; the first button that does
+/// not fit, and every button after it, gets an empty rect, so it is neither
+/// painted (no `[ Sta` fragment) nor hoverable nor clickable.
+///
+/// Hidden actions must stay keyboard-reachable. Onboarding guarantees it:
+/// every footer button has a key — Enter for the primary action, Esc for
+/// Cancel/Back, and the keys in each screen's help text for the rest (`a`
+/// add subagent / add another provider, `^r` Reveal, `^e` Use env var, `r`
+/// Retry, ↑/↓ + Enter on the completion choices, Enter for device-code
+/// "Approve now"). Settings help-row actions (Save/Cancel/Open) mirror their
+/// page's own key bindings.
 pub(crate) fn action_bar_layout(area: Rect, buttons: &[ActionButton<'_>]) -> Vec<Rect> {
     let mut rects = vec![Rect::default(); buttons.len()];
     if area.width == 0 || area.height == 0 || buttons.is_empty() {
@@ -259,13 +271,13 @@ pub(crate) fn action_bar_layout(area: Rect, buttons: &[ActionButton<'_>]) -> Vec
         area.right() - total
     };
     for (index, width) in widths.iter().enumerate() {
-        if x >= area.right() {
+        if x.saturating_add(*width) > area.right() {
             break;
         }
         // Keep geometry for disabled controls too.  Callers that own a
         // pointer registry need to expose a dimmed control as an explicit,
         // non-operable target rather than losing its identity at paint time.
-        rects[index] = Rect::new(x, area.y, (*width).min(area.right() - x), 1);
+        rects[index] = Rect::new(x, area.y, *width, 1);
         x = x.saturating_add(*width).saturating_add(1);
     }
     rects
@@ -323,10 +335,14 @@ pub(crate) fn action_button_at(rects: &[Rect], pos: Position) -> Option<usize> {
 /// Stateful action bar for a surface that owns its pointer routing.
 ///
 /// It holds only per-frame geometry. Hover is never stored: each render
-/// derives it from the caller's last known pointer position against *that*
-/// frame's layout, so a resize, a screen or phase change, clipping, or a
-/// disabled button can never leave the hover chip on a button the pointer is
-/// not over.
+/// derives it from the caller's last *reported* pointer position against
+/// that frame's layout, so a relayout, a screen or phase change, clipping,
+/// or a disabled button never moves the chip onto a button that position is
+/// not over. The position itself can be stale: crossterm has no mouse-leave
+/// event, so a pointer that leaves the terminal is reported nowhere. Callers
+/// therefore forget it at every boundary that invalidates coordinates
+/// (resize, focus loss, mouse capture off) and pass `None` while another
+/// layer owns the pointer.
 #[derive(Default)]
 pub(crate) struct ActionBar {
     rects: Vec<Rect>,
@@ -717,6 +733,30 @@ mod tests {
         // No pointer (a modal owns it, or focus was lost): no hover.
         let unowned = paint_bar(&mut bar, 40, &buttons, None);
         assert!(hovered_cells(&unowned).is_empty());
+    }
+
+    #[test]
+    fn a_button_that_does_not_fit_whole_is_not_laid_out_painted_or_clickable() {
+        let buttons = [
+            ActionButton::secondary("Add another provider"),
+            ActionButton::primary("Start coding"),
+        ];
+        // 24 + 1 + 16 = 41 cells; at 30 only the first fits whole.
+        let layout = action_bar_layout(Rect::new(0, 0, 30, 1), &buttons);
+        assert_eq!(layout[0], Rect::new(0, 0, 24, 1));
+        assert!(layout[1].is_empty(), "{:?}", layout[1]);
+
+        let mut bar = ActionBar::default();
+        let pointer = Position::new(25, 0);
+        let buffer = paint_bar(&mut bar, 30, &buttons, Some(pointer));
+        let row: String = (0..30).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(
+            !row.contains('S') && row.trim_end().ends_with(']'),
+            "{row:?}"
+        );
+        assert!(hovered_cells(&buffer).is_empty());
+        assert_eq!(bar.clicked(pointer), None);
+        assert_eq!(bar.clicked(Position::new(2, 0)), Some(0));
     }
 
     #[test]

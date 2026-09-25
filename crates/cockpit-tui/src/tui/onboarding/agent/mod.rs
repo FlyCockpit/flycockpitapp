@@ -84,26 +84,36 @@ enum SubagentsFocus {
     Edit,
 }
 
-/// What a first click armed on a two-click confirmation list. Keyed by the
-/// confirmed thing's identity — never its row position — so an armed row
-/// cannot pass to whichever target later occupies that row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a first click armed on a two-click confirmation list, keyed by the
+/// confirmed thing's content identity — never a row, slot, list index, or
+/// child path, all of which are recycled.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfirmTarget {
-    ThirdPartyTrust,
-    SidecarEgress,
-    /// A pending trust confirmation, by its policy route index.
-    RouteTrust(usize),
+    /// Publisher trust for this exact pinned source locator.
+    ThirdPartyTrust { locator: String },
+    /// Remote egress for this exact sidecar model.
+    SidecarEgress {
+        provider_id: String,
+        model_id: String,
+    },
+    /// The shared trust classification of this exact model.
+    RouteTrust {
+        provider_id: String,
+        model_id: String,
+    },
 }
 
-/// A pending first click: the target, plus the phase and the subagent being
-/// edited when it was armed. It confirms only if the second click lands on
-/// the same target in the same phase and draft; it is cleared by any
-/// confirmation (click or keyboard) and is inert once its target leaves the
-/// list.
+/// A pending first click. A two-click confirmation is two *consecutive*
+/// clicks on the same target: the arm confirms only if the next click lands
+/// on the same content target, in the same phase, in the same draft instance
+/// (a monotonically allocated identity per draft context, never an index).
+/// Any other interaction — a key, a paste, an action-bar button, a wheel
+/// scroll, navigation, a draft context change, or a projection replacement —
+/// disarms it (see [`AgentAuthoringScreen::disarm`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArmedConfirmation {
     phase: Phase,
-    child_path: Option<Vec<usize>>,
+    draft_instance: u64,
     target: ConfirmTarget,
 }
 
@@ -138,6 +148,11 @@ pub struct AgentAuthoringScreen {
     model_picker_row_rects: Vec<Rect>,
     list_nav: ui::ListNav,
     armed: Option<ArmedConfirmation>,
+    /// Identity of the draft context being edited (the root draft or one
+    /// child draft). Reallocated from `next_draft_instance` whenever the
+    /// context changes, so an identity is never reused.
+    draft_instance: u64,
+    next_draft_instance: u64,
     tool_model_picker: Option<usize>,
     tool_model_cursor: usize,
     /// The catalog is captured for the editor's lifetime. Production receives
@@ -183,6 +198,8 @@ impl AgentAuthoringScreen {
             model_picker_row_rects: Vec::new(),
             list_nav: ui::ListNav::new(),
             armed: None,
+            draft_instance: 0,
+            next_draft_instance: 0,
             tool_model_picker: None,
             tool_model_cursor: 0,
             tool_catalog: tool_surface_catalog(),
@@ -233,6 +250,7 @@ impl AgentAuthoringScreen {
             .is_some_and(|revision| revision != projection.policy.policy_revision);
         self.projection = projection;
         self.draft = fresh_authoring_draft(&self.projection);
+        self.enter_draft_context();
         self.draft_diagnostics.clear();
         if stale_review {
             self.review = None;
@@ -245,6 +263,7 @@ impl AgentAuthoringScreen {
     }
 
     pub fn apply_outcome(&mut self, outcome: ApplyAuthoredAgentPackageOutcome) {
+        self.disarm();
         match outcome {
             ApplyAuthoredAgentPackageOutcome::Review(review) => {
                 self.review = Some(review);
@@ -493,6 +512,7 @@ impl AgentAuthoringScreen {
     /// Step back inside authoring. Returns false only at the root name phase,
     /// where the onboarding shell may offer its escape menu or stage Back.
     pub(crate) fn back(&mut self) -> bool {
+        self.disarm();
         if self.tool_model_picker.take().is_some() {
             self.status = None;
             return true;
@@ -628,6 +648,7 @@ impl AgentAuthoringScreen {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<AgentAuthoringAction> {
+        self.disarm();
         if let Some(action) = self.pending_action.take() {
             return Some(action);
         }
@@ -750,6 +771,7 @@ impl AgentAuthoringScreen {
                 mouse.kind,
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             ) {
+                self.disarm();
                 let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                     -1
                 } else {
@@ -796,13 +818,13 @@ impl AgentAuthoringScreen {
                     | Phase::SubagentEdit(SubagentPhase::ModelTrust)
             ) {
                 self.cursor = logical;
-                if let Some(target) = self.confirm_target_at(logical) {
-                    if self.is_armed(target) {
-                        // toggle_selection clears the arm.
+                match self.confirm_target_at(logical) {
+                    Some(target) if self.is_armed(&target) => {
+                        // toggle_selection consumes the arm.
                         self.toggle_selection();
-                    } else {
-                        self.armed = Some(self.arm_key(target));
                     }
+                    Some(target) => self.armed = Some(self.arm_key(target)),
+                    None => self.disarm(),
                 }
             } else {
                 self.cursor = logical;
@@ -814,6 +836,7 @@ impl AgentAuthoringScreen {
     }
 
     pub fn paste(&mut self, text: &str) {
+        self.disarm();
         match self.phase {
             Phase::SourceIdentity | Phase::SubagentEdit(SubagentPhase::Identity) => {
                 self.name_field.paste(text);
@@ -853,6 +876,7 @@ impl AgentAuthoringScreen {
             return;
         }
         self.draft.children.remove(self.cursor);
+        self.disarm();
         self.cursor = self.cursor.min(self.draft.children.len().saturating_sub(1));
         self.review = None;
         self.review_policy_revision = None;
@@ -916,36 +940,78 @@ impl AgentAuthoringScreen {
     /// The two-click confirmation target shown on `row` of the current list.
     fn confirm_target_at(&self, row: usize) -> Option<ConfirmTarget> {
         match self.phase {
-            Phase::ThirdPartyTrust if row == 0 => Some(ConfirmTarget::ThirdPartyTrust),
-            Phase::SidecarEgress if row == 0 => Some(ConfirmTarget::SidecarEgress),
+            Phase::ThirdPartyTrust if row == 0 => Some(ConfirmTarget::ThirdPartyTrust {
+                locator: self.draft.third_party_locator.clone(),
+            }),
+            Phase::SidecarEgress if row == 0 => {
+                let route = self
+                    .projection
+                    .policy
+                    .routes
+                    .get(self.draft.sidecar_route_index?)?;
+                Some(ConfirmTarget::SidecarEgress {
+                    provider_id: route.provider_id.clone(),
+                    model_id: route.model_id.clone(),
+                })
+            }
             Phase::ModelTrust => self
                 .draft
                 .pending_trust_route_indices(&self.projection)
                 .get(row)
-                .map(|index| ConfirmTarget::RouteTrust(*index)),
+                .and_then(|index| self.route_trust_target(*index)),
             Phase::SubagentEdit(SubagentPhase::ModelTrust) => self
                 .current_child()
                 .map(|child| child.pending_trust_route_indices(&self.projection))
                 .and_then(|pending| pending.get(row).copied())
-                .map(ConfirmTarget::RouteTrust),
+                .and_then(|index| self.route_trust_target(index)),
             _ => None,
         }
+    }
+
+    /// The trust-confirmation target of policy route `index`, by model identity.
+    fn route_trust_target(&self, index: usize) -> Option<ConfirmTarget> {
+        let route = self.projection.policy.routes.get(index)?;
+        Some(ConfirmTarget::RouteTrust {
+            provider_id: route.provider_id.clone(),
+            model_id: route.model_id.clone(),
+        })
     }
 
     fn arm_key(&self, target: ConfirmTarget) -> ArmedConfirmation {
         ArmedConfirmation {
             phase: self.phase,
-            child_path: self
-                .subagent_stack
-                .last()
-                .map(|frame| frame.child_path.clone()),
+            draft_instance: self.draft_instance,
             target,
         }
     }
 
-    /// Whether `target` is armed in the current phase and draft.
-    fn is_armed(&self, target: ConfirmTarget) -> bool {
-        self.armed.as_ref() == Some(&self.arm_key(target))
+    /// Whether `target` is armed in the current phase and draft instance.
+    fn is_armed(&self, target: &ConfirmTarget) -> bool {
+        self.armed.as_ref().is_some_and(|armed| {
+            armed.phase == self.phase
+                && armed.draft_instance == self.draft_instance
+                && &armed.target == target
+        })
+    }
+
+    /// Whether route `index`'s trust row shows as armed.
+    fn route_trust_armed(&self, index: usize) -> bool {
+        self.route_trust_target(index)
+            .is_some_and(|target| self.is_armed(&target))
+    }
+
+    /// Drop a pending first click. Every interaction other than the second
+    /// click on the same target calls this.
+    fn disarm(&mut self) {
+        self.armed = None;
+    }
+
+    /// Begin a new draft context — a child draft entered or left, or the root
+    /// draft rebuilt — with a never-reused identity, dropping any arm.
+    fn enter_draft_context(&mut self) {
+        self.next_draft_instance += 1;
+        self.draft_instance = self.next_draft_instance;
+        self.disarm();
     }
 
     fn toggle_selection(&mut self) {
@@ -1417,7 +1483,12 @@ impl AgentAuthoringScreen {
                 None
             }
             Phase::ThirdPartyLocator => {
-                self.draft.third_party_locator = self.third_party_field.text().trim().to_string();
+                let locator = self.third_party_field.text().trim().to_string();
+                if locator != self.draft.third_party_locator {
+                    // Publisher trust was given for a different source.
+                    self.draft.third_party_trust_confirmed = false;
+                }
+                self.draft.third_party_locator = locator;
                 self.phase = Phase::ThirdPartyTrust;
                 None
             }
@@ -1719,6 +1790,7 @@ impl AgentAuthoringScreen {
             parent.children.push(prepared_child_draft(&self.projection));
         }
         self.editing_child = Self::child_at_path(&self.draft, &child_path).cloned();
+        self.enter_draft_context();
         self.subagents_focus = SubagentsFocus::Add;
         self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
         self.cursor = 0;
@@ -1748,6 +1820,7 @@ impl AgentAuthoringScreen {
             phase: SubagentPhase::Identity,
         });
         self.editing_child = child;
+        self.enter_draft_context();
         self.subagents_focus = SubagentsFocus::Edit;
         self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
         self.cursor = 0;
@@ -1766,6 +1839,7 @@ impl AgentAuthoringScreen {
         });
         self.draft.children.push(child);
         self.editing_child = self.draft.children.last().cloned();
+        self.enter_draft_context();
         self.subagents_focus = SubagentsFocus::Add;
         self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
         self.cursor = 0;
@@ -1787,6 +1861,7 @@ impl AgentAuthoringScreen {
             phase: SubagentPhase::Identity,
         });
         self.editing_child = child;
+        self.enter_draft_context();
         self.subagents_focus = SubagentsFocus::Edit;
         self.phase = Phase::SubagentEdit(SubagentPhase::Identity);
         self.cursor = 0;
@@ -1796,6 +1871,7 @@ impl AgentAuthoringScreen {
     }
 
     fn commit_subagent_edit(&mut self) {
+        self.enter_draft_context();
         if let Some(mut child) = self.editing_child.take() {
             child.name = self.name_field.text().trim().to_string();
             if let Some(frame) = self.subagent_stack.pop() {
@@ -1828,6 +1904,7 @@ impl AgentAuthoringScreen {
     }
 
     fn cancel_subagent_edit(&mut self) {
+        self.enter_draft_context();
         if let Some(frame) = self.subagent_stack.pop() {
             // The stacked parent snapshot never includes an uncommitted child;
             // restoring it is sufficient for both add and edit cancellation.
@@ -2009,6 +2086,7 @@ impl AgentAuthoringScreen {
     }
 
     pub(crate) fn action_bar_click(&mut self, button: usize) -> Option<AgentAuthoringAction> {
+        self.disarm();
         match self.phase {
             Phase::SubagentsList if button == 0 => {
                 self.begin_add_subagent();
@@ -2227,7 +2305,9 @@ impl AgentAuthoringScreen {
             }
             Phase::ThirdPartyTrust => {
                 let marked = self.draft.third_party_trust_confirmed
-                    || self.is_armed(ConfirmTarget::ThirdPartyTrust);
+                    || self
+                        .confirm_target_at(0)
+                        .is_some_and(|target| self.is_armed(&target));
                 lines.push((
                     Some(0),
                     Line::from(vec![
@@ -2255,7 +2335,9 @@ impl AgentAuthoringScreen {
                     ));
                 }
                 let marked = self.draft.sidecar_egress_confirmed
-                    || self.is_armed(ConfirmTarget::SidecarEgress);
+                    || self
+                        .confirm_target_at(0)
+                        .is_some_and(|target| self.is_armed(&target));
                 lines.push((
                     Some(0),
                     Line::from(vec![
@@ -2325,7 +2407,7 @@ impl AgentAuthoringScreen {
                         .get(index)
                         .copied()
                         .unwrap_or(false);
-                    let marked = confirmed || self.is_armed(ConfirmTarget::RouteTrust(index));
+                    let marked = confirmed || self.route_trust_armed(index);
                     lines.push((
                         Some(row),
                         Line::from(vec![
@@ -2367,7 +2449,7 @@ impl AgentAuthoringScreen {
                             .get(index)
                             .copied()
                             .unwrap_or(false);
-                        let marked = confirmed || self.is_armed(ConfirmTarget::RouteTrust(index));
+                        let marked = confirmed || self.route_trust_armed(index);
                         lines.push((
                             Some(row),
                             Line::from(vec![

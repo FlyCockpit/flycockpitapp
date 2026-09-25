@@ -521,6 +521,13 @@ impl SessionRail {
         self.pointer_position = None;
     }
 
+    /// End the rail's pointer interactions: hover and any confirm-button
+    /// press in progress.
+    pub fn cancel_pointer_transients(&mut self) {
+        self.clear_hover();
+        self.confirm_buttons.clear_hover_and_pressed();
+    }
+
     pub fn set_pointer_capture(&mut self, capture: bool) {
         self.pointer_capture = capture;
     }

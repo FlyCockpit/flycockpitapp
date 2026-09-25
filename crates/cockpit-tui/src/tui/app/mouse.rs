@@ -43,6 +43,7 @@ impl App {
     /// - left-up → finalize drag-select (selection persists for copy).
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
+        self.observe_pointer(mouse.column, mouse.row);
         if let Some(prompt) = self.daemon_restart_prompt.as_mut() {
             let restart = point_in(prompt.restart_rect, mouse.column, mouse.row);
             let quit = point_in(prompt.quit_rect, mouse.column, mouse.row);
@@ -1562,28 +1563,110 @@ impl App {
         });
     }
 
-    /// The one funnel for ending every pointer interaction that must not
-    /// outlive a terminal resize or focus loss: link gestures, settings
-    /// hover/press transients, the pane-divider drag, onboarding's pointer
-    /// capture (and, on focus loss, its pointer position), and the chat
-    /// transcript's selection gesture.
-    pub(super) fn end_pointer_interactions(&mut self, end: PointerInteractionEnd) {
+    /// End every pointer capture and press in progress, so no later event
+    /// can continue or complete a gesture whose owner lost it. This is the
+    /// complete list of capture/press state in the TUI:
+    /// - chat: link gesture + pending link activation, the transcript
+    ///   selection/copy gesture and pending performance-chip press (via
+    ///   `invalidate_mouse_gesture`);
+    /// - app chrome: the registered-button press (`button_registry`) and the
+    ///   session rail's confirm-button press;
+    /// - the pane-divider drag and the composer picker scrollbar drag;
+    /// - settings: hover, header hover, the pressed target and the button
+    ///   registry press, the help-row pointer, and the page's transients;
+    /// - onboarding: the provider scrollbar drag.
+    ///
+    /// Called when an app-level modal takes the pointer (the daemon restart
+    /// prompt) and, via [`Self::end_pointer_interactions`], on resize and focus
+    /// loss.
+    pub(super) fn end_pointer_captures(&mut self, reason: MouseGestureInvalidation) {
         self.link_pointer_gesture.cancel();
         self.link_registry.invalidate_pointer_generation();
         self.pending_link_activation = None;
-        self.dialog.cancel_settings_pointer_transients();
+        self.button_registry.clear_hover_and_pressed();
+        self.session_rail.cancel_pointer_transients();
         self.dragging_divider = false;
+        self.end_composer_picker_scroll_drag();
+        self.dialog.cancel_settings_pointer_transients();
         if let Some(shell) = self.onboarding_shell.as_mut() {
-            match end {
-                PointerInteractionEnd::Resize => shell.handle_resize(),
-                PointerInteractionEnd::FocusLost => shell.handle_focus_lost(),
-            }
+            shell.cancel_pointer_capture();
         }
+        self.invalidate_mouse_gesture(reason, self.event_loop_monotonic_now);
+    }
+
+    /// The terminal was resized or lost focus: every capture ends, and the
+    /// last reported pointer position is forgotten everywhere it is kept
+    /// (after a resize it names a different cell; after focus loss it is
+    /// unknown), so nothing hovers until the pointer is reported again.
+    pub(super) fn end_pointer_interactions(&mut self, end: PointerInteractionEnd) {
         let reason = match end {
             PointerInteractionEnd::Resize => MouseGestureInvalidation::ViewChange,
             PointerInteractionEnd::FocusLost => MouseGestureInvalidation::Cancel,
         };
-        self.invalidate_mouse_gesture(reason, self.event_loop_monotonic_now);
+        self.end_pointer_captures(reason);
+        self.forget_pointer();
+    }
+
+    /// Record the last reported pointer position with every surface that
+    /// derives hover from it. Called for every mouse event before routing,
+    /// so a surface stays current even when another layer consumes the
+    /// event.
+    pub(super) fn observe_pointer(&mut self, column: u16, row: u16) {
+        let pointer = Some(ratatui::layout::Position::new(column, row));
+        self.dialog.observe_settings_pointer(pointer);
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.observe_pointer(pointer);
+        }
+    }
+
+    /// The pointer position is unknown (resize, focus loss, mouse capture
+    /// turned off): no surface may derive hover from an old one.
+    pub(super) fn forget_pointer(&mut self) {
+        self.dialog.observe_settings_pointer(None);
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.observe_pointer(None);
+            shell.end_pointer_interactions();
+        }
+        self.session_rail.clear_hover();
+        self.hovered_affordance = None;
+    }
+
+    /// The layer that receives pointer input — the same precedence
+    /// [`Self::handle_mouse`] routes by. The single source for "who owns the
+    /// pointer": hover renderers below the owner paint no hover.
+    pub(super) fn pointer_owner(&self) -> PointerOwner {
+        if self.daemon_restart_prompt.is_some() {
+            PointerOwner::DaemonRestartPrompt
+        } else if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
+            PointerOwner::WorkspaceTrust
+        } else if self.onboarding_shell.is_some() {
+            PointerOwner::Onboarding
+        } else if self.keys_overlay.is_some() {
+            PointerOwner::KeysOverlay
+        } else if self.context_menu.is_some() {
+            PointerOwner::ContextMenu
+        } else {
+            PointerOwner::Surface
+        }
+    }
+
+    /// Tell every hover renderer whether it owns the pointer this frame.
+    pub(super) fn distribute_pointer_ownership(&mut self) {
+        let owner = self.pointer_owner();
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.set_pointer_owned(owner == PointerOwner::Onboarding);
+        }
+        self.dialog
+            .set_settings_pointer_owned(owner == PointerOwner::Surface);
+    }
+
+    /// Show the daemon restart prompt. It is modal and takes the pointer, so
+    /// every capture underneath ends now (its release would never arrive).
+    pub(super) fn open_daemon_restart_prompt(&mut self) {
+        if self.daemon_restart_prompt.is_none() {
+            self.end_pointer_captures(MouseGestureInvalidation::Cancel);
+        }
+        self.daemon_restart_prompt = Some(super::DaemonRestartPrompt::default());
     }
 
     pub(super) fn invalidate_mouse_gesture(

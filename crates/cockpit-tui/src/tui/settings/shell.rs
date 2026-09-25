@@ -344,6 +344,9 @@ pub(super) struct SettingsPointerSurface {
     /// Last pointer position seen over the settings surface; the help row
     /// derives its hover from it each frame.
     pub help_row_pointer: std::cell::Cell<Option<ratatui::layout::Position>>,
+    /// Whether this surface owns the pointer this frame (the app clears it
+    /// while an app-level overlay sits on top).
+    pub pointer_owned: std::cell::Cell<bool>,
 }
 
 impl Default for SettingsPointerSurface {
@@ -361,6 +364,7 @@ impl Default for SettingsPointerSurface {
             rows: RefCell::new(RowControlRegistry::default()),
             surface_generation: std::cell::Cell::new(0),
             help_row_pointer: std::cell::Cell::new(None),
+            pointer_owned: std::cell::Cell::new(true),
         }
     }
 }

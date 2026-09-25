@@ -201,7 +201,7 @@ impl AuthScreen {
         match self.phase {
             AuthPhase::Acknowledge => "enter acknowledge   esc back   ^c quit",
             AuthPhase::DeviceIdle => "enter open & poll   esc back   ^c quit",
-            AuthPhase::DevicePolling => "esc cancel   ^c quit",
+            AuthPhase::DevicePolling => "enter approve now   esc cancel   ^c quit",
             AuthPhase::PasteCallback => "paste callback   enter continue   esc back   ^c quit",
             AuthPhase::ApiKey => "tab next field   ^r reveal   ^e env var   esc back   ^c quit",
         }
@@ -500,6 +500,9 @@ impl AuthScreen {
             AuthPhase::Acknowledge if key.code == KeyCode::Enter => self.action(0),
             AuthPhase::DeviceIdle if key.code == KeyCode::Enter => self.action(0),
             AuthPhase::DevicePolling if key.code == KeyCode::Esc => self.action(0),
+            // "Approve now" must stay keyboard-reachable when a narrow
+            // footer hides its button.
+            AuthPhase::DevicePolling if key.code == KeyCode::Enter => self.action(1),
             AuthPhase::PasteCallback if key.code == KeyCode::Enter => self.action(0),
             AuthPhase::PasteCallback => {
                 self.callback.handle_key(key);

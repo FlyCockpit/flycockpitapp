@@ -3506,6 +3506,18 @@ pub(super) struct SelectionSpan {
     pub end_col: u16,
 }
 
+/// Which layer receives pointer input (see [`App::pointer_owner`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PointerOwner {
+    DaemonRestartPrompt,
+    WorkspaceTrust,
+    Onboarding,
+    KeysOverlay,
+    ContextMenu,
+    /// No overlay: the chat surface, or a settings dialog, owns it.
+    Surface,
+}
+
 /// Why [`App::end_pointer_interactions`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PointerInteractionEnd {

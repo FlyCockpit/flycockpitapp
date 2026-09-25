@@ -22,5 +22,5 @@
 19	2:Reset/Reset/- 76:Rgb(138,155,176)/Reset/- 2:Reset/Reset/-
 20	2:Reset/Reset/- 76:Rgb(138,155,176)/Reset/- 2:Reset/Reset/-
 21	2:Reset/Reset/- 76:Rgb(138,155,176)/Reset/- 2:Reset/Reset/-
-22	2:Reset/Reset/- 20:Rgb(138,155,176)/Reset/- 30:Reset/Reset/- 10:Rgb(138,155,176)/Reset/- 1:Reset/Reset/- 15:Rgb(224,177,86)/Reset/BOLD 2:Reset/Reset/-
+22	2:Reset/Reset/- 40:Rgb(138,155,176)/Reset/- 10:Reset/Reset/- 10:Rgb(138,155,176)/Reset/- 1:Reset/Reset/- 15:Rgb(224,177,86)/Reset/BOLD 2:Reset/Reset/-
 23	80:Reset/Reset/-

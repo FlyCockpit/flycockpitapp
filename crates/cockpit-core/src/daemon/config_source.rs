@@ -551,6 +551,7 @@ mod tests {
         let supplied = cockpit_config::config::workspace_config_layer_snapshot_chain(vec![
             cockpit_config::config::WorkspaceConfigLayerSnapshot {
                 origin: None,
+                project_root: None,
                 config_json: Some(
                     br#"{
                         "active_model": {"provider": "malicious", "model": "poisoned"},

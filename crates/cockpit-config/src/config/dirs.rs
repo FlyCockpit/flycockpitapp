@@ -209,17 +209,46 @@ pub fn discover_config_dirs(cwd: &Path) -> Vec<ConfigDir> {
 /// because UI editing still needs the discovered directory order for choosing a
 /// concrete layer to write.
 pub fn config_file_paths_for_load(cwd: &Path) -> Vec<PathBuf> {
-    if let Some(path) = std::env::var_os(COCKPIT_CONFIG_ENV)
-        && !path.is_empty()
-    {
-        let path = PathBuf::from(path);
-        if explicit_config_write_allowed(&path) {
-            return vec![path];
-        }
-        return Vec::new();
+    if let Some(paths) = explicit_config_file_paths() {
+        return paths;
     }
 
     file_paths_for_load(cwd, CONFIG_FILE)
+}
+
+/// The `COCKPIT_CONFIG` explicit override, when set: it supplies the only
+/// `config.json` layer (or none when its project layer is not trusted). The
+/// one definition shared by workspace loads and installation-policy loads, so
+/// sessions and daemon-global policy never read disjoint layers.
+fn explicit_config_file_paths() -> Option<Vec<PathBuf>> {
+    let path = std::env::var_os(COCKPIT_CONFIG_ENV).filter(|path| !path.is_empty())?;
+    let path = PathBuf::from(path);
+    Some(if explicit_config_write_allowed(&path) {
+        vec![path]
+    } else {
+        Vec::new()
+    })
+}
+
+/// The `config.json` layers of installation-wide (daemon-global) policy:
+/// the `COCKPIT_CONFIG` explicit override exactly as [`config_file_paths_for_load`]
+/// selects it, otherwise the canonical global layer. No project root takes
+/// part. Every returned path is absolute: a relative override would be
+/// resolved against the daemon's inherited working directory, so it is an
+/// error.
+pub fn installation_config_file_paths() -> anyhow::Result<Vec<PathBuf>> {
+    if let Some(paths) = explicit_config_file_paths() {
+        for path in &paths {
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "{COCKPIT_CONFIG_ENV} must be an absolute path for installation-wide policy (got `{}`)",
+                    path.display()
+                );
+            }
+        }
+        return Ok(paths);
+    }
+    Ok(vec![global_config_file()?])
 }
 
 fn explicit_config_write_allowed(path: &Path) -> bool {

@@ -1550,10 +1550,13 @@ struct RedactListUnions {
 #[cfg(test)]
 fn resolve_redact_list_unions_from_paths(paths: &[PathBuf]) -> RedactListUnions {
     let docs = load_existing_docs_from_paths(paths);
-    resolve_redact_list_unions_from_docs(&docs)
+    resolve_redact_list_unions_from_docs(&docs, &mut Vec::new())
 }
 
-fn resolve_redact_list_unions_from_docs(docs: &[ExtendedConfigDoc]) -> RedactListUnions {
+fn resolve_redact_list_unions_from_docs(
+    docs: &[ExtendedConfigDoc],
+    warnings: &mut Vec<String>,
+) -> RedactListUnions {
     let mut out = RedactListUnions::default();
     let mut denylist_seen: HashSet<String> = HashSet::new();
     let mut allowlist_seen: HashSet<String> = HashSet::new();
@@ -1583,6 +1586,16 @@ fn resolve_redact_list_unions_from_docs(docs: &[ExtendedConfigDoc]) -> RedactLis
             if path.to_string_lossy().trim().is_empty() {
                 continue;
             }
+            // Relative entries are anchored at the DECLARING layer's project
+            // root at merge time, so every effective entry is absolute and no
+            // consumer ever resolves one against a process working directory.
+            let Some(path) = anchor_config_relative_path(doc.path_base.as_deref(), &path) else {
+                tracing::warn!(
+                    "ignored a relative `redact.extra_dotenv_paths` entry in a layer without a project root"
+                );
+                warnings.push(RELATIVE_EXTRA_DOTENV_PATH_WARNING.to_string());
+                continue;
+            };
             if extra_dotenv_paths_seen.insert(path.clone()) {
                 out.extra_dotenv_paths.push(path);
             }
@@ -1597,6 +1610,70 @@ fn redact_list_strings(redact: &Map<String, Value>, key: &str) -> Vec<String> {
         .get(key)
         .and_then(|value| serde_json::from_value(value.clone()).ok())
         .unwrap_or_default()
+}
+
+/// Path-free warning for a relative `redact.extra_dotenv_paths` entry in a
+/// layer with no project root (the global layer or an explicit non-project
+/// override). The entry is not honored; configure an absolute path instead.
+pub const RELATIVE_EXTRA_DOTENV_PATH_WARNING: &str = "ignored a relative `redact.extra_dotenv_paths` entry: only project `.cockpit/` layers can use paths relative to their project root; use an absolute path in global config";
+
+/// Anchor one configured `redact.extra_dotenv_paths` entry for its layer.
+///
+/// - An absolute path is kept as written.
+/// - A relative path made only of normal, `.` and `..` components is joined to
+///   the layer's absolute project root (`base`).
+/// - Anything else is rejected (`None`): a relative entry in a layer with no
+///   project root, and every non-absolute path carrying a root or a Windows
+///   prefix (`\secrets.env`, `C:secrets.env`), which `Path::join` would not
+///   anchor at `base` but at the current drive or its working directory.
+pub fn anchor_config_relative_path(base: Option<&Path>, path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    let plain_relative = path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(_)
+                | std::path::Component::CurDir
+                | std::path::Component::ParentDir
+        )
+    });
+    let base = base.filter(|base| base.is_absolute())?;
+    plain_relative.then(|| base.join(path))
+}
+
+fn redact_list_paths_raw(raw: &Value) -> Vec<PathBuf> {
+    raw.get("redact")
+        .and_then(Value::as_object)
+        .map(|redact| redact_list_paths(redact, "extra_dotenv_paths"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| !path.to_string_lossy().trim().is_empty())
+        .collect()
+}
+
+/// The absolute project root of a conventional `<root>/.cockpit/config.json`
+/// layer path; `None` for every other layer (global, explicit non-project
+/// overrides) or a non-absolute path.
+pub fn layer_project_root(config_path: &Path) -> Option<PathBuf> {
+    let layer_dir = config_path.parent()?;
+    if layer_dir.file_name()? != ".cockpit" {
+        return None;
+    }
+    let root = layer_dir.parent()?;
+    root.is_absolute().then(|| root.to_path_buf())
+}
+
+/// The anchor of a loaded layer's relative path settings: its own project root
+/// for `.cockpit` layers, and `cwd` (the directory it is keyed to) for the
+/// machine-local layer of `cwd`.
+fn layer_path_base(config_path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    if let Some(root) = layer_project_root(config_path) {
+        return Some(root);
+    }
+    let cwd = cwd.filter(|cwd| cwd.is_absolute())?;
+    let local = crate::config::dirs::local_config_dir_for(cwd).ok()?;
+    (config_path.parent() == Some(local.as_path())).then(|| cwd.to_path_buf())
 }
 
 fn redact_list_paths(redact: &Map<String, Value>, key: &str) -> Vec<PathBuf> {
@@ -1675,6 +1752,16 @@ pub struct RedactConfig {
     /// scan (§7). Replaces the old walk-up-to-git-root discovery.
     #[serde(default = "default_dotenv_patterns")]
     pub dotenv_patterns: Vec<String>,
+    /// Explicit env files scanned in addition to `dotenv_patterns`.
+    ///
+    /// A relative entry is anchored at merge time at the project root of the
+    /// `.cockpit/` layer that declares it (the machine-local layer of a
+    /// directory anchors at that directory), so every effective entry is
+    /// absolute. Layers with no project root (the global layer and explicit
+    /// non-project `COCKPIT_CONFIG` files) accept absolute paths only: a
+    /// relative entry there is ignored with a warning by layered loads and is
+    /// an error for installation-wide policy. A non-absolute path with a root
+    /// or a Windows prefix (`C:secrets.env`) is never anchored.
     #[serde(default)]
     pub extra_dotenv_paths: Vec<PathBuf>,
     /// Extra glob patterns for secret-bearing paths. These extend, never
@@ -2167,21 +2254,85 @@ pub fn load_installation_handover_timers() -> Result<HandoverTimersConfig> {
     })
 }
 
-/// Load the effective extended config of the canonical user-owned global layer
-/// alone, for daemon-global policy (daemon-wide redaction coverage, retention).
+/// Installation-wide (daemon-global) policy sections that are read strictly by
+/// [`load_installation_extended_config`]: an explicitly present section must
+/// decode completely, with no unknown keys and no permissive recovery.
+const INSTALLATION_POLICY_SECTIONS: &[&str] = &["redact", "retention"];
+
+/// Load installation-wide policy for the daemon (daemon-wide redaction
+/// coverage, retention sweeps, `cockpit doctor`'s retention report).
 ///
-/// No project root participates: project `.cockpit/` layers, machine-local
-/// per-directory layers, and the `COCKPIT_CONFIG` explicit override are all
-/// workspace/invocation scoped and therefore outside daemon-global authority.
-/// The layer is resolved through the same merge path as every layered load
-/// (list unions, fail-closed sections, malformed-layer handling), so a global
-/// setting means the same thing here as in a session's effective config. A
-/// missing global layer is the fresh-install default; an unresolvable global
-/// config directory is an error.
+/// The layers are exactly [`installation_config_file_paths`](crate::config::dirs::installation_config_file_paths):
+/// the `COCKPIT_CONFIG` explicit override when set (selected the same way a
+/// session's load selects it, so daemon-global policy and sessions never read
+/// disjoint layers), otherwise the canonical global layer. No project root
+/// participates.
+///
+/// This reader is strict because a silently weaker policy is worse than an
+/// error here (a dropped denylist, or a retention window defaulting to 90 days
+/// and deleting transcripts):
+/// - an absent layer is the fresh-install default;
+/// - any other read, permission, size, UTF-8, or JSON failure is an error;
+/// - an explicitly present policy section ([`INSTALLATION_POLICY_SECTIONS`])
+///   must decode through its type with no unknown keys;
+/// - a relative `redact.extra_dotenv_paths` entry is an error, because these
+///   layers have no project root to anchor it.
 pub fn load_installation_extended_config() -> Result<ExtendedConfig> {
-    let path = crate::config::dirs::global_config_file()?;
-    let docs = load_existing_docs_from_paths(&[path]);
-    Ok(resolve_loaded_docs(&docs))
+    let paths = crate::config::dirs::installation_config_file_paths()?;
+    let mut docs = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let Some(doc) = ExtendedConfigDoc::load_existing(path)? else {
+            continue;
+        };
+        validate_installation_policy_sections(&doc)?;
+        docs.push(doc);
+    }
+    let (config, _warnings) = resolve_loaded_docs_with_warnings(&docs);
+    Ok(config)
+}
+
+fn validate_installation_policy_sections(doc: &ExtendedConfigDoc) -> Result<()> {
+    let defaults = serde_json::to_value(ExtendedConfig::default())
+        .context("serializing default config for policy validation")?;
+    for section in INSTALLATION_POLICY_SECTIONS {
+        let Some(value) = doc.raw.get(*section) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            anyhow::bail!(
+                "invalid `{section}` section in {}: expected an object",
+                doc.path.display()
+            );
+        };
+        if let Some(known) = defaults.get(*section).and_then(Value::as_object) {
+            for key in object.keys() {
+                if !known.contains_key(key) {
+                    anyhow::bail!(
+                        "invalid `{section}` section in {}: unknown key `{key}`",
+                        doc.path.display()
+                    );
+                }
+            }
+        }
+        let mut probe = Map::new();
+        probe.insert((*section).to_string(), value.clone());
+        // Error text is field-level only; values can be secrets.
+        if serde_json::from_value::<ExtendedConfig>(Value::Object(probe)).is_err() {
+            anyhow::bail!(
+                "invalid `{section}` section in {}: a field has the wrong type",
+                doc.path.display()
+            );
+        }
+    }
+    for entry in redact_list_paths_raw(&doc.raw) {
+        if anchor_config_relative_path(doc.path_base.as_deref(), &entry).is_none() {
+            anyhow::bail!(
+                "invalid `redact.extra_dotenv_paths` entry in {}: installation-wide config has no project root, so every entry must be an absolute path",
+                doc.path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Read the only installation-wide setting that participates in interactive
@@ -2243,7 +2394,7 @@ fn load_daemon_lifetime_policy_at(path: &Path) -> Result<bool> {
 pub fn load_for_cwd_with_warnings(cwd: &Path) -> (ExtendedConfig, Vec<String>) {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);
-    let docs = load_existing_docs_from_paths(&paths);
+    let docs = load_existing_docs_for_cwd(&paths, cwd);
     resolve_loaded_docs_with_warnings(&docs)
 }
 
@@ -2254,7 +2405,7 @@ pub fn load_for_cwd_with_computer_use_policy(
 ) -> (ExtendedConfig, Option<ComputerUseMode>) {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);
-    let docs = load_existing_docs_from_paths(&paths);
+    let docs = load_existing_docs_for_cwd(&paths, cwd);
     let computer_use = resolve_computer_use_policy_from_docs(&docs);
     (resolve_loaded_docs(&docs), computer_use)
 }
@@ -2265,9 +2416,9 @@ fn resolve_loaded_docs(docs: &[ExtendedConfigDoc]) -> ExtendedConfig {
 
 fn resolve_loaded_docs_with_warnings(docs: &[ExtendedConfigDoc]) -> (ExtendedConfig, Vec<String>) {
     if !docs.is_empty() {
-        let (mut cfg, warnings) = load_merged_from_docs_with_warnings(docs);
+        let (mut cfg, mut warnings) = load_merged_from_docs_with_warnings(docs);
         cfg.gitignore_allow = resolve_gitignore_allow_from_docs(docs);
-        let redact_unions = resolve_redact_list_unions_from_docs(docs);
+        let redact_unions = resolve_redact_list_unions_from_docs(docs, &mut warnings);
         cfg.redact.denylist = redact_unions.denylist;
         cfg.redact.allowlist = redact_unions.allowlist;
         cfg.redact.extra_dotenv_paths = redact_unions.extra_dotenv_paths;
@@ -2339,13 +2490,14 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
     let mut docs: Vec<_> = captured
         .into_iter()
         .map(|(path, raw)| ExtendedConfigDoc {
+            path_base: layer_path_base(&path, Some(cwd)),
             path,
             raw,
             origin: ConfigLayerOrigin::LocalTrusted,
         })
         .collect();
     for layer in &workspace.layers {
-        docs.push(extended_doc_from_workspace_snapshot(layer)?);
+        docs.push(extended_doc_from_workspace_snapshot(layer, Some(cwd))?);
     }
     let mut validation = Ok(());
     for doc in &docs {
@@ -2375,11 +2527,25 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
     })
 }
 
+/// `cwd` is the attached workspace root the chain was captured for: it anchors
+/// the machine-local layer (keyed to that root). Project layers anchor at
+/// their own captured project root; other layers are unanchored.
 fn extended_doc_from_workspace_snapshot(
     workspace: &crate::config::WorkspaceConfigLayerSnapshot,
+    cwd: Option<&Path>,
 ) -> Result<ExtendedConfigDoc> {
     let raw = parse_config_root_object(workspace.config_json.as_deref().unwrap_or(b"{}"))?;
+    let path_base = match workspace.origin {
+        Some(ConfigDirKind::MachineLocal) => {
+            cwd.filter(|cwd| cwd.is_absolute()).map(Path::to_path_buf)
+        }
+        _ => workspace
+            .project_root
+            .clone()
+            .filter(|root| root.is_absolute()),
+    };
     Ok(ExtendedConfigDoc {
+        path_base,
         // Never expose the attachment path in diagnostics or wire data. The
         // source label identifies provenance without becoming filesystem data.
         path: PathBuf::from("<attached workspace config>"),
@@ -2400,6 +2566,7 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
     let docs: Vec<_> = captured
         .into_iter()
         .map(|(path, raw)| ExtendedConfigDoc {
+            path_base: layer_path_base(&path, Some(cwd)),
             path,
             raw,
             origin: ConfigLayerOrigin::LocalTrusted,
@@ -2548,6 +2715,18 @@ fn read_extended_config_doc(path: &Path) -> Result<ExtendedConfigDoc> {
     ExtendedConfigDoc::load(path)
 }
 
+/// [`load_existing_docs_from_paths`] for a load keyed to `cwd`: the
+/// machine-local layer of `cwd` is anchored there for relative path settings.
+fn load_existing_docs_for_cwd(paths: &[PathBuf], cwd: &Path) -> Vec<ExtendedConfigDoc> {
+    let mut docs = load_existing_docs_from_paths(paths);
+    for doc in &mut docs {
+        if doc.path_base.is_none() {
+            doc.path_base = layer_path_base(&doc.path, Some(cwd));
+        }
+    }
+    docs
+}
+
 fn load_existing_docs_from_paths(paths: &[PathBuf]) -> Vec<ExtendedConfigDoc> {
     let mut docs = Vec::new();
     for path in paths {
@@ -2578,6 +2757,7 @@ fn load_merged_from_docs_with_warnings(
         path: PathBuf::from("<merged effective config>"),
         raw: merged,
         origin: ConfigLayerOrigin::LocalTrusted,
+        path_base: None,
     }
     .config();
     (cfg, warnings)
@@ -2670,7 +2850,7 @@ pub fn guidance_proposal_doc_layers_from_snapshot_chain(
 ) -> Result<GuidanceProposalDocLayers> {
     let mut out = GuidanceProposalDocLayers::default();
     for layer in &chain.layers {
-        let doc = extended_doc_from_workspace_snapshot(layer)?;
+        let doc = extended_doc_from_workspace_snapshot(layer, None)?;
         let value = guidance_proposal_field_from_doc(&doc);
         match layer.origin.as_ref() {
             Some(ConfigDirKind::HomeXdg) => {
@@ -2788,6 +2968,10 @@ pub struct ExtendedConfigDoc {
     pub path: PathBuf,
     raw: Value,
     origin: ConfigLayerOrigin,
+    /// Absolute directory this layer's relative path settings are anchored
+    /// at (see [`anchor_config_relative_path`]); `None` when the layer has no
+    /// project root, in which case relative path settings are rejected.
+    path_base: Option<PathBuf>,
 }
 
 /// Trust origin of a captured config layer.
@@ -3124,12 +3308,22 @@ impl ExtendedConfigDoc {
     /// [`ConfigLayerOrigin::Remote`] and `image_generation` is stripped at
     /// construction. See the [`ConfigLayerOrigin`] invariant.
     pub fn load(path: &Path) -> Result<Self> {
+        Ok(Self::load_existing(path)?.unwrap_or_else(|| Self {
+            path: path.to_path_buf(),
+            raw: Value::Object(Map::new()),
+            origin: ConfigLayerOrigin::LocalTrusted,
+            path_base: layer_path_base(path, None),
+        }))
+    }
+
+    /// Load a config layer that exists, distinguishing genuine absence
+    /// (`Ok(None)`) from every read or parse failure (`Err`).
+    pub fn load_existing(path: &Path) -> Result<Option<Self>> {
         // No outer read context: the bounded reader already attaches a
         // `reading <path>` context to IO failures and surfaces over-cap
         // files as a top-level `exceeds the byte limit` failure.
-        let raw_str = match crate::config::files::read_workspace_config_text(path)? {
-            Some(raw) => raw,
-            None => "{}".to_string(),
+        let Some(raw_str) = crate::config::files::read_workspace_config_text(path)? else {
+            return Ok(None);
         };
         let raw: Value = if raw_str.trim().is_empty() {
             Value::Object(Map::new())
@@ -3144,12 +3338,13 @@ impl ExtendedConfigDoc {
             }
         };
         strip_secret_store_key(&mut raw);
-        Ok(Self {
+        Ok(Some(Self {
             path: path.to_path_buf(),
             raw,
             // Only local, trust-filtered paths reach this loader today.
             origin: ConfigLayerOrigin::LocalTrusted,
-        })
+            path_base: layer_path_base(path, None),
+        }))
     }
 
     /// SECURITY: the ONLY supported way to introduce a config layer sourced
@@ -3179,6 +3374,7 @@ impl ExtendedConfigDoc {
             path: PathBuf::from("<remote .well-known/cockpit>"),
             raw,
             origin: ConfigLayerOrigin::Remote,
+            path_base: None,
         }
     }
 

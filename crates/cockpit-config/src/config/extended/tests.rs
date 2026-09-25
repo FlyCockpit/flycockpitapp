@@ -10,6 +10,7 @@ fn retained_guidance_layers_use_discovery_origin_not_chain_position() {
     ) -> crate::config::WorkspaceConfigLayerSnapshot {
         crate::config::WorkspaceConfigLayerSnapshot {
             origin,
+            project_root: None,
             config_json: Some(
                 format!(r#"{{"allow_computer_guidance_proposals":{value}}}"#).into_bytes(),
             ),
@@ -2034,7 +2035,8 @@ fn config_resolution_result_unchanged_after_single_pass_rewrite() {
     assert_eq!(cfg.redact.allowlist, vec!["safe"]);
     assert_eq!(
         cfg.redact.extra_dotenv_paths,
-        vec![PathBuf::from(".env.shared")]
+        vec![project.join(".env.shared")],
+        "a relative entry anchors at its declaring layer's project root"
     );
     assert_eq!(
         cfg.gitignore_allow,
@@ -3005,6 +3007,7 @@ mod image_generation {
                 path: PathBuf::from("<local>"),
                 raw,
                 origin: ConfigLayerOrigin::LocalTrusted,
+                path_base: None,
             }
         }
 
@@ -3621,8 +3624,8 @@ fn installation_extended_config_reads_only_the_global_layer() {
         r#"{"redact":{"denylist":["global-deny"],"extra_dotenv_paths":["/abs/global.env"]}}"#,
     )
     .unwrap();
-    // A project layer under the process cwd and an explicit override are both
-    // workspace/invocation scoped: neither may reach daemon-global policy.
+    // A project layer under the process cwd is workspace scoped and never
+    // reaches installation-wide policy.
     let project = tmp.path().join("launch");
     std::fs::create_dir_all(project.join(".cockpit")).unwrap();
     std::fs::write(
@@ -3632,10 +3635,7 @@ fn installation_extended_config_reads_only_the_global_layer() {
         r#"{"redact":{"denylist":["project-deny"]}}"#,
     )
     .unwrap();
-    let explicit = tmp.path().join("explicit.json");
-    std::fs::write(&explicit, r#"{"redact":{"denylist":["explicit-deny"]}}"#).unwrap();
     env.set_current_dir(&project).unwrap();
-    env.set_cockpit_config(&explicit);
 
     let redact = load_installation_extended_config().unwrap().redact;
     assert_eq!(redact.denylist, vec!["global-deny".to_string()]);
@@ -3646,13 +3646,101 @@ fn installation_extended_config_reads_only_the_global_layer() {
 }
 
 #[test]
+fn installation_extended_config_honors_the_explicit_override_like_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+    std::fs::write(
+        config_dir.join(crate::config::dirs::CONFIG_FILE),
+        r#"{"retention":{"transcript_window_days":1}}"#,
+    )
+    .unwrap();
+    let explicit = tmp.path().join("explicit.json");
+    std::fs::write(
+        &explicit,
+        r#"{"redact":{"denylist":["explicit-deny"]},"retention":{"transcript_window_days":0}}"#,
+    )
+    .unwrap();
+    env.set_cockpit_config(&explicit);
+
+    let installation = load_installation_extended_config().unwrap();
+    assert_eq!(
+        installation.redact.denylist,
+        vec!["explicit-deny".to_string()]
+    );
+    assert_eq!(installation.retention.transcript_window_days, 0);
+    assert_eq!(
+        crate::config::dirs::installation_config_file_paths().unwrap(),
+        crate::config::dirs::config_file_paths_for_load(tmp.path()),
+        "installation policy and sessions read the same explicit layer"
+    );
+
+    env.set_cockpit_config(std::path::Path::new("relative.json"));
+    assert!(
+        load_installation_extended_config().is_err(),
+        "a relative override would be resolved against the daemon cwd"
+    );
+}
+
+#[test]
 fn installation_extended_config_defaults_without_a_global_layer() {
     let tmp = TempDir::new().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let redact = load_installation_extended_config().unwrap().redact;
-    assert!(redact.denylist.is_empty());
-    assert!(redact.extra_dotenv_paths.is_empty());
-    assert_eq!(redact.dotenv_patterns, default_dotenv_patterns());
+    let installation = load_installation_extended_config().unwrap();
+    assert!(installation.redact.denylist.is_empty());
+    assert_eq!(
+        installation.redact.dotenv_patterns,
+        default_dotenv_patterns()
+    );
+    assert_eq!(
+        installation.retention,
+        cockpit_db::db::retention::RetentionConfig::default()
+    );
+}
+
+#[test]
+fn installation_extended_config_fails_closed_on_a_broken_global_layer() {
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+    let path = config_dir.join(crate::config::dirs::CONFIG_FILE);
+    for (label, body) in [
+        ("malformed JSON", r#"{"redact":{"denylist":["x"]"#),
+        ("non-object root", "[]"),
+        (
+            "wrong redact type",
+            r#"{"redact":{"denylist":"not-a-list"}}"#,
+        ),
+        ("unknown redact key", r#"{"redact":{"denyList":["typo"]}}"#),
+        (
+            "wrong retention type",
+            r#"{"retention":{"transcript_window_days":"never"}}"#,
+        ),
+        (
+            "relative global extra path",
+            r#"{"redact":{"extra_dotenv_paths":["rel.env"]}}"#,
+        ),
+    ] {
+        std::fs::write(&path, body).unwrap();
+        assert!(
+            load_installation_extended_config().is_err(),
+            "{label} must not silently weaken installation policy"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(&path, r#"{"redact":{"denylist":["x"]}}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read(&path).is_err();
+        let result = load_installation_extended_config();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Root bypasses file modes; the check is meaningful only when the
+        // file is actually unreadable to this process.
+        if unreadable {
+            assert!(result.is_err(), "an unreadable global layer is an error");
+        }
+    }
 }
 
 #[test]
@@ -3890,6 +3978,7 @@ fn doc_from_raw(raw: Value) -> ExtendedConfigDoc {
         path: PathBuf::from("<typed round-trip test>"),
         raw,
         origin: ConfigLayerOrigin::LocalTrusted,
+        path_base: None,
     }
 }
 
@@ -4120,6 +4209,7 @@ fn layer_doc(path: &str, raw: Value) -> ExtendedConfigDoc {
         path: PathBuf::from(path),
         raw,
         origin: ConfigLayerOrigin::LocalTrusted,
+        path_base: None,
     }
 }
 

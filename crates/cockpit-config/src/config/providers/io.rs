@@ -1891,6 +1891,7 @@ mod atomic_write_tests {
     fn retained_project_layer_cannot_replace_global_auth_command() {
         let snapshot = |origin, command: &str| crate::config::WorkspaceConfigLayerSnapshot {
             origin,
+            project_root: None,
             config_json: None,
             provider_files: vec![(
                 "custom".into(),

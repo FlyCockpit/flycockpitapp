@@ -70,7 +70,9 @@ impl StringListKind {
             StringListKind::ExtraDotenvPaths => {
                 "Explicit env-file paths scanned for secrets in addition to the \
                  glob patterns. Each file's format is auto-detected and its values \
-                 added to the redaction table."
+                 added to the redaction table. A relative path resolves against the \
+                 project root of the .cockpit layer that declares it; global config \
+                 accepts absolute paths only."
             }
             StringListKind::RedactDenylist => {
                 "Literal values that must ALWAYS be redacted, even if shorter than \

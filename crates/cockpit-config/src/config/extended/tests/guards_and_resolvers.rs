@@ -558,16 +558,21 @@ fn resolve_gitignore_allow_unions_layers_dedup() {
 fn resolve_redact_list_unions_layers_dedup_and_trim() {
     let tmp = TempDir::new().unwrap();
     let global = tmp.path().join("global.json");
-    let project = tmp.path().join("project.json");
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join(".cockpit")).unwrap();
+    let project = root.join(".cockpit/config.json");
+    let shared = tmp.path().join("shared/.env.ci");
+    let dup = root.join("dup.env");
     std::fs::write(
         &global,
-        r#"{
-                "redact": {
-                    "denylist": ["AKIA_HOME", "dup"],
-                    "allowlist": ["PATH", " HOME_ONLY "],
-                    "extra_dotenv_paths": ["../shared/.env.ci", "dup.env"]
-                }
-            }"#,
+        serde_json::json!({
+            "redact": {
+                "denylist": ["AKIA_HOME", "dup"],
+                "allowlist": ["PATH", " HOME_ONLY "],
+                "extra_dotenv_paths": [shared, dup]
+            }
+        })
+        .to_string(),
     )
     .unwrap();
     std::fs::write(
@@ -602,12 +607,94 @@ fn resolve_redact_list_unions_layers_dedup_and_trim() {
     );
     assert_eq!(
         merged.extra_dotenv_paths,
+        vec![shared, dup, root.join("project.env")],
+        "project-relative entries anchor at the declaring layer's root, then dedupe by path"
+    );
+}
+
+#[test]
+fn relative_extra_dotenv_paths_anchor_at_the_declaring_layer() {
+    let tmp = TempDir::new().unwrap();
+    let outer = tmp.path().join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(outer.join(".cockpit")).unwrap();
+    std::fs::create_dir_all(inner.join(".cockpit")).unwrap();
+    let global = tmp.path().join("global.json");
+    std::fs::write(
+        &global,
+        r#"{"redact":{"extra_dotenv_paths":["relative-in-global.env"]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        outer.join(".cockpit/config.json"),
+        r#"{"redact":{"extra_dotenv_paths":["secrets/outer.env", "../up.env"]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        inner.join(".cockpit/config.json"),
+        r#"{"redact":{"extra_dotenv_paths":["inner.env"]}}"#,
+    )
+    .unwrap();
+
+    let docs = load_existing_docs_from_paths(&[
+        global,
+        outer.join(".cockpit/config.json"),
+        inner.join(".cockpit/config.json"),
+    ]);
+    let mut warnings = Vec::new();
+    let merged = resolve_redact_list_unions_from_docs(&docs, &mut warnings);
+
+    assert_eq!(
+        merged.extra_dotenv_paths,
         vec![
-            PathBuf::from("../shared/.env.ci"),
-            PathBuf::from("dup.env"),
-            PathBuf::from("project.env"),
+            outer.join("secrets/outer.env"),
+            outer.join("../up.env"),
+            inner.join("inner.env"),
         ],
-        "relative paths are preserved verbatim and deduped by PathBuf equality"
+        "each relative entry anchors at its own layer, never a process cwd"
+    );
+    assert_eq!(
+        warnings,
+        vec![RELATIVE_EXTRA_DOTENV_PATH_WARNING.to_string()],
+        "a relative entry in a layer without a project root is rejected"
+    );
+}
+
+#[test]
+fn anchor_config_relative_path_rejects_rooted_and_prefixed_relative_paths() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    assert_eq!(
+        anchor_config_relative_path(Some(root), std::path::Path::new("a/.env")),
+        Some(root.join("a/.env"))
+    );
+    assert_eq!(
+        anchor_config_relative_path(None, std::path::Path::new("a/.env")),
+        None
+    );
+    assert_eq!(
+        anchor_config_relative_path(
+            Some(std::path::Path::new("relative-root")),
+            std::path::Path::new("a/.env")
+        ),
+        None,
+        "a non-absolute base never anchors"
+    );
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            anchor_config_relative_path(Some(root), std::path::Path::new(r"C:secrets.env")),
+            None
+        );
+        assert_eq!(
+            anchor_config_relative_path(Some(root), std::path::Path::new(r"\secrets.env")),
+            None
+        );
+    }
+    let absolute = root.join("abs.env");
+    assert_eq!(
+        anchor_config_relative_path(None, &absolute),
+        Some(absolute.clone())
     );
 }
 
@@ -642,7 +729,7 @@ fn load_for_cwd_unions_redact_lists_and_keeps_dotenv_patterns_replace() {
                 "redact": {
                     "denylist": ["home-secret"],
                     "allowlist": ["HOME_OK"],
-                    "extra_dotenv_paths": ["home.env"],
+                    "extra_dotenv_paths": ["/abs/home.env"],
                     "dotenv_patterns": [".env.home"]
                 }
             }"#,
@@ -675,7 +762,7 @@ fn load_for_cwd_unions_redact_lists_and_keeps_dotenv_patterns_replace() {
     );
     assert_eq!(
         cfg.redact.extra_dotenv_paths,
-        vec![PathBuf::from("home.env"), PathBuf::from("project.env")]
+        vec![PathBuf::from("/abs/home.env"), project.join("project.env")]
     );
     assert_eq!(
         cfg.redact.dotenv_patterns,

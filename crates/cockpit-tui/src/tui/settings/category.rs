@@ -1062,8 +1062,10 @@ impl SettingId {
             }
             SettingId::RedactExtraDotenvPaths => {
                 "Explicit extra env-file paths to scan in addition to whatever the \
-                 glob patterns match. Drill in to add, edit, reorder, or remove \
-                 paths."
+                 glob patterns match. Relative paths are resolved against the \
+                 project root of the .cockpit layer that declares them; global \
+                 config needs absolute paths. Drill in to add, edit, reorder, \
+                 or remove paths."
             }
             SettingId::RedactMinSecretLength => {
                 "Shortest value length that may be auto-added to the redaction \

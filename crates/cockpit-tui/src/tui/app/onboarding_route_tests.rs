@@ -286,3 +286,52 @@ fn welcome_fly_in_drives_the_animation_tick() {
         "reduced-motion welcome must not hold the animation tick"
     );
 }
+
+fn app_dragging_onboarding_scrollbar(tmp: &std::path::Path) -> App {
+    let mut app = App::new(Some(tmp), false);
+    let mut shell = crate::tui::onboarding::OnboardingShell::new(
+        &snapshot(cockpit_proto::OnboardingStage::Provider),
+        false,
+    );
+    let engine = crate::tui::settings::Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    crate::tui::golden::render_frame(80, 20, |frame| {
+        shell.render(frame, frame.area(), &engine, &mut links);
+    });
+    let scrollbar = shell.test_provider_scrollbar().expect("provider screen");
+    assert!(!scrollbar.is_empty(), "the 80x20 catalog must overflow");
+    let down = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: scrollbar.x,
+        row: scrollbar.y,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    };
+    let mut pointer_engine = crate::tui::settings::Dialog::None;
+    shell.handle_mouse(down, &mut pointer_engine);
+    assert!(shell.test_pointer_captured());
+    app.onboarding_shell = Some(Box::new(shell));
+    app
+}
+
+#[test]
+fn focus_loss_and_resize_end_onboarding_and_divider_pointer_captures() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+
+    for event in [
+        crossterm::event::Event::FocusLost,
+        crossterm::event::Event::Resize(100, 30),
+    ] {
+        let mut app = app_dragging_onboarding_scrollbar(tmp.path());
+        app.dragging_divider = true;
+        app.handle_terminal_event(event.clone());
+        assert!(
+            !app.onboarding_shell
+                .as_ref()
+                .unwrap()
+                .test_pointer_captured(),
+            "{event:?} must end the onboarding scrollbar drag"
+        );
+        assert!(!app.dragging_divider, "{event:?} must end the divider drag");
+    }
+}

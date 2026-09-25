@@ -909,7 +909,8 @@ fn settlement_trust_first_mouse_click_renders_selected_radio() {
 
     screen.phase = Phase::SidecarEgress;
     screen.draft.sidecar_route_index = Some(0);
-    screen.mouse_selected = None;
+    // No manual reset: the publisher-trust arm is keyed to its own phase
+    // and target, so it cannot pre-arm the sidecar row.
     render_buffer(&mut screen, 120, 40);
     let sidecar_egress = screen.list_row_rects[0];
     assert!(screen.handle_mouse(click_at(Position::new(sidecar_egress.x, sidecar_egress.y,))));
@@ -1314,4 +1315,98 @@ fn rendering_into_an_empty_area_clears_the_previous_rows() {
         "stale row toggled Auto-prune"
     );
     assert!(screen.list_row_rects.is_empty());
+}
+
+/// Model trust with two routes pending confirmation.
+fn two_pending_trust_screen() -> AgentAuthoringScreen {
+    let mut projection = sample_projection("two-pending");
+    projection.policy.routes[1].confirmation_required = true;
+    projection.policy.routes[1].trust = AgentPolicyTrustClassification::Unset;
+    let mut screen = AgentAuthoringScreen::new(projection, "two-pending".into());
+    screen.draft.route_grants[1].enabled = true;
+    screen.phase = Phase::ModelTrust;
+    assert_eq!(
+        screen.draft.pending_trust_route_indices(&screen.projection),
+        [0, 1]
+    );
+    screen
+}
+
+#[test]
+fn a_keyboard_confirm_consumes_the_armed_row_so_the_next_model_needs_two_clicks() {
+    let mut screen = two_pending_trust_screen();
+    render_buffer(&mut screen, 120, 40);
+    let first_row = screen.list_row_rects[0];
+    // Arm route 0 with a first click, then confirm it with Space.
+    screen.handle_mouse(click_at(Position::new(first_row.x, first_row.y)));
+    assert!(!screen.draft.trust_confirmations[0]);
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(screen.draft.trust_confirmations[0]);
+
+    // Route 1 now occupies row 0. Its first click must only arm it.
+    render_buffer(&mut screen, 120, 40);
+    let row = screen.list_row_rects[0];
+    screen.handle_mouse(click_at(Position::new(row.x, row.y)));
+    assert!(
+        !screen.draft.trust_confirmations[1],
+        "the next model inherited the consumed arm and confirmed on one click"
+    );
+    screen.handle_mouse(click_at(Position::new(row.x, row.y)));
+    assert!(screen.draft.trust_confirmations[1]);
+}
+
+#[test]
+fn an_armed_row_does_not_pass_to_the_model_that_takes_its_position() {
+    let mut screen = two_pending_trust_screen();
+    render_buffer(&mut screen, 120, 40);
+    let first_row = screen.list_row_rects[0];
+    // Arm route 0, then route 0 leaves the pending list by another path
+    // (its grant is disabled), so route 1 moves up to row 0.
+    screen.handle_mouse(click_at(Position::new(first_row.x, first_row.y)));
+    screen.draft.route_grants[0].enabled = false;
+    render_buffer(&mut screen, 120, 40);
+    let row = screen.list_row_rects[0];
+    screen.handle_mouse(click_at(Position::new(row.x, row.y)));
+    assert!(
+        !screen.draft.trust_confirmations[1],
+        "route 1 was confirmed by route 0's arm"
+    );
+}
+
+#[test]
+fn an_armed_row_does_not_survive_a_phase_change() {
+    let mut screen = two_pending_trust_screen();
+    render_buffer(&mut screen, 120, 40);
+    let first_row = screen.list_row_rects[0];
+    screen.handle_mouse(click_at(Position::new(first_row.x, first_row.y)));
+    // Leave and re-enter the trust phase.
+    screen.phase = Phase::ModelGrants;
+    render_buffer(&mut screen, 120, 40);
+    screen.phase = Phase::ThirdPartyTrust;
+    render_buffer(&mut screen, 120, 40);
+    let publisher = screen.list_row_rects[0];
+    screen.handle_mouse(click_at(Position::new(publisher.x, publisher.y)));
+    assert!(
+        !screen.draft.third_party_trust_confirmed,
+        "an arm from the model-trust phase confirmed publisher trust"
+    );
+}
+
+#[test]
+fn a_keyboard_confirm_clears_the_pending_arm_on_the_same_target() {
+    let mut screen = AgentAuthoringScreen::new(sample_projection("arm-clear"), "op".into());
+    screen.phase = Phase::ThirdPartyTrust;
+    render_buffer(&mut screen, 120, 40);
+    let row = screen.list_row_rects[0];
+    screen.handle_mouse(click_at(Position::new(row.x, row.y)));
+    // Confirm with Space, then withdraw it with Space.
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(screen.draft.third_party_trust_confirmed);
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(!screen.draft.third_party_trust_confirmed);
+    // The earlier click was consumed by the confirmation: one click only
+    // arms again, it does not confirm.
+    render_buffer(&mut screen, 120, 40);
+    screen.handle_mouse(click_at(Position::new(row.x, row.y)));
+    assert!(!screen.draft.third_party_trust_confirmed);
 }

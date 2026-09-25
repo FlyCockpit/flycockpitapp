@@ -84,6 +84,29 @@ enum SubagentsFocus {
     Edit,
 }
 
+/// What a first click armed on a two-click confirmation list. Keyed by the
+/// confirmed thing's identity — never its row position — so an armed row
+/// cannot pass to whichever target later occupies that row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmTarget {
+    ThirdPartyTrust,
+    SidecarEgress,
+    /// A pending trust confirmation, by its policy route index.
+    RouteTrust(usize),
+}
+
+/// A pending first click: the target, plus the phase and the subagent being
+/// edited when it was armed. It confirms only if the second click lands on
+/// the same target in the same phase and draft; it is cleared by any
+/// confirmation (click or keyboard) and is inert once its target leaves the
+/// list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArmedConfirmation {
+    phase: Phase,
+    child_path: Option<Vec<usize>>,
+    target: ConfirmTarget,
+}
+
 /// Saved parent context while a nested subagent draft is on the stack.
 #[derive(Debug, Clone)]
 struct SubagentStackFrame {
@@ -114,7 +137,7 @@ pub struct AgentAuthoringScreen {
     list_row_indices: Vec<usize>,
     model_picker_row_rects: Vec<Rect>,
     list_nav: ui::ListNav,
-    mouse_selected: Option<usize>,
+    armed: Option<ArmedConfirmation>,
     tool_model_picker: Option<usize>,
     tool_model_cursor: usize,
     /// The catalog is captured for the editor's lifetime. Production receives
@@ -159,7 +182,7 @@ impl AgentAuthoringScreen {
             list_row_indices: Vec::new(),
             model_picker_row_rects: Vec::new(),
             list_nav: ui::ListNav::new(),
-            mouse_selected: None,
+            armed: None,
             tool_model_picker: None,
             tool_model_cursor: 0,
             tool_catalog: tool_surface_catalog(),
@@ -772,13 +795,14 @@ impl AgentAuthoringScreen {
                     | Phase::SidecarEgress
                     | Phase::SubagentEdit(SubagentPhase::ModelTrust)
             ) {
-                if self.mouse_selected == Some(logical) {
-                    self.cursor = logical;
-                    self.toggle_selection();
-                    self.mouse_selected = None;
-                } else {
-                    self.cursor = logical;
-                    self.mouse_selected = Some(logical);
+                self.cursor = logical;
+                if let Some(target) = self.confirm_target_at(logical) {
+                    if self.is_armed(target) {
+                        // toggle_selection clears the arm.
+                        self.toggle_selection();
+                    } else {
+                        self.armed = Some(self.arm_key(target));
+                    }
                 }
             } else {
                 self.cursor = logical;
@@ -889,7 +913,44 @@ impl AgentAuthoringScreen {
         }
     }
 
+    /// The two-click confirmation target shown on `row` of the current list.
+    fn confirm_target_at(&self, row: usize) -> Option<ConfirmTarget> {
+        match self.phase {
+            Phase::ThirdPartyTrust if row == 0 => Some(ConfirmTarget::ThirdPartyTrust),
+            Phase::SidecarEgress if row == 0 => Some(ConfirmTarget::SidecarEgress),
+            Phase::ModelTrust => self
+                .draft
+                .pending_trust_route_indices(&self.projection)
+                .get(row)
+                .map(|index| ConfirmTarget::RouteTrust(*index)),
+            Phase::SubagentEdit(SubagentPhase::ModelTrust) => self
+                .current_child()
+                .map(|child| child.pending_trust_route_indices(&self.projection))
+                .and_then(|pending| pending.get(row).copied())
+                .map(ConfirmTarget::RouteTrust),
+            _ => None,
+        }
+    }
+
+    fn arm_key(&self, target: ConfirmTarget) -> ArmedConfirmation {
+        ArmedConfirmation {
+            phase: self.phase,
+            child_path: self
+                .subagent_stack
+                .last()
+                .map(|frame| frame.child_path.clone()),
+            target,
+        }
+    }
+
+    /// Whether `target` is armed in the current phase and draft.
+    fn is_armed(&self, target: ConfirmTarget) -> bool {
+        self.armed.as_ref() == Some(&self.arm_key(target))
+    }
+
     fn toggle_selection(&mut self) {
+        // Any confirmation, by click or keyboard, consumes a pending arm.
+        self.armed = None;
         match self.phase {
             Phase::SourceIdentity if self.cursor < self.projection.sources.len() => {
                 self.draft.source_selection = SourceSelection::Catalog;
@@ -2165,8 +2226,8 @@ impl AgentAuthoringScreen {
                 return lines;
             }
             Phase::ThirdPartyTrust => {
-                let marked =
-                    self.draft.third_party_trust_confirmed || self.mouse_selected == Some(0);
+                let marked = self.draft.third_party_trust_confirmed
+                    || self.is_armed(ConfirmTarget::ThirdPartyTrust);
                 lines.push((
                     Some(0),
                     Line::from(vec![
@@ -2193,7 +2254,8 @@ impl AgentAuthoringScreen {
                         )),
                     ));
                 }
-                let marked = self.draft.sidecar_egress_confirmed || self.mouse_selected == Some(0);
+                let marked = self.draft.sidecar_egress_confirmed
+                    || self.is_armed(ConfirmTarget::SidecarEgress);
                 lines.push((
                     Some(0),
                     Line::from(vec![
@@ -2263,7 +2325,7 @@ impl AgentAuthoringScreen {
                         .get(index)
                         .copied()
                         .unwrap_or(false);
-                    let marked = confirmed || self.mouse_selected == Some(row);
+                    let marked = confirmed || self.is_armed(ConfirmTarget::RouteTrust(index));
                     lines.push((
                         Some(row),
                         Line::from(vec![
@@ -2305,7 +2367,7 @@ impl AgentAuthoringScreen {
                             .get(index)
                             .copied()
                             .unwrap_or(false);
-                        let marked = confirmed || self.mouse_selected == Some(row);
+                        let marked = confirmed || self.is_armed(ConfirmTarget::RouteTrust(index));
                         lines.push((
                             Some(row),
                             Line::from(vec![

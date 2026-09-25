@@ -15,6 +15,24 @@ pub fn read_fixture(path: &Path) -> String {
     })
 }
 
+/// Builder for a fixture's same-directory staging file. tempfile stages
+/// private (0600) files by default; a fixture must keep the mode a plain write
+/// would give it (0666 masked by the umask). Windows has no mode bits to set,
+/// so the platform split lives here rather than as a cfg-gated mutation.
+#[cfg(unix)]
+fn fixture_staging_builder() -> tempfile::Builder<'static, 'static> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut builder = tempfile::Builder::new();
+    builder.permissions(std::fs::Permissions::from_mode(0o666));
+    builder
+}
+
+#[cfg(not(unix))]
+fn fixture_staging_builder() -> tempfile::Builder<'static, 'static> {
+    tempfile::Builder::new()
+}
+
 /// Replace a generated test fixture, creating its parent directory first.
 ///
 /// The replacement is atomic: the contents go to a temporary file in the
@@ -34,17 +52,11 @@ pub fn write_fixture(path: &Path, contents: &str) {
             parent.display()
         );
     });
-    // tempfile stages private (0600) files by default; a fixture must keep the
-    // mode a plain write would give it (0666 masked by the umask).
-    let mut builder = tempfile::Builder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
-    }
-    let mut staged = builder.tempfile_in(parent).unwrap_or_else(|error| {
-        panic!("stage test fixture {}: {error}", path.display());
-    });
+    let mut staged = fixture_staging_builder()
+        .tempfile_in(parent)
+        .unwrap_or_else(|error| {
+            panic!("stage test fixture {}: {error}", path.display());
+        });
     staged
         .write_all(contents.as_bytes())
         .unwrap_or_else(|error| {
@@ -402,8 +414,6 @@ pub fn workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::sync::Arc;
 
     #[test]
     fn write_fixture_replaces_contents_with_the_default_file_mode() {

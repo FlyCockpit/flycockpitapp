@@ -1562,6 +1562,30 @@ impl App {
         });
     }
 
+    /// The one funnel for ending every pointer interaction that must not
+    /// outlive a terminal resize or focus loss: link gestures, settings
+    /// hover/press transients, the pane-divider drag, onboarding's pointer
+    /// capture (and, on focus loss, its pointer position), and the chat
+    /// transcript's selection gesture.
+    pub(super) fn end_pointer_interactions(&mut self, end: PointerInteractionEnd) {
+        self.link_pointer_gesture.cancel();
+        self.link_registry.invalidate_pointer_generation();
+        self.pending_link_activation = None;
+        self.dialog.cancel_settings_pointer_transients();
+        self.dragging_divider = false;
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            match end {
+                PointerInteractionEnd::Resize => shell.handle_resize(),
+                PointerInteractionEnd::FocusLost => shell.handle_focus_lost(),
+            }
+        }
+        let reason = match end {
+            PointerInteractionEnd::Resize => MouseGestureInvalidation::ViewChange,
+            PointerInteractionEnd::FocusLost => MouseGestureInvalidation::Cancel,
+        };
+        self.invalidate_mouse_gesture(reason, self.event_loop_monotonic_now);
+    }
+
     pub(super) fn invalidate_mouse_gesture(
         &mut self,
         reason: MouseGestureInvalidation,

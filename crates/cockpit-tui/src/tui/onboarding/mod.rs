@@ -477,7 +477,6 @@ struct EscapeMenu {
     cursor: usize,
     choices: Vec<EscapeChoice>,
     row_rects: Vec<Rect>,
-    hover: Option<usize>,
 }
 
 impl EscapeMenu {
@@ -522,7 +521,6 @@ impl EscapeMenu {
             cursor: 0,
             choices,
             row_rects: Vec::new(),
-            hover: None,
         })
     }
 
@@ -545,11 +543,13 @@ impl EscapeMenu {
         let pos = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
-                self.hover = self
+                // Hover itself is derived at render from the pointer; a
+                // move over a row also moves the keyboard cursor there.
+                if let Some(index) = self
                     .row_rects
                     .iter()
-                    .position(|rect| chrome::hit(*rect, pos));
-                if let Some(index) = self.hover {
+                    .position(|rect| chrome::hit(*rect, pos))
+                {
                     self.cursor = index;
                 }
                 EscapeMenuPointer::Tracked
@@ -615,7 +615,10 @@ pub struct OnboardingShell {
     /// Hit area of the last-rendered list body; wheel events are gated on it.
     list_area: Rect,
     back_rect: Rect,
-    back_hover: bool,
+    /// Last known pointer position, from any mouse event (`None` before the
+    /// first one and after focus is lost). Hover is never stored: every
+    /// render derives it from this position against that frame's layout.
+    pointer: Option<Position>,
     actions: ActionBar,
 }
 
@@ -640,7 +643,7 @@ impl OnboardingShell {
             list_row_rects: Vec::new(),
             list_area: Rect::default(),
             back_rect: Rect::default(),
-            back_hover: false,
+            pointer: None,
             actions: ActionBar::default(),
         }
     }
@@ -693,6 +696,21 @@ impl OnboardingShell {
 
     pub(crate) fn screen_is_agent_authoring(&self) -> bool {
         matches!(self.screen, OnboardingScreen::AgentAuthoring(_))
+    }
+
+    /// Whether a pointer capture (the provider scrollbar drag) is live.
+    #[cfg(test)]
+    pub(crate) fn test_pointer_captured(&self) -> bool {
+        matches!(&self.screen, OnboardingScreen::ProviderSearch(screen) if screen.dragging_scrollbar())
+    }
+
+    /// The provider scrollbar rect of the last render, if any.
+    #[cfg(test)]
+    pub(crate) fn test_provider_scrollbar(&self) -> Option<Rect> {
+        match &self.screen {
+            OnboardingScreen::ProviderSearch(screen) => Some(screen.scrollbar_area()),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -1647,6 +1665,11 @@ impl OnboardingShell {
         // provider mutation makes Back/Defer/Cancel unofferable.
         let authority_pending = engine.has_unsettled_local_authority();
         self.escape = EscapeMenu::open(self.stage, authority_pending, self.completion_detour);
+        if self.escape.is_some() {
+            // The modal captures the pointer from here on (including the
+            // release of any gesture in progress), so end that gesture now.
+            self.cancel_pointer_capture();
+        }
     }
 
     /// Translate a confirmed escape-menu choice. Shell-local navigation
@@ -1671,6 +1694,7 @@ impl OnboardingShell {
         engine: &mut Dialog,
     ) -> PointerOutcome {
         let pos = Position::new(mouse.column, mouse.row);
+        self.pointer = Some(pos);
         if let Some(menu) = self.escape.as_mut() {
             return match menu.handle_mouse(mouse) {
                 EscapeMenuPointer::Chosen(choice) => {
@@ -1689,8 +1713,6 @@ impl OnboardingShell {
             };
         }
 
-        self.back_hover = chrome::hit(self.back_rect, pos);
-        self.actions.track(pos);
         match mouse.kind {
             MouseEventKind::Moved => PointerOutcome::consumed(),
             MouseEventKind::Down(MouseButton::Left) if chrome::hit(self.back_rect, pos) => {
@@ -2015,9 +2037,18 @@ impl OnboardingShell {
         // previous frame's rectangle clickable.
         self.clear_hit_geometry();
         if area.width == 0 || area.height == 0 {
+            // No layout at all: nothing a captured gesture could still act
+            // on exists, so the gesture ends here.
+            self.cancel_pointer_capture();
             return;
         }
         frame.render_widget(Clear, area);
+        // A modal owns the pointer: nothing behind it shows hover.
+        let chrome_pointer = if self.escape.is_some() {
+            None
+        } else {
+            self.pointer
+        };
 
         // Welcome is an edge-to-edge cinematic scene. Its own prompt is the
         // only action affordance, and this stage never paints a Back button.
@@ -2031,7 +2062,7 @@ impl OnboardingShell {
             )
             .render(frame, area);
             if let Some(menu) = self.escape.as_mut() {
-                Self::render_escape_menu(frame, area, menu);
+                Self::render_escape_menu(frame, area, menu, self.pointer);
             }
             return;
         }
@@ -2042,12 +2073,11 @@ impl OnboardingShell {
                 if matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice)
         );
         let back_enabled = self.back_enabled();
-        if !(back_visible && back_enabled) {
-            // The hovered target no longer exists in this layout.
-            self.back_hover = false;
-        }
+        let back_hovered = back_visible
+            && back_enabled
+            && chrome_pointer.is_some_and(|pos| chrome::hit(chrome::back_button_rect(area), pos));
         self.back_rect =
-            chrome::render_back_button(frame, area, back_visible, back_enabled, self.back_hover);
+            chrome::render_back_button(frame, area, back_visible, back_enabled, back_hovered);
 
         let col = ui::column(area);
         let ShellRows {
@@ -2124,9 +2154,9 @@ impl OnboardingShell {
             },
             self.help_text(),
         );
-        self.actions.render(frame, footer, &buttons);
+        self.actions.render(frame, footer, &buttons, chrome_pointer);
         if let Some(menu) = self.escape.as_mut() {
-            Self::render_escape_menu(frame, area, menu);
+            Self::render_escape_menu(frame, area, menu, self.pointer);
         }
     }
 
@@ -2134,12 +2164,15 @@ impl OnboardingShell {
     /// back button, action bar, list rows, and Escape menu rows, plus the
     /// active screen's own geometry.
     ///
-    /// Only per-frame geometry is cleared. Cross-frame interaction state —
-    /// action-bar and Escape-menu hover, the back button's hover, a provider
-    /// scrollbar drag, field focus, a pending double-click selection — is
-    /// kept, and is invalidated only where the new layout shows its target
-    /// is gone (see `ActionBar::render`, `set_scrollbar_area`, and the back
-    /// button below).
+    /// Only per-frame geometry is cleared. Interaction state is kept, and is
+    /// never positional:
+    /// - hover (action bar, back button, Escape menu rows) is not stored at
+    ///   all; each render derives it from [`Self::pointer`] against that
+    ///   frame's layout;
+    /// - a pointer capture (the provider scrollbar drag) survives redraws but
+    ///   ends at every gesture boundary — see [`Self::cancel_pointer_capture`];
+    /// - pending two-click confirmations are keyed by the target's identity
+    ///   (the agent screen's `ArmedConfirmation`), not a row index.
     fn clear_hit_geometry(&mut self) {
         self.back_rect = Rect::default();
         self.actions.clear_geometry();
@@ -2161,6 +2194,30 @@ impl OnboardingShell {
             | OnboardingScreen::Complete { .. }
             | OnboardingScreen::EmbeddedSettings => {}
         }
+    }
+
+    /// End any pointer capture in progress (the provider scrollbar drag).
+    /// Called at every boundary where the gesture's owner can no longer see
+    /// its release or its target: a modal opening, a frame with no layout,
+    /// a terminal resize, and focus loss. Switching screens drops the
+    /// capture with the screen.
+    pub(crate) fn cancel_pointer_capture(&mut self) {
+        if let OnboardingScreen::ProviderSearch(screen) = &mut self.screen {
+            screen.cancel_scrollbar_drag();
+        }
+    }
+
+    /// The terminal was resized: every captured gesture ends. The pointer
+    /// position is kept, so hover re-derives against the new layout.
+    pub(crate) fn handle_resize(&mut self) {
+        self.cancel_pointer_capture();
+    }
+
+    /// The terminal lost focus: every captured gesture ends and the pointer
+    /// position is unknown until the next mouse event, so nothing hovers.
+    pub(crate) fn handle_focus_lost(&mut self) {
+        self.cancel_pointer_capture();
+        self.pointer = None;
     }
 
     fn screen_title(&self) -> &'static str {
@@ -2522,7 +2579,12 @@ impl OnboardingShell {
         frame.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), inner);
     }
 
-    fn render_escape_menu(frame: &mut Frame, area: Rect, menu: &mut EscapeMenu) {
+    fn render_escape_menu(
+        frame: &mut Frame,
+        area: Rect,
+        menu: &mut EscapeMenu,
+        pointer: Option<Position>,
+    ) {
         let width = 48.min(area.width.saturating_sub(4));
         let height = (menu.choices.len() as u16 + 4)
             .min(area.height.saturating_sub(2))
@@ -2571,7 +2633,13 @@ impl OnboardingShell {
                 break;
             }
             let selected = index == menu.cursor;
-            let hovered = menu.hover == Some(index);
+            let row = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            let hovered = pointer.is_some_and(|pos| chrome::hit(row, pos));
             let mut style = if selected {
                 Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
             } else {

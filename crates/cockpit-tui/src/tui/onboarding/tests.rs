@@ -1059,34 +1059,246 @@ fn provider_scrollbar_drag_survives_redraws_between_pointer_events() {
     assert!(offset(&shell) > at_middle, "the viewport keeps moving");
 }
 
-#[test]
-fn shrinking_the_secure_store_leaves_no_stale_choice_rows() {
-    // Shell-routed class guard for a non-agent screen: after a shrink, the
-    // position of a choice row that moved away must not act. At 80x24 the
-    // machine-bound row sits on row 8; at 80x8 that is the bottom margin
-    // (content is rows 4-5, the footer row 6).
+fn available_secure_store_shell() -> OnboardingShell {
     let mut secure = snapshot(OnboardingStage::SecureStore);
     secure.host_capabilities =
         secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
-    let mut shell = OnboardingShell::new(&secure, false);
+    OnboardingShell::new(&secure, false)
+}
+
+fn render_zero_area(shell: &mut OnboardingShell) {
+    let engine = Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    crate::tui::golden::render_frame(80, 24, |frame| {
+        let area = frame.area();
+        shell.render(frame, Rect { height: 0, ..area }, &engine, &mut links);
+    });
+}
+
+#[test]
+fn a_frame_with_no_layout_leaves_no_stale_choice_rows() {
+    // Only the shell's own clear protects this path: a zero-area frame
+    // returns before any screen renderer runs, so no renderer re-clears.
+    let mut shell = available_secure_store_shell();
     let mut engine = Dialog::None;
     render_string(&mut shell, 80, 24, &engine);
-    let stale = shell.list_row_rects[2];
-    assert_eq!(stale.y, 8, "{:?}", shell.list_row_rects);
-    render_string(&mut shell, 80, 8, &engine);
+    let machine = shell.list_row_rects[2];
+    assert!(!machine.is_empty(), "{:?}", shell.list_row_rects);
+    render_zero_area(&mut shell);
     assert!(
-        !shell
-            .list_row_rects
-            .iter()
-            .any(|rect| rect.contains(Position::new(stale.x + 2, stale.y))),
+        shell.list_row_rects.is_empty(),
         "{:?}",
         shell.list_row_rects
     );
     let before = shell.test_secure_store_cursor_placement();
-    let outcome = shell.handle_mouse(click(stale.x + 2, stale.y), &mut engine);
-    // A stale hit would move the cursor to the machine-bound row.
+    let outcome = shell.handle_mouse(click(machine.x + 2, machine.y), &mut engine);
     assert!(outcome.action.is_none());
-    assert_eq!(shell.test_secure_store_cursor_placement(), before);
+    assert_eq!(
+        shell.test_secure_store_cursor_placement(),
+        before,
+        "a stale row moved the cursor"
+    );
+}
+
+#[test]
+fn action_bar_hover_follows_the_pointer_not_the_button_index_across_a_resize() {
+    let mut shell = available_secure_store_shell();
+    let mut engine = Dialog::None;
+    let narrow = render_buffer(&mut shell, 80, 24);
+    let button = find_text(&narrow, "[ Continue ]");
+    let pointer = Position::new(button.x + 2, button.y);
+    shell.handle_mouse(moved(pointer.x, pointer.y), &mut engine);
+    let hovered = render_buffer(&mut shell, 80, 24);
+    assert_ne!(
+        hovered[(pointer.x, pointer.y)].bg,
+        ratatui::style::Color::Reset
+    );
+
+    // Wider terminal: the right-aligned button moves away from the pointer.
+    let wide = render_buffer(&mut shell, 100, 24);
+    let moved_button = find_text(&wide, "[ Continue ]");
+    assert_ne!(moved_button, button, "the resize must move the button");
+    for x in moved_button.x..moved_button.x + 12 {
+        assert_eq!(
+            wide[(x, moved_button.y)].bg,
+            ratatui::style::Color::Reset,
+            "hover must not follow the button away from the pointer"
+        );
+    }
+    assert_eq!(
+        wide[(pointer.x, pointer.y)].bg,
+        ratatui::style::Color::Reset
+    );
+}
+
+#[test]
+fn back_hover_is_owned_by_the_escape_menu_while_it_is_open() {
+    let mut shell = shell_at(OnboardingStage::Profile);
+    let mut engine = Dialog::None;
+    let idle = render_buffer(&mut shell, 80, 24);
+    let back = find_text(&idle, "‹ Back");
+    shell.handle_mouse(moved(back.x, back.y), &mut engine);
+    let hovered = render_buffer(&mut shell, 80, 24);
+    assert_ne!(hovered[(back.x, back.y)].bg, ratatui::style::Color::Reset);
+
+    // The modal owns the pointer: the chrome behind it shows no hover.
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let under_menu = render_buffer(&mut shell, 80, 24);
+    assert!(render_string(&mut shell, 80, 24, &engine).contains("Leave setup?"));
+    assert_eq!(
+        under_menu[(back.x, back.y)].bg,
+        ratatui::style::Color::Reset
+    );
+
+    // The pointer moves while the menu has it, then the menu closes: hover
+    // re-derives from where the pointer is now, not where it was.
+    shell.handle_mouse(moved(40, 20), &mut engine);
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let closed = render_buffer(&mut shell, 80, 24);
+    assert!(!render_string(&mut shell, 80, 24, &engine).contains("Leave setup?"));
+    assert_eq!(closed[(back.x, back.y)].bg, ratatui::style::Color::Reset);
+}
+
+fn search_screen(shell: &OnboardingShell) -> &ProviderSearchScreen {
+    match &shell.screen {
+        OnboardingScreen::ProviderSearch(screen) => screen,
+        _other => panic!("expected search screen"),
+    }
+}
+
+/// A provider shell at 80x20 with a scrollbar drag in progress.
+fn dragging_provider_shell() -> (OnboardingShell, Rect) {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 20, &engine);
+    let scrollbar = search_screen(&shell).scrollbar_area();
+    assert!(scrollbar.height >= 3, "{scrollbar:?}");
+    assert!(
+        shell
+            .handle_mouse(click(scrollbar.x, scrollbar.y), &mut engine)
+            .consumed
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    assert!(search_screen(&shell).dragging_scrollbar());
+    (shell, scrollbar)
+}
+
+#[test]
+fn a_selected_provider_does_not_snap_a_dragged_viewport_back() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 20, &engine);
+    // Select the first provider with a click on its row.
+    let first = shell.list_row_rects[0];
+    shell.handle_mouse(click(first.x + 3, first.y), &mut engine);
+    render_string(&mut shell, 80, 20, &engine);
+    assert_eq!(search_screen(&shell).cursor(), 0);
+
+    let scrollbar = search_screen(&shell).scrollbar_area();
+    assert!(
+        shell
+            .handle_mouse(click(scrollbar.x, scrollbar.y), &mut engine)
+            .consumed
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    let middle = scrollbar.y + scrollbar.height / 2;
+    assert!(
+        shell
+            .handle_mouse(drag_left(scrollbar.x, middle), &mut engine)
+            .consumed
+    );
+    let at_middle = search_screen(&shell).offset();
+    assert!(at_middle > 0);
+    render_string(&mut shell, 80, 20, &engine);
+    assert_eq!(
+        search_screen(&shell).offset(),
+        at_middle,
+        "a redraw snapped the dragged viewport back to the selected provider"
+    );
+    let bottom = scrollbar.bottom() - 1;
+    assert!(
+        shell
+            .handle_mouse(drag_left(scrollbar.x, bottom), &mut engine)
+            .consumed
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    assert!(search_screen(&shell).offset() > at_middle);
+
+    // The wheel sticks too.
+    let offset = search_screen(&shell).offset();
+    shell.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: first.x + 3,
+            row: first.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut engine,
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    assert_eq!(search_screen(&shell).offset(), offset - 1);
+
+    // A cursor move brings the viewport back to the cursor.
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    render_string(&mut shell, 80, 20, &engine);
+    assert!(search_screen(&shell).offset() <= search_screen(&shell).cursor());
+}
+
+#[test]
+fn opening_the_escape_menu_ends_a_scrollbar_drag() {
+    let (mut shell, scrollbar) = dragging_provider_shell();
+    let mut engine = Dialog::None;
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    assert!(!search_screen(&shell).dragging_scrollbar());
+    // The release the menu swallows, then dismissing the menu, leave no
+    // latched drag that a later unrelated drag could drive.
+    shell.handle_mouse(release_left(scrollbar.x, scrollbar.y), &mut engine);
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    render_string(&mut shell, 80, 20, &engine);
+    let offset = search_screen(&shell).offset();
+    let later = shell.handle_mouse(drag_left(scrollbar.x, scrollbar.bottom() - 1), &mut engine);
+    assert!(!later.consumed);
+    assert_eq!(search_screen(&shell).offset(), offset);
+}
+
+#[test]
+fn a_changed_scrollbar_rect_ends_a_scrollbar_drag() {
+    let (mut shell, _) = dragging_provider_shell();
+    render_string(&mut shell, 80, 22, &Dialog::None);
+    assert!(!search_screen(&shell).dragging_scrollbar());
+}
+
+#[test]
+fn a_frame_with_no_layout_ends_a_scrollbar_drag() {
+    let (mut shell, _) = dragging_provider_shell();
+    render_zero_area(&mut shell);
+    assert!(!search_screen(&shell).dragging_scrollbar());
+}
+
+#[test]
+fn resize_and_focus_loss_end_a_scrollbar_drag() {
+    let (mut shell, _) = dragging_provider_shell();
+    shell.handle_resize();
+    assert!(!search_screen(&shell).dragging_scrollbar());
+
+    let (mut shell, _) = dragging_provider_shell();
+    shell.handle_focus_lost();
+    assert!(!search_screen(&shell).dragging_scrollbar());
+}
+
+#[test]
+fn focus_loss_forgets_the_pointer_so_nothing_hovers() {
+    let mut shell = available_secure_store_shell();
+    let mut engine = Dialog::None;
+    let idle = render_buffer(&mut shell, 80, 24);
+    let button = find_text(&idle, "[ Continue ]");
+    shell.handle_mouse(moved(button.x + 2, button.y), &mut engine);
+    shell.handle_focus_lost();
+    let after = render_buffer(&mut shell, 80, 24);
+    assert_eq!(
+        after[(button.x + 2, button.y)].bg,
+        ratatui::style::Color::Reset
+    );
 }
 
 #[test]

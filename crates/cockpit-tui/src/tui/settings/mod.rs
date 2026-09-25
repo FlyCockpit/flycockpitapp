@@ -5807,6 +5807,7 @@ impl Dialog {
             *settings.pointer_surface.hover.borrow_mut() = None;
             settings.pointer_surface.header_hover.set(None);
             *settings.pointer_surface.pressed.borrow_mut() = None;
+            settings.cx.pointer_surface.help_row_pointer.set(None);
             settings.page.cancel_pointer_transients();
         }
     }
@@ -8414,11 +8415,10 @@ impl SettingsDialog {
                     .buttons
                     .borrow_mut()
                     .handle_mouse(mouse);
-                let help_hover = self.cx.pointer_surface.help_row_action_at(Position {
+                self.cx.pointer_surface.help_row_pointer.set(Some(Position {
                     x: mouse.column,
                     y: mouse.row,
-                });
-                self.cx.pointer_surface.help_row_hover.set(help_hover);
+                }));
                 let action = match button_outcome {
                     Some(_) => self
                         .pointer_surface
@@ -8760,11 +8760,8 @@ impl SettingsDialog {
         } else {
             self.page.help_text(&self.cx).to_string()
         };
-        help_row.hover = self.cx.pointer_surface.help_row_hover.get();
+        help_row.pointer = self.cx.pointer_surface.help_row_pointer.get();
         let help_action_rects = shell::render_settings_help_row(frame, layout[2], &help, &help_row);
-        self.cx
-            .pointer_surface
-            .set_help_row_action_rects(help_action_rects.clone());
         if self.pointer_surface.enabled.get() {
             for (index, (rect, action)) in help_action_rects
                 .into_iter()

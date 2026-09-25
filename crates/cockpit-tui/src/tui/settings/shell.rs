@@ -129,7 +129,9 @@ pub(super) struct SettingsHelpAction<'a> {
 
 pub(super) struct SettingsHelpRow<'a> {
     pub actions: Vec<SettingsHelpAction<'a>>,
-    pub hover: Option<usize>,
+    /// Last known pointer position. Hover is derived from it against the
+    /// row's layout at render, never stored as a button index.
+    pub pointer: Option<ratatui::layout::Position>,
     disabled_reasons: Vec<Option<&'static str>>,
 }
 
@@ -140,7 +142,7 @@ pub(super) fn finish_help_row<'a>(
     SettingsHelpRow {
         disabled_reasons: vec![None; actions.len()],
         actions,
-        hover: cx.pointer_surface.help_row_hover.get(),
+        pointer: cx.pointer_surface.help_row_pointer.get(),
     }
 }
 
@@ -211,7 +213,12 @@ pub(super) fn render_settings_help_row(
     if buttons.is_empty() {
         Vec::new()
     } else {
-        crate::tui::chrome::render_action_bar(frame, area, &buttons, row.hover)
+        let layout = crate::tui::chrome::action_bar_layout(area, &buttons);
+        let hover = row
+            .pointer
+            .and_then(|pos| crate::tui::chrome::action_button_at(&layout, pos))
+            .filter(|index| buttons[*index].enabled);
+        crate::tui::chrome::render_action_bar(frame, area, &buttons, hover)
     }
 }
 
@@ -334,8 +341,9 @@ pub(super) struct SettingsPointerSurface {
     pub buttons: RefCell<ButtonRegistry>,
     pub rows: RefCell<RowControlRegistry>,
     pub surface_generation: std::cell::Cell<u64>,
-    pub help_row_hover: std::cell::Cell<Option<usize>>,
-    help_row_action_rects: RefCell<Vec<Rect>>,
+    /// Last pointer position seen over the settings surface; the help row
+    /// derives its hover from it each frame.
+    pub help_row_pointer: std::cell::Cell<Option<ratatui::layout::Position>>,
 }
 
 impl Default for SettingsPointerSurface {
@@ -352,19 +360,8 @@ impl Default for SettingsPointerSurface {
             buttons: RefCell::new(ButtonRegistry::default()),
             rows: RefCell::new(RowControlRegistry::default()),
             surface_generation: std::cell::Cell::new(0),
-            help_row_hover: std::cell::Cell::new(None),
-            help_row_action_rects: RefCell::new(Vec::new()),
+            help_row_pointer: std::cell::Cell::new(None),
         }
-    }
-}
-
-impl SettingsPointerSurface {
-    pub(super) fn set_help_row_action_rects(&self, rects: Vec<Rect>) {
-        *self.help_row_action_rects.borrow_mut() = rects;
-    }
-
-    pub(super) fn help_row_action_at(&self, pos: ratatui::layout::Position) -> Option<usize> {
-        crate::tui::chrome::action_button_at(&self.help_row_action_rects.borrow(), pos)
     }
 }
 
@@ -820,6 +817,46 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn help_row_hover_cells(width: u16, pointer: Option<ratatui::layout::Position>) -> Vec<u16> {
+        let row = SettingsHelpRow {
+            actions: vec![SettingsHelpAction {
+                label: "Save",
+                enabled: true,
+                primary: true,
+                action: super::super::pointer_actions::SettingsPointerAction::Root(
+                    super::super::pointer_actions::RootAction::Open(
+                        super::super::pointer_actions::RootNodeId::Interface,
+                    ),
+                ),
+            }],
+            pointer,
+            disabled_reasons: vec![None],
+        };
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_settings_help_row(frame, frame.area(), "help", &row);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width)
+            .filter(|x| buffer[(*x, 0)].bg != ratatui::style::Color::Reset)
+            .collect()
+    }
+
+    #[test]
+    fn help_row_hover_is_derived_from_the_pointer_against_this_frames_layout() {
+        // "[ Save ]" is right-aligned: x 32..40 in a 40-cell row.
+        let over_save = ratatui::layout::Position::new(34, 0);
+        assert_eq!(
+            help_row_hover_cells(40, Some(over_save)),
+            (32..40).collect::<Vec<_>>()
+        );
+        // Wider row: the button moved away from the unchanged pointer.
+        assert!(help_row_hover_cells(60, Some(over_save)).is_empty());
+        assert!(help_row_hover_cells(40, None).is_empty());
+    }
 
     #[test]
     fn settings_text_columns_reserves_two_cell_gutter() {

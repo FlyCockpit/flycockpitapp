@@ -3506,6 +3506,13 @@ pub(super) struct SelectionSpan {
     pub end_col: u16,
 }
 
+/// Why [`App::end_pointer_interactions`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PointerInteractionEnd {
+    Resize,
+    FocusLost,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MouseGestureInvalidation {
     Cancel,
@@ -4919,14 +4926,11 @@ impl App {
                 false
             }
             Event::Resize(_, _) => {
-                self.link_pointer_gesture.cancel();
-                self.link_registry.invalidate_pointer_generation();
-                self.pending_link_activation = None;
-                self.dialog.cancel_settings_pointer_transients();
-                self.invalidate_mouse_gesture(
-                    MouseGestureInvalidation::ViewChange,
-                    self.event_loop_monotonic_now,
-                );
+                self.end_pointer_interactions(PointerInteractionEnd::Resize);
+                false
+            }
+            Event::FocusLost => {
+                self.end_pointer_interactions(PointerInteractionEnd::FocusLost);
                 false
             }
             _ => false,

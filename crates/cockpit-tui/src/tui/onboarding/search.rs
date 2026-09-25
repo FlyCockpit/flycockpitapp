@@ -71,9 +71,19 @@ pub(crate) struct ProviderSearchScreen {
     /// Row capacity observed at the last render; used to clamp scrolling
     /// whenever the list or the terminal size changes.
     viewport_capacity: usize,
+    /// Whether the viewport tracks the cursor. Set by every cursor move
+    /// (keyboard, pointer selection, query re-anchor); cleared when the user
+    /// scrolls the viewport directly (wheel, scrollbar drag), so a redraw
+    /// never snaps a manually scrolled viewport back to the cursor.
+    follow_cursor: bool,
     status: Option<String>,
+    /// Per-frame geometry: the scrollbar rect of the last render.
     scrollbar_area: Rect,
-    dragging_scrollbar: bool,
+    /// The pointer capture of an in-progress scrollbar drag, anchored to the
+    /// scrollbar rect it started on. It survives redraws of that same rect
+    /// and ends on release, on any change of the rect (resize, relayout,
+    /// no scrollbar), or when the shell cancels the capture.
+    scrollbar_drag: Option<Rect>,
 }
 
 impl ProviderSearchScreen {
@@ -84,9 +94,10 @@ impl ProviderSearchScreen {
             selection_started: false,
             offset: 0,
             viewport_capacity: 0,
+            follow_cursor: false,
             status: None,
             scrollbar_area: Rect::default(),
-            dragging_scrollbar: false,
+            scrollbar_drag: None,
         }
     }
 
@@ -134,6 +145,12 @@ impl ProviderSearchScreen {
     /// [`Self::remap_selection`] instead: an index clamp alone can move the
     /// cursor onto a *different* template when the list shrinks around it.
     fn clamp(&mut self) {
+        self.follow_cursor = true;
+        self.follow();
+    }
+
+    /// Bound cursor and viewport, then bring the cursor into view.
+    fn follow(&mut self) {
         let len = self.filtered().len();
         self.cursor = self.cursor.min(len.saturating_sub(1));
         let capacity = self.viewport_capacity.max(1);
@@ -249,24 +266,26 @@ impl ProviderSearchScreen {
                     .scrollbar_area
                     .contains((mouse.column, mouse.row).into()) =>
             {
-                self.dragging_scrollbar = true;
+                self.scrollbar_drag = Some(self.scrollbar_area);
                 self.drag_scrollbar(mouse.row);
                 None
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging_scrollbar => {
+            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_drag.is_some() => {
                 self.drag_scrollbar(mouse.row);
                 None
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                self.dragging_scrollbar = false;
+                self.scrollbar_drag = None;
                 None
             }
             MouseEventKind::ScrollUp => {
+                self.follow_cursor = false;
                 self.offset = self.offset.saturating_sub(1);
                 self.clamp_viewport();
                 None
             }
             MouseEventKind::ScrollDown => {
+                self.follow_cursor = false;
                 let len = self.filtered().len();
                 let capacity = self.viewport_capacity.max(1);
                 let max_offset = len.saturating_sub(capacity);
@@ -286,6 +305,7 @@ impl ProviderSearchScreen {
                     self.activate(self.selected_template())
                 } else {
                     self.cursor = next;
+                    self.follow_cursor = true;
                     self.selection_started = true;
                     self.status = None;
                     None
@@ -296,6 +316,7 @@ impl ProviderSearchScreen {
     }
 
     fn drag_scrollbar(&mut self, row: u16) {
+        self.follow_cursor = false;
         let len = self.filtered().len();
         let capacity = self.viewport_capacity.max(1);
         let max_offset = len.saturating_sub(capacity);
@@ -311,22 +332,31 @@ impl ProviderSearchScreen {
     }
 
     /// Forget the previous frame's scrollbar rectangle. An in-progress drag
-    /// is interaction state and survives; it is cancelled only when the next
-    /// layout has no scrollbar ([`Self::set_scrollbar_area`] with an empty
-    /// area) or the button is released.
+    /// is interaction state and survives the clear; the next
+    /// [`Self::set_scrollbar_area`] decides whether it still applies.
     pub(crate) fn clear_hit_geometry(&mut self) {
         self.scrollbar_area = Rect::default();
     }
 
+    /// Record this frame's scrollbar rect. A drag continues only while the
+    /// scrollbar it started on is laid out unchanged; any other rect (none,
+    /// resized, moved) ends it.
     pub(crate) fn set_scrollbar_area(&mut self, area: Rect) {
         self.scrollbar_area = area;
-        if area.is_empty() {
-            self.dragging_scrollbar = false;
+        if self.scrollbar_drag.is_some_and(|anchor| anchor != area) {
+            self.scrollbar_drag = None;
         }
     }
 
+    /// End an in-progress scrollbar drag (the shell calls this at gesture
+    /// boundaries it owns: a modal opening, a frame with no layout, resize,
+    /// focus loss).
+    pub(crate) fn cancel_scrollbar_drag(&mut self) {
+        self.scrollbar_drag = None;
+    }
+
     pub(crate) fn dragging_scrollbar(&self) -> bool {
-        self.dragging_scrollbar
+        self.scrollbar_drag.is_some()
     }
 
     #[cfg(test)]
@@ -375,7 +405,13 @@ impl ProviderSearchScreen {
     /// live terminal size (resize-safe).
     pub(crate) fn observe_viewport(&mut self, capacity: usize) {
         self.viewport_capacity = capacity;
-        self.clamp();
+        // A redraw only bounds the viewport; it follows the cursor only while
+        // the last viewport change came from a cursor move.
+        if self.follow_cursor {
+            self.follow();
+        } else {
+            self.clamp_viewport();
+        }
     }
 
     /// Rows to render for `capacity` visible rows.

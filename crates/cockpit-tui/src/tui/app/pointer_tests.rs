@@ -558,21 +558,35 @@ fn a_session_switch_chord_goes_to_the_context_menu_on_top() {
 
 #[test]
 fn paste_under_a_floating_layer_reaches_nothing_below_it() {
+    // Through the production intake (`handle_observed_terminal_event`), for
+    // every floating layer: the paste reaches neither the composer nor any
+    // other sink underneath.
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    for daemon_prompt in [false, true] {
+    for layer in Layer::ALL.into_iter().filter(|layer| layer.is_floating()) {
         let mut app = chat_app(tmp.path());
-        if daemon_prompt {
-            app.open_daemon_restart_prompt();
-        } else {
-            open_floating(&mut app, Layer::RulesReview);
-        }
-        let before = app.composer.text().to_string();
-        app.handle_paste("pasted text".to_string());
+        open_layer(&mut app, layer);
+        assert_eq!(app.top_layer(), layer);
+        let at = std::time::Duration::from_secs(10);
+        app.event_loop_monotonic_now = at;
+        let _ = app.handle_observed_terminal_event(
+            crossterm::event::Event::Paste("pasted text".to_string()),
+            at,
+            1,
+            None,
+            None,
+        );
+        let flush = at + std::time::Duration::from_millis(50);
+        let decision = app.terminal_paste_classifier.flush_due(flush);
+        let _ = app.apply_terminal_paste_decision(decision);
         assert_eq!(
             app.composer.text(),
-            before,
-            "daemon_prompt={daemon_prompt}: the paste reached the composer"
+            "",
+            "{layer:?}: the paste reached the composer"
+        );
+        assert!(
+            app.pending_paste_probes.is_empty(),
+            "{layer:?}: a paste probe started"
         );
     }
 }
@@ -888,4 +902,369 @@ fn settings_confirmations_drop_only_when_settings_loses_the_input() {
     app.keys_overlay = Some(KeysOverlay::open(KeyContext::Composer));
     draw(&mut app, 120, 50);
     assert!(!app.dialog.test_tools_delete_pending());
+
+    // A resize voids the pointer's coordinates: it drops an armed
+    // confirmation even when the keyboard armed it (fail-safe; an arm does
+    // not record which device armed it).
+    app.keys_overlay = None;
+    draw(&mut app, 120, 50);
+    app.dialog.test_arm_tools_delete("mytool");
+    app.end_pointer_interactions(super::PointerInteractionEnd::Resize);
+    assert!(!app.dialog.test_tools_delete_pending());
+}
+
+// ── Keys through the production intake ─────────────────────────────────
+
+/// Put `layer` on top of a chat app. Exhaustive, so a new layer must say how
+/// it opens before the intake matrix compiles.
+fn open_layer(app: &mut App, layer: Layer) {
+    match layer {
+        Layer::DaemonRestartPrompt => app.open_daemon_restart_prompt(),
+        Layer::KeysOverlay | Layer::ContextMenu | Layer::RulesReview | Layer::PinsReview => {
+            open_floating(app, layer)
+        }
+        Layer::WorkspaceTrust => {
+            app.dialog = Dialog::open_workspace_trust(cockpit_config::trust::TrustRoot {
+                opened_path: std::path::PathBuf::from("/project"),
+                root: std::path::PathBuf::from("/project"),
+                kind: cockpit_config::trust::TrustRootKind::Directory,
+            });
+        }
+        Layer::Onboarding => mount_onboarding(app, cockpit_proto::OnboardingStage::Welcome),
+        Layer::Surface => {}
+    }
+}
+
+/// Type `keys` as a real terminal delivers a fast burst: each through
+/// `handle_observed_terminal_event` 1 ms apart, then the classifier's idle
+/// flush as the event loop's paste-wait arm runs it.
+fn typed_burst(app: &mut App, keys: &[KeyCode]) -> bool {
+    let start = std::time::Duration::from_secs(10);
+    let mut exit = false;
+    for (index, code) in keys.iter().enumerate() {
+        let at = start + std::time::Duration::from_millis(index as u64);
+        app.event_loop_monotonic_now = at;
+        exit |= app.handle_observed_terminal_event(
+            crossterm::event::Event::Key(key(*code)),
+            at,
+            1,
+            None,
+            None,
+        );
+    }
+    let flush = start + std::time::Duration::from_millis(keys.len() as u64 + 50);
+    app.event_loop_monotonic_now = flush;
+    let decision = app.terminal_paste_classifier.flush_due(flush);
+    exit |= app.apply_terminal_paste_decision(decision);
+    exit
+}
+
+#[test]
+fn a_typing_burst_reaches_the_layer_on_top_never_a_hidden_composer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for layer in Layer::ALL {
+        let mut app = chat_app(tmp.path());
+        open_layer(&mut app, layer);
+        assert_eq!(app.top_layer(), layer, "{layer:?} is on top");
+        assert_eq!(
+            app.structured_paste_composer_eligible(),
+            layer == Layer::Surface,
+            "{layer:?}: only the surface's composer may intake-buffer keys"
+        );
+        // Keys the layer itself handles, typed fast enough to be buffered as
+        // a rapid-paste candidate when the composer is eligible.
+        let keys: &[KeyCode] = match layer {
+            Layer::DaemonRestartPrompt => &[KeyCode::Tab, KeyCode::Enter],
+            Layer::KeysOverlay => &[KeyCode::Char('j'), KeyCode::Char('q')],
+            Layer::ContextMenu => &[KeyCode::Char('j')],
+            Layer::RulesReview | Layer::PinsReview => &[KeyCode::Char('j'), KeyCode::Enter],
+            Layer::WorkspaceTrust | Layer::Onboarding | Layer::Surface => {
+                &[KeyCode::Char('x'), KeyCode::Char('y')]
+            }
+        };
+        typed_burst(&mut app, keys);
+        if layer == Layer::Surface {
+            assert_eq!(app.composer.text(), "xy", "the surface composer types");
+            continue;
+        }
+        assert_eq!(
+            app.composer.text(),
+            "",
+            "{layer:?}: typed into the hidden composer"
+        );
+        match layer {
+            // Tab moved the focus to Quit; Enter activated it.
+            Layer::DaemonRestartPrompt => assert!(app.exit_requested, "Tab+Enter must quit"),
+            Layer::KeysOverlay => assert!(app.keys_overlay.is_none(), "`q` must close it"),
+            Layer::ContextMenu => {
+                assert_eq!(app.context_menu.as_ref().map(|menu| menu.cursor), Some(1));
+            }
+            Layer::RulesReview => assert!(app.rules_review.is_some()),
+            Layer::PinsReview => assert!(app.pins_review.is_some()),
+            Layer::WorkspaceTrust => assert_eq!(app.base_layer(), Layer::WorkspaceTrust),
+            Layer::Onboarding => assert!(app.onboarding_shell.is_some()),
+            Layer::Surface => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn the_daemon_prompt_restart_key_reaches_the_prompt_through_the_intake() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = chat_app(tmp.path());
+    app.apply_event(TurnEvent::DaemonRestartPrompt);
+    assert_eq!(app.top_layer(), Layer::DaemonRestartPrompt);
+    typed_burst(&mut app, &[KeyCode::Char('r')]);
+    assert_eq!(
+        app.composer.text(),
+        "",
+        "`r` was typed into the hidden composer"
+    );
+    // No runner in this app: the prompt's restart reports it unavailable.
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("restart is unavailable")),
+        "`r` must reach the prompt's restart"
+    );
+}
+
+#[test]
+fn a_typing_burst_reaches_the_surface_owner_ahead_of_the_composer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+
+    let mut app = chat_app(tmp.path());
+    app.pending_stop_confirm = Some(Vec::new());
+    typed_burst(&mut app, &[KeyCode::Char('n')]);
+    assert!(app.pending_stop_confirm.is_none(), "`n` must cancel /stop");
+    assert_eq!(app.composer.text(), "");
+
+    let mut app = chat_app(tmp.path());
+    app.pending_prune_confirm = true;
+    typed_burst(&mut app, &[KeyCode::Char('n')]);
+    assert!(!app.pending_prune_confirm, "`n` must cancel /prune");
+    assert_eq!(app.composer.text(), "");
+
+    let mut app = chat_app(tmp.path());
+    app.session_rail.focus();
+    typed_burst(&mut app, &[KeyCode::Char('j'), KeyCode::Char('k')]);
+    assert_eq!(app.composer.text(), "", "the focused rail takes its keys");
+
+    let mut app = chat_app(tmp.path());
+    app.overlay = super::Overlay::Help(super::help_overlay::HelpOverlay::open());
+    typed_burst(&mut app, &[KeyCode::Char('x'), KeyCode::Char('y')]);
+    assert_eq!(app.composer.text(), "", "the help overlay takes its keys");
+}
+
+#[test]
+fn a_key_taken_by_a_persisting_review_box_disarms_the_onboarding_confirmation() {
+    // Isolates the key path: the box is on top before either trust click
+    // and stays on top across the key, so no top-layer change disarms.
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = onboarding_trust_app(tmp.path());
+    open_floating(&mut app, Layer::RulesReview);
+    draw(&mut app, 120, 40);
+    let (row, _) = trust(&app);
+    let row = row.as_position();
+    let rules = app.rules_review_rect.expect("rules box painted");
+    assert!(
+        !rules.contains(row),
+        "the trust row must be outside the box"
+    );
+
+    // Control: two clicks with nothing between them confirm.
+    let mut control = onboarding_trust_app(tmp.path());
+    open_floating(&mut control, Layer::RulesReview);
+    draw(&mut control, 120, 40);
+    app_click(&mut control, row);
+    draw(&mut control, 120, 40);
+    app_click(&mut control, row);
+    assert!(trust(&control).1, "two uninterrupted clicks confirm");
+
+    app_click(&mut app, row);
+    draw(&mut app, 120, 40);
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.top_layer(), Layer::RulesReview, "the box stayed on top");
+    draw(&mut app, 120, 40);
+    app_click(&mut app, row);
+    assert!(
+        !trust(&app).1,
+        "the key taken by the box did not break the pair"
+    );
+}
+
+#[test]
+fn a_successful_editor_round_trip_ends_captures_and_forgets_the_pointer() {
+    // Capture was off on the terminal while the editor ran, so a release in
+    // that interval never arrived — even though the restore turned capture
+    // back on.
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = chat_app(tmp.path());
+    app.handle_mouse(mouse(MouseEventKind::Moved, 5, 3));
+    arm_every_capture(&mut app);
+    app.sync_mouse_capture_after_restore(true);
+    assert!(app.mouse_capture, "the restore turned capture back on");
+    assert_eq!(app.pointer, None, "the pointer was forgotten");
+    assert_every_capture_ended_and_committed_actions_kept(&app, "editor round trip");
+}
+
+// ── Surface popovers occlude what they cover ───────────────────────────
+
+fn transcript_app(tmp: &std::path::Path) -> App {
+    let mut app =
+        App::new_with_workspace_trust(Some(tmp), false, super::StartupWorkspaceTrust::Decided);
+    app.dialog = Dialog::None;
+    app.launch.banner_enabled = false;
+    app.mouse_capture = true;
+    for seq in 0..30i64 {
+        app.history.push(crate::tui::history::HistoryEntry::User {
+            text: format!("user message number {seq} with enough text to fill the row"),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: Some(seq * 2),
+            optimistic_submission_id: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+    }
+    app
+}
+
+fn is_transcript_control(dispatch: &crate::tui::button::ButtonDispatch) -> bool {
+    use crate::tui::button::ButtonDispatch;
+    matches!(
+        dispatch,
+        ButtonDispatch::TranscriptPin { .. }
+            | ButtonDispatch::TranscriptUnpin { .. }
+            | ButtonDispatch::TranscriptFork { .. }
+    )
+}
+
+/// Cells of transcript Pin/Fork controls painted this frame, from the
+/// transcript's own row geometry (not the registry under test).
+fn transcript_control_cells(app: &App) -> Vec<Position> {
+    let area = app.chat_area.expect("transcript painted");
+    let mut cells = Vec::new();
+    for (row, meta) in app.chat_row_meta.iter().enumerate() {
+        for hit in [meta.pin_hit, meta.fork_hit].into_iter().flatten() {
+            if hit.col_end > hit.col_start {
+                cells.push(Position::new(area.x + hit.col_start, area.y + row as u16));
+            }
+        }
+    }
+    cells
+}
+
+#[test]
+fn a_body_overlay_takes_the_pointer_from_the_transcript_controls_it_covers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = transcript_app(tmp.path());
+    app.overlay = super::Overlay::Help(super::help_overlay::HelpOverlay::open());
+    draw(&mut app, 120, 50);
+    let popover = app.last_popover_rect;
+    let cells = transcript_control_cells(&app);
+    let covered: Vec<Position> = cells
+        .iter()
+        .copied()
+        .filter(|cell| popover.contains(*cell))
+        .collect();
+    assert!(
+        !covered.is_empty(),
+        "the fixture must paint transcript controls under the popover"
+    );
+    assert!(
+        app.button_registry
+            .targets()
+            .iter()
+            .all(|target| !is_transcript_control(&target.dispatch)
+                || !target.rect.intersects(popover)),
+        "a covered transcript control is still registered"
+    );
+    let history = app.history.len();
+    for cell in covered {
+        app.handle_mouse(mouse(MouseEventKind::Moved, cell.x, cell.y));
+        draw(&mut app, 120, 50);
+        assert!(
+            app.button_registry.hover().is_none(),
+            "{cell:?} hovers under help"
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            cell.x,
+            cell.y,
+        ));
+        assert!(
+            app.button_registry.pressed().is_none(),
+            "{cell:?} pressed under help"
+        );
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), cell.x, cell.y));
+        assert!(matches!(app.overlay, super::Overlay::Help(_)));
+        assert!(app.pin_pick.is_none() && app.fork_pick.is_none());
+        assert_eq!(app.history.len(), history, "{cell:?} acted under help");
+        assert!(app.toast.is_none(), "{cell:?} acted under help");
+    }
+
+    // Inverse: a transcript control the popover does not cover stays live.
+    if let Some(open) = cells.iter().copied().find(|cell| !popover.contains(*cell)) {
+        assert!(
+            app.button_registry
+                .hit(open.x, open.y)
+                .is_some_and(|target| is_transcript_control(&target.dispatch)),
+            "an uncovered control lost the pointer"
+        );
+    }
+}
+
+#[test]
+fn transcript_controls_take_the_pointer_when_no_popover_covers_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = transcript_app(tmp.path());
+    draw(&mut app, 120, 50);
+    let cells = transcript_control_cells(&app);
+    assert!(!cells.is_empty());
+    for cell in cells {
+        assert!(
+            app.button_registry
+                .hit(cell.x, cell.y)
+                .is_some_and(|target| is_transcript_control(&target.dispatch)),
+            "{cell:?} is not hit-testable without a popover"
+        );
+    }
+}
+
+#[test]
+fn leader_actions_run_only_over_the_chat_surface() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for base in [Layer::Onboarding, Layer::WorkspaceTrust, Layer::Surface] {
+        let mut app = App::new_with_workspace_trust(
+            Some(tmp.path()),
+            false,
+            super::StartupWorkspaceTrust::Decided,
+        );
+        app.dialog = Dialog::None;
+        open_layer(&mut app, base);
+        open_floating(&mut app, Layer::KeysOverlay);
+        assert_eq!(app.base_layer(), base);
+        app.handle_key(key(KeyCode::Char('n')));
+        let notes_open = matches!(app.overlay, super::Overlay::Notes(_));
+        if base == Layer::Surface {
+            assert!(notes_open, "the leader action runs over the surface");
+            assert!(app.keys_overlay.is_none());
+        } else {
+            assert!(!notes_open, "{base:?}: a leader action ran under the base");
+            assert!(
+                app.keys_overlay.is_some(),
+                "{base:?}: an ordinary overlay key"
+            );
+        }
+    }
 }

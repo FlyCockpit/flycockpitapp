@@ -1247,6 +1247,10 @@ impl App {
         self.button_registry
             .begin_frame(self.mouse_capture, self.button_surface_generation);
         self.row_registry.begin_frame(self.mouse_capture);
+        // The queue's row hits are this frame's too: a frame that does not
+        // paint the queue (an overlay is up, the queue emptied) leaves none.
+        self.queue_row_hits.clear();
+        self.surface_occluder = None;
         self.session_rail.set_pointer_capture(self.mouse_capture);
         self.session_rail.begin_frame();
         let rects = geom.layout(frame.area());
@@ -1299,6 +1303,7 @@ impl App {
         }
         if popover_stack_active {
             frame.render_widget(ratatui::widgets::Clear, popover_body);
+            self.occlude_surface(popover_body);
         }
 
         let base = self.base_layer();
@@ -1459,10 +1464,9 @@ impl App {
                         }
                     } else if self.composer_controls.picker.is_none()
                         && !self.chat_header_more_open
-                        && self.context_menu.is_none()
-                        && self.pins_review.is_none()
-                        && self.rules_review.is_none()
-                        && self.keys_overlay.is_none()
+                        // No floating layer (from the layer stack) is over
+                        // the composer.
+                        && !self.top_layer().is_floating()
                     {
                         frame.set_cursor_position(cursor_pos);
                     }

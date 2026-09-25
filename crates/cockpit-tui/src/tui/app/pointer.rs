@@ -27,7 +27,10 @@
 //!   cancelled here.
 //! - **Keys and paste** enter through the layer stack before any other
 //!   stage: a floating layer on top takes them all, except the base's global
-//!   quit/interrupt keys (see `App::is_base_global_key`).
+//!   quit/interrupt keys (see `App::is_base_global_key`). The rapid-paste
+//!   intake, which replays buffered keys straight into the composer, buffers
+//!   only while the surface is on top and its composer owns typing
+//!   (`App::structured_paste_composer_eligible`, derived from this stack).
 
 use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -50,6 +53,37 @@ pub(super) enum Layer {
 }
 
 impl Layer {
+    /// Every layer, in stack order (topmost first). A new variant does not
+    /// compile until [`Layer::ordinal`]'s exhaustive match gives it an
+    /// ordinal, which is its index here (the const check below rejects a
+    /// mismatch), so every test that iterates this array (the key-intake
+    /// matrix among them) covers it.
+    pub(super) const ALL: [Layer; 8] = [
+        Layer::DaemonRestartPrompt,
+        Layer::KeysOverlay,
+        Layer::ContextMenu,
+        Layer::RulesReview,
+        Layer::PinsReview,
+        Layer::WorkspaceTrust,
+        Layer::Onboarding,
+        Layer::Surface,
+    ];
+
+    /// This layer's index in [`Layer::ALL`]. A new variant gets the index it
+    /// is listed at there.
+    pub(super) const fn ordinal(self) -> usize {
+        match self {
+            Layer::DaemonRestartPrompt => 0,
+            Layer::KeysOverlay => 1,
+            Layer::ContextMenu => 2,
+            Layer::RulesReview => 3,
+            Layer::PinsReview => 4,
+            Layer::WorkspaceTrust => 5,
+            Layer::Onboarding => 6,
+            Layer::Surface => 7,
+        }
+    }
+
     /// Floating layers paint over the base; exactly one base layer is last
     /// in the stack.
     pub(super) fn is_floating(self) -> bool {
@@ -63,6 +97,16 @@ impl Layer {
         )
     }
 }
+
+// `Layer::ALL[i]` has ordinal `i`: each listed variant sits at its own
+// ordinal, so none is listed twice and the list is in stack order.
+const _: () = {
+    let mut index = 0;
+    while index < Layer::ALL.len() {
+        assert!(Layer::ALL[index].ordinal() == index);
+        index += 1;
+    }
+};
 
 impl App {
     /// The painted layers, topmost first — the reverse of paint order.
@@ -180,7 +224,10 @@ impl App {
     ///
     /// A settings page's armed confirmations are not captures: they drop
     /// only when settings loses the input to a layer above it, or the
-    /// pointer's coordinates become void (resize, focus loss, capture off).
+    /// pointer's coordinates become void (resize, focus loss, capture off,
+    /// an external-editor round trip). The second rule drops a
+    /// keyboard-armed confirmation too, since an armed confirmation does not
+    /// record which device armed it: fail-safe, the user re-arms it.
     ///
     /// Committed actions are **kept**, because the user already completed
     /// them: a link activation waiting out its multi-click window, a
@@ -265,6 +312,24 @@ impl App {
         {
             shell.cancel_pending_confirmation();
         }
+    }
+
+    /// A surface popover was just painted over `rect` on top of the
+    /// transcript. Everything painted under it so far this frame — the
+    /// transcript's registered buttons and links — is covered there, so it
+    /// stops taking the pointer (click and hover) at once; the popover's own
+    /// targets, registered after this, are unaffected. Pointer paths that hit
+    /// other transcript geometry check [`Self::pointer_occluded`].
+    pub(super) fn occlude_surface(&mut self, rect: Rect) {
+        self.button_registry.occlude(rect);
+        self.link_registry.occlude(rect);
+        self.surface_occluder = Some(rect);
+    }
+
+    /// Whether `pos` lies under this frame's surface popover, where the
+    /// transcript underneath does not take the pointer.
+    pub(super) fn pointer_occluded(&self, pos: Position) -> bool {
+        self.surface_occluder.is_some_and(|rect| rect.contains(pos))
     }
 
     /// Show the daemon restart prompt. It takes the pointer, so the

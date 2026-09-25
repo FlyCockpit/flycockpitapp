@@ -2502,6 +2502,9 @@ pub struct App {
     pub(super) pending_mouse_copies: HashMap<AsyncActionId, PendingMouseCopy>,
     #[cfg(test)]
     pub(super) arm_controllable_mouse_copy: bool,
+    /// The text of the last mouse copy started (tests assert what is copied).
+    #[cfg(test)]
+    pub(super) last_scheduled_mouse_copy_text: Option<String>,
     #[cfg(test)]
     pub(super) controllable_mouse_copy:
         Option<crate::tui::async_action::ControllableMouseCopyRunner>,
@@ -2782,6 +2785,10 @@ pub struct App {
     /// Popover body rect from the latest [`Self::render`] (for acceptance tests).
     #[cfg(any(test, feature = "test-support"))]
     pub(super) last_popover_rect: ratatui::layout::Rect,
+    /// This frame's surface popover (a body overlay, the settings dialog or
+    /// the workspace-trust dialog), painted over the transcript: nothing
+    /// painted under it takes the pointer there (`App::occlude_surface`).
+    pub(super) surface_occluder: Option<ratatui::layout::Rect>,
 
     /// Mutable confirmation row for rapid agent switching before the next turn.
     pub(super) pending_agent_switch_log: Option<PendingAgentSwitchLog>,
@@ -4355,6 +4362,7 @@ impl App {
             last_button_frame_key: None,
             #[cfg(any(test, feature = "test-support"))]
             last_popover_rect: ratatui::layout::Rect::default(),
+            surface_occluder: None,
 
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
@@ -4388,6 +4396,8 @@ impl App {
             pending_mouse_copies: HashMap::new(),
             #[cfg(test)]
             arm_controllable_mouse_copy: false,
+            #[cfg(test)]
+            last_scheduled_mouse_copy_text: None,
             #[cfg(test)]
             controllable_mouse_copy: None,
             pending_link_activation: None,

@@ -984,6 +984,7 @@ impl App {
     /// embedded pane).
     fn transcript_hover_suppressed(&self, mouse: &MouseEvent) -> bool {
         self.pointer_owner_at(Position::new(mouse.column, mouse.row)) != Layer::Surface
+            || self.pointer_occluded(Position::new(mouse.column, mouse.row))
             || self.dialog.is_active()
             || self.question_dialog.is_some()
             || self.composer_controls.picker.is_some()
@@ -1606,6 +1607,7 @@ impl App {
     pub(super) fn drop_mouse_copy_ui_ownership(&mut self) {
         self.pending_mouse_copies.clear();
         self.mouse_gesture_state.invalidate_copy();
+        self.drop_orphaned_copy_payload();
     }
 
     pub(super) fn tombstone_cancelled_mouse_copies(&mut self, cancelled: &[AsyncActionResult]) {
@@ -1881,7 +1883,25 @@ impl App {
         let (next, effects) = mouse_gesture::reduce(state, &cfg, &input);
         self.mouse_gesture_state = next;
         self.apply_gesture_effects(&effects);
+        self.drop_orphaned_copy_payload();
         effects
+    }
+
+    /// The committed copy text lives exactly as long as its copy timer: once
+    /// the timer was fired or tombstoned (Esc, a new press, a view or
+    /// terminal change, a session change, shutdown), the text is dropped.
+    /// Called after every change to the gesture's copy timer.
+    pub(super) fn drop_orphaned_copy_payload(&mut self) {
+        let state = &self.mouse_gesture_state;
+        if self
+            .scheduled_copy_payload
+            .as_ref()
+            .is_some_and(|(token, _)| {
+                state.copy_token != Some(*token) || state.pending_copy_deadline.is_none()
+            })
+        {
+            self.scheduled_copy_payload = None;
+        }
     }
 
     fn apply_gesture_effects(&mut self, effects: &[mouse_gesture::GestureEffect]) {
@@ -1955,6 +1975,10 @@ impl App {
             _ => self.snapshot_selection_text(),
         };
         let char_count = text.chars().count();
+        #[cfg(test)]
+        {
+            self.last_scheduled_mouse_copy_text = Some(text.clone());
+        }
         #[cfg(test)]
         if self.arm_controllable_mouse_copy {
             self.start_controllable_mouse_copy(token, press_generation, char_count);

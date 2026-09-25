@@ -147,6 +147,15 @@ impl ButtonRegistry {
         }
     }
 
+    /// A surface was just painted over `rect`, on top of every target
+    /// registered so far this frame: any of them it touches is no longer
+    /// under the pointer, so it stops being hit-testable and hoverable.
+    /// Targets the covering surface registers afterwards are its own and
+    /// stay. (A partly covered target is dropped whole: fail-safe.)
+    pub fn occlude(&mut self, rect: Rect) {
+        self.targets.retain(|target| !target.rect.intersects(rect));
+    }
+
     pub fn hit(&self, column: u16, row: u16) -> Option<&RegisteredButton> {
         if !self.capture {
             return None;

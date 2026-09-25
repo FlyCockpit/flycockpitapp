@@ -471,18 +471,23 @@ impl App {
     /// exactly then most relevant — but they never preempt its keys or
     /// clicks.
     pub(super) fn header_chrome_interactive(&self) -> bool {
-        self.chat_header_layout.is_some()
+        // Any layer over the surface (a review box, the which-key overlay,
+        // a context menu, the daemon prompt) or a non-surface base takes the
+        // header's keys: from the layer stack, so none can be forgotten.
+        self.top_layer() == super::pointer::Layer::Surface
+            && self.chat_header_layout.is_some()
             && matches!(self.overlay, Overlay::None)
             && self.question_dialog.is_none()
             && !self.dialog.is_active()
             && !self.keyboard_modal_body_surface_open()
     }
 
-    /// The body-owning keyboard modals that are neither `Overlay` variants
-    /// nor dialogs: the `/pin`/`/fork`/`/copy-pick` pick modes, the
-    /// `/pins`/`/rules` review panels, and the transcript-find bar. Each
+    /// The surface's body-owning keyboard modals that are neither `Overlay`
+    /// variants nor dialogs: the `/pin`/`/fork`/`/copy-pick` pick modes and
+    /// the transcript-find bar (the `/pins`/`/rules` review boxes are layers,
+    /// covered by the layer check in `header_chrome_interactive`). Each
     /// paints over the transcript and swallows every keystroke while open
-    /// (`handle_key` routes the pick/review modes ahead of the header; the
+    /// (`handle_key` routes the pick modes ahead of the header; the
     /// find bar owns every key once no pill selection is live), so header
     /// chrome must yield to them on the mouse path too — otherwise a pill
     /// click could preempt a workflow the keyboard already treats as
@@ -492,8 +497,6 @@ impl App {
         self.pin_pick.is_some()
             || self.fork_pick.is_some()
             || self.copy_pick.is_some()
-            || self.pins_review.is_some()
-            || self.rules_review.is_some()
             || self.transcript_find.is_some()
     }
 

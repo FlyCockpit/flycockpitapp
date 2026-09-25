@@ -285,17 +285,23 @@ impl App {
         }
     }
 
-    /// The one path for a live mouse-capture change, shared by `/mouse` and
-    /// the settings toggle. Turning capture off ends every capture and
-    /// forgets the pointer, so no hover or held press outlives it.
     /// After an external program returned the terminal: record the capture
-    /// state the restore actually achieved.
+    /// state the restore actually achieved. Mouse capture was off on the
+    /// terminal for the whole time the program ran — releases and motion in
+    /// that interval never arrived — so every capture ends and the pointer is
+    /// forgotten even when the restore turned capture back on.
     pub(super) fn sync_mouse_capture_after_restore(&mut self, live: bool) {
         if live != self.mouse_capture {
             self.commit_mouse_capture(live);
         }
+        if live {
+            self.end_mouse_capture();
+        }
     }
 
+    /// The one path for a live mouse-capture change, shared by `/mouse` and
+    /// the settings toggle. Turning capture off ends every capture and
+    /// forgets the pointer, so no hover or held press outlives it.
     fn commit_mouse_capture(&mut self, enabled: bool) {
         self.mouse_capture = enabled;
         self.invalidate_primary_paste();

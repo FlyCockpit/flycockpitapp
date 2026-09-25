@@ -850,4 +850,74 @@ async fn a_scheduled_double_click_copy_keeps_its_word_across_a_resize() {
         .map(|copy| copy.char_count)
         .collect();
     assert_eq!(copied, [5], "the committed word copy must copy \"world\"");
+    assert_eq!(
+        app.last_scheduled_mouse_copy_text.as_deref(),
+        Some("world"),
+        "the committed word copy must copy exactly \"world\""
+    );
+    assert!(
+        app.scheduled_copy_payload.is_none(),
+        "the payload was consumed"
+    );
+}
+
+#[test]
+fn a_cancelled_scheduled_copy_drops_its_committed_text() {
+    // Every way the multi-click copy timer is tombstoned before it fires
+    // drops the text it captured; the timer firing consumes it.
+    type Cancel = fn(&mut App);
+    let cancels: [(&str, Cancel); 5] = [
+        ("esc", |app| {
+            app.handle_key(key(KeyCode::Esc));
+        }),
+        ("new press", |app| {
+            app.event_loop_monotonic_now = Duration::from_millis(100);
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        }),
+        ("view change", |app| {
+            app.invalidate_mouse_gesture(
+                MouseGestureInvalidation::ViewChange,
+                Duration::from_millis(40),
+            );
+        }),
+        ("terminal change", |app| {
+            app.invalidate_mouse_gesture(
+                MouseGestureInvalidation::TerminalChange,
+                Duration::from_millis(40),
+            );
+        }),
+        ("shutdown ownership", |app| {
+            app.drop_mouse_copy_ui_ownership()
+        }),
+    ];
+    for (name, cancel) in cancels {
+        let mut app = app_with_hello_grid();
+        app.arm_controllable_mouse_copy = true;
+        app.event_loop_monotonic_now = Duration::from_millis(0);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0));
+        app.event_loop_monotonic_now = Duration::from_millis(20);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0));
+        assert!(
+            app.scheduled_copy_payload
+                .as_ref()
+                .is_some_and(|(_, text)| text == "world"),
+            "{name}: the double click committed its word"
+        );
+        cancel(&mut app);
+        assert!(
+            app.mouse_gesture_state.pending_copy_deadline.is_none(),
+            "{name}: the timer was tombstoned"
+        );
+        assert!(
+            app.scheduled_copy_payload.is_none(),
+            "{name}: the text outlived its timer"
+        );
+        app.service_due_mouse_gesture_timers(Duration::from_millis(600));
+        assert!(
+            app.last_scheduled_mouse_copy_text.is_none(),
+            "{name}: a stale copy ran"
+        );
+    }
 }

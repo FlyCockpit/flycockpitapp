@@ -546,10 +546,16 @@ impl SessionRail {
         let button_y = inner.y.saturating_add(lines.len() as u16);
         let choice = *choice;
         frame.render_widget(Paragraph::new(lines), inner);
-        paint_confirm_buttons_into(&mut self.confirm_buttons, frame, inner, button_y, choice);
+        // Each button is painted once, by the rail's own registry (which
+        // owns its hover and press); the app registry only registers the
+        // same targets, so a second paint cannot overwrite the hover style.
+        let painted =
+            paint_confirm_buttons_into(&mut self.confirm_buttons, frame, inner, button_y, choice);
         self.confirm_buttons.end_frame();
         if let Some(extra) = extra {
-            paint_confirm_buttons_into(extra, frame, inner, button_y, choice);
+            for (rect, spec) in painted {
+                extra.register(rect, spec);
+            }
         }
     }
 }
@@ -560,9 +566,10 @@ fn paint_confirm_buttons_into(
     inner: Rect,
     y: u16,
     choice: ConfirmChoice,
-) {
+) -> Vec<(Rect, crate::tui::button::ButtonSpec)> {
+    let mut painted = Vec::new();
     if y >= inner.bottom() {
-        return;
+        return painted;
     }
     let mut x = inner.x;
     for (label, this) in [
@@ -593,10 +600,12 @@ fn paint_confirm_buttons_into(
         .focused(this == choice)
         .kind(kind);
         let max_width = inner.right().saturating_sub(x);
-        if let Some(rect) = buttons.paint(frame, x, y, max_width, spec) {
+        if let Some(rect) = buttons.paint(frame, x, y, max_width, spec.clone()) {
+            painted.push((rect, spec));
             x = rect.right().saturating_add(1);
         }
     }
+    painted
 }
 
 pub fn card_lines(

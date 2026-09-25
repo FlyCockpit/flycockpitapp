@@ -51,6 +51,40 @@ impl App {
         self.sync_pointer_owner();
         self.observe_pointer(mouse.column, mouse.row);
         let owner = self.pointer_owner_at(Position::new(mouse.column, mouse.row));
+        // A capture belongs to the layer that received its press: an event
+        // routed to a different owner (a drag that crossed into a review
+        // box, say) means that owner will never see the release.
+        if self
+            .last_pointer_event_owner
+            .is_some_and(|previous| previous != owner)
+        {
+            self.end_pointer_captures();
+        }
+        self.last_pointer_event_owner = Some(owner);
+        // A press or scroll that goes to a layer above the onboarding base
+        // breaks a pending two-click confirmation there.
+        if owner != Layer::Onboarding
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Down(_)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            )
+        {
+            self.note_interaction_above_onboarding();
+        }
+        self.route_mouse(mouse, owner);
+        // A release ends every capture. Its owner has handled it; anything
+        // still latched had its release swallowed by another handler (an
+        // overlay inside the surface, a review box) and must not survive.
+        if matches!(mouse.kind, MouseEventKind::Up(_)) {
+            self.end_pointer_captures();
+        }
+    }
+
+    fn route_mouse(&mut self, mouse: MouseEvent, owner: Layer) {
         if owner == Layer::DaemonRestartPrompt {
             if let Some(prompt) = self.daemon_restart_prompt.as_mut() {
                 let restart = point_in(prompt.restart_rect, mouse.column, mouse.row);
@@ -1857,8 +1891,14 @@ impl App {
                 | mouse_gesture::GestureEffect::ScheduleActivation { .. }
                 | mouse_gesture::GestureEffect::CancelActivation { .. }
                 | mouse_gesture::GestureEffect::Activate { .. }
-                | mouse_gesture::GestureEffect::Notify { .. }
-                | mouse_gesture::GestureEffect::ScheduleCopyTimer { .. } => {}
+                | mouse_gesture::GestureEffect::Notify { .. } => {}
+                // A multi-click copy is committed when the click completes:
+                // capture its text now, so the timer copies what was
+                // selected even if the selection is cleared meanwhile (a
+                // resize voids it).
+                mouse_gesture::GestureEffect::ScheduleCopyTimer { token, .. } => {
+                    self.scheduled_copy_payload = Some((*token, self.snapshot_selection_text()));
+                }
                 mouse_gesture::GestureEffect::Select(request) => {
                     self.selection = self.materialize_gesture_selection(*request);
                 }
@@ -1910,7 +1950,10 @@ impl App {
     }
 
     fn schedule_mouse_copy(&mut self, token: u64, press_generation: u64) {
-        let text = self.snapshot_selection_text();
+        let text = match self.scheduled_copy_payload.take() {
+            Some((scheduled, text)) if scheduled == token => text,
+            _ => self.snapshot_selection_text(),
+        };
         let char_count = text.chars().count();
         #[cfg(test)]
         if self.arm_controllable_mouse_copy {

@@ -280,9 +280,16 @@ fn key_router_precedence_matrix_covers_every_focus_and_picker_state() {
                 let keys = chord.keys();
                 let mut actual = KeyRouterStage::Composer;
                 for (index, key) in keys.iter().copied().enumerate() {
-                    actual = app
-                        .handle_precedence_key(key)
-                        .unwrap_or(KeyRouterStage::Composer);
+                    // Once the leader opened the which-key overlay it is the
+                    // top of the layer stack, which takes the next key ahead
+                    // of every precedence stage (it runs the leader action).
+                    actual = if app.keys_overlay.is_some() {
+                        app.handle_key(key);
+                        KeyRouterStage::CtrlChord
+                    } else {
+                        app.handle_precedence_key(key)
+                            .unwrap_or(KeyRouterStage::Composer)
+                    };
                     if index + 1 < keys.len() {
                         assert_eq!(
                             actual,

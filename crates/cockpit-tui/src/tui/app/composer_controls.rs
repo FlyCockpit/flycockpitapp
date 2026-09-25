@@ -620,16 +620,17 @@ impl App {
     /// which-key overlay — still swallow keys while they are up. The
     /// top-level router separately preserves embedded-pane ownership for Ctrl
     /// chords while keeping excoc's Alt session chords global.
+    /// Composer chords work only while the surface is the top of the layer
+    /// stack (no floating layer, which also rules out onboarding and the
+    /// workspace-trust dialog) and no surface-level modal holds the keys.
     pub(super) fn composer_chords_available(&self) -> bool {
-        self.question_dialog.is_none()
+        self.top_layer() == super::pointer::Layer::Surface
+            && self.question_dialog.is_none()
             && !self.dialog.is_active()
             && self.pin_pick.is_none()
             && self.fork_pick.is_none()
             && self.copy_pick.is_none()
-            && self.pins_review.is_none()
-            && self.rules_review.is_none()
             && self.transcript_find.is_none()
-            && self.keys_overlay.is_none()
     }
 
     pub(super) fn close_composer_picker_on_outside_press(&mut self, column: u16, row: u16) -> bool {

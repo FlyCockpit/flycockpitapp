@@ -5845,17 +5845,24 @@ impl Dialog {
         }
     }
 
-    /// End the settings pointer captures — the pressed semantic target and
+    /// End the settings pointer captures: the pressed semantic target and
     /// the button registry's press (so press → resize → release cannot
-    /// activate) — and the page's pointer-owned confirmations. Committed
-    /// actions (an external-editor edit, an OAuth copy, a setup operation)
-    /// are not captures and complete on their own.
+    /// activate). Committed actions (an external-editor edit, an OAuth copy,
+    /// a setup operation) are not captures and complete on their own.
     pub(crate) fn end_settings_pointer_captures(&mut self) {
         if let Dialog::Settings(settings) = self {
             for surface in [&settings.pointer_surface, &settings.cx.pointer_surface] {
                 *surface.pressed.borrow_mut() = None;
                 surface.buttons.borrow_mut().clear_pressed();
             }
+        }
+    }
+
+    /// Drop the page's armed confirmations (reset, delete): called when
+    /// settings loses the input to a layer above it, or the pointer's
+    /// coordinates become void (resize, focus loss, capture off).
+    pub(crate) fn cancel_settings_pointer_confirmations(&mut self) {
+        if let Dialog::Settings(settings) = self {
             settings.page.cancel_pointer_transients();
         }
     }
@@ -5905,6 +5912,42 @@ impl Dialog {
             Dialog::Settings(settings) => settings.cx.pointer_surface.pointer_owned.get(),
             _ => false,
         }
+    }
+
+    /// The dialog button registry's target rects and whether any is
+    /// hovered (test inspection).
+    #[cfg(test)]
+    pub(crate) fn test_settings_buttons(&self) -> (Vec<Rect>, bool) {
+        match self {
+            Dialog::Settings(settings) => {
+                let buttons = settings.pointer_surface.buttons.borrow();
+                (
+                    buttons.targets().iter().map(|target| target.rect).collect(),
+                    buttons.hover().is_some(),
+                )
+            }
+            _ => (Vec::new(), false),
+        }
+    }
+
+    /// Arm the Tools page's delete confirmation, as its `d` key does on a
+    /// user tool (test setup), and read it back.
+    #[cfg(test)]
+    pub(crate) fn test_arm_tools_delete(&mut self, name: &str) {
+        let Dialog::Settings(settings) = self else {
+            panic!("settings dialog");
+        };
+        let page = settings
+            .page
+            .downcast_mut::<tools_page::ToolsPage>()
+            .expect("tools page");
+        page.delete_pending = Some(name.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_tools_delete_pending(&self) -> bool {
+        matches!(self, Dialog::Settings(settings)
+            if matches!(settings.test_page(), TestPageRef::Tools(page) if page.delete_pending.is_some()))
     }
 
     /// Whether the settings button registry holds a press.
@@ -8546,10 +8589,15 @@ impl SettingsDialog {
             || mouse.row < area.y
             || mouse.row >= area.bottom()
         {
-            if matches!(mouse.kind, MouseEventKind::Moved) {
-                *self.pointer_surface.hover.borrow_mut() = None;
-                self.pointer_surface.header_hover.set(None);
-            }
+            // The pointer is outside the dialog, whatever the event: no
+            // settings hover store may keep a target it is not over —
+            // registered buttons included.
+            *self.pointer_surface.hover.borrow_mut() = None;
+            self.pointer_surface.header_hover.set(None);
+            self.pointer_surface
+                .buttons
+                .borrow_mut()
+                .resolve_hover(None);
             return SettingsPointerOutcome::Consumed;
         }
         match mouse.kind {

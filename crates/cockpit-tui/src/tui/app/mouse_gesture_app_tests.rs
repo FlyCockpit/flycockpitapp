@@ -29,7 +29,7 @@ fn key(code: KeyCode) -> KeyEvent {
     }
 }
 
-fn selectable_meta() -> render::ChatRowMeta {
+pub(super) fn selectable_meta() -> render::ChatRowMeta {
     render::ChatRowMeta {
         history_index: Some(0),
         row_kind: render::ChatRowKind::Message,
@@ -827,4 +827,27 @@ fn resize_and_focus_loss_end_an_in_progress_drag() {
         assert!(!app.mouse_gesture_state.dragging, "{event:?}: drag ended");
         assert!(app.mouse_gesture_state.pending_press.is_none(), "{event:?}");
     }
+}
+
+#[tokio::test]
+async fn a_scheduled_double_click_copy_keeps_its_word_across_a_resize() {
+    let mut app = app_with_hello_grid();
+    app.arm_controllable_mouse_copy = true;
+    app.event_loop_monotonic_now = Duration::from_millis(0);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0));
+    app.event_loop_monotonic_now = Duration::from_millis(20);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0));
+    assert!(app.mouse_gesture_state.pending_copy_deadline.is_some());
+    // The resize voids the selection's coordinates before the timer fires.
+    app.handle_terminal_event(crossterm::event::Event::Resize(40, 10));
+    assert!(app.selection.is_none());
+    app.service_due_mouse_gesture_timers(Duration::from_millis(500));
+    let copied: Vec<usize> = app
+        .pending_mouse_copies
+        .values()
+        .map(|copy| copy.char_count)
+        .collect();
+    assert_eq!(copied, [5], "the committed word copy must copy \"world\"");
 }

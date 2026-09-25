@@ -209,10 +209,17 @@ fn rail_hover_follows_the_last_reported_pointer_not_only_motion() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let mut app = chat_app(tmp.path());
-    app.session_rail.set_pointer(Some((2, 2)));
-    // A click (not a Move) elsewhere reports the pointer's new position.
-    app.handle_mouse(mouse(MouseEventKind::ScrollDown, 60, 20));
-    app.resolve_pointer_hover();
+    app.session_rail.set_visible(true);
+    draw(&mut app, 120, 40);
+    let rail = app.session_rail.rail_area().expect("rail painted");
+    let over_rail = Position::new(rail.x + 2, rail.y + 2);
+    app.handle_mouse(mouse(MouseEventKind::Moved, over_rail.x, over_rail.y));
+    draw(&mut app, 120, 40);
+    assert_eq!(app.session_rail.pointer(), Some((over_rail.x, over_rail.y)));
+    // The next report is a wheel event far from the rail — not a Move. The
+    // rail must not keep hovering the old cell.
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, 100, 30));
+    draw(&mut app, 120, 40);
     assert_eq!(
         app.session_rail.pointer(),
         None,
@@ -488,4 +495,397 @@ fn settings_records_a_pointer_event_another_layer_consumed() {
         Some(Position::new(20, 7))
     );
     assert_eq!(app.pointer, Some(Position::new(20, 7)));
+}
+
+// ── Keys and paste enter through the layer stack ────────────────────────
+
+fn queued_item() -> cockpit_proto::QueueItem {
+    cockpit_proto::QueueItem {
+        id: uuid::Uuid::from_u128(77),
+        status: cockpit_proto::QueueItemStatus::Queued,
+        text: "queued".to_string(),
+        display_text: None,
+        target: cockpit_proto::QueueTarget::root("Build"),
+        delivery_class: cockpit_proto::QueueDeliveryClass::Steering,
+        send_now: false,
+    }
+}
+
+#[test]
+fn a_floating_layer_takes_the_key_before_a_focused_queue_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for layer in [Layer::ContextMenu, Layer::KeysOverlay] {
+        let mut app = chat_app(tmp.path());
+        let item = queued_item();
+        let id = item.id;
+        app.queue.push(item);
+        app.queue_focus = Some(id);
+        open_floating(&mut app, layer);
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(
+            app.toast.is_none(),
+            "{layer:?}: `x` reached the queue under the layer: {:?}",
+            app.toast.as_ref().map(|toast| toast.text.clone())
+        );
+        assert_eq!(app.queue_focus, Some(id), "{layer:?}");
+        if layer == Layer::ContextMenu {
+            assert!(app.context_menu.is_none(), "the menu handled `x` (dismiss)");
+        }
+    }
+}
+
+#[test]
+fn a_session_switch_chord_goes_to_the_context_menu_on_top() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = chat_app(tmp.path());
+    open_floating(&mut app, Layer::ContextMenu);
+    assert!(!app.composer_chords_available());
+    let counts = app.session_rail.request_counts();
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+    assert_eq!(
+        app.context_menu.as_ref().map(|menu| menu.cursor),
+        Some(1),
+        "the menu took the key (its cursor moved)"
+    );
+    assert_eq!(
+        app.session_rail.request_counts(),
+        counts,
+        "no session switch ran"
+    );
+}
+
+#[test]
+fn paste_under_a_floating_layer_reaches_nothing_below_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for daemon_prompt in [false, true] {
+        let mut app = chat_app(tmp.path());
+        if daemon_prompt {
+            app.open_daemon_restart_prompt();
+        } else {
+            open_floating(&mut app, Layer::RulesReview);
+        }
+        let before = app.composer.text().to_string();
+        app.handle_paste("pasted text".to_string());
+        assert_eq!(
+            app.composer.text(),
+            before,
+            "daemon_prompt={daemon_prompt}: the paste reached the composer"
+        );
+    }
+}
+
+#[test]
+fn floating_layers_on_the_surface_take_their_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = chat_app(tmp.path());
+    open_floating(&mut app, Layer::ContextMenu);
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.context_menu.is_none());
+
+    let mut app = chat_app(tmp.path());
+    app.pins_review = PinsReview::enter(vec![
+        cockpit_proto::PinnedMessage {
+            seq: 1,
+            is_assistant: false,
+            text: "one".to_string(),
+        },
+        cockpit_proto::PinnedMessage {
+            seq: 2,
+            is_assistant: true,
+            text: "two".to_string(),
+        },
+    ]);
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.pins_review.as_ref().unwrap().cursor, 1);
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.pins_review.is_none());
+}
+
+#[test]
+fn the_base_quit_key_passes_a_floating_layer_on_either_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    // Surface base: Ctrl-C arms the interrupt/exit window.
+    let mut app = chat_app(tmp.path());
+    open_floating(&mut app, Layer::KeysOverlay);
+    app.handle_key(ctrl_c);
+    assert!(
+        app.ctrl_c_armed_at.is_some(),
+        "Ctrl-C must reach the surface"
+    );
+
+    // Onboarding base: its quit chord closes onboarding.
+    let mut app = chat_app(tmp.path());
+    mount_onboarding(&mut app, cockpit_proto::OnboardingStage::Profile);
+    open_floating(&mut app, Layer::KeysOverlay);
+    app.handle_key(ctrl_c);
+    assert!(
+        app.onboarding_shell.is_none(),
+        "Ctrl-C must reach the onboarding shell under the overlay"
+    );
+}
+
+// ── The onboarding confirmation boundary at app level ───────────────────
+
+fn onboarding_trust_app(tmp: &std::path::Path) -> App {
+    let mut app = chat_app(tmp);
+    mount_onboarding(&mut app, cockpit_proto::OnboardingStage::Agent);
+    app.onboarding_shell
+        .as_mut()
+        .unwrap()
+        .test_mount_agent_model_trust();
+    app
+}
+
+fn trust(app: &App) -> (Rect, bool) {
+    app.onboarding_shell
+        .as_ref()
+        .unwrap()
+        .test_agent_trust()
+        .expect("agent screen")
+}
+
+fn app_click(app: &mut App, at: Position) {
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at.x, at.y));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), at.x, at.y));
+}
+
+#[test]
+fn a_click_in_a_review_box_between_the_two_trust_clicks_disarms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = onboarding_trust_app(tmp.path());
+    open_floating(&mut app, Layer::PinsReview);
+    draw(&mut app, 120, 40);
+    let (row, _) = trust(&app);
+    let row = row.as_position();
+    let pins = app
+        .pins_review_rect
+        .expect("pins box painted")
+        .as_position();
+    assert_eq!(app.pointer_owner_at(row), Layer::Onboarding);
+    app_click(&mut app, row);
+    app_click(&mut app, pins);
+    draw(&mut app, 120, 40);
+    app_click(&mut app, row);
+    assert!(
+        !trust(&app).1,
+        "the review-box click did not break the pair"
+    );
+
+    // Control: without the interruption the pair confirms.
+    let mut app = onboarding_trust_app(tmp.path());
+    open_floating(&mut app, Layer::PinsReview);
+    draw(&mut app, 120, 40);
+    app_click(&mut app, row);
+    draw(&mut app, 120, 40);
+    app_click(&mut app, row);
+    assert!(trust(&app).1);
+}
+
+#[test]
+fn the_daemon_prompt_between_the_two_trust_clicks_disarms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = onboarding_trust_app(tmp.path());
+    draw(&mut app, 120, 40);
+    let (row, _) = trust(&app);
+    let row = row.as_position();
+    app_click(&mut app, row);
+    app.apply_event(TurnEvent::DaemonRestartPrompt);
+    draw(&mut app, 120, 40);
+    app.handle_key(key(KeyCode::Char('r')));
+    app.daemon_restart_prompt = None;
+    draw(&mut app, 120, 40);
+    app_click(&mut app, row);
+    assert!(!trust(&app).1, "the daemon prompt did not break the pair");
+}
+
+// ── Captures follow the pointer's actual owner ──────────────────────────
+
+fn grid_app(tmp: &std::path::Path) -> App {
+    let mut app = chat_app(tmp);
+    app.copy_on_release = true;
+    app.chat_area = Some(Rect::new(0, 0, 11, 1));
+    app.chat_text_grid = vec!["hello world".chars().map(|ch| ch.to_string()).collect()];
+    app.chat_row_meta = vec![super::mouse_gesture_app_tests::selectable_meta()];
+    app
+}
+
+#[test]
+fn a_drag_that_crosses_into_a_review_box_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = grid_app(tmp.path());
+    app.pins_review = PinsReview::enter(vec![cockpit_proto::PinnedMessage {
+        seq: 1,
+        is_assistant: false,
+        text: "pinned".to_string(),
+    }]);
+    app.pins_review_rect = Some(Rect::new(0, 5, 40, 3));
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 0));
+    assert!(app.mouse_gesture_state.dragging);
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 6));
+    assert!(
+        !app.mouse_gesture_state.dragging,
+        "the drag outlived its owner"
+    );
+
+    // A divider drag released inside the box ends too.
+    app.dragging_divider = true;
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, 6));
+    assert!(!app.dragging_divider);
+}
+
+#[test]
+fn a_release_swallowed_inside_the_surface_still_ends_the_drag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = grid_app(tmp.path());
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 0));
+    assert!(app.mouse_gesture_state.dragging);
+    // An overlay inside the surface layer opens and swallows the release.
+    app.overlay = super::Overlay::Help(super::help_overlay::HelpOverlay::open());
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, 0));
+    assert!(!app.mouse_gesture_state.dragging);
+    assert!(app.mouse_gesture_state.pending_press.is_none());
+}
+
+#[test]
+fn review_boxes_take_their_cells_for_clicks_and_wheel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = grid_app(tmp.path());
+    app.chat_total_lines = 100;
+    app.chat_visible_lines = 1;
+    app.pins_review = PinsReview::enter(vec![cockpit_proto::PinnedMessage {
+        seq: 1,
+        is_assistant: false,
+        text: "pinned".to_string(),
+    }]);
+    app.pins_review_rect = Some(Rect::new(0, 0, 3, 1));
+    let offset = app.chat_scroll_offset;
+    // Inside the box: the chat under it neither scrolls nor selects.
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, 1, 0));
+    assert_eq!(app.chat_scroll_offset, offset, "the wheel reached the chat");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 0));
+    assert!(app.selection.is_none(), "the click reached the chat");
+    // Beside the box: the chat does.
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, 8, 0));
+    assert_ne!(app.chat_scroll_offset, offset);
+}
+
+// ── Hover resolution: every store, every path ───────────────────────────
+
+#[test]
+fn settings_button_hover_clears_when_the_pointer_leaves_the_dialog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = settings_tools_app(tmp.path());
+    draw(&mut app, 120, 50);
+    let (targets, _) = app.dialog.test_settings_buttons();
+    let button = targets
+        .first()
+        .copied()
+        .expect("a registered settings button");
+    app.handle_mouse(mouse(MouseEventKind::Moved, button.x, button.y));
+    assert!(
+        app.dialog.test_settings_buttons().1,
+        "hovered over the button"
+    );
+    // Into the margin outside the dialog (and outside the rail).
+    app.handle_mouse(mouse(MouseEventKind::Moved, 119, 49));
+    draw(&mut app, 120, 50);
+    assert!(
+        !app.dialog.test_settings_buttons().1,
+        "the button registry kept a hover the pointer left"
+    );
+}
+
+#[test]
+fn a_stationary_pointer_hovers_what_a_new_frame_puts_under_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    // Learn where the settings button will be.
+    let mut probe = settings_tools_app(tmp.path());
+    let idle = draw(&mut probe, 120, 50);
+    let (targets, _) = probe.dialog.test_settings_buttons();
+    let button = targets
+        .first()
+        .copied()
+        .expect("a registered settings button");
+    let cell = Position::new(button.x + 1, button.y);
+
+    // The pointer rests there before the dialog opens; the dialog then
+    // appears under it with no further pointer event.
+    let mut app = chat_app(tmp.path());
+    app.handle_mouse(mouse(MouseEventKind::Moved, cell.x, cell.y));
+    let mut dialog = crate::tui::settings::SettingsDialog::open(tmp.path().join("config.json"));
+    dialog.test_enter_root_node("Tools");
+    app.dialog = Dialog::Settings(Box::new(dialog));
+    let presented = draw(&mut app, 120, 50);
+    assert_ne!(
+        presented[(cell.x, cell.y)].bg,
+        idle[(cell.x, cell.y)].bg,
+        "the presented frame must already hover the button under the pointer"
+    );
+}
+
+#[test]
+fn a_capture_lost_by_an_editor_restore_forgets_the_pointer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = chat_app(tmp.path());
+    app.handle_mouse(mouse(MouseEventKind::Moved, 5, 3));
+    app.dragging_divider = true;
+    app.sync_mouse_capture_after_restore(false);
+    assert!(!app.mouse_capture);
+    assert_eq!(app.pointer, None);
+    assert!(!app.dragging_divider);
+}
+
+#[test]
+fn settings_confirmations_drop_only_when_settings_loses_the_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = settings_tools_app(tmp.path());
+    draw(&mut app, 120, 50);
+    app.dialog.test_arm_tools_delete("mytool");
+
+    // A pins box opens over settings: settings lost the top.
+    app.pins_review = PinsReview::enter(vec![cockpit_proto::PinnedMessage {
+        seq: 1,
+        is_assistant: false,
+        text: "pinned".to_string(),
+    }]);
+    draw(&mut app, 120, 50);
+    // Settings lost the top to the box: the confirmation is dropped.
+    assert!(!app.dialog.test_tools_delete_pending());
+
+    app.dialog.test_arm_tools_delete("mytool");
+    let pins = app.pins_review_rect.expect("pins box").as_position();
+    app.handle_mouse(mouse(MouseEventKind::Moved, pins.x, pins.y));
+    app.handle_mouse(mouse(MouseEventKind::Moved, 60, 10));
+    app.handle_mouse(mouse(MouseEventKind::Moved, pins.x, pins.y));
+    assert!(
+        app.dialog.test_tools_delete_pending(),
+        "pointer-owner changes must not drop a keyboard-armed confirmation"
+    );
+    // The box closes: the top returns to settings, nothing is dropped.
+    app.pins_review = None;
+    draw(&mut app, 120, 50);
+    assert!(app.dialog.test_tools_delete_pending());
+    // Settings loses the input to the keys overlay: dropped (fail-safe).
+    app.keys_overlay = Some(KeysOverlay::open(KeyContext::Composer));
+    draw(&mut app, 120, 50);
+    assert!(!app.dialog.test_tools_delete_pending());
 }

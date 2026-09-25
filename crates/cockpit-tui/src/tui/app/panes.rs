@@ -92,8 +92,9 @@ impl App {
         )
         .await;
         // Keep App.mouse_capture aligned with post-restore TTY state (e.g. when
-        // restore failed to re-enable capture).
-        self.mouse_capture = live_mouse;
+        // restore failed to re-enable capture), through the one capture
+        // commit path so a lost capture also ends captures and hover.
+        self.sync_mouse_capture_after_restore(live_mouse);
         let redraw = outcome.redraw;
 
         match &outcome.status {
@@ -165,8 +166,9 @@ impl App {
         )
         .await;
         // Keep App.mouse_capture aligned with post-restore TTY state (e.g. when
-        // restore failed to re-enable capture).
-        self.mouse_capture = live_mouse;
+        // restore failed to re-enable capture), through the one capture
+        // commit path so a lost capture also ends captures and hover.
+        self.sync_mouse_capture_after_restore(live_mouse);
         let redraw = outcome.redraw;
 
         use crate::tui::settings::pointer_actions::ExternalEditOutcome;
@@ -243,8 +245,9 @@ impl App {
         )
         .await;
         // Keep App.mouse_capture aligned with post-restore TTY state (e.g. when
-        // restore failed to re-enable capture).
-        self.mouse_capture = live_mouse;
+        // restore failed to re-enable capture), through the one capture
+        // commit path so a lost capture also ends captures and hover.
+        self.sync_mouse_capture_after_restore(live_mouse);
         let redraw = outcome.redraw;
 
         use crate::tui::settings::pointer_actions::ExternalEditOutcome;

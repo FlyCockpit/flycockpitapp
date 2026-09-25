@@ -16,11 +16,18 @@
 //!   ([`App::resolve_pointer_hover`]), and the frame is redrawn when that
 //!   changed anything, so the presented frame hovers exactly what the owned
 //!   pointer is over.
-//! - **Captures** (a held press or drag whose release is still to come) end
-//!   at every boundary where that release can no longer reach its owner
-//!   ([`App::end_pointer_captures`]): the owning layer changes
-//!   ([`App::sync_pointer_owner`]), resize, focus loss, mouse capture off.
-//!   Completed actions are not captures and are never cancelled here.
+//! - **Captures** (a held press or drag whose release is still to come)
+//!   belong to the layer that received the press. They end
+//!   ([`App::end_pointer_captures`]) when a pointer event is routed to a
+//!   different owner (including a move into a review box), after every
+//!   release (whoever handled it — a release swallowed by an overlay inside
+//!   the surface still ends the drag), when the top layer changes
+//!   ([`App::sync_pointer_owner`]), and on resize, focus loss and mouse
+//!   capture off. Completed actions are not captures and are never
+//!   cancelled here.
+//! - **Keys and paste** enter through the layer stack before any other
+//!   stage: a floating layer on top takes them all, except the base's global
+//!   quit/interrupt keys (see `App::is_base_global_key`).
 
 use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -168,13 +175,17 @@ impl App {
     /// - the registered-button press (`button_registry`) and the session
     ///   rail's confirm-button press;
     /// - the pane-divider drag and the composer picker scrollbar drag;
-    /// - settings: the pressed target, the button-registry press, and the
-    ///   page's pointer-owned confirmations;
+    /// - settings: the pressed target and the button-registry press;
     /// - onboarding: the provider scrollbar drag.
+    ///
+    /// A settings page's armed confirmations are not captures: they drop
+    /// only when settings loses the input to a layer above it, or the
+    /// pointer's coordinates become void (resize, focus loss, capture off).
     ///
     /// Committed actions are **kept**, because the user already completed
     /// them: a link activation waiting out its multi-click window, a
-    /// scheduled or in-flight mouse copy, the primary-selection paste, a
+    /// scheduled multi-click copy (its text captured when the click
+    /// completed) or an in-flight copy, the primary-selection paste, a
     /// settings external-editor edit, an OAuth copy or setup operation, and
     /// the selection itself (except after a resize, when its coordinates are
     /// void).
@@ -206,6 +217,7 @@ impl App {
     /// coordinates.
     pub(super) fn end_pointer_interactions(&mut self, end: PointerInteractionEnd) {
         self.end_pointer_captures_clearing_selection(end == PointerInteractionEnd::Resize);
+        self.dialog.cancel_settings_pointer_confirmations();
         self.forget_pointer();
     }
 
@@ -214,6 +226,7 @@ impl App {
     /// pointer is forgotten.
     pub(super) fn end_mouse_capture(&mut self) {
         self.end_pointer_captures();
+        self.dialog.cancel_settings_pointer_confirmations();
         self.forget_pointer();
     }
 
@@ -225,11 +238,32 @@ impl App {
     /// pointer event) and at the start of every render.
     pub(super) fn sync_pointer_owner(&mut self) {
         let top = self.top_layer();
-        if self.last_top_layer != Some(top) {
-            if self.last_top_layer.is_some() {
+        let previous = self.last_top_layer;
+        if previous != Some(top) {
+            if previous.is_some() {
                 self.end_pointer_captures();
+                // Consecutive clicks cannot straddle a change of top layer.
+                self.note_interaction_above_onboarding();
+                // A confirmation armed on the surface (a settings page's
+                // reset/delete) is dropped only when the surface itself lost
+                // the input to a layer above it — fail-safe, and never by a
+                // change among layers it was already below.
+                if previous == Some(Layer::Surface) && top != Layer::Surface {
+                    self.dialog.cancel_settings_pointer_confirmations();
+                }
             }
             self.last_top_layer = Some(top);
+        }
+    }
+
+    /// Any interaction that does not reach the onboarding base — a press,
+    /// scroll or key taken by a layer above it, or a change of top layer —
+    /// breaks the base's pending two-click confirmation.
+    pub(super) fn note_interaction_above_onboarding(&mut self) {
+        if self.base_layer() == Layer::Onboarding
+            && let Some(shell) = self.onboarding_shell.as_mut()
+        {
+            shell.cancel_pending_confirmation();
         }
     }
 
@@ -340,6 +374,7 @@ impl App {
     fn surface_hover_snapshot(&self) -> SurfaceHoverSnapshot {
         SurfaceHoverSnapshot {
             rail: self.session_rail.pointer(),
+            rail_confirm: self.session_rail.confirm_hover(),
             button: self.button_registry.hover().cloned(),
             queue: self.queue_hover,
             link: self.link_registry.hovered().map(|link| link.url.clone()),
@@ -370,6 +405,7 @@ impl App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SurfaceHoverSnapshot {
     rail: Option<(u16, u16)>,
+    rail_confirm: Option<crate::tui::button::ButtonId>,
     button: Option<crate::tui::button::ButtonId>,
     queue: Option<uuid::Uuid>,
     link: Option<String>,

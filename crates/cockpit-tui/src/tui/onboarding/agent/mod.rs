@@ -785,6 +785,21 @@ impl AgentAuthoringScreen {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_enter_model_trust(&mut self) {
+        self.draft.route_grants[0].enabled = true;
+        self.draft.trust_confirmations[0] = false;
+        self.phase = Phase::ModelTrust;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_trust_row_and_confirmed(&self) -> (Rect, bool) {
+        (
+            self.list_row_rects.first().copied().unwrap_or_default(),
+            self.draft.trust_confirmations[0],
+        )
+    }
+
     /// Drop a pending first click because the pointer interaction ended
     /// (resize, focus loss) — the two clicks can no longer be consecutive.
     pub(crate) fn cancel_pending_confirmation(&mut self) {

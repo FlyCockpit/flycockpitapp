@@ -518,15 +518,20 @@ impl SessionRail {
         self.set_pointer(None);
     }
 
-    /// The pointer as the app reports it for this surface: the last reported
-    /// position when the rail's layer owns it, else `None`. Every hover the
-    /// rail paints (cards, their actions, the chrome chips, confirm buttons)
-    /// derives from this against the frame being painted.
+    /// The confirm button the rail paints hovered.
+    pub(crate) fn confirm_hover(&self) -> Option<crate::tui::button::ButtonId> {
+        self.confirm_buttons.hover().cloned()
+    }
+
     /// The pointer the rail paints hover from.
     pub fn pointer(&self) -> Option<(u16, u16)> {
         self.pointer_position
     }
 
+    /// The pointer as the app reports it for this surface: the last reported
+    /// position when the rail's layer owns it, else `None`. Every hover the
+    /// rail paints (cards, their actions, the chrome chips, confirm buttons)
+    /// derives from this against the frame being painted.
     pub fn set_pointer(&mut self, pointer: Option<(u16, u16)>) {
         self.pointer_position = pointer;
         self.confirm_buttons

@@ -708,6 +708,28 @@ impl OnboardingShell {
         matches!(&self.screen, OnboardingScreen::ProviderSearch(screen) if screen.dragging_scrollbar())
     }
 
+    /// Mount the agent screen in model trust with route 0 ("exact-a")
+    /// pending confirmation (test setup).
+    #[cfg(test)]
+    pub(crate) fn test_mount_agent_model_trust(&mut self) {
+        let mut screen = agent::AgentAuthoringScreen::new(
+            agent::golden_sample_projection(),
+            "test-trust".into(),
+        );
+        screen.test_enter_model_trust();
+        self.screen = OnboardingScreen::AgentAuthoring(Box::new(screen));
+    }
+
+    /// The first two-click row of the agent screen, and whether route 0's
+    /// trust is confirmed (test inspection).
+    #[cfg(test)]
+    pub(crate) fn test_agent_trust(&self) -> Option<(Rect, bool)> {
+        match &self.screen {
+            OnboardingScreen::AgentAuthoring(screen) => Some(screen.test_trust_row_and_confirmed()),
+            _ => None,
+        }
+    }
+
     /// Whether the shell owns the pointer this frame.
     #[cfg(test)]
     pub(crate) fn test_pointer_owned(&self) -> bool {
@@ -1288,7 +1310,7 @@ impl OnboardingShell {
         )
     }
 
-    fn is_quit_chord(key: &KeyEvent) -> bool {
+    pub(crate) fn is_quit_chord(key: &KeyEvent) -> bool {
         key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     }
@@ -2238,6 +2260,14 @@ impl OnboardingShell {
     pub(crate) fn end_pointer_interactions(&mut self) {
         self.cancel_pointer_capture();
         self.pointer = None;
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            screen.cancel_pending_confirmation();
+        }
+    }
+
+    /// Drop a pending two-click confirmation (the agent's trust/egress arm):
+    /// an interaction the shell never saw came between the clicks.
+    pub(crate) fn cancel_pending_confirmation(&mut self) {
         if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
             screen.cancel_pending_confirmation();
         }

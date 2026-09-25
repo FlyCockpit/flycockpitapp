@@ -8035,3 +8035,48 @@ fn oauth_false_completion_is_not_rendered_as_success() {
         assert!(state.status.as_ref().is_some_and(|status| status.is_err()));
     }
 }
+
+#[test]
+fn pointer_confirmation_cleanup_keeps_committed_oauth_copy_and_copilot_setup() {
+    // An OAuth copy and a Copilot setup operation are committed actions:
+    // dropping the page's pointer-owned confirmations must not cancel them.
+    let entry = one_provider_config(None).providers.remove("p").unwrap();
+
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+    let (flow, operation) = state.begin_copy_for_test();
+    let mut page = ProvidersPage::OAuthSetup {
+        state: Box::new(state),
+        parent: Box::new(EditState::new("p".into(), entry.clone())),
+    };
+    super::super::SettingsPage::cancel_pointer_transients(&mut page);
+    let ProvidersPage::OAuthSetup { state, .. } = &mut page else {
+        unreachable!()
+    };
+    state.complete_copy(flow, operation, Ok("copied".into()));
+    assert_eq!(
+        state.status.as_ref().unwrap().as_deref(),
+        Ok("copied"),
+        "the committed OAuth copy must still complete"
+    );
+
+    let mut gate = super::super::shell::PointerOperationGate::default();
+    let _ = gate.begin();
+    let mut page = ProvidersPage::CopilotSetup {
+        state: CopilotSetupState {
+            shell: None,
+            rc_path: None,
+            already_configured: false,
+            outcome: None,
+            operation: gate,
+        },
+        parent: Box::new(EditState::new("p".into(), entry)),
+    };
+    super::super::SettingsPage::cancel_pointer_transients(&mut page);
+    let ProvidersPage::CopilotSetup { state, .. } = &page else {
+        unreachable!()
+    };
+    assert!(
+        state.operation.is_pending(),
+        "the committed Copilot setup operation must stay in flight"
+    );
+}

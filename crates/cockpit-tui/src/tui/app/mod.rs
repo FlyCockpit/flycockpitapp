@@ -3125,6 +3125,12 @@ pub struct App {
     pub(super) rules_review_rect: Option<Rect>,
     /// Last reported pointer position (see `app/pointer.rs`).
     pub(super) pointer: Option<ratatui::layout::Position>,
+    /// Text of a committed multi-click copy, captured when its timer was
+    /// armed, keyed by the copy token.
+    pub(super) scheduled_copy_payload: Option<(u64, String)>,
+    /// Layer that received the previous pointer event (captures belong to
+    /// it).
+    pub(super) last_pointer_event_owner: Option<pointer::Layer>,
     /// Top layer seen by the last ownership sync.
     pub(super) last_top_layer: Option<pointer::Layer>,
     /// Count of pinned messages in this session (`pinned-messages`). Drives
@@ -4471,6 +4477,8 @@ impl App {
             rules_review_rect: None,
             pointer: None,
             last_top_layer: None,
+            scheduled_copy_payload: None,
+            last_pointer_event_owner: None,
             rules_review: None,
             pin_count: 0,
             pin_control_rows: Vec::new(),

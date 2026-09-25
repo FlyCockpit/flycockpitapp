@@ -1504,11 +1504,14 @@ impl WorkerWorkspaceConfigAuthority {
     /// narrower than favorite mutation: a global source gets an exact
     /// capability for `SetModelFavorite`, but is not workspace-local endpoint
     /// repair authority. Selection never consults `COCKPIT_CONFIG` or fresh
-    /// discovery.
+    /// discovery. A layer the attach-time `policy` does not permit writing
+    /// (an explicit override inside an ignored project `.cockpit/`) is
+    /// readable but never an endpoint-repair target.
     pub(crate) fn provider_write_target(
         &self,
         snapshot: &cockpit_config::config::WorkspaceConfigLayerSnapshotChain,
         provider_id: &str,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
     ) -> Option<PathBuf> {
         if cockpit_config::config::providers::validate_provider_id_for_filename(provider_id)
             .is_err()
@@ -1529,6 +1532,12 @@ impl WorkerWorkspaceConfigAuthority {
                 .config_directory
                 .canonical_path()
                 .join(&layer.config_leaf);
+            if !cockpit_config::config::dirs::config_layer_write_allowed_for_policy(
+                &config_path,
+                Some(policy),
+            ) {
+                continue;
+            }
             let provider_path = cockpit_config::config::providers::provider_file_path_for_config(
                 &config_path,
                 provider_id,
@@ -1546,38 +1555,6 @@ impl WorkerWorkspaceConfigAuthority {
         defining.or(fallback)
     }
 
-    /// Materialize the frozen effective-default target as a config-crate
-    /// capability. The returned descriptor owns a clone of the retained
-    /// directory handle, so the mutation never reopens this pathname after
-    /// attachment.
-    pub(crate) fn retained_effective_default_target(
-        self: &Arc<Self>,
-    ) -> Result<cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget> {
-        self.verify()?;
-        let target = self
-            .default_write_target
-            .as_ref()
-            .context("no retained cockpit config layer applies to this attached session")?;
-        target
-            .config_directory
-            .verify(target.config_directory.canonical_path())?;
-        let verifier_authority = Arc::clone(self);
-        cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget::new(
-            target.config_directory.retained_directory_handle()?,
-            target.config_leaf.clone(),
-            target.effective_default_journal_leaf.clone(),
-            target.effective_default_backup_leaf.clone(),
-            target.canonical_config_path.clone(),
-            self.attached_root.canonical_path().to_path_buf(),
-            target.scope.clone(),
-        )
-        .map(|target| {
-            target.with_verifier(Arc::new(move || {
-                verifier_authority.verify_default_effective_layers()
-            }))
-        })
-    }
-
     /// Return the highest-precedence default target that is enabled by the
     /// *current* attached workspace policy.  Retaining a project capability at
     /// attach is deliberately not permission to keep writing it after a
@@ -1588,14 +1565,7 @@ impl WorkerWorkspaceConfigAuthority {
         policy: &crate::config::trust::WorkspaceTrustPolicy,
     ) -> Result<cockpit_config::config::effective_default::RetainedEffectiveDefaultTarget> {
         self.verify_retained_config_source_chain_for_policy(policy)?;
-        let target = self
-            .default_effective_layers
-            .iter()
-            .rev()
-            .find(|layer| self.retained_layer_is_projected(layer, policy))
-            .context(
-                "no retained cockpit config layer applies under the current workspace trust policy",
-            )?;
+        let target = self.retained_default_write_layer_for_policy(policy)?;
         target
             .config_directory
             .verify(target.config_directory.canonical_path())?;
@@ -1671,6 +1641,7 @@ impl WorkerWorkspaceConfigAuthority {
     /// the current worker snapshot. This never re-captures layers or follows
     /// a later `COCKPIT_CONFIG`: the proof chooses one exact captured layer,
     /// provider file digest, and model object.
+    #[cfg(test)]
     pub(crate) fn retained_provider_model_favorite_target(
         self: &Arc<Self>,
         source: cockpit_config::config::providers::RetainedProviderModelSource,
@@ -1710,6 +1681,10 @@ impl WorkerWorkspaceConfigAuthority {
             anyhow::ensure!(
                 self.retained_layer_is_projected(selected, policy),
                 "provider source is no longer enabled by the current workspace trust policy"
+            );
+            anyhow::ensure!(
+                self.retained_layer_is_writable(selected, policy),
+                "provider source is not writable under the current workspace trust policy"
             );
         }
         selected
@@ -1836,18 +1811,7 @@ impl WorkerWorkspaceConfigAuthority {
         requested: Option<&cockpit_config::config::providers::ActiveModelRef>,
     ) -> Result<cockpit_config::config::providers::ProvidersConfig> {
         let mut chain = self.capture_retained_config_source_chain_for_policy(policy)?;
-        let index = self
-            .default_effective_layers
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, layer)| {
-                self.retained_layer_is_projected(layer, policy)
-                    .then_some(index)
-            })
-            .context(
-                "no retained cockpit config layer applies under the current workspace trust policy",
-            )?;
+        let index = self.retained_default_write_layer_index_for_policy(policy)?;
         let target = chain
             .layers
             .get_mut(index)
@@ -2004,6 +1968,60 @@ impl WorkerWorkspaceConfigAuthority {
         }
     }
 
+    /// Whether the current policy lets a retained layer be *written*.
+    /// Projection (readability) is necessary but not sufficient: the explicit
+    /// override is projected in every trust mode, yet an override located in a
+    /// project `.cockpit/` directory is written only while that project is
+    /// trusted. The decision itself is the shared config-layer write gate,
+    /// judged under the captured policy rather than the ambient one.
+    fn retained_layer_is_writable(
+        &self,
+        layer: &RetainedDefaultWriteTargetAuthority,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> bool {
+        self.retained_layer_is_projected(layer, policy)
+            && cockpit_config::config::dirs::config_layer_write_allowed_for_policy(
+                &layer.canonical_config_path,
+                Some(policy),
+            )
+    }
+
+    /// Index of the one legal effective-default write layer under `policy`:
+    /// the highest-precedence *projected* layer, which must also be writable.
+    /// It never falls back to a lower layer — that would write a value the
+    /// projected higher layer immediately shadows.
+    fn retained_default_write_layer_index_for_policy(
+        &self,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<usize> {
+        let index = self
+            .default_effective_layers
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, layer)| {
+                self.retained_layer_is_projected(layer, policy)
+                    .then_some(index)
+            })
+            .context(
+                "no retained cockpit config layer applies under the current workspace trust policy",
+            )?;
+        anyhow::ensure!(
+            self.retained_layer_is_writable(&self.default_effective_layers[index], policy),
+            "the highest-precedence retained cockpit config layer is not writable under the \
+             current workspace trust policy"
+        );
+        Ok(index)
+    }
+
+    fn retained_default_write_layer_for_policy(
+        &self,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Result<&RetainedDefaultWriteTargetAuthority> {
+        let index = self.retained_default_write_layer_index_for_policy(policy)?;
+        Ok(&self.default_effective_layers[index])
+    }
+
     fn hook_source_is_projected(
         &self,
         source: &cockpit_config::config::extended::hooks::HookConfigSource,
@@ -2099,14 +2117,7 @@ impl WorkerWorkspaceConfigAuthority {
         config_generation: u64,
     ) -> Result<cockpit_config::config::effective_default::DefaultUpdateAuthorityBinding> {
         self.verify_retained_config_source_chain_for_policy(policy)?;
-        let target = self
-            .default_effective_layers
-            .iter()
-            .rev()
-            .find(|layer| self.retained_layer_is_projected(layer, policy))
-            .context(
-                "no retained cockpit config layer applies under the current workspace trust policy",
-            )?;
+        let target = self.retained_default_write_layer_for_policy(policy)?;
         let projected = self
             .default_effective_layers
             .iter()
@@ -9648,6 +9659,103 @@ mod tests {
             cockpit_config::config::providers::ConfigDoc::providers_from_paths(&[project_config]);
         assert!(global.providers["p"].models[0].favorite);
         assert!(!project.providers["p"].models[0].favorite);
+    }
+
+    /// T3: a `COCKPIT_CONFIG` override located in a project `.cockpit/` is
+    /// retained and readable under IgnoreConfig, but no retained writer may
+    /// select it: favorite, effective default, receipt binding and endpoint
+    /// repair all go through the shared config-layer write gate.
+    #[test]
+    fn retained_project_located_override_is_read_but_never_written_under_ignore_config() {
+        let home = tempfile::tempdir().expect("isolated Cockpit home");
+        let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(home.path());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace_root = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+        let override_config = workspace_root.join(".cockpit/config.json");
+        std::fs::create_dir_all(override_config.parent().expect("config parent")).unwrap();
+        std::fs::write(&override_config, r#"{"providers":{"p":{}}}"#).unwrap();
+        let provider =
+            cockpit_config::config::providers::provider_file_path_for_config(&override_config, "p")
+                .expect("provider path");
+        std::fs::create_dir_all(provider.parent().expect("provider parent")).unwrap();
+        std::fs::write(
+            &provider,
+            r#"{"models":[{"id":"m","name":"override","favorite":false}]}"#,
+        )
+        .unwrap();
+        let _override = env.override_cockpit_config(&override_config);
+        let policy_for = |mode| crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&workspace_root).unwrap(),
+            mode,
+        };
+        let ignore = policy_for(crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig);
+        let trust = policy_for(crate::db::workspace_trust::WorkspaceTrustMode::Trust);
+        let authority = Arc::new(
+            WorkerWorkspaceConfigAuthority::capture(&workspace_root, &ignore)
+                .expect("capture the explicit override under IgnoreConfig"),
+        );
+        let snapshot = authority
+            .capture_retained_effective_default_layer_chain()
+            .expect("override is retained and readable");
+        assert!(
+            snapshot.exclusive,
+            "the override is the single retained layer"
+        );
+        let source = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+            &snapshot.layers,
+            "p",
+            "m",
+        )
+        .expect("parse override source")
+        .expect("override source is projected");
+
+        let refused = authority
+            .retained_provider_model_favorite_target_for_policy(source.clone(), &ignore)
+            .expect_err("favorite write to an ignored project override is refused");
+        assert!(
+            format!("{refused:#}")
+                .contains("not writable under the current workspace trust policy"),
+            "{refused:#}"
+        );
+        let refused = authority
+            .retained_effective_default_target_for_policy(&ignore)
+            .expect_err("default write to an ignored project override is refused");
+        assert!(
+            format!("{refused:#}").contains("not writable"),
+            "{refused:#}"
+        );
+        assert!(
+            authority
+                .retained_effective_default_authority_binding_for_policy(&ignore, 1)
+                .is_err_and(|error| format!("{error:#}").contains("not writable")),
+            "no receipt binding authorizes the unwritable override"
+        );
+        assert_eq!(
+            authority.provider_write_target(&snapshot, "p", &ignore),
+            None,
+            "endpoint repair never persists into an ignored project override"
+        );
+        assert!(
+            !std::fs::read_to_string(&provider)
+                .unwrap()
+                .contains(r#""favorite":true"#),
+            "nothing was written"
+        );
+
+        // Positive control: the same retained authority writes once trusted.
+        assert!(
+            authority
+                .provider_write_target(&snapshot, "p", &trust)
+                .is_some()
+        );
+        authority
+            .retained_provider_model_favorite_target_for_policy(source, &trust)
+            .expect("trusted project override is writable")
+            .write_model_favorite(true)
+            .expect("favorite update once trusted");
+        let written =
+            cockpit_config::config::providers::ConfigDoc::providers_from_paths(&[override_config]);
+        assert!(written.providers["p"].models[0].favorite);
     }
 
     #[test]

@@ -4501,9 +4501,10 @@ mod tests {
             placeholder: "***REDACT***".to_owned(),
             ..crate::config::extended::RedactConfig::default()
         };
-        let redaction = Arc::new(
-            crate::redact::RedactionTable::build(&cfg, std::path::Path::new(".")).unwrap(),
-        );
+        // Sources resolve against an absolute workspace root, never the cwd.
+        let workspace = tempfile::tempdir().unwrap();
+        let redaction =
+            Arc::new(crate::redact::RedactionTable::build(&cfg, workspace.path()).unwrap());
         let live_prelude =
             crate::engine::text_artifact_frame::render_accepted_user_composition_with_redaction(
                 &envelope.to_string(),

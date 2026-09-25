@@ -3106,6 +3106,15 @@ mod oauth_store_tests {
             .and_then(|body| body.split("async fn ").next())
             .expect("AutoTitle implementation");
         assert!(title.contains("let live = ctx.registry.live_handle(session_id)"));
+        // A non-live session pre-resolves command secrets before its
+        // coverage key (which fingerprints the command cache) and model.
+        let preresolve = title
+            .find(".preresolve_session_command_secrets(&session, &providers)")
+            .expect("non-live auto-title pre-resolves command secrets");
+        let coverage = title
+            .find("if session.redaction_coverage().is_none()")
+            .expect("coverage binding");
+        assert!(preresolve < coverage);
         assert!(title.contains("if session.redaction_coverage().is_none()"));
         assert!(title.contains("CoverageScope::AutoTitle"));
         assert!(title.contains("consume_at_async_sink"));
@@ -32736,6 +32745,18 @@ pub(super) async fn auto_title_request(
         .config_source()
         .load_with_trust(&session.project_root, &trust_policy)
         .map_err(workspace_trust_error)?;
+    if live.is_none() {
+        // A session-scoped model build pre-resolves its workspace's
+        // command-backed secrets first, exactly as registry create/resume do:
+        // the title model's store and coverage then see the resolved
+        // outputs instead of failing provider auth or omitting them.
+        crate::config::trust::scope_workspace_trust_policy(
+            trust_policy.clone(),
+            ctx.registry
+                .preresolve_session_command_secrets(&session, &providers),
+        )
+        .await;
+    }
     let env = live.as_ref().map_or_else(
         || {
             ctx.env_baseline

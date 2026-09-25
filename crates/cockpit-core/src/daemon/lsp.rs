@@ -31,7 +31,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::config::extended::{ExtendedConfig, LspAutoInstall};
-use crate::daemon::{EventSender, SharedRedactionTable};
+use crate::daemon::EventSender;
 use crate::redact::RedactionTable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,9 +182,13 @@ impl LspManager {
         }
     }
 
-    pub fn set_notice_bus(&self, tx: EventSender, redaction: SharedRedactionTable) {
+    pub fn set_notice_bus(
+        &self,
+        tx: EventSender,
+        coverage: crate::daemon::global_coverage::GlobalCoverage,
+    ) {
         *crate::sync::lock_or_recover(&self.inner.notices) =
-            Some(crate::daemon::GlobalEventBus { tx, redaction });
+            Some(crate::daemon::GlobalEventBus { tx, coverage });
     }
 
     #[allow(dead_code)]
@@ -539,13 +543,15 @@ impl LspManager {
     ///
     /// Notice text can echo workspace content (installer or server output),
     /// so it is scrubbed with the originating session's table as well as the
-    /// live daemon-global one ([`EventScrub`](crate::daemon::EventScrub): two
-    /// tables applied in turn, never merged). Scrubbing cannot fail, so the
-    /// notice is always delivered.
+    /// current daemon-global one ([`EventScrub`](crate::daemon::EventScrub):
+    /// both tables' entries matched together in one scrub-only pass). If that
+    /// coverage cannot be established, owners still receive the notice and
+    /// other principals do not (a notice is all free text).
     async fn notice(&self, text: String, origin: &Arc<RedactionTable>) {
         let bus = crate::sync::lock_or_recover(&self.inner.notices).clone();
         if let Some(bus) = bus {
-            bus.send_from_origin(origin, crate::daemon::proto::Event::LspNotice { text });
+            bus.send_from_origin_async(origin, crate::daemon::proto::Event::LspNotice { text })
+                .await;
         }
     }
 
@@ -2065,8 +2071,12 @@ mod tests {
         const WORKSPACE_SECRET: &str = "lsp-origin-workspace-secret-77c1";
         let manager = LspManager::new();
         let (tx, mut rx) = broadcast::channel(4);
-        let global = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
-        manager.set_notice_bus(tx, global);
+        manager.set_notice_bus(
+            tx,
+            crate::daemon::global_coverage::GlobalCoverage::fixed(
+                Arc::new(RedactionTable::empty()),
+            ),
+        );
         let workspace = tempfile::tempdir().unwrap();
         let origin = Arc::new(
             RedactionTable::build_with_env_and_secrets(
@@ -2105,8 +2115,12 @@ mod tests {
         }));
 
         let (tx, mut rx) = broadcast::channel(4);
-        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
-        manager.set_notice_bus(tx, redaction);
+        manager.set_notice_bus(
+            tx,
+            crate::daemon::global_coverage::GlobalCoverage::fixed(
+                Arc::new(RedactionTable::empty()),
+            ),
+        );
         manager
             .notice(
                 "poison recovered".to_string(),

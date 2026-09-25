@@ -169,6 +169,13 @@ pub(crate) fn fs_read_sync(
     wants_base64: bool,
 ) -> Result<Response, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
+    // Hold the root before anything is resolved beneath it: the final open
+    // walks from this held directory, never from the root's pathname.
+    let held_root =
+        cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+            &root,
+        )
+        .map_err(|error| read_open_error("the project root", &error))?;
     // The protection decision is snapshotted before the requested path is
     // resolved and is applied to both the requested name and its resolved
     // target, so removing or retargeting a configured alias mid-request
@@ -179,6 +186,14 @@ pub(crate) fn fs_read_sync(
     if resolved.is_dir() {
         return Err(bad_request(format!("`{path}` is a directory")));
     }
+    // Record which file the policy decision is about (device/inode, or the
+    // volume serial and file ID on Windows) when the decision is made. The
+    // descriptor opened below must be this exact file.
+    let checked_identity =
+        cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::regular_file_authorization_identity(
+            &resolved,
+        )
+        .map_err(|error| read_open_error(path, &error))?;
     ensure_read_allowed(policy.as_ref(), &requested, &resolved)?;
     #[cfg(test)]
     apply_fs_read_panic_for_test(&resolved);
@@ -188,11 +203,11 @@ pub(crate) fn fs_read_sync(
     let limits = crate::resource_limits::ResourceLimits::defaults();
     // Read the exact file the policy checked: open the canonical target
     // through a no-follow walk beneath the held root (no symlink or reparse
-    // component is traversed), so replacing an approved file or directory
-    // with a link to a protected file after the check cannot redirect this
-    // read. The descriptor is then read directly; the pathname is never
-    // reopened.
-    let file = open_checked_read_target(&root, &resolved)?;
+    // component is traversed), then require the descriptor's identity to
+    // equal the checked one. Neither a link nor a regular file or directory
+    // renamed over the checked path after the check can redirect this read.
+    // The descriptor is then read directly; the pathname is never reopened.
+    let file = open_checked_read_target(&held_root, &root, &resolved, &checked_identity, path)?;
     let prefixed = crate::resource_limits::read_file_for_fs_read(file).map_err(resource_limit)?;
     let hash = crate::resource_limits::sha256_hex_array(&prefixed.digest);
     let binary = crate::tools::common::looks_binary(&prefixed.prefix);
@@ -2032,28 +2047,92 @@ fn is_image_path(path: &Path) -> bool {
 }
 
 /// Open `resolved` (a canonical path beneath `root`, already checked by the
-/// sharee policy) without following any symlink or reparse point between
-/// `root` and the file. Any substitution since the check fails closed.
-fn open_checked_read_target(root: &Path, resolved: &Path) -> Result<std::fs::File, ErrorPayload> {
+/// sharee policy) through `held_root` without following any symlink or
+/// reparse point between the root and the file, and require the opened
+/// descriptor to be the file whose identity was recorded at the check. Any
+/// substitution since the check fails closed.
+///
+/// Limits of the no-follow walk: every component must be valid UTF-8 (a
+/// non-UTF-8 name is refused with a typed error, never read by pathname); on
+/// Windows a component containing `\` or `:` is refused, and a file behind a
+/// reparse point of any kind (including cloud-placeholder or deduplicated
+/// files) cannot be opened because the walk does not reparse.
+fn open_checked_read_target(
+    held_root: &cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority,
+    root: &Path,
+    resolved: &Path,
+    checked_identity: &str,
+    path: &str,
+) -> Result<std::fs::File, ErrorPayload> {
     let relative = resolved
         .strip_prefix(root)
         .map_err(|_| bad_request("resolved path escaped the project root"))?;
     let components = relative
         .components()
         .map(|component| match component {
-            Component::Normal(name) => name
-                .to_str()
-                .ok_or_else(|| bad_request("path is not valid UTF-8")),
+            Component::Normal(name) => name.to_str().ok_or_else(|| {
+                bad_request(format!(
+                    "`{path}` resolves to a name that is not valid UTF-8, which fs_read cannot open"
+                ))
+            }),
             _ => Err(bad_request("resolved path is not canonical")),
         })
         .collect::<Result<Vec<&str>, ErrorPayload>>()?;
-    let held =
-        cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
-            root,
+    let file = held_root
+        .open_regular_file_relative(&components)
+        .map_err(|error| read_open_error(path, &error))?;
+    let opened_identity =
+        cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::regular_file_identity(
+            &file,
         )
-        .map_err(|error| bad_request(format!("project root changed during read: {error:#}")))?;
-    held.open_regular_file_relative(&components)
-        .map_err(|error| bad_request(format!("file changed during read: {error:#}")))
+        .map_err(|error| read_open_error(path, &error))?;
+    if opened_identity != checked_identity {
+        return Err(conflict(format!(
+            "`{path}` was replaced after the read policy checked it"
+        )));
+    }
+    Ok(file)
+}
+
+/// Map a failure to open a read target to a typed error that says what
+/// actually happened. A link or mount point met by the no-follow walk means
+/// the path was substituted (conflict); a vanished file is not-found; every
+/// other I/O failure keeps its own meaning; a refusal that is not an I/O
+/// error (a non-regular leaf, an entry name the walk cannot address) is a
+/// bad request.
+fn read_open_error(what: &str, error: &anyhow::Error) -> ErrorPayload {
+    let io = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+    match io {
+        Some(io) if io_error_is_path_substitution(io) => conflict(format!(
+            "`{what}` changed during read: a link or mount point replaced part of its path"
+        )),
+        Some(io) if io.kind() == std::io::ErrorKind::NotFound => ErrorPayload {
+            code: ErrorCode::NotFound,
+            message: format!("`{what}` no longer exists"),
+        },
+        Some(io) => bad_request(format!("cannot open `{what}`: {io}")),
+        None => bad_request(format!("cannot read `{what}`: {error}")),
+    }
+}
+
+#[cfg(unix)]
+fn io_error_is_path_substitution(error: &std::io::Error) -> bool {
+    // ELOOP: O_NOFOLLOW met a symlink. ENOTDIR: an O_DIRECTORY component is
+    // no longer a directory. EXDEV: a component became a mount point.
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ELOOP | libc::ENOTDIR | libc::EXDEV)
+    )
+}
+
+#[cfg(not(unix))]
+fn io_error_is_path_substitution(_error: &std::io::Error) -> bool {
+    // Windows reports a reparse point met by the non-reparsing walk as an
+    // access failure; it keeps that meaning, and a regular-file substitution
+    // is still caught by the identity comparison.
+    false
 }
 
 fn ensure_read_allowed(
@@ -2140,7 +2219,21 @@ fn sharee_secret_policy(
         .map_err(internal)?;
         match std::fs::canonicalize(&extra) {
             Ok(target) => extra_targets.push(target),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // Absence is lstat NotFound only. A configured entry that exists
+            // but cannot be resolved (a dangling link) is unavailable, and an
+            // unavailable protection source fails the request closed.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&extra) {
+                    Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        return Err(internal(
+                            "a configured protected path (redact.extra_dotenv_paths) is a \
+                             dangling link; fix or remove the entry",
+                        ));
+                    }
+                    Err(error) => return Err(internal(error)),
+                }
+            }
             Err(error) => return Err(internal(error)),
         }
         extra_paths.push(extra);
@@ -2740,16 +2833,255 @@ mod tests {
         *lock.lock().unwrap() = true;
         cvar.notify_all();
 
-        match read_task.await.unwrap() {
-            Ok(Response::FsRead { content, .. }) => {
-                assert!(
-                    !content.unwrap_or_default().contains(PROTECTED),
-                    "the read followed a link swapped in after the check"
-                );
-            }
-            Ok(other) => panic!("unexpected response: {other:?}"),
-            Err(error) => assert_eq!(error.code, ErrorCode::BadRequest, "{error:?}"),
+        let error = read_task
+            .await
+            .unwrap()
+            .expect_err("the read must not follow a link swapped in after the check");
+        assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+        assert!(!error.message.contains(PROTECTED), "{error:?}");
+    }
+
+    /// Run `fs_read` for `principal`, and once it has passed its policy check
+    /// on `path`, apply `swap` before letting the open proceed.
+    #[cfg(unix)]
+    async fn fs_read_with_swap_after_check(
+        ctx: Arc<crate::daemon::server::DaemonContext>,
+        principal: ClientPrincipal,
+        root: &Path,
+        path: &str,
+        swap: impl FnOnce(),
+    ) -> Result<Response, ErrorPayload> {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        set_fs_read_block_for_test(root.join(path), entered_tx, release.clone());
+        let read_task = tokio::spawn(fs_read(
+            ctx,
+            principal,
+            root.to_string_lossy().into_owned(),
+            path.to_string(),
+            false,
+        ));
+        entered_rx.await.expect("fs_read passed its policy check");
+        swap();
+        let (lock, cvar) = &*release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+        tokio::time::timeout(std::time::Duration::from_secs(20), read_task)
+            .await
+            .expect("fs_read must not block on the swapped-in leaf")
+            .unwrap()
+    }
+
+    /// T4: a *regular* file renamed over the checked path after the policy
+    /// check traverses no link, so only the identity binding refuses it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_read_refuses_a_regular_file_renamed_over_the_checked_path() {
+        const PROTECTED: &str = "renamed-over-protected-content-41aa";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("approved.txt"), "approved").unwrap();
+        let protected = root.join("protected.txt");
+        std::fs::write(&protected, PROTECTED).unwrap();
+        let ctx = Arc::new(test_ctx(&root));
+        let approved = root.join("approved.txt");
+        let error = fs_read_with_swap_after_check(
+            ctx,
+            ClientPrincipal::owner(),
+            &root,
+            "approved.txt",
+            || std::fs::rename(&protected, &approved).unwrap(),
+        )
+        .await
+        .expect_err("a file renamed over the checked path is not the checked file");
+        assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+        assert!(!error.message.contains(PROTECTED));
+    }
+
+    /// T4 for a sharee: the sharee's decision (approved.txt allowed, `.env`
+    /// blocked) binds the read, so renaming the protected `.env` over the
+    /// approved name after the check cannot hand the sharee its bytes.
+    #[cfg(all(unix, feature = "remote"))]
+    #[tokio::test]
+    async fn sharee_fs_read_refuses_a_protected_file_renamed_over_an_approved_one() {
+        const PROTECTED: &str = "sharee-swap-protected-content-0d77";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("approved.txt"), "approved").unwrap();
+        let dotenv = root.join(".env");
+        std::fs::write(&dotenv, format!("TOKEN={PROTECTED}")).unwrap();
+        let ctx = Arc::new(test_ctx(&root));
+        // Preconditions: the sharee may read approved.txt and not `.env`.
+        assert!(matches!(
+            fs_read_sync(
+                &ctx,
+                &remote_project_files(&root),
+                &root.to_string_lossy(),
+                "approved.txt",
+                false
+            ),
+            Ok(Response::FsRead { .. })
+        ));
+        assert_eq!(
+            fs_read_sync(
+                &ctx,
+                &remote_project_files(&root),
+                &root.to_string_lossy(),
+                ".env",
+                false
+            )
+            .expect_err("dotenv is protected from sharees")
+            .code,
+            ErrorCode::Authorization
+        );
+        let approved = root.join("approved.txt");
+        let error = fs_read_with_swap_after_check(
+            ctx,
+            remote_project_files(&root),
+            &root,
+            "approved.txt",
+            || std::fs::rename(&dotenv, &approved).unwrap(),
+        )
+        .await
+        .expect_err("the sharee never receives the renamed protected file");
+        assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+        assert!(!error.message.contains(PROTECTED));
+    }
+
+    /// T13: a leaf replaced by a FIFO after the check fails the descriptor
+    /// type check instead of blocking the open until a writer appears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_read_refuses_a_fifo_leaf_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let target = root.join("approved.txt");
+        std::fs::write(&target, "approved").unwrap();
+        let ctx = Arc::new(test_ctx(&root));
+        let error = fs_read_with_swap_after_check(
+            ctx.clone(),
+            ClientPrincipal::owner(),
+            &root,
+            "approved.txt",
+            || {
+                std::fs::remove_file(&target).unwrap();
+                make_fifo(&target);
+            },
+        )
+        .await
+        .expect_err("a FIFO leaf is not read");
+        assert_ne!(error.code, ErrorCode::Internal, "{error:?}");
+
+        // A FIFO present from the start is refused at the check, typed.
+        let fifo = root.join("pipe");
+        make_fifo(&fifo);
+        let error = fs_read_sync(
+            &ctx,
+            &ClientPrincipal::owner(),
+            &root.to_string_lossy(),
+            "pipe",
+            false,
+        )
+        .expect_err("a FIFO is not a regular file");
+        assert_eq!(error.code, ErrorCode::BadRequest, "{error:?}");
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+    }
+
+    /// C1: fs_read reads a file reached through an in-workspace symlink (the
+    /// walk opens its canonical target) and a Unix name containing `\`,
+    /// which the held walk only refuses where it is a separator (Windows).
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_reads_in_workspace_links_and_backslash_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/target.txt"), "linked content").unwrap();
+        std::os::unix::fs::symlink(root.join("docs/target.txt"), root.join("link.txt")).unwrap();
+        std::fs::write(root.join("a\\b.txt"), "backslash content").unwrap();
+        let ctx = test_ctx(&root);
+        let read = |path: &str| match fs_read_sync(
+            &ctx,
+            &ClientPrincipal::owner(),
+            &root.to_string_lossy(),
+            path,
+            false,
+        ) {
+            Ok(Response::FsRead { content, .. }) => content.unwrap_or_default(),
+            other => panic!("reading {path}: {other:?}"),
+        };
+        assert_eq!(read("link.txt"), "linked content");
+        assert_eq!(read("a\\b.txt"), "backslash content");
+    }
+
+    /// End to end for a sharee: a relative project-layer `extra_dotenv_paths`
+    /// entry (anchored at the project root) and an absolute one both block the
+    /// sharee's read, including through an in-workspace link, while an
+    /// ordinary file (directly or through a link) stays readable.
+    #[cfg(all(unix, feature = "remote"))]
+    #[test]
+    fn sharee_fs_read_honors_configured_extra_paths_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".cockpit")).unwrap();
+        std::fs::create_dir_all(workspace.join("secrets")).unwrap();
+        std::fs::create_dir_all(workspace.join("other")).unwrap();
+        let root = workspace.canonicalize().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        std::fs::write(root.join("secrets/token.txt"), "relative-protected").unwrap();
+        std::fs::write(root.join("other/creds.txt"), "absolute-protected").unwrap();
+        std::fs::write(root.join("approved.txt"), "approved").unwrap();
+        std::fs::write(
+            root.join(".cockpit/config.json"),
+            serde_json::json!({
+                "redact": {
+                    "extra_dotenv_paths": [
+                        "secrets/token.txt",
+                        root.join("other/creds.txt"),
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(root.join("secrets/token.txt"), root.join("alias.txt")).unwrap();
+        std::os::unix::fs::symlink(root.join("approved.txt"), root.join("link.txt")).unwrap();
+        let ctx = test_ctx_with_source(
+            &root,
+            crate::daemon::config_source::ConfigSource::production(),
+        );
+        let sharee = remote_project_files(&root);
+        let root_str = root.to_string_lossy().into_owned();
+        for blocked in ["secrets/token.txt", "other/creds.txt", "alias.txt"] {
+            let error = fs_read_sync(&ctx, &sharee, &root_str, blocked, false)
+                .expect_err("configured protected path");
+            assert_eq!(error.code, ErrorCode::Authorization, "{blocked}: {error:?}");
         }
+        for (allowed, expected) in [("approved.txt", "approved"), ("link.txt", "approved")] {
+            match fs_read_sync(&ctx, &sharee, &root_str, allowed, false) {
+                Ok(Response::FsRead { content, .. }) => {
+                    assert_eq!(content.as_deref(), Some(expected), "{allowed}")
+                }
+                other => panic!("{allowed}: {other:?}"),
+            }
+        }
+        // The owner is not subject to the sharee policy.
+        assert!(matches!(
+            fs_read_sync(
+                &ctx,
+                &ClientPrincipal::owner(),
+                &root_str,
+                "secrets/token.txt",
+                false
+            ),
+            Ok(Response::FsRead { .. })
+        ));
     }
 
     /// A malformed protection policy (the sharee's redact settings) fails the
@@ -2770,9 +3102,61 @@ mod tests {
             &root,
             crate::daemon::config_source::ConfigSource::production(),
         );
+        let error = sharee_secret_policy(&ctx, &remote_project_files(&root), &root)
+            .err()
+            .expect("a malformed extra_dotenv_paths must not silently drop protection");
+        assert_eq!(error.code, ErrorCode::Internal, "{error:?}");
         assert!(
-            sharee_secret_policy(&ctx, &remote_project_files(&root), &root).is_err(),
-            "a malformed extra_dotenv_paths must not silently drop protection"
+            error.message.contains("redact") && error.message.contains("extra_dotenv_paths"),
+            "the strict validator names the offending key: {error:?}"
+        );
+        assert!(
+            !error.message.contains("secret.txt"),
+            "the error carries no configured value: {error:?}"
+        );
+
+        // Positive control: the same layer, well-formed, yields a policy.
+        std::fs::write(
+            root.join(".cockpit/config.json"),
+            r#"{"redact":{"extra_dotenv_paths":["secret.txt"]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            sharee_secret_policy(&ctx, &remote_project_files(&root), &root),
+            Ok(Some(_))
+        ));
+    }
+
+    /// C8: a configured protected path that is a dangling link is an error,
+    /// not an absent source (absence means lstat NotFound only).
+    #[cfg(all(unix, feature = "remote"))]
+    #[test]
+    fn sharee_policy_fails_closed_on_a_dangling_configured_extra_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        std::fs::create_dir_all(root.join(".cockpit")).unwrap();
+        std::fs::write(
+            root.join(".cockpit/config.json"),
+            r#"{"redact":{"extra_dotenv_paths":["dangling.env","absent.env"]}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(root.join("missing-target"), root.join("dangling.env")).unwrap();
+        let ctx = test_ctx_with_source(
+            &root,
+            crate::daemon::config_source::ConfigSource::production(),
+        );
+        let error = sharee_secret_policy(&ctx, &remote_project_files(&root), &root)
+            .err()
+            .expect("a dangling configured protected path fails closed");
+        assert_eq!(error.code, ErrorCode::Internal, "{error:?}");
+        std::fs::remove_file(root.join("dangling.env")).unwrap();
+        assert!(
+            matches!(
+                sharee_secret_policy(&ctx, &remote_project_files(&root), &root),
+                Ok(Some(_))
+            ),
+            "a truly absent configured path protects nothing yet and is not an error"
         );
     }
 

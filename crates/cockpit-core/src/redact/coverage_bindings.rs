@@ -12,6 +12,21 @@ use crate::env_snapshot::EnvSnapshot;
 use super::coverage_authority::{CoverageBinding, RedactionCoverageKey};
 use super::{RedactionSourceScope, RedactionTable, matched_dotenv_sources};
 
+// Versioned hash domains of the coverage bindings, pinned in
+// `internal_version_pins.rs`: changing one changes every binding derived
+// from it.
+/// Domain of the redact-policy digest (`redact_config_digest`).
+pub(crate) const REDACT_POLICY_DIGEST_DOMAIN: &[u8] = b"flycockpit-redact-policy-v1\0";
+/// Domain of the captured source-bytes digest (`source_bytes_digest`).
+pub(crate) const SOURCE_BYTES_DIGEST_DOMAIN: &[u8] = b"flycockpit-redaction-source-bytes-v1\0";
+/// Domain of the SSH candidate-set digest (`ssh_candidates_digest`).
+pub(crate) const SSH_CANDIDATES_DIGEST_DOMAIN: &[u8] = b"flycockpit-redaction-ssh-candidates-v1\0";
+/// Domain of the machine-source binding (`encode_machine_sources`).
+pub(crate) const MACHINE_SOURCES_DIGEST_DOMAIN: &[u8] =
+    b"flycockpit-redaction-machine-sources-v1\0";
+/// Domain of the sealed-records binding (`sealed_records_binding`).
+pub(crate) const SEALED_RECORDS_DIGEST_DOMAIN: &[u8] = b"flycockpit-redaction-sealed-v1\0";
+
 /// Inputs needed to derive a session coverage key and to snapshot capture
 /// boundary revisions at publication time.
 pub(crate) struct SessionCoverageInputs<'a> {
@@ -98,7 +113,7 @@ pub(crate) fn redact_config_digest(config: &RedactConfig) -> String {
         allowlist,
     } = config;
     let mut hasher = Sha256::new();
-    hasher.update(b"flycockpit-redact-policy-v1\0");
+    hasher.update(REDACT_POLICY_DIGEST_DOMAIN);
     let mut field = |tag: &[u8], bytes: &[u8]| {
         hasher.update((tag.len() as u64).to_le_bytes());
         hasher.update(tag);
@@ -184,7 +199,7 @@ pub(crate) fn machine_sources_probe_binding(
 /// Digest of one file-backed source's exact bytes.
 pub(crate) fn source_bytes_digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"flycockpit-redaction-source-bytes-v1\0");
+    hasher.update(SOURCE_BYTES_DIGEST_DOMAIN);
     hasher.update(bytes);
     hasher.finalize().into()
 }
@@ -193,7 +208,7 @@ pub(crate) fn source_bytes_digest(bytes: &[u8]) -> [u8; 32] {
 /// `(value, origin)` pairs in collection order.
 pub(crate) fn ssh_candidates_digest(candidates: &[(String, String)]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"flycockpit-redaction-ssh-candidates-v1\0");
+    hasher.update(SSH_CANDIDATES_DIGEST_DOMAIN);
     hasher.update((candidates.len() as u64).to_le_bytes());
     for (value, origin) in candidates {
         for part in [origin.as_bytes(), value.as_bytes()] {
@@ -222,7 +237,7 @@ fn encode_machine_sources(
     unsupported: &[PathBuf],
 ) -> CoverageBinding {
     let mut hasher = Sha256::new();
-    hasher.update(b"flycockpit-redaction-machine-sources-v1\0");
+    hasher.update(MACHINE_SOURCES_DIGEST_DOMAIN);
     let mut field = |bytes: &[u8]| {
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
@@ -283,7 +298,7 @@ pub(crate) fn machine_sources_binding(
     };
     let ssh = if config.scan_ssh_keys {
         let directory = super::ssh::resolve_ssh_key_dir(scope, config.ssh_key_dir.as_deref())?;
-        let candidates = super::ssh::collect_ssh_key_candidates(directory.as_deref())?;
+        let candidates = super::ssh::collect_ssh_key_candidates(directory.as_ref())?;
         Some(ssh_candidates_digest(&candidates))
     } else {
         None
@@ -312,7 +327,7 @@ pub(crate) fn sealed_records_binding(
     records: &[cockpit_db::db::sealed_scope::SealedValueRecordRow],
 ) -> CoverageBinding {
     let mut hasher = Sha256::new();
-    hasher.update(b"flycockpit-redaction-sealed-v1\0");
+    hasher.update(SEALED_RECORDS_DIGEST_DOMAIN);
     for record in records {
         hasher.update(record.record_id.as_bytes());
         hasher.update(record.active_version.to_le_bytes());

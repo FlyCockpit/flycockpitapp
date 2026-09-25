@@ -37712,8 +37712,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         caffeinate: base.caffeinate.clone(),
         global_events,
         global_redaction: base.global_redaction.clone(),
-        redaction_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        redaction_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        global_coverage: base.global_coverage.clone(),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -37827,8 +37826,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         caffeinate: base.caffeinate.clone(),
         global_events,
         global_redaction: base.global_redaction.clone(),
-        redaction_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        redaction_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        global_coverage: base.global_coverage.clone(),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -43144,8 +43142,8 @@ async fn locked_services_never_admit_ordinary_payload_before_coverage() {
             .as_ref()
             .expect("constructed ready services")
             .context
-            .redaction_generation
-            .load(std::sync::atomic::Ordering::Acquire)
+            .global_coverage
+            .published_generation_for_test()
             > 0,
         "ReadyServices publication requires an admitted authority generation"
     );
@@ -43583,11 +43581,10 @@ async fn bound_session_table(
 }
 
 fn scrubbed_for_non_owner(envelope: EventEnvelope) -> proto::Event {
-    let mut event = envelope.event;
-    for table in envelope.redact.tables() {
-        scrub_event_free_text(&mut event, table);
-    }
-    event
+    envelope
+        .redact
+        .project_for_non_owner(envelope.event, scrub_event_free_text)
+        .expect("delivered to non-owners")
 }
 
 /// Session-originated events on the daemon-global bus (LSP notices, a
@@ -43640,7 +43637,7 @@ async fn session_originated_global_events_are_scrubbed_with_global_and_session_t
 
     let bus = crate::daemon::GlobalEventBus {
         tx: ctx.global_events.clone(),
-        redaction: ctx.global_redaction.clone(),
+        coverage: ctx.global_coverage.clone(),
     };
     let mut rx = ctx.subscribe_global();
     bus.send_from_origin(
@@ -43661,7 +43658,7 @@ async fn session_originated_global_events_are_scrubbed_with_global_and_session_t
     // The LSP manager's notice path uses the same composite.
     ctx.registry
         .lsp_manager()
-        .set_notice_bus(ctx.global_events.clone(), ctx.global_redaction.clone());
+        .set_notice_bus(ctx.global_events.clone(), ctx.global_coverage.clone());
     let mut rx = ctx.subscribe_global();
     ctx.registry
         .lsp_manager()
@@ -43692,6 +43689,16 @@ async fn unavailable_global_coverage_still_delivers_content_free_events() {
     // Force the next broadcast to republish (stale epoch) through a source
     // whose policy cannot load.
     let mut ctx = Arc::try_unwrap(ctx).unwrap_or_else(|_| panic!("unique test context"));
+    ctx.global_coverage = crate::daemon::global_coverage::GlobalCoverage::new(
+        current_redaction(&ctx.global_redaction),
+        0,
+        0,
+        ctx.registry.coverage_authority().clone(),
+        source.clone(),
+        &ctx.secret_vault,
+        ctx.registry.downgrade(),
+    );
+    ctx.global_redaction = ctx.global_coverage.shared_table();
     ctx.config_source = source;
     let ctx = Arc::new(ctx);
     ctx.registry.coverage_authority().invalidate();
@@ -43699,7 +43706,7 @@ async fn unavailable_global_coverage_still_delivers_content_free_events() {
 
     ctx.broadcast_global(proto::Event::DaemonDraining { forced: false });
     assert!(matches!(
-        rx.try_recv().expect("drain is delivered").event,
+        scrubbed_for_non_owner(rx.try_recv().expect("drain is delivered")),
         proto::Event::DaemonDraining { forced: false }
     ));
     ctx.broadcast_global(proto::Event::CaffeinateState {
@@ -43707,14 +43714,149 @@ async fn unavailable_global_coverage_still_delivers_content_free_events() {
         lid_close_guaranteed: false,
         message: Some("free text".into()),
     });
+    let envelope = rx.try_recv().expect("caffeinate state is delivered");
+    assert!(
+        matches!(
+            &envelope.event,
+            proto::Event::CaffeinateState { message: Some(text), .. } if text == "free text"
+        ),
+        "owners still receive the event unchanged"
+    );
     assert!(matches!(
-        rx.try_recv().expect("caffeinate state is delivered").event,
+        scrubbed_for_non_owner(envelope),
         proto::Event::CaffeinateState {
             active: true,
             message: None,
             ..
         }
     ));
+
+    // An event with no content-free form really is withheld from non-owners.
+    ctx.broadcast_global(proto::Event::LspNotice {
+        text: "workspace installer output".into(),
+    });
+    let envelope = rx.try_recv().expect("the envelope reaches the bus");
+    assert!(
+        envelope
+            .redact
+            .project_for_non_owner(envelope.event, scrub_event_free_text)
+            .is_none(),
+        "a free-text-only event is withheld from non-owners"
+    );
+
+    // Host capabilities keep their structure but lose every free-text field.
+    let mut snapshot = proto::HostCapabilitySnapshot::unpublished();
+    snapshot.generation = 7;
+    snapshot.features.push(proto::FeatureCapabilityRow {
+        id: "sandbox".into(),
+        state: proto::FeatureCapabilityState::Missing,
+        reason: "secret-bearing reason".into(),
+        fix_command: Some("fix --token secret".into()),
+        remedy_text: Some("remedy".into()),
+        dependency_ids: vec!["bwrap".into()],
+    });
+    snapshot.secret_store.fail_closed_reason = Some("secret-bearing reason".into());
+    ctx.broadcast_global(proto::Event::HostCapabilitiesChanged { snapshot });
+    let proto::Event::HostCapabilitiesChanged { snapshot } =
+        scrubbed_for_non_owner(rx.try_recv().expect("host capabilities are delivered"))
+    else {
+        panic!("expected HostCapabilitiesChanged");
+    };
+    assert_eq!(snapshot.generation, 7);
+    assert_eq!(
+        snapshot.features[0].state,
+        proto::FeatureCapabilityState::Missing
+    );
+    assert_eq!(
+        snapshot.features[0].dependency_ids,
+        vec!["bwrap".to_string()]
+    );
+    assert_eq!(
+        snapshot.features[0].reason,
+        crate::daemon::global_coverage::CONTENT_FREE_REASON
+    );
+    assert_eq!(snapshot.features[0].fix_command, None);
+    assert_eq!(snapshot.features[0].remedy_text, None);
+    assert_eq!(
+        snapshot.secret_store.fail_closed_reason.as_deref(),
+        Some(crate::daemon::global_coverage::CONTENT_FREE_REASON)
+    );
+}
+
+/// T1: overlapping secrets from the daemon-global and the originating
+/// session's tables are matched against the original text together. Applied
+/// one after the other, the global replacement would cut the session match
+/// and leave its `WXYZ` suffix behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_event_scrub_covers_overlaps_across_tables() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_ssh_keys = false;
+    extended.redact.denylist = vec!["abcdefghij".to_string()];
+    let source =
+        crate::daemon::config_source::ConfigSource::fixed(stub_providers_config(), extended);
+    let ctx = test_ctx_with_config_source(source.clone());
+    let global = acquire_daemon_redaction_table(
+        ctx.registry.coverage_authority().clone(),
+        &source,
+        &ctx.secret_vault,
+        &ctx.registry.command_secret_cache(),
+        crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
+    )
+    .await
+    .expect("bound daemon-global table");
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join(".env"),
+        "WORKSPACE_TOKEN=cdefghijWXYZ\n",
+    )
+    .unwrap();
+    let session = bound_session_table(
+        &ctx,
+        workspace.path(),
+        crate::config::extended::RedactConfig {
+            scan_ssh_keys: false,
+            ..crate::config::extended::RedactConfig::default()
+        },
+    )
+    .await;
+    assert!(
+        global.scrub("abcdefghij") != "abcdefghij",
+        "precondition: global covers"
+    );
+    assert!(
+        session.scrub("cdefghijWXYZ") != "cdefghijWXYZ",
+        "precondition: session covers"
+    );
+    let sequential = session.scrub(&global.scrub("abcdefghijWXYZ"));
+    assert!(
+        sequential.contains("WXYZ"),
+        "precondition: sequential application leaks the overlap suffix: {sequential}"
+    );
+
+    let composite = crate::daemon::EventScrub::with_origin(&global, &session)
+        .expect("scrub-only composite of two lineages");
+    let scrubbed = composite.scrub("abcdefghijWXYZ");
+    assert!(!scrubbed.contains("WXYZ"), "{scrubbed}");
+    assert!(!scrubbed.contains("cdefghij"), "{scrubbed}");
+
+    // The same composite is what the global bus delivers.
+    set_current_redaction(&ctx.global_redaction, global.clone());
+    let bus = crate::daemon::GlobalEventBus {
+        tx: ctx.global_events.clone(),
+        coverage: ctx.global_coverage.clone(),
+    };
+    let mut rx = ctx.subscribe_global();
+    bus.send_from_origin(
+        &session,
+        proto::Event::LspNotice {
+            text: "abcdefghijWXYZ".into(),
+        },
+    );
+    let proto::Event::LspNotice { text } = scrubbed_for_non_owner(rx.try_recv().unwrap()) else {
+        panic!("expected LspNotice");
+    };
+    assert!(!text.contains("WXYZ"), "{text}");
 }
 
 /// Any coverage-authority invalidation (for example a command secret
@@ -43757,6 +43899,56 @@ async fn authority_invalidation_republishes_global_coverage() {
             .scrub(GLOBAL_SECRET)
             .contains(GLOBAL_SECRET),
         "the invalidation must republish the daemon-global table"
+    );
+}
+
+/// C3: a session-originated global event gets the same freshness check as a
+/// daemon-global broadcast. After an authority invalidation the bus
+/// republishes before scrubbing, instead of using the stale published table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_originated_events_republish_stale_global_coverage() {
+    const GLOBAL_SECRET: &str = "origin-send-after-invalidate-canary-2b4d";
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_ssh_keys = false;
+    let denylist = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let live = denylist.clone();
+    let source = crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| {
+            let mut extended = extended.clone();
+            extended.redact.denylist = live.lock().unwrap().clone();
+            Ok((stub_providers_config(), extended))
+        },
+        |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx_with_config_source(source);
+    // Publish a current table that does not cover the secret yet.
+    ctx.broadcast_global(proto::Event::DaemonDraining { forced: false });
+    assert_eq!(
+        current_redaction(&ctx.global_redaction).scrub(GLOBAL_SECRET),
+        GLOBAL_SECRET
+    );
+    denylist.lock().unwrap().push(GLOBAL_SECRET.to_string());
+    ctx.registry.coverage_authority().invalidate();
+
+    let bus = crate::daemon::GlobalEventBus {
+        tx: ctx.global_events.clone(),
+        coverage: ctx.global_coverage.clone(),
+    };
+    let mut rx = ctx.subscribe_global();
+    bus.send_from_origin(
+        &Arc::new(RedactionTable::empty()),
+        proto::Event::LspNotice {
+            text: format!("installer echoed {GLOBAL_SECRET}"),
+        },
+    );
+    let proto::Event::LspNotice { text } = scrubbed_for_non_owner(rx.try_recv().unwrap()) else {
+        panic!("expected LspNotice");
+    };
+    assert!(
+        !text.contains(GLOBAL_SECRET),
+        "stale global table used: {text}"
     );
 }
 

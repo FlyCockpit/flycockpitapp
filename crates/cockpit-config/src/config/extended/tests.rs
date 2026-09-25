@@ -4503,3 +4503,48 @@ fn unknown_top_level_keys_survive_a_typed_write() {
         "unknown keys are preserved on write, not deleted"
     );
 }
+
+/// T9: an unreadable installation layer is reported by path and a value-free
+/// kind. A malformed root or a JSON syntax error in a layer holding
+/// credentials never copies any byte of the layer into the error.
+#[test]
+fn installation_policy_errors_never_quote_layer_values() {
+    use InstallationPolicyUnavailable as U;
+    const SECRET: &str = "sk-live-credential-value-5e7a";
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for (body, expected) in [
+        (
+            format!(r#"[{{"providers":{{"p":{{"api_key":"{SECRET}"}}}}}}]"#),
+            U::RootNotObject { found: "an array" },
+        ),
+        (
+            format!(r#""{SECRET}""#),
+            U::RootNotObject { found: "a string" },
+        ),
+        (
+            format!("{{\n  \"redact\": {{\"denylist\": [\"{SECRET}\""),
+            U::MalformedJson { line: 2, column: 0 },
+        ),
+    ] {
+        let path = write_global_layer(&body);
+        let error = load_installation_policy(InstallationPolicySection::Redact)
+            .expect_err("an unreadable installation layer fails closed");
+        let rendered = error.to_string();
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(!format!("{error:?}").contains(SECRET), "{error:?}");
+        assert_eq!(error.path.as_deref(), Some(path.as_path()));
+        match (error.problem, expected) {
+            (
+                InstallationPolicyProblem::Unavailable(U::MalformedJson { line, .. }),
+                U::MalformedJson {
+                    line: expected_line,
+                    ..
+                },
+            ) => assert_eq!(line, expected_line, "{rendered}"),
+            (problem, expected) => {
+                assert_eq!(problem, InstallationPolicyProblem::Unavailable(expected))
+            }
+        }
+    }
+}

@@ -668,9 +668,22 @@ fn take_forced_metadata_failure() -> bool {
     take_forced_failure(&FORCE_POST_CLEANUP_METADATA_FAILURE)
 }
 
+/// Characters that would let one entry name address anything other than a
+/// single child of the held directory. `\` is a separator only on Windows;
+/// on Unix it is an ordinary filename character (`a\b.txt` is one entry), so
+/// refusing it there would reject legitimate names without protecting any
+/// walk. `:` selects an alternate data stream on Windows.
+#[cfg(windows)]
+const UNSAFE_COMPONENT_CHARS: [char; 4] = ['/', '\\', ':', '\0'];
+#[cfg(not(windows))]
+const UNSAFE_COMPONENT_CHARS: [char; 2] = ['/', '\0'];
+
 fn validate_component(value: &str) -> Result<()> {
     ensure!(
-        !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\', '\0']),
+        !value.is_empty()
+            && value != "."
+            && value != ".."
+            && !value.contains(UNSAFE_COMPONENT_CHARS),
         "unsafe held-directory entry name"
     );
     Ok(())
@@ -720,6 +733,31 @@ mod imp {
             &metadata.dev().to_be_bytes(),
             &metadata.ino().to_be_bytes(),
         ]))
+    }
+
+    /// Open a leaf that must be a regular file, beneath an already-held
+    /// parent, without following a final symlink. `O_NONBLOCK` makes a leaf
+    /// that is a FIFO or device fail the type check instead of blocking the
+    /// open until a writer appears; once the descriptor is known to be a
+    /// regular file the flag is cleared, so every caller receives an ordinary
+    /// blocking descriptor (on FUSE the flag's effect on reads is
+    /// filesystem-defined).
+    fn open_regular_leaf(
+        parent: &File,
+        leaf: &std::ffi::CStr,
+        open_context: &'static str,
+        not_regular: &'static str,
+    ) -> Result<File> {
+        let file = held_fd::openat(
+            parent.as_raw_fd(),
+            leaf,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+        .context(open_context)?;
+        ensure!(file.metadata()?.is_file(), "{not_regular}");
+        crate::bounded::clear_nonblock(&file)
+            .context("clearing O_NONBLOCK on a held regular file")?;
+        Ok(file)
     }
 
     #[derive(Debug)]
@@ -846,16 +884,12 @@ mod imp {
                 );
             }
             let leaf = CString::new(*leaf).context("workspace leaf has NUL")?;
-            let mut file = held_fd::openat(
-                parent.as_raw_fd(),
+            let mut file = open_regular_leaf(
+                &parent,
                 &leaf,
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-            .context("opening held workspace definition")?;
-            ensure!(
-                file.metadata()?.is_file(),
-                "held workspace definition is not a regular file"
-            );
+                "opening held workspace definition",
+                "held workspace definition is not a regular file",
+            )?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
                 .context("reading held workspace definition")?;
@@ -881,20 +915,12 @@ mod imp {
                 );
             }
             let leaf = CString::new(*leaf).context("workspace leaf has NUL")?;
-            // O_NONBLOCK: a leaf replaced by a FIFO must fail the type check
-            // below rather than block this open until a writer appears. It
-            // has no effect on reads of the regular file that is returned.
-            let file = held_fd::openat(
-                parent.as_raw_fd(),
+            open_regular_leaf(
+                &parent,
                 &leaf,
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                "opening held workspace regular file",
+                "held workspace source is not a regular file",
             )
-            .context("opening held workspace regular file")?;
-            ensure!(
-                file.metadata()?.is_file(),
-                "held workspace source is not a regular file"
-            );
-            Ok(file)
         }
 
         pub(super) fn read_regular_file_bounded(
@@ -920,15 +946,15 @@ mod imp {
                 );
             }
             let leaf = CString::new(*leaf).context("workspace leaf has NUL")?;
-            let mut file = held_fd::openat(
-                parent.as_raw_fd(),
+            let file = open_regular_leaf(
+                &parent,
                 &leaf,
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-            .context("opening held workspace definition")?;
+                "opening held workspace definition",
+                "held workspace definition is not a bounded regular file",
+            )?;
             let metadata = file.metadata()?;
             ensure!(
-                metadata.is_file() && metadata.len() <= max_bytes as u64,
+                metadata.len() <= max_bytes as u64,
                 "held workspace definition is not a bounded regular file"
             );
             let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -1010,15 +1036,15 @@ mod imp {
                 );
             }
             let leaf = CString::new(*leaf).context("workspace executable leaf has NUL")?;
-            let file = held_fd::openat(
-                parent.as_raw_fd(),
+            let file = open_regular_leaf(
+                &parent,
                 &leaf,
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-            .context("opening held workspace executable")?;
+                "opening held workspace executable",
+                "held workspace executable is not a bounded regular file",
+            )?;
             let metadata = file.metadata()?;
             ensure!(
-                metadata.is_file() && metadata.len() <= max_bytes as u64,
+                metadata.len() <= max_bytes as u64,
                 "held workspace executable is not a bounded regular file"
             );
             let executable = metadata.mode() & 0o111 != 0;
@@ -1540,17 +1566,12 @@ mod imp {
             named.st_mode & libc::S_IFMT == libc::S_IFREG,
             "held artifact entry is not a regular file"
         );
-        let file = held_fd::openat(
-            dir.as_raw_fd(),
+        open_regular_leaf(
+            dir,
             &name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            "reopening held artifact",
+            "held artifact entry is not a regular file",
         )
-        .context("reopening held artifact")?;
-        ensure!(
-            file.metadata()?.is_file(),
-            "held artifact entry is not a regular file"
-        );
-        Ok(file)
     }
 
     pub(super) fn entry_absent(dir: &File, name: &str) -> Result<bool> {
@@ -1663,6 +1684,8 @@ mod imp {
                     )?;
                 } else {
                     ensure!(metadata.is_file(), "held package entry is not regular");
+                    crate::bounded::clear_nonblock(&held)
+                        .context("clearing O_NONBLOCK on a held package file")?;
                     ensure!(
                         metadata.len() <= per_file_limit as u64,
                         "held package file exceeds its byte limit"

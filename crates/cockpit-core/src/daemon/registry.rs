@@ -231,6 +231,20 @@ pub struct SessionRegistry {
     inner: Arc<Inner>,
 }
 
+/// A non-owning handle to a [`SessionRegistry`], for state the registry
+/// itself holds (the daemon-global bus's coverage) that must read registry
+/// state without keeping the registry alive.
+#[derive(Clone)]
+pub struct WeakSessionRegistry {
+    inner: std::sync::Weak<Inner>,
+}
+
+impl WeakSessionRegistry {
+    pub fn upgrade(&self) -> Option<SessionRegistry> {
+        self.inner.upgrade().map(|inner| SessionRegistry { inner })
+    }
+}
+
 struct Inner {
     db: Db,
     guidance_proposals:
@@ -1024,9 +1038,19 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.resource_scheduler) = scheduler;
     }
 
-    pub fn set_global_bus(&self, tx: EventSender, redaction: crate::daemon::SharedRedactionTable) {
+    pub fn set_global_bus(
+        &self,
+        tx: EventSender,
+        coverage: crate::daemon::global_coverage::GlobalCoverage,
+    ) {
         *crate::sync::lock_or_recover(&self.inner.global_bus) =
-            Some(crate::daemon::GlobalEventBus { tx, redaction });
+            Some(crate::daemon::GlobalEventBus { tx, coverage });
+    }
+
+    pub fn downgrade(&self) -> WeakSessionRegistry {
+        WeakSessionRegistry {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     #[cfg(feature = "extended")]
@@ -2636,8 +2660,11 @@ impl SessionRegistry {
         // workspace discovery. Ambient-only providers deliberately have no
         // worker-local persistence target.
         let session_active = resolve_session_active_model(&providers_cfg, &session)?;
-        let config_path = workspace_root_authority
-            .provider_write_target(&workspace_layer, &session_active.provider);
+        let config_path = workspace_root_authority.provider_write_target(
+            &workspace_layer,
+            &session_active.provider,
+            &trust_policy,
+        );
         let model = resolve_session_worker_model(
             &providers_cfg,
             &extended_cfg,

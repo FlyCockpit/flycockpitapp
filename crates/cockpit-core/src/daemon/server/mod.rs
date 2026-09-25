@@ -125,7 +125,7 @@ fn build_test_daemon_redaction_table(
     Ok(Arc::new(built))
 }
 
-async fn acquire_daemon_redaction_table(
+pub(crate) async fn acquire_daemon_redaction_table(
     authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
     config_source: &crate::daemon::config_source::ConfigSource,
     vault: &Arc<crate::secure_key::SecretVault>,
@@ -240,7 +240,7 @@ async fn acquire_daemon_global_coverage(
 /// production path on its existing runtime, but give current-thread callers
 /// a dedicated runtime so acquisition can make progress while this thread is
 /// parked waiting for the synchronous publication contract.
-fn acquire_daemon_redaction_table_blocking(
+pub(crate) fn acquire_daemon_redaction_table_blocking(
     authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
     config_source: crate::daemon::config_source::ConfigSource,
     vault: Arc<crate::secure_key::SecretVault>,
@@ -297,57 +297,9 @@ fn scrub_event_for_principal(
     if principal.has_owner_level_authority() {
         return Some(envelope.event);
     }
-    let mut event = envelope.event;
-    for table in envelope.redact.tables() {
-        scrub_event_free_text(&mut event, table);
-    }
-    Some(event)
-}
-
-/// The content-free form of a daemon-global event, delivered when coverage
-/// for its free text is unavailable. Structural fields that clients act on
-/// are kept; every free-text field is removed. `None` for an event with no
-/// such form, or one this projection does not know (new producers are
-/// withheld by default until they declare a content-free form here).
-fn content_free_global_event(event: proto::Event) -> Option<proto::Event> {
-    match event {
-        // No free text at all.
-        event @ (proto::Event::DaemonDraining { .. }
-        | proto::Event::DaemonLifetimeChanged { .. }
-        | proto::Event::Reconnect { .. }
-        | proto::Event::OnboardingBootstrap(_)) => Some(event),
-        #[cfg(feature = "extended")]
-        event @ proto::Event::ImageControlConfigChanged { .. } => Some(event),
-        proto::Event::CaffeinateState {
-            active,
-            lid_close_guaranteed,
-            message: _,
-        } => Some(proto::Event::CaffeinateState {
-            active,
-            lid_close_guaranteed,
-            message: None,
-        }),
-        #[cfg(feature = "remote")]
-        proto::Event::ConnectorStatus {
-            enabled,
-            status,
-            relay_url,
-            relay_id,
-            relay_region,
-            last_error: _,
-        } => Some(proto::Event::ConnectorStatus {
-            enabled,
-            status,
-            relay_url,
-            relay_id,
-            relay_region,
-            last_error: None,
-        }),
-        // Advisory payloads that are themselves the free text; clients
-        // re-read host capabilities on demand and drift warnings repeat on
-        // the next attach.
-        _ => None,
-    }
+    envelope
+        .redact
+        .project_for_non_owner(envelope.event, scrub_event_free_text)
 }
 
 fn scrub_proto_event(event: proto::Event, redact: &RedactionTable) -> Option<proto::Event> {
@@ -1830,6 +1782,17 @@ fn scrub_host_capability_snapshot(
     }
     for row in &mut snapshot.dependencies {
         scrub_string(&mut row.reason, redact);
+        // Probe-derived values: a discovered version string and structured
+        // cause/remedy payloads can echo tool output.
+        if let Some(version) = &mut row.discovered_version {
+            scrub_string(version, redact);
+        }
+        if let Some(cause) = &mut row.cause {
+            scrub_json_strings(cause, redact);
+        }
+        if let Some(remedy) = &mut row.remedy {
+            scrub_json_strings(remedy, redact);
+        }
     }
     if let Some(reason) = &mut snapshot.secret_store.fail_closed_reason {
         scrub_string(reason, redact);
@@ -2826,19 +2789,13 @@ pub struct DaemonContext {
     /// (if any) session it's attached to — so a daemon-global event like
     /// [`proto::Event::CaffeinateState`] reaches *all* connected clients.
     global_events: EventSender,
+    /// Read side of the published daemon-global table (the same cell
+    /// `global_coverage` publishes into).
     global_redaction: SharedRedactionTable,
-    /// Vault inventory generation reflected by the currently published
-    /// `global_redaction` table. `broadcast_global` rebuilds the table only
-    /// when the live vault generation has advanced past this value, so a
-    /// direct/cross-process vault write still refreshes redaction while a
-    /// bursty broadcast with no vault change stays cheap. `0` forces a rebuild
-    /// on the first broadcast after construction.
-    redaction_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Coverage-authority epoch the published daemon-global table was
-    /// acquired under. Any authority invalidation (for example a command
-    /// secret resolving) advances the epoch, so the broadcast fast path
-    /// republishes even when the vault generation did not move.
-    redaction_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Publication state of the daemon-global table: the one place the table
+    /// and its freshness stamps are published together, monotonically, by
+    /// every producer (stale broadcast, refresh, vault callback).
+    global_coverage: crate::daemon::global_coverage::GlobalCoverage,
     pub terminal_host: crate::daemon::terminal::TerminalHostHandle,
     /// Live client state. Each protocol-active transport increments the count
     /// and permanently records that this owner has served a client.
@@ -3479,7 +3436,7 @@ impl DaemonContext {
         registry.set_secret_vault(secret_vault.clone());
         config_source.install_vault(secret_vault.clone());
         let boot_coverage_admitted = boot_redaction.is_some();
-        let global_redaction = Arc::new(std::sync::RwLock::new(match boot_redaction {
+        let boot_table = match boot_redaction {
             Some(redaction) => redaction,
             None => {
                 #[cfg(any(test, feature = "test-support"))]
@@ -3491,51 +3448,43 @@ impl DaemonContext {
                 #[cfg(not(any(test, feature = "test-support")))]
                 panic!("production daemon construction requires admitted boot coverage")
             }
-        }));
-        let redaction_generation = Arc::new(std::sync::atomic::AtomicU64::new(
-            secret_vault
-                .current_inventory_generation()
-                .unwrap_or(u64::from(boot_coverage_admitted)),
-        ));
+        };
+        // An admitted boot table is stamped with the epoch it was admitted
+        // under; an unadmitted test table carries epoch 0 so the first use
+        // after any invalidation republishes it.
+        let boot_generation = secret_vault
+            .current_inventory_generation()
+            .unwrap_or(u64::from(boot_coverage_admitted));
+        let boot_epoch = if boot_coverage_admitted {
+            coverage_authority.epoch()
+        } else {
+            0
+        };
+        let global_coverage = crate::daemon::global_coverage::GlobalCoverage::new(
+            boot_table,
+            boot_generation,
+            boot_epoch,
+            coverage_authority.clone(),
+            config_source.clone(),
+            &secret_vault,
+            registry.downgrade(),
+        );
+        let global_redaction = global_coverage.shared_table();
         // MCP connections retain only the vault handle, not the full daemon
         // context. Install the owner publication seam here so an in-band
         // OAuth refresh cannot commit a new token while leaving the active
-        // daemon redaction table stale. A Weak avoids a vault↔callback cycle.
-        let publisher_redaction = global_redaction.clone();
-        let publisher_config = config_source.clone();
-        let publisher_vault = Arc::downgrade(&secret_vault);
+        // daemon redaction table stale. It publishes through the same
+        // monotonic publication state as every other producer.
+        let publisher_coverage = global_coverage.clone();
         let publisher_authority = coverage_authority.clone();
-        let publisher_cache = registry.command_secret_cache();
-        let redaction_epoch = Arc::new(std::sync::atomic::AtomicU64::new(
-            if boot_coverage_admitted {
-                coverage_authority.epoch()
-            } else {
-                0
-            },
-        ));
-        let publisher_generation = redaction_generation.clone();
-        let publisher_epoch = redaction_epoch.clone();
         secret_vault.install_owner_redaction_publisher(Arc::new(move || {
             publisher_authority.invalidate();
-            let vault = publisher_vault
-                .upgrade()
-                .ok_or_else(|| "daemon vault is no longer available".to_string())?;
-            let generation = vault
-                .current_inventory_generation()
-                .map_err(|error| error.to_string())?;
-            let epoch = publisher_authority.epoch();
-            let table = acquire_daemon_redaction_table_blocking(
-                publisher_authority.clone(),
-                publisher_config.clone(),
-                vault,
-                publisher_cache.clone(),
-                crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
-            )
-            .map_err(|error| error.to_string())?;
-            set_current_redaction(&publisher_redaction, table);
-            publisher_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
-            publisher_epoch.store(epoch, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+            publisher_coverage
+                .republish_blocking(
+                    crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
+                )
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"))
         }));
         #[cfg(debug_assertions)]
         let agent_installation_fixture =
@@ -3557,8 +3506,8 @@ impl DaemonContext {
         crate::daemon::bulk_staging::spawn_reaper(shutdown.clone());
         registry
             .lsp_manager()
-            .set_notice_bus(global_events.clone(), global_redaction.clone());
-        registry.set_global_bus(global_events.clone(), global_redaction.clone());
+            .set_notice_bus(global_events.clone(), global_coverage.clone());
+        registry.set_global_bus(global_events.clone(), global_coverage.clone());
         #[cfg(feature = "extended")]
         let scheduler = (!paths.ephemeral)
             .then(|| start_persistent_scheduler(&db, &secret_vault, &registry, &shutdown, None))
@@ -3691,8 +3640,7 @@ impl DaemonContext {
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
             global_redaction,
-            redaction_generation,
-            redaction_epoch,
+            global_coverage,
             terminal_host,
             client_presence,
             shutdown,
@@ -4324,113 +4272,22 @@ impl DaemonContext {
         self.global_events.subscribe()
     }
 
-    /// Broadcast a daemon-global event to all connected clients.
+    /// Broadcast a daemon-global event to all connected clients through the
+    /// one global delivery funnel: scrubbed with a current daemon-global
+    /// table (republished first when stale). When coverage is unavailable,
+    /// clients still receive every event they wait on (drain, reconnect,
+    /// onboarding, lifetime, caffeinate) in its content-free form.
     pub fn broadcast_global(&self, event: proto::Event) {
-        if self.global_coverage_is_current() {
-            send_event(
-                &self.global_events,
-                &current_redaction(&self.global_redaction),
-                event,
-            );
-            return;
-        }
-        match self.republish_global_redaction_blocking() {
-            Ok(table) => send_event(&self.global_events, &table, event),
-            Err(error) => {
-                // Coverage for the event's free text is unavailable. Clients
-                // wait on several of these events (drain, reconnect,
-                // onboarding, lifetime, caffeinate), so they are never simply
-                // dropped: every free-text field is removed and the resulting
-                // content-free event is delivered. An event with no
-                // content-free projection is withheld, and says so.
-                let error = format!("{error:#}");
-                match content_free_global_event(event) {
-                    Some(event) => {
-                        tracing::warn!(
-                            error = %error,
-                            "daemon-global coverage unavailable; delivering event without free text"
-                        );
-                        send_event(
-                            &self.global_events,
-                            &current_redaction(&self.global_redaction),
-                            event,
-                        );
-                    }
-                    None => tracing::error!(
-                        error = %error,
-                        "daemon event withheld: coverage is unavailable and it has no content-free form"
-                    ),
-                }
-            }
-        }
-    }
-
-    /// Whether the published daemon-global table still reflects the current
-    /// vault generation *and* the current coverage-authority epoch.
-    fn global_coverage_is_current(&self) -> bool {
-        let Ok(generation) = self.secret_vault.current_inventory_generation() else {
-            return false;
-        };
-        generation
-            == self
-                .redaction_generation
-                .load(std::sync::atomic::Ordering::SeqCst)
-            && self.registry.coverage_authority().epoch()
-                == self
-                    .redaction_epoch
-                    .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn republish_global_redaction_blocking(&self) -> Result<Arc<RedactionTable>> {
-        let generation = self
-            .secret_vault
-            .current_inventory_generation()
-            .context("reading daemon redaction source revision")?;
-        let epoch = self.registry.coverage_authority().epoch();
-        let table = acquire_daemon_redaction_table_blocking(
-            self.registry.coverage_authority().clone(),
-            self.config_source.clone(),
-            self.secret_vault.clone(),
-            self.registry.command_secret_cache(),
-            crate::redact::coverage_authority::CoverageScope::DaemonGlobalEvent,
-        )?;
-        set_current_redaction(&self.global_redaction, table.clone());
-        self.redaction_generation
-            .store(generation, std::sync::atomic::Ordering::SeqCst);
-        self.redaction_epoch
-            .store(epoch, std::sync::atomic::Ordering::SeqCst);
-        Ok(table)
+        self.global_coverage
+            .deliver(&self.global_events, None, event);
     }
 
     pub(crate) async fn refresh_redaction_table(&self) -> Result<()> {
         self.registry.coverage_authority().invalidate();
-        self.republish_global_redaction().await
-    }
-
-    async fn republish_global_redaction(&self) -> Result<()> {
-        let authority = self.registry.coverage_authority().clone();
-        let source = self.config_source.clone();
-        let vault = self.secret_vault.clone();
-        let command_cache = self.registry.command_secret_cache();
-        let shared = self.global_redaction.clone();
-        let published_generation = self.redaction_generation.clone();
-        let generation = vault
-            .current_inventory_generation()
-            .context("reading daemon redaction source revision")?;
-        let epoch = authority.epoch();
-        let table = acquire_daemon_redaction_table(
-            authority,
-            &source,
-            &vault,
-            &command_cache,
-            crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
-        )
-        .await?;
-        set_current_redaction(&shared, table.clone());
-        published_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
-        self.redaction_epoch
-            .store(epoch, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
+        self.global_coverage
+            .republish(crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh)
+            .await
+            .map(|_| ())
     }
 
     #[cfg(test)]

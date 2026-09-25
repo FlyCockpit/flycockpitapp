@@ -4185,7 +4185,9 @@ fn disabled_table() -> TestArc<RedactionTable> {
         enabled: false,
         ..RedactConfig::default()
     };
-    TestArc::new(RedactionTable::build(&cfg, std::path::Path::new(".")).unwrap())
+    // Sources resolve against an absolute workspace root, never the cwd.
+    let workspace = tempfile::tempdir().unwrap();
+    TestArc::new(RedactionTable::build(&cfg, workspace.path()).unwrap())
 }
 
 #[test]

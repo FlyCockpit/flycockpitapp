@@ -201,9 +201,14 @@ fn migrate_effective_layers_once_with_store(
     let paths = crate::config::dirs::config_file_paths_for_load(cwd);
     let seen = MIGRATED_LAYERS.get_or_init(|| Mutex::new(HashSet::new()));
     let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The migration rewrites literal headers in place, so it only touches a
+    // layer the trust policy permits writing. A readable-but-unwritable
+    // layer (an explicit override inside an ignored project `.cockpit/`) is
+    // left unmarked and migrates once the workspace is trusted.
     let pending = paths
         .into_iter()
         .filter(|path| !seen.contains(path))
+        .filter(|path| crate::config::dirs::config_layer_write_allowed(path))
         .collect::<Vec<_>>();
     if pending.is_empty() {
         return Ok(());

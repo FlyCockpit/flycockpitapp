@@ -19,6 +19,10 @@ use uuid::Uuid;
 
 use super::RedactionTable;
 
+/// Domain of every coverage binding digest, pinned in
+/// `internal_version_pins.rs`.
+pub(crate) const COVERAGE_BINDING_DOMAIN: &[u8] = b"flycockpit-redaction-coverage-binding-v1\0";
+
 pub(crate) const COVERAGE_WORKERS: usize = 2;
 pub(crate) const COVERAGE_QUEUE: usize = 32;
 pub(crate) const COVERAGE_FLIGHTS: usize = 64;
@@ -81,7 +85,7 @@ impl CoverageBinding {
     /// The result never crosses a protocol or diagnostic boundary.
     pub(crate) fn derive(domain: &[u8], identity: &[u8]) -> Self {
         let mut digest = Sha256::new();
-        digest.update(b"flycockpit-redaction-coverage-binding-v1\0");
+        digest.update(COVERAGE_BINDING_DOMAIN);
         digest.update(domain);
         digest.update([0]);
         digest.update(identity);

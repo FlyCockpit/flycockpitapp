@@ -64,8 +64,10 @@ fn open_nonblocking_read(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
+/// Clear `O_NONBLOCK` on a descriptor opened non-blocking only so a FIFO or
+/// device could fail its type check without blocking the open.
 #[cfg(unix)]
-fn clear_nonblock(file: &File) -> io::Result<()> {
+pub(crate) fn clear_nonblock(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let fd = file.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };

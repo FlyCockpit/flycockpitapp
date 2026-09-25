@@ -18,11 +18,13 @@ pub(crate) fn read_workspace_config_bytes(path: &Path) -> Result<Option<Vec<u8>>
         {
             Ok(None)
         }
-        Err(cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. }) => {
-            anyhow::bail!(
+        Err(error @ cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. }) => {
+            // Keep the typed cause in the chain so callers can classify it
+            // without matching message text.
+            Err(anyhow::Error::new(error).context(format!(
                 "{} exceeds the {limit} byte limit ({actual} bytes)",
                 path.display()
-            )
+            )))
         }
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }

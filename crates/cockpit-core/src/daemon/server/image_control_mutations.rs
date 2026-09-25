@@ -994,6 +994,16 @@ pub(crate) async fn dispatch_image_control_mutation(
     // merged/effective projection: that would flatten inherited values into a
     // different layer and mutate the authority model as a side effect.
     let layer = authoritative_image_layer(ctx, &cwd, &trust_policy).map_err(internal)?;
+    // Reading the layer does not make it writable: an explicit override (or
+    // a scaffold) inside a project `.cockpit/` the policy ignores is refused
+    // by the shared config-layer write gate.
+    if !crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        cockpit_config::config::dirs::config_layer_write_allowed(&layer.target)
+    }) {
+        return Err(bad_request(
+            "the image config layer is not writable under the current workspace trust policy",
+        ));
+    }
     let target = layer.target;
     let target_display = target.to_string_lossy().into_owned();
     let read_target = target.clone();

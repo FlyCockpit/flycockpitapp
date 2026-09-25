@@ -261,7 +261,16 @@ pub fn current_workspace_trust_policy() -> Option<WorkspaceTrustPolicy> {
 }
 
 pub fn project_config_allowed(cockpit_dir: &Path) -> bool {
-    let Some(policy) = runtime_policy() else {
+    project_config_allowed_for_policy(cockpit_dir, runtime_policy().as_ref())
+}
+
+/// [`project_config_allowed`] against an explicit policy rather than the
+/// ambient one. `None` (no policy resolved) fails closed.
+pub fn project_config_allowed_for_policy(
+    cockpit_dir: &Path,
+    policy: Option<&WorkspaceTrustPolicy>,
+) -> bool {
+    let Some(policy) = policy else {
         return false;
     };
     if policy.mode == WorkspaceTrustMode::Trust {

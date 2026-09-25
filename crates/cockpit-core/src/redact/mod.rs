@@ -1386,7 +1386,7 @@ impl RedactionTable {
         // secret — key material must never be dropped by the prune step.
         if cfg.scan_ssh_keys {
             let ssh_key_dir = ssh::resolve_ssh_key_dir(scope, cfg.ssh_key_dir.as_deref())?;
-            let collected = collect_ssh_key_candidates(ssh_key_dir.as_deref())?;
+            let collected = collect_ssh_key_candidates(ssh_key_dir.as_ref())?;
             capture.ssh = Some(coverage_bindings::ssh_candidates_digest(&collected));
             for (value, origin) in collected {
                 candidates.push(Candidate::forced(value, origin, true));
@@ -1614,20 +1614,7 @@ impl RedactionTable {
     }
 
     pub fn union(&self, other: &Self) -> Result<Self> {
-        let mut entries = self.entries.clone();
-        entries.extend(other.entries.iter().cloned());
-        let mut unsupported_files = self.unsupported_files.clone();
-        unsupported_files.extend(other.unsupported_files.iter().cloned());
-        unsupported_files.sort();
-        unsupported_files.dedup();
-        let protected = self.protected.union(&other.protected);
-        let mut merged = Self::from_redaction_entries(
-            entries,
-            self.placeholder.clone(),
-            self.disabled && other.disabled,
-            unsupported_files,
-            protected,
-        )?;
+        let mut merged = self.merged_entries(other)?;
         merged.coverage_binding = match (&self.coverage_binding, &other.coverage_binding) {
             (Some(left), Some(right)) => match left.binding_ordering(right) {
                 Some(std::cmp::Ordering::Equal) => Some(left.clone()),
@@ -1644,6 +1631,36 @@ impl RedactionTable {
             (None, None) => None,
         };
         Ok(merged)
+    }
+
+    /// Scrub-only merge of two tables of *any* coverage lineage.
+    ///
+    /// Every entry of both tables is matched against the original text in one
+    /// pass, so the single-table overlap handling applies across the two
+    /// entry sets (applying the tables one after another would let the first
+    /// table's replacement cut a second-table match and leak its suffix). The
+    /// result carries **no** coverage binding: it is not the coverage of any
+    /// lineage and must never be installed or published. Only
+    /// [`crate::daemon::EventScrub`] holds one, and it exposes no table.
+    pub(crate) fn scrub_only_union(&self, other: &Self) -> Result<Self> {
+        self.merged_entries(other)
+    }
+
+    fn merged_entries(&self, other: &Self) -> Result<Self> {
+        let mut entries = self.entries.clone();
+        entries.extend(other.entries.iter().cloned());
+        let mut unsupported_files = self.unsupported_files.clone();
+        unsupported_files.extend(other.unsupported_files.iter().cloned());
+        unsupported_files.sort();
+        unsupported_files.dedup();
+        let protected = self.protected.union(&other.protected);
+        Self::from_redaction_entries(
+            entries,
+            self.placeholder.clone(),
+            self.disabled && other.disabled,
+            unsupported_files,
+            protected,
+        )
     }
 
     /// Add one caller-supplied ordinary literal to this table.  Sealed-value

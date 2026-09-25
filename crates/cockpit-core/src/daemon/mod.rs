@@ -53,6 +53,7 @@ pub mod effective_default_recovery;
 pub mod egress;
 pub(crate) mod ephemeral_guard;
 pub mod fs_api;
+pub mod global_coverage;
 pub(crate) mod guidance_maintenance;
 #[cfg(feature = "extended")]
 pub(crate) mod image_generation_adapters;
@@ -186,41 +187,69 @@ pub struct EventEnvelope {
 /// Usually a single table. An event that originates in one session's
 /// workspace but is delivered on the daemon-global bus (an LSP notice, a
 /// session's host-capability publication) is scrubbed with the live
-/// daemon-global table *and* the originating session's table, applied in
-/// turn. This is deliberately not a [`RedactionTable`]: two tables from
-/// different coverage lineages are never merged into one bound table (which
-/// the coverage authority rightly refuses), so this value can only scrub; it
-/// can never be published, installed, or bound.
+/// daemon-global table *and* the originating session's table. Those two are
+/// bound tables of different coverage lineages, which the coverage authority
+/// rightly refuses to merge into one bound table; this value instead holds an
+/// unbound, scrub-only merge whose entries are matched against the original
+/// text in one pass (so an overlap across the two tables cannot leave a
+/// suffix behind). It exposes no table, so the merge can never be published,
+/// installed or bound.
+///
+/// When coverage for an event cannot be established it is marked
+/// content-free: owners receive it unchanged and every other principal
+/// receives only its content-free projection, or nothing.
 #[derive(Debug, Clone)]
-pub struct EventScrub {
-    primary: Arc<RedactionTable>,
-    origin: Option<Arc<RedactionTable>>,
+pub struct EventScrub(EventScrubKind);
+
+#[derive(Debug, Clone)]
+enum EventScrubKind {
+    Table(Arc<RedactionTable>),
+    ContentFree,
 }
 
 impl EventScrub {
     pub fn single(table: Arc<RedactionTable>) -> Self {
-        Self {
-            primary: table,
-            origin: None,
+        Self(EventScrubKind::Table(table))
+    }
+
+    /// The daemon-global table plus the originating session's table, merged
+    /// for scrubbing only.
+    pub(crate) fn with_origin(global: &RedactionTable, origin: &RedactionTable) -> Result<Self> {
+        Ok(Self(EventScrubKind::Table(Arc::new(
+            global.scrub_only_union(origin)?,
+        ))))
+    }
+
+    /// No coverage: non-owners receive the content-free projection only.
+    pub(crate) fn content_free() -> Self {
+        Self(EventScrubKind::ContentFree)
+    }
+
+    /// The form of `event` a non-owner principal receives, or `None` when it
+    /// is withheld. `scrub_free_text` scrubs every free-text field of an
+    /// event with one table.
+    pub(crate) fn project_for_non_owner(
+        &self,
+        event: proto::Event,
+        scrub_free_text: impl FnOnce(&mut proto::Event, &RedactionTable),
+    ) -> Option<proto::Event> {
+        match &self.0 {
+            EventScrubKind::Table(table) => {
+                let mut event = event;
+                scrub_free_text(&mut event, table);
+                Some(event)
+            }
+            EventScrubKind::ContentFree => global_coverage::content_free_global_event(event),
         }
     }
 
-    /// The daemon-global table plus the originating session's table.
-    pub fn with_origin(global: Arc<RedactionTable>, origin: Arc<RedactionTable>) -> Self {
-        Self {
-            primary: global,
-            origin: Some(origin),
-        }
-    }
-
-    /// Every table this event must be scrubbed with, in application order.
-    pub fn tables(&self) -> impl Iterator<Item = &RedactionTable> {
-        std::iter::once(self.primary.as_ref()).chain(self.origin.as_deref())
-    }
-
+    /// Scrub one string as a non-owner would see it. Content-free coverage
+    /// withholds all free text.
     pub fn scrub(&self, text: &str) -> String {
-        self.tables()
-            .fold(text.to_string(), |text, table| table.scrub(&text))
+        match &self.0 {
+            EventScrubKind::Table(table) => table.scrub(text),
+            EventScrubKind::ContentFree => String::new(),
+        }
     }
 }
 
@@ -234,12 +263,13 @@ pub type EventSender = broadcast::Sender<EventEnvelope>;
 pub type EventReceiver = broadcast::Receiver<EventEnvelope>;
 pub type SharedRedactionTable = Arc<std::sync::RwLock<Arc<RedactionTable>>>;
 
-/// The daemon-global event bus together with its live coverage table, handed
-/// to producers whose events originate in a session but reach every client.
+/// The daemon-global event bus together with its coverage publication state,
+/// handed to producers whose events originate in a session but reach every
+/// client.
 #[derive(Clone)]
 pub struct GlobalEventBus {
     pub tx: EventSender,
-    pub redaction: SharedRedactionTable,
+    pub coverage: global_coverage::GlobalCoverage,
 }
 
 impl std::fmt::Debug for GlobalEventBus {
@@ -252,12 +282,27 @@ impl std::fmt::Debug for GlobalEventBus {
 
 impl GlobalEventBus {
     /// Broadcast an event that originates in a session: scrubbed with the
-    /// live daemon-global table and the session's table (see [`EventScrub`]).
-    /// Scrubbing cannot fail, so the event is never withheld.
+    /// *current* daemon-global table (republished first when stale, exactly
+    /// as a daemon-global broadcast) and the session's table.
     pub fn send_from_origin(&self, origin: &Arc<RedactionTable>, event: proto::Event) {
+        self.coverage.deliver(&self.tx, Some(origin), event);
+    }
+
+    /// [`Self::send_from_origin`] for async producers.
+    pub async fn send_from_origin_async(&self, origin: &Arc<RedactionTable>, event: proto::Event) {
+        self.coverage
+            .deliver_async(&self.tx, Some(origin), event)
+            .await;
+    }
+
+    /// Broadcast an event whose originating session's coverage is not
+    /// available (a receipt recovered by another session's worker). No other
+    /// session's table may stand in for it, so owners receive the event and
+    /// every other principal receives only its content-free projection.
+    pub fn send_without_origin_coverage(&self, event: proto::Event) {
         let _ = self.tx.send(EventEnvelope {
             event,
-            redact: EventScrub::with_origin(current_redaction(&self.redaction), origin.clone()),
+            redact: EventScrub::content_free(),
         });
     }
 }

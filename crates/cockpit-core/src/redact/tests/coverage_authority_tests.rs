@@ -604,15 +604,17 @@ async fn external_mutation_before_completed_scan_boundary_retries_or_refuses() {
     std::os::unix::fs::symlink(&first_target, &link).expect("initial SSH symlink");
     #[cfg(windows)]
     std::os::windows::fs::symlink_file(&first_target, &link).expect("initial SSH symlink");
-    let ssh_result =
-        super::super::ssh::collect_ssh_key_candidates_with_fence(Some(&ssh_dir), |_| {
+    let ssh_result = super::super::ssh::collect_ssh_key_candidates_with_fence(
+        Some(&super::super::ssh::SshKeyDir::configured(&ssh_dir)),
+        |_| {
             std::fs::remove_file(&link).expect("remove old SSH symlink");
             #[cfg(unix)]
             std::os::unix::fs::symlink(&second_target, &link).expect("retarget SSH symlink");
             #[cfg(windows)]
             std::os::windows::fs::symlink_file(&second_target, &link)
                 .expect("retarget SSH symlink");
-        });
+        },
+    );
     assert!(
         ssh_result.is_err(),
         "retargeted SSH input must refuse capture"
@@ -623,19 +625,30 @@ async fn external_mutation_before_completed_scan_boundary_retries_or_refuses() {
     std::fs::write(changing_ssh_dir.join("id_first"), pem("inventory-first"))
         .expect("first inventory key");
     let added_key = changing_ssh_dir.join("id_added");
-    // A key added during capture is not in the captured table, and the
-    // captured-bytes binding no longer matches a fresh read, so the authority
-    // refuses to publish (the collector itself tolerates directory churn).
+    // A key added while the collector runs (this collector is also the
+    // publication fence) is refused by its source-set closure check.
+    let changing = super::super::ssh::SshKeyDir::configured(&changing_ssh_dir);
     let captured =
-        super::super::ssh::collect_ssh_key_candidates_with_fence(Some(&changing_ssh_dir), |_| {
+        super::super::ssh::collect_ssh_key_candidates_with_fence(Some(&changing), |_| {
             std::fs::write(&added_key, pem("inventory-added"))
                 .expect("add SSH source during capture");
-        })
-        .expect("directory churn does not fail the collector");
-    let fresh = super::super::ssh::collect_ssh_key_candidates(Some(&changing_ssh_dir))
-        .expect("fresh SSH read");
+        });
+    assert!(
+        captured
+            .as_ref()
+            .is_err_and(|error| format!("{error:#}").contains("a key was added")),
+        "a key added during capture must refuse capture: {captured:?}"
+    );
+    // And the key set is part of the source binding, so a capture taken
+    // before the addition never matches a fresh read after it.
+    std::fs::remove_file(&added_key).expect("remove added key");
+    let before =
+        super::super::ssh::collect_ssh_key_candidates(Some(&changing)).expect("stable SSH read");
+    std::fs::write(&added_key, pem("inventory-added")).expect("add SSH source");
+    let fresh =
+        super::super::ssh::collect_ssh_key_candidates(Some(&changing)).expect("fresh SSH read");
     assert_ne!(
-        super::super::coverage_bindings::ssh_candidates_digest(&captured),
+        super::super::coverage_bindings::ssh_candidates_digest(&before),
         super::super::coverage_bindings::ssh_candidates_digest(&fresh),
         "a changed SSH key set must change the source binding, refusing publication"
     );

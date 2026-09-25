@@ -1785,16 +1785,23 @@ fn ssh_keys_skipped_when_disabled() {
     assert_eq!(t.scrub(ED25519_PRIVATE_KEY), ED25519_PRIVATE_KEY);
 }
 
+/// A *configured* SSH directory that does not exist is an unavailable
+/// source, not an empty one: the user asked for keys there, and coverage must
+/// not silently publish without them. (Only the unconfigured default
+/// `~/.ssh` may be absent; see `ssh_key_dir_absence_is_only_an_absent_default`.)
 #[test]
-fn ssh_missing_dir_is_silent() {
+fn ssh_missing_configured_dir_fails_closed() {
     let dir = TempDir::new().unwrap();
     let missing = dir.path().join("no-such-ssh-dir");
     let mut cfg = enabled_cfg();
     cfg.scan_ssh_keys = true;
     cfg.ssh_key_dir = Some(missing);
-    // Build succeeds (no error) with an empty table.
-    let t = RedactionTable::build(&cfg, dir.path()).unwrap();
-    assert!(t.is_empty());
+    let error = RedactionTable::build(&cfg, dir.path())
+        .expect_err("a missing configured SSH directory fails the build");
+    assert!(
+        format!("{error:#}").contains("redact.ssh_key_dir does not exist"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -3186,7 +3193,9 @@ fn ssh_key_dir_resolution_is_scope_aware_and_never_uses_the_cwd() {
             Some(relative)
         )
         .unwrap(),
-        Some(workspace.path().join("keys"))
+        Some(super::ssh::SshKeyDir::configured(
+            workspace.path().join("keys")
+        ))
     );
     let error = super::ssh::resolve_ssh_key_dir(RedactionSourceScope::DaemonGlobal, Some(relative))
         .unwrap_err();
@@ -3200,7 +3209,7 @@ fn ssh_key_dir_resolution_is_scope_aware_and_never_uses_the_cwd() {
     assert_eq!(
         super::ssh::resolve_ssh_key_dir(RedactionSourceScope::DaemonGlobal, Some(&absolute))
             .unwrap(),
-        Some(absolute)
+        Some(super::ssh::SshKeyDir::configured(absolute))
     );
 
     // With SSH scanning ENABLED, a daemon-global build refuses a relative
@@ -3401,11 +3410,14 @@ fn ssh_collector_skips_non_key_entries_and_directory_churn() {
     let keys = returns_promptly({
         let ssh = ssh.clone();
         move || {
-            super::ssh::collect_ssh_key_candidates_with_fence(Some(&ssh), |_| {
-                // Entries appear and disappear while the scan runs.
-                let _ = std::fs::remove_file(ssh.join("scratch"));
-                let _ = std::fs::write(ssh.join("editor.swp"), "tmp");
-            })
+            super::ssh::collect_ssh_key_candidates_with_fence(
+                Some(&super::ssh::SshKeyDir::configured(&ssh)),
+                |_| {
+                    // Entries appear and disappear while the scan runs.
+                    let _ = std::fs::remove_file(ssh.join("scratch"));
+                    let _ = std::fs::write(ssh.join("editor.swp"), "tmp");
+                },
+            )
         }
     })
     .expect("non-key entries and churn never fail the SSH collector");
@@ -3414,6 +3426,81 @@ fn ssh_collector_skips_non_key_entries_and_directory_churn() {
             .any(|(value, _)| value.contains("churn-key-canary-5d11")),
         "the real key is still collected"
     );
+}
+
+/// T5: only an absent *default* SSH directory is an empty source. A
+/// configured directory that is missing or a dangling link, and a default
+/// directory that is a dangling link, are unavailable sources.
+#[cfg(unix)]
+#[test]
+fn ssh_key_dir_absence_is_only_an_absent_default() {
+    use super::ssh::{SshKeyDir, collect_ssh_key_candidates};
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing");
+    let dangling = dir.path().join("dangling");
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+
+    assert!(
+        collect_ssh_key_candidates(Some(&SshKeyDir::default_dir(&missing)))
+            .expect("an absent default directory is an empty source")
+            .is_empty()
+    );
+    for (dir, what) in [
+        (
+            SshKeyDir::configured(&missing),
+            "missing configured directory",
+        ),
+        (
+            SshKeyDir::configured(&dangling),
+            "dangling configured directory",
+        ),
+        (
+            SshKeyDir::default_dir(&dangling),
+            "dangling default directory",
+        ),
+    ] {
+        let error = collect_ssh_key_candidates(Some(&dir))
+            .expect_err(what)
+            .to_string();
+        assert!(
+            error.contains("SSH source is unavailable"),
+            "{what}: {error}"
+        );
+    }
+}
+
+/// T7: the collector is also the publication fence, so a key that appears
+/// while it runs (a new entry, or an existing non-key entry rewritten as a
+/// key) is refused by its source-set closure check, while non-key churn is
+/// still tolerated (see `ssh_collector_skips_non_key_entries_and_directory_churn`).
+#[cfg(unix)]
+#[test]
+fn ssh_collector_refuses_a_key_added_during_the_fence() {
+    use super::ssh::{SshKeyDir, collect_ssh_key_candidates_with_fence};
+    let pem = |marker: &str| {
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{marker}\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+    };
+    for late_name in ["id_aaa_added", "id_zzz_added", "a_notes"] {
+        let dir = TempDir::new().unwrap();
+        let ssh = dir.path().join("ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(ssh.join("id_mmm"), pem("existing-key-3c1d")).unwrap();
+        // `a_notes` exists as a non-key, is inspected (and skipped) before
+        // `id_mmm`, and is rewritten as a key while `id_mmm` is confirmed.
+        std::fs::write(ssh.join("a_notes"), "not a key").unwrap();
+        let late = ssh.join(late_name);
+        let result =
+            collect_ssh_key_candidates_with_fence(Some(&SshKeyDir::configured(&ssh)), |_| {
+                std::fs::write(&late, pem("late-key-8e2a")).unwrap();
+            });
+        let error = result.expect_err("a key added during the fence must refuse capture");
+        assert!(
+            format!("{error:#}").contains("a key was added"),
+            "{late_name}: {error:#}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -3431,9 +3518,12 @@ fn ssh_collector_skips_an_entry_removed_before_it_is_read() {
     .unwrap();
     std::fs::write(ssh.join("zzz"), "vanishing entry").unwrap();
     let doomed = ssh.join("zzz");
-    let keys = super::ssh::collect_ssh_key_candidates_with_fence(Some(&ssh), |_| {
-        let _ = std::fs::remove_file(&doomed);
-    })
+    let keys = super::ssh::collect_ssh_key_candidates_with_fence(
+        Some(&super::ssh::SshKeyDir::configured(&ssh)),
+        |_| {
+            let _ = std::fs::remove_file(&doomed);
+        },
+    )
     .expect("a vanished entry is skipped");
     assert!(
         keys.iter()

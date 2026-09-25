@@ -2303,12 +2303,143 @@ impl InstallationPolicySection {
     }
 }
 
+/// Why an installation-policy layer could not be read. Every variant is
+/// value-free: it names a kind (and for malformed JSON, a position), never
+/// any byte of the file, because a malformed layer can hold credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallationPolicyUnavailable {
+    /// The layer set could not be resolved (for example a relative
+    /// `COCKPIT_CONFIG`, or no home directory).
+    Unresolved,
+    /// The layer exists but vanished or is a dangling link.
+    Vanished,
+    /// An I/O failure of this kind.
+    Io(std::io::ErrorKind),
+    /// The layer exceeds the config-file byte limit.
+    TooLarge,
+    /// The layer is not a regular file.
+    NotRegular,
+    /// The layer is not UTF-8.
+    NotUtf8,
+    /// The layer is not valid JSON; the syntax error is at this position.
+    MalformedJson { line: usize, column: usize },
+    /// The JSON root is not an object; it is this JSON kind.
+    RootNotObject { found: &'static str },
+    /// Any other failure (logged locally, never echoed).
+    Other,
+}
+
+impl InstallationPolicyUnavailable {
+    /// Classify a layer-read failure by the typed causes in its chain. Only
+    /// the kind is kept; the error's text is never copied.
+    fn classify(error: &anyhow::Error) -> Self {
+        for cause in error.chain() {
+            if cause
+                .downcast_ref::<crate::config::dirs::ExplicitConfigOverrideError>()
+                .is_some()
+            {
+                return Self::Unresolved;
+            }
+            if let Some(root) = cause.downcast_ref::<ConfigRootNotObject>() {
+                return Self::RootNotObject { found: root.found };
+            }
+            if cause.downcast_ref::<ConfigLayerVanished>().is_some() {
+                return Self::Vanished;
+            }
+            if let Some(json) = cause.downcast_ref::<serde_json::Error>() {
+                return Self::MalformedJson {
+                    line: json.line(),
+                    column: json.column(),
+                };
+            }
+            if cause.downcast_ref::<std::string::FromUtf8Error>().is_some() {
+                return Self::NotUtf8;
+            }
+            if let Some(bounded) = cause.downcast_ref::<cockpit_host::bounded::BoundedIoError>() {
+                return match bounded {
+                    cockpit_host::bounded::BoundedIoError::Limit { .. } => Self::TooLarge,
+                    cockpit_host::bounded::BoundedIoError::NotRegular { .. } => Self::NotRegular,
+                    cockpit_host::bounded::BoundedIoError::Io(io) => Self::Io(io.kind()),
+                };
+            }
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                return Self::Io(io.kind());
+            }
+        }
+        Self::Other
+    }
+}
+
+impl std::fmt::Display for InstallationPolicyUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unresolved => f.write_str("the config layer could not be resolved"),
+            Self::Vanished => f.write_str("dangling link or removed during read"),
+            Self::Io(kind) => write!(f, "I/O error: {kind}"),
+            Self::TooLarge => f.write_str("exceeds the config file size limit"),
+            Self::NotRegular => f.write_str("not a regular file"),
+            Self::NotUtf8 => f.write_str("not valid UTF-8"),
+            Self::MalformedJson { line, column } => {
+                write!(f, "malformed JSON at line {line}, column {column}")
+            }
+            Self::RootNotObject { found } => {
+                write!(f, "the JSON root must be an object, found {found}")
+            }
+            Self::Other => f.write_str("unreadable"),
+        }
+    }
+}
+
+/// A config layer whose JSON root is not an object. Carries the JSON kind
+/// only, never the value.
+#[derive(Debug, Clone, Copy)]
+struct ConfigRootNotObject {
+    found: &'static str,
+}
+
+impl std::fmt::Display for ConfigRootNotObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "expected config.json root to be an object, found {}",
+            self.found
+        )
+    }
+}
+
+impl std::error::Error for ConfigRootNotObject {}
+
+/// A config layer lstat found, but that could not be opened (a dangling link,
+/// or one removed during the read).
+#[derive(Debug, Clone, Copy)]
+struct ConfigLayerVanished;
+
+impl std::fmt::Display for ConfigLayerVanished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("config layer exists but is unavailable (dangling link or removed during read)")
+    }
+}
+
+impl std::error::Error for ConfigLayerVanished {}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// What is wrong with an installation-policy layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallationPolicyProblem {
     /// The layer (or the installation directory, or the explicit override)
-    /// cannot be resolved or read. The payload is the sanitized cause.
-    Unavailable(String),
+    /// cannot be resolved or read, for this value-free reason.
+    Unavailable(InstallationPolicyUnavailable),
+
     /// The section is present but is not a JSON object.
     NotAnObject,
     /// The section has a key its type does not define (for example a typo
@@ -2332,12 +2463,18 @@ pub struct InstallationPolicyError {
 }
 
 impl InstallationPolicyError {
-    fn unavailable(path: Option<&Path>, error: impl std::fmt::Display) -> Self {
+    /// Only the classified kind of `error` is kept: its text can quote the
+    /// layer's bytes (credentials included), so it is logged locally at
+    /// debug level and never carried in the error.
+    fn unavailable(path: Option<&Path>, error: &anyhow::Error) -> Self {
+        tracing::debug!(error = %format!("{error:#}"), "installation policy layer unavailable");
         Self {
             path: path.map(Path::to_path_buf),
             section: None,
             key: None,
-            problem: InstallationPolicyProblem::Unavailable(format!("{error:#}")),
+            problem: InstallationPolicyProblem::Unavailable(
+                InstallationPolicyUnavailable::classify(error),
+            ),
         }
     }
 
@@ -2404,11 +2541,11 @@ pub fn load_installation_policy(
     section: InstallationPolicySection,
 ) -> std::result::Result<ExtendedConfig, InstallationPolicyError> {
     let paths = crate::config::dirs::installation_config_file_paths()
-        .map_err(|error| InstallationPolicyError::unavailable(None, error))?;
+        .map_err(|error| InstallationPolicyError::unavailable(None, &error))?;
     let mut docs = Vec::with_capacity(paths.len());
     for path in &paths {
         let Some(doc) = ExtendedConfigDoc::load_installation_layer(path)
-            .map_err(|error| InstallationPolicyError::unavailable(Some(path), error))?
+            .map_err(|error| InstallationPolicyError::unavailable(Some(path), &error))?
         else {
             continue;
         };
@@ -2456,11 +2593,11 @@ pub fn load_redact_policy_strict_for_cwd(
     cwd: &Path,
 ) -> std::result::Result<RedactConfig, InstallationPolicyError> {
     let paths = crate::config::dirs::try_config_file_paths_for_load(cwd)
-        .map_err(|error| InstallationPolicyError::unavailable(None, error))?;
+        .map_err(|error| InstallationPolicyError::unavailable(None, &anyhow::Error::new(error)))?;
     let mut docs = Vec::with_capacity(paths.len());
     for path in &paths {
         let Some(mut doc) = ExtendedConfigDoc::load_installation_layer(path)
-            .map_err(|error| InstallationPolicyError::unavailable(Some(path), error))?
+            .map_err(|error| InstallationPolicyError::unavailable(Some(path), &error))?
         else {
             continue;
         };
@@ -2497,8 +2634,9 @@ fn validate_policy_section(
     let Some(object) = value.as_object() else {
         return Err(problem(None, InstallationPolicyProblem::NotAnObject));
     };
-    let defaults = serde_json::to_value(ExtendedConfig::default())
-        .map_err(|error| InstallationPolicyError::unavailable(Some(path), error))?;
+    let defaults = serde_json::to_value(ExtendedConfig::default()).map_err(|error| {
+        InstallationPolicyError::unavailable(Some(path), &anyhow::Error::new(error))
+    })?;
     let known = defaults.get(section.key()).and_then(Value::as_object);
     for (key, entry) in object {
         if known.is_some_and(|known| !known.contains_key(key)) {
@@ -3534,10 +3672,8 @@ impl ExtendedConfigDoc {
             Ok(_) => {}
         }
         Self::load_existing(path)?.map(Some).ok_or_else(|| {
-            anyhow::anyhow!(
-                "config layer {} exists but is unavailable (dangling link or removed during read)",
-                path.display()
-            )
+            anyhow::Error::new(ConfigLayerVanished)
+                .context(format!("reading config layer {}", path.display()))
         })
     }
 
@@ -3558,8 +3694,12 @@ impl ExtendedConfigDoc {
         };
         let mut raw = match raw {
             Value::Object(_) => raw,
+            // The kind only: the value itself can hold credentials.
             other => {
-                anyhow::bail!("expected config.json root to be an object, found {other:?}")
+                return Err(anyhow::Error::new(ConfigRootNotObject {
+                    found: json_kind(&other),
+                })
+                .context(format!("parsing config.json at {}", path.display())));
             }
         };
         strip_secret_store_key(&mut raw);

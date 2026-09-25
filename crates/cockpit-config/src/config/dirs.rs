@@ -283,11 +283,32 @@ pub fn installation_config_file_paths() -> anyhow::Result<Vec<PathBuf>> {
     Ok(vec![global_config_file()?])
 }
 
-fn explicit_config_write_allowed(path: &Path) -> bool {
+/// The one write gate for a durable `config.json` layer (or a file beside
+/// it, such as `providers/<id>.json` or the effective-default journal),
+/// judged under the ambient workspace-trust policy.
+///
+/// Readability is not writability: the `COCKPIT_CONFIG` override is loaded
+/// regardless of trust, but a layer that sits in a project `.cockpit/`
+/// directory is written only while that project is trusted. Every durable
+/// config writer — the ambient pathname resolvers here and in
+/// `effective_default`, the literal-header migration, the image-control
+/// registry, and the daemon's retained attach-time capabilities (through
+/// [`config_layer_write_allowed_for_policy`]) — decides through this rule.
+pub fn config_layer_write_allowed(path: &Path) -> bool {
+    config_layer_write_allowed_for_policy(path, crate::config::trust::runtime_policy().as_ref())
+}
+
+/// [`config_layer_write_allowed`] against an explicit policy, for writers
+/// that captured their authority's policy instead of reading the ambient one.
+pub fn config_layer_write_allowed_for_policy(
+    path: &Path,
+    policy: Option<&crate::config::trust::WorkspaceTrustPolicy>,
+) -> bool {
     let parent = path.parent().unwrap_or(Path::new(""));
-    // Only conventional project `.cockpit/config.json` requires workspace trust.
+    // Only a conventional project `.cockpit/` directory requires workspace
+    // trust; the global and machine-local layers never do.
     if parent.file_name().is_some_and(|name| name == ".cockpit") {
-        crate::config::trust::project_config_write_allowed(parent)
+        crate::config::trust::project_config_allowed_for_policy(parent, policy)
     } else {
         true
     }
@@ -308,7 +329,7 @@ pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option
         && !path.is_empty()
     {
         let path = PathBuf::from(path);
-        if !explicit_config_write_allowed(&path) {
+        if !config_layer_write_allowed(&path) {
             return None;
         }
         return crate::config::providers::provider_file_path_for_config(&path, provider_id).ok();
@@ -353,7 +374,7 @@ pub fn most_specific_existing_config_write_target(cwd: &Path) -> Option<PathBuf>
         && !path.is_empty()
     {
         let path = PathBuf::from(path);
-        if explicit_config_write_allowed(&path) {
+        if config_layer_write_allowed(&path) {
             return Some(path);
         }
         return None;
@@ -855,8 +876,31 @@ mod tests {
         let _override = env.override_cockpit_config(&config);
 
         assert_eq!(config_file_paths_for_load(&repo), vec![config.clone()]);
-        assert_eq!(installation_config_file_paths().unwrap(), vec![config]);
+        assert_eq!(
+            installation_config_file_paths().unwrap(),
+            vec![config.clone()]
+        );
         assert!(most_specific_config_write_target(&repo).is_none());
+        assert!(config_write_target_for_provider(&repo, "p").is_none());
+        assert!(!config_layer_write_allowed(&config));
+        // The effective-default writer selects the same layer attach reads,
+        // and refuses it rather than falling back.
+        let refused =
+            crate::config::effective_default::resolve_effective_default_write_target(&repo)
+                .expect_err("the ignored project override is not a default-model write target");
+        assert_eq!(refused.diagnostic_code, "effective_default_trust_denied");
+        // The same path under an explicit Trust policy is writable, and the
+        // global layer never needs trust.
+        let trusted = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&repo).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        assert!(config_layer_write_allowed_for_policy(
+            &config,
+            Some(&trusted)
+        ));
+        assert!(!config_layer_write_allowed_for_policy(&config, None));
+        assert!(config_layer_write_allowed(&global_config_file().unwrap()));
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 

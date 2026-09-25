@@ -3614,16 +3614,33 @@ fn installation_handover_timer_overrides_load_from_the_supervisor_layer() {
     );
 }
 
+fn write_global_layer(body: &str) -> std::path::PathBuf {
+    let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+    let path = config_dir.join(crate::config::dirs::CONFIG_FILE);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+fn policy_problem(
+    result: std::result::Result<ExtendedConfig, InstallationPolicyError>,
+) -> (
+    Option<InstallationPolicySection>,
+    Option<String>,
+    InstallationPolicyProblem,
+) {
+    let error = result.expect_err("installation policy must fail closed");
+    (error.section, error.key, error.problem)
+}
+
 #[test]
-fn installation_extended_config_reads_only_the_global_layer() {
+fn installation_policy_reads_only_the_global_layer() {
     let tmp = TempDir::new().unwrap();
     let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
-    std::fs::write(
-        config_dir.join(crate::config::dirs::CONFIG_FILE),
-        r#"{"redact":{"denylist":["global-deny"],"extra_dotenv_paths":["/abs/global.env"]}}"#,
-    )
-    .unwrap();
+    let global_env = tmp.path().join("abs/global.env");
+    write_global_layer(
+        &serde_json::json!({"redact": {"denylist": ["global-deny"], "extra_dotenv_paths": [global_env]}})
+            .to_string(),
+    );
     // A project layer under the process cwd is workspace scoped and never
     // reaches installation-wide policy.
     let project = tmp.path().join("launch");
@@ -3637,110 +3654,269 @@ fn installation_extended_config_reads_only_the_global_layer() {
     .unwrap();
     env.set_current_dir(&project).unwrap();
 
-    let redact = load_installation_extended_config().unwrap().redact;
+    let redact = load_installation_redact_policy().unwrap();
     assert_eq!(redact.denylist, vec!["global-deny".to_string()]);
-    assert_eq!(
-        redact.extra_dotenv_paths,
-        vec![PathBuf::from("/abs/global.env")]
-    );
+    assert_eq!(redact.extra_dotenv_paths, vec![global_env]);
 }
 
+/// `COCKPIT_CONFIG` is an operator choice: sessions and installation-wide
+/// policy resolve it identically, whatever trust policy (if any) is in scope,
+/// even when it names a conventional `<root>/.cockpit/config.json` — and such
+/// an override is an installation layer, so relative paths are rejected, not
+/// anchored at `<root>`.
 #[test]
-fn installation_extended_config_honors_the_explicit_override_like_sessions() {
+fn explicit_override_is_trust_independent_and_installation_scoped() {
     let tmp = TempDir::new().unwrap();
     let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
-    std::fs::write(
-        config_dir.join(crate::config::dirs::CONFIG_FILE),
-        r#"{"retention":{"transcript_window_days":1}}"#,
-    )
-    .unwrap();
-    let explicit = tmp.path().join("explicit.json");
+    write_global_layer(r#"{"retention":{"transcript_window_days":1}}"#);
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+    let explicit = project.join(".cockpit/config.json");
     std::fs::write(
         &explicit,
         r#"{"redact":{"denylist":["explicit-deny"]},"retention":{"transcript_window_days":0}}"#,
     )
     .unwrap();
     env.set_cockpit_config(&explicit);
+    // No workspace-trust policy is in scope (the daemon's background tasks).
+    assert!(crate::config::trust::runtime_policy().is_none());
 
-    let installation = load_installation_extended_config().unwrap();
     assert_eq!(
-        installation.redact.denylist,
+        load_installation_retention_policy()
+            .unwrap()
+            .transcript_window_days,
+        0,
+        "an untrusted-looking `.cockpit` override is still the operator's policy"
+    );
+    assert_eq!(
+        load_installation_redact_policy().unwrap().denylist,
         vec!["explicit-deny".to_string()]
     );
-    assert_eq!(installation.retention.transcript_window_days, 0);
     assert_eq!(
         crate::config::dirs::installation_config_file_paths().unwrap(),
         crate::config::dirs::config_file_paths_for_load(tmp.path()),
         "installation policy and sessions read the same explicit layer"
     );
 
-    env.set_cockpit_config(std::path::Path::new("relative.json"));
-    assert!(
-        load_installation_extended_config().is_err(),
-        "a relative override would be resolved against the daemon cwd"
+    // Relative extras in the override are rejected, never anchored.
+    std::fs::write(
+        &explicit,
+        r#"{"redact":{"extra_dotenv_paths":["rel.env"]}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        policy_problem(load_installation_policy(InstallationPolicySection::Redact)),
+        (
+            Some(InstallationPolicySection::Redact),
+            Some("extra_dotenv_paths".to_string()),
+            InstallationPolicyProblem::RelativePath
+        )
     );
+
+    env.set_cockpit_config(std::path::Path::new("relative.json"));
+    assert!(matches!(
+        crate::config::dirs::installation_config_file_paths()
+            .unwrap_err()
+            .downcast_ref::<crate::config::dirs::ExplicitConfigOverrideError>(),
+        Some(crate::config::dirs::ExplicitConfigOverrideError::Relative(
+            _
+        ))
+    ));
+    assert!(matches!(
+        crate::config::dirs::try_config_file_paths_for_load(tmp.path()),
+        Err(crate::config::dirs::ExplicitConfigOverrideError::Relative(
+            _
+        ))
+    ));
 }
 
 #[test]
-fn installation_extended_config_defaults_without_a_global_layer() {
+fn installation_policy_defaults_only_when_the_layer_does_not_exist() {
     let tmp = TempDir::new().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let installation = load_installation_extended_config().unwrap();
-    assert!(installation.redact.denylist.is_empty());
-    assert_eq!(
-        installation.redact.dotenv_patterns,
-        default_dotenv_patterns()
+    assert!(
+        load_installation_redact_policy()
+            .unwrap()
+            .denylist
+            .is_empty()
     );
     assert_eq!(
-        installation.retention,
+        load_installation_retention_policy().unwrap(),
         cockpit_db::db::retention::RetentionConfig::default()
     );
+
+    // A dangling link is an unavailable configured source, not absence.
+    #[cfg(unix)]
+    {
+        let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("gone.json"),
+            config_dir.join(crate::config::dirs::CONFIG_FILE),
+        )
+        .unwrap();
+        assert!(matches!(
+            policy_problem(load_installation_policy(
+                InstallationPolicySection::Retention
+            ))
+            .2,
+            InstallationPolicyProblem::Unavailable(_)
+        ));
+    }
 }
 
 #[test]
-fn installation_extended_config_fails_closed_on_a_broken_global_layer() {
+fn installation_policy_fails_closed_per_section_with_typed_errors() {
+    use InstallationPolicyProblem as P;
+    use InstallationPolicySection as S;
     let tmp = TempDir::new().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
-    let path = config_dir.join(crate::config::dirs::CONFIG_FILE);
-    for (label, body) in [
-        ("malformed JSON", r#"{"redact":{"denylist":["x"]"#),
-        ("non-object root", "[]"),
+    for (body, section, expected) in [
         (
-            "wrong redact type",
             r#"{"redact":{"denylist":"not-a-list"}}"#,
-        ),
-        ("unknown redact key", r#"{"redact":{"denyList":["typo"]}}"#),
-        (
-            "wrong retention type",
-            r#"{"retention":{"transcript_window_days":"never"}}"#,
+            S::Redact,
+            (Some(S::Redact), Some("denylist".to_string()), P::WrongType),
         ),
         (
-            "relative global extra path",
+            r#"{"redact":{"denyList":["typo"]}}"#,
+            S::Redact,
+            (Some(S::Redact), Some("denyList".to_string()), P::UnknownKey),
+        ),
+        (
+            r#"{"redact":"off"}"#,
+            S::Redact,
+            (Some(S::Redact), None, P::NotAnObject),
+        ),
+        (
             r#"{"redact":{"extra_dotenv_paths":["rel.env"]}}"#,
+            S::Redact,
+            (
+                Some(S::Redact),
+                Some("extra_dotenv_paths".to_string()),
+                P::RelativePath,
+            ),
+        ),
+        (
+            r#"{"redact":{"ssh_key_dir":"keys"}}"#,
+            S::Redact,
+            (
+                Some(S::Redact),
+                Some("ssh_key_dir".to_string()),
+                P::RelativePath,
+            ),
+        ),
+        (
+            r#"{"retention":{"transcript_window_days":"never"}}"#,
+            S::Retention,
+            (
+                Some(S::Retention),
+                Some("transcript_window_days".to_string()),
+                P::WrongType,
+            ),
         ),
     ] {
-        std::fs::write(&path, body).unwrap();
-        assert!(
-            load_installation_extended_config().is_err(),
-            "{label} must not silently weaken installation policy"
+        write_global_layer(body);
+        assert_eq!(
+            policy_problem(load_installation_policy(section)),
+            expected,
+            "{body}"
         );
+        // The other section is unaffected by this fault.
+        let other = if section == S::Redact {
+            S::Retention
+        } else {
+            S::Redact
+        };
+        assert!(
+            load_installation_policy(other).is_ok(),
+            "a {section:?} fault must not disable {other:?}: {body}"
+        );
+    }
+    for body in [r#"{"redact":{"denylist":["x"]"#, "[]"] {
+        write_global_layer(body);
+        for section in S::ALL {
+            assert!(matches!(
+                policy_problem(load_installation_policy(section)).2,
+                P::Unavailable(_)
+            ));
+        }
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::write(&path, r#"{"redact":{"denylist":["x"]}}"#).unwrap();
+        let path = write_global_layer(r#"{"redact":{"denylist":["x"]}}"#);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let unreadable = std::fs::read(&path).is_err();
-        let result = load_installation_extended_config();
+        let result = load_installation_policy(S::Redact);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        // Root bypasses file modes; the check is meaningful only when the
-        // file is actually unreadable to this process.
         if unreadable {
-            assert!(result.is_err(), "an unreadable global layer is an error");
+            assert!(matches!(policy_problem(result).2, P::Unavailable(_)));
+        } else {
+            eprintln!("note: privileges bypass mode 000; unreadable-layer case skipped");
         }
     }
+}
+
+#[test]
+fn settings_writer_validator_matches_the_loader() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    let error = validate_installation_layer_document(
+        &path,
+        &serde_json::json!({"redact": {"extra_dotenv_paths": ["rel.env"]}}),
+    )
+    .unwrap_err();
+    assert_eq!(error.problem, InstallationPolicyProblem::RelativePath);
+    assert!(
+        error.to_string().contains("redact.extra_dotenv_paths"),
+        "{error}"
+    );
+    let error = validate_installation_layer_document(
+        &path,
+        &serde_json::json!({"retention": {"transcript_window_days": "x"}}),
+    )
+    .unwrap_err();
+    assert_eq!(error.section, Some(InstallationPolicySection::Retention));
+    let absolute = tmp.path().join("abs.env");
+    assert!(
+        validate_installation_layer_document(
+            &path,
+            &serde_json::json!({"redact": {"extra_dotenv_paths": [absolute]}}),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn ssh_key_dir_anchors_at_the_declaring_layer() {
+    let tmp = TempDir::new().unwrap();
+    let outer = tmp.path().join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(outer.join(".cockpit")).unwrap();
+    std::fs::create_dir_all(inner.join(".cockpit")).unwrap();
+    std::fs::write(
+        outer.join(".cockpit/config.json"),
+        r#"{"redact":{"ssh_key_dir":"keys"}}"#,
+    )
+    .unwrap();
+    std::fs::write(inner.join(".cockpit/config.json"), r#"{"name":"inner"}"#).unwrap();
+    let docs = load_existing_docs_from_paths(&[
+        outer.join(".cockpit/config.json"),
+        inner.join(".cockpit/config.json"),
+    ]);
+    let (cfg, warnings) = resolve_loaded_docs_with_warnings(&docs);
+    assert_eq!(
+        cfg.redact.ssh_key_dir,
+        Some(outer.join("keys")),
+        "a relative ssh_key_dir anchors at its declaring layer, not the consumer"
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let global = tmp.path().join("global.json");
+    std::fs::write(&global, r#"{"redact":{"ssh_key_dir":"keys"}}"#).unwrap();
+    let docs = load_existing_docs_from_paths(&[global]);
+    let (cfg, warnings) = resolve_loaded_docs_with_warnings(&docs);
+    assert_eq!(cfg.redact.ssh_key_dir, None);
+    assert_eq!(warnings, vec![RELATIVE_SSH_KEY_DIR_WARNING.to_string()]);
 }
 
 #[test]

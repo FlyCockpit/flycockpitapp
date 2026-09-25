@@ -31,10 +31,6 @@ pub struct PrivateImageIngress {
 }
 
 pub trait TerminalHost: std::fmt::Debug + Send + Sync {
-    /// `origin` is the live coverage table of the session (or workspace)
-    /// the terminal is opened for. Terminal events travel on the
-    /// daemon-global bus, whose own table has no workspace file sources, so
-    /// every event of this terminal is covered by both tables.
     fn open(
         &self,
         context: AuthenticatedTerminalContext,
@@ -42,7 +38,6 @@ pub trait TerminalHost: std::fmt::Debug + Send + Sync {
         cwd: Option<String>,
         cols: u16,
         rows: u16,
-        origin: SharedRedactionTable,
     ) -> TerminalResult;
     fn attach(
         &self,
@@ -170,7 +165,6 @@ impl TerminalHost for UnsupportedTerminalHost {
         _cwd: Option<String>,
         _cols: u16,
         _rows: u16,
-        _origin: SharedRedactionTable,
     ) -> TerminalResult {
         Err(unsupported_terminal_host())
     }
@@ -327,7 +321,6 @@ impl TerminalHost for TestTerminalHost {
         cwd: Option<String>,
         _cols: u16,
         _rows: u16,
-        _origin: SharedRedactionTable,
     ) -> TerminalResult {
         // Same cwd validation as the real host's `resolve_cwd`, without
         // consulting the home directory for the `None` default.

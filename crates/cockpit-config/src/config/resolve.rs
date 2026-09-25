@@ -255,34 +255,42 @@ mod tests {
     }
 
     #[test]
+    fn require_absolute_rejects_relative_roots() {
+        let error = require_absolute("HOME", PathBuf::from("relative-home")).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<NonAbsoluteInstallationRoot>(),
+            Some(&NonAbsoluteInstallationRoot {
+                source: "HOME",
+                path: PathBuf::from("relative-home"),
+            })
+        );
+        let absolute = std::env::temp_dir();
+        assert_eq!(
+            require_absolute("HOME", absolute.clone()).unwrap(),
+            absolute
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn installation_roots_reject_a_relative_home() {
         let env = crate::test_env::lock();
         env.remove_var("XDG_CONFIG_HOME");
         env.remove_var("XDG_STATE_HOME");
         env.set_var("HOME", "relative-home");
-        // Only platforms whose fallback derives from $HOME can observe this.
-        if let Some(home) = dirs::home_dir()
-            && home.is_relative()
-        {
-            #[cfg(unix)]
-            {
-                let error = cockpit_state_dir_unchecked().unwrap_err();
-                assert!(
-                    error
-                        .downcast_ref::<NonAbsoluteInstallationRoot>()
-                        .is_some()
-                );
-            }
-            #[cfg(target_os = "linux")]
-            {
-                let error = cockpit_config_dir_unchecked().unwrap_err();
-                assert!(
-                    error
-                        .downcast_ref::<NonAbsoluteInstallationRoot>()
-                        .is_some(),
-                    "a relative HOME must not yield a cwd-relative global layer"
-                );
-            }
+        // On Linux the platform fallback derives from $HOME unvalidated, so
+        // the guard below is what keeps the global layer off the cwd.
+        assert_eq!(dirs::home_dir(), Some(PathBuf::from("relative-home")));
+        for error in [
+            cockpit_config_dir_unchecked().unwrap_err(),
+            cockpit_state_dir_unchecked().unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .downcast_ref::<NonAbsoluteInstallationRoot>()
+                    .is_some(),
+                "{error:#}"
+            );
         }
     }
 
@@ -300,11 +308,13 @@ mod tests {
             );
         }
         // A purely relative value is ignored per the XDG spec, never joined
-        // onto the working directory.
+        // onto the working directory: the platform default applies.
+        let home = std::env::temp_dir().join("xdg-relative-home");
+        env.set_var("HOME", &home);
         env.set_var("XDG_CONFIG_HOME", "relative-config");
-        if let Ok(path) = cockpit_config_dir_unchecked() {
-            assert!(path.is_absolute(), "{}", path.display());
-        }
+        let path = cockpit_config_dir_unchecked().expect("platform default applies");
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(!path.starts_with("relative-config"), "{}", path.display());
     }
 
     #[test]

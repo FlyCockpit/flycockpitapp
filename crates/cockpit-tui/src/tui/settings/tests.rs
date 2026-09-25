@@ -10024,3 +10024,38 @@ fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
     assert!(mcp.contains("expected_request_intent_hash"));
     assert!(source.contains("provider_view_matches_mutation"));
 }
+
+/// Global config has no project root, so a relative extra env-file path typed
+/// into the global layer is refused inline (the row stays in edit mode with an
+/// explanation) instead of being saved into a layer the daemon then refuses.
+#[test]
+fn relative_extra_env_path_in_global_layer_is_rejected_inline() {
+    use string_list::{RELATIVE_GLOBAL_PATH_ERROR, StringListPage};
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    let before = std::fs::read_to_string(&dialog.extended_path).unwrap();
+    dialog.extended_base.as_object_mut().unwrap().insert(
+        "__cockpit_settings_layer_kind".into(),
+        serde_json::to_value(cockpit_proto::CockpitConfigLayer::HomeXdg).unwrap(),
+    );
+    dialog.set_test_page(Page::StringList(Box::new(
+        StringListPage::extra_dotenv_paths(),
+    )));
+    dialog.handle_key(press(KeyCode::Char('a')));
+    for ch in "rel.env".chars() {
+        dialog.handle_key(press(KeyCode::Char(ch)));
+    }
+    dialog.handle_key(press(KeyCode::Enter));
+    match dialog.test_page() {
+        TestPageRef::StringList(page) => {
+            assert!(page.grabbed.is_some(), "the row stays in edit mode");
+            assert_eq!(page.status.as_deref(), Some(RELATIVE_GLOBAL_PATH_ERROR));
+        }
+        other => panic!("expected the string list page, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&dialog.extended_path).unwrap(),
+        before,
+        "nothing is saved"
+    );
+}

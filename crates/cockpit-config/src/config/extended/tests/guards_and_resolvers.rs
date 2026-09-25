@@ -723,16 +723,20 @@ fn load_for_cwd_unions_redact_lists_and_keeps_dotenv_patterns_replace() {
     let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     let home_cfg = tmp.path().join("home/.config/cockpit/config.json");
     std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
+    // An absolute path on every platform (a bare `/abs/...` is not absolute
+    // on Windows).
+    let home_env = tmp.path().join("abs/home.env");
     std::fs::write(
         &home_cfg,
-        r#"{
-                "redact": {
-                    "denylist": ["home-secret"],
-                    "allowlist": ["HOME_OK"],
-                    "extra_dotenv_paths": ["/abs/home.env"],
-                    "dotenv_patterns": [".env.home"]
-                }
-            }"#,
+        serde_json::json!({
+            "redact": {
+                "denylist": ["home-secret"],
+                "allowlist": ["HOME_OK"],
+                "extra_dotenv_paths": [home_env],
+                "dotenv_patterns": [".env.home"]
+            }
+        })
+        .to_string(),
     )
     .unwrap();
     let project = tmp.path().join("repo");
@@ -762,7 +766,7 @@ fn load_for_cwd_unions_redact_lists_and_keeps_dotenv_patterns_replace() {
     );
     assert_eq!(
         cfg.redact.extra_dotenv_paths,
-        vec![PathBuf::from("/abs/home.env"), project.join("project.env")]
+        vec![home_env, project.join("project.env")]
     );
     assert_eq!(
         cfg.redact.dotenv_patterns,

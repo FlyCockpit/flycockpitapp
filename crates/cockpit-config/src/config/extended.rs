@@ -1612,6 +1612,36 @@ fn redact_list_strings(redact: &Map<String, Value>, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Path-free warning for a relative `redact.ssh_key_dir` in a layer without a
+/// project root. The setting is ignored (the default SSH directory applies).
+pub const RELATIVE_SSH_KEY_DIR_WARNING: &str = "ignored a relative `redact.ssh_key_dir`: only project `.cockpit/` layers can use a path relative to their project root; use an absolute path in global config";
+
+/// The effective `redact.ssh_key_dir`: the most specific layer that sets it
+/// wins, and a relative value is anchored at that DECLARING layer's project
+/// root (the same rule as `extra_dotenv_paths`), so no consumer resolves it
+/// against a process or session working directory.
+fn resolve_anchored_ssh_key_dir(
+    docs: &[ExtendedConfigDoc],
+    warnings: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let (doc, value) = docs.iter().rev().find_map(|doc| {
+        // Malformed values are dropped by the layer merge; skip them here too
+        // so a lower layer's valid value still applies.
+        let value = doc.raw.get("redact")?.as_object()?.get("ssh_key_dir")?;
+        matches!(value, Value::String(_) | Value::Null).then_some((doc, value))
+    })?;
+    let path = match value {
+        Value::String(path) if !path.trim().is_empty() => PathBuf::from(path),
+        _ => return None,
+    };
+    let anchored = anchor_config_relative_path(doc.path_base.as_deref(), &path);
+    if anchored.is_none() {
+        tracing::warn!("ignored a relative `redact.ssh_key_dir` in a layer without a project root");
+        warnings.push(RELATIVE_SSH_KEY_DIR_WARNING.to_string());
+    }
+    anchored
+}
+
 /// Path-free warning for a relative `redact.extra_dotenv_paths` entry in a
 /// layer with no project root (the global layer or an explicit non-project
 /// override). The entry is not honored; configure an absolute path instead.
@@ -1642,16 +1672,6 @@ pub fn anchor_config_relative_path(base: Option<&Path>, path: &Path) -> Option<P
     plain_relative.then(|| base.join(path))
 }
 
-fn redact_list_paths_raw(raw: &Value) -> Vec<PathBuf> {
-    raw.get("redact")
-        .and_then(Value::as_object)
-        .map(|redact| redact_list_paths(redact, "extra_dotenv_paths"))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|path| !path.to_string_lossy().trim().is_empty())
-        .collect()
-}
-
 /// The absolute project root of a conventional `<root>/.cockpit/config.json`
 /// layer path; `None` for every other layer (global, explicit non-project
 /// overrides) or a non-absolute path.
@@ -1668,6 +1688,14 @@ pub fn layer_project_root(config_path: &Path) -> Option<PathBuf> {
 /// for `.cockpit` layers, and `cwd` (the directory it is keyed to) for the
 /// machine-local layer of `cwd`.
 fn layer_path_base(config_path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    // The explicit override is an installation-level layer, never anchored
+    // to a project root even when its path looks like one.
+    if matches!(
+        crate::config::dirs::explicit_config_override(),
+        Ok(Some(ref explicit)) if explicit == config_path
+    ) {
+        return None;
+    }
     if let Some(root) = layer_project_root(config_path) {
         return Some(root);
     }
@@ -2254,82 +2282,251 @@ pub fn load_installation_handover_timers() -> Result<HandoverTimersConfig> {
     })
 }
 
-/// Installation-wide (daemon-global) policy sections that are read strictly by
-/// [`load_installation_extended_config`]: an explicitly present section must
-/// decode completely, with no unknown keys and no permissive recovery.
-const INSTALLATION_POLICY_SECTIONS: &[&str] = &["redact", "retention"];
+/// A section of installation-wide (daemon-global) policy. Each is loaded and
+/// validated on its own, so a fault in one never disables the other: a
+/// retention typo must not take daemon-global redaction coverage down, and a
+/// redact fault must not stop retention sweeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallationPolicySection {
+    Redact,
+    Retention,
+}
 
-/// Load installation-wide policy for the daemon (daemon-wide redaction
-/// coverage, retention sweeps, `cockpit doctor`'s retention report).
+impl InstallationPolicySection {
+    pub const ALL: [Self; 2] = [Self::Redact, Self::Retention];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Redact => "redact",
+            Self::Retention => "retention",
+        }
+    }
+}
+
+/// What is wrong with an installation-policy layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallationPolicyProblem {
+    /// The layer (or the installation directory, or the explicit override)
+    /// cannot be resolved or read. The payload is the sanitized cause.
+    Unavailable(String),
+    /// The section is present but is not a JSON object.
+    NotAnObject,
+    /// The section has a key its type does not define (for example a typo
+    /// that would otherwise silently drop a setting).
+    UnknownKey,
+    /// A key's value does not decode through its type.
+    WrongType,
+    /// A path setting is relative, but installation-wide layers have no
+    /// project root to anchor it.
+    RelativePath,
+}
+
+/// A typed installation-policy failure naming the file, the section and key,
+/// and the problem. Values are never included (they can be secrets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallationPolicyError {
+    pub path: Option<PathBuf>,
+    pub section: Option<InstallationPolicySection>,
+    pub key: Option<String>,
+    pub problem: InstallationPolicyProblem,
+}
+
+impl InstallationPolicyError {
+    fn unavailable(path: Option<&Path>, error: impl std::fmt::Display) -> Self {
+        Self {
+            path: path.map(Path::to_path_buf),
+            section: None,
+            key: None,
+            problem: InstallationPolicyProblem::Unavailable(format!("{error:#}")),
+        }
+    }
+
+    fn in_section(
+        path: &Path,
+        section: InstallationPolicySection,
+        key: Option<&str>,
+        problem: InstallationPolicyProblem,
+    ) -> Self {
+        Self {
+            path: Some(path.to_path_buf()),
+            section: Some(section),
+            key: key.map(str::to_string),
+            problem,
+        }
+    }
+}
+
+impl std::fmt::Display for InstallationPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid installation config")?;
+        if let Some(path) = &self.path {
+            write!(f, " {}", path.display())?;
+        }
+        match (self.section, &self.key) {
+            (Some(section), Some(key)) => write!(f, " at `{}.{key}`", section.key())?,
+            (Some(section), None) => write!(f, " at `{}`", section.key())?,
+            _ => {}
+        }
+        match &self.problem {
+            InstallationPolicyProblem::Unavailable(cause) => write!(f, ": unavailable ({cause})"),
+            InstallationPolicyProblem::NotAnObject => f.write_str(": expected an object"),
+            InstallationPolicyProblem::UnknownKey => f.write_str(": unknown key"),
+            InstallationPolicyProblem::WrongType => f.write_str(": value has the wrong type"),
+            InstallationPolicyProblem::RelativePath => f.write_str(
+                ": installation-wide config has no project root, so paths must be absolute",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InstallationPolicyError {}
+
+/// Load one section of installation-wide policy for the daemon (daemon-wide
+/// redaction coverage, retention sweeps, `cockpit doctor`'s retention report).
 ///
-/// The layers are exactly [`installation_config_file_paths`](crate::config::dirs::installation_config_file_paths):
-/// the `COCKPIT_CONFIG` explicit override when set (selected the same way a
-/// session's load selects it, so daemon-global policy and sessions never read
-/// disjoint layers), otherwise the canonical global layer. No project root
-/// participates.
+/// The layers are exactly
+/// [`installation_config_file_paths`](crate::config::dirs::installation_config_file_paths):
+/// the `COCKPIT_CONFIG` explicit override when set (selected exactly as
+/// sessions select it, never filtered by workspace trust), otherwise the
+/// canonical global layer. No project root participates.
 ///
-/// This reader is strict because a silently weaker policy is worse than an
+/// The reader is strict because a silently weaker policy is worse than an
 /// error here (a dropped denylist, or a retention window defaulting to 90 days
 /// and deleting transcripts):
-/// - an absent layer is the fresh-install default;
-/// - any other read, permission, size, UTF-8, or JSON failure is an error;
-/// - an explicitly present policy section ([`INSTALLATION_POLICY_SECTIONS`])
-///   must decode through its type with no unknown keys;
-/// - a relative `redact.extra_dotenv_paths` entry is an error, because these
-///   layers have no project root to anchor it.
-pub fn load_installation_extended_config() -> Result<ExtendedConfig> {
-    let paths = crate::config::dirs::installation_config_file_paths()?;
+/// - only a path that does not exist at all is absent (the fresh-install
+///   default); a dangling link or any read, size, UTF-8 or JSON failure is an
+///   error;
+/// - the requested section, when present, must decode through its type with
+///   no unknown keys, and its path settings must be absolute.
+///
+/// Only the requested section is validated.
+pub fn load_installation_policy(
+    section: InstallationPolicySection,
+) -> std::result::Result<ExtendedConfig, InstallationPolicyError> {
+    let paths = crate::config::dirs::installation_config_file_paths()
+        .map_err(|error| InstallationPolicyError::unavailable(None, error))?;
     let mut docs = Vec::with_capacity(paths.len());
     for path in &paths {
-        let Some(doc) = ExtendedConfigDoc::load_existing(path)? else {
+        let Some(doc) = ExtendedConfigDoc::load_installation_layer(path)
+            .map_err(|error| InstallationPolicyError::unavailable(Some(path), error))?
+        else {
             continue;
         };
-        validate_installation_policy_sections(&doc)?;
+        validate_policy_section(&doc.path, &doc.raw, doc.path_base.as_deref(), section)?;
         docs.push(doc);
     }
     let (config, _warnings) = resolve_loaded_docs_with_warnings(&docs);
     Ok(config)
 }
 
-fn validate_installation_policy_sections(doc: &ExtendedConfigDoc) -> Result<()> {
-    let defaults = serde_json::to_value(ExtendedConfig::default())
-        .context("serializing default config for policy validation")?;
-    for section in INSTALLATION_POLICY_SECTIONS {
-        let Some(value) = doc.raw.get(*section) else {
+/// Installation-wide redact policy (see [`load_installation_policy`]).
+pub fn load_installation_redact_policy()
+-> std::result::Result<RedactConfig, InstallationPolicyError> {
+    load_installation_policy(InstallationPolicySection::Redact).map(|config| config.redact)
+}
+
+/// Installation-wide retention policy (see [`load_installation_policy`]).
+pub fn load_installation_retention_policy()
+-> std::result::Result<cockpit_db::db::retention::RetentionConfig, InstallationPolicyError> {
+    load_installation_policy(InstallationPolicySection::Retention).map(|config| config.retention)
+}
+
+/// Validate a whole would-be installation-layer document (every policy
+/// section) with the same rules the loaders apply. Writers of an
+/// installation layer (the settings editor) run this before committing, so
+/// they can never author a layer the daemon then refuses to load.
+pub fn validate_installation_layer_document(
+    path: &Path,
+    raw: &Value,
+) -> std::result::Result<(), InstallationPolicyError> {
+    for section in InstallationPolicySection::ALL {
+        validate_policy_section(path, raw, None, section)?;
+    }
+    Ok(())
+}
+
+/// Workspace redact policy read strictly: the same layers a session reads
+/// for `cwd` (under the caller's workspace-trust policy), but every present
+/// layer must be readable and its `redact` section must decode completely
+/// with no unknown keys and only anchorable paths. Security decisions that
+/// derive protection from redact settings (the sharee secret-file check)
+/// use this, so a malformed protection policy fails closed instead of being
+/// dropped by the permissive layer merge.
+pub fn load_redact_policy_strict_for_cwd(
+    cwd: &Path,
+) -> std::result::Result<RedactConfig, InstallationPolicyError> {
+    let paths = crate::config::dirs::try_config_file_paths_for_load(cwd)
+        .map_err(|error| InstallationPolicyError::unavailable(None, error))?;
+    let mut docs = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let Some(mut doc) = ExtendedConfigDoc::load_installation_layer(path)
+            .map_err(|error| InstallationPolicyError::unavailable(Some(path), error))?
+        else {
             continue;
         };
-        let Some(object) = value.as_object() else {
-            anyhow::bail!(
-                "invalid `{section}` section in {}: expected an object",
-                doc.path.display()
-            );
-        };
-        if let Some(known) = defaults.get(*section).and_then(Value::as_object) {
-            for key in object.keys() {
-                if !known.contains_key(key) {
-                    anyhow::bail!(
-                        "invalid `{section}` section in {}: unknown key `{key}`",
-                        doc.path.display()
-                    );
-                }
-            }
+        if doc.path_base.is_none() {
+            doc.path_base = layer_path_base(&doc.path, Some(cwd));
         }
+        validate_policy_section(
+            &doc.path,
+            &doc.raw,
+            doc.path_base.as_deref(),
+            InstallationPolicySection::Redact,
+        )?;
+        docs.push(doc);
+    }
+    let (config, _warnings) = resolve_loaded_docs_with_warnings(&docs);
+    Ok(config.redact)
+}
+
+/// Validate one policy section of a layer. `base` is the layer's project
+/// root: relative path settings must anchor there (installation layers have
+/// none, so their path settings must be absolute).
+fn validate_policy_section(
+    path: &Path,
+    raw: &Value,
+    base: Option<&Path>,
+    section: InstallationPolicySection,
+) -> std::result::Result<(), InstallationPolicyError> {
+    let Some(value) = raw.get(section.key()) else {
+        return Ok(());
+    };
+    let problem = |key: Option<&str>, problem| {
+        InstallationPolicyError::in_section(path, section, key, problem)
+    };
+    let Some(object) = value.as_object() else {
+        return Err(problem(None, InstallationPolicyProblem::NotAnObject));
+    };
+    let defaults = serde_json::to_value(ExtendedConfig::default())
+        .map_err(|error| InstallationPolicyError::unavailable(Some(path), error))?;
+    let known = defaults.get(section.key()).and_then(Value::as_object);
+    for (key, entry) in object {
+        if known.is_some_and(|known| !known.contains_key(key)) {
+            return Err(problem(Some(key), InstallationPolicyProblem::UnknownKey));
+        }
+        let mut field = Map::new();
+        field.insert(key.clone(), entry.clone());
         let mut probe = Map::new();
-        probe.insert((*section).to_string(), value.clone());
-        // Error text is field-level only; values can be secrets.
+        probe.insert(section.key().to_string(), Value::Object(field));
         if serde_json::from_value::<ExtendedConfig>(Value::Object(probe)).is_err() {
-            anyhow::bail!(
-                "invalid `{section}` section in {}: a field has the wrong type",
-                doc.path.display()
-            );
+            return Err(problem(Some(key), InstallationPolicyProblem::WrongType));
         }
     }
-    for entry in redact_list_paths_raw(&doc.raw) {
-        if anchor_config_relative_path(doc.path_base.as_deref(), &entry).is_none() {
-            anyhow::bail!(
-                "invalid `redact.extra_dotenv_paths` entry in {}: installation-wide config has no project root, so every entry must be an absolute path",
-                doc.path.display()
-            );
+    if section == InstallationPolicySection::Redact {
+        for key in ["extra_dotenv_paths", "ssh_key_dir"] {
+            let paths: Vec<PathBuf> = match object.get(key) {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(_)) => redact_list_paths(object, key),
+                Some(Value::String(path)) => vec![PathBuf::from(path)],
+                Some(_) => Vec::new(),
+            };
+            if paths
+                .iter()
+                .filter(|path| !path.to_string_lossy().trim().is_empty())
+                .any(|path| anchor_config_relative_path(base, path).is_none())
+            {
+                return Err(problem(Some(key), InstallationPolicyProblem::RelativePath));
+            }
         }
     }
     Ok(())
@@ -2419,6 +2616,7 @@ fn resolve_loaded_docs_with_warnings(docs: &[ExtendedConfigDoc]) -> (ExtendedCon
         let (mut cfg, mut warnings) = load_merged_from_docs_with_warnings(docs);
         cfg.gitignore_allow = resolve_gitignore_allow_from_docs(docs);
         let redact_unions = resolve_redact_list_unions_from_docs(docs, &mut warnings);
+        cfg.redact.ssh_key_dir = resolve_anchored_ssh_key_dir(docs, &mut warnings);
         cfg.redact.denylist = redact_unions.denylist;
         cfg.redact.allowlist = redact_unions.allowlist;
         cfg.redact.extra_dotenv_paths = redact_unions.extra_dotenv_paths;
@@ -2470,7 +2668,7 @@ pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
     let paths = if workspace.exclusive {
         Vec::new()
     } else {
-        config_file_paths_for_load(cwd)
+        crate::config::dirs::try_config_file_paths_for_load(cwd)?
     };
     let (ambient_providers, captured, mut provider_warnings) =
         crate::config::providers::ConfigDoc::try_load_effective_with_layer_snapshot(&paths)?;
@@ -2535,14 +2733,19 @@ fn extended_doc_from_workspace_snapshot(
     cwd: Option<&Path>,
 ) -> Result<ExtendedConfigDoc> {
     let raw = parse_config_root_object(workspace.config_json.as_deref().unwrap_or(b"{}"))?;
+    // Only discovered project and machine-local layers have a project root.
+    // Global layers and the explicit override (origin `None`) are
+    // installation-scoped, even when the override's path looks like a
+    // `.cockpit/config.json`.
     let path_base = match workspace.origin {
         Some(ConfigDirKind::MachineLocal) => {
             cwd.filter(|cwd| cwd.is_absolute()).map(Path::to_path_buf)
         }
-        _ => workspace
+        Some(ConfigDirKind::Project) => workspace
             .project_root
             .clone()
             .filter(|root| root.is_absolute()),
+        Some(ConfigDirKind::HomeXdg) | None => None,
     };
     Ok(ExtendedConfigDoc {
         path_base,
@@ -2556,7 +2759,7 @@ fn extended_doc_from_workspace_snapshot(
 
 pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConfigLoad> {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let paths = config_file_paths_for_load(cwd);
+    let paths = crate::config::dirs::try_config_file_paths_for_load(cwd)?;
     // Provider recovery/migration is a barrier. Only after it completes do we
     // capture every readable participating config layer once; providers,
     // extended settings, strict validation, and provenance are all projected
@@ -3314,6 +3517,28 @@ impl ExtendedConfigDoc {
             origin: ConfigLayerOrigin::LocalTrusted,
             path_base: layer_path_base(path, None),
         }))
+    }
+
+    /// Load an installation-policy layer strictly. Only a path that does not
+    /// exist at all (`lstat` reports `NotFound`) is absent. A dangling symlink,
+    /// a source that disappears between the check and the read, or any other
+    /// failure is an error: an unavailable configured source must never look
+    /// like a fresh install.
+    pub fn load_installation_layer(path: &Path) -> Result<Option<Self>> {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("reading config layer {}", path.display())));
+            }
+            Ok(_) => {}
+        }
+        Self::load_existing(path)?.map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "config layer {} exists but is unavailable (dangling link or removed during read)",
+                path.display()
+            )
+        })
     }
 
     /// Load a config layer that exists, distinguishing genuine absence

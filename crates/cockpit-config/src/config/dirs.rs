@@ -209,44 +209,76 @@ pub fn discover_config_dirs(cwd: &Path) -> Vec<ConfigDir> {
 /// because UI editing still needs the discovered directory order for choosing a
 /// concrete layer to write.
 pub fn config_file_paths_for_load(cwd: &Path) -> Vec<PathBuf> {
-    if let Some(paths) = explicit_config_file_paths() {
-        return paths;
+    match try_config_file_paths_for_load(cwd) {
+        Ok(paths) => paths,
+        Err(error) => {
+            // Advisory loads cannot report errors; the strict daemon loads use
+            // `try_config_file_paths_for_load` and fail on the same condition.
+            tracing::error!(%error, "ignoring an unusable explicit config override");
+            Vec::new()
+        }
     }
-
-    file_paths_for_load(cwd, CONFIG_FILE)
 }
 
+/// [`config_file_paths_for_load`] with the explicit-override error surfaced.
+/// Strict (daemon-contract and installation) loads use this, so a relative
+/// `COCKPIT_CONFIG` is an error everywhere rather than a cwd lookup.
+pub fn try_config_file_paths_for_load(
+    cwd: &Path,
+) -> Result<Vec<PathBuf>, ExplicitConfigOverrideError> {
+    if let Some(path) = explicit_config_override()? {
+        return Ok(vec![path]);
+    }
+    Ok(file_paths_for_load(cwd, CONFIG_FILE))
+}
+
+/// A `COCKPIT_CONFIG` override that cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplicitConfigOverrideError {
+    /// The override is not an absolute path, so it would resolve against the
+    /// process's working directory.
+    Relative(PathBuf),
+}
+
+impl std::fmt::Display for ExplicitConfigOverrideError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Relative(path) => write!(
+                f,
+                "{COCKPIT_CONFIG_ENV} must be an absolute path (got `{}`)",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExplicitConfigOverrideError {}
+
 /// The `COCKPIT_CONFIG` explicit override, when set: it supplies the only
-/// `config.json` layer (or none when its project layer is not trusted). The
-/// one definition shared by workspace loads and installation-policy loads, so
-/// sessions and daemon-global policy never read disjoint layers.
-fn explicit_config_file_paths() -> Option<Vec<PathBuf>> {
-    let path = std::env::var_os(COCKPIT_CONFIG_ENV).filter(|path| !path.is_empty())?;
+/// `config.json` layer. It is an operator-level choice, so it is never
+/// filtered by the ambient workspace-trust policy (sessions and
+/// installation-wide policy resolve it identically, whatever trust context
+/// the caller runs in), and it is never anchored to a project root even when
+/// its path looks like `<root>/.cockpit/config.json`. A relative override is
+/// an error before anything else.
+pub fn explicit_config_override() -> Result<Option<PathBuf>, ExplicitConfigOverrideError> {
+    let Some(path) = std::env::var_os(COCKPIT_CONFIG_ENV).filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
     let path = PathBuf::from(path);
-    Some(if explicit_config_write_allowed(&path) {
-        vec![path]
-    } else {
-        Vec::new()
-    })
+    if !path.is_absolute() {
+        return Err(ExplicitConfigOverrideError::Relative(path));
+    }
+    Ok(Some(path))
 }
 
 /// The `config.json` layers of installation-wide (daemon-global) policy:
-/// the `COCKPIT_CONFIG` explicit override exactly as [`config_file_paths_for_load`]
-/// selects it, otherwise the canonical global layer. No project root takes
-/// part. Every returned path is absolute: a relative override would be
-/// resolved against the daemon's inherited working directory, so it is an
-/// error.
+/// the `COCKPIT_CONFIG` explicit override exactly as sessions select it,
+/// otherwise the canonical global layer. No project root takes part and
+/// every returned path is absolute.
 pub fn installation_config_file_paths() -> anyhow::Result<Vec<PathBuf>> {
-    if let Some(paths) = explicit_config_file_paths() {
-        for path in &paths {
-            if !path.is_absolute() {
-                anyhow::bail!(
-                    "{COCKPIT_CONFIG_ENV} must be an absolute path for installation-wide policy (got `{}`)",
-                    path.display()
-                );
-            }
-        }
-        return Ok(paths);
+    if let Some(path) = explicit_config_override()? {
+        return Ok(vec![path]);
     }
     Ok(vec![global_config_file()?])
 }
@@ -801,8 +833,12 @@ mod tests {
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
+    /// `COCKPIT_CONFIG` is an operator-level choice: it is loaded exactly as
+    /// named whatever workspace-trust policy is in scope (sessions and
+    /// installation-wide policy must resolve it identically), while writes
+    /// into a conventional project path remain trust-gated.
     #[test]
-    fn cockpit_config_env_inside_ignored_project_is_not_loaded() {
+    fn cockpit_config_env_inside_ignored_project_is_loaded_but_not_written() {
         let tmp = TempDir::new().unwrap();
         let env = test_support::IsolatedCockpitHome::new(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
@@ -818,7 +854,8 @@ mod tests {
         );
         let _override = env.override_cockpit_config(&config);
 
-        assert!(config_file_paths_for_load(&repo).is_empty());
+        assert_eq!(config_file_paths_for_load(&repo), vec![config.clone()]);
+        assert_eq!(installation_config_file_paths().unwrap(), vec![config]);
         assert!(most_specific_config_write_target(&repo).is_none());
         crate::config::trust::clear_runtime_policy_for_tests();
     }

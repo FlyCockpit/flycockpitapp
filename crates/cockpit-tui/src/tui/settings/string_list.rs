@@ -104,6 +104,10 @@ impl StringListKind {
     }
 }
 
+/// Inline error for a relative path typed into a global-layer path list.
+pub(super) const RELATIVE_GLOBAL_PATH_ERROR: &str =
+    "Global config needs an absolute path (it has no project root to resolve a relative one).";
+
 /// Grab/reorder editor state for one config list.
 pub(super) struct StringListPage {
     pub(super) kind: StringListKind,
@@ -386,10 +390,32 @@ impl SettingsCx {
         p.status = None;
     }
 
+    /// Whether the edited settings layer is the global (installation-wide)
+    /// layer, whose path settings have no project root to anchor them.
+    fn editing_global_layer(&self) -> bool {
+        self.extended_base
+            .get("__cockpit_settings_layer_kind")
+            .cloned()
+            .and_then(|kind| serde_json::from_value::<cockpit_proto::CockpitConfigLayer>(kind).ok())
+            == Some(cockpit_proto::CockpitConfigLayer::HomeXdg)
+    }
+
     fn commit_string_list_grab(&mut self, p: &mut StringListPage) {
         let Some(g) = p.grabbed.take() else { return };
         p.delete.disarm();
         let trimmed = g.buf.text().trim().to_string();
+        if p.kind == StringListKind::ExtraDotenvPaths
+            && !trimmed.is_empty()
+            && self.editing_global_layer()
+            && !std::path::Path::new(&trimmed).is_absolute()
+        {
+            // Global config has no project root to resolve a relative path
+            // against, and the daemon refuses such a layer. Keep the row in
+            // edit mode with the text, and say why, instead of saving it.
+            p.status = Some(RELATIVE_GLOBAL_PATH_ERROR.to_string());
+            p.grabbed = Some(g);
+            return;
+        }
         if trimmed.is_empty() {
             if p.kind == StringListKind::RedactDenylist && g.original_name.is_some() {
                 if let Some(original) = g.original_name {

@@ -209,6 +209,79 @@ pub fn send_event(tx: &EventSender, redact: &Arc<RedactionTable>, event: proto::
     });
 }
 
+/// Coverage for events that originate in one session's workspace but are
+/// delivered on the daemon-global bus (terminal output, clipboard, notices).
+///
+/// Daemon-global coverage deliberately contains no workspace file sources, so
+/// such an event is covered by the union of the live daemon-global table and
+/// the live originating table. The union is rebuilt only when either live
+/// table changes.
+#[derive(Clone)]
+pub struct EventCoverage {
+    global: SharedRedactionTable,
+    origin: SharedRedactionTable,
+    cache: Arc<std::sync::Mutex<Option<CoverageUnion>>>,
+}
+
+#[derive(Clone)]
+struct CoverageUnion {
+    global: Arc<RedactionTable>,
+    origin: Arc<RedactionTable>,
+    union: Arc<RedactionTable>,
+}
+
+impl std::fmt::Debug for EventCoverage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EventCoverage")
+            .finish_non_exhaustive()
+    }
+}
+
+impl EventCoverage {
+    pub fn new(global: SharedRedactionTable, origin: SharedRedactionTable) -> Self {
+        Self {
+            global,
+            origin,
+            cache: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// The table covering an event emitted now. Both live tables are read
+    /// once, so the union matches a single instant of each.
+    pub fn current(&self) -> Result<Arc<RedactionTable>> {
+        let global = current_redaction(&self.global);
+        let origin = current_redaction(&self.origin);
+        let mut cache = crate::sync::lock_or_recover(&self.cache);
+        if let Some(cached) = cache.as_ref()
+            && Arc::ptr_eq(&cached.global, &global)
+            && Arc::ptr_eq(&cached.origin, &origin)
+        {
+            return Ok(cached.union.clone());
+        }
+        let union = Arc::new(global.union(&origin)?);
+        *cache = Some(CoverageUnion {
+            global,
+            origin,
+            union: union.clone(),
+        });
+        Ok(union)
+    }
+}
+
+/// Send an event covered by [`EventCoverage`]. When the coverage union cannot
+/// be built the event is withheld (fail closed) rather than delivered under
+/// the narrower daemon-global table.
+pub fn send_covered_event(tx: &EventSender, coverage: &EventCoverage, event: proto::Event) {
+    match coverage.current() {
+        Ok(table) => send_event(tx, &table, event),
+        Err(error) => tracing::error!(
+            error = %format!("{error:#}"),
+            "event withheld: originating redaction coverage is unavailable"
+        ),
+    }
+}
+
 /// Internal lifetime marker passed to a detached child. Both persistent and
 /// ephemeral owners publish at the canonical socket; only their lifetime
 /// policy differs.
@@ -3460,11 +3533,25 @@ async fn run_foreground_inner_with_boot_db_impl(
     // accept loop is runnable so a contended sweep cannot delay the first
     // protocol hello. The pass uses the same transactional implementation as
     // later interval ticks and may safely overlap client reads.
-    let mut initial_retention = ForegroundTask::new(tokio::spawn(server::run_retention_pass(
-        ctx.db.clone(),
-        server::retention_config(),
-        chrono::Utc::now().timestamp(),
-    )));
+    // An unreadable retention policy skips the pass rather than applying the
+    // default windows (see `server::retention_config`).
+    let initial_retention_policy = server::retention_config();
+    let initial_retention_db = ctx.db.clone();
+    let mut initial_retention = ForegroundTask::new(tokio::spawn(async move {
+        match initial_retention_policy {
+            Some(policy) => {
+                server::run_retention_pass(
+                    initial_retention_db,
+                    policy,
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+            }
+            None => tracing::warn!(
+                "initial retention pass skipped: the installation retention policy is unavailable"
+            ),
+        }
+    }));
     timer.phase("socket_bind");
     boot_dbg!("after_bind");
     timer.phase("endpoint_published");

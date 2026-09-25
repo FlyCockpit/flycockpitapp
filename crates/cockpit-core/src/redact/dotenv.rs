@@ -24,21 +24,45 @@ pub(crate) fn dotenv_max_depth(in_git_repo: bool) -> Option<usize> {
     if in_git_repo { None } else { Some(8) }
 }
 
+/// A configured redaction source path that cannot be placed without the
+/// process working directory: a relative path with no workspace root (the
+/// daemon-global scope), a relative workspace root, or a non-absolute path
+/// carrying a root or Windows drive prefix. Coverage fails closed on it.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "`{setting}` entry `{}` is not an absolute path and has no workspace root to resolve against",
+    path.display()
+)]
+pub(crate) struct UnanchoredRedactionSourcePath {
+    pub(crate) setting: &'static str,
+    pub(crate) path: PathBuf,
+}
+
 /// The env-file sources of one build scope: the single discovery funnel for
 /// table builds and coverage bindings.
 ///
-/// A [`RedactionSourceScope::Workspace`] walks `patterns` below its root and
-/// adds the configured `extra` paths (relative ones resolved against that
-/// root). [`RedactionSourceScope::DaemonGlobal`] walks nothing: it honors only
-/// absolute configured paths, because a relative path names a file inside a
-/// workspace and is covered by that workspace's sessions.
+/// A [`RedactionSourceScope::Workspace`] (whose root must be absolute) walks
+/// `patterns` below its root and adds the configured `extra` paths.
+/// [`RedactionSourceScope::DaemonGlobal`] walks nothing and honors absolute
+/// configured paths only. Layered config already anchors relative entries at
+/// their declaring project layer, so a relative entry reaching the
+/// daemon-global scope is an error, never a cwd lookup.
 pub(crate) fn matched_dotenv_sources(
     scope: RedactionSourceScope<'_>,
     patterns: &[String],
     extra: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
     match scope {
-        RedactionSourceScope::Workspace(root) => matched_dotenv_paths(root, patterns, extra),
+        RedactionSourceScope::Workspace(root) => {
+            if !root.is_absolute() {
+                return Err(UnanchoredRedactionSourcePath {
+                    setting: "workspace root",
+                    path: root.to_path_buf(),
+                }
+                .into());
+            }
+            matched_dotenv_paths(root, patterns, extra)
+        }
         RedactionSourceScope::DaemonGlobal => {
             let mut out = Vec::new();
             collect_explicit_dotenv_paths(scope, extra, &mut out)?;
@@ -49,22 +73,25 @@ pub(crate) fn matched_dotenv_sources(
     }
 }
 
-/// Resolve one configured `extra_dotenv_paths` entry for `scope`. Absolute
-/// paths are scope-independent. A relative path is workspace-relative, so it
-/// resolves against a workspace root and is never resolved against the
-/// process working directory; daemon-global scope has no root and yields
-/// `None`.
+/// Resolve one configured `extra_dotenv_paths` entry for `scope` with the
+/// same anchoring rule layered config applies
+/// ([`anchor_config_relative_path`](crate::config::extended::anchor_config_relative_path)):
+/// absolute paths as written, plain relative paths under an absolute
+/// workspace root, and an [`UnanchoredRedactionSourcePath`] error otherwise.
 pub(crate) fn resolve_explicit_dotenv_path(
     scope: RedactionSourceScope<'_>,
     path: &Path,
-) -> Option<PathBuf> {
-    if path.is_absolute() {
-        return Some(path.to_path_buf());
-    }
-    match scope {
-        RedactionSourceScope::Workspace(root) => Some(root.join(path)),
+) -> std::result::Result<PathBuf, UnanchoredRedactionSourcePath> {
+    let base = match scope {
+        RedactionSourceScope::Workspace(root) => Some(root),
         RedactionSourceScope::DaemonGlobal => None,
-    }
+    };
+    crate::config::extended::anchor_config_relative_path(base, path).ok_or_else(|| {
+        UnanchoredRedactionSourcePath {
+            setting: "redact.extra_dotenv_paths",
+            path: path.to_path_buf(),
+        }
+    })
 }
 
 pub(crate) fn matched_dotenv_paths(
@@ -163,10 +190,7 @@ fn collect_explicit_dotenv_paths(
     out: &mut Vec<PathBuf>,
 ) -> Result<()> {
     for path in extra {
-        let Some(path) = resolve_explicit_dotenv_path(scope, path) else {
-            continue;
-        };
-        let path = &path;
+        let path = &resolve_explicit_dotenv_path(scope, path)?;
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -176,11 +200,7 @@ fn collect_explicit_dotenv_paths(
             }
             Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::metadata(path) {
                 Ok(target) if target.is_file() => {
-                    std::fs::File::open(path).map_err(|error| {
-                        anyhow::anyhow!(
-                            "configured dotenv source is unavailable during capture: {error}"
-                        )
-                    })?;
+                    confirm_regular_source(path)?;
                     out.push(path.clone());
                 }
                 Ok(_) => {}
@@ -191,17 +211,27 @@ fn collect_explicit_dotenv_paths(
                 }
             },
             Ok(metadata) if metadata.is_file() => {
-                std::fs::File::open(path).map_err(|error| {
-                    anyhow::anyhow!(
-                        "configured dotenv source is unavailable during capture: {error}"
-                    )
-                })?;
+                confirm_regular_source(path)?;
                 out.push(path.clone());
             }
             Ok(_) => {}
         }
     }
     Ok(())
+}
+
+/// Confirm a discovered explicit source is still an openable regular file.
+///
+/// The open is non-blocking and the type is validated on the descriptor, so a
+/// source swapped for a FIFO between the metadata check and this open is an
+/// error instead of an open that blocks a coverage worker until a writer
+/// appears.
+pub(super) fn confirm_regular_source(path: &Path) -> Result<()> {
+    cockpit_host::bounded::open_regular_file(path)
+        .map(drop)
+        .map_err(|error| {
+            anyhow::anyhow!("configured dotenv source is unavailable during capture: {error}")
+        })
 }
 
 pub(crate) fn dotenv_scan_start_is_unbounded(cwd: &Path) -> bool {

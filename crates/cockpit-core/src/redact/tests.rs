@@ -1498,18 +1498,27 @@ fn daemon_global_scope_discovers_only_absolute_configured_env_files() {
     let paths = matched_dotenv_sources(
         RedactionSourceScope::DaemonGlobal,
         &crate::config::extended::default_dotenv_patterns(),
-        &[absolute.clone(), relative.clone()],
+        std::slice::from_ref(&absolute),
     )
     .unwrap();
     assert_eq!(
         paths,
         vec![absolute.clone()],
-        "daemon-global scope walks nothing and has no root for relative paths"
+        "daemon-global scope walks nothing"
+    );
+    assert!(
+        matched_dotenv_sources(
+            RedactionSourceScope::DaemonGlobal,
+            &crate::config::extended::default_dotenv_patterns(),
+            &[absolute.clone(), relative.clone()],
+        )
+        .is_err(),
+        "daemon-global scope has no root: a relative configured path fails closed"
     );
 
     let mut cfg = enabled_cfg();
     cfg.scan_dotenv = true;
-    cfg.extra_dotenv_paths = vec![absolute, relative];
+    cfg.extra_dotenv_paths = vec![absolute];
     let global = RedactionTable::build_scoped(
         &cfg,
         RedactionSourceScope::DaemonGlobal,
@@ -1535,12 +1544,21 @@ fn relative_extra_dotenv_paths_resolve_against_the_workspace_root() {
     .unwrap();
     let relative = PathBuf::from("secrets/ci.env");
     assert_eq!(
-        resolve_explicit_dotenv_path(RedactionSourceScope::Workspace(workspace.path()), &relative),
-        Some(workspace.path().join("secrets/ci.env"))
+        resolve_explicit_dotenv_path(RedactionSourceScope::Workspace(workspace.path()), &relative)
+            .unwrap(),
+        workspace.path().join("secrets/ci.env")
     );
-    assert_eq!(
-        resolve_explicit_dotenv_path(RedactionSourceScope::DaemonGlobal, &relative),
-        None
+    assert!(
+        resolve_explicit_dotenv_path(RedactionSourceScope::DaemonGlobal, &relative).is_err(),
+        "daemon-global scope has no root: a relative entry is a typed error, never a cwd lookup"
+    );
+    assert!(
+        resolve_explicit_dotenv_path(
+            RedactionSourceScope::Workspace(Path::new("relative-root")),
+            &relative
+        )
+        .is_err(),
+        "a relative workspace root is rejected"
     );
 
     let mut cfg = enabled_cfg();
@@ -3118,4 +3136,207 @@ fn scrub_covers_multibyte_utf8_overlapping_literals() {
     assert!(!out.contains(b), "second multibyte secret survived: {out}");
     assert!(!out.contains("γδ"), "shared multibyte run leaked: {out}");
     assert_eq!(out, format!("X{ph}Y"));
+}
+
+#[cfg(unix)]
+fn make_fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+}
+
+/// Runs `probe` on a helper thread and fails (instead of hanging the suite)
+/// when it does not return promptly: a blocking open of a FIFO with no writer
+/// never returns.
+#[cfg(unix)]
+fn returns_promptly<T: Send + 'static>(probe: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(probe());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("source probe blocked on a FIFO instead of failing")
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_and_ssh_sources_never_block_on_a_fifo() {
+    let dir = TempDir::new().unwrap();
+    let fifo = dir.path().join("swapped.env");
+    make_fifo(&fifo);
+    let dotenv_probe = fifo.clone();
+    assert!(
+        returns_promptly(move || super::dotenv::confirm_regular_source(&dotenv_probe)).is_err(),
+        "an explicit source swapped for a FIFO is an error, not a blocking open"
+    );
+    let ssh_probe = fifo.clone();
+    assert!(
+        returns_promptly(move || super::ssh::read_ssh_source_text(&ssh_probe)).is_err(),
+        "an SSH source swapped for a FIFO is an error, not a blocking read"
+    );
+}
+
+#[test]
+fn ssh_key_dir_resolution_is_scope_aware_and_never_uses_the_cwd() {
+    let workspace = TempDir::new().unwrap();
+    let relative = Path::new("keys");
+    assert_eq!(
+        super::ssh::resolve_ssh_key_dir(
+            RedactionSourceScope::Workspace(workspace.path()),
+            Some(relative)
+        )
+        .unwrap(),
+        Some(workspace.path().join("keys"))
+    );
+    let error = super::ssh::resolve_ssh_key_dir(RedactionSourceScope::DaemonGlobal, Some(relative))
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<UnanchoredRedactionSourcePath>()
+            .is_some(),
+        "a relative daemon-global SSH directory is a typed error: {error:#}"
+    );
+    let absolute = workspace.path().join("abs-keys");
+    assert_eq!(
+        super::ssh::resolve_ssh_key_dir(RedactionSourceScope::DaemonGlobal, Some(&absolute))
+            .unwrap(),
+        Some(absolute)
+    );
+
+    // With SSH scanning ENABLED, a daemon-global build refuses a relative
+    // directory instead of reading the process cwd.
+    let mut cfg = enabled_cfg();
+    cfg.scan_ssh_keys = true;
+    cfg.ssh_key_dir = Some(relative.to_path_buf());
+    let error = RedactionTable::build_scoped(
+        &cfg,
+        RedactionSourceScope::DaemonGlobal,
+        &HashMap::new(),
+        Vec::<(String, String)>::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<UnanchoredRedactionSourcePath>()),
+        "{error:#}"
+    );
+    assert!(
+        super::coverage_bindings::machine_sources_probe_binding(
+            &cfg,
+            RedactionSourceScope::DaemonGlobal
+        )
+        .is_err(),
+        "the coverage binding uses the same resolver and fails closed"
+    );
+
+    // A workspace build scans the anchored directory.
+    let keys = workspace.path().join("keys");
+    std::fs::create_dir(&keys).unwrap();
+    std::fs::write(
+        keys.join("id_test"),
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nworkspace-ssh-key-canary-9f2\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let table = RedactionTable::build_scoped(
+        &cfg,
+        RedactionSourceScope::Workspace(workspace.path()),
+        &HashMap::new(),
+        Vec::<(String, String)>::new(),
+    )
+    .unwrap();
+    assert!(
+        !table
+            .scrub("workspace-ssh-key-canary-9f2")
+            .contains("workspace-ssh-key-canary-9f2")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_binding_errors_never_hash_like_an_empty_source() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.scan_ssh_keys = true;
+    cfg.ssh_key_dir = Some(ssh.clone());
+    let scope = RedactionSourceScope::Workspace(dir.path());
+    assert!(
+        super::coverage_bindings::machine_sources_binding(&cfg, scope, None).is_ok(),
+        "an empty, readable SSH source binds"
+    );
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = std::fs::read_dir(&ssh).is_err();
+    let result = super::coverage_bindings::machine_sources_binding(&cfg, scope, None);
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Root bypasses directory modes; the property is only observable when the
+    // directory is actually unreadable to this process.
+    if unreadable {
+        assert!(
+            result.is_err(),
+            "an unreadable source is unavailable, not equal to the empty binding"
+        );
+    }
+}
+
+#[test]
+fn policy_digest_covers_every_table_affecting_field_unambiguously() {
+    use super::coverage_bindings::redact_config_digest;
+    let base = enabled_cfg();
+    let digest = redact_config_digest(&base);
+    type Mutation = Box<dyn Fn(&mut RedactConfig)>;
+    let variants: Vec<(&str, Mutation)> = vec![
+        (
+            "denylist",
+            Box::new(|c| c.denylist = vec!["new-literal".into()]),
+        ),
+        (
+            "allowlist",
+            Box::new(|c| c.allowlist = vec!["SAFE_NAME".into()]),
+        ),
+        ("min_secret_length", Box::new(|c| c.min_secret_length += 1)),
+        ("placeholder", Box::new(|c| c.placeholder = "[x]".into())),
+        (
+            "secret_path_patterns",
+            Box::new(|c| c.secret_path_patterns = vec!["*.key".into()]),
+        ),
+        ("enabled", Box::new(|c| c.enabled = !c.enabled)),
+        (
+            "ssh_key_dir",
+            Box::new(|c| c.ssh_key_dir = Some("/k".into())),
+        ),
+        (
+            "extra_dotenv_paths",
+            Box::new(|c| c.extra_dotenv_paths = vec!["/x.env".into()]),
+        ),
+    ];
+    for (field, mutate) in variants {
+        let mut changed = base.clone();
+        mutate(&mut changed);
+        assert_ne!(
+            redact_config_digest(&changed),
+            digest,
+            "`{field}` must change the policy digest"
+        );
+    }
+    let mut joined = base.clone();
+    joined.denylist = vec!["ab".into()];
+    let mut split = base.clone();
+    split.denylist = vec!["a".into(), "b".into()];
+    assert_ne!(
+        redact_config_digest(&joined),
+        redact_config_digest(&split),
+        "list boundaries are part of the encoding"
+    );
+    let mut moved = base.clone();
+    moved.allowlist = vec!["a".into()];
+    let mut other = base;
+    other.denylist = vec!["a".into()];
+    assert_ne!(
+        redact_config_digest(&moved),
+        redact_config_digest(&other),
+        "field tags are part of the encoding"
+    );
 }

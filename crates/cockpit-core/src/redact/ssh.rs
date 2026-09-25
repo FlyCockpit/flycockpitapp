@@ -21,9 +21,52 @@ pub(super) fn is_pem_private_key(content: &str) -> bool {
         .any(|h| trimmed.starts_with(h))
 }
 
+/// Resolve the SSH key directory a build in `scope` scans: the one resolver
+/// shared by table capture and coverage bindings.
+///
+/// - Unset: the user's `~/.ssh`, which must resolve to an absolute path (a
+///   relative `HOME` would otherwise be read relative to the process cwd).
+///   No home directory means no SSH source.
+/// - Absolute: used as written.
+/// - Relative: anchored at the workspace root for a workspace scope; a
+///   daemon-global build has no root and rejects it, as does any non-absolute
+///   path with a root or Windows prefix.
+pub(crate) fn resolve_ssh_key_dir(
+    scope: RedactionSourceScope<'_>,
+    configured: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    match configured {
+        Some(dir) => {
+            let base = match scope {
+                RedactionSourceScope::Workspace(root) => Some(root),
+                RedactionSourceScope::DaemonGlobal => None,
+            };
+            crate::config::extended::anchor_config_relative_path(base, dir)
+                .map(Some)
+                .ok_or_else(|| {
+                    UnanchoredRedactionSourcePath {
+                        setting: "redact.ssh_key_dir",
+                        path: dir.to_path_buf(),
+                    }
+                    .into()
+                })
+        }
+        None => match dirs::home_dir() {
+            None => Ok(None),
+            Some(home) if home.is_absolute() => Ok(Some(home.join(".ssh"))),
+            Some(home) => Err(UnanchoredRedactionSourcePath {
+                setting: "HOME",
+                path: home,
+            }
+            .into()),
+        },
+    }
+}
+
 /// Collect `(value, origin)` candidates for every private SSH key under the
-/// configured dir (`ssh_key_dir` override, else the user's `~/.ssh`). A
-/// missing/unreadable dir is skipped silently (no error). For each regular
+/// already-resolved `ssh_key_dir` (see [`resolve_ssh_key_dir`]); `None` means
+/// there is no SSH source. A missing directory is an empty source; an
+/// unreadable one fails closed. For each regular
 /// file (symlinks followed to their target) whose content is a PEM private
 /// key, the trimmed full key text is registered with origin `$ssh:<file>`;
 /// a newline-normalized (`\r\n`→`\n`) variant is added when it differs so a
@@ -38,14 +81,8 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
     ssh_key_dir: Option<&Path>,
     mut before_confirm: impl FnMut(&Path),
 ) -> Result<Vec<(String, String)>> {
-    let dir = match ssh_key_dir {
-        Some(d) => d.to_path_buf(),
-        None => {
-            let Some(home) = dirs::home_dir() else {
-                return Ok(Vec::new());
-            };
-            home.join(".ssh")
-        }
+    let Some(dir) = ssh_key_dir.map(Path::to_path_buf) else {
+        return Ok(Vec::new());
     };
 
     let discover = || -> Result<Option<Vec<PathBuf>>> {
@@ -97,16 +134,19 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
         let target_before = std::fs::canonicalize(&path).map_err(|error| {
             anyhow::anyhow!("configured SSH source is unreadable during capture: {error}")
         })?;
-        let content = std::fs::read_to_string(&path).map_err(|error| {
+        // Bounded, non-blocking-open read with descriptor-based regular-file
+        // validation: a key swapped for a FIFO after the metadata check fails
+        // instead of stalling a coverage worker on the open.
+        let content = read_ssh_source_text(path).map_err(|error| {
             anyhow::anyhow!("configured SSH source is unreadable during capture: {error}")
         })?;
         before_confirm(&path);
         // A configured symlink can be retargeted independently of the
         // directory entry. Capture refuses an unstable read instead of
         // publishing coverage for either half of the replacement.
-        let target_after = std::fs::canonicalize(&path)
+        let target_after = std::fs::canonicalize(path)
             .map_err(|_| anyhow::anyhow!("configured SSH source changed during capture"))?;
-        let confirm = std::fs::read_to_string(&path)
+        let confirm = read_ssh_source_text(path)
             .map_err(|_| anyhow::anyhow!("configured SSH source changed during capture"))?;
         if target_before != target_after || content != confirm {
             anyhow::bail!("configured SSH source changed during capture");
@@ -135,4 +175,9 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
         anyhow::bail!("configured SSH source set changed during capture");
     }
     Ok(out)
+}
+
+pub(super) fn read_ssh_source_text(path: &Path) -> Result<String> {
+    let bytes = crate::resource_limits::read_for_tool(path)?;
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("SSH source is not UTF-8"))
 }

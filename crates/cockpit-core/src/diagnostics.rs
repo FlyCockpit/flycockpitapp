@@ -208,7 +208,7 @@ pub async fn cli_snapshot(
     .await;
     snapshot.network = network;
     snapshot.has_failures |= network_failed;
-    let (database, database_failed) = database_lines(&db_source, &extended).await;
+    let (database, database_failed) = database_lines(&db_source).await;
     snapshot.database = database;
     snapshot.has_failures |= database_failed;
     let (mut daemon, _) = daemon_lines().await;
@@ -565,10 +565,8 @@ fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -
     crate::daemon::session_worker::initial_active_agent(extended).to_string()
 }
 
-async fn database_lines(
-    db: &DiagnosticDb<'_>,
-    extended: &crate::config::extended::ExtendedConfig,
-) -> (Vec<String>, bool) {
+async fn database_lines(db: &DiagnosticDb<'_>) -> (Vec<String>, bool) {
+    let retention = installation_retention_report_line();
     // `default_path` only resolves the on-disk location; it does NOT open,
     // create, or migrate anything, so the real path is always safe to report.
     let resolved_path = match db {
@@ -619,7 +617,7 @@ async fn database_lines(
                 lines.push("schema: unavailable because no database file exists yet".to_string());
                 lines
                     .push("integrity: unavailable because no database file exists yet".to_string());
-                append_database_failure_guidance(&mut lines, &extended.retention);
+                append_database_failure_guidance(&mut lines, &retention);
                 return (lines, false);
             } else {
                 lines.push(format!("openability: FAILED ({})", one_line(&message)));
@@ -628,7 +626,7 @@ async fn database_lines(
                 );
                 lines.push("integrity: unavailable because SQLite did not open".to_string());
             }
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
         // No DB at all (e.g. a TUI client): the resolved path stays visible but
@@ -637,7 +635,7 @@ async fn database_lines(
             lines.push("openability: unavailable (daemon not running)".to_string());
             lines.push("schema: unavailable".to_string());
             lines.push("integrity: unavailable (daemon not running)".to_string());
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     };
@@ -662,7 +660,7 @@ async fn database_lines(
                 .expect("one database read failed");
             lines.push(format!("schema: FAILED ({})", one_line(&error.to_string())));
             lines.push("integrity: unavailable because schema reads failed".to_string());
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -686,7 +684,7 @@ async fn database_lines(
                 "storage: FAILED ({})",
                 one_line(&error.to_string())
             ));
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -700,7 +698,7 @@ async fn database_lines(
                 "integrity: FAILED ({})",
                 one_line(&format!("{error:#}"))
             ));
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -716,7 +714,7 @@ async fn database_lines(
                 "retention protection: FAILED ({})",
                 one_line(&format!("{error:#}"))
             ));
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -732,7 +730,7 @@ async fn database_lines(
                 crate::db::retention::SESSIONS_EXPIRY_SKIPPED_MEDIA_BARRIER_KEY,
                 one_line(&format!("{error:#}"))
             ));
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -744,8 +742,24 @@ async fn database_lines(
         "repair: read-only doctor never edits SQLite; restore a validated sibling *.backup-*.sqlite or move the database aside and restart"
             .to_string(),
     );
-    lines.push(retention_line(&extended.retention));
+    lines.push(retention);
     (lines, false)
+}
+
+/// The retention line `cockpit doctor` reports: the installation-wide policy
+/// the daemon's sweeps apply, read through the same strict loader. A policy
+/// that cannot be read is reported as such, because the daemon then skips its
+/// sweeps instead of applying default windows.
+fn installation_retention_report_line() -> String {
+    match crate::config::extended::load_installation_extended_config()
+        .map(|extended| extended.retention)
+    {
+        Ok(policy) => retention_line(&policy),
+        Err(error) => format!(
+            "retention: FAILED ({}); the daemon skips retention sweeps until the policy loads",
+            one_line(&format!("{error:#}"))
+        ),
+    }
 }
 
 fn is_absent_database(message: &str) -> bool {
@@ -791,10 +805,7 @@ fn retention_line(retention: &crate::db::retention::RetentionConfig) -> String {
     )
 }
 
-fn append_database_failure_guidance(
-    lines: &mut Vec<String>,
-    retention: &crate::db::retention::RetentionConfig,
-) {
+fn append_database_failure_guidance(lines: &mut Vec<String>, retention: &str) {
     lines.push(
         "export: unavailable while database health is failed; do not bypass daemon validation"
             .to_string(),
@@ -803,7 +814,7 @@ fn append_database_failure_guidance(
         "repair: read-only doctor never edits SQLite; restore a validated sibling *.backup-*.sqlite or move the database aside and restart"
             .to_string(),
     );
-    lines.push(retention_line(retention));
+    lines.push(retention.to_string());
 }
 
 async fn daemon_lines() -> (Vec<String>, bool) {
@@ -2756,7 +2767,7 @@ mod tests {
             ..crate::db::retention::RetentionConfig::default()
         };
         let mut lines = Vec::new();
-        append_database_failure_guidance(&mut lines, &retention);
+        append_database_failure_guidance(&mut lines, &retention_line(&retention));
 
         assert!(
             lines

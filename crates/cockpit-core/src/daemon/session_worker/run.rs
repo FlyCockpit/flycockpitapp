@@ -13737,22 +13737,26 @@ pub(super) async fn run_worker(
                                                             redact_config: &effective_redact,
                                                         }
                                                         .coverage_key();
-                                                        let coverage_key = installed_key
-                                                            .with_current_owned_revisions(
-                                                                &current_key,
-                                                            );
-                                                        authority.invalidate_key(&installed_key);
-                                                        let capture_policy_digest =
-                                                            policy_digest.clone();
-                                                        let env = session_env.clone();
-                                                        let env_snapshot_for_capture =
-                                                            environment.clone();
-                                                        let publish_vault =
-                                                            session.secret_vault().clone();
-                                                        let publish_db = session.db.clone();
-                                                        let publish_command_cache =
-                                                            command_cache.clone();
-                                                        let publish_fence =
+                                                        match current_key {
+                                                            Err(error) => Err(error),
+                                                            Ok(current_key) => {
+                                                                let coverage_key = installed_key
+                                                                    .with_current_owned_revisions(
+                                                                        &current_key,
+                                                                    );
+                                                                authority
+                                                                    .invalidate_key(&installed_key);
+                                                                let capture_policy_digest =
+                                                                    policy_digest.clone();
+                                                                let env = session_env.clone();
+                                                                let env_snapshot_for_capture =
+                                                                    environment.clone();
+                                                                let publish_vault =
+                                                                    session.secret_vault().clone();
+                                                                let publish_db = session.db.clone();
+                                                                let publish_command_cache =
+                                                                    command_cache.clone();
+                                                                let publish_fence =
                                                             crate::daemon::session_worker::worker_coverage_publish_owners(
                                                                 &session,
                                                                 &env_overlay,
@@ -13763,7 +13767,7 @@ pub(super) async fn run_worker(
                                                                 publish_command_cache.clone(),
                                                             )
                                                             .publish_fence();
-                                                        match authority
+                                                                match authority
                                                             .acquire(
                                                                 coverage_key.clone(),
                                                                 crate::redact::coverage_authority::CoverageScope::RedactionOverride,
@@ -13856,6 +13860,8 @@ pub(super) async fn run_worker(
                                                             Err(error) => Err(anyhow::anyhow!(
                                                                 error.to_string()
                                                             )),
+                                                        }
+                                                            }
                                                         }
                                                     }
                                                 }

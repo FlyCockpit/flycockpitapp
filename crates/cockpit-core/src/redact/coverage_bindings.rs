@@ -75,22 +75,80 @@ pub(crate) struct OwnedSourceRevisions {
     pub machine_sources: CoverageBinding,
 }
 
+/// Digest of every table-affecting redact setting.
+///
+/// The config is destructured exhaustively, so adding a `RedactConfig` field
+/// is a compile error here until it is encoded. Each field is written with a
+/// tag and every string, path, and list with an explicit length, so no two
+/// distinct configs (for example `["ab"]` and `["a", "b"]`) share an encoding.
 pub(crate) fn redact_config_digest(config: &RedactConfig) -> String {
+    let RedactConfig {
+        enabled,
+        scan_environment,
+        scan_dotenv,
+        scan_ssh_keys,
+        ssh_key_dir,
+        dotenv_patterns,
+        extra_dotenv_paths,
+        secret_path_patterns,
+        min_secret_length,
+        placeholder,
+        denylist,
+        allowlist,
+    } = config;
     let mut hasher = Sha256::new();
     hasher.update(b"flycockpit-redact-policy-v1\0");
-    hasher.update([u8::from(config.enabled)]);
-    hasher.update([u8::from(config.scan_environment)]);
-    hasher.update([u8::from(config.scan_dotenv)]);
-    hasher.update([u8::from(config.scan_ssh_keys)]);
-    if let Some(dir) = &config.ssh_key_dir {
-        hasher.update(dir.as_os_str().as_encoded_bytes());
+    let mut field = |tag: &[u8], bytes: &[u8]| {
+        hasher.update((tag.len() as u64).to_le_bytes());
+        hasher.update(tag);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(b"enabled", &[u8::from(*enabled)]);
+    field(b"scan_environment", &[u8::from(*scan_environment)]);
+    field(b"scan_dotenv", &[u8::from(*scan_dotenv)]);
+    field(b"scan_ssh_keys", &[u8::from(*scan_ssh_keys)]);
+    match ssh_key_dir {
+        Some(dir) => field(b"ssh_key_dir", dir.as_os_str().as_encoded_bytes()),
+        None => field(b"ssh_key_dir:none", &[]),
     }
-    for pattern in &config.dotenv_patterns {
-        hasher.update(pattern.as_bytes());
-    }
-    for path in &config.extra_dotenv_paths {
-        hasher.update(path.as_os_str().as_encoded_bytes());
-    }
+    field(
+        b"min_secret_length",
+        &(*min_secret_length as u64).to_le_bytes(),
+    );
+    field(b"placeholder", placeholder.as_bytes());
+    let mut list = |tag: &[u8], items: Vec<&[u8]>| {
+        field(tag, &(items.len() as u64).to_le_bytes());
+        for item in items {
+            field(tag, item);
+        }
+    };
+    list(
+        b"dotenv_patterns",
+        dotenv_patterns.iter().map(|item| item.as_bytes()).collect(),
+    );
+    list(
+        b"extra_dotenv_paths",
+        extra_dotenv_paths
+            .iter()
+            .map(|item| item.as_os_str().as_encoded_bytes())
+            .collect(),
+    );
+    list(
+        b"secret_path_patterns",
+        secret_path_patterns
+            .iter()
+            .map(|item| item.as_bytes())
+            .collect(),
+    );
+    list(
+        b"denylist",
+        denylist.iter().map(|item| item.as_bytes()).collect(),
+    );
+    list(
+        b"allowlist",
+        allowlist.iter().map(|item| item.as_bytes()).collect(),
+    );
     hasher
         .finalize()
         .iter()
@@ -118,50 +176,65 @@ pub(crate) fn credential_vault_binding(
 pub(crate) fn machine_sources_probe_binding(
     config: &RedactConfig,
     scope: RedactionSourceScope<'_>,
-) -> CoverageBinding {
+) -> anyhow::Result<CoverageBinding> {
     machine_sources_binding(config, scope, None)
 }
 
+/// Binding of the file-backed sources a build in `scope` reads.
+///
+/// Every source failure is an error, never a sentinel: an unavailable source
+/// must not hash equal to an empty or earlier successful one, so key
+/// derivation, boundary capture, and the publication fence all fail closed.
 pub(crate) fn machine_sources_binding(
     config: &RedactConfig,
     scope: RedactionSourceScope<'_>,
     table: Option<&RedactionTable>,
-) -> CoverageBinding {
+) -> anyhow::Result<CoverageBinding> {
     let mut hasher = Sha256::new();
     hasher.update(b"flycockpit-redaction-machine-sources-v1\0");
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
     if config.scan_dotenv {
-        if let Ok(paths) =
-            matched_dotenv_sources(scope, &config.dotenv_patterns, &config.extra_dotenv_paths)
-        {
-            for path in paths {
-                hasher.update(path.as_os_str().as_encoded_bytes());
-                if let Ok(bytes) = crate::resource_limits::read_for_tool(&path) {
-                    hasher.update(&bytes);
-                } else {
-                    hasher.update([0xFF]);
-                }
-            }
-        } else {
-            hasher.update([0xFF]);
+        let paths =
+            matched_dotenv_sources(scope, &config.dotenv_patterns, &config.extra_dotenv_paths)?;
+        field(&(paths.len() as u64).to_le_bytes());
+        for path in paths {
+            // Same typed failures as the capture itself, so an over-cap or
+            // unreadable source is reported identically wherever it is hit.
+            let bytes =
+                crate::resource_limits::read_for_tool(&path).map_err(|error| match error {
+                    crate::resource_limits::ResourceLimitError::ByteLimit { .. } => {
+                        anyhow::Error::from(super::EnvFileOverLimitError { path: path.clone() })
+                    }
+                    _ => anyhow::Error::from(super::RedactionSourceUnreadableError {
+                        path: path.clone(),
+                    }),
+                })?;
+            field(path.as_os_str().as_encoded_bytes());
+            field(&bytes);
         }
     }
     if config.scan_ssh_keys {
-        if let Ok(candidates) =
-            super::ssh::collect_ssh_key_candidates(config.ssh_key_dir.as_deref())
-        {
-            for (value, origin) in candidates {
-                hasher.update(origin.as_bytes());
-                hasher.update(value.as_bytes());
-            }
+        let directory = super::ssh::resolve_ssh_key_dir(scope, config.ssh_key_dir.as_deref())?;
+        let candidates = super::ssh::collect_ssh_key_candidates(directory.as_deref())?;
+        field(&(candidates.len() as u64).to_le_bytes());
+        for (value, origin) in candidates {
+            field(origin.as_bytes());
+            field(value.as_bytes());
         }
     }
     if let Some(table) = table {
         for path in table.unsupported_files() {
-            hasher.update(path.as_os_str().as_encoded_bytes());
+            field(path.as_os_str().as_encoded_bytes());
         }
     }
     let digest = hasher.finalize();
-    CoverageBinding::derive(b"machine-sources", digest.as_slice())
+    Ok(CoverageBinding::derive(
+        b"machine-sources",
+        digest.as_slice(),
+    ))
 }
 
 pub(crate) fn sealed_records_binding(
@@ -179,8 +252,8 @@ pub(crate) fn sealed_records_binding(
 }
 
 impl SessionCoverageInputs<'_> {
-    pub(crate) fn coverage_key(&self) -> RedactionCoverageKey {
-        RedactionCoverageKey::session(
+    pub(crate) fn coverage_key(&self) -> anyhow::Result<RedactionCoverageKey> {
+        Ok(RedactionCoverageKey::session(
             principal_binding(self.principal),
             owner_authorization_binding(self.owner_authorization_revision),
             CoverageBinding::derive(b"session", self.session_id.as_bytes()),
@@ -196,12 +269,15 @@ impl SessionCoverageInputs<'_> {
             machine_sources_probe_binding(
                 self.redact_config,
                 RedactionSourceScope::Workspace(self.workspace_root),
-            ),
-        )
+            )?,
+        ))
     }
 
-    pub(crate) fn boundary_revisions(&self, table: &RedactionTable) -> OwnedSourceRevisions {
-        OwnedSourceRevisions {
+    pub(crate) fn boundary_revisions(
+        &self,
+        table: &RedactionTable,
+    ) -> anyhow::Result<OwnedSourceRevisions> {
+        Ok(OwnedSourceRevisions {
             environment: CoverageBinding::derive(
                 b"environment",
                 self.environment.digest().as_bytes(),
@@ -217,8 +293,8 @@ impl SessionCoverageInputs<'_> {
                 self.redact_config,
                 RedactionSourceScope::Workspace(self.workspace_root),
                 Some(table),
-            ),
-        }
+            )?,
+        })
     }
 }
 
@@ -255,8 +331,8 @@ pub(crate) async fn snapshot_session_capture_inputs<'a>(
 }
 
 impl DaemonGlobalCoverageInputs<'_> {
-    pub(crate) fn coverage_key(&self) -> RedactionCoverageKey {
-        RedactionCoverageKey::daemon_global(
+    pub(crate) fn coverage_key(&self) -> anyhow::Result<RedactionCoverageKey> {
+        Ok(RedactionCoverageKey::daemon_global(
             CoverageBinding::derive(b"principal", b"daemon"),
             CoverageBinding::derive(b"owner-authorization", b"daemon-owner"),
             CoverageBinding::derive(b"environment", self.environment.digest().as_bytes()),
@@ -264,12 +340,15 @@ impl DaemonGlobalCoverageInputs<'_> {
             CoverageBinding::derive(b"policy", self.policy_digest.as_bytes()),
             self.sealed,
             CoverageBinding::derive(b"override", &self.override_revision.to_le_bytes()),
-            machine_sources_probe_binding(self.redact_config, RedactionSourceScope::DaemonGlobal),
-        )
+            machine_sources_probe_binding(self.redact_config, RedactionSourceScope::DaemonGlobal)?,
+        ))
     }
 
-    pub(crate) fn boundary_revisions(&self, table: &RedactionTable) -> OwnedSourceRevisions {
-        OwnedSourceRevisions {
+    pub(crate) fn boundary_revisions(
+        &self,
+        table: &RedactionTable,
+    ) -> anyhow::Result<OwnedSourceRevisions> {
+        Ok(OwnedSourceRevisions {
             environment: CoverageBinding::derive(
                 b"environment",
                 self.environment.digest().as_bytes(),
@@ -285,8 +364,8 @@ impl DaemonGlobalCoverageInputs<'_> {
                 self.redact_config,
                 RedactionSourceScope::DaemonGlobal,
                 Some(table),
-            ),
-        }
+            )?,
+        })
     }
 }
 
@@ -339,7 +418,7 @@ impl SessionCoveragePublishOwners {
                 &redact_config,
                 RedactionSourceScope::Workspace(&workspace_root),
                 Some(table),
-            ),
+            )?,
         })
     }
 
@@ -393,7 +472,7 @@ impl DaemonGlobalCoveragePublishOwners {
                 &redact_config,
                 RedactionSourceScope::DaemonGlobal,
                 Some(table),
-            ),
+            )?,
         })
     }
 

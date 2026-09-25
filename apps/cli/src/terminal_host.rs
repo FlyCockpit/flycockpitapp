@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::daemon::proto::{self, ErrorCode, ErrorPayload, Response};
 use crate::daemon::terminal::AuthenticatedTerminalContext;
-use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
+use crate::daemon::{EventCoverage, EventSender, SharedRedactionTable, send_covered_event};
 #[cfg(test)]
 use crate::redact::RedactionTable;
 #[cfg(test)]
@@ -170,6 +170,10 @@ struct TerminalHostInner {
 }
 
 struct TerminalState {
+    /// Coverage for this terminal's events: the live daemon-global table
+    /// united with the live table of the session (or workspace) that opened
+    /// it, so terminal output echoing that workspace's secrets is scrubbed.
+    coverage: EventCoverage,
     id: Uuid,
     /// Exact terminal generation. Tombstoned generations never reopen.
     generation: u64,
@@ -671,7 +675,14 @@ impl TerminalHost {
         cols: u16,
         rows: u16,
     ) -> std::result::Result<Response, ErrorPayload> {
-        self.open_with_context(test_local_terminal_context(), Uuid::nil(), cwd, cols, rows)
+        self.open_with_context(
+            test_local_terminal_context(),
+            Uuid::nil(),
+            cwd,
+            cols,
+            rows,
+            self.redaction.clone(),
+        )
     }
 
     fn open_with_context(
@@ -681,6 +692,7 @@ impl TerminalHost {
         cwd: Option<String>,
         cols: u16,
         rows: u16,
+        origin: SharedRedactionTable,
     ) -> std::result::Result<Response, ErrorPayload> {
         let cwd = resolve_cwd(cwd)?;
         {
@@ -699,7 +711,7 @@ impl TerminalHost {
             rows,
             &self.temp_root,
             self.event_tx.clone(),
-            self.redaction.clone(),
+            EventCoverage::new(self.redaction.clone(), origin),
             self.prepared_ingress.clone(),
         )
         .map_err(internal)?;
@@ -745,7 +757,7 @@ impl TerminalHost {
         rows: u16,
     ) -> std::result::Result<Response, ErrorPayload> {
         let terminal = self.get_terminal(terminal_id)?;
-        let (viewer_count, replay, binding, terminal_generation) = {
+        let (viewer_count, replay, binding, terminal_generation, coverage) = {
             let mut state = crate::sync::lock_or_recover(&terminal);
             if state.closed {
                 return Err(unknown_terminal(terminal_id));
@@ -759,15 +771,19 @@ impl TerminalHost {
                 state.buffer.bytes(),
                 binding,
                 generation,
+                state.coverage.clone(),
             )
         };
         if !replay.is_empty() {
-            self.emit_output_chunks(terminal_id, replay);
+            self.emit_output_chunks(&coverage, terminal_id, replay);
         }
-        self.emit(proto::Event::TerminalViewers {
-            terminal_id,
-            count: viewer_count,
-        });
+        self.emit(
+            &coverage,
+            proto::Event::TerminalViewers {
+                terminal_id,
+                count: viewer_count,
+            },
+        );
         Ok(Response::TerminalOpened {
             terminal_id,
             viewer_count,
@@ -781,7 +797,7 @@ impl TerminalHost {
         let Ok(terminal) = self.get_terminal(terminal_id) else {
             return;
         };
-        let count = {
+        let (count, coverage) = {
             let mut state = crate::sync::lock_or_recover(&terminal);
             if state
                 .bindings
@@ -795,9 +811,12 @@ impl TerminalHost {
             if state.viewer_count == 0 {
                 state.last_detached = Some(Instant::now());
             }
-            state.viewer_count
+            (state.viewer_count, state.coverage.clone())
         };
-        self.emit(proto::Event::TerminalViewers { terminal_id, count });
+        self.emit(
+            &coverage,
+            proto::Event::TerminalViewers { terminal_id, count },
+        );
     }
 
     #[cfg(test)]
@@ -886,11 +905,12 @@ impl TerminalHost {
         };
         {
             let mut state = crate::sync::lock_or_recover(&terminal);
+            let coverage = state.coverage.clone();
             let _ = close_generation_locked(
                 &mut state,
                 CloseTrigger::ClientClose,
                 &self.event_tx,
-                &self.redaction,
+                &coverage,
                 &self.prepared_ingress,
             );
         }
@@ -1197,6 +1217,13 @@ impl TerminalHost {
         release_prepared_ingress_map(&self.prepared_ingress, released);
     }
 
+    /// Coverage for tests that drive the PTY path directly: the host table
+    /// stands in for both the daemon-global and the originating table.
+    #[cfg(test)]
+    fn test_coverage(&self) -> EventCoverage {
+        EventCoverage::new(self.redaction.clone(), self.redaction.clone())
+    }
+
     fn get_terminal(
         &self,
         terminal_id: Uuid,
@@ -1208,16 +1235,19 @@ impl TerminalHost {
             .ok_or_else(|| unknown_terminal(terminal_id))
     }
 
-    fn emit(&self, event: proto::Event) {
-        send_current_event(&self.event_tx, &self.redaction, event);
+    fn emit(&self, coverage: &EventCoverage, event: proto::Event) {
+        send_covered_event(&self.event_tx, coverage, event);
     }
 
-    fn emit_output_chunks(&self, terminal_id: Uuid, bytes: Vec<u8>) {
+    fn emit_output_chunks(&self, coverage: &EventCoverage, terminal_id: Uuid, bytes: Vec<u8>) {
         for chunk in bytes.chunks(OUTPUT_CHUNK_BYTES) {
-            self.emit(proto::Event::TerminalOutput {
-                terminal_id,
-                bytes: chunk.to_vec(),
-            });
+            self.emit(
+                coverage,
+                proto::Event::TerminalOutput {
+                    terminal_id,
+                    bytes: chunk.to_vec(),
+                },
+            );
         }
     }
 
@@ -1226,7 +1256,7 @@ impl TerminalHost {
     fn handle_pty_bytes(
         terminal: &Arc<Mutex<TerminalState>>,
         event_tx: &EventSender,
-        redaction: &SharedRedactionTable,
+        redaction: &EventCoverage,
         bytes: &[u8],
         prepared_ingress: &PreparedIngressQuotaMap,
     ) {
@@ -1248,7 +1278,7 @@ impl TerminalHost {
                 // or suffix bytes are present in passthrough on overflow.
                 drop(state);
                 for chunk in passthrough.chunks(OUTPUT_CHUNK_BYTES) {
-                    send_current_event(
+                    send_covered_event(
                         event_tx,
                         redaction,
                         proto::Event::TerminalOutput {
@@ -1258,7 +1288,7 @@ impl TerminalHost {
                     );
                 }
                 for text in clipboards {
-                    send_current_event(
+                    send_covered_event(
                         event_tx,
                         redaction,
                         proto::Event::TerminalClipboard {
@@ -1280,7 +1310,7 @@ impl TerminalHost {
             (filtered, id)
         };
         for chunk in filtered.passthrough.chunks(OUTPUT_CHUNK_BYTES) {
-            send_current_event(
+            send_covered_event(
                 event_tx,
                 redaction,
                 proto::Event::TerminalOutput {
@@ -1297,7 +1327,7 @@ impl TerminalHost {
             if !still_open {
                 return;
             }
-            send_current_event(
+            send_covered_event(
                 event_tx,
                 redaction,
                 proto::Event::TerminalClipboard { terminal_id, text },
@@ -1319,7 +1349,7 @@ fn close_generation_locked(
     state: &mut TerminalState,
     trigger: CloseTrigger,
     event_tx: &EventSender,
-    redaction: &SharedRedactionTable,
+    redaction: &EventCoverage,
     prepared_ingress: &PreparedIngressQuotaMap,
 ) -> TerminalCloseOutcome {
     if state.closed {
@@ -1385,7 +1415,7 @@ fn close_generation_locked(
     // Only overflow emits Osc52ProtocolViolation, and only once.
     if matches!(trigger, CloseTrigger::Osc52Overflow) && !state.osc52_violation_emitted {
         state.osc52_violation_emitted = true;
-        send_current_event(
+        send_covered_event(
             event_tx,
             redaction,
             proto::Event::Osc52ProtocolViolation {
@@ -1397,7 +1427,7 @@ fn close_generation_locked(
 
     state.close_outcome = Some(outcome);
     let reason = trigger.reason(outcome).to_string();
-    send_current_event(
+    send_covered_event(
         event_tx,
         redaction,
         proto::Event::TerminalClosed {
@@ -1497,8 +1527,9 @@ impl crate::daemon::terminal::TerminalHost for TerminalHost {
         cwd: Option<String>,
         cols: u16,
         rows: u16,
+        origin: SharedRedactionTable,
     ) -> crate::daemon::terminal::TerminalResult {
-        TerminalHost::open_with_context(self, context, session_id, cwd, cols, rows)
+        TerminalHost::open_with_context(self, context, session_id, cwd, cols, rows, origin)
     }
 
     fn attach(
@@ -1665,7 +1696,7 @@ fn spawn_terminal(
     rows: u16,
     temp_root: &Path,
     event_tx: EventSender,
-    redaction: SharedRedactionTable,
+    redaction: EventCoverage,
     prepared_ingress: PreparedIngressQuotaMap,
 ) -> Result<Arc<Mutex<TerminalState>>> {
     let rows = rows.max(1);
@@ -1717,6 +1748,7 @@ fn spawn_terminal(
         .context("clone terminal pty reader")?;
     let temp_dir = temp_root.join(random_base32());
     let state = Arc::new(Mutex::new(TerminalState {
+        coverage: redaction.clone(),
         id,
         generation: 1,
         master: Some(master),
@@ -2769,14 +2801,14 @@ mod tests {
         TerminalHost::handle_pty_bytes(
             &terminal,
             &host.event_tx,
-            &host.redaction,
+            &host.test_coverage(),
             &head,
             &host.prepared_ingress,
         );
         TerminalHost::handle_pty_bytes(
             &terminal,
             &host.event_tx,
-            &host.redaction,
+            &host.test_coverage(),
             b"X",
             &host.prepared_ingress,
         );
@@ -2784,7 +2816,7 @@ mod tests {
         TerminalHost::handle_pty_bytes(
             &terminal,
             &host.event_tx,
-            &host.redaction,
+            &host.test_coverage(),
             b"\x07SECRET",
             &host.prepared_ingress,
         );
@@ -2890,7 +2922,7 @@ mod tests {
                     &mut state,
                     CloseTrigger::Osc52Overflow,
                     &host.event_tx,
-                    &host.redaction,
+                    &host.test_coverage(),
                     &host.prepared_ingress,
                 );
                 assert_eq!(outcome, TerminalCloseOutcome::CloseBlocked, "{label}");
@@ -2950,14 +2982,14 @@ mod tests {
                         TerminalHost::handle_pty_bytes(
                             &terminal,
                             &host.event_tx,
-                            &host.redaction,
+                            &host.test_coverage(),
                             &head,
                             &host.prepared_ingress,
                         );
                         TerminalHost::handle_pty_bytes(
                             &terminal,
                             &host.event_tx,
-                            &host.redaction,
+                            &host.test_coverage(),
                             b"X",
                             &host.prepared_ingress,
                         );
@@ -2967,7 +2999,7 @@ mod tests {
                             &mut state,
                             *other,
                             &host.event_tx,
-                            &host.redaction,
+                            &host.test_coverage(),
                             &host.prepared_ingress,
                         );
                     }
@@ -3541,7 +3573,7 @@ mod tests {
                 &mut state,
                 CloseTrigger::ProcessExited,
                 &host.event_tx,
-                &host.redaction,
+                &host.test_coverage(),
                 &host.prepared_ingress,
             );
         }
@@ -3566,14 +3598,14 @@ mod tests {
         TerminalHost::handle_pty_bytes(
             &terminal,
             &host.event_tx,
-            &host.redaction,
+            &host.test_coverage(),
             &head,
             &host.prepared_ingress,
         );
         TerminalHost::handle_pty_bytes(
             &terminal,
             &host.event_tx,
-            &host.redaction,
+            &host.test_coverage(),
             b"X",
             &host.prepared_ingress,
         );
@@ -4358,7 +4390,10 @@ mod tests {
     impl TerminalState {
         /// Lightweight generation state for close-oracle tests (no live PTY).
         fn new_test(id: Uuid, temp_dir: PathBuf) -> Self {
+            let empty: SharedRedactionTable =
+                Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
             Self {
+                coverage: EventCoverage::new(empty.clone(), empty),
                 id,
                 generation: 1,
                 master: None,

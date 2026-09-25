@@ -189,7 +189,7 @@ async fn acquire_daemon_global_coverage(
         override_revision: 0,
         redact_config: &redact_config,
     };
-    let key = coverage_inputs.coverage_key();
+    let key = coverage_inputs.coverage_key()?;
     let publish_fence = crate::redact::coverage_bindings::daemon_global_publish_owners_for_config(
         config_source.clone(),
         vault.clone(),
@@ -227,6 +227,120 @@ async fn acquire_daemon_global_coverage(
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
         .install_table()
         .map(|table| Arc::new(table))
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+/// Workspace-scoped coverage for an absolute root that has no attached
+/// session (an unattached terminal's working directory).
+///
+/// Events produced there travel on the daemon-global bus, whose own table has
+/// no workspace file sources, so they need the root's `.env`/secret-file
+/// coverage as well. With no session there is no workspace trust decision, so
+/// the redact policy is the installation-wide one; sources are discovered in
+/// the root's workspace scope. Every failure is a fail-closed error.
+pub(crate) async fn acquire_unattached_workspace_coverage(
+    ctx: &DaemonContext,
+    root: &Path,
+    purpose: crate::redact::coverage_authority::CoverageScope,
+) -> Result<Arc<RedactionTable>> {
+    anyhow::ensure!(
+        root.is_absolute(),
+        "coverage_unavailable: workspace coverage requires an absolute root"
+    );
+    let vault = ctx.secret_vault.clone();
+    let command_cache = ctx.registry.command_secret_cache();
+    let redact_config =
+        crate::redact::coverage_bindings::load_daemon_global_redact_config(&ctx.config_source)?;
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&redact_config);
+    let environment = crate::env_snapshot::EnvSnapshot::new(
+        cockpit_proto::EnvSnapshotSource::DaemonStart,
+        daemon_process_env(),
+    );
+    let vault_revision = vault
+        .current_inventory_generation()
+        .map_err(|error| anyhow::anyhow!("reading workspace redaction vault revision: {error}"))?;
+    let sealed_records = ctx
+        .db
+        .machine_scoped_sealed_redaction_records()
+        .await
+        .context("reading sealed redaction records")?;
+    let sealed = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+    let root = root.to_path_buf();
+    // No session exists: the nil id plus the workspace binding identify the
+    // root's coverage lineage.
+    let session_id = Uuid::nil();
+    let principal = ClientPrincipal::owner();
+    let key = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &principal,
+        owner_authorization_revision: 0,
+        session_id,
+        workspace_root: &root,
+        environment: &environment,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed,
+        override_revision: 0,
+        redact_config: &redact_config,
+    }
+    .coverage_key()?;
+    let publish_fence = crate::redact::coverage_bindings::session_publish_owners(
+        vault.clone(),
+        ctx.db.clone(),
+        command_cache.clone(),
+        crate::redact::coverage_bindings::SessionCoveragePublishLive {
+            environment: Arc::new({
+                let environment = environment.clone();
+                move || Ok(environment.clone())
+            }),
+            policy_digest: Arc::new({
+                let policy_digest = policy_digest.clone();
+                move || policy_digest.clone()
+            }),
+            override_revision: Arc::new(|| 0),
+            redact_config: Arc::new({
+                let redact_config = redact_config.clone();
+                move || redact_config.clone()
+            }),
+            workspace_root: Arc::new({
+                let root = root.clone();
+                move || root.clone()
+            }),
+        },
+    )
+    .publish_fence();
+    ctx.registry
+        .coverage_authority()
+        .acquire(key, purpose, move || {
+            let store = crate::credentials::CredentialStore::from_vault(vault)?;
+            let principal = ClientPrincipal::owner();
+            let inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                principal: &principal,
+                owner_authorization_revision: 0,
+                session_id,
+                workspace_root: &root,
+                environment: &environment,
+                vault_revision,
+                command_cache: &command_cache,
+                policy_digest: &policy_digest,
+                sealed,
+                override_revision: 0,
+                redact_config: &redact_config,
+            };
+            let build =
+                crate::redact::coverage_authority::CoverageBuild::capture_session_without_sealed(
+                    &redact_config,
+                    &root,
+                    environment.vars(),
+                    &store,
+                    &inputs,
+                )?;
+            Ok(build.with_publish_fence(publish_fence))
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .install_table()
+        .map(Arc::new)
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
@@ -7377,20 +7491,52 @@ pub(crate) async fn run_locked_until_ready(
     }
 }
 
-/// Daemon-wide retention policy from the global config layer. Retention is
-/// installation state, so no project layer (and in particular not one found
-/// by walking up from the daemon's inherited working directory) participates.
-pub(super) fn retention_config() -> RetentionConfig {
-    match ConfigSource::production().load_global() {
-        Ok(extended) => extended.retention,
+/// Installation-wide retention policy, read strictly through
+/// [`load_installation_extended_config`](crate::config::extended::load_installation_extended_config):
+/// the global layer (or the `COCKPIT_CONFIG` override, as for sessions), never
+/// a project layer found from the daemon's inherited working directory. The
+/// daemon's sweeps and `cockpit doctor`'s retention report share this reader.
+pub(crate) fn load_installation_retention_policy() -> Result<RetentionConfig> {
+    crate::config::extended::load_installation_extended_config()
+        .map(|extended| extended.retention)
+        .context("loading installation retention policy")
+}
+
+/// The last retention policy that loaded successfully in this process.
+static LAST_KNOWN_RETENTION: std::sync::Mutex<Option<RetentionConfig>> =
+    std::sync::Mutex::new(None);
+
+/// The retention policy a sweep may apply, or `None` to skip the sweep.
+///
+/// A policy that cannot be read is never replaced by the default: defaults
+/// would silently shorten a configured window (for example deleting
+/// transcripts kept "forever"). The last successfully loaded policy is reused
+/// instead; with none, the sweep is skipped.
+pub(crate) fn retention_config() -> Option<RetentionConfig> {
+    let mut last_known = LAST_KNOWN_RETENTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match load_installation_retention_policy() {
+        Ok(policy) => {
+            *last_known = Some(policy);
+            Some(policy)
+        }
         Err(error) => {
             tracing::warn!(
                 error = %format!("{error:#}"),
-                "global retention config unavailable; using the default retention policy"
+                reusing_last_known = last_known.is_some(),
+                "installation retention policy unavailable; not applying a default policy"
             );
-            RetentionConfig::default()
+            *last_known
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_last_known_retention_for_test() {
+    *LAST_KNOWN_RETENTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {

@@ -1919,6 +1919,13 @@ impl SessionWorkerHandle {
         current_redaction(&self.redaction)
     }
 
+    /// The session's live coverage table, for daemon-global events that
+    /// originate in this session's workspace (see
+    /// [`EventCoverage`](crate::daemon::EventCoverage)).
+    pub(crate) fn shared_redaction(&self) -> SharedRedactionTable {
+        self.redaction.clone()
+    }
+
     pub(crate) fn coverage_publish_owners(
         &self,
         vault: std::sync::Arc<crate::secure_key::SecretVault>,
@@ -2025,7 +2032,7 @@ impl SessionWorkerHandle {
             override_revision: 0,
             redact_config: &config,
         }
-        .coverage_key();
+        .coverage_key()?;
         let key = installed_key.with_current_owned_revisions(&current_key);
         let store = self.session.credential_store()?;
         let sealed = self.session.machine_scoped_sealed_redactions().await?;

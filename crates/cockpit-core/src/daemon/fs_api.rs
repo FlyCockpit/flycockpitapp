@@ -80,6 +80,8 @@ pub(crate) fn fs_list_blocking(
     show_hidden: bool,
 ) -> Result<Response, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
+    // Snapshot the sharee protection decision before resolving any target.
+    let policy = sharee_secret_policy(ctx, principal, &root)?;
     let dir = resolve_existing_path(&root, path)?;
     if !dir.is_dir() {
         return Err(bad_request(format!("`{path}` is not a directory")));
@@ -97,7 +99,14 @@ pub(crate) fn fs_list_blocking(
             truncated = true;
             break;
         }
-        entries.push(entry_to_wire(ctx, principal, &root, entry.path(), name)?);
+        let path = entry.path();
+        entries.push(entry_to_wire(
+            policy.as_ref(),
+            &root,
+            Some(&path),
+            path.clone(),
+            name,
+        )?);
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Response::FsList { entries, truncated })
@@ -125,12 +134,14 @@ pub(crate) fn fs_stat_blocking(
     path: &str,
 ) -> Result<Response, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
+    let policy = sharee_secret_policy(ctx, principal, &root)?;
+    let requested = root.join(clean_relative_path(path)?);
     let resolved = resolve_existing_path(&root, path)?;
     let name = resolved
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
-    let entry = entry_to_wire(ctx, principal, &root, resolved, name)?;
+    let entry = entry_to_wire(policy.as_ref(), &root, Some(&requested), resolved, name)?;
     Ok(Response::FsStat { entry })
 }
 
@@ -158,11 +169,17 @@ pub(crate) fn fs_read_sync(
     wants_base64: bool,
 ) -> Result<Response, ErrorPayload> {
     let root = canonical_project_root(project_root)?;
+    // The protection decision is snapshotted before the requested path is
+    // resolved and is applied to both the requested name and its resolved
+    // target, so removing or retargeting a configured alias mid-request
+    // cannot drop protection from a target already resolved.
+    let policy = sharee_secret_policy(ctx, principal, &root)?;
+    let requested = root.join(clean_relative_path(path)?);
     let resolved = resolve_existing_path(&root, path)?;
     if resolved.is_dir() {
         return Err(bad_request(format!("`{path}` is a directory")));
     }
-    ensure_read_allowed(ctx, principal, &root, &resolved)?;
+    ensure_read_allowed(policy.as_ref(), &requested, &resolved)?;
     #[cfg(test)]
     apply_fs_read_panic_for_test(&resolved);
     #[cfg(test)]
@@ -1892,9 +1909,9 @@ async fn join_fs_handler(
 }
 
 fn entry_to_wire(
-    ctx: &DaemonContext,
-    principal: &ClientPrincipal,
+    policy: Option<&ShareeSecretPolicy>,
     root: &Path,
+    requested: Option<&Path>,
     path: PathBuf,
     name: String,
 ) -> Result<FsEntry, ErrorPayload> {
@@ -1906,11 +1923,12 @@ fn entry_to_wire(
         .as_deref()
         .map(crate::gitignore::is_gitignored)
         .unwrap_or(false);
-    let secret_blocked = canonical
-        .as_deref()
-        .map(|p| secret_blocked_for_sharee(ctx, principal, root, p))
-        .transpose()?
-        .unwrap_or(false);
+    let secret_blocked = policy.is_some_and(|policy| {
+        requested.is_some_and(|requested| policy.blocks(requested))
+            || canonical
+                .as_deref()
+                .is_some_and(|resolved| policy.blocks(resolved))
+    });
     let kind = if is_symlink {
         FsEntryKind::Symlink
     } else if meta.is_dir() {
@@ -1971,12 +1989,11 @@ fn is_image_path(path: &Path) -> bool {
 }
 
 fn ensure_read_allowed(
-    ctx: &DaemonContext,
-    principal: &ClientPrincipal,
-    root: &Path,
-    path: &Path,
+    policy: Option<&ShareeSecretPolicy>,
+    requested: &Path,
+    resolved: &Path,
 ) -> Result<(), ErrorPayload> {
-    if secret_blocked_for_sharee(ctx, principal, root, path)? {
+    if policy.is_some_and(|policy| policy.blocks(requested) || policy.blocks(resolved)) {
         return Err(ErrorPayload {
             code: ErrorCode::Authorization,
             message: "remote principal cannot read gitignored or dotenv-protected files".into(),
@@ -1985,23 +2002,42 @@ fn ensure_read_allowed(
     Ok(())
 }
 
-fn secret_blocked_for_sharee(
+/// A sharee's secret-file protection, captured once per request before any
+/// requested path is resolved.
+///
+/// Configured `extra_dotenv_paths` are resolved through the redaction
+/// funnel against the workspace root (never the daemon cwd) and snapshotted
+/// both as written and as their canonical target. A configured source whose
+/// resolution fails for any reason other than absence fails the request
+/// closed; an absent source protects nothing at decision time.
+struct ShareeSecretPolicy {
+    extra_paths: Vec<PathBuf>,
+    extra_targets: Vec<PathBuf>,
+    dotenv_matcher: ignore::gitignore::Gitignore,
+}
+
+impl ShareeSecretPolicy {
+    fn blocks(&self, path: &Path) -> bool {
+        crate::gitignore::is_gitignored(path)
+            || self.extra_paths.iter().any(|extra| extra == path)
+            || self.extra_targets.iter().any(|target| target == path)
+            || matches!(
+                self.dotenv_matcher
+                    .matched_path_or_any_parents(path, path.is_dir()),
+                Match::Ignore(_)
+            )
+    }
+}
+
+/// `None` for principals with owner-level authority (no sharee protection).
+fn sharee_secret_policy(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
     root: &Path,
-    path: &Path,
-) -> Result<bool, ErrorPayload> {
+) -> Result<Option<ShareeSecretPolicy>, ErrorPayload> {
     if principal.has_owner_level_authority() {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(crate::gitignore::is_gitignored(path) || dotenv_pattern_matches(ctx, root, path)?)
-}
-
-fn dotenv_pattern_matches(
-    ctx: &DaemonContext,
-    root: &Path,
-    path: &Path,
-) -> Result<bool, ErrorPayload> {
     let trust_root = crate::config::trust::resolve_trust_root(root).map_err(internal)?;
     let root_for_db = trust_root.root.clone();
     let trust_policy = ctx
@@ -2026,24 +2062,26 @@ fn dotenv_pattern_matches(
         .map_err(internal)?
         .1
         .redact;
-    // Relative configured paths are workspace-relative: resolve them through
-    // the redaction funnel against `root`, never the daemon's working dir.
-    if cfg.extra_dotenv_paths.iter().any(|extra| {
-        crate::redact::resolve_explicit_dotenv_path(
+    let mut extra_paths = Vec::with_capacity(cfg.extra_dotenv_paths.len());
+    let mut extra_targets = Vec::with_capacity(cfg.extra_dotenv_paths.len());
+    for extra in &cfg.extra_dotenv_paths {
+        let extra = crate::redact::resolve_explicit_dotenv_path(
             crate::redact::RedactionSourceScope::Workspace(root),
             extra,
         )
-        .and_then(|extra| std::fs::canonicalize(extra).ok())
-        .as_deref()
-            == Some(path)
-    }) {
-        return Ok(true);
+        .map_err(internal)?;
+        match std::fs::canonicalize(&extra) {
+            Ok(target) => extra_targets.push(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(internal(error)),
+        }
+        extra_paths.push(extra);
     }
-    let matcher = crate::gitignore::build_allowlist_matcher(root, &cfg.dotenv_patterns);
-    Ok(matches!(
-        matcher.matched_path_or_any_parents(path, path.is_dir()),
-        Match::Ignore(_)
-    ))
+    Ok(Some(ShareeSecretPolicy {
+        extra_paths,
+        extra_targets,
+        dotenv_matcher: crate::gitignore::build_allowlist_matcher(root, &cfg.dotenv_patterns),
+    }))
 }
 
 pub(crate) fn canonical_project_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {
@@ -2233,6 +2271,13 @@ mod tests {
     use crate::daemon::principal::{PrincipalGrant, PrincipalScope};
 
     fn test_ctx(root: &Path) -> crate::daemon::server::DaemonContext {
+        test_ctx_with(root, crate::config::extended::ExtendedConfig::default())
+    }
+
+    fn test_ctx_with(
+        root: &Path,
+        extended: crate::config::extended::ExtendedConfig,
+    ) -> crate::daemon::server::DaemonContext {
         let db = crate::db::Db::open_in_memory().expect("in-memory db");
         let normalized_root = root.canonicalize().unwrap().to_string_lossy().into_owned();
         db.blocking_write_for_sync_maintenance(move |conn| {
@@ -2257,7 +2302,7 @@ mod tests {
             crate::daemon::terminal::test_host_factory(),
             crate::daemon::config_source::ConfigSource::fixed(
                 crate::config::providers::ProvidersConfig::default(),
-                crate::config::extended::ExtendedConfig::default(),
+                extended,
             ),
         )
     }
@@ -2486,10 +2531,47 @@ mod tests {
         let root = tmp.path();
         let ctx = test_ctx(root);
         std::fs::write(root.join(".env"), "SECRET=value").unwrap();
+        #[cfg(feature = "remote")]
         let path = root.join(".env").canonicalize().unwrap();
         #[cfg(feature = "remote")]
-        assert!(secret_blocked_for_sharee(&ctx, &remote_project_files(root), root, &path).unwrap());
-        assert!(!secret_blocked_for_sharee(&ctx, &ClientPrincipal::owner(), root, &path).unwrap());
+        assert!(
+            sharee_secret_policy(&ctx, &remote_project_files(root), root)
+                .unwrap()
+                .expect("sharee policy")
+                .blocks(&path)
+        );
+        assert!(
+            sharee_secret_policy(&ctx, &ClientPrincipal::owner(), root)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The sharee protection decision is taken before the requested path is
+    /// resolved and survives the configured alias disappearing afterwards; a
+    /// relative configured path resolves against the workspace root.
+    #[cfg(all(unix, feature = "remote"))]
+    #[test]
+    fn sharee_protection_is_snapshotted_before_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("secrets")).unwrap();
+        std::fs::write(root.join("token.txt"), "TOKEN=value").unwrap();
+        std::os::unix::fs::symlink(root.join("token.txt"), root.join("secrets/link")).unwrap();
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.redact.extra_dotenv_paths = vec![root.join("secrets/link")];
+        let ctx = test_ctx_with(&root, extended);
+        let policy = sharee_secret_policy(&ctx, &remote_project_files(&root), &root)
+            .unwrap()
+            .expect("sharee policy");
+        // The alias disappears after the decision (the race window).
+        std::fs::remove_file(root.join("secrets/link")).unwrap();
+        let target = root.join("token.txt").canonicalize().unwrap();
+        assert!(
+            policy.blocks(&target),
+            "the already-decided protected target stays protected"
+        );
+        assert!(ensure_read_allowed(Some(&policy), &root.join("token.txt"), &target).is_err());
     }
 
     #[cfg(feature = "remote")]

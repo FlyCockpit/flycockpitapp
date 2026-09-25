@@ -2538,7 +2538,7 @@ impl SessionRegistry {
             override_revision: 0,
             redact_config: &extended_cfg.redact,
         };
-        let coverage_key = coverage_inputs.coverage_key();
+        let coverage_key = coverage_inputs.coverage_key()?;
         let capture_policy_digest = policy_digest.clone();
         let env_snapshot_for_capture = env_snapshot.clone();
         let publish_vault = session.secret_vault().clone();

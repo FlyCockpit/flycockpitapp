@@ -17652,7 +17652,8 @@ async fn seed_test_handle_redaction_coverage(
         override_revision: 0,
         redact_config: &config,
     }
-    .coverage_key();
+    .coverage_key()
+    .expect("test handle coverage key");
     session.set_redaction_coverage(
         ctx.registry.coverage_authority().clone(),
         key,
@@ -43416,6 +43417,7 @@ async fn daemon_global_coverage_never_reads_or_walks_the_daemon_cwd() {
     const RELATIVE_EXTRA_CANARY: &str = "daemon-cwd-relative-extra-canary-51e2";
     const WORKSPACE_CANARY: &str = "workspace-dotenv-canary-c83b10f4";
     const GLOBAL_DENYLIST_CANARY: &str = "global-layer-denylist-canary-9d2e";
+    const CWD_SSH_CANARY: &str = "daemon-cwd-ssh-key-canary-4e19";
 
     let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let launch = tempfile::tempdir().unwrap();
@@ -43435,26 +43437,21 @@ async fn daemon_global_coverage_never_reads_or_walks_the_daemon_cwd() {
         format!("RELATIVE_TOKEN={RELATIVE_EXTRA_CANARY}\n"),
     )
     .unwrap();
+    // SSH scanning is enabled: a key-shaped file in the launch directory's
+    // `.ssh` must not be read (the SSH source is the absolute `$HOME/.ssh`).
+    std::fs::create_dir_all(launch.path().join(".ssh")).unwrap();
+    std::fs::write(
+        launch.path().join(".ssh/id_launch"),
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{CWD_SSH_CANARY}\n-----END OPENSSH PRIVATE KEY-----\n"
+        ),
+    )
+    .unwrap();
     // A directory the walker cannot list: dotenv discovery treats a traversal
     // error as a hard capture failure, so any walk of the launch directory
     // fails coverage outright instead of silently skipping it.
     #[cfg(unix)]
-    let _locked = {
-        use std::os::unix::fs::PermissionsExt as _;
-        /// Restores the directory's mode even when an assertion panics, so
-        /// the temp tree stays removable.
-        struct Unlistable(PathBuf);
-        impl Drop for Unlistable {
-            fn drop(&mut self) {
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-            }
-        }
-        let locked = launch.path().join("unlistable");
-        std::fs::create_dir(&locked).unwrap();
-        let guard = Unlistable(locked.clone());
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        guard
-    };
+    let _locked = UnlistableDir::create(&launch.path().join("unlistable"));
     env.set_current_dir(launch.path()).unwrap();
 
     let workspace = tempfile::tempdir().unwrap();
@@ -43466,10 +43463,11 @@ async fn daemon_global_coverage_never_reads_or_walks_the_daemon_cwd() {
 
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.redact.scan_dotenv = true;
-    extended.redact.scan_ssh_keys = false;
+    extended.redact.scan_ssh_keys = true;
     extended.redact.dotenv_patterns = crate::config::extended::default_dotenv_patterns();
-    // Relative configured paths are workspace-relative, never cwd-relative.
-    extended.redact.extra_dotenv_paths = vec![PathBuf::from("relative.secrets")];
+    // `relative.secrets` exists in the launch directory but is not configured
+    // for daemon-global policy (layered config rejects relative global
+    // entries); its canary proves the directory is not read either way.
     extended.redact.denylist = vec![GLOBAL_DENYLIST_CANARY.to_string()];
     let redact_config = extended.redact.clone();
     let source =
@@ -43512,7 +43510,8 @@ async fn daemon_global_coverage_never_reads_or_walks_the_daemon_cwd() {
         override_revision: 0,
         redact_config: &redact_config,
     }
-    .coverage_key();
+    .coverage_key()
+    .expect("session coverage key for workspace W");
     let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
     let capture_config = redact_config.clone();
     let session_table = ctx
@@ -43553,6 +43552,7 @@ async fn daemon_global_coverage_never_reads_or_walks_the_daemon_cwd() {
             NESTED_CWD_CANARY,
             RELATIVE_EXTRA_CANARY,
             WORKSPACE_CANARY,
+            CWD_SSH_CANARY,
         ] {
             assert_eq!(
                 table.scrub(canary),
@@ -43581,6 +43581,310 @@ async fn daemon_global_coverage_never_reads_or_walks_the_daemon_cwd() {
         );
     }
     drop(env);
+}
+
+/// A directory made unlistable (mode 000) for the no-walk tests, restored on
+/// drop so the temp tree stays removable even when an assertion panics.
+///
+/// Root bypasses directory modes. When the directory is still listable the
+/// guard reports it and callers keep only their canary assertions: the
+/// "any walk fails" amplifier is then unobservable, not violated.
+#[cfg(unix)]
+struct UnlistableDir {
+    path: PathBuf,
+    effective: bool,
+}
+
+#[cfg(unix)]
+impl UnlistableDir {
+    fn create(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(path).unwrap();
+        let mut guard = Self {
+            path: path.to_path_buf(),
+            effective: false,
+        };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        guard.effective = std::fs::read_dir(path).is_err();
+        if !guard.effective {
+            eprintln!(
+                "note: running with privileges that bypass mode 000; the unlistable-directory \
+                 amplifier is skipped and only the canary assertions apply"
+            );
+        }
+        guard
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnlistableDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+fn boot_test_extended(tmp: &Path) -> crate::config::extended::ExtendedConfig {
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.daemon.boot.secret_store_backend =
+        crate::config::extended::DaemonSecretStoreBackend::File;
+    extended.daemon.boot.secret_store_path = Some(tmp.join("vault"));
+    let probe_root = tmp.join("container-probes");
+    extended.daemon.boot.container_probe_paths =
+        crate::config::extended::DaemonContainerProbePaths {
+            docker_env: probe_root.join("dockerenv"),
+            container_env: probe_root.join("containerenv"),
+            init_cgroup: probe_root.join("cgroup"),
+            self_mountinfo: probe_root.join("mountinfo"),
+        };
+    extended.redact.scan_dotenv = true;
+    extended.redact.scan_ssh_keys = true;
+    extended
+}
+
+async fn boot_test_ctx(
+    tmp: &Path,
+    extended: crate::config::extended::ExtendedConfig,
+) -> Result<DaemonContext> {
+    let db = crate::db::Db::open(&tmp.join("cockpit.db")).expect("temp db");
+    let config_source = crate::daemon::config_source::ConfigSource::fixed(
+        crate::config::providers::ProvidersConfig::default(),
+        extended,
+    );
+    let mut timer = crate::startup::PhaseTimer::start("boot_without_daemon_cwd");
+    boot_ready_with_db(
+        DaemonPaths {
+            socket: tmp.join("cockpit-cwd-boot.sock"),
+            pid_file: tmp.join("cockpit-cwd-boot.pid"),
+            ephemeral: true,
+        },
+        db,
+        &mut timer,
+        crate::daemon::terminal::test_host_factory(),
+        config_source,
+    )
+    .await
+}
+
+/// The production boot path (`boot_ready_with_db`) builds daemon-global
+/// coverage without the daemon's working directory: a launch directory with
+/// env-file and SSH canaries plus an unlistable subdirectory is neither read
+/// nor walked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_boot_never_reads_or_walks_the_daemon_cwd() {
+    const BOOT_CWD_CANARY: &str = "boot-cwd-dotenv-canary-a61d";
+    const BOOT_SSH_CANARY: &str = "boot-cwd-ssh-canary-5b0e";
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let launch = tempfile::tempdir().unwrap();
+    std::fs::write(
+        launch.path().join(".env"),
+        format!("BOOT_TOKEN={BOOT_CWD_CANARY}\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(launch.path().join(".ssh")).unwrap();
+    std::fs::write(
+        launch.path().join(".ssh/id_boot"),
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{BOOT_SSH_CANARY}\n-----END OPENSSH PRIVATE KEY-----\n"
+        ),
+    )
+    .unwrap();
+    let _locked = UnlistableDir::create(&launch.path().join("unlistable"));
+    env.set_current_dir(launch.path()).unwrap();
+
+    let ctx = boot_test_ctx(tmp.path(), boot_test_extended(tmp.path()))
+        .await
+        .expect("boot never walks the unlistable launch directory");
+    let table = current_redaction(&ctx.global_redaction);
+    for canary in [BOOT_CWD_CANARY, BOOT_SSH_CANARY] {
+        assert_eq!(
+            table.scrub(canary),
+            canary,
+            "boot coverage must not read the daemon's launch directory"
+        );
+    }
+}
+
+/// A daemon whose inherited working directory was deleted still boots: the
+/// daemon-global coverage never resolves it (previously `current_dir()`
+/// failed boot, and the publish fence `.expect`-panicked).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_boot_survives_a_deleted_daemon_cwd() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let launch = tempfile::tempdir().unwrap();
+    let doomed = launch.path().join("deleted-launch-dir");
+    std::fs::create_dir(&doomed).unwrap();
+    env.set_current_dir(&doomed).unwrap();
+    std::fs::remove_dir(&doomed).unwrap();
+    assert!(
+        std::env::current_dir().is_err(),
+        "precondition: cwd is gone"
+    );
+
+    let ctx = boot_test_ctx(tmp.path(), boot_test_extended(tmp.path()))
+        .await
+        .expect("boot does not depend on the daemon's working directory");
+    ctx.refresh_redaction_table()
+        .await
+        .expect("a refresh publishes through the fence without resolving the cwd");
+}
+
+#[test]
+fn boot_redaction_phase_has_no_cwd_dependency() {
+    let source = include_str!("mod.rs");
+    let boot = source
+        .split("pub(crate) async fn boot_ready_with_db(")
+        .nth(1)
+        .expect("boot_ready_with_db");
+    let redaction_phase = boot
+        .split("let (boot_secret_store, boot_secret_store_path) = boot_redaction_task")
+        .nth(1)
+        .and_then(|rest| rest.split("timer.phase(\"redaction_table\");").next())
+        .expect("boot redaction phase");
+    assert!(redaction_phase.contains("acquire_daemon_global_coverage("));
+    assert!(!redaction_phase.contains("current_dir"));
+    assert!(!redaction_phase.contains("config_source\n        .load("));
+    assert!(!redaction_phase.contains(".load(&"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unattached_workspace_coverage_covers_its_root_not_the_daemon_cwd() {
+    use crate::redact::coverage_authority::CoverageScope;
+    const ROOT_CANARY: &str = "terminal-root-dotenv-canary-1c77";
+    const CWD_CANARY: &str = "terminal-daemon-cwd-canary-83fa";
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let launch = tempfile::tempdir().unwrap();
+    std::fs::write(
+        launch.path().join(".env"),
+        format!("CWD_TOKEN={CWD_CANARY}\n"),
+    )
+    .unwrap();
+    env.set_current_dir(launch.path()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join(".env"),
+        format!("ROOT_TOKEN={ROOT_CANARY}\n"),
+    )
+    .unwrap();
+    let ctx = test_ctx();
+    let root_path = root.path().canonicalize().unwrap();
+    let table =
+        acquire_unattached_workspace_coverage(&ctx, &root_path, CoverageScope::UnattachedTerminal)
+            .await
+            .expect("workspace coverage for an absolute root");
+    assert!(!table.scrub(ROOT_CANARY).contains(ROOT_CANARY));
+    assert_eq!(table.scrub(CWD_CANARY), CWD_CANARY);
+    assert!(
+        acquire_unattached_workspace_coverage(
+            &ctx,
+            Path::new("relative-root"),
+            CoverageScope::UnattachedTerminal
+        )
+        .await
+        .is_err(),
+        "a relative root is refused"
+    );
+}
+
+/// Terminal and other workspace-originated events on the daemon-global bus
+/// carry the union of the live global and originating tables.
+#[test]
+fn covered_events_carry_the_originating_workspace_coverage() {
+    const ORIGIN_SECRET: &str = "terminal-origin-secret-canary-6d02";
+    let workspace = tempfile::tempdir().unwrap();
+    let origin_table = RedactionTable::build_with_env_and_secrets(
+        &crate::config::extended::RedactConfig {
+            scan_environment: false,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            ..crate::config::extended::RedactConfig::default()
+        },
+        workspace.path(),
+        &HashMap::new(),
+        [("terminal-token".to_string(), ORIGIN_SECRET.to_string())],
+    )
+    .unwrap();
+    let global: SharedRedactionTable =
+        Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+    let origin: SharedRedactionTable = Arc::new(std::sync::RwLock::new(Arc::new(origin_table)));
+    let coverage = crate::daemon::EventCoverage::new(global.clone(), origin);
+    let (tx, mut rx) = broadcast::channel(4);
+    crate::daemon::send_covered_event(
+        &tx,
+        &coverage,
+        proto::Event::TerminalClipboard {
+            terminal_id: Uuid::nil(),
+            text: ORIGIN_SECRET.to_string(),
+        },
+    );
+    let envelope = rx.try_recv().expect("covered event delivered");
+    assert!(!envelope.redact.scrub(ORIGIN_SECRET).contains(ORIGIN_SECRET));
+    // The global table alone (the previous terminal coverage) misses it.
+    assert_eq!(
+        current_redaction(&global).scrub(ORIGIN_SECRET),
+        ORIGIN_SECRET
+    );
+}
+
+/// With no session selected, the debug-context render never reads the
+/// daemon's working directory (its AGENTS.md or its system prompt).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_global_debug_context_does_not_read_the_daemon_cwd() {
+    const GUIDANCE_CANARY: &str = "daemon-cwd-guidance-canary-0a3b";
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let launch = tempfile::tempdir().unwrap();
+    std::fs::write(
+        launch.path().join("AGENTS.md"),
+        format!("# guidance\n{GUIDANCE_CANARY}\n"),
+    )
+    .unwrap();
+    env.set_current_dir(launch.path()).unwrap();
+    let ctx = test_ctx();
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::GetRedactionCoverageStatus { session_id: None },
+    )
+    .await
+    .expect("daemon-global coverage status");
+    let Response::RedactionCoverageStatus(status) = response else {
+        panic!("expected RedactionCoverageStatus");
+    };
+    let rendered = status.rendered_context.expect("owner render");
+    assert!(!rendered.contains(GUIDANCE_CANARY), "{rendered}");
+    assert!(
+        !rendered.contains(&launch.path().display().to_string()),
+        "{rendered}"
+    );
+}
+
+/// An unreadable installation retention policy never becomes the default
+/// policy: the last loaded policy is reused, or the sweep is skipped.
+#[test]
+fn unreadable_retention_policy_never_falls_back_to_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    reset_last_known_retention_for_test();
+    let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+    let path = config_dir.join(crate::config::dirs::CONFIG_FILE);
+    std::fs::write(
+        &path,
+        r#"{"retention":{"transcript_window_days":"broken"}}"#,
+    )
+    .unwrap();
+    assert_eq!(retention_config(), None, "no policy has loaded yet: skip");
+    std::fs::write(&path, r#"{"retention":{"transcript_window_days":0}}"#).unwrap();
+    let loaded = retention_config().expect("valid policy");
+    assert_eq!(loaded.transcript_window_days, 0);
+    std::fs::write(&path, "{ not json").unwrap();
+    assert_eq!(
+        retention_config(),
+        Some(loaded),
+        "an unreadable policy reuses the last loaded one, never the 90-day default"
+    );
 }
 
 #[tokio::test]

@@ -38,8 +38,9 @@ pub fn file_len(path: &Path) -> io::Result<u64> {
 }
 
 /// Open `path` for a bounded content read: non-regular files are rejected
-/// without blocking on a FIFO writer, and the returned handle is blocking.
-fn open_regular_file(path: &Path) -> Result<File, BoundedIoError> {
+/// without blocking on a FIFO writer (the open is non-blocking and the type is
+/// checked on the descriptor), and the returned handle is blocking.
+pub fn open_regular_file(path: &Path) -> Result<File, BoundedIoError> {
     let file = open_nonblocking_read(path)?;
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {

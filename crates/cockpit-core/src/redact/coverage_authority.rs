@@ -120,6 +120,9 @@ pub(crate) enum CoverageScope {
     ApprovalPreview,
     DebugContext,
     RedactionOverride,
+    /// A terminal opened without an attached session, covered for its own
+    /// working directory.
+    UnattachedTerminal,
 }
 
 /// All members are opaque daemon-derived revisions/identities.  A key cannot
@@ -428,7 +431,7 @@ impl CoverageBuild {
         let base =
             RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
         let table = base.union(sealed)?;
-        let boundary_revisions = boundary_inputs.boundary_revisions(&table);
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table)?;
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 
@@ -442,7 +445,7 @@ impl CoverageBuild {
     ) -> Result<Self> {
         let table =
             RedactionTable::build_daemon_global_with_credential_store(config, environment, store)?;
-        let boundary_revisions = boundary_inputs.boundary_revisions(&table);
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table)?;
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 
@@ -455,7 +458,7 @@ impl CoverageBuild {
     ) -> Result<Self> {
         let table =
             RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
-        let boundary_revisions = boundary_inputs.boundary_revisions(&table);
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table)?;
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 }

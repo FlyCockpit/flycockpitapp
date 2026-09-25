@@ -106,9 +106,11 @@ mod command_output;
 pub(crate) mod coverage_authority;
 pub(crate) mod coverage_bindings;
 mod dotenv;
+pub(crate) use dotenv::{
+    UnanchoredRedactionSourcePath, matched_dotenv_sources, resolve_explicit_dotenv_path,
+};
 #[cfg(test)]
 pub(crate) use dotenv::{dotenv_max_depth, dotenv_scan_start_is_unbounded, matched_dotenv_paths};
-pub(crate) use dotenv::{matched_dotenv_sources, resolve_explicit_dotenv_path};
 mod protected;
 pub(crate) mod protected_redaction_history;
 // The production key resolver is wired into the daemon / registry / Session
@@ -1335,7 +1337,8 @@ impl RedactionTable {
         // Private SSH keys: each is registered as a forced (non-prunable)
         // secret — key material must never be dropped by the prune step.
         if cfg.scan_ssh_keys {
-            for (value, origin) in collect_ssh_key_candidates(cfg.ssh_key_dir.as_deref())? {
+            let ssh_key_dir = ssh::resolve_ssh_key_dir(scope, cfg.ssh_key_dir.as_deref())?;
+            for (value, origin) in collect_ssh_key_candidates(ssh_key_dir.as_deref())? {
                 candidates.push(Candidate::forced(value, origin, true));
             }
         }
@@ -2362,9 +2365,6 @@ impl RedactionTable {
     }
 }
 
-/// Extract secret-bearing leaves from an MCP named-secret JSON record. Keep
-/// this allowlist closed: metadata such as expiry timestamps and issuer URLs
-/// must not become redaction literals merely because they live beside tokens.
 /// Every stored-secret literal a credential store contributes to coverage:
 /// named secrets, provider credentials, provider auth commands, and OAuth
 /// descriptors. Shared by the workspace and daemon-global builders so the two
@@ -2380,6 +2380,9 @@ fn credential_store_entries(store: &crate::credentials::CredentialStore) -> Vec<
     entries
 }
 
+/// Extract secret-bearing leaves from an MCP named-secret JSON record. Keep
+/// this allowlist closed: metadata such as expiry timestamps and issuer URLs
+/// must not become redaction literals merely because they live beside tokens.
 fn mcp_sensitive_json_values(raw: &str) -> Vec<(String, String)> {
     const SENSITIVE_FIELDS: &[&str] = &[
         "access_token",

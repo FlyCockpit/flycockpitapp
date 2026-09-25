@@ -88,6 +88,17 @@ impl Session {
             .current_inventory_generation()
             .map_err(|error| anyhow::anyhow!("reading test redaction vault revision: {error}"))?;
         let principal = crate::daemon::principal::ClientPrincipal::owner();
+        // This installs only the coverage *lineage* (principal, session,
+        // workspace). Every real acquisition re-derives the owned revisions,
+        // machine sources included, from live inputs and fails closed there,
+        // so the lineage key does not probe file-backed sources: a fixture
+        // whose workspace holds an over-cap or unreadable source must still be
+        // constructible so the acquisition itself can refuse.
+        let lineage_config = crate::config::extended::RedactConfig {
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            ..config.clone()
+        };
         let inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
             principal: &principal,
             owner_authorization_revision: 0,
@@ -99,11 +110,11 @@ impl Session {
             policy_digest: &policy_digest,
             sealed: crate::redact::coverage_bindings::sealed_records_binding(&[]),
             override_revision: 0,
-            redact_config: &config,
+            redact_config: &lineage_config,
         };
         self.set_redaction_coverage(
             crate::redact::coverage_authority::RedactionCoverageAuthority::default(),
-            inputs.coverage_key(),
+            inputs.coverage_key()?,
             policy_digest,
         );
         Ok(self)

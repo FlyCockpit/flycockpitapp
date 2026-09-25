@@ -120,6 +120,31 @@ pub fn secure_vault_open_options(
     })
 }
 
+/// Prefix of daemon-derived onboarding operation ids. Client operation ids
+/// may never use it, so an internal operation (a secure-store stage advance,
+/// a boot reconciliation) can never collide with, or be pre-empted by, a
+/// client's receipt.
+const INTERNAL_OPERATION_ID_PREFIX: &str = "cockpit-internal:";
+
+/// The single validator for client-supplied onboarding operation ids, run
+/// before any durable or irreversible effect.
+fn validate_client_operation_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 128 {
+        bail!("onboarding client operation id must be 1 to 128 bytes");
+    }
+    if id.starts_with(INTERNAL_OPERATION_ID_PREFIX) {
+        bail!("onboarding client operation id uses the reserved internal namespace");
+    }
+    Ok(())
+}
+
+/// A daemon-derived operation id. Fixed-width (a UUID or revision after the
+/// reserved prefix), so it always fits the receipt key whatever the client
+/// id length was.
+fn internal_operation_id(kind: &str, discriminator: impl std::fmt::Display) -> String {
+    format!("{INTERNAL_OPERATION_ID_PREFIX}{kind}:{discriminator}")
+}
+
 #[derive(Clone)]
 pub struct OnboardingAuthority {
     db: Db,
@@ -160,9 +185,7 @@ impl OnboardingAuthority {
         request: BeginOrReopenOnboarding,
         host_capabilities: HostCapabilitySnapshot,
     ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)> {
-        if request.client_operation_id.is_empty() {
-            bail!("onboarding client operation id is required");
-        }
+        validate_client_operation_id(&request.client_operation_id)?;
         let (row, receipt_row) = self
             .db
             .onboarding_begin_or_reopen(
@@ -188,18 +211,27 @@ impl OnboardingAuthority {
         request: &ApplyOnboardingSecureIntent,
         host_capabilities: HostCapabilitySnapshot,
     ) -> Result<Option<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)>> {
-        if request.client_operation_id.is_empty() {
+        if validate_client_operation_id(&request.client_operation_id).is_err() {
             return Ok(None);
         }
-        let Some(row) = self
+        // Only the exact secure-store operation replays: the receipt must be
+        // of the `secure_store` kind with this request's fingerprint. A
+        // receipt of another operation sharing the id is not evidence that
+        // this intent committed.
+        let Ok(found) = self
             .db
-            .onboarding_receipt(
+            .onboarding_secure_intent_receipt(
                 request.run_id,
                 request.attempt_id,
                 request.client_operation_id.clone(),
+                db_placement(request.placement),
+                request.passphrase.is_some(),
             )
-            .await?
+            .await
         else {
+            return Ok(None);
+        };
+        let Some((_, row)) = found else {
             return Ok(None);
         };
         let committed = receipt(row);
@@ -229,6 +261,7 @@ impl OnboardingAuthority {
     where
         F: FnOnce(OnboardingSecurePlacement, Option<Zeroizing<String>>) -> Result<()>,
     {
+        validate_client_operation_id(&request.client_operation_id)?;
         if vault_authority_exists {
             return Err(SecureIntentRejection::AlreadyCommitted.into());
         }
@@ -237,14 +270,12 @@ impl OnboardingAuthority {
         let passphrase = request.passphrase.map(|value| value.into_zeroizing());
         if let Some((snapshot, prior_receipt)) = self
             .db
-            .onboarding_transition_receipt(
+            .onboarding_secure_intent_receipt(
                 request.run_id,
                 request.attempt_id,
                 client_operation_id.clone(),
-                DbStage::SecureStore,
-                DbBootstrapState::Materializing,
-                false,
-                Some(db_placement(placement)),
+                db_placement(placement),
+                passphrase.is_some(),
             )
             .await?
         {
@@ -284,7 +315,7 @@ impl OnboardingAuthority {
         let (ready, _) = self
             .mark_secure_store_ready(
                 &pending,
-                format!("{client_operation_id}:ready"),
+                internal_operation_id("secure-store-ready", pending_receipt.receipt_id),
                 host_capabilities.clone(),
             )
             .await?;
@@ -352,13 +383,11 @@ impl OnboardingAuthority {
         }
         let (row, receipt_row) = self
             .db
-            .onboarding_transition_pending(
+            .onboarding_secure_intent_pending(
                 current,
                 client_operation_id,
-                DbStage::SecureStore,
-                DbBootstrapState::Materializing,
-                false,
-                Some(db_placement(placement)),
+                db_placement(placement),
+                passphrase_present,
                 stage_entry_config_generation(),
             )
             .await?;
@@ -381,6 +410,21 @@ impl OnboardingAuthority {
         let Some(current) = self.db.onboarding_snapshot().await? else {
             return Ok(None);
         };
+        // The original secure-store operation's receipt is terminalized from
+        // the durable evidence first, at every crash boundary: committed when
+        // the vault proves the effect, rejected when no vault exists. Its
+        // idempotent replay then answers the original client operation.
+        if let Some(pending) = self.db.onboarding_pending_secure_intent_receipt().await? {
+            let status = if vault_authority_exists {
+                DbReceiptStatus::Committed
+            } else {
+                DbReceiptStatus::Rejected
+            };
+            self.db
+                .onboarding_set_pending_receipt_status(pending.receipt_id, status)
+                .await
+                .context("terminalizing the interrupted secure-store receipt")?;
+        }
         if current.bootstrap_state != DbBootstrapState::Materializing {
             return Ok(Some(project(current, host_capabilities, None)?));
         }
@@ -401,7 +445,7 @@ impl OnboardingAuthority {
         } else {
             (DbStage::SecureStore, DbBootstrapState::AwaitingChoice, None)
         };
-        let operation_id = format!("bootstrap-reconcile-{}", current.revision);
+        let operation_id = internal_operation_id("bootstrap-reconcile", current.revision);
         let (snapshot, _) = self
             .db
             .onboarding_transition(
@@ -415,64 +459,6 @@ impl OnboardingAuthority {
             )
             .await?;
         Ok(Some(project(snapshot, host_capabilities, None)?))
-    }
-
-    pub async fn mark_ready_construction_failed(
-        &self,
-        host_capabilities: HostCapabilitySnapshot,
-    ) -> Result<OnboardingBootstrapSnapshot> {
-        let current = self
-            .db
-            .onboarding_snapshot()
-            .await?
-            .context("no onboarding run exists")?;
-        if current.bootstrap_state == DbBootstrapState::Failed {
-            return project(current, host_capabilities, None);
-        }
-        let selected_secure_placement = current.selected_secure_placement;
-        let limited_mode = current.limited_mode;
-        let stage = current.stage;
-        let revision = current.revision;
-        let (row, _) = self
-            .db
-            .onboarding_transition(
-                current,
-                format!("ready-construction-failed-{revision}"),
-                stage,
-                DbBootstrapState::Failed,
-                limited_mode,
-                selected_secure_placement,
-                stage_entry_config_generation(),
-            )
-            .await?;
-        project(row, host_capabilities, None)
-    }
-
-    pub async fn mark_ready_construction_recovered(&self) -> Result<()> {
-        // No onboarding run means no checkpoint to heal (e.g. an installation
-        // provisioned without the interactive first run).
-        let Some(current) = self.db.onboarding_snapshot().await? else {
-            return Ok(());
-        };
-        if current.bootstrap_state != DbBootstrapState::Failed {
-            return Ok(());
-        }
-        let selected_secure_placement = current.selected_secure_placement;
-        let limited_mode = current.limited_mode;
-        let stage = current.stage;
-        let revision = current.revision;
-        self.db
-            .onboarding_transition(
-                current,
-                format!("ready-construction-recovered-{revision}"),
-                stage,
-                DbBootstrapState::Ready,
-                limited_mode,
-                selected_secure_placement,
-                stage_entry_config_generation(),
-            )
-            .await?;
-        Ok(())
     }
 
     pub async fn mark_secure_store_ready(
@@ -519,6 +505,7 @@ impl OnboardingAuthority {
         request: ApplyOnboardingTransition,
         host_capabilities: HostCapabilitySnapshot,
     ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)> {
+        validate_client_operation_id(&request.client_operation_id)?;
         if request.settlement.is_some() {
             bail!("settlement correlation is only valid for provider, model, or agent advance");
         }
@@ -551,6 +538,7 @@ impl OnboardingAuthority {
         request: ApplyOnboardingTransition,
         host_capabilities: HostCapabilitySnapshot,
     ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)> {
+        validate_client_operation_id(&request.client_operation_id)?;
         let settlement = request
             .settlement
             .as_ref()
@@ -732,7 +720,6 @@ fn bootstrap_state(value: DbBootstrapState) -> OnboardingBootstrapState {
         DbBootstrapState::AwaitingPassphrase => OnboardingBootstrapState::AwaitingPassphrase,
         DbBootstrapState::Materializing => OnboardingBootstrapState::Materializing,
         DbBootstrapState::Ready => OnboardingBootstrapState::Ready,
-        DbBootstrapState::Failed => OnboardingBootstrapState::Failed,
     }
 }
 
@@ -817,6 +804,180 @@ mod tests {
             .await
             .unwrap()
             .0
+    }
+
+    fn machine_bound_intent(
+        secure: &OnboardingBootstrapSnapshot,
+        client_operation_id: &str,
+    ) -> ApplyOnboardingSecureIntent {
+        ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: client_operation_id.into(),
+            placement: OnboardingSecurePlacement::MachineBoundFile,
+            passphrase: None,
+        }
+    }
+
+    /// The crash boundaries of one secure-store intent, simulated on the
+    /// durable rows: after the pending receipt, after the vault commit (the
+    /// receipt still pending), after the receipt commit (the stage not yet
+    /// advanced), and after the stage advance. Boot reconciliation must
+    /// terminalize the ORIGINAL operation's receipt from the vault evidence at
+    /// every one of them, so the original client operation replays.
+    #[derive(Clone, Copy, Debug)]
+    enum CrashBoundary {
+        PendingReceiptNoVault,
+        VaultCommittedReceiptPending,
+        ReceiptCommittedStageNotAdvanced,
+        StageAdvanced,
+    }
+
+    async fn crash_at(
+        boundary: CrashBoundary,
+    ) -> (OnboardingAuthority, OnboardingBootstrapSnapshot) {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db);
+        let secure = secure_stage(&authority).await;
+        let (pending, pending_receipt) = authority
+            .record_secure_intent(
+                secure.run_id,
+                secure.attempt_id,
+                secure.revision,
+                "crash-intent".into(),
+                OnboardingSecurePlacement::MachineBoundFile,
+                false,
+                capabilities(),
+            )
+            .await
+            .unwrap();
+        match boundary {
+            CrashBoundary::PendingReceiptNoVault | CrashBoundary::VaultCommittedReceiptPending => {}
+            CrashBoundary::ReceiptCommittedStageNotAdvanced => {
+                authority
+                    .db
+                    .onboarding_set_pending_receipt_status(
+                        pending_receipt.receipt_id,
+                        DbReceiptStatus::Committed,
+                    )
+                    .await
+                    .unwrap();
+            }
+            CrashBoundary::StageAdvanced => {
+                authority
+                    .db
+                    .onboarding_set_pending_receipt_status(
+                        pending_receipt.receipt_id,
+                        DbReceiptStatus::Committed,
+                    )
+                    .await
+                    .unwrap();
+                authority
+                    .mark_secure_store_ready(
+                        &pending,
+                        internal_operation_id("secure-store-ready", pending_receipt.receipt_id),
+                        capabilities(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        (authority, secure)
+    }
+
+    #[tokio::test]
+    async fn boot_reconciliation_terminalizes_the_original_receipt_at_every_crash_boundary() {
+        for boundary in [
+            CrashBoundary::PendingReceiptNoVault,
+            CrashBoundary::VaultCommittedReceiptPending,
+            CrashBoundary::ReceiptCommittedStageNotAdvanced,
+            CrashBoundary::StageAdvanced,
+        ] {
+            let (authority, secure) = crash_at(boundary).await;
+            let vault_exists = !matches!(boundary, CrashBoundary::PendingReceiptNoVault);
+            let reconciled = authority
+                .reconcile_materializing_secure_intent(vault_exists, capabilities())
+                .await
+                .unwrap()
+                .expect("run exists");
+            let original = authority
+                .receipt(cockpit_proto::OnboardingReceiptQuery {
+                    run_id: secure.run_id,
+                    attempt_id: secure.attempt_id,
+                    client_operation_id: "crash-intent".into(),
+                })
+                .await
+                .unwrap()
+                .expect("the original receipt exists");
+            let replay = authority
+                .committed_secure_intent_replay(
+                    &machine_bound_intent(&secure, "crash-intent"),
+                    capabilities(),
+                )
+                .await
+                .unwrap();
+            if vault_exists {
+                assert_eq!(
+                    original.status,
+                    OnboardingReceiptStatus::Committed,
+                    "{boundary:?}: the vault proves the original effect"
+                );
+                assert_eq!(reconciled.stage, OnboardingStage::Provider, "{boundary:?}");
+                assert_eq!(reconciled.bootstrap_state, OnboardingBootstrapState::Ready);
+                assert!(
+                    replay.is_some(),
+                    "{boundary:?}: the original operation replays"
+                );
+            } else {
+                assert_eq!(
+                    original.status,
+                    OnboardingReceiptStatus::Rejected,
+                    "{boundary:?}: no vault, no effect"
+                );
+                assert_eq!(reconciled.stage, OnboardingStage::SecureStore);
+                assert!(replay.is_none());
+            }
+            // Idempotent: a second boot changes nothing.
+            let again = authority
+                .reconcile_materializing_secure_intent(vault_exists, capabilities())
+                .await
+                .unwrap()
+                .expect("run exists");
+            assert_eq!(again.revision, reconciled.revision, "{boundary:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_internal_operation_ids_are_rejected_before_any_effect() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db);
+        let secure = secure_stage(&authority).await;
+        let materialized = Arc::new(AtomicUsize::new(0));
+        let calls = materialized.clone();
+        let error = authority
+            .apply_secure_intent_with(
+                machine_bound_intent(&secure, "cockpit-internal:secure-store-ready:x"),
+                capabilities(),
+                false,
+                move |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("reserved namespace");
+        assert!(error.to_string().contains("reserved"), "{error:#}");
+        assert_eq!(materialized.load(Ordering::SeqCst), 0);
+        let too_long = authority
+            .apply_secure_intent_with(
+                machine_bound_intent(&secure, &"y".repeat(129)),
+                capabilities(),
+                false,
+                |_, _| panic!("an over-long id must be rejected before materialization"),
+            )
+            .await;
+        assert!(too_long.is_err());
     }
 
     #[tokio::test]

@@ -18,7 +18,6 @@ export const onboardingBootstrapStateSchema = z.enum([
   "awaiting_passphrase",
   "materializing",
   "ready",
-  "failed",
 ]);
 export type OnboardingBootstrapState = z.infer<typeof onboardingBootstrapStateSchema>;
 

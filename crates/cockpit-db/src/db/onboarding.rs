@@ -63,7 +63,6 @@ pub enum OnboardingBootstrapState {
     AwaitingPassphrase,
     Materializing,
     Ready,
-    Failed,
 }
 
 impl OnboardingBootstrapState {
@@ -73,7 +72,6 @@ impl OnboardingBootstrapState {
             Self::AwaitingPassphrase => "awaiting_passphrase",
             Self::Materializing => "materializing",
             Self::Ready => "ready",
-            Self::Failed => "failed",
         }
     }
 
@@ -83,7 +81,6 @@ impl OnboardingBootstrapState {
             "awaiting_passphrase" => Ok(Self::AwaitingPassphrase),
             "materializing" => Ok(Self::Materializing),
             "ready" => Ok(Self::Ready),
-            "failed" => Ok(Self::Failed),
             _ => bail!("invalid persisted onboarding bootstrap state"),
         }
     }
@@ -295,28 +292,98 @@ impl Db {
     }
 
     /// The secure-vault hand-off reserves its revision before performing an
-    /// external effect.  Its receipt stays pending until that effect reports
-    /// success, so a crash can be reconciled without pretending it committed.
-    pub async fn onboarding_transition_pending(
+    /// external effect. Its receipt is the distinct `secure_store` operation
+    /// kind (fingerprinted by the placement and whether a passphrase was
+    /// supplied) and stays pending until that effect reports success, so a
+    /// crash can be reconciled without pretending it committed.
+    pub async fn onboarding_secure_intent_pending(
         &self,
         snapshot: OnboardingSnapshotRow,
         client_operation_id: String,
-        next_stage: OnboardingStage,
-        bootstrap_state: OnboardingBootstrapState,
-        limited_mode: bool,
-        selected_secure_placement: Option<OnboardingSecurePlacement>,
+        placement: OnboardingSecurePlacement,
+        passphrase_present: bool,
         stage_entry_config_generation: u64,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
-        self.onboarding_transition_with_receipt_status(
-            snapshot,
-            client_operation_id,
-            next_stage,
-            bootstrap_state,
-            limited_mode,
-            selected_secure_placement,
-            OnboardingReceiptStatus::Pending,
-            stage_entry_config_generation,
-        )
+        self.write(move |conn| {
+            let fingerprint = secure_intent_fingerprint(placement, passphrase_present);
+            transition_conn_with_fingerprint(
+                conn,
+                &snapshot,
+                &client_operation_id,
+                OnboardingStage::SecureStore,
+                OnboardingBootstrapState::Materializing,
+                false,
+                Some(placement),
+                OnboardingReceiptStatus::Pending,
+                stage_entry_config_generation,
+                fingerprint,
+            )
+        })
+        .await
+    }
+
+    /// The secure-store receipt for exactly this operation: same run,
+    /// attempt, and client operation id, *and* the `secure_store` operation
+    /// kind with the same request fingerprint. A receipt of any other
+    /// operation (a begin, an ordinary transition) or of a different
+    /// placement is an error, never a replay.
+    pub async fn onboarding_secure_intent_receipt(
+        &self,
+        run_id: Uuid,
+        attempt_id: Uuid,
+        client_operation_id: String,
+        placement: OnboardingSecurePlacement,
+        passphrase_present: bool,
+    ) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
+        self.read(move |conn| {
+            receipt_with_fingerprint_conn(
+                conn,
+                run_id,
+                attempt_id,
+                &client_operation_id,
+                secure_intent_fingerprint(placement, passphrase_present),
+            )
+        })
+        .await
+    }
+
+    /// The still-pending secure-store receipt of the active attempt, if any:
+    /// the original operation boot reconciliation must terminalize.
+    pub async fn onboarding_pending_secure_intent_receipt(
+        &self,
+    ) -> Result<Option<OnboardingReceiptRow>> {
+        self.read(|conn| {
+            let Some(current) = snapshot_conn(conn)? else {
+                return Ok(None);
+            };
+            conn.query_row(
+                "SELECT receipt_id, client_operation_id, consumed_revision FROM onboarding_receipts
+                 WHERE run_id = ?1 AND attempt_id = ?2 AND operation_kind = 'secure_store'
+                   AND status = 'pending'
+                 ORDER BY consumed_revision DESC LIMIT 1",
+                params![current.run_id.to_string(), current.attempt_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(receipt_id, client_operation_id, consumed_revision)| {
+                Ok(OnboardingReceiptRow {
+                    receipt_id: uuid(receipt_id, "receipt id")?,
+                    run_id: current.run_id,
+                    attempt_id: current.attempt_id,
+                    client_operation_id,
+                    consumed_revision: u64::try_from(consumed_revision)?,
+                    status: OnboardingReceiptStatus::Pending,
+                    replayed: true,
+                })
+            })
+            .transpose()
+        })
         .await
     }
 
@@ -520,6 +587,39 @@ fn transition_conn(
     receipt_status: OnboardingReceiptStatus,
     stage_entry_config_generation: u64,
 ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
+    let fingerprint = transition_fingerprint(
+        next_stage,
+        bootstrap_state,
+        limited_mode,
+        selected_secure_placement,
+    );
+    transition_conn_with_fingerprint(
+        conn,
+        current,
+        client_operation_id,
+        next_stage,
+        bootstrap_state,
+        limited_mode,
+        selected_secure_placement,
+        receipt_status,
+        stage_entry_config_generation,
+        fingerprint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transition_conn_with_fingerprint(
+    conn: &rusqlite::Connection,
+    current: &OnboardingSnapshotRow,
+    client_operation_id: &str,
+    next_stage: OnboardingStage,
+    bootstrap_state: OnboardingBootstrapState,
+    limited_mode: bool,
+    selected_secure_placement: Option<OnboardingSecurePlacement>,
+    receipt_status: OnboardingReceiptStatus,
+    stage_entry_config_generation: u64,
+    fingerprint: (&'static str, String),
+) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
     if client_operation_id.is_empty() || client_operation_id.len() > 128 {
         bail!("invalid onboarding client operation id");
     }
@@ -541,12 +641,7 @@ fn transition_conn(
             },
         )
         .optional()?;
-    let (operation_kind, operation_digest) = transition_fingerprint(
-        next_stage,
-        bootstrap_state,
-        limited_mode,
-        selected_secure_placement,
-    );
+    let (operation_kind, operation_digest) = fingerprint;
     if let Some((receipt_id, consumed_revision, replay_kind, replay_digest, status)) = replay {
         if replay_kind != operation_kind || replay_digest != operation_digest {
             bail!("onboarding client operation id was reused for a different transition");
@@ -625,12 +720,28 @@ fn transition_receipt_conn(
     limited_mode: bool,
     selected_secure_placement: Option<OnboardingSecurePlacement>,
 ) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
-    let (operation_kind, operation_digest) = transition_fingerprint(
-        next_stage,
-        bootstrap_state,
-        limited_mode,
-        selected_secure_placement,
-    );
+    receipt_with_fingerprint_conn(
+        conn,
+        run_id,
+        attempt_id,
+        client_operation_id,
+        transition_fingerprint(
+            next_stage,
+            bootstrap_state,
+            limited_mode,
+            selected_secure_placement,
+        ),
+    )
+}
+
+fn receipt_with_fingerprint_conn(
+    conn: &rusqlite::Connection,
+    run_id: Uuid,
+    attempt_id: Uuid,
+    client_operation_id: &str,
+    fingerprint: (&'static str, String),
+) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
+    let (operation_kind, operation_digest) = fingerprint;
     let receipt = conn
         .query_row(
             "SELECT receipt_id, consumed_revision, operation_kind, operation_digest, status
@@ -792,6 +903,20 @@ fn transition_fingerprint(
             placement
                 .map(OnboardingSecurePlacement::as_str)
                 .unwrap_or("-")
+        )),
+    )
+}
+
+fn secure_intent_fingerprint(
+    placement: OnboardingSecurePlacement,
+    passphrase_present: bool,
+) -> (&'static str, String) {
+    (
+        "secure_store",
+        transition_digest(&format!(
+            "secure_store:{}:{}",
+            placement.as_str(),
+            passphrase_present
         )),
     )
 }

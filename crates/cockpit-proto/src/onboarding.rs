@@ -30,7 +30,6 @@ pub enum OnboardingBootstrapState {
     AwaitingPassphrase,
     Materializing,
     Ready,
-    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -463,6 +463,14 @@ struct PtyObserver {
     /// for the rest of the run. The TUI draws every frame inside a
     /// synchronized update, so this is exactly what the user saw first.
     first_synchronized_frame: Option<vt100::Screen>,
+    /// Every synchronized-update frame the child completed, oldest first
+    /// (bounded), so a test can assert over *all* frames up to a point, not
+    /// only the first and the latest.
+    synchronized_frames: Vec<vt100::Screen>,
+    /// When the observer was created (the PTY child was just spawned) and
+    /// when the first synchronized frame completed: launch-to-first-frame.
+    spawned_at: Instant,
+    first_frame_at: Option<Instant>,
     /// When output that is not part of a completed frame last arrived, if
     /// any arrived after the latest frame boundary. Bytes past a boundary are
     /// either a frame still being written (a burst that ends in its own
@@ -524,6 +532,9 @@ struct FrameBoundaryObserver {
     /// Inside a synchronized-update frame (`?2026h` seen, `?2026l` not yet).
     in_sync: bool,
 }
+
+/// Bound on recorded synchronized frames per PTY child.
+const MAX_RECORDED_FRAMES: usize = 400;
 
 /// A frame-mode event at an offset (exclusive end, within the fed bytes).
 enum FrameEvent {
@@ -617,6 +628,9 @@ impl PtyObserver {
             frames: FrameBoundaryObserver::default(),
             completed_frame: None,
             first_synchronized_frame: None,
+            synchronized_frames: Vec::new(),
+            spawned_at: Instant::now(),
+            first_frame_at: None,
             unframed_since_boundary: None,
             handed_off: false,
         }
@@ -634,10 +648,14 @@ impl PtyObserver {
             };
             self.parser.process(&bytes[fed..end]);
             fed = end;
-            if matches!(event, FrameEvent::Completed(_, true))
-                && self.first_synchronized_frame.is_none()
-            {
-                self.first_synchronized_frame = Some(self.parser.screen().clone());
+            if matches!(event, FrameEvent::Completed(_, true)) {
+                if self.first_synchronized_frame.is_none() {
+                    self.first_synchronized_frame = Some(self.parser.screen().clone());
+                    self.first_frame_at = Some(Instant::now());
+                }
+                if self.synchronized_frames.len() < MAX_RECORDED_FRAMES {
+                    self.synchronized_frames.push(self.parser.screen().clone());
+                }
             }
             self.completed_frame = match event {
                 FrameEvent::Completed(..) => Some(self.parser.screen().clone()),
@@ -1446,6 +1464,28 @@ impl HermeticCockpit {
         };
         let observer = pty.observer.lock().expect("pty observer lock");
         ScreenSnapshot::from_screen(observer.parser.screen())
+    }
+
+    /// Every synchronized frame drawn so far (bounded), oldest first.
+    pub fn synchronized_frame_snapshots(&self) -> Vec<ScreenSnapshot> {
+        let Some(pty) = self.pty.as_ref() else {
+            return Vec::new();
+        };
+        let observer = pty.observer.lock().expect("pty observer lock");
+        observer
+            .synchronized_frames
+            .iter()
+            .map(ScreenSnapshot::from_screen)
+            .collect()
+    }
+
+    /// Time from spawning the PTY child to its first completed frame.
+    pub fn launch_to_first_frame(&self) -> Option<Duration> {
+        let pty = self.pty.as_ref()?;
+        let observer = pty.observer.lock().expect("pty observer lock");
+        observer
+            .first_frame_at
+            .map(|at| at.duration_since(observer.spawned_at))
     }
 
     /// The first frame the TUI drew (its first completed synchronized

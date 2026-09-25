@@ -585,10 +585,18 @@ fn tui_pty_cold_first_run_mouse_completes_and_second_launch_is_ready() {
     complete_cold_first_run(WalkthroughInput::Mouse);
 }
 
+/// Onboarding-screen markers that must never appear on an onboarded home.
+const ONBOARDING_MARKERS: [&str; 4] = [
+    "[press any button to continue]",
+    "What should Cockpit call you?",
+    "Secure your secrets",
+    "step 1/8",
+];
+
 /// Flicker-free startup: the TUI asks the daemon whether onboarding is needed
 /// before it enters the alternate screen, so the very first frame on a fresh
-/// home is the onboarding shell — never a chat UI that onboarding replaces a
-/// moment later.
+/// home — and every frame after it — is the onboarding shell, never a chat UI
+/// that onboarding replaces a moment later.
 #[test]
 fn tui_pty_first_frame_is_onboarding_on_a_fresh_home() {
     let mut session = HermeticCockpit::prepare_fresh(HermeticProfile::Default);
@@ -603,21 +611,26 @@ fn tui_pty_first_frame_is_onboarding_on_a_fresh_home() {
             |screen| screen.contains("[press any button to continue]"),
         )
         .expect("cold first-run reaches the Welcome shell");
-    let first = session
-        .first_frame_snapshot()
-        .expect("the TUI drew a first frame")
-        .contents();
+    let frames = session.synchronized_frame_snapshots();
+    assert!(!frames.is_empty(), "the TUI drew no synchronized frame");
     assert!(
-        first.contains("[press any button to continue]"),
-        "the first frame on a fresh home must already be the onboarding Welcome:\n{first}"
+        frames[0].contains("[press any button to continue]"),
+        "the first frame on a fresh home must already be the onboarding Welcome:\n{}",
+        frames[0].contents()
     );
-    assert!(
-        !first.contains(COMPOSER_PLACEHOLDER),
-        "the chat composer must never flash before onboarding:\n{first}"
-    );
-    assert!(
-        !first.contains("Starting cockpit"),
-        "the pre-screen notice belongs to the normal screen, never a frame:\n{first}"
+    for (index, frame) in frames.iter().enumerate() {
+        assert!(
+            !frame.contains(COMPOSER_PLACEHOLDER) && !frame.contains("Starting cockpit"),
+            "frame {index} before the Welcome settled showed chat or the pre-screen notice:\n{}",
+            frame.contents()
+        );
+    }
+    eprintln!(
+        "first-frame-timing fresh-home launch_to_first_frame_ms={}",
+        session
+            .launch_to_first_frame()
+            .expect("first frame timestamp")
+            .as_millis()
     );
 
     session.reap();
@@ -625,8 +638,32 @@ fn tui_pty_first_frame_is_onboarding_on_a_fresh_home() {
     session.assert_reaped();
 }
 
-/// Flicker-free startup, onboarded home: the first frame is the chat UI and
-/// no onboarding surface is ever drawn.
+fn assert_every_frame_is_chat_until_ready(session: &mut HermeticCockpit, label: &str) {
+    session
+        .wait_until_screen(label, COLD_WELCOME_TIMEOUT, |screen| {
+            screen.contains(COMPOSER_PLACEHOLDER)
+        })
+        .expect("an onboarded home opens the chat UI");
+    let frames = session.synchronized_frame_snapshots();
+    assert!(!frames.is_empty(), "the TUI drew no synchronized frame");
+    assert!(
+        frames[0].contains(COMPOSER_PLACEHOLDER),
+        "the first frame on an onboarded home must be the chat UI:\n{}",
+        frames[0].contents()
+    );
+    for (index, frame) in frames.iter().enumerate() {
+        for marker in ONBOARDING_MARKERS {
+            assert!(
+                !frame.contains(marker),
+                "frame {index} on an onboarded home drew onboarding (`{marker}`):\n{}",
+                frame.contents()
+            );
+        }
+    }
+}
+
+/// Flicker-free startup, onboarded home with a running daemon: every frame is
+/// the chat UI and no onboarding surface is ever drawn.
 #[test]
 fn tui_pty_first_frame_is_chat_on_an_onboarded_home() {
     let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
@@ -634,30 +671,42 @@ fn tui_pty_first_frame_is_chat_on_an_onboarded_home() {
     session
         .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
         .expect("spawn onboarded PTY child");
-    session
-        .wait_until_screen("ready chat", COLD_WELCOME_TIMEOUT, |screen| {
-            screen.contains(COMPOSER_PLACEHOLDER)
-        })
-        .expect("an onboarded home opens the chat UI");
-    let first = session
-        .first_frame_snapshot()
-        .expect("the TUI drew a first frame")
-        .contents();
-    assert!(
-        first.contains(COMPOSER_PLACEHOLDER),
-        "the first frame on an onboarded home must be the chat UI:\n{first}"
+    assert_every_frame_is_chat_until_ready(&mut session, "ready chat (warm daemon)");
+    eprintln!(
+        "first-frame-timing warm-onboarded launch_to_first_frame_ms={}",
+        session
+            .launch_to_first_frame()
+            .expect("first frame timestamp")
+            .as_millis()
     );
-    for onboarding_marker in [
-        "[press any button to continue]",
-        "What should Cockpit call you?",
-        "Secure your secrets",
-        "step 1/8",
-    ] {
-        assert!(
-            !first.contains(onboarding_marker),
-            "an onboarded home must never draw onboarding (`{onboarding_marker}`):\n{first}"
-        );
-    }
     session.reap();
+    session.assert_reaped();
+}
+
+/// Cold onboarded start: no daemon is running, so the TUI spawns it. The
+/// first frame is still the chat UI (decided from the daemon's early
+/// bootstrap answer), never onboarding, and it does not wait for the full
+/// ready-service boot.
+#[test]
+fn tui_pty_first_frame_is_chat_on_a_cold_onboarded_home() {
+    let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
+    // Record the workspace-trust decision, then stop that daemon: the PTY
+    // launch below starts from a cold (daemon-less) onboarded home.
+    session.start_trusted_daemon();
+    session.stop_child_spawned_daemon();
+    session.forget_fixture_daemon_ownership();
+    session
+        .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
+        .expect("spawn cold onboarded PTY child");
+    assert_every_frame_is_chat_until_ready(&mut session, "ready chat (cold daemon)");
+    eprintln!(
+        "first-frame-timing cold-onboarded launch_to_first_frame_ms={}",
+        session
+            .launch_to_first_frame()
+            .expect("first frame timestamp")
+            .as_millis()
+    );
+    session.reap();
+    session.stop_child_spawned_daemon();
     session.assert_reaped();
 }

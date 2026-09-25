@@ -123,26 +123,35 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
         if is_ssh_non_key_name(&name) {
             continue;
         }
-        // `fs::metadata` follows symlinks — we want the target's content if
-        // it's a regular file (it's the key *material* being redacted).
-        let meta = std::fs::metadata(&path).map_err(|error| {
-            anyhow::anyhow!("configured SSH source is unreadable during capture: {error}")
-        })?;
+        // Only regular files (symlinks followed to their target: it is the
+        // key *material* being redacted) can be keys. Sockets (ControlMaster),
+        // FIFOs and directories are skipped, as is an entry that disappears
+        // between listing and inspection: it contributes no key, and the
+        // publication fence rereads the directory.
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "configured SSH source is unreadable during capture: {error}"
+                ));
+            }
+        };
         if !meta.is_file() {
             continue;
         }
-        let target_before = std::fs::canonicalize(&path).map_err(|error| {
+        let Some(content) = read_ssh_candidate(path)? else {
+            continue;
+        };
+        if !is_pem_private_key(&content) {
+            continue;
+        }
+        let target_before = std::fs::canonicalize(path).map_err(|error| {
             anyhow::anyhow!("configured SSH source is unreadable during capture: {error}")
         })?;
-        // Bounded, non-blocking-open read with descriptor-based regular-file
-        // validation: a key swapped for a FIFO after the metadata check fails
-        // instead of stalling a coverage worker on the open.
-        let content = read_ssh_source_text(path).map_err(|error| {
-            anyhow::anyhow!("configured SSH source is unreadable during capture: {error}")
-        })?;
-        before_confirm(&path);
+        before_confirm(path);
         // A configured symlink can be retargeted independently of the
-        // directory entry. Capture refuses an unstable read instead of
+        // directory entry. Capture refuses an unstable key read instead of
         // publishing coverage for either half of the replacement.
         let target_after = std::fs::canonicalize(path)
             .map_err(|_| anyhow::anyhow!("configured SSH source changed during capture"))?;
@@ -150,9 +159,6 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
             .map_err(|_| anyhow::anyhow!("configured SSH source changed during capture"))?;
         if target_before != target_after || content != confirm {
             anyhow::bail!("configured SSH source changed during capture");
-        }
-        if !is_pem_private_key(&content) {
-            continue;
         }
         let origin = format!("$ssh:{name}");
         let trimmed = content.trim().to_string();
@@ -171,10 +177,32 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
             out.push((trimmed, origin));
         }
     }
-    if discover()?.as_deref() != Some(discovered.as_slice()) {
-        anyhow::bail!("configured SSH source set changed during capture");
-    }
+    // No listing-equality check: churn of non-key entries (ControlMaster
+    // sockets, editor temp files) must not fail capture. A key appearing or
+    // changing after this pass changes the fresh-read source binding, so the
+    // coverage authority refuses to publish this table (key probe vs. the
+    // captured-bytes boundary, and the publication fence).
     Ok(out)
+}
+
+/// Read one directory entry as a possible key. `Ok(None)` for an entry that
+/// cannot be a key: it disappeared, is no longer a regular file, is larger
+/// than any key, or is not UTF-8 (`.DS_Store` and other binary files). Any
+/// other failure (for example permission denied) is an error: the entry could
+/// be key material that coverage would silently miss.
+fn read_ssh_candidate(path: &Path) -> Result<Option<String>> {
+    use crate::resource_limits::ResourceLimitError;
+    match crate::resource_limits::read_for_tool(path) {
+        Ok(bytes) => Ok(String::from_utf8(bytes).ok()),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(ResourceLimitError::ByteLimit { .. }) => Ok(None),
+        Err(ResourceLimitError::Io(cockpit_host::bounded::BoundedIoError::NotRegular {
+            ..
+        })) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "configured SSH source is unreadable during capture: {error}"
+        )),
+    }
 }
 
 pub(super) fn read_ssh_source_text(path: &Path) -> Result<String> {

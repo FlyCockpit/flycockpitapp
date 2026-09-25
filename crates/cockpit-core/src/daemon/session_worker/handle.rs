@@ -1919,13 +1919,6 @@ impl SessionWorkerHandle {
         current_redaction(&self.redaction)
     }
 
-    /// The session's live coverage table, for daemon-global events that
-    /// originate in this session's workspace (see
-    /// [`EventCoverage`](crate::daemon::EventCoverage)).
-    pub(crate) fn shared_redaction(&self) -> SharedRedactionTable {
-        self.redaction.clone()
-    }
-
     pub(crate) fn coverage_publish_owners(
         &self,
         vault: std::sync::Arc<crate::secure_key::SecretVault>,
@@ -3000,7 +2993,7 @@ pub(crate) fn spawn(
         std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>,
     >,
     write_scope: crate::write_scope::WriteScopeSource,
-    global_bus: Option<EventSender>,
+    global_bus: Option<crate::daemon::GlobalEventBus>,
     trust_policy: crate::config::trust::WorkspaceTrustPolicy,
     trust_revision: i64,
     cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,

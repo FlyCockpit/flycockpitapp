@@ -7577,7 +7577,7 @@ async fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
     };
     let envelope = EventEnvelope {
         event: event.clone(),
-        redact: table,
+        redact: table.into(),
     };
 
     let owner = scrub_event_for_principal(&ClientPrincipal::owner(), envelope.clone()).unwrap();
@@ -7612,7 +7612,7 @@ async fn boundary_scrubs_streaming_deltas_for_non_owner() {
             &remote_principal(),
             EventEnvelope {
                 event,
-                redact: table.clone(),
+                redact: table.clone().into(),
             },
         )
         .unwrap();
@@ -7637,7 +7637,7 @@ async fn boundary_scrubs_nested_json_text_for_non_owner() {
         &remote_principal(),
         EventEnvelope {
             event,
-            redact: table,
+            redact: table.into(),
         },
     )
     .unwrap();
@@ -7660,7 +7660,7 @@ async fn boundary_uses_emit_time_table_not_later_table() {
         &remote_principal(),
         EventEnvelope {
             event,
-            redact: emit_table,
+            redact: emit_table.into(),
         },
     )
     .unwrap();
@@ -7686,7 +7686,7 @@ async fn session_and_global_events_use_their_own_tables() {
         &remote_principal(),
         EventEnvelope {
             event: session_event,
-            redact: table_for("session-secret"),
+            redact: table_for("session-secret").into(),
         },
     )
     .unwrap();
@@ -7694,7 +7694,7 @@ async fn session_and_global_events_use_their_own_tables() {
         &remote_principal(),
         EventEnvelope {
             event: global_event,
-            redact: table_for("global-secret"),
+            redact: table_for("global-secret").into(),
         },
     )
     .unwrap();
@@ -13829,6 +13829,73 @@ async fn remote_owner_save_image_spend_policy_commits_and_replays() {
         .expect("committed image-spend policy operation");
     assert_eq!(status.state, "committed");
     assert!(status.safe_response.is_some());
+}
+
+/// The settings editor writes the global layer through the daemon. A value
+/// the installation-policy loader would refuse (a relative
+/// `redact.extra_dotenv_paths` entry has no project root in global config) is
+/// rejected before the durable commit, so the editor can never author a layer
+/// that stops daemon-global coverage or the next boot.
+#[tokio::test]
+async fn settings_patch_to_the_global_layer_runs_the_installation_validator() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+    let global_dir = cockpit_config::config::dirs::global_config_dir().unwrap();
+    std::fs::create_dir_all(&global_dir).unwrap();
+    let global_file = global_dir.join(cockpit_config::config::dirs::CONFIG_FILE);
+    std::fs::write(&global_file, "{}\n").unwrap();
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
+    trust_workspace_root(&ctx, project.path()).await;
+    let project_root = project.path().to_string_lossy().into_owned();
+    let mut state = owner_state();
+    let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+    let Response::ExtendedConfigSnapshot { layers, .. } = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::GetExtendedConfigSnapshot {
+            project_root: project_root.clone(),
+            snapshot_session_id: snapshot_session_id.clone(),
+        },
+    )
+    .await
+    .expect("settings snapshot") else {
+        panic!("expected an extended config snapshot");
+    };
+    let global = layers
+        .into_iter()
+        .find(|layer| layer.kind == cockpit_proto::CockpitConfigLayer::HomeXdg)
+        .expect("the global layer is part of the settings snapshot");
+    let error = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ApplyExtendedConfigPatch {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
+            project_root,
+            layer_id: global.layer_id.clone(),
+            patch: cockpit_proto::ExtendedConfigPatch {
+                operations: vec![cockpit_proto::ExtendedConfigPathMutation::Set {
+                    path: vec!["redact".to_string(), "extra_dotenv_paths".to_string()],
+                    value: serde_json::json!(["secrets.env"]),
+                }],
+                materialize: false,
+                denylist: Vec::new(),
+                redacted_mutations: Vec::new(),
+            },
+            expected_revision: global.revision.clone(),
+            snapshot_session_id,
+        },
+    )
+    .await
+    .expect_err("a relative global path must be refused before commit");
+    assert_eq!(error.code, ErrorCode::BadRequest, "{error:?}");
+    assert!(
+        error.message.contains("redact.extra_dotenv_paths"),
+        "{}",
+        error.message
+    );
+    assert_eq!(std::fs::read_to_string(&global_file).unwrap(), "{}\n");
+    assert!(cockpit_config::config::extended::load_installation_redact_policy().is_ok());
 }
 
 /// The `image_generation` registry is authored ONLY by the dedicated
@@ -20380,7 +20447,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // with `Internal` post-auth, before any docs pipeline / inference runs.
         // The authz boundary (owner-allowed, non-owner-denied) is what this
         // matrix verifies.
-        "docs_ask" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        "docs_ask" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // v10 owner-remoted persistent mutations (including the reclassified
         // `upsert_assistant`) reject on the ephemeral matrix daemon before any
         // work, exactly like the sibling ephemeral-guarded owner mutations.
@@ -23163,9 +23230,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             no_sandbox: true,
             offline: true,
         },
-        // project_root: None ⇒ the daemon's canonical cwd, which the ephemeral
-        // matrix daemon never trusts, so the owner-authorized request fails
-        // closed at trust resolution before running the docs pipeline.
+        // project_root: None ⇒ refused: the docs session needs an explicit
+        // workspace and never falls back to the daemon's working directory,
+        // so the owner-authorized request fails before any trust or
+        // coverage work.
         "docs_ask" => Request::DocsAsk {
             question: "how do tasks work?".into(),
             package: Some("tokio".into()),
@@ -36533,7 +36601,7 @@ async fn response_send_failure_warns_with_request_id_and_no_payload() {
 fn test_event_envelope(event: proto::Event) -> EventEnvelope {
     EventEnvelope {
         event,
-        redact: std::sync::Arc::new(RedactionTable::empty()),
+        redact: std::sync::Arc::new(RedactionTable::empty()).into(),
     }
 }
 
@@ -37645,6 +37713,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         global_events,
         global_redaction: base.global_redaction.clone(),
         redaction_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        redaction_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -37759,6 +37828,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         global_events,
         global_redaction: base.global_redaction.clone(),
         redaction_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        redaction_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         persistent_endpoint_publication_failure: std::sync::atomic::AtomicBool::new(false),
         redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -42386,74 +42456,7 @@ async fn sealed_compartment_create_and_rotate_journal_nothing_through_dispatch()
     );
 }
 
-// ---- Daemon-startup command-backed secret resolution (inc 2) -------------
-
-/// Counting executor for the startup-resolution tests: records invocations and
-/// returns a canned success or a canned failure.
-struct StartupCountingExecutor {
-    outcome: std::result::Result<String, crate::secret_command::CommandSecretError>,
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-impl StartupCountingExecutor {
-    fn ok(value: &str) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
-            outcome: Ok(value.to_string()),
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        })
-    }
-
-    fn failing(error: crate::secret_command::CommandSecretError) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
-            outcome: Err(error),
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::secret_command::CommandSecretExecutor for StartupCountingExecutor {
-    async fn run(
-        &self,
-        _argv: &[String],
-    ) -> std::result::Result<String, crate::secret_command::CommandSecretError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.outcome.clone()
-    }
-}
-
-fn startup_ctx_referencing_command_secret(secret_name: &str) -> std::sync::Arc<DaemonContext> {
-    use crate::config::providers::{
-        ActiveModelRef, HeaderSpec, ModelEntry, ProviderEntry, ProvidersConfig,
-    };
-    let mut providers = ProvidersConfig::default();
-    providers.providers.insert(
-        "lmstudio".to_string(),
-        ProviderEntry {
-            url: "http://localhost:1/v1".to_string(),
-            models: vec![ModelEntry {
-                id: "m".to_string(),
-                ..ModelEntry::default()
-            }],
-            headers: vec![HeaderSpec {
-                name: "Authorization".to_string(),
-                value: format!("Bearer $secret:{secret_name}"),
-            }],
-            ..ProviderEntry::default()
-        },
-    );
-    providers.active_model = Some(ActiveModelRef {
-        provider: "lmstudio".to_string(),
-        model: "m".to_string(),
-        reasoning_effort: None,
-        thinking_mode: None,
-        prompt_cache_retention: None,
-    });
-    test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
-        providers,
-        crate::config::extended::ExtendedConfig::default(),
-    ))
-}
+// ---- Command-backed secrets are never resolved from the daemon cwd -------
 
 /// Claim `(provider, cwd)` ownership of `item_id` so the owner-scoped startup
 /// resolution (keyed on `std::env::current_dir()`) resolves it. Read-only w.r.t.
@@ -42491,240 +42494,14 @@ async fn trust_current_dir(db: &crate::db::Db) {
     .unwrap();
 }
 
-/// AC3: a referenced, provider-owned command-backed secret is `Resolved` after
-/// startup resolution (which `boot_with_db` runs) in a TRUSTED workspace.
+/// Command-secret resolution is workspace-scoped: every session pre-resolves
+/// its own workspace's references at create/resume
+/// (`preresolve_session_command_secrets`). Boot therefore has nothing to
+/// resolve without a workspace and never uses the daemon's inherited working
+/// directory as one, even when that directory is trusted and owns a
+/// referenced command secret.
 #[tokio::test]
-async fn daemon_startup_resolves_referenced_command_secrets() {
-    let ctx = startup_ctx_referencing_command_secret("startupcmd");
-    let mut store =
-        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
-    store
-        .set_named_secret_command("startupcmd", vec!["prog".to_string()])
-        .unwrap();
-    store.save().unwrap();
-    claim_current_dir_ownership(&ctx.db, "startupcmd");
-    trust_current_dir(&ctx.db).await;
-
-    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::ok(
-        "startup-resolved-token-abcdef0123456789",
-    ));
-    ctx.registry.set_command_secret_cache(cache.clone());
-
-    ctx.resolve_startup_command_secrets().await;
-
-    assert!(
-        matches!(
-            cache.status("startupcmd"),
-            Some(crate::secret_command::CommandResolutionStatus::Resolved)
-        ),
-        "a referenced command secret must be Resolved after startup"
-    );
-    assert_eq!(cache.exec_count(), 1);
-}
-
-/// AC3: a failing startup resolution lands as `Failed` and never fails boot
-/// (the resolution completes without panicking / returning an error).
-#[tokio::test]
-async fn daemon_startup_command_secret_failure_does_not_fail_boot() {
-    let ctx = startup_ctx_referencing_command_secret("startupcmd");
-    let mut store =
-        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
-    store
-        .set_named_secret_command("startupcmd", vec!["prog".to_string()])
-        .unwrap();
-    store.save().unwrap();
-    claim_current_dir_ownership(&ctx.db, "startupcmd");
-    trust_current_dir(&ctx.db).await;
-
-    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::failing(
-        crate::secret_command::CommandSecretError::NotFound,
-    ));
-    ctx.registry.set_command_secret_cache(cache.clone());
-
-    // Completes normally: startup resolution never fails boot on a command error.
-    ctx.resolve_startup_command_secrets().await;
-
-    assert!(
-        matches!(
-            cache.status("startupcmd"),
-            Some(crate::secret_command::CommandResolutionStatus::Failed(_))
-        ),
-        "a failing referenced command secret must land as Failed after startup"
-    );
-    assert_eq!(cache.exec_count(), 1);
-}
-
-/// HIGH #3a (part 1): an UNSET/untrusted workspace fails closed — startup
-/// resolution resolves the trust policy from the DB, and with no trust decision
-/// it never loads project config or execs. The FIXED source WOULD return the
-/// reference if consulted, so a `0` exec count proves the trust gate exists (an
-/// implementation that skipped the trust check would exec 1).
-#[tokio::test]
-async fn daemon_startup_untrusted_workspace_does_not_exec_command() {
-    let ctx = startup_ctx_referencing_command_secret("trustcmd");
-    let mut store =
-        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
-    store
-        .set_named_secret_command("trustcmd", vec!["prog".to_string()])
-        .unwrap();
-    store.save().unwrap();
-    // Ownership is claimed so the ONLY thing preventing execution is the
-    // (absent) workspace trust decision — no `trust_current_dir` call here.
-    claim_current_dir_ownership(&ctx.db, "trustcmd");
-
-    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::ok(
-        "must-never-be-produced-token",
-    ));
-    ctx.registry.set_command_secret_cache(cache.clone());
-
-    ctx.resolve_startup_command_secrets().await;
-
-    assert_eq!(
-        cache.exec_count(),
-        0,
-        "an untrusted / unset workspace must never exec a project command reference at boot"
-    );
-    assert!(cache.status("trustcmd").is_none());
-}
-
-/// HIGH #3a (part 2): startup resolution loads through the TRUST-AWARE daemon
-/// loader (`load_effective_for_daemon` → `daemon_load`), NOT the trust-blind
-/// `load`. With a TRUSTED workspace (so trust resolution succeeds), a source
-/// whose trust-blind `load` references the command secret while its trust-aware
-/// `daemon_load` returns empty (the dropped-project-layer shape) must exec 0
-/// times — an implementation that consulted `load` would exec 1.
-#[tokio::test]
-async fn daemon_startup_uses_trust_aware_daemon_loader() {
-    use crate::config::providers::{
-        ActiveModelRef, HeaderSpec, ModelEntry, ProviderEntry, ProvidersConfig,
-    };
-    let mut referencing = ProvidersConfig::default();
-    referencing.providers.insert(
-        "lmstudio".to_string(),
-        ProviderEntry {
-            url: "http://localhost:1/v1".to_string(),
-            models: vec![ModelEntry {
-                id: "m".to_string(),
-                ..ModelEntry::default()
-            }],
-            headers: vec![HeaderSpec {
-                name: "Authorization".to_string(),
-                value: "Bearer $secret:trustcmd".to_string(),
-            }],
-            ..ProviderEntry::default()
-        },
-    );
-    referencing.active_model = Some(ActiveModelRef {
-        provider: "lmstudio".to_string(),
-        model: "m".to_string(),
-        reasoning_effort: None,
-        thinking_mode: None,
-        prompt_cache_retention: None,
-    });
-    let source = crate::daemon::config_source::ConfigSource::new_with_daemon_load(
-        // Trust-blind `load`: references the command secret (what an unguarded
-        // implementation would consult).
-        move |_cwd| {
-            Ok((
-                referencing.clone(),
-                crate::config::extended::ExtendedConfig::default(),
-            ))
-        },
-        // Trust-aware `daemon_load`: models a dropped project layer (empty).
-        |_cwd| {
-            Ok(crate::daemon::config_source::DaemonConfigLoad {
-                providers: crate::config::providers::ProvidersConfig::default(),
-                provider_warnings: Vec::new(),
-                extended: crate::config::extended::ExtendedConfig::default(),
-                response_metrics_tokenizer_validation: Ok(()),
-                participating_layers: Vec::new(),
-            })
-        },
-        |_cwd, _provider| None,
-        |_cwd| crate::daemon::config_source::ConfigWatchPaths::new(Vec::new(), Vec::new()),
-    );
-    let ctx = test_ctx_with_config_source(source);
-    let mut store =
-        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
-    store
-        .set_named_secret_command("trustcmd", vec!["prog".to_string()])
-        .unwrap();
-    store.save().unwrap();
-    claim_current_dir_ownership(&ctx.db, "trustcmd");
-    // Trusted workspace, so trust resolution SUCCEEDS and the loader choice is
-    // the only thing that matters.
-    trust_current_dir(&ctx.db).await;
-
-    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::ok(
-        "must-never-be-produced-token",
-    ));
-    ctx.registry.set_command_secret_cache(cache.clone());
-
-    ctx.resolve_startup_command_secrets().await;
-
-    assert_eq!(
-        cache.exec_count(),
-        0,
-        "startup must use the trust-aware daemon loader, not the trust-blind load"
-    );
-    assert!(cache.status("trustcmd").is_none());
-}
-
-/// MEDIUM (owner-scoping through the startup route): startup resolution reads
-/// argv specs through an OWNER-SCOPED store, so a referenced command name owned
-/// by a DIFFERENT workspace is never executed at boot. In a TRUSTED workspace
-/// (so trust is not the reason for skipping) with the spec present but owned by
-/// a foreign root, `resolve_startup_command_secrets` must exec 0 times — a
-/// regression to an UNSCOPED vault lookup would find the spec and exec it once.
-#[tokio::test]
-async fn daemon_startup_does_not_exec_foreign_owned_command() {
-    let ctx = startup_ctx_referencing_command_secret("foreignstartupcmd");
-    let mut store =
-        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
-    store
-        .set_named_secret_command("foreignstartupcmd", vec!["prog".to_string()])
-        .unwrap();
-    store.save().unwrap();
-    // Owned by a DIFFERENT workspace root, NOT this daemon's cwd — so the
-    // owner-scoped startup view drops it.
-    let foreign_root = crate::secret_ownership::canonical_owner_root("/some/other/workspace");
-    ctx.db
-        .blocking_write_for_sync_maintenance(move |conn| {
-            conn.execute(
-                "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
-                 VALUES ('foreignstartupcmd', 'provider', ?1, 0)",
-                rusqlite::params![foreign_root],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    // Trusted, so the ONLY thing preventing execution is owner-scoping.
-    trust_current_dir(&ctx.db).await;
-
-    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::ok(
-        "must-never-be-produced-token",
-    ));
-    ctx.registry.set_command_secret_cache(cache.clone());
-
-    ctx.resolve_startup_command_secrets().await;
-
-    assert_eq!(
-        cache.exec_count(),
-        0,
-        "startup must owner-scope: a foreign-owned command name is never execed"
-    );
-    assert!(cache.status("foreignstartupcmd").is_none());
-}
-
-/// #5(b): the REAL `boot_with_db` entry point runs startup command-secret
-/// resolution. A trusted workspace + a fixed config that REFERENCES a
-/// provider-owned command secret is injected, so the boot-path resolution must
-/// leave a completed status (`Resolved`/`Failed`) in the daemon cache. Removing
-/// the `resolve_startup_command_secrets` hook from `boot_with_db` makes the
-/// status `None` and fails this test. (The argv is a nonexistent program, so the
-/// real subprocess executor returns quickly with `Failed(NotFound)` — no hang.)
-#[tokio::test]
-async fn boot_with_db_resolves_referenced_command_secret() {
+async fn boot_never_resolves_command_secrets_from_the_daemon_cwd() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).expect("temp db");
     let mut extended = crate::config::extended::ExtendedConfig::default();
@@ -42817,9 +42594,10 @@ async fn boot_with_db_resolves_referenced_command_secret() {
         ctx.registry
             .command_secret_cache()
             .status("bootcmd")
-            .is_some(),
-        "boot must run startup command-secret resolution for the referenced, \
-         trusted, owned command secret"
+            .is_none(),
+        "boot must not resolve (or exec) command secrets scoped to the daemon's \
+         inherited working directory; each session pre-resolves its own \
+         workspace's references at create/resume"
     );
 }
 
@@ -43624,6 +43402,7 @@ impl Drop for UnlistableDir {
     }
 }
 
+#[cfg(unix)]
 fn boot_test_extended(tmp: &Path) -> crate::config::extended::ExtendedConfig {
     let mut extended = crate::config::extended::ExtendedConfig::default();
     extended.daemon.boot.secret_store_backend =
@@ -43642,6 +43421,7 @@ fn boot_test_extended(tmp: &Path) -> crate::config::extended::ExtendedConfig {
     extended
 }
 
+#[cfg(unix)]
 async fn boot_test_ctx(
     tmp: &Path,
     extended: crate::config::extended::ExtendedConfig,
@@ -43733,100 +43513,301 @@ async fn production_boot_survives_a_deleted_daemon_cwd() {
         .expect("a refresh publishes through the fence without resolving the cwd");
 }
 
-#[test]
-fn boot_redaction_phase_has_no_cwd_dependency() {
-    let source = include_str!("mod.rs");
-    let boot = source
-        .split("pub(crate) async fn boot_ready_with_db(")
-        .nth(1)
-        .expect("boot_ready_with_db");
-    let redaction_phase = boot
-        .split("let (boot_secret_store, boot_secret_store_path) = boot_redaction_task")
-        .nth(1)
-        .and_then(|rest| rest.split("timer.phase(\"redaction_table\");").next())
-        .expect("boot redaction phase");
-    assert!(redaction_phase.contains("acquire_daemon_global_coverage("));
-    assert!(!redaction_phase.contains("current_dir"));
-    assert!(!redaction_phase.contains("config_source\n        .load("));
-    assert!(!redaction_phase.contains(".load(&"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unattached_workspace_coverage_covers_its_root_not_the_daemon_cwd() {
-    use crate::redact::coverage_authority::CoverageScope;
-    const ROOT_CANARY: &str = "terminal-root-dotenv-canary-1c77";
-    const CWD_CANARY: &str = "terminal-daemon-cwd-canary-83fa";
-    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
-    let launch = tempfile::tempdir().unwrap();
-    std::fs::write(
-        launch.path().join(".env"),
-        format!("CWD_TOKEN={CWD_CANARY}\n"),
-    )
-    .unwrap();
-    env.set_current_dir(launch.path()).unwrap();
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(
-        root.path().join(".env"),
-        format!("ROOT_TOKEN={ROOT_CANARY}\n"),
-    )
-    .unwrap();
-    let ctx = test_ctx();
-    let root_path = root.path().canonicalize().unwrap();
-    let table =
-        acquire_unattached_workspace_coverage(&ctx, &root_path, CoverageScope::UnattachedTerminal)
-            .await
-            .expect("workspace coverage for an absolute root");
-    assert!(!table.scrub(ROOT_CANARY).contains(ROOT_CANARY));
-    assert_eq!(table.scrub(CWD_CANARY), CWD_CANARY);
-    assert!(
-        acquire_unattached_workspace_coverage(
-            &ctx,
-            Path::new("relative-root"),
-            CoverageScope::UnattachedTerminal
-        )
-        .await
-        .is_err(),
-        "a relative root is refused"
+/// A production-bound session table for `workspace`: acquired through the
+/// coverage authority exactly as session start does, so it carries a real
+/// coverage binding (a different lineage from the daemon-global table).
+async fn bound_session_table(
+    ctx: &Arc<DaemonContext>,
+    workspace: &Path,
+    redact_config: crate::config::extended::RedactConfig,
+) -> Arc<RedactionTable> {
+    use crate::redact::coverage_authority::{CoverageBuild, CoverageScope};
+    let command_cache = ctx.registry.command_secret_cache();
+    let vault_revision = ctx.secret_vault.current_inventory_generation().unwrap();
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&redact_config);
+    let environment = crate::env_snapshot::EnvSnapshot::new(
+        proto::EnvSnapshotSource::SessionWorker,
+        HashMap::new(),
     );
+    let sealed = crate::redact::coverage_authority::CoverageBinding::derive(b"sealed", b"test");
+    let session_id = Uuid::now_v7();
+    let workspace_root = workspace.to_path_buf();
+    let key = crate::redact::coverage_bindings::SessionCoverageInputs {
+        principal: &ClientPrincipal::owner(),
+        owner_authorization_revision: 1,
+        session_id,
+        workspace_root: &workspace_root,
+        environment: &environment,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed,
+        override_revision: 0,
+        redact_config: &redact_config,
+    }
+    .coverage_key()
+    .expect("session coverage key");
+    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    let table = ctx
+        .registry
+        .coverage_authority()
+        .acquire(key, CoverageScope::SessionStart, move || {
+            let principal = ClientPrincipal::owner();
+            let inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
+                principal: &principal,
+                owner_authorization_revision: 1,
+                session_id,
+                workspace_root: &workspace_root,
+                environment: &environment,
+                vault_revision,
+                command_cache: &command_cache,
+                policy_digest: &policy_digest,
+                sealed,
+                override_revision: 0,
+                redact_config: &redact_config,
+            };
+            CoverageBuild::capture(
+                &redact_config,
+                &workspace_root,
+                environment.vars(),
+                &store,
+                &RedactionTable::empty(),
+                &inputs,
+            )
+        })
+        .await
+        .expect("session coverage")
+        .install_table()
+        .expect("installed session table");
+    Arc::new(table)
 }
 
-/// Terminal and other workspace-originated events on the daemon-global bus
-/// carry the union of the live global and originating tables.
-#[test]
-fn covered_events_carry_the_originating_workspace_coverage() {
-    const ORIGIN_SECRET: &str = "terminal-origin-secret-canary-6d02";
+fn scrubbed_for_non_owner(envelope: EventEnvelope) -> proto::Event {
+    let mut event = envelope.event;
+    for table in envelope.redact.tables() {
+        scrub_event_free_text(&mut event, table);
+    }
+    event
+}
+
+/// Session-originated events on the daemon-global bus (LSP notices, a
+/// session's host-capability publication) are scrubbed with the live
+/// daemon-global table AND the session's table. The two are production-bound
+/// tables of different coverage lineages, which can never be merged into one
+/// bound table; the scrub-only composite applies both, and the event is
+/// always delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_originated_global_events_are_scrubbed_with_global_and_session_tables() {
+    const GLOBAL_SECRET: &str = "global-bus-denylisted-canary-3a8e";
+    const WORKSPACE_SECRET: &str = "global-bus-workspace-canary-91cd";
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_ssh_keys = false;
+    extended.redact.denylist = vec![GLOBAL_SECRET.to_string()];
+    let source =
+        crate::daemon::config_source::ConfigSource::fixed(stub_providers_config(), extended);
+    let ctx = test_ctx_with_config_source(source.clone());
+    let global = acquire_daemon_redaction_table(
+        ctx.registry.coverage_authority().clone(),
+        &source,
+        &ctx.secret_vault,
+        &ctx.registry.command_secret_cache(),
+        crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
+    )
+    .await
+    .expect("bound daemon-global table");
+    set_current_redaction(&ctx.global_redaction, global.clone());
     let workspace = tempfile::tempdir().unwrap();
-    let origin_table = RedactionTable::build_with_env_and_secrets(
-        &crate::config::extended::RedactConfig {
-            scan_environment: false,
-            scan_dotenv: false,
+    std::fs::write(
+        workspace.path().join(".env"),
+        format!("WORKSPACE_TOKEN={WORKSPACE_SECRET}\n"),
+    )
+    .unwrap();
+    let session = bound_session_table(
+        &ctx,
+        workspace.path(),
+        crate::config::extended::RedactConfig {
             scan_ssh_keys: false,
             ..crate::config::extended::RedactConfig::default()
         },
-        workspace.path(),
-        &HashMap::new(),
-        [("terminal-token".to_string(), ORIGIN_SECRET.to_string())],
     )
-    .unwrap();
-    let global: SharedRedactionTable =
-        Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
-    let origin: SharedRedactionTable = Arc::new(std::sync::RwLock::new(Arc::new(origin_table)));
-    let coverage = crate::daemon::EventCoverage::new(global.clone(), origin);
-    let (tx, mut rx) = broadcast::channel(4);
-    crate::daemon::send_covered_event(
-        &tx,
-        &coverage,
-        proto::Event::TerminalClipboard {
-            terminal_id: Uuid::nil(),
-            text: ORIGIN_SECRET.to_string(),
+    .await;
+    assert!(global.coverage_binding().is_some() && session.coverage_binding().is_some());
+    assert!(
+        global.union(&session).is_err(),
+        "precondition: cross-lineage bound tables cannot be merged"
+    );
+
+    let bus = crate::daemon::GlobalEventBus {
+        tx: ctx.global_events.clone(),
+        redaction: ctx.global_redaction.clone(),
+    };
+    let mut rx = ctx.subscribe_global();
+    bus.send_from_origin(
+        &session,
+        proto::Event::LspNotice {
+            text: format!("install failed: {GLOBAL_SECRET} {WORKSPACE_SECRET}"),
         },
     );
-    let envelope = rx.try_recv().expect("covered event delivered");
-    assert!(!envelope.redact.scrub(ORIGIN_SECRET).contains(ORIGIN_SECRET));
-    // The global table alone (the previous terminal coverage) misses it.
+    let envelope = rx
+        .try_recv()
+        .expect("the event is delivered, never withheld");
+    let proto::Event::LspNotice { text } = scrubbed_for_non_owner(envelope) else {
+        panic!("expected LspNotice");
+    };
+    assert!(!text.contains(GLOBAL_SECRET), "{text}");
+    assert!(!text.contains(WORKSPACE_SECRET), "{text}");
+
+    // The LSP manager's notice path uses the same composite.
+    ctx.registry
+        .lsp_manager()
+        .set_notice_bus(ctx.global_events.clone(), ctx.global_redaction.clone());
+    let mut rx = ctx.subscribe_global();
+    ctx.registry
+        .lsp_manager()
+        .notice_for_test(format!("{GLOBAL_SECRET} {WORKSPACE_SECRET}"), &session)
+        .await;
+    let proto::Event::LspNotice { text } =
+        scrubbed_for_non_owner(rx.try_recv().expect("LSP notice delivered"))
+    else {
+        panic!("expected LspNotice");
+    };
+    assert!(
+        !text.contains(GLOBAL_SECRET) && !text.contains(WORKSPACE_SECRET),
+        "{text}"
+    );
+}
+
+/// When daemon-global coverage cannot be republished, events clients wait on
+/// are still delivered in a content-free form; only events with no such form
+/// are withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_global_coverage_still_delivers_content_free_events() {
+    let source = crate::daemon::config_source::ConfigSource::new(
+        |_cwd| anyhow::bail!("installation policy unavailable"),
+        |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx();
+    // Force the next broadcast to republish (stale epoch) through a source
+    // whose policy cannot load.
+    let mut ctx = Arc::try_unwrap(ctx).unwrap_or_else(|_| panic!("unique test context"));
+    ctx.config_source = source;
+    let ctx = Arc::new(ctx);
+    ctx.registry.coverage_authority().invalidate();
+    let mut rx = ctx.subscribe_global();
+
+    ctx.broadcast_global(proto::Event::DaemonDraining { forced: false });
+    assert!(matches!(
+        rx.try_recv().expect("drain is delivered").event,
+        proto::Event::DaemonDraining { forced: false }
+    ));
+    ctx.broadcast_global(proto::Event::CaffeinateState {
+        active: true,
+        lid_close_guaranteed: false,
+        message: Some("free text".into()),
+    });
+    assert!(matches!(
+        rx.try_recv().expect("caffeinate state is delivered").event,
+        proto::Event::CaffeinateState {
+            active: true,
+            message: None,
+            ..
+        }
+    ));
+}
+
+/// Any coverage-authority invalidation (for example a command secret
+/// resolving) makes the next global broadcast republish, even when the vault
+/// generation did not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authority_invalidation_republishes_global_coverage() {
+    const GLOBAL_SECRET: &str = "republish-after-invalidate-canary-7e21";
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_ssh_keys = false;
+    let denylist = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let live = denylist.clone();
+    let source = crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| {
+            let mut extended = extended.clone();
+            extended.redact.denylist = live.lock().unwrap().clone();
+            Ok((stub_providers_config(), extended))
+        },
+        |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx_with_config_source(source);
+    ctx.broadcast_global(proto::Event::DaemonDraining { forced: false });
     assert_eq!(
-        current_redaction(&global).scrub(ORIGIN_SECRET),
-        ORIGIN_SECRET
+        current_redaction(&ctx.global_redaction).scrub(GLOBAL_SECRET),
+        GLOBAL_SECRET
+    );
+    denylist.lock().unwrap().push(GLOBAL_SECRET.to_string());
+    let generation = ctx.secret_vault.current_inventory_generation().unwrap();
+    ctx.registry.coverage_authority().invalidate();
+    ctx.broadcast_global(proto::Event::DaemonDraining { forced: false });
+    assert_eq!(
+        ctx.secret_vault.current_inventory_generation().unwrap(),
+        generation,
+        "precondition: no vault change"
+    );
+    assert!(
+        !current_redaction(&ctx.global_redaction)
+            .scrub(GLOBAL_SECRET)
+            .contains(GLOBAL_SECRET),
+        "the invalidation must republish the daemon-global table"
+    );
+}
+
+struct FixedCommandOutput(&'static str);
+
+#[async_trait::async_trait]
+impl crate::secret_command::CommandSecretExecutor for FixedCommandOutput {
+    async fn run(
+        &self,
+        _argv: &[String],
+    ) -> std::result::Result<String, crate::secret_command::CommandSecretError> {
+        Ok(self.0.to_string())
+    }
+}
+
+/// The daemon-global key binds the command-cache fingerprint, so its table
+/// must also carry the resolved command outputs (as session stores do).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_global_coverage_includes_resolved_command_secret_outputs() {
+    const COMMAND_OUTPUT: &str = "global-command-secret-output-canary-4f6b";
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_ssh_keys = false;
+    let source =
+        crate::daemon::config_source::ConfigSource::fixed(stub_providers_config(), extended);
+    let ctx = test_ctx_with_config_source(source.clone());
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store
+        .set_named_secret_command("globalcmd", vec!["prog".to_string()])
+        .unwrap();
+    store.save().unwrap();
+    let cache = crate::secret_command::CommandSecretCache::new(Arc::new(FixedCommandOutput(
+        COMMAND_OUTPUT,
+    )));
+    cache
+        .ensure_resolved("globalcmd", &["prog".to_string()])
+        .await;
+    ctx.registry.set_command_secret_cache(cache.clone());
+    let table = acquire_daemon_redaction_table(
+        ctx.registry.coverage_authority().clone(),
+        &source,
+        &ctx.secret_vault,
+        &cache,
+        crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
+    )
+    .await
+    .expect("daemon-global coverage");
+    assert!(
+        !table.scrub(COMMAND_OUTPUT).contains(COMMAND_OUTPUT),
+        "a resolved command secret must be covered by daemon-global coverage"
     );
 }
 

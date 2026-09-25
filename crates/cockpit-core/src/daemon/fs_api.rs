@@ -186,7 +186,14 @@ pub(crate) fn fs_read_sync(
     apply_fs_read_block_for_test(&resolved);
 
     let limits = crate::resource_limits::ResourceLimits::defaults();
-    let prefixed = crate::resource_limits::read_for_fs_read(&resolved).map_err(resource_limit)?;
+    // Read the exact file the policy checked: open the canonical target
+    // through a no-follow walk beneath the held root (no symlink or reparse
+    // component is traversed), so replacing an approved file or directory
+    // with a link to a protected file after the check cannot redirect this
+    // read. The descriptor is then read directly; the pathname is never
+    // reopened.
+    let file = open_checked_read_target(&root, &resolved)?;
+    let prefixed = crate::resource_limits::read_file_for_fs_read(file).map_err(resource_limit)?;
     let hash = crate::resource_limits::sha256_hex_array(&prefixed.digest);
     let binary = crate::tools::common::looks_binary(&prefixed.prefix);
     let kind = read_kind_for_path(&resolved, binary);
@@ -855,6 +862,18 @@ pub async fn apply_extended_config_patch(
                     }
                 }
             }
+            // An installation layer (the global layer, or the explicit
+            // override) is also installation-wide daemon policy. Run the same
+            // strict validator the daemon's loaders apply before the durable
+            // commit, so the editor can never author a layer the daemon then
+            // refuses to load (and a restart cannot boot).
+            if is_installation_layer(&target) {
+                cockpit_config::config::extended::validate_installation_layer_document(
+                    &target,
+                    &merged_document,
+                )
+                .map_err(|error| bad_request(error.to_string()))?;
+            }
             let desired_hash = content_hash(&merged);
             let result_revision = settings_revision(capability.kind, &target, &desired_hash);
             let changed = desired_hash != current_hash || (materialize && !existed);
@@ -1126,6 +1145,30 @@ pub(super) async fn recover_extended_config_patch_journals(
             .map_err(internal)?;
     }
     Ok(())
+}
+
+/// Whether `target` is one of the layers installation-wide policy reads.
+fn is_installation_layer(target: &Path) -> bool {
+    let Ok(paths) = cockpit_config::config::dirs::installation_config_file_paths() else {
+        // An unusable override means no installation layer can be selected;
+        // validate every global-looking target strictly regardless.
+        return cockpit_config::config::dirs::global_config_file()
+            .is_ok_and(|global| same_file_path(&global, target));
+    };
+    paths.iter().any(|path| same_file_path(path, target))
+}
+
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let canonical = |path: &Path| match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .ok()
+            .map(|parent| parent.join(name)),
+        _ => None,
+    };
+    matches!((canonical(a), canonical(b)), (Some(a), Some(b)) if a == b)
 }
 
 fn discovered_settings_layers(
@@ -1988,6 +2031,31 @@ fn is_image_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Open `resolved` (a canonical path beneath `root`, already checked by the
+/// sharee policy) without following any symlink or reparse point between
+/// `root` and the file. Any substitution since the check fails closed.
+fn open_checked_read_target(root: &Path, resolved: &Path) -> Result<std::fs::File, ErrorPayload> {
+    let relative = resolved
+        .strip_prefix(root)
+        .map_err(|_| bad_request("resolved path escaped the project root"))?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => name
+                .to_str()
+                .ok_or_else(|| bad_request("path is not valid UTF-8")),
+            _ => Err(bad_request("resolved path is not canonical")),
+        })
+        .collect::<Result<Vec<&str>, ErrorPayload>>()?;
+    let held =
+        cockpit_host::private_fs::held_directory::HeldWorkspaceDirectoryAuthority::open_existing(
+            root,
+        )
+        .map_err(|error| bad_request(format!("project root changed during read: {error:#}")))?;
+    held.open_regular_file_relative(&components)
+        .map_err(|error| bad_request(format!("file changed during read: {error:#}")))
+}
+
 fn ensure_read_allowed(
     policy: Option<&ShareeSecretPolicy>,
     requested: &Path,
@@ -2056,12 +2124,12 @@ fn sharee_secret_policy(
             })
         })
         .map_err(internal)?;
+    // Strict: a malformed or unreadable protection policy fails the request
+    // closed instead of being dropped by the permissive layer merge.
     let cfg = ctx
         .config_source()
-        .load_with_trust(root, &trust_policy)
-        .map_err(internal)?
-        .1
-        .redact;
+        .load_redact_policy_strict_with_trust(root, &trust_policy)
+        .map_err(internal)?;
     let mut extra_paths = Vec::with_capacity(cfg.extra_dotenv_paths.len());
     let mut extra_targets = Vec::with_capacity(cfg.extra_dotenv_paths.len());
     for extra in &cfg.extra_dotenv_paths {
@@ -2278,6 +2346,19 @@ mod tests {
         root: &Path,
         extended: crate::config::extended::ExtendedConfig,
     ) -> crate::daemon::server::DaemonContext {
+        test_ctx_with_source(
+            root,
+            crate::daemon::config_source::ConfigSource::fixed(
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+        )
+    }
+
+    fn test_ctx_with_source(
+        root: &Path,
+        config_source: crate::daemon::config_source::ConfigSource,
+    ) -> crate::daemon::server::DaemonContext {
         let db = crate::db::Db::open_in_memory().expect("in-memory db");
         let normalized_root = root.canonicalize().unwrap().to_string_lossy().into_owned();
         db.blocking_write_for_sync_maintenance(move |conn| {
@@ -2300,10 +2381,7 @@ mod tests {
                 ephemeral: true,
             },
             crate::daemon::terminal::test_host_factory(),
-            crate::daemon::config_source::ConfigSource::fixed(
-                crate::config::providers::ProvidersConfig::default(),
-                extended,
-            ),
+            config_source,
         )
     }
 
@@ -2628,6 +2706,74 @@ mod tests {
         cvar.notify_all();
         let response = read_task.await.unwrap().unwrap();
         assert!(matches!(response, Response::FsRead { .. }));
+    }
+
+    /// The read uses the exact file the policy checked: replacing an approved
+    /// file with a symlink to another file between the check and the read
+    /// fails the read instead of returning the other file's content.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_read_never_follows_a_link_swapped_in_after_the_policy_check() {
+        const PROTECTED: &str = "swapped-in-protected-content-8c2d";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let approved = root.join("approved.txt");
+        std::fs::write(&approved, "approved").unwrap();
+        let protected = root.join(".env");
+        std::fs::write(&protected, format!("TOKEN={PROTECTED}")).unwrap();
+        let ctx = Arc::new(test_ctx(&root));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        set_fs_read_block_for_test(approved.clone(), entered_tx, release.clone());
+
+        let read_task = tokio::spawn(fs_read(
+            ctx,
+            ClientPrincipal::owner(),
+            root.to_string_lossy().into_owned(),
+            "approved.txt".to_string(),
+            false,
+        ));
+        entered_rx.await.expect("fs_read passed its policy check");
+        std::fs::remove_file(&approved).unwrap();
+        std::os::unix::fs::symlink(&protected, &approved).unwrap();
+        let (lock, cvar) = &*release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+
+        match read_task.await.unwrap() {
+            Ok(Response::FsRead { content, .. }) => {
+                assert!(
+                    !content.unwrap_or_default().contains(PROTECTED),
+                    "the read followed a link swapped in after the check"
+                );
+            }
+            Ok(other) => panic!("unexpected response: {other:?}"),
+            Err(error) => assert_eq!(error.code, ErrorCode::BadRequest, "{error:?}"),
+        }
+    }
+
+    /// A malformed protection policy (the sharee's redact settings) fails the
+    /// request closed instead of being dropped by the permissive merge.
+    #[cfg(feature = "remote")]
+    #[test]
+    fn sharee_policy_fails_closed_on_a_malformed_protection_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        std::fs::create_dir_all(root.join(".cockpit")).unwrap();
+        std::fs::write(
+            root.join(".cockpit/config.json"),
+            r#"{"redact":{"extra_dotenv_paths":"secret.txt"}}"#,
+        )
+        .unwrap();
+        let ctx = test_ctx_with_source(
+            &root,
+            crate::daemon::config_source::ConfigSource::production(),
+        );
+        assert!(
+            sharee_secret_policy(&ctx, &remote_project_files(&root), &root).is_err(),
+            "a malformed extra_dotenv_paths must not silently drop protection"
+        );
     }
 
     #[tokio::test]

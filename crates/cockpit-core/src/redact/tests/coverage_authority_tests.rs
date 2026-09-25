@@ -623,14 +623,21 @@ async fn external_mutation_before_completed_scan_boundary_retries_or_refuses() {
     std::fs::write(changing_ssh_dir.join("id_first"), pem("inventory-first"))
         .expect("first inventory key");
     let added_key = changing_ssh_dir.join("id_added");
-    let inventory_result =
+    // A key added during capture is not in the captured table, and the
+    // captured-bytes binding no longer matches a fresh read, so the authority
+    // refuses to publish (the collector itself tolerates directory churn).
+    let captured =
         super::super::ssh::collect_ssh_key_candidates_with_fence(Some(&changing_ssh_dir), |_| {
             std::fs::write(&added_key, pem("inventory-added"))
                 .expect("add SSH source during capture");
-        });
-    assert!(
-        inventory_result.is_err(),
-        "a changed SSH discovery set must refuse capture"
+        })
+        .expect("directory churn does not fail the collector");
+    let fresh = super::super::ssh::collect_ssh_key_candidates(Some(&changing_ssh_dir))
+        .expect("fresh SSH read");
+    assert_ne!(
+        super::super::coverage_bindings::ssh_candidates_digest(&captured),
+        super::super::coverage_bindings::ssh_candidates_digest(&fresh),
+        "a changed SSH key set must change the source binding, refusing publication"
     );
 
     let authority = RedactionCoverageAuthority::default();

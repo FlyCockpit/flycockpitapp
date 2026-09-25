@@ -135,7 +135,20 @@ pub fn read_prefix_and_hash(
     prefix_cap: usize,
     max_len: u64,
 ) -> Result<PrefixedFile, BoundedIoError> {
-    let file = open_regular_file(path)?;
+    read_prefix_and_hash_from_file(open_regular_file(path)?, prefix_cap, max_len)
+}
+
+/// [`read_prefix_and_hash`] over an already-opened descriptor, so a caller
+/// that authorized one exact file (for example through a no-follow open)
+/// reads that same file and never reopens a pathname.
+pub fn read_prefix_and_hash_from_file(
+    file: File,
+    prefix_cap: usize,
+    max_len: u64,
+) -> Result<PrefixedFile, BoundedIoError> {
+    if !file.metadata()?.file_type().is_file() {
+        return Err(BoundedIoError::NotRegular { what: "file" });
+    }
     let len = file.metadata()?.len();
     if len > max_len {
         return Err(BoundedIoError::Limit {

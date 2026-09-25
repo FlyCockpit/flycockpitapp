@@ -3340,3 +3340,103 @@ fn policy_digest_covers_every_table_affecting_field_unambiguously() {
         "field tags are part of the encoding"
     );
 }
+
+/// The boundary binding comes from the bytes the table was built from. A
+/// source that changes and changes back around the capture (A -> B -> A)
+/// leaves a fresh read equal to the key, but the captured binding (B) does
+/// not match, so the authority refuses to publish a table built from B.
+#[test]
+fn captured_source_binding_is_derived_from_the_bytes_the_table_used() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let env = root.join(".env");
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    let scope = RedactionSourceScope::Workspace(root);
+
+    std::fs::write(&env, "TOKEN=aba-original-secret-value\n").unwrap();
+    let key_a = super::coverage_bindings::machine_sources_probe_binding(&cfg, scope).unwrap();
+    let (table_a, capture_a) =
+        RedactionTable::build_scoped_recorded(&cfg, scope, &HashMap::new(), Vec::new()).unwrap();
+    assert_eq!(
+        super::coverage_bindings::captured_machine_sources_binding(&capture_a, &table_a),
+        key_a,
+        "an unchanged source binds identically from a fresh read and from the capture"
+    );
+
+    std::fs::write(&env, "TOKEN=aba-replacement-secret-value\n").unwrap();
+    let (table_b, capture_b) =
+        RedactionTable::build_scoped_recorded(&cfg, scope, &HashMap::new(), Vec::new()).unwrap();
+    std::fs::write(&env, "TOKEN=aba-original-secret-value\n").unwrap();
+    assert_eq!(
+        super::coverage_bindings::machine_sources_probe_binding(&cfg, scope).unwrap(),
+        key_a,
+        "precondition: the restored source reads like the key again"
+    );
+    assert_ne!(
+        super::coverage_bindings::captured_machine_sources_binding(&capture_b, &table_b),
+        key_a,
+        "a table built from B must never bind as A"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_collector_skips_non_key_entries_and_directory_churn() {
+    let dir = TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    std::fs::write(
+        ssh.join("id_ed25519"),
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nchurn-key-canary-5d11\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    // A non-UTF-8 file (macOS `.DS_Store`), a ControlMaster socket, and a
+    // FIFO are not keys and must not fail capture.
+    std::fs::write(ssh.join(".DS_Store"), [0xff, 0xfe, 0x00, 0x81]).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(ssh.join("cm-user@host:22")).unwrap();
+    make_fifo(&ssh.join("pipe"));
+    let doomed = ssh.join("scratch");
+    std::fs::write(&doomed, "not a key").unwrap();
+    let keys = returns_promptly({
+        let ssh = ssh.clone();
+        move || {
+            super::ssh::collect_ssh_key_candidates_with_fence(Some(&ssh), |_| {
+                // Entries appear and disappear while the scan runs.
+                let _ = std::fs::remove_file(ssh.join("scratch"));
+                let _ = std::fs::write(ssh.join("editor.swp"), "tmp");
+            })
+        }
+    })
+    .expect("non-key entries and churn never fail the SSH collector");
+    assert!(
+        keys.iter()
+            .any(|(value, _)| value.contains("churn-key-canary-5d11")),
+        "the real key is still collected"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_collector_skips_an_entry_removed_before_it_is_read() {
+    let dir = TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    // `aaa` sorts first; removing `zzz` while `aaa` is confirmed simulates
+    // an entry vanishing between listing and inspection.
+    std::fs::write(
+        ssh.join("aaa"),
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nremoval-race-key-2b9e\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    std::fs::write(ssh.join("zzz"), "vanishing entry").unwrap();
+    let doomed = ssh.join("zzz");
+    let keys = super::ssh::collect_ssh_key_candidates_with_fence(Some(&ssh), |_| {
+        let _ = std::fs::remove_file(&doomed);
+    })
+    .expect("a vanished entry is skipped");
+    assert!(
+        keys.iter()
+            .any(|(value, _)| value.contains("removal-race-key-2b9e"))
+    );
+}

@@ -32,7 +32,6 @@ use uuid::Uuid;
 
 use crate::config::extended::{DaemonUploadLimitsConfig, ExtendedConfig, RetentionConfig};
 use crate::daemon::DaemonPaths;
-use crate::daemon::config_source::ConfigSource;
 use crate::daemon::principal::{self, ClientPrincipal, SessionAccess};
 use crate::daemon::proto::{
     self, Body, Envelope, ErrorCode, ErrorPayload, ProtoReadHalf, ProtoStream, ProtoWriteHalf,
@@ -201,7 +200,11 @@ async fn acquire_daemon_global_coverage(
     let capture_cache = command_cache.clone();
     authority
         .acquire(key, purpose, move || {
-            let store = crate::credentials::CredentialStore::from_vault(capture_vault)?;
+            let mut store = crate::credentials::CredentialStore::from_vault(capture_vault)?;
+            // The key binds the command-cache fingerprint, so the table must
+            // carry the resolved command outputs it fingerprints (as session
+            // stores do); otherwise a covered command secret is omitted.
+            store.inject_command_outputs(&capture_cache);
             let env = env_snapshot.vars().clone();
             let capture_inputs = crate::redact::coverage_bindings::DaemonGlobalCoverageInputs {
                 environment: &env_snapshot,
@@ -227,120 +230,6 @@ async fn acquire_daemon_global_coverage(
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
         .install_table()
         .map(|table| Arc::new(table))
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
-}
-
-/// Workspace-scoped coverage for an absolute root that has no attached
-/// session (an unattached terminal's working directory).
-///
-/// Events produced there travel on the daemon-global bus, whose own table has
-/// no workspace file sources, so they need the root's `.env`/secret-file
-/// coverage as well. With no session there is no workspace trust decision, so
-/// the redact policy is the installation-wide one; sources are discovered in
-/// the root's workspace scope. Every failure is a fail-closed error.
-pub(crate) async fn acquire_unattached_workspace_coverage(
-    ctx: &DaemonContext,
-    root: &Path,
-    purpose: crate::redact::coverage_authority::CoverageScope,
-) -> Result<Arc<RedactionTable>> {
-    anyhow::ensure!(
-        root.is_absolute(),
-        "coverage_unavailable: workspace coverage requires an absolute root"
-    );
-    let vault = ctx.secret_vault.clone();
-    let command_cache = ctx.registry.command_secret_cache();
-    let redact_config =
-        crate::redact::coverage_bindings::load_daemon_global_redact_config(&ctx.config_source)?;
-    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&redact_config);
-    let environment = crate::env_snapshot::EnvSnapshot::new(
-        cockpit_proto::EnvSnapshotSource::DaemonStart,
-        daemon_process_env(),
-    );
-    let vault_revision = vault
-        .current_inventory_generation()
-        .map_err(|error| anyhow::anyhow!("reading workspace redaction vault revision: {error}"))?;
-    let sealed_records = ctx
-        .db
-        .machine_scoped_sealed_redaction_records()
-        .await
-        .context("reading sealed redaction records")?;
-    let sealed = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
-    let root = root.to_path_buf();
-    // No session exists: the nil id plus the workspace binding identify the
-    // root's coverage lineage.
-    let session_id = Uuid::nil();
-    let principal = ClientPrincipal::owner();
-    let key = crate::redact::coverage_bindings::SessionCoverageInputs {
-        principal: &principal,
-        owner_authorization_revision: 0,
-        session_id,
-        workspace_root: &root,
-        environment: &environment,
-        vault_revision,
-        command_cache: &command_cache,
-        policy_digest: &policy_digest,
-        sealed,
-        override_revision: 0,
-        redact_config: &redact_config,
-    }
-    .coverage_key()?;
-    let publish_fence = crate::redact::coverage_bindings::session_publish_owners(
-        vault.clone(),
-        ctx.db.clone(),
-        command_cache.clone(),
-        crate::redact::coverage_bindings::SessionCoveragePublishLive {
-            environment: Arc::new({
-                let environment = environment.clone();
-                move || Ok(environment.clone())
-            }),
-            policy_digest: Arc::new({
-                let policy_digest = policy_digest.clone();
-                move || policy_digest.clone()
-            }),
-            override_revision: Arc::new(|| 0),
-            redact_config: Arc::new({
-                let redact_config = redact_config.clone();
-                move || redact_config.clone()
-            }),
-            workspace_root: Arc::new({
-                let root = root.clone();
-                move || root.clone()
-            }),
-        },
-    )
-    .publish_fence();
-    ctx.registry
-        .coverage_authority()
-        .acquire(key, purpose, move || {
-            let store = crate::credentials::CredentialStore::from_vault(vault)?;
-            let principal = ClientPrincipal::owner();
-            let inputs = crate::redact::coverage_bindings::SessionCoverageInputs {
-                principal: &principal,
-                owner_authorization_revision: 0,
-                session_id,
-                workspace_root: &root,
-                environment: &environment,
-                vault_revision,
-                command_cache: &command_cache,
-                policy_digest: &policy_digest,
-                sealed,
-                override_revision: 0,
-                redact_config: &redact_config,
-            };
-            let build =
-                crate::redact::coverage_authority::CoverageBuild::capture_session_without_sealed(
-                    &redact_config,
-                    &root,
-                    environment.vars(),
-                    &store,
-                    &inputs,
-                )?;
-            Ok(build.with_publish_fence(publish_fence))
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        .install_table()
-        .map(Arc::new)
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
@@ -408,7 +297,57 @@ fn scrub_event_for_principal(
     if principal.has_owner_level_authority() {
         return Some(envelope.event);
     }
-    scrub_proto_event(envelope.event, &envelope.redact)
+    let mut event = envelope.event;
+    for table in envelope.redact.tables() {
+        scrub_event_free_text(&mut event, table);
+    }
+    Some(event)
+}
+
+/// The content-free form of a daemon-global event, delivered when coverage
+/// for its free text is unavailable. Structural fields that clients act on
+/// are kept; every free-text field is removed. `None` for an event with no
+/// such form, or one this projection does not know (new producers are
+/// withheld by default until they declare a content-free form here).
+fn content_free_global_event(event: proto::Event) -> Option<proto::Event> {
+    match event {
+        // No free text at all.
+        event @ (proto::Event::DaemonDraining { .. }
+        | proto::Event::DaemonLifetimeChanged { .. }
+        | proto::Event::Reconnect { .. }
+        | proto::Event::OnboardingBootstrap(_)) => Some(event),
+        #[cfg(feature = "extended")]
+        event @ proto::Event::ImageControlConfigChanged { .. } => Some(event),
+        proto::Event::CaffeinateState {
+            active,
+            lid_close_guaranteed,
+            message: _,
+        } => Some(proto::Event::CaffeinateState {
+            active,
+            lid_close_guaranteed,
+            message: None,
+        }),
+        #[cfg(feature = "remote")]
+        proto::Event::ConnectorStatus {
+            enabled,
+            status,
+            relay_url,
+            relay_id,
+            relay_region,
+            last_error: _,
+        } => Some(proto::Event::ConnectorStatus {
+            enabled,
+            status,
+            relay_url,
+            relay_id,
+            relay_region,
+            last_error: None,
+        }),
+        // Advisory payloads that are themselves the free text; clients
+        // re-read host capabilities on demand and drift warnings repeat on
+        // the next attach.
+        _ => None,
+    }
 }
 
 fn scrub_proto_event(event: proto::Event, redact: &RedactionTable) -> Option<proto::Event> {
@@ -1389,6 +1328,13 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             allow: _,
         }
+        // Interactive terminal output is intentionally unscrubbed: the
+        // terminal is the owner's own shell (the PTY runs with the owner's
+        // authority and could print any secret directly), so byte-stream
+        // substitution would only corrupt the stream without protecting
+        // anything. Only the clipboard text a program asks the client to
+        // copy (`TerminalClipboard`) is scrubbed, with the daemon-global
+        // table. These events are never withheld for coverage reasons.
         | proto::Event::TerminalOutput {
             terminal_id: _,
             bytes: _,
@@ -2888,6 +2834,11 @@ pub struct DaemonContext {
     /// bursty broadcast with no vault change stays cheap. `0` forces a rebuild
     /// on the first broadcast after construction.
     redaction_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Coverage-authority epoch the published daemon-global table was
+    /// acquired under. Any authority invalidation (for example a command
+    /// secret resolving) advances the epoch, so the broadcast fast path
+    /// republishes even when the vault generation did not move.
+    redaction_epoch: Arc<std::sync::atomic::AtomicU64>,
     pub terminal_host: crate::daemon::terminal::TerminalHostHandle,
     /// Live client state. Each protocol-active transport increments the count
     /// and permanently records that this owner has served a client.
@@ -3555,7 +3506,15 @@ impl DaemonContext {
         let publisher_vault = Arc::downgrade(&secret_vault);
         let publisher_authority = coverage_authority.clone();
         let publisher_cache = registry.command_secret_cache();
+        let redaction_epoch = Arc::new(std::sync::atomic::AtomicU64::new(
+            if boot_coverage_admitted {
+                coverage_authority.epoch()
+            } else {
+                0
+            },
+        ));
         let publisher_generation = redaction_generation.clone();
+        let publisher_epoch = redaction_epoch.clone();
         secret_vault.install_owner_redaction_publisher(Arc::new(move || {
             publisher_authority.invalidate();
             let vault = publisher_vault
@@ -3564,6 +3523,7 @@ impl DaemonContext {
             let generation = vault
                 .current_inventory_generation()
                 .map_err(|error| error.to_string())?;
+            let epoch = publisher_authority.epoch();
             let table = acquire_daemon_redaction_table_blocking(
                 publisher_authority.clone(),
                 publisher_config.clone(),
@@ -3574,6 +3534,7 @@ impl DaemonContext {
             .map_err(|error| error.to_string())?;
             set_current_redaction(&publisher_redaction, table);
             publisher_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
+            publisher_epoch.store(epoch, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }));
         #[cfg(debug_assertions)]
@@ -3597,7 +3558,7 @@ impl DaemonContext {
         registry
             .lsp_manager()
             .set_notice_bus(global_events.clone(), global_redaction.clone());
-        registry.set_global_bus(global_events.clone());
+        registry.set_global_bus(global_events.clone(), global_redaction.clone());
         #[cfg(feature = "extended")]
         let scheduler = (!paths.ephemeral)
             .then(|| start_persistent_scheduler(&db, &secret_vault, &registry, &shutdown, None))
@@ -3731,6 +3692,7 @@ impl DaemonContext {
             global_events,
             global_redaction,
             redaction_generation,
+            redaction_epoch,
             terminal_host,
             client_presence,
             shutdown,
@@ -3832,55 +3794,6 @@ impl DaemonContext {
         self.redaction_key_resolver = Some(resolver);
         self.secure_key = Some(handle);
         self._secure_key_actor = Some(actor);
-    }
-
-    /// Resolve every command-backed named secret referenced by the daemon's
-    /// configured provider headers into the process cache at startup
-    /// (`daemon_startup_resolves_referenced_command_secrets`). Referenced names
-    /// end up `Resolved` or `Failed` in the cache; a failure lands as `Failed`
-    /// and NEVER fails boot — the first outbound request then observes the cached
-    /// status (missing / auth error), never a sync exec. Called once from
-    /// `boot_with_db`, after the secure-key actor has attached.
-    pub(crate) async fn resolve_startup_command_secrets(&self) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-        // Trust-gate the config load: a daemon launched inside an UNTRUSTED
-        // repository must not read that repo's project-layer provider headers
-        // and exec their `$secret:` command references at boot. Loading under
-        // the DB-resolved workspace trust policy drops untrusted project layers,
-        // so only trusted (workspace/global) references reach resolution.
-        let trust_policy = match crate::config::trust::resolve_workspace_trust_policy_from_db(
-            &self.db, &cwd,
-        )
-        .await
-        {
-            Ok(policy) => policy,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "startup command-secret resolution skipped: workspace trust policy unavailable"
-                );
-                return;
-            }
-        };
-        let providers = match self
-            .config_source
-            .load_effective_for_daemon(&cwd, &trust_policy)
-        {
-            Ok((providers, _extended)) => providers,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "startup command-secret resolution skipped: provider config load failed"
-                );
-                return;
-            }
-        };
-        let names = crate::secret_ref::provider_named_secret_references(&providers);
-        // Owner-scoped by (provider, cwd): only already-claimed command names
-        // resolve; a foreign / unclaimed name is dropped and never execed.
-        self.registry
-            .resolve_provider_command_secrets(&cwd.display().to_string(), &names, false)
-            .await;
     }
 
     /// The shared production redaction key resolver, or a fail-closed error when
@@ -4413,15 +4326,7 @@ impl DaemonContext {
 
     /// Broadcast a daemon-global event to all connected clients.
     pub fn broadcast_global(&self, event: proto::Event) {
-        let Ok(generation) = self.secret_vault.current_inventory_generation() else {
-            tracing::error!("coverage_unavailable: reading daemon redaction source revision");
-            return;
-        };
-        if generation
-            == self
-                .redaction_generation
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.global_coverage_is_current() {
             send_event(
                 &self.global_events,
                 &current_redaction(&self.global_redaction),
@@ -4429,17 +4334,59 @@ impl DaemonContext {
             );
             return;
         }
-
-        if let Err(error) = self.republish_global_redaction_blocking(event) {
-            tracing::error!(%error, "daemon event refused while coverage is unavailable");
+        match self.republish_global_redaction_blocking() {
+            Ok(table) => send_event(&self.global_events, &table, event),
+            Err(error) => {
+                // Coverage for the event's free text is unavailable. Clients
+                // wait on several of these events (drain, reconnect,
+                // onboarding, lifetime, caffeinate), so they are never simply
+                // dropped: every free-text field is removed and the resulting
+                // content-free event is delivered. An event with no
+                // content-free projection is withheld, and says so.
+                let error = format!("{error:#}");
+                match content_free_global_event(event) {
+                    Some(event) => {
+                        tracing::warn!(
+                            error = %error,
+                            "daemon-global coverage unavailable; delivering event without free text"
+                        );
+                        send_event(
+                            &self.global_events,
+                            &current_redaction(&self.global_redaction),
+                            event,
+                        );
+                    }
+                    None => tracing::error!(
+                        error = %error,
+                        "daemon event withheld: coverage is unavailable and it has no content-free form"
+                    ),
+                }
+            }
         }
     }
 
-    fn republish_global_redaction_blocking(&self, event: proto::Event) -> Result<()> {
+    /// Whether the published daemon-global table still reflects the current
+    /// vault generation *and* the current coverage-authority epoch.
+    fn global_coverage_is_current(&self) -> bool {
+        let Ok(generation) = self.secret_vault.current_inventory_generation() else {
+            return false;
+        };
+        generation
+            == self
+                .redaction_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+            && self.registry.coverage_authority().epoch()
+                == self
+                    .redaction_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn republish_global_redaction_blocking(&self) -> Result<Arc<RedactionTable>> {
         let generation = self
             .secret_vault
             .current_inventory_generation()
             .context("reading daemon redaction source revision")?;
+        let epoch = self.registry.coverage_authority().epoch();
         let table = acquire_daemon_redaction_table_blocking(
             self.registry.coverage_authority().clone(),
             self.config_source.clone(),
@@ -4450,8 +4397,9 @@ impl DaemonContext {
         set_current_redaction(&self.global_redaction, table.clone());
         self.redaction_generation
             .store(generation, std::sync::atomic::Ordering::SeqCst);
-        send_event(&self.global_events, &table, event);
-        Ok(())
+        self.redaction_epoch
+            .store(epoch, std::sync::atomic::Ordering::SeqCst);
+        Ok(table)
     }
 
     pub(crate) async fn refresh_redaction_table(&self) -> Result<()> {
@@ -4469,6 +4417,7 @@ impl DaemonContext {
         let generation = vault
             .current_inventory_generation()
             .context("reading daemon redaction source revision")?;
+        let epoch = authority.epoch();
         let table = acquire_daemon_redaction_table(
             authority,
             &source,
@@ -4479,6 +4428,8 @@ impl DaemonContext {
         .await?;
         set_current_redaction(&shared, table.clone());
         published_generation.store(generation, std::sync::atomic::Ordering::SeqCst);
+        self.redaction_epoch
+            .store(epoch, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -6678,12 +6629,11 @@ pub(crate) async fn boot_ready_with_db(
     {
         tracing::warn!(error = %error, "skill curator scheduler registration failed");
     }
-    // Resolve command-backed named secrets referenced by configured provider
-    // headers into the daemon cache. Failures land as `Failed` (never fail
-    // boot); the first outbound request then sees the cached status, not a sync
-    // exec.
-    ctx.resolve_startup_command_secrets().await;
-    timer.phase("command_secret_startup_resolve");
+    // Command-backed named secrets are owner-scoped per (provider, workspace)
+    // and are pre-resolved by each session at create/resume for its own
+    // workspace (`preresolve_session_command_secrets`). Boot has no workspace,
+    // so it resolves none, and never adopts the daemon's inherited working
+    // directory as one.
     Ok(ctx)
 }
 
@@ -7491,15 +7441,16 @@ pub(crate) async fn run_locked_until_ready(
     }
 }
 
-/// Installation-wide retention policy, read strictly through
-/// [`load_installation_extended_config`](crate::config::extended::load_installation_extended_config):
-/// the global layer (or the `COCKPIT_CONFIG` override, as for sessions), never
-/// a project layer found from the daemon's inherited working directory. The
-/// daemon's sweeps and `cockpit doctor`'s retention report share this reader.
+/// Installation-wide retention policy, read strictly (and validated on its
+/// own, so a redact fault never stops sweeps) through
+/// [`load_installation_retention_policy`](crate::config::extended::load_installation_retention_policy):
+/// the global layer or the `COCKPIT_CONFIG` override, never a project layer
+/// found from the daemon's inherited working directory. The daemon's sweeps
+/// and `cockpit doctor`'s retention report share this reader. `Ok` means a
+/// successful load or a genuinely absent layer; only then is a policy
+/// recorded as last-known.
 pub(crate) fn load_installation_retention_policy() -> Result<RetentionConfig> {
-    crate::config::extended::load_installation_extended_config()
-        .map(|extended| extended.retention)
-        .context("loading installation retention policy")
+    Ok(crate::config::extended::load_installation_retention_policy()?)
 }
 
 /// The last retention policy that loaded successfully in this process.

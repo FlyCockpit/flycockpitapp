@@ -1212,6 +1212,23 @@ impl RedactionTable {
         )
     }
 
+    /// [`Self::build_with_env_and_credential_store`] plus the record of the
+    /// file-backed sources it consumed, for the coverage authority's
+    /// boundary binding.
+    pub(crate) fn build_with_env_and_credential_store_recorded(
+        cfg: &RedactConfig,
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<(Self, coverage_bindings::MachineSourceCapture)> {
+        Self::build_scoped_recorded(
+            cfg,
+            RedactionSourceScope::Workspace(cwd),
+            env,
+            credential_store_entries(store),
+        )
+    }
+
     /// Daemon-global builder: the same collectors as a session build, minus
     /// every workspace-rooted source (see [`RedactionSourceScope::DaemonGlobal`]).
     pub(crate) fn build_daemon_global_with_credential_store(
@@ -1219,7 +1236,18 @@ impl RedactionTable {
         env: &HashMap<String, String>,
         store: &crate::credentials::CredentialStore,
     ) -> Result<Self> {
-        Self::build_scoped(
+        Self::build_daemon_global_with_credential_store_recorded(cfg, env, store)
+            .map(|(table, _)| table)
+    }
+
+    /// [`Self::build_daemon_global_with_credential_store`] plus the record of
+    /// the file-backed sources it consumed.
+    pub(crate) fn build_daemon_global_with_credential_store_recorded(
+        cfg: &RedactConfig,
+        env: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<(Self, coverage_bindings::MachineSourceCapture)> {
+        Self::build_scoped_recorded(
             cfg,
             RedactionSourceScope::DaemonGlobal,
             env,
@@ -1252,6 +1280,19 @@ impl RedactionTable {
         env: &HashMap<String, String>,
         stored_secrets: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self> {
+        Self::build_scoped_recorded(cfg, scope, env, stored_secrets).map(|(table, _)| table)
+    }
+
+    /// [`Self::build_scoped`], also returning the record of the file-backed
+    /// sources consumed (each env file's confirmed-bytes digest and the SSH
+    /// candidates digest), from the same reads that produced the table.
+    pub(crate) fn build_scoped_recorded(
+        cfg: &RedactConfig,
+        scope: RedactionSourceScope<'_>,
+        env: &HashMap<String, String>,
+        stored_secrets: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<(Self, coverage_bindings::MachineSourceCapture)> {
+        let mut capture = coverage_bindings::MachineSourceCapture::default();
         let protected = ProtectedPaths::from_scope(scope, env);
         // `cfg.enabled == false` is a *scrub-time* opt-out, never a reason to
         // skip collection. The table is always built for real so that an
@@ -1304,8 +1345,14 @@ impl RedactionTable {
         if cfg.scan_dotenv {
             let discovered =
                 matched_dotenv_sources(scope, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?;
+            let mut consumed = Vec::with_capacity(discovered.len());
             for path in &discovered {
-                match collect_env_file_candidates(path, &cfg.allowlist) {
+                let (scan, digest) =
+                    dotenv::collect_env_file_candidates_recorded(path, &cfg.allowlist, || {});
+                if let Some(digest) = digest {
+                    consumed.push((path.clone(), digest));
+                }
+                match scan {
                     EnvFileScan::Candidates(file_entries) => {
                         for entry in file_entries {
                             candidates.push(entry);
@@ -1332,13 +1379,16 @@ impl RedactionTable {
             {
                 return Err(RedactionSourceChangedError.into());
             }
+            capture.dotenv = Some(consumed);
         }
 
         // Private SSH keys: each is registered as a forced (non-prunable)
         // secret — key material must never be dropped by the prune step.
         if cfg.scan_ssh_keys {
             let ssh_key_dir = ssh::resolve_ssh_key_dir(scope, cfg.ssh_key_dir.as_deref())?;
-            for (value, origin) in collect_ssh_key_candidates(ssh_key_dir.as_deref())? {
+            let collected = collect_ssh_key_candidates(ssh_key_dir.as_deref())?;
+            capture.ssh = Some(coverage_bindings::ssh_candidates_digest(&collected));
+            for (value, origin) in collected {
                 candidates.push(Candidate::forced(value, origin, true));
             }
         }
@@ -1419,6 +1469,7 @@ impl RedactionTable {
             unsupported_files,
             protected,
         )
+        .map(|table| (table, capture))
     }
 
     /// Build a table from `(value, origin, source)` triples. Every triple
@@ -3002,6 +3053,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/approval/policy.rs",
         "crates/cockpit-core/src/conversation_rules.rs",
         "crates/cockpit-core/src/daemon/fs_api.rs",
+        "crates/cockpit-core/src/daemon/mod.rs",
         "crates/cockpit-core/src/daemon/org_sync.rs",
         "crates/cockpit-core/src/daemon/remote_audit_upload.rs",
         "crates/cockpit-core/src/daemon/server/dispatch.rs",

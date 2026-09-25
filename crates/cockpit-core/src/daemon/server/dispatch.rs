@@ -12504,39 +12504,16 @@ async fn handle_serialized_request_impl(
         Request::FindWorktreeRoot { path } => crate::daemon::fs_api::find_worktree_root(path).await,
 
         Request::OpenTerminal { cwd, cols, rows } => {
-            // Terminal events travel on the daemon-global bus; cover them with
-            // the originating session's live table, or, unattached, with
-            // coverage acquired for the terminal's own working directory.
-            // Coverage failure refuses the terminal (fail closed).
-            let (session_id, cwd, origin) = match state.attached.as_ref() {
-                Some(attached) => (
-                    attached.handle.session_id(),
-                    cwd,
-                    attached.handle.shared_redaction(),
-                ),
-                None => {
-                    let root = unattached_terminal_root(cwd.as_deref())?;
-                    let table = super::acquire_unattached_workspace_coverage(
-                        ctx,
-                        &root,
-                        crate::redact::coverage_authority::CoverageScope::UnattachedTerminal,
-                    )
-                    .await
-                    .map_err(internal)?;
-                    (
-                        Uuid::nil(),
-                        Some(root.to_string_lossy().into_owned()),
-                        Arc::new(std::sync::RwLock::new(table)),
-                    )
-                }
-            };
+            let session_id = state
+                .attached
+                .as_ref()
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id());
             let response = state.terminal_host.open(
                 state.terminal_context.clone(),
                 session_id,
                 cwd,
                 cols,
                 rows,
-                origin,
             )?;
             if let Response::TerminalOpened {
                 terminal_id,
@@ -19885,38 +19862,6 @@ fn render_daemon_global_debug_context(table: &crate::redact::RedactionTable) -> 
         "Daemon-global redaction coverage is ready. The system prompt and project \
          guidance are session-scoped: select a session to render them.",
     )
-}
-
-/// The working directory of a terminal opened without an attached session,
-/// resolved once so its coverage and its shell share one absolute root. The
-/// default is the user's home directory, never the daemon's working directory.
-fn unattached_terminal_root(cwd: Option<&str>) -> std::result::Result<PathBuf, ErrorPayload> {
-    let requested = match cwd {
-        Some(cwd) => PathBuf::from(cwd),
-        None => dirs::home_dir()
-            .filter(|home| home.is_absolute())
-            .ok_or_else(|| ErrorPayload {
-                code: ErrorCode::RootMissing,
-                message: "terminal cwd is unavailable: no absolute home directory".into(),
-            })?,
-    };
-    if !requested.is_absolute() {
-        return Err(bad_request("terminal cwd must be an absolute path"));
-    }
-    let canonical = std::fs::canonicalize(&requested).map_err(|error| ErrorPayload {
-        code: ErrorCode::RootMissing,
-        message: format!(
-            "terminal cwd `{}` is unavailable: {error}",
-            requested.display()
-        ),
-    })?;
-    if !canonical.is_dir() {
-        return Err(ErrorPayload {
-            code: ErrorCode::RootMissing,
-            message: format!("terminal cwd `{}` is not a directory", requested.display()),
-        });
-    }
-    Ok(canonical)
 }
 
 fn render_debug_context(root: &Path, table: &crate::redact::RedactionTable) -> String {
@@ -31353,9 +31298,14 @@ async fn docs_ask_response(
     package: Option<String>,
     project_root: Option<String>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    // The docs session builds workspace-scoped redaction coverage (it walks
+    // the root's env files and reads its project config), so it needs an
+    // explicit workspace. It never falls back to the daemon's inherited
+    // working directory.
     let requested_root = project_root
         .map(PathBuf::from)
-        .unwrap_or_else(|| ctx.canonical_cwd.clone());
+        .filter(|root| root.is_absolute())
+        .ok_or_else(|| bad_request("docs ask requires an absolute project root"))?;
     let trust_policy =
         crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &requested_root)
             .await

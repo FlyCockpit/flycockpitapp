@@ -173,17 +173,94 @@ use crate::redact::RedactionTable;
 const RESTART_RELEASE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// In-daemon event broadcast item. The wire schema remains proto::Event;
-/// the envelope pins the accumulated redaction table that was live when the
-/// event was emitted so each client can scrub with the correct snapshot.
+/// the envelope pins the redaction coverage that was live when the event was
+/// emitted so each client can scrub with the correct snapshot.
 #[derive(Debug, Clone)]
 pub struct EventEnvelope {
     pub event: proto::Event,
-    pub redact: Arc<RedactionTable>,
+    pub redact: EventScrub,
+}
+
+/// Scrub-only coverage for one event.
+///
+/// Usually a single table. An event that originates in one session's
+/// workspace but is delivered on the daemon-global bus (an LSP notice, a
+/// session's host-capability publication) is scrubbed with the live
+/// daemon-global table *and* the originating session's table, applied in
+/// turn. This is deliberately not a [`RedactionTable`]: two tables from
+/// different coverage lineages are never merged into one bound table (which
+/// the coverage authority rightly refuses), so this value can only scrub; it
+/// can never be published, installed, or bound.
+#[derive(Debug, Clone)]
+pub struct EventScrub {
+    primary: Arc<RedactionTable>,
+    origin: Option<Arc<RedactionTable>>,
+}
+
+impl EventScrub {
+    pub fn single(table: Arc<RedactionTable>) -> Self {
+        Self {
+            primary: table,
+            origin: None,
+        }
+    }
+
+    /// The daemon-global table plus the originating session's table.
+    pub fn with_origin(global: Arc<RedactionTable>, origin: Arc<RedactionTable>) -> Self {
+        Self {
+            primary: global,
+            origin: Some(origin),
+        }
+    }
+
+    /// Every table this event must be scrubbed with, in application order.
+    pub fn tables(&self) -> impl Iterator<Item = &RedactionTable> {
+        std::iter::once(self.primary.as_ref()).chain(self.origin.as_deref())
+    }
+
+    pub fn scrub(&self, text: &str) -> String {
+        self.tables()
+            .fold(text.to_string(), |text, table| table.scrub(&text))
+    }
+}
+
+impl From<Arc<RedactionTable>> for EventScrub {
+    fn from(table: Arc<RedactionTable>) -> Self {
+        Self::single(table)
+    }
 }
 
 pub type EventSender = broadcast::Sender<EventEnvelope>;
 pub type EventReceiver = broadcast::Receiver<EventEnvelope>;
 pub type SharedRedactionTable = Arc<std::sync::RwLock<Arc<RedactionTable>>>;
+
+/// The daemon-global event bus together with its live coverage table, handed
+/// to producers whose events originate in a session but reach every client.
+#[derive(Clone)]
+pub struct GlobalEventBus {
+    pub tx: EventSender,
+    pub redaction: SharedRedactionTable,
+}
+
+impl std::fmt::Debug for GlobalEventBus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GlobalEventBus")
+            .finish_non_exhaustive()
+    }
+}
+
+impl GlobalEventBus {
+    /// Broadcast an event that originates in a session: scrubbed with the
+    /// live daemon-global table and the session's table (see [`EventScrub`]).
+    /// Scrubbing cannot fail, so the event is never withheld.
+    pub fn send_from_origin(&self, origin: &Arc<RedactionTable>, event: proto::Event) {
+        let _ = self.tx.send(EventEnvelope {
+            event,
+            redact: EventScrub::with_origin(current_redaction(&self.redaction), origin.clone()),
+        });
+    }
+}
 
 pub fn current_redaction(table: &SharedRedactionTable) -> Arc<RedactionTable> {
     table
@@ -205,81 +282,8 @@ pub fn send_current_event(tx: &EventSender, redact: &SharedRedactionTable, event
 pub fn send_event(tx: &EventSender, redact: &Arc<RedactionTable>, event: proto::Event) {
     let _ = tx.send(EventEnvelope {
         event,
-        redact: redact.clone(),
+        redact: EventScrub::single(redact.clone()),
     });
-}
-
-/// Coverage for events that originate in one session's workspace but are
-/// delivered on the daemon-global bus (terminal output, clipboard, notices).
-///
-/// Daemon-global coverage deliberately contains no workspace file sources, so
-/// such an event is covered by the union of the live daemon-global table and
-/// the live originating table. The union is rebuilt only when either live
-/// table changes.
-#[derive(Clone)]
-pub struct EventCoverage {
-    global: SharedRedactionTable,
-    origin: SharedRedactionTable,
-    cache: Arc<std::sync::Mutex<Option<CoverageUnion>>>,
-}
-
-#[derive(Clone)]
-struct CoverageUnion {
-    global: Arc<RedactionTable>,
-    origin: Arc<RedactionTable>,
-    union: Arc<RedactionTable>,
-}
-
-impl std::fmt::Debug for EventCoverage {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("EventCoverage")
-            .finish_non_exhaustive()
-    }
-}
-
-impl EventCoverage {
-    pub fn new(global: SharedRedactionTable, origin: SharedRedactionTable) -> Self {
-        Self {
-            global,
-            origin,
-            cache: Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
-
-    /// The table covering an event emitted now. Both live tables are read
-    /// once, so the union matches a single instant of each.
-    pub fn current(&self) -> Result<Arc<RedactionTable>> {
-        let global = current_redaction(&self.global);
-        let origin = current_redaction(&self.origin);
-        let mut cache = crate::sync::lock_or_recover(&self.cache);
-        if let Some(cached) = cache.as_ref()
-            && Arc::ptr_eq(&cached.global, &global)
-            && Arc::ptr_eq(&cached.origin, &origin)
-        {
-            return Ok(cached.union.clone());
-        }
-        let union = Arc::new(global.union(&origin)?);
-        *cache = Some(CoverageUnion {
-            global,
-            origin,
-            union: union.clone(),
-        });
-        Ok(union)
-    }
-}
-
-/// Send an event covered by [`EventCoverage`]. When the coverage union cannot
-/// be built the event is withheld (fail closed) rather than delivered under
-/// the narrower daemon-global table.
-pub fn send_covered_event(tx: &EventSender, coverage: &EventCoverage, event: proto::Event) {
-    match coverage.current() {
-        Ok(table) => send_event(tx, &table, event),
-        Err(error) => tracing::error!(
-            error = %format!("{error:#}"),
-            "event withheld: originating redaction coverage is unavailable"
-        ),
-    }
 }
 
 /// Internal lifetime marker passed to a detached child. Both persistent and

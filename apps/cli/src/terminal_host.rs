@@ -1208,6 +1208,12 @@ impl TerminalHost {
             .ok_or_else(|| unknown_terminal(terminal_id))
     }
 
+    /// Terminal events ride the daemon-global bus with the live daemon-global
+    /// table. By design the PTY stream (output, viewers, close) is not
+    /// scrubbed: the terminal is the owner's own shell, so a secret it prints
+    /// is already in the owner's hands and substituting bytes would only
+    /// corrupt the stream. Only `TerminalClipboard` text is scrubbed (see the
+    /// daemon's event scrubber). No terminal event is withheld for coverage.
     fn emit(&self, event: proto::Event) {
         send_current_event(&self.event_tx, &self.redaction, event);
     }

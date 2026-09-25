@@ -120,9 +120,6 @@ pub(crate) enum CoverageScope {
     ApprovalPreview,
     DebugContext,
     RedactionOverride,
-    /// A terminal opened without an attached session, covered for its own
-    /// working directory.
-    UnattachedTerminal,
 }
 
 /// All members are opaque daemon-derived revisions/identities.  A key cannot
@@ -428,10 +425,14 @@ impl CoverageBuild {
         sealed: &RedactionTable,
         boundary_inputs: &super::coverage_bindings::SessionCoverageInputs<'_>,
     ) -> Result<Self> {
-        let base =
-            RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
+        let (base, capture) = RedactionTable::build_with_env_and_credential_store_recorded(
+            config,
+            root,
+            environment,
+            store,
+        )?;
         let table = base.union(sealed)?;
-        let boundary_revisions = boundary_inputs.boundary_revisions(&table)?;
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table, &capture);
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 
@@ -443,9 +444,12 @@ impl CoverageBuild {
         store: &crate::credentials::CredentialStore,
         boundary_inputs: &super::coverage_bindings::DaemonGlobalCoverageInputs<'_>,
     ) -> Result<Self> {
-        let table =
-            RedactionTable::build_daemon_global_with_credential_store(config, environment, store)?;
-        let boundary_revisions = boundary_inputs.boundary_revisions(&table)?;
+        let (table, capture) = RedactionTable::build_daemon_global_with_credential_store_recorded(
+            config,
+            environment,
+            store,
+        )?;
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table, &capture);
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 
@@ -456,9 +460,13 @@ impl CoverageBuild {
         store: &crate::credentials::CredentialStore,
         boundary_inputs: &super::coverage_bindings::SessionCoverageInputs<'_>,
     ) -> Result<Self> {
-        let table =
-            RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
-        let boundary_revisions = boundary_inputs.boundary_revisions(&table)?;
+        let (table, capture) = RedactionTable::build_with_env_and_credential_store_recorded(
+            config,
+            root,
+            environment,
+            store,
+        )?;
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table, &capture);
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 }
@@ -941,6 +949,13 @@ impl RedactionCoverageAuthority {
 
     /// Revoke current coverage after any known owned mutation. Existing and
     /// late work becomes inert; the next acquisition performs a complete scan.
+    /// The authority's invalidation epoch. Every [`Self::invalidate`] advances
+    /// it, so a holder of a previously published table can tell that its
+    /// coverage was revoked even when no vault generation changed.
+    pub(crate) fn epoch(&self) -> u64 {
+        lock(&self.inner.state).epoch
+    }
+
     pub(crate) fn invalidate(&self) {
         let mut state = lock(&self.inner.state);
         state.epoch = state.epoch.wrapping_add(1).max(1);

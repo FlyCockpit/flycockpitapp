@@ -23,7 +23,9 @@ use crate::config::trust::WorkspaceTrustPolicy;
 
 type LoadFn = dyn Fn(&Path) -> Result<(ProvidersConfig, ExtendedConfig)> + Send + Sync;
 type BootLoadFn = dyn Fn() -> Result<crate::config::extended::DaemonBootConfig> + Send + Sync;
-type GlobalLoadFn = dyn Fn() -> Result<ExtendedConfig> + Send + Sync;
+type StrictRedactLoadFn =
+    dyn Fn(&Path) -> Result<crate::config::extended::RedactConfig> + Send + Sync;
+type GlobalRedactLoadFn = dyn Fn() -> Result<crate::config::extended::RedactConfig> + Send + Sync;
 type DaemonLoadFn = dyn Fn(&Path) -> Result<DaemonConfigLoad> + Send + Sync;
 type WorkspaceDaemonLoadFn = dyn Fn(
         &Path,
@@ -94,10 +96,14 @@ impl ConfigWatchPaths {
 pub struct ConfigSource {
     load: Arc<LoadFn>,
     boot_load: Arc<BootLoadFn>,
-    /// Daemon-global policy (global redaction coverage, retention): the
-    /// canonical global layer only, never resolved against a project root or
-    /// the daemon's inherited working directory.
-    global_load: Arc<GlobalLoadFn>,
+    /// Installation-wide redact policy for daemon-global coverage: the
+    /// `COCKPIT_CONFIG` explicit override when set, otherwise the canonical
+    /// global layer. Never resolved against a project root or the daemon's
+    /// inherited working directory.
+    global_redact_load: Arc<GlobalRedactLoadFn>,
+    /// Workspace redact policy read strictly, for security decisions that
+    /// must fail closed on a malformed protection policy.
+    strict_redact_load: Arc<StrictRedactLoadFn>,
     daemon_load: Arc<DaemonLoadFn>,
     workspace_daemon_load: Arc<WorkspaceDaemonLoadFn>,
     write_target: Arc<WriteTargetFn>,
@@ -147,9 +153,13 @@ impl ConfigSource {
                 let load = load.clone();
                 move || Ok(load(Path::new("/"))?.1.daemon.boot)
             }),
-            global_load: Arc::new({
+            global_redact_load: Arc::new({
                 let load = load.clone();
-                move || Ok(load(Path::new("/"))?.1)
+                move || Ok(load(Path::new("/"))?.1.redact)
+            }),
+            strict_redact_load: Arc::new({
+                let load = load.clone();
+                move |cwd| Ok(load(cwd)?.1.redact)
             }),
             daemon_load: Arc::new(move |cwd| {
                 let (providers, extended) = daemon_source(cwd)?;
@@ -196,9 +206,13 @@ impl ConfigSource {
                 let daemon_load = daemon_load.clone();
                 move || Ok(daemon_load(Path::new("/"))?.extended.daemon.boot)
             }),
-            global_load: Arc::new({
+            global_redact_load: Arc::new({
                 let daemon_load = daemon_load.clone();
-                move || Ok(daemon_load(Path::new("/"))?.extended)
+                move || Ok(daemon_load(Path::new("/"))?.extended.redact)
+            }),
+            strict_redact_load: Arc::new({
+                let daemon_load = daemon_load.clone();
+                move |cwd| Ok(daemon_load(cwd)?.extended.redact)
             }),
             daemon_load,
             workspace_daemon_load: Arc::new(move |cwd, _workspace| {
@@ -283,7 +297,14 @@ impl ConfigSource {
         Self {
             load,
             boot_load: Arc::new(crate::config::extended::load_installation_daemon_boot),
-            global_load: Arc::new(crate::config::extended::load_installation_extended_config),
+            global_redact_load: Arc::new(|| {
+                Ok(crate::config::extended::load_installation_redact_policy()?)
+            }),
+            strict_redact_load: Arc::new(|cwd| {
+                Ok(crate::config::extended::load_redact_policy_strict_for_cwd(
+                    cwd,
+                )?)
+            }),
             daemon_load,
             workspace_daemon_load,
             write_target: Arc::new(|cwd, provider_id| {
@@ -359,12 +380,25 @@ impl ConfigSource {
         (self.boot_load)()
     }
 
-    /// Load daemon-global policy from the global config layer alone. Callers
-    /// that build daemon-wide state (global redaction coverage, retention)
-    /// use this rather than [`Self::load`] so no project root, and in
-    /// particular not the daemon's inherited working directory, participates.
-    pub fn load_global(&self) -> Result<ExtendedConfig> {
-        (self.global_load)()
+    /// Installation-wide redact policy (the explicit override when set,
+    /// otherwise the global layer), read strictly. Daemon-global coverage uses
+    /// this rather than [`Self::load`], so no project root, and in particular
+    /// not the daemon's inherited working directory, participates.
+    pub fn load_global_redact(&self) -> Result<crate::config::extended::RedactConfig> {
+        (self.global_redact_load)()
+    }
+
+    /// The workspace redact policy for `cwd` under `policy`, read strictly:
+    /// an unreadable layer or a malformed `redact` section is an error rather
+    /// than being dropped by the permissive merge.
+    pub fn load_redact_policy_strict_with_trust(
+        &self,
+        cwd: &Path,
+        policy: &WorkspaceTrustPolicy,
+    ) -> Result<crate::config::extended::RedactConfig> {
+        crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
+            (self.strict_redact_load)(cwd)
+        })
     }
 
     /// Load the effective configs for `cwd` under a resolved workspace-trust

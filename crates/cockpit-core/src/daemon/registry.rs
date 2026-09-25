@@ -302,7 +302,7 @@ struct Inner {
     shutdown: ShutdownSignal,
     /// Daemon-global event bus, installed once by [`DaemonContext`]. Workers
     /// use it for singular global recomputes derived from per-session events.
-    global_bus: Mutex<Option<EventSender>>,
+    global_bus: Mutex<Option<crate::daemon::GlobalEventBus>>,
     /// Injectable config-resolution seam (`daemon-trust-test-isolation.md`).
     /// Production wires [`ConfigSource::production`] once at daemon startup;
     /// tests inject fixed configs so no attach/resume/worker path consults
@@ -1024,8 +1024,9 @@ impl SessionRegistry {
         *crate::sync::lock_or_recover(&self.inner.resource_scheduler) = scheduler;
     }
 
-    pub fn set_global_bus(&self, tx: EventSender) {
-        *crate::sync::lock_or_recover(&self.inner.global_bus) = Some(tx);
+    pub fn set_global_bus(&self, tx: EventSender, redaction: crate::daemon::SharedRedactionTable) {
+        *crate::sync::lock_or_recover(&self.inner.global_bus) =
+            Some(crate::daemon::GlobalEventBus { tx, redaction });
     }
 
     #[cfg(feature = "extended")]

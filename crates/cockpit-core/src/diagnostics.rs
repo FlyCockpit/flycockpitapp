@@ -566,6 +566,18 @@ fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -
 }
 
 async fn database_lines(db: &DiagnosticDb<'_>) -> (Vec<String>, bool) {
+    let (lines, failed) = database_lines_inner(db).await;
+    // An unreadable retention policy is a failure in its own right: the
+    // daemon then sweeps with a stale policy or not at all.
+    let retention_failed = lines
+        .iter()
+        .any(|line| line.starts_with(RETENTION_FAILED_PREFIX));
+    (lines, failed || retention_failed)
+}
+
+const RETENTION_FAILED_PREFIX: &str = "retention: FAILED";
+
+async fn database_lines_inner(db: &DiagnosticDb<'_>) -> (Vec<String>, bool) {
     let retention = installation_retention_report_line();
     // `default_path` only resolves the on-disk location; it does NOT open,
     // create, or migrate anything, so the real path is always safe to report.
@@ -747,17 +759,14 @@ async fn database_lines(db: &DiagnosticDb<'_>) -> (Vec<String>, bool) {
 }
 
 /// The retention line `cockpit doctor` reports: the installation-wide policy
-/// the daemon's sweeps apply, read through the same strict loader. A policy
-/// that cannot be read is reported as such, because the daemon then skips its
-/// sweeps instead of applying default windows.
+/// the daemon's sweeps apply, read through the same strict loader. An
+/// unreadable policy is a doctor failure; it never falls back to defaults.
 fn installation_retention_report_line() -> String {
-    match crate::config::extended::load_installation_extended_config()
-        .map(|extended| extended.retention)
-    {
+    match crate::config::extended::load_installation_retention_policy() {
         Ok(policy) => retention_line(&policy),
         Err(error) => format!(
-            "retention: FAILED ({}); the daemon skips retention sweeps until the policy loads",
-            one_line(&format!("{error:#}"))
+            "{RETENTION_FAILED_PREFIX} ({}); the daemon keeps sweeping with the last retention policy it loaded, or skips sweeps if it has loaded none, until this is fixed",
+            one_line(&error.to_string())
         ),
     }
 }
@@ -2755,6 +2764,33 @@ mod tests {
         assert!(!is_schema_rejection(
             "opening SQLite read-only: permission denied"
         ));
+    }
+
+    /// An unreadable installation retention policy is a doctor failure (the
+    /// daemon sweeps with a stale policy or not at all), and the message says
+    /// exactly that.
+    #[tokio::test]
+    async fn unreadable_retention_policy_fails_doctor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+        let db = crate::db::Db::open(&tmp.path().join("doctor.db")).unwrap();
+        let (lines, failed) = database_lines(&DiagnosticDb::Open(&db)).await;
+        assert!(!failed, "{lines:?}");
+
+        let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+        std::fs::write(
+            config_dir.join(crate::config::dirs::CONFIG_FILE),
+            r#"{"retention":{"transcript_window_days":"never"}}"#,
+        )
+        .unwrap();
+        let (lines, failed) = database_lines(&DiagnosticDb::Open(&db)).await;
+        assert!(failed, "{lines:?}");
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with(RETENTION_FAILED_PREFIX))
+            .expect("retention failure line");
+        assert!(line.contains("last retention policy it loaded"), "{line}");
+        assert!(line.contains("retention.transcript_window_days"), "{line}");
     }
 
     #[test]

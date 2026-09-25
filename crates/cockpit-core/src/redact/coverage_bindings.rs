@@ -30,8 +30,9 @@ pub(crate) struct SessionCoverageInputs<'a> {
 
 /// Inputs of daemon-wide coverage. There is deliberately no root: daemon-global
 /// coverage is built from daemon-global sources only (the environment
-/// snapshot, vault/keyring and command secrets, and the global config layer's
-/// redact settings) and never walks a workspace or the daemon's working
+/// snapshot, vault/keyring and command secrets, and the installation-wide
+/// redact policy: the `COCKPIT_CONFIG` override when set, otherwise the
+/// global layer) and never walks a workspace or the daemon's working
 /// directory. Workspace env files are covered per session.
 pub(crate) struct DaemonGlobalCoverageInputs<'a> {
     pub environment: &'a EnvSnapshot,
@@ -47,19 +48,19 @@ pub(crate) struct DaemonGlobalCoverageInputs<'a> {
 /// fail closed (no table is published) instead of panicking.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DaemonGlobalCoverageError {
-    #[error("coverage_unavailable: loading the global redaction config layer: {0:#}")]
+    #[error("coverage_unavailable: loading the installation-wide redact policy: {0:#}")]
     GlobalRedactConfig(anyhow::Error),
 }
 
-/// The single read of daemon-global redaction policy: the global config layer
-/// through the injected [`ConfigSource`](crate::daemon::config_source::ConfigSource),
-/// with no project root.
+/// The single read of daemon-global redaction policy: the installation-wide
+/// redact policy (explicit override or global layer) through the injected
+/// [`ConfigSource`](crate::daemon::config_source::ConfigSource), with no
+/// project root.
 pub(crate) fn load_daemon_global_redact_config(
     config_source: &crate::daemon::config_source::ConfigSource,
 ) -> Result<RedactConfig, DaemonGlobalCoverageError> {
     config_source
-        .load_global()
-        .map(|extended| extended.redact)
+        .load_global_redact()
         .map_err(DaemonGlobalCoverageError::GlobalRedactConfig)
 }
 
@@ -180,7 +181,74 @@ pub(crate) fn machine_sources_probe_binding(
     machine_sources_binding(config, scope, None)
 }
 
-/// Binding of the file-backed sources a build in `scope` reads.
+/// Digest of one file-backed source's exact bytes.
+pub(crate) fn source_bytes_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"flycockpit-redaction-source-bytes-v1\0");
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// Digest of the SSH key candidates a collection produced, as
+/// `(value, origin)` pairs in collection order.
+pub(crate) fn ssh_candidates_digest(candidates: &[(String, String)]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"flycockpit-redaction-ssh-candidates-v1\0");
+    hasher.update((candidates.len() as u64).to_le_bytes());
+    for (value, origin) in candidates {
+        for part in [origin.as_bytes(), value.as_bytes()] {
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+    }
+    hasher.finalize().into()
+}
+
+/// The file-backed sources one table capture actually consumed: each env
+/// file with the digest of the exact bytes it was parsed from, and the digest
+/// of the SSH candidates it registered. The capture's boundary binding is
+/// derived from this record, never from a second read, so a source that
+/// changes and changes back around the capture (A→B→A) cannot make a table
+/// built from B look like it covers A.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MachineSourceCapture {
+    pub(crate) dotenv: Option<Vec<(PathBuf, [u8; 32])>>,
+    pub(crate) ssh: Option<[u8; 32]>,
+}
+
+fn encode_machine_sources(
+    dotenv: Option<&[(PathBuf, [u8; 32])]>,
+    ssh: Option<&[u8; 32]>,
+    unsupported: &[PathBuf],
+) -> CoverageBinding {
+    let mut hasher = Sha256::new();
+    hasher.update(b"flycockpit-redaction-machine-sources-v1\0");
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    if let Some(sources) = dotenv {
+        field(b"dotenv");
+        field(&(sources.len() as u64).to_le_bytes());
+        for (path, digest) in sources {
+            field(path.as_os_str().as_encoded_bytes());
+            field(digest);
+        }
+    }
+    if let Some(digest) = ssh {
+        field(b"ssh");
+        field(digest);
+    }
+    field(b"unsupported");
+    for path in unsupported {
+        field(path.as_os_str().as_encoded_bytes());
+    }
+    let digest = hasher.finalize();
+    CoverageBinding::derive(b"machine-sources", digest.as_slice())
+}
+
+/// Binding of the file-backed sources a build in `scope` reads, from a fresh
+/// read (key probing and the publication fence).
 ///
 /// Every source failure is an error, never a sentinel: an unavailable source
 /// must not hash equal to an empty or earlier successful one, so key
@@ -190,16 +258,10 @@ pub(crate) fn machine_sources_binding(
     scope: RedactionSourceScope<'_>,
     table: Option<&RedactionTable>,
 ) -> anyhow::Result<CoverageBinding> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"flycockpit-redaction-machine-sources-v1\0");
-    let mut field = |bytes: &[u8]| {
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    };
-    if config.scan_dotenv {
+    let dotenv = if config.scan_dotenv {
         let paths =
             matched_dotenv_sources(scope, &config.dotenv_patterns, &config.extra_dotenv_paths)?;
-        field(&(paths.len() as u64).to_le_bytes());
+        let mut sources = Vec::with_capacity(paths.len());
         for path in paths {
             // Same typed failures as the capture itself, so an over-cap or
             // unreadable source is reported identically wherever it is hit.
@@ -212,29 +274,38 @@ pub(crate) fn machine_sources_binding(
                         path: path.clone(),
                     }),
                 })?;
-            field(path.as_os_str().as_encoded_bytes());
-            field(&bytes);
+            let digest = source_bytes_digest(&bytes);
+            sources.push((path, digest));
         }
-    }
-    if config.scan_ssh_keys {
+        Some(sources)
+    } else {
+        None
+    };
+    let ssh = if config.scan_ssh_keys {
         let directory = super::ssh::resolve_ssh_key_dir(scope, config.ssh_key_dir.as_deref())?;
         let candidates = super::ssh::collect_ssh_key_candidates(directory.as_deref())?;
-        field(&(candidates.len() as u64).to_le_bytes());
-        for (value, origin) in candidates {
-            field(origin.as_bytes());
-            field(value.as_bytes());
-        }
-    }
-    if let Some(table) = table {
-        for path in table.unsupported_files() {
-            field(path.as_os_str().as_encoded_bytes());
-        }
-    }
-    let digest = hasher.finalize();
-    Ok(CoverageBinding::derive(
-        b"machine-sources",
-        digest.as_slice(),
+        Some(ssh_candidates_digest(&candidates))
+    } else {
+        None
+    };
+    let unsupported = table.map(RedactionTable::unsupported_files).unwrap_or(&[]);
+    Ok(encode_machine_sources(
+        dotenv.as_deref(),
+        ssh.as_ref(),
+        unsupported,
     ))
+}
+
+/// Binding of the sources a capture consumed (see [`MachineSourceCapture`]).
+pub(crate) fn captured_machine_sources_binding(
+    capture: &MachineSourceCapture,
+    table: &RedactionTable,
+) -> CoverageBinding {
+    encode_machine_sources(
+        capture.dotenv.as_deref(),
+        capture.ssh.as_ref(),
+        table.unsupported_files(),
+    )
 }
 
 pub(crate) fn sealed_records_binding(
@@ -273,11 +344,14 @@ impl SessionCoverageInputs<'_> {
         ))
     }
 
+    /// Revisions at the completed-scan boundary. The machine-source binding
+    /// comes from the bytes the capture consumed (`capture`), not a reread.
     pub(crate) fn boundary_revisions(
         &self,
         table: &RedactionTable,
-    ) -> anyhow::Result<OwnedSourceRevisions> {
-        Ok(OwnedSourceRevisions {
+        capture: &MachineSourceCapture,
+    ) -> OwnedSourceRevisions {
+        OwnedSourceRevisions {
             environment: CoverageBinding::derive(
                 b"environment",
                 self.environment.digest().as_bytes(),
@@ -289,12 +363,8 @@ impl SessionCoverageInputs<'_> {
                 b"override",
                 &self.override_revision.to_le_bytes(),
             ),
-            machine_sources: machine_sources_binding(
-                self.redact_config,
-                RedactionSourceScope::Workspace(self.workspace_root),
-                Some(table),
-            )?,
-        })
+            machine_sources: captured_machine_sources_binding(capture, table),
+        }
     }
 }
 
@@ -344,11 +414,14 @@ impl DaemonGlobalCoverageInputs<'_> {
         ))
     }
 
+    /// Revisions at the completed-scan boundary. The machine-source binding
+    /// comes from the bytes the capture consumed (`capture`), not a reread.
     pub(crate) fn boundary_revisions(
         &self,
         table: &RedactionTable,
-    ) -> anyhow::Result<OwnedSourceRevisions> {
-        Ok(OwnedSourceRevisions {
+        capture: &MachineSourceCapture,
+    ) -> OwnedSourceRevisions {
+        OwnedSourceRevisions {
             environment: CoverageBinding::derive(
                 b"environment",
                 self.environment.digest().as_bytes(),
@@ -360,12 +433,8 @@ impl DaemonGlobalCoverageInputs<'_> {
                 b"override",
                 &self.override_revision.to_le_bytes(),
             ),
-            machine_sources: machine_sources_binding(
-                self.redact_config,
-                RedactionSourceScope::DaemonGlobal,
-                Some(table),
-            )?,
-        })
+            machine_sources: captured_machine_sources_binding(capture, table),
+        }
     }
 }
 

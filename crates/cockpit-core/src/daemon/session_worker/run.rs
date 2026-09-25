@@ -1312,7 +1312,7 @@ async fn publish_one_completed_host_capability_refresh_operation_while_serialize
     operation_id: uuid::Uuid,
     receipt: crate::db::agent_tree_decisions::HostCapabilityRefreshSnapshotReceipt,
     runtime: &HostCapabilityRefreshRuntime,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
 ) -> std::result::Result<HostCapabilitiesRefreshCompletion, String> {
     // Parse and canonicalize before changing the store. The database also
@@ -1373,10 +1373,11 @@ async fn publish_one_completed_host_capability_refresh_operation_while_serialize
         // owns the one event.  In the crash-after-swap case `published` is
         // false on recovery but this is still the first durable publication
         // acknowledgement and therefore the one event emission.
+        // Delivered to every client: scrubbed with the live daemon-global
+        // table and this session's table (never one of them alone).
         if let Some(global_bus) = global_bus {
-            crate::daemon::send_current_event(
-                global_bus,
-                redaction,
+            global_bus.send_from_origin(
+                &crate::daemon::current_redaction(redaction),
                 proto::Event::HostCapabilitiesChanged {
                     snapshot: snapshot.clone(),
                 },
@@ -1397,7 +1398,7 @@ async fn publish_one_completed_host_capability_refresh_operation_while_serialize
 async fn drain_completed_host_capability_refresh_outbox_while_serialized(
     session: &std::sync::Arc<crate::session::Session>,
     runtime: &HostCapabilityRefreshRuntime,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
 ) -> std::result::Result<
     Option<crate::db::agent_tree_decisions::HostCapabilityRefreshOutboxCursor>,
@@ -1525,7 +1526,7 @@ async fn execute_host_capability_refresh_operation(
     session: &std::sync::Arc<crate::session::Session>,
     operation_id: uuid::Uuid,
     runtime: &HostCapabilityRefreshRuntime,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
 ) -> std::result::Result<HostCapabilitiesRefreshCompletion, String> {
     // Keep the whole operation linearized with publication, not merely the
@@ -1550,7 +1551,7 @@ async fn execute_host_capability_refresh_operation_while_serialized(
     session: &std::sync::Arc<crate::session::Session>,
     operation_id: uuid::Uuid,
     runtime: &HostCapabilityRefreshRuntime,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
 ) -> std::result::Result<HostCapabilitiesRefreshCompletion, String> {
     // Before a new probe can reserve its generation, make every older
@@ -1812,7 +1813,7 @@ async fn execute_host_capability_refresh_operation_while_serialized(
 async fn spawn_ready_host_capability_refresh_operations(
     session: &std::sync::Arc<crate::session::Session>,
     runtime: Option<HostCapabilityRefreshRuntime>,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
     registry: &Arc<WorkerAgentTreeResolverRegistry>,
     terminalization_failure_fence: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -6198,7 +6199,7 @@ pub(super) async fn run_worker(
         std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>,
     >,
     write_scope: crate::write_scope::WriteScopeSource,
-    global_bus: Option<EventSender>,
+    global_bus: Option<crate::daemon::GlobalEventBus>,
     park_commit: crate::engine::interrupt::ParkCommit,
     terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     terminal_closing: Arc<AtomicBool>,

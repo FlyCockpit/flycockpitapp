@@ -881,10 +881,13 @@ mod imp {
                 );
             }
             let leaf = CString::new(*leaf).context("workspace leaf has NUL")?;
+            // O_NONBLOCK: a leaf replaced by a FIFO must fail the type check
+            // below rather than block this open until a writer appears. It
+            // has no effect on reads of the regular file that is returned.
             let file = held_fd::openat(
                 parent.as_raw_fd(),
                 &leaf,
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
             .context("opening held workspace regular file")?;
             ensure!(

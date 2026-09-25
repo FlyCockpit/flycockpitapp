@@ -31,7 +31,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::config::extended::{ExtendedConfig, LspAutoInstall};
-use crate::daemon::{EventSender, SharedRedactionTable, send_event};
+use crate::daemon::{EventSender, SharedRedactionTable};
 use crate::redact::RedactionTable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +97,7 @@ struct LspInner {
     statuses: RwLock<HashMap<String, LspServerStatus>>,
     prompted: Mutex<HashSet<String>>,
     installed: RwLock<HashMap<String, InstalledRecord>>,
-    notices: StdMutex<Option<(EventSender, SharedRedactionTable)>>,
+    notices: StdMutex<Option<crate::daemon::GlobalEventBus>>,
 }
 
 /// Evidence that an LSP operation has passed the manager-wide protection
@@ -183,7 +183,8 @@ impl LspManager {
     }
 
     pub fn set_notice_bus(&self, tx: EventSender, redaction: SharedRedactionTable) {
-        *crate::sync::lock_or_recover(&self.inner.notices) = Some((tx, redaction));
+        *crate::sync::lock_or_recover(&self.inner.notices) =
+            Some(crate::daemon::GlobalEventBus { tx, redaction });
     }
 
     #[allow(dead_code)]
@@ -537,25 +538,20 @@ impl LspManager {
     /// Broadcast an LSP notice on the daemon-global bus.
     ///
     /// Notice text can echo workspace content (installer or server output),
-    /// so it is covered by the originating session's table as well as the
-    /// daemon-global one. When the union cannot be built the notice is
-    /// withheld (fail closed); the calling session still receives its own
-    /// result through its session-scoped channel.
+    /// so it is scrubbed with the originating session's table as well as the
+    /// live daemon-global one ([`EventScrub`](crate::daemon::EventScrub): two
+    /// tables applied in turn, never merged). Scrubbing cannot fail, so the
+    /// notice is always delivered.
     async fn notice(&self, text: String, origin: &Arc<RedactionTable>) {
         let bus = crate::sync::lock_or_recover(&self.inner.notices).clone();
-        if let Some((tx, global)) = bus {
-            match crate::daemon::current_redaction(&global).union(origin) {
-                Ok(table) => send_event(
-                    &tx,
-                    &Arc::new(table),
-                    crate::daemon::proto::Event::LspNotice { text },
-                ),
-                Err(error) => warn!(
-                    error = %format!("{error:#}"),
-                    "LSP notice withheld: originating coverage is unavailable"
-                ),
-            }
+        if let Some(bus) = bus {
+            bus.send_from_origin(origin, crate::daemon::proto::Event::LspNotice { text });
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn notice_for_test(&self, text: String, origin: &Arc<RedactionTable>) {
+        self.notice(text, origin).await;
     }
 
     async fn operation_lease(&self) -> LspOperationLease<'_> {

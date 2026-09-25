@@ -279,23 +279,43 @@ pub(super) fn collect_env_file_candidates_with_fence(
     user_allowlist: &[String],
     before_confirm: impl FnOnce(),
 ) -> EnvFileScan {
+    collect_env_file_candidates_recorded(path, user_allowlist, before_confirm).0
+}
+
+/// Collect a source's candidates and return the digest of the exact
+/// confirmed bytes they were parsed from (`None` when the source was not
+/// read to completion). The coverage boundary binding is derived from this
+/// digest, so the binding and the table can never come from different reads.
+pub(super) fn collect_env_file_candidates_recorded(
+    path: &Path,
+    user_allowlist: &[String],
+    before_confirm: impl FnOnce(),
+) -> (EnvFileScan, Option<[u8; 32]>) {
     let first = match crate::resource_limits::read_for_tool(path) {
         Ok(bytes) => bytes,
         Err(crate::resource_limits::ResourceLimitError::ByteLimit { .. }) => {
-            return EnvFileScan::OverLimit;
+            return (EnvFileScan::OverLimit, None);
         }
-        Err(_) => return EnvFileScan::Unreadable,
+        Err(_) => return (EnvFileScan::Unreadable, None),
     };
     before_confirm();
     let bytes = match crate::resource_limits::read_for_tool(path) {
         Ok(bytes) if bytes == first => bytes,
-        Ok(_) => return EnvFileScan::Changed,
+        Ok(_) => return (EnvFileScan::Changed, None),
         Err(crate::resource_limits::ResourceLimitError::ByteLimit { .. }) => {
-            return EnvFileScan::OverLimit;
+            return (EnvFileScan::OverLimit, None);
         }
-        Err(_) => return EnvFileScan::Changed,
+        Err(_) => return (EnvFileScan::Changed, None),
     };
-    let text = String::from_utf8_lossy(&bytes);
+    let digest = super::coverage_bindings::source_bytes_digest(&bytes);
+    (
+        parse_env_file_bytes(path, &bytes, user_allowlist),
+        Some(digest),
+    )
+}
+
+fn parse_env_file_bytes(path: &Path, bytes: &[u8], user_allowlist: &[String]) -> EnvFileScan {
+    let text = String::from_utf8_lossy(bytes);
     let display = path.display().to_string();
 
     // (1) KEY=VALUE (dotenv). `parse_dotenv` returns `Some` when at least

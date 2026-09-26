@@ -144,6 +144,16 @@ pub(crate) async fn union_machine_scoped_sealed_redactions(
     Ok(unioned)
 }
 
+/// Capture the sealed portion of a fresh authority scan. This local empty
+/// identity never leaves the sealed-source collector and cannot create a
+/// generation or an admission lease.
+pub(crate) async fn machine_scoped_sealed_redactions(
+    db: &crate::db::Db,
+    vault: &std::sync::Arc<crate::secure_key::SecretVault>,
+) -> Result<crate::redact::RedactionTable> {
+    union_machine_scoped_sealed_redactions(db, vault, &crate::redact::RedactionTable::empty()).await
+}
+
 #[cfg(test)]
 mod agent_acquisition_tests {
     use super::*;
@@ -179,14 +189,11 @@ impl Session {
         union_machine_scoped_sealed_redactions(&self.db, &self.secret_vault, table).await
     }
 
-    /// Capture the sealed portion of a fresh authority scan. This local empty
-    /// identity never leaves the sealed-source collector and cannot create a
-    /// generation or an admission lease.
+    /// Capture the sealed portion of a fresh authority scan.
     pub(crate) async fn machine_scoped_sealed_redactions(
         &self,
     ) -> Result<crate::redact::RedactionTable> {
-        self.with_machine_scoped_sealed_redactions(&crate::redact::RedactionTable::empty())
-            .await
+        machine_scoped_sealed_redactions(&self.db, &self.secret_vault).await
     }
 
     /// Create a session-scoped value in the agent-acquired namespace. This is

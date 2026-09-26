@@ -20053,12 +20053,9 @@ async fn acquire_workspace_debug_coverage(
         redact_config: &config,
     }
     .coverage_key()?;
-    let sealed = crate::session::sealed_values::union_machine_scoped_sealed_redactions(
-        &ctx.db,
-        &ctx.secret_vault,
-        &crate::redact::RedactionTable::empty(),
-    )
-    .await?;
+    let sealed =
+        crate::session::sealed_values::machine_scoped_sealed_redactions(&ctx.db, &ctx.secret_vault)
+            .await?;
     // Inject already-resolved command outputs only: a read-only debug
     // projection never executes provider auth commands.
     let mut store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())?;

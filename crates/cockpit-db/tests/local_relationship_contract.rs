@@ -1049,7 +1049,7 @@ fn schema_sections() -> (&'static str, &'static str) {
     )
 }
 
-fn effective_profiles() -> [(&'static str, schema_parser::Schema); 2] {
+fn effective_sections() -> [(&'static str, schema_parser::Schema); 2] {
     let (base, extended) = schema_sections();
     [
         ("local", schema_parser::parse(&[base])),
@@ -1065,8 +1065,8 @@ fn schema_digest(schema: &str) -> String {
 }
 
 #[test]
-fn effective_schema_profiles_are_ordered_closed_and_indexed() {
-    let [(local_name, local), (extended_name, extended)] = effective_profiles();
+fn schema_sections_are_ordered_closed_and_indexed() {
+    let [(local_name, local), (extended_name, extended)] = effective_sections();
     assert_eq!(local_name, "local");
     assert_eq!(extended_name, "extended");
     assert!(
@@ -1306,7 +1306,7 @@ fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
         schema_digest(RELATIONSHIP_INVENTORY),
         RELATIONSHIP_INVENTORY_REVIEW_DIGEST
     );
-    let [(_, local), (_, extended)] = effective_profiles();
+    let [(_, local), (_, extended)] = effective_sections();
     let inventory = relationship_inventory();
     let local_objects = schema_parser::classified_objects(&local)
         .map(|(object, _)| object.to_owned())
@@ -1359,7 +1359,7 @@ fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
 
 #[test]
 fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
-    let [(_, mut local), _] = effective_profiles();
+    let [(_, mut local), _] = effective_sections();
     let objects = schema_parser::classified_objects(&local)
         .map(|(object, _)| object.to_owned())
         .collect::<std::collections::BTreeSet<_>>();
@@ -1655,7 +1655,7 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
         "hot-query annotations drifted"
     );
 
-    let [(_, local), (_, extended)] = effective_profiles();
+    let [(_, local), (_, extended)] = effective_sections();
     for (
         marker,
         owner,

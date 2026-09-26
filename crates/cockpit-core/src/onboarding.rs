@@ -15,8 +15,9 @@ use zeroize::Zeroizing;
 
 use crate::db::Db;
 use crate::db::onboarding::{
-    OnboardingBootstrapState as DbBootstrapState, OnboardingReceiptRow,
-    OnboardingReceiptStatus as DbReceiptStatus, OnboardingSnapshotRow, OnboardingStage as DbStage,
+    OnboardingBootstrapState as DbBootstrapState, OnboardingOperationFingerprint,
+    OnboardingReceiptRow, OnboardingReceiptStatus as DbReceiptStatus, OnboardingSnapshotRow,
+    OnboardingStage as DbStage,
 };
 
 /// Typed rejection raised by the secure-intent authority before any vault
@@ -39,6 +40,16 @@ pub enum SecureIntentRejection {
     CapabilityUnpublished,
     #[error("selected secure-store placement is unavailable: {guidance}")]
     CapabilityUnavailable { guidance: String },
+    /// The client operation id is empty, too long, or in the reserved
+    /// internal namespace.
+    #[error("{0}")]
+    InvalidOperationId(String),
+    /// This exact operation was already decided and rejected.
+    #[error("this secure-store operation was rejected")]
+    PriorOperationRejected,
+    /// This exact operation's effect is uncertain and no vault exists.
+    #[error("this secure-store operation did not complete")]
+    PriorOperationUncertain,
 }
 
 /// Classify a secure-intent failure into the fixed wire rejection by type.
@@ -54,6 +65,11 @@ pub fn classify_secure_intent_error(
     if error
         .downcast_ref::<crate::db::onboarding::OnboardingRevisionConflict>()
         .is_some()
+        // An operation id reused with other parameters (or another
+        // passphrase) is a conflict with the recorded operation.
+        || error
+            .downcast_ref::<crate::db::onboarding::OnboardingOperationReused>()
+            .is_some()
     {
         return Wire::RevisionConflict;
     }
@@ -63,7 +79,12 @@ pub fn classify_secure_intent_error(
             | SecureIntentRejection::PassphraseRequired
             | SecureIntentRejection::PassphraseNotAllowed
             | SecureIntentRejection::NoActiveRun
-            | SecureIntentRejection::WrongStage => Wire::InvalidRequest,
+            | SecureIntentRejection::WrongStage
+            | SecureIntentRejection::InvalidOperationId(_)
+            | SecureIntentRejection::PriorOperationRejected => Wire::InvalidRequest,
+            SecureIntentRejection::PriorOperationUncertain => {
+                Wire::MaterializationFailed(Reason::Unclassified)
+            }
             SecureIntentRejection::CapabilityUnpublished
             | SecureIntentRejection::CapabilityUnavailable { .. } => {
                 Wire::PlacementUnavailable(Reason::CapabilityUnavailable)
@@ -120,14 +141,230 @@ pub fn secure_vault_open_options(
     })
 }
 
+/// Prefix of daemon-derived onboarding operation ids. Client operation ids
+/// may never use it, so an internal operation (a secure-store stage advance,
+/// a boot reconciliation) can never collide with, or be pre-empted by, a
+/// client's receipt.
+const INTERNAL_OPERATION_ID_PREFIX: &str = "cockpit-internal:";
+
+/// The single validator for client-supplied onboarding operation ids, run
+/// before any durable or irreversible effect.
+fn validate_client_operation_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 128 {
+        bail!("onboarding client operation id must be 1 to 128 bytes");
+    }
+    if id.starts_with(INTERNAL_OPERATION_ID_PREFIX) {
+        bail!("onboarding client operation id uses the reserved internal namespace");
+    }
+    Ok(())
+}
+
+/// A daemon-derived operation id. Fixed-width (a UUID or revision after the
+/// reserved prefix), so it always fits the receipt key whatever the client
+/// id length was.
+fn internal_operation_id(kind: &str, discriminator: impl std::fmt::Display) -> String {
+    format!("{INTERNAL_OPERATION_ID_PREFIX}{kind}:{discriminator}")
+}
+
+/// A secure-store intent after ingress: its validated identity, including a
+/// slow, salted binding of the passphrase value (see
+/// [`crate::secure_key::onboarding_passphrase_binding`]), and its one-shot
+/// passphrase. The identity is what a receipt replays against; the
+/// passphrase is consumed by materialization and never retained.
+pub struct SecureIntentSubmission {
+    run_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+    expected_revision: u64,
+    client_operation_id: String,
+    placement: OnboardingSecurePlacement,
+    passphrase: Option<Zeroizing<String>>,
+    fingerprint: OnboardingOperationFingerprint,
+}
+
+/// The secret-free lookup identity of a [`SecureIntentSubmission`]: what its
+/// receipt is keyed and fingerprinted by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureIntentKey {
+    run_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+    client_operation_id: String,
+    fingerprint: OnboardingOperationFingerprint,
+}
+
+impl SecureIntentSubmission {
+    pub fn key(&self) -> SecureIntentKey {
+        SecureIntentKey {
+            run_id: self.run_id,
+            attempt_id: self.attempt_id,
+            client_operation_id: self.client_operation_id.clone(),
+            fingerprint: self.fingerprint.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SecureIntentSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecureIntentSubmission")
+            .field("run_id", &self.run_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("expected_revision", &self.expected_revision)
+            .field("client_operation_id", &self.client_operation_id)
+            .field("placement", &self.placement)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// The canonical request identity of a client transition: kind, expected
+/// revision, and settlement correlation. It determines the outcome at that
+/// revision, so its receipt can answer a lost-acknowledgement retry after
+/// the checkpoint moved on.
+fn client_transition_fingerprint(
+    request: &ApplyOnboardingTransition,
+) -> Result<OnboardingOperationFingerprint> {
+    let canonical = format!(
+        "{}:{}:{}",
+        serde_json::to_string(&request.transition).context("encoding onboarding transition")?,
+        request.expected_revision,
+        serde_json::to_string(&request.settlement).context("encoding onboarding settlement")?,
+    );
+    Ok(OnboardingOperationFingerprint::client_transition(
+        &canonical,
+    ))
+}
+
 #[derive(Clone)]
 pub struct OnboardingAuthority {
     db: Db,
+    /// Test seam: fail the next secure intent's bookkeeping right after its
+    /// vault committed (receipt settlement), taking the production error path.
+    #[cfg(test)]
+    fail_next_post_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OnboardingAuthority {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self {
+            db,
+            #[cfg(test)]
+            fail_next_post_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn inject_post_commit_failure(&self) {
+        self.fail_next_post_commit
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a durable vault authority row exists: the commit point of a
+    /// secure-store materialization.
+    fn durable_vault_exists(&self) -> Result<bool> {
+        self.db
+            .blocking_write_for_sync_maintenance(cockpit_db::secret_vault::load_authority_conn)
+            .map(|authority| authority.is_some())
+    }
+
+    /// Validate a secure-store intent and derive its operation identity
+    /// before any lookup or effect.
+    pub async fn prepare_secure_intent(
+        &self,
+        request: ApplyOnboardingSecureIntent,
+    ) -> Result<SecureIntentSubmission> {
+        validate_client_operation_id(&request.client_operation_id)
+            .map_err(|error| SecureIntentRejection::InvalidOperationId(error.to_string()))?;
+        let passphrase = request.passphrase.map(|value| value.into_zeroizing());
+        let binding = match passphrase.as_ref() {
+            None => None,
+            Some(value) => {
+                let bytes = Zeroizing::new(value.as_bytes().to_vec());
+                let context = format!(
+                    "{}:{}:{}",
+                    request.run_id, request.attempt_id, request.client_operation_id
+                )
+                .into_bytes();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        crate::secure_key::onboarding_passphrase_binding(&bytes, &context)
+                    })
+                    .await
+                    .context("onboarding passphrase binding task failed")?
+                    .map_err(anyhow::Error::new)?,
+                )
+            }
+        };
+        let fingerprint = OnboardingOperationFingerprint::secure_store(
+            db_placement(request.placement),
+            binding.as_deref(),
+        );
+        Ok(SecureIntentSubmission {
+            run_id: request.run_id,
+            attempt_id: request.attempt_id,
+            expected_revision: request.expected_revision,
+            client_operation_id: request.client_operation_id,
+            placement: request.placement,
+            passphrase,
+            fingerprint,
+        })
+    }
+
+    /// The receipt of exactly this submission (any status) with the current
+    /// snapshot. An operation id reused for a different request is
+    /// [`crate::db::onboarding::OnboardingOperationReused`].
+    pub async fn secure_intent_receipt(
+        &self,
+        key: &SecureIntentKey,
+        host_capabilities: HostCapabilitySnapshot,
+    ) -> Result<Option<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)>> {
+        let Some((row, receipt_row)) = self
+            .db
+            .onboarding_receipt_with_fingerprint(
+                key.run_id,
+                key.attempt_id,
+                key.client_operation_id.clone(),
+                key.fingerprint.clone(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let receipt = receipt(receipt_row);
+        Ok(Some((
+            project(row, host_capabilities, Some(receipt.clone()))?,
+            receipt,
+        )))
+    }
+
+    /// The receipt of exactly this client transition request, if it already
+    /// committed: the answer to a retried request whose acknowledgement was
+    /// lost. Checked before any revision comparison.
+    pub async fn transition_replay(
+        &self,
+        request: &ApplyOnboardingTransition,
+        host_capabilities: HostCapabilitySnapshot,
+    ) -> Result<Option<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)>> {
+        validate_client_operation_id(&request.client_operation_id)?;
+        let Some((row, receipt_row)) = self
+            .db
+            .onboarding_receipt_with_fingerprint(
+                request.run_id,
+                request.attempt_id,
+                request.client_operation_id.clone(),
+                client_transition_fingerprint(request)?,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let receipt = receipt(receipt_row);
+        Ok(Some((
+            project(row, host_capabilities, Some(receipt.clone()))?,
+            receipt,
+        )))
     }
 
     pub async fn snapshot(
@@ -160,9 +397,7 @@ impl OnboardingAuthority {
         request: BeginOrReopenOnboarding,
         host_capabilities: HostCapabilitySnapshot,
     ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)> {
-        if request.client_operation_id.is_empty() {
-            bail!("onboarding client operation id is required");
-        }
+        validate_client_operation_id(&request.client_operation_id)?;
         let (row, receipt_row) = self
             .db
             .onboarding_begin_or_reopen(
@@ -174,6 +409,37 @@ impl OnboardingAuthority {
         let receipt = receipt(receipt_row);
         let snapshot = project(row, host_capabilities, Some(receipt.clone()))?;
         Ok((snapshot, receipt))
+    }
+
+    /// Idempotent replay of an already committed secure-store intent. Once
+    /// the vault authority exists a fresh materialization is impossible, but
+    /// the same submission (same run, attempt, and client operation id) may
+    /// legitimately arrive again after its response was lost. It resolves to
+    /// the committed receipt and the current snapshot instead of an opaque
+    /// rejection. Anything else (another operation id, an uncommitted
+    /// receipt) returns `None` and the caller keeps its fail-closed denial.
+    pub async fn committed_secure_intent_replay(
+        &self,
+        key: &SecureIntentKey,
+        host_capabilities: HostCapabilitySnapshot,
+    ) -> Result<Option<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)>> {
+        // Only the exact secure-store operation replays: the receipt must be
+        // of the `secure_store` kind with this request's fingerprint (which
+        // binds the passphrase value). A receipt of another operation sharing
+        // the id is not evidence that this intent committed.
+        let Some((_, committed)) = self
+            .secure_intent_receipt(key, host_capabilities.clone())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if committed.status != OnboardingReceiptStatus::Committed {
+            return Ok(None);
+        }
+        let Some(snapshot) = self.snapshot(host_capabilities).await? else {
+            return Ok(None);
+        };
+        Ok(Some((snapshot, committed)))
     }
 
     /// Apply an intent through the only secret-bearing onboarding boundary.
@@ -193,51 +459,100 @@ impl OnboardingAuthority {
     where
         F: FnOnce(OnboardingSecurePlacement, Option<Zeroizing<String>>) -> Result<()>,
     {
+        let submission = self.prepare_secure_intent(request).await?;
+        self.apply_prepared_secure_intent_with(
+            submission,
+            host_capabilities,
+            vault_authority_exists,
+            materialize,
+        )
+        .await
+    }
+
+    /// [`Self::apply_secure_intent_with`] for an already prepared submission.
+    ///
+    /// A prior receipt of this exact submission answers only by its own
+    /// status: `Committed` is the applied result; `Rejected`, `Unknown`, or a
+    /// still-`Pending` receipt is never reported as success. After the
+    /// effect, the receipt settles from durable evidence: a materializer
+    /// error with a vault authority present still committed the choice.
+    pub async fn apply_prepared_secure_intent_with<F>(
+        &self,
+        mut submission: SecureIntentSubmission,
+        host_capabilities: HostCapabilitySnapshot,
+        vault_authority_exists: bool,
+        materialize: F,
+    ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)>
+    where
+        F: FnOnce(OnboardingSecurePlacement, Option<Zeroizing<String>>) -> Result<()>,
+    {
+        if let Some((snapshot, prior)) = self
+            .secure_intent_receipt(&submission.key(), host_capabilities.clone())
+            .await?
+        {
+            return match prior.status {
+                OnboardingReceiptStatus::Committed => Ok((snapshot, prior)),
+                OnboardingReceiptStatus::Rejected => {
+                    Err(SecureIntentRejection::PriorOperationRejected.into())
+                }
+                OnboardingReceiptStatus::Unknown | OnboardingReceiptStatus::Pending => {
+                    Err(SecureIntentRejection::PriorOperationUncertain.into())
+                }
+            };
+        }
         if vault_authority_exists {
             return Err(SecureIntentRejection::AlreadyCommitted.into());
         }
-        let client_operation_id = request.client_operation_id.clone();
-        let placement = request.placement;
-        let passphrase = request.passphrase.map(|value| value.into_zeroizing());
-        if let Some((snapshot, prior_receipt)) = self
-            .db
-            .onboarding_transition_receipt(
-                request.run_id,
-                request.attempt_id,
-                client_operation_id.clone(),
-                DbStage::SecureStore,
-                DbBootstrapState::Materializing,
-                false,
-                Some(db_placement(placement)),
-            )
-            .await?
-        {
-            let receipt = receipt(prior_receipt);
-            return Ok((
-                project(snapshot, host_capabilities, Some(receipt.clone()))?,
-                receipt,
-            ));
-        }
+        let placement = submission.placement;
+        let passphrase = submission.passphrase.take();
         let (pending, pending_receipt) = self
-            .record_secure_intent(
-                request.run_id,
-                request.attempt_id,
-                request.expected_revision,
-                client_operation_id.clone(),
-                placement,
-                passphrase.is_some(),
-                host_capabilities.clone(),
-            )
+            .record_secure_intent(&submission, passphrase.is_some(), host_capabilities.clone())
             .await?;
         if let Err(error) = materialize(placement, passphrase) {
-            self.db
-                .onboarding_set_pending_receipt_status(
-                    pending_receipt.receipt_id,
-                    DbReceiptStatus::Unknown,
-                )
-                .await
-                .context("recording uncertain secure-store materialization")?;
-            return Err(error);
+            // The authority row is the commit point. Settle from it now when
+            // it can be read: absent means no effect (rejected), present
+            // means the choice committed despite the later error. Only an
+            // unreadable authority leaves the effect uncertain for
+            // reconciliation.
+            match self.durable_vault_exists() {
+                Ok(false) => {
+                    self.db
+                        .onboarding_settle_uncertain_receipt(
+                            pending_receipt.receipt_id,
+                            DbReceiptStatus::Rejected,
+                        )
+                        .await
+                        .context("recording a failed secure-store materialization")?;
+                    return Err(error);
+                }
+                Ok(true) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "secure-store materialization reported an error after its vault authority committed; settling the choice as committed"
+                    );
+                }
+                Err(evidence) => {
+                    tracing::warn!(
+                        error = %format!("{evidence:#}"),
+                        "vault authority unreadable after a failed materialization; the outcome stays uncertain"
+                    );
+                    self.db
+                        .onboarding_set_pending_receipt_status(
+                            pending_receipt.receipt_id,
+                            DbReceiptStatus::Unknown,
+                        )
+                        .await
+                        .context("recording uncertain secure-store materialization")?;
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_post_commit
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            bail!("injected failure settling the committed secure-store receipt");
         }
         self.db
             .onboarding_set_pending_receipt_status(
@@ -248,7 +563,7 @@ impl OnboardingAuthority {
         let (ready, _) = self
             .mark_secure_store_ready(
                 &pending,
-                format!("{client_operation_id}:ready"),
+                internal_operation_id("secure-store-ready", pending_receipt.receipt_id),
                 host_capabilities.clone(),
             )
             .await?;
@@ -261,14 +576,14 @@ impl OnboardingAuthority {
 
     async fn record_secure_intent(
         &self,
-        run_id: uuid::Uuid,
-        attempt_id: uuid::Uuid,
-        expected_revision: u64,
-        client_operation_id: String,
-        placement: OnboardingSecurePlacement,
+        submission: &SecureIntentSubmission,
         passphrase_present: bool,
         host_capabilities: HostCapabilitySnapshot,
     ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)> {
+        let run_id = submission.run_id;
+        let attempt_id = submission.attempt_id;
+        let expected_revision = submission.expected_revision;
+        let placement = submission.placement;
         match placement {
             OnboardingSecurePlacement::PassphraseFile if !passphrase_present => {
                 return Err(SecureIntentRejection::PassphraseRequired.into());
@@ -316,13 +631,11 @@ impl OnboardingAuthority {
         }
         let (row, receipt_row) = self
             .db
-            .onboarding_transition_pending(
+            .onboarding_secure_intent_pending(
                 current,
-                client_operation_id,
-                DbStage::SecureStore,
-                DbBootstrapState::Materializing,
-                false,
-                Some(db_placement(placement)),
+                submission.client_operation_id.clone(),
+                db_placement(placement),
+                submission.fingerprint.clone(),
                 stage_entry_config_generation(),
             )
             .await?;
@@ -345,6 +658,29 @@ impl OnboardingAuthority {
         let Some(current) = self.db.onboarding_snapshot().await? else {
             return Ok(None);
         };
+        // Every unsettled (`pending` or `unknown`) secure-store receipt is
+        // terminalized from the durable evidence first, at every crash
+        // boundary. Effects are serialized and a committed vault refuses
+        // every later intent, so only the latest unsettled operation can be
+        // the one that committed: it settles committed when the vault proves
+        // the effect and rejected otherwise; any earlier one did not commit.
+        // Idempotent under concurrent reconcilers (boot, construction).
+        let uncertain = self
+            .db
+            .onboarding_uncertain_secure_intent_receipts()
+            .await?;
+        let latest = uncertain.last().map(|receipt| receipt.receipt_id);
+        for receipt in &uncertain {
+            let status = if vault_authority_exists && Some(receipt.receipt_id) == latest {
+                DbReceiptStatus::Committed
+            } else {
+                DbReceiptStatus::Rejected
+            };
+            self.db
+                .onboarding_settle_uncertain_receipt(receipt.receipt_id, status)
+                .await
+                .context("terminalizing an interrupted secure-store receipt")?;
+        }
         if current.bootstrap_state != DbBootstrapState::Materializing {
             return Ok(Some(project(current, host_capabilities, None)?));
         }
@@ -365,7 +701,7 @@ impl OnboardingAuthority {
         } else {
             (DbStage::SecureStore, DbBootstrapState::AwaitingChoice, None)
         };
-        let operation_id = format!("bootstrap-reconcile-{}", current.revision);
+        let operation_id = internal_operation_id("bootstrap-reconcile", current.revision);
         let (snapshot, _) = self
             .db
             .onboarding_transition(
@@ -379,64 +715,6 @@ impl OnboardingAuthority {
             )
             .await?;
         Ok(Some(project(snapshot, host_capabilities, None)?))
-    }
-
-    pub async fn mark_ready_construction_failed(
-        &self,
-        host_capabilities: HostCapabilitySnapshot,
-    ) -> Result<OnboardingBootstrapSnapshot> {
-        let current = self
-            .db
-            .onboarding_snapshot()
-            .await?
-            .context("no onboarding run exists")?;
-        if current.bootstrap_state == DbBootstrapState::Failed {
-            return project(current, host_capabilities, None);
-        }
-        let selected_secure_placement = current.selected_secure_placement;
-        let limited_mode = current.limited_mode;
-        let stage = current.stage;
-        let revision = current.revision;
-        let (row, _) = self
-            .db
-            .onboarding_transition(
-                current,
-                format!("ready-construction-failed-{revision}"),
-                stage,
-                DbBootstrapState::Failed,
-                limited_mode,
-                selected_secure_placement,
-                stage_entry_config_generation(),
-            )
-            .await?;
-        project(row, host_capabilities, None)
-    }
-
-    pub async fn mark_ready_construction_recovered(&self) -> Result<()> {
-        let current = self
-            .db
-            .onboarding_snapshot()
-            .await?
-            .context("no onboarding run exists")?;
-        if current.bootstrap_state != DbBootstrapState::Failed {
-            return Ok(());
-        }
-        let selected_secure_placement = current.selected_secure_placement;
-        let limited_mode = current.limited_mode;
-        let stage = current.stage;
-        let revision = current.revision;
-        self.db
-            .onboarding_transition(
-                current,
-                format!("ready-construction-recovered-{revision}"),
-                stage,
-                DbBootstrapState::Ready,
-                limited_mode,
-                selected_secure_placement,
-                stage_entry_config_generation(),
-            )
-            .await?;
-        Ok(())
     }
 
     pub async fn mark_secure_store_ready(
@@ -483,9 +761,17 @@ impl OnboardingAuthority {
         request: ApplyOnboardingTransition,
         host_capabilities: HostCapabilitySnapshot,
     ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)> {
+        validate_client_operation_id(&request.client_operation_id)?;
         if request.settlement.is_some() {
             bail!("settlement correlation is only valid for provider, model, or agent advance");
         }
+        if let Some(replayed) = self
+            .transition_replay(&request, host_capabilities.clone())
+            .await?
+        {
+            return Ok(replayed);
+        }
+        let fingerprint = client_transition_fingerprint(&request)?;
         let current = self
             .db
             .onboarding_snapshot()
@@ -501,6 +787,7 @@ impl OnboardingAuthority {
         self.commit_transition(
             current,
             request.client_operation_id,
+            fingerprint,
             stage,
             limited_mode,
             host_capabilities,
@@ -515,6 +802,7 @@ impl OnboardingAuthority {
         request: ApplyOnboardingTransition,
         host_capabilities: HostCapabilitySnapshot,
     ) -> Result<(OnboardingBootstrapSnapshot, OnboardingTransitionReceipt)> {
+        validate_client_operation_id(&request.client_operation_id)?;
         let settlement = request
             .settlement
             .as_ref()
@@ -530,6 +818,13 @@ impl OnboardingAuthority {
         {
             bail!("onboarding settlement does not match the active run checkpoint");
         }
+        if let Some(replayed) = self
+            .transition_replay(&request, host_capabilities.clone())
+            .await?
+        {
+            return Ok(replayed);
+        }
+        let fingerprint = client_transition_fingerprint(&request)?;
         let current = self
             .db
             .onboarding_snapshot()
@@ -553,6 +848,7 @@ impl OnboardingAuthority {
         self.commit_transition(
             current,
             request.client_operation_id,
+            fingerprint,
             next,
             false,
             host_capabilities,
@@ -564,6 +860,7 @@ impl OnboardingAuthority {
         &self,
         current: OnboardingSnapshotRow,
         client_operation_id: String,
+        fingerprint: OnboardingOperationFingerprint,
         stage: DbStage,
         limited_mode: bool,
         host_capabilities: HostCapabilitySnapshot,
@@ -571,9 +868,10 @@ impl OnboardingAuthority {
         let selected_secure_placement = current.selected_secure_placement;
         let (row, receipt_row) = self
             .db
-            .onboarding_transition(
+            .onboarding_client_transition(
                 current,
                 client_operation_id,
+                fingerprint,
                 stage,
                 DbBootstrapState::Ready,
                 limited_mode,
@@ -696,7 +994,6 @@ fn bootstrap_state(value: DbBootstrapState) -> OnboardingBootstrapState {
         DbBootstrapState::AwaitingPassphrase => OnboardingBootstrapState::AwaitingPassphrase,
         DbBootstrapState::Materializing => OnboardingBootstrapState::Materializing,
         DbBootstrapState::Ready => OnboardingBootstrapState::Ready,
-        DbBootstrapState::Failed => OnboardingBootstrapState::Failed,
     }
 }
 
@@ -781,6 +1078,409 @@ mod tests {
             .await
             .unwrap()
             .0
+    }
+
+    fn machine_bound_intent(
+        secure: &OnboardingBootstrapSnapshot,
+        client_operation_id: &str,
+    ) -> ApplyOnboardingSecureIntent {
+        ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: client_operation_id.into(),
+            placement: OnboardingSecurePlacement::MachineBoundFile,
+            passphrase: None,
+        }
+    }
+
+    /// The crash boundaries of one secure-store intent, simulated on the
+    /// durable rows: after the pending receipt, after the vault commit (the
+    /// receipt still pending), after the receipt commit (the stage not yet
+    /// advanced), and after the stage advance. Boot reconciliation must
+    /// terminalize the ORIGINAL operation's receipt from the vault evidence at
+    /// every one of them, so the original client operation replays.
+    #[derive(Clone, Copy, Debug)]
+    enum CrashBoundary {
+        PendingReceiptNoVault,
+        VaultCommittedReceiptPending,
+        ReceiptCommittedStageNotAdvanced,
+        StageAdvanced,
+    }
+
+    async fn crash_at(
+        boundary: CrashBoundary,
+    ) -> (OnboardingAuthority, OnboardingBootstrapSnapshot) {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db);
+        let secure = secure_stage(&authority).await;
+        let submission = authority
+            .prepare_secure_intent(machine_bound_intent(&secure, "crash-intent"))
+            .await
+            .unwrap();
+        let (pending, pending_receipt) = authority
+            .record_secure_intent(&submission, false, capabilities())
+            .await
+            .unwrap();
+        match boundary {
+            CrashBoundary::PendingReceiptNoVault | CrashBoundary::VaultCommittedReceiptPending => {}
+            CrashBoundary::ReceiptCommittedStageNotAdvanced => {
+                authority
+                    .db
+                    .onboarding_set_pending_receipt_status(
+                        pending_receipt.receipt_id,
+                        DbReceiptStatus::Committed,
+                    )
+                    .await
+                    .unwrap();
+            }
+            CrashBoundary::StageAdvanced => {
+                authority
+                    .db
+                    .onboarding_set_pending_receipt_status(
+                        pending_receipt.receipt_id,
+                        DbReceiptStatus::Committed,
+                    )
+                    .await
+                    .unwrap();
+                authority
+                    .mark_secure_store_ready(
+                        &pending,
+                        internal_operation_id("secure-store-ready", pending_receipt.receipt_id),
+                        capabilities(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        (authority, secure)
+    }
+
+    #[tokio::test]
+    async fn boot_reconciliation_terminalizes_the_original_receipt_at_every_crash_boundary() {
+        for boundary in [
+            CrashBoundary::PendingReceiptNoVault,
+            CrashBoundary::VaultCommittedReceiptPending,
+            CrashBoundary::ReceiptCommittedStageNotAdvanced,
+            CrashBoundary::StageAdvanced,
+        ] {
+            let (authority, secure) = crash_at(boundary).await;
+            let vault_exists = !matches!(boundary, CrashBoundary::PendingReceiptNoVault);
+            let reconciled = authority
+                .reconcile_materializing_secure_intent(vault_exists, capabilities())
+                .await
+                .unwrap()
+                .expect("run exists");
+            let original = authority
+                .receipt(cockpit_proto::OnboardingReceiptQuery {
+                    run_id: secure.run_id,
+                    attempt_id: secure.attempt_id,
+                    client_operation_id: "crash-intent".into(),
+                })
+                .await
+                .unwrap()
+                .expect("the original receipt exists");
+            let key = authority
+                .prepare_secure_intent(machine_bound_intent(&secure, "crash-intent"))
+                .await
+                .unwrap()
+                .key();
+            let replay = authority
+                .committed_secure_intent_replay(&key, capabilities())
+                .await
+                .unwrap();
+            if vault_exists {
+                assert_eq!(
+                    original.status,
+                    OnboardingReceiptStatus::Committed,
+                    "{boundary:?}: the vault proves the original effect"
+                );
+                assert_eq!(reconciled.stage, OnboardingStage::Provider, "{boundary:?}");
+                assert_eq!(reconciled.bootstrap_state, OnboardingBootstrapState::Ready);
+                assert!(
+                    replay.is_some(),
+                    "{boundary:?}: the original operation replays"
+                );
+            } else {
+                assert_eq!(
+                    original.status,
+                    OnboardingReceiptStatus::Rejected,
+                    "{boundary:?}: no vault, no effect"
+                );
+                assert_eq!(reconciled.stage, OnboardingStage::SecureStore);
+                assert!(replay.is_none());
+            }
+            // Idempotent: a second boot changes nothing.
+            let again = authority
+                .reconcile_materializing_secure_intent(vault_exists, capabilities())
+                .await
+                .unwrap()
+                .expect("run exists");
+            assert_eq!(again.revision, reconciled.revision, "{boundary:?}");
+        }
+    }
+
+    fn passphrase_intent(
+        secure: &OnboardingBootstrapSnapshot,
+        client_operation_id: &str,
+        passphrase: &str,
+    ) -> ApplyOnboardingSecureIntent {
+        ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: client_operation_id.into(),
+            placement: OnboardingSecurePlacement::PassphraseFile,
+            passphrase: Some(
+                SensitiveOnboardingPassphrase::confirmed(passphrase.into(), passphrase.into())
+                    .unwrap(),
+            ),
+        }
+    }
+
+    /// G8: the secure-store fingerprint binds the passphrase value. The same
+    /// operation id with the same passphrase replays; with a different
+    /// passphrase it is a conflict, never an `Applied` for a secret that was
+    /// not the one committed. The value itself is never stored.
+    #[tokio::test]
+    async fn secure_intent_replay_binds_the_passphrase_value() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db.clone());
+        let secure = secure_stage(&authority).await;
+        let (_, committed) = authority
+            .apply_secure_intent_with(
+                passphrase_intent(&secure, "bound-intent", "first-passphrase"),
+                capabilities(),
+                false,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        let same = authority
+            .prepare_secure_intent(passphrase_intent(
+                &secure,
+                "bound-intent",
+                "first-passphrase",
+            ))
+            .await
+            .unwrap();
+        let replay = authority
+            .committed_secure_intent_replay(&same.key(), capabilities())
+            .await
+            .unwrap()
+            .expect("the same passphrase replays");
+        assert_eq!(replay.1.receipt_id, committed.receipt_id);
+        let other = authority
+            .prepare_secure_intent(passphrase_intent(
+                &secure,
+                "bound-intent",
+                "second-passphrase",
+            ))
+            .await
+            .unwrap();
+        let error = authority
+            .committed_secure_intent_replay(&other.key(), capabilities())
+            .await
+            .expect_err("another passphrase under the same id is a conflict");
+        assert_eq!(
+            classify_secure_intent_error(&error),
+            cockpit_proto::SensitiveOnboardingIntentError::RevisionConflict
+        );
+        let stored = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT group_concat(operation_digest, '|') FROM onboarding_receipts",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )?)
+            })
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(!stored.contains("first-passphrase"));
+    }
+
+    /// F6/G2: a materializer error after the vault authority committed is a
+    /// committed choice (the authority row is the commit point), and boot
+    /// reconciliation settles `unknown` receipts from the vault evidence:
+    /// the latest unsettled operation is the one that committed, earlier
+    /// ones did not.
+    #[tokio::test]
+    async fn uncertain_secure_intents_settle_from_the_vault_authority() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db.clone());
+        let secure = secure_stage(&authority).await;
+        let writer = db.clone();
+        let (committed_snapshot, committed) = authority
+            .apply_secure_intent_with(
+                machine_bound_intent(&secure, "commit-then-fail"),
+                capabilities(),
+                false,
+                move |_, _| {
+                    writer.blocking_write_for_sync_maintenance(|conn| {
+                        conn.execute(
+                            "INSERT INTO secret_vault_authority VALUES (1, 'database', 'database', 'machine_bound', 'test-fingerprint', 1, 1, 0)",
+                            [],
+                        )?;
+                        Ok(())
+                    })?;
+                    anyhow::bail!("opening the committed vault failed")
+                },
+            )
+            .await
+            .expect("a committed authority settles the choice as committed");
+        assert_eq!(committed.status, OnboardingReceiptStatus::Committed);
+        assert_eq!(committed_snapshot.stage, OnboardingStage::Provider);
+
+        // Boot reconciliation over two unsettled receipts: an earlier one and
+        // the latest, both left `unknown` by crashes before settlement.
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db.clone());
+        let secure = secure_stage(&authority).await;
+        let earlier = authority
+            .prepare_secure_intent(machine_bound_intent(&secure, "earlier"))
+            .await
+            .unwrap();
+        let (after_earlier, earlier_receipt) = authority
+            .record_secure_intent(&earlier, false, capabilities())
+            .await
+            .unwrap();
+        db.onboarding_set_pending_receipt_status(
+            earlier_receipt.receipt_id,
+            DbReceiptStatus::Unknown,
+        )
+        .await
+        .unwrap();
+        let latest = authority
+            .prepare_secure_intent(machine_bound_intent(&after_earlier, "latest"))
+            .await
+            .unwrap();
+        let (_, latest_receipt) = authority
+            .record_secure_intent(&latest, false, capabilities())
+            .await
+            .unwrap();
+        db.onboarding_set_pending_receipt_status(
+            latest_receipt.receipt_id,
+            DbReceiptStatus::Unknown,
+        )
+        .await
+        .unwrap();
+        let reconciled = authority
+            .reconcile_materializing_secure_intent(true, capabilities())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconciled.stage, OnboardingStage::Provider);
+        let status = |id: &str| {
+            let authority = authority.clone();
+            let query = cockpit_proto::OnboardingReceiptQuery {
+                run_id: secure.run_id,
+                attempt_id: secure.attempt_id,
+                client_operation_id: id.into(),
+            };
+            async move { authority.receipt(query).await.unwrap().unwrap().status }
+        };
+        assert_eq!(status("latest").await, OnboardingReceiptStatus::Committed);
+        assert_eq!(status("earlier").await, OnboardingReceiptStatus::Rejected);
+        // Idempotent under a concurrent or repeated reconciler.
+        authority
+            .reconcile_materializing_secure_intent(true, capabilities())
+            .await
+            .unwrap();
+        assert_eq!(status("latest").await, OnboardingReceiptStatus::Committed);
+    }
+
+    /// G9: a client transition whose acknowledgement was lost is re-sent
+    /// unchanged after the checkpoint moved on; it answers from its receipt
+    /// (same receipt, no second revision) instead of a revision conflict.
+    /// The same id with a different request is a conflict.
+    #[tokio::test]
+    async fn lost_ack_transition_retry_returns_the_original_result() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db);
+        let (welcome, _) = authority
+            .begin_or_reopen(
+                BeginOrReopenOnboarding {
+                    expected_revision: None,
+                    client_operation_id: "begin".into(),
+                    reentry: false,
+                },
+                capabilities(),
+            )
+            .await
+            .unwrap();
+        let request = ApplyOnboardingTransition {
+            run_id: welcome.run_id,
+            attempt_id: welcome.attempt_id,
+            expected_revision: welcome.revision,
+            client_operation_id: "advance-welcome".into(),
+            transition: OnboardingTransitionKind::Advance,
+            settlement: None,
+        };
+        let (first, first_receipt) = authority
+            .apply_transition(request.clone(), capabilities())
+            .await
+            .unwrap();
+        let (retried, retried_receipt) = authority
+            .apply_transition(request.clone(), capabilities())
+            .await
+            .expect("the lost-ack retry answers from its receipt");
+        assert_eq!(retried_receipt.receipt_id, first_receipt.receipt_id);
+        assert_eq!(retried.revision, first.revision, "no second revision");
+        let replay = authority
+            .transition_replay(&request, capabilities())
+            .await
+            .unwrap()
+            .expect("the receipt answers before any revision check");
+        assert_eq!(replay.1.receipt_id, first_receipt.receipt_id);
+        let reused = authority
+            .apply_transition(
+                ApplyOnboardingTransition {
+                    transition: OnboardingTransitionKind::Back,
+                    ..request
+                },
+                capabilities(),
+            )
+            .await
+            .expect_err("the same id for a different request is a conflict");
+        assert!(
+            reused
+                .downcast_ref::<crate::db::onboarding::OnboardingOperationReused>()
+                .is_some(),
+            "{reused:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_internal_operation_ids_are_rejected_before_any_effect() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let authority = OnboardingAuthority::new(db);
+        let secure = secure_stage(&authority).await;
+        let materialized = Arc::new(AtomicUsize::new(0));
+        let calls = materialized.clone();
+        let error = authority
+            .apply_secure_intent_with(
+                machine_bound_intent(&secure, "cockpit-internal:secure-store-ready:x"),
+                capabilities(),
+                false,
+                move |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("reserved namespace");
+        assert!(error.to_string().contains("reserved"), "{error:#}");
+        assert_eq!(materialized.load(Ordering::SeqCst), 0);
+        let too_long = authority
+            .apply_secure_intent_with(
+                machine_bound_intent(&secure, &"y".repeat(129)),
+                capabilities(),
+                false,
+                |_, _| panic!("an over-long id must be rejected before materialization"),
+            )
+            .await;
+        assert!(too_long.is_err());
     }
 
     #[tokio::test]
@@ -942,7 +1642,7 @@ mod tests {
                 anyhow::bail!("materializer interrupted")
             })
             .await
-            .expect_err("failed materialization must leave an uncertain checkpoint");
+            .expect_err("failed materialization must leave a materializing checkpoint");
         assert!(error.to_string().contains("materializer interrupted"));
         let uncertain = authority
             .receipt(cockpit_proto::OnboardingReceiptQuery {
@@ -953,7 +1653,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(uncertain.status, OnboardingReceiptStatus::Unknown);
+        // No vault authority exists after the failure, and the authority row
+        // is the commit point: the operation definitively did not commit.
+        assert_eq!(uncertain.status, OnboardingReceiptStatus::Rejected);
         let resumed = authority
             .reconcile_materializing_secure_intent(false, capabilities())
             .await

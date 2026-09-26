@@ -4624,8 +4624,10 @@ pub(crate) fn locked_in_process_endpoint(
     let locked_for_connections = locked.clone();
     let locked_for_client_connections = locked_for_connections.clone();
     let ready_tx_for_watch = ready_tx.clone();
+    // Registered before the endpoint exists, so any construction this owner
+    // starts always has its consumer.
+    let mut ready_signal = locked_for_connections.subscribe_ready_handoff();
     tokio::spawn(async move {
-        let mut ready_signal = locked_for_connections.subscribe_ready_handoff();
         while ready_signal.changed().await.is_ok() {
             if !*ready_signal.borrow_and_update() {
                 continue;
@@ -4633,9 +4635,16 @@ pub(crate) fn locked_in_process_endpoint(
             let Some(constructed) = locked_for_connections.take_achieved_ready() else {
                 continue;
             };
+            if locked_for_connections
+                .stop_requested
+                .load(Ordering::Acquire)
+            {
+                // A stop was acknowledged while construction ran.
+                constructed.retire_for_stop();
+                break;
+            }
             if constructed
                 .publish_context_to_watch(&ready_tx_for_watch)
-                .await
                 .is_ok()
             {
                 break;
@@ -4660,31 +4669,21 @@ pub(crate) fn locked_in_process_endpoint(
             if request.reply.is_closed() {
                 continue;
             }
-            let response = if ready_tx.borrow().is_some() {
-                cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                    cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
-                )
+            let published = ready_tx.borrow().clone();
+            let response = if let Some(ctx) = published {
+                // After publication the ready services own the sensitive
+                // funnel (including an idempotent replay of the committed
+                // submission), exactly like a reconnected ready endpoint.
+                if !request.payload.starts_with(b"COBSI001") {
+                    cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+                        cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
+                    )
+                } else {
+                    handle_ready_onboarding_secure_intent(&ctx, &request.payload).await
+                }
             } else {
                 match cockpit_proto::decode_sensitive_onboarding_intent(&request.payload) {
-                    Ok(frame) => {
-                        match locked.apply_secure_intent(frame.request).await {
-                            Ok(result) => match locked.finish_ready_transition().await {
-                                Ok(constructed) => {
-                                    constructed
-                                        .finalize_sensitive_in_process(&ready_tx, result)
-                                        .await
-                                }
-                                Err(_) => {
-                                    cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                                        cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
-                                    )
-                                }
-                            }
-                            Err(error) => {
-                                cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(error)
-                            }
-                        }
-                    }
+                    Ok(frame) => apply_locked_secure_intent(&locked, frame.request).await,
                     Err(_) => cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
                         cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
                     ),
@@ -4713,19 +4712,9 @@ fn spawn_locked_in_process_client(
                 request.request,
                 cockpit_proto::Request::RetryOnboardingReadyConstruction
             ) {
-                match locked.prepare_retry_ready_handoff().await {
-                    Ok((response, constructed)) => {
-                        if request.reply.send(Ok(response)).is_ok() {
-                            constructed.publish_stored();
-                        }
-                    }
-                    Err(error) => {
-                        let _ = request.reply.send(Err(ErrorPayload {
-                            code: ErrorCode::BootstrapLocked,
-                            message: error.to_string(),
-                        }));
-                    }
-                }
+                let _ = request
+                    .reply
+                    .send(retry_locked_ready_construction(&locked).await);
                 continue;
             }
             let result = handle_locked_in_process_request(&locked, request.request).await;
@@ -4736,6 +4725,55 @@ fn spawn_locked_in_process_client(
         requests: request_tx,
         events: event_rx,
     }
+}
+
+/// Apply a secure-store intent on a locked owner and, once the vault has
+/// committed, hand ready construction to the daemon-owned funnel — one
+/// ownership span (see [`LockedServices::apply_secure_intent_span`]). The
+/// response reports the committed transition immediately; it is a
+/// notification, not part of construction, so a lost or undeliverable
+/// response cannot affect the ready graph. Clients observe readiness through
+/// the locked hello's `ready_construction` phase and reconcile a lost
+/// response from the committed receipt.
+async fn apply_locked_secure_intent(
+    locked: &Arc<LockedServices>,
+    request: cockpit_proto::ApplyOnboardingSecureIntent,
+) -> cockpit_proto::SensitiveOnboardingIntentResponse {
+    match locked.apply_secure_intent_span(request).await {
+        Ok(result) => cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result),
+        Err(error) => cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(error),
+    }
+}
+
+/// `retry_onboarding_ready_construction` on a locked owner: (re)start the
+/// daemon-owned construction and answer with the current snapshot at once.
+/// Idempotent while construction runs. The caller waits for readiness on the
+/// hello phase; it never owns, and so can never cancel, the construction.
+async fn retry_locked_ready_construction(
+    locked: &Arc<LockedServices>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let outcome = async {
+        let started = locked.start_ready_construction()?;
+        tracing::info!(?started, "onboarding ready construction retry admitted");
+        #[cfg(test)]
+        if locked
+            .fail_next_retry_snapshot
+            .swap(false, Ordering::AcqRel)
+        {
+            anyhow::bail!("injected retry snapshot failure");
+        }
+        Ok::<_, anyhow::Error>(Response::OnboardingBootstrapSnapshot(
+            locked
+                .onboarding
+                .snapshot(locked.host_capabilities())
+                .await?,
+        ))
+    }
+    .await;
+    outcome.map_err(|error| ErrorPayload {
+        code: ErrorCode::BootstrapLocked,
+        message: format!("daemon bootstrap is locked: {error:#}"),
+    })
 }
 
 /// Settle the native onboarding profile display name through the locked bootstrap.
@@ -4789,6 +4827,14 @@ async fn apply_locked_onboarding_profile(
 fn locked_error_payload(error: &anyhow::Error) -> ErrorPayload {
     const PLAIN: &str = "daemon bootstrap is locked";
     const ADMISSION: &str = "bootstrap is locked";
+    if error.is::<ReadyConstructionInProgress>() {
+        // Self-resolving: the same request succeeds against the ready
+        // services construction is about to publish.
+        return ErrorPayload {
+            code: ErrorCode::RetryLater,
+            message: format!("{PLAIN}: {error}"),
+        };
+    }
     let message = if error.to_string() == ADMISSION {
         PLAIN.to_string()
     } else {
@@ -4800,121 +4846,148 @@ fn locked_error_payload(error: &anyhow::Error) -> ErrorPayload {
     }
 }
 
+/// The locked bootstrap allowlist, shared by the socket and in-process
+/// transports (one funnel: admission, exclusion, and denial semantics are
+/// identical on both). `authenticated` is the transport's owner-class
+/// verdict; transport-specific requests (the peer-credential exchange, the
+/// ready-construction retry) are handled by the caller before this.
+/// `StopDaemon` only acknowledges here: each transport retires the owner
+/// after its response is delivered.
+async fn dispatch_locked_bootstrap_request(
+    locked: &LockedServices,
+    request: Request,
+    authenticated: bool,
+) -> Result<Response> {
+    match request {
+        Request::DaemonStatus => {
+            locked_bootstrap_hello_for_any_platform(locked, authenticated).await
+        }
+        _ if !authenticated => Err(anyhow::anyhow!("bootstrap peer is not authenticated")),
+        Request::GetOnboardingBootstrapSnapshot => Ok(Response::OnboardingBootstrapSnapshot(
+            locked
+                .onboarding
+                .snapshot(locked.host_capabilities())
+                .await?,
+        )),
+        Request::BeginOrReopenOnboarding(request) => {
+            let Some(_admission) = locked.admit_locked_mutation().await else {
+                return Err(locked.locked_mutation_denied());
+            };
+            let (snapshot, receipt) = locked
+                .onboarding
+                .begin_or_reopen(request, locked.host_capabilities())
+                .await?;
+            Ok(Response::OnboardingTransition(
+                cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+            ))
+        }
+        Request::GetOnboardingTransitionReceipt(query) => Ok(
+            Response::OnboardingTransitionReceipt(locked.onboarding.receipt(query).await?),
+        ),
+        Request::GetWorkspaceTrust { project_root } => {
+            let decision = locked
+                .db
+                .workspace_trust_by_root(PathBuf::from(&project_root).as_path())
+                .await?;
+            Ok(Response::WorkspaceTrust {
+                mode: decision.map(|decision| match decision.mode {
+                    crate::db::workspace_trust::WorkspaceTrustMode::Trust => {
+                        cockpit_proto::WorkspaceTrustMode::Trust
+                    }
+                    crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig => {
+                        cockpit_proto::WorkspaceTrustMode::IgnoreConfig
+                    }
+                    crate::db::workspace_trust::WorkspaceTrustMode::Untrusted => {
+                        cockpit_proto::WorkspaceTrustMode::Untrusted
+                    }
+                }),
+                config_generation: inventory::current_config_generation(),
+            })
+        }
+        Request::StopDaemon { .. } => Ok(Response::Ack),
+        Request::ApplyOnboardingTransition(request) => {
+            // A retried request whose acknowledgement was lost answers from
+            // its receipt before any admission or revision check.
+            if let Some((snapshot, receipt)) = locked
+                .onboarding
+                .transition_replay(&request, locked.host_capabilities())
+                .await?
+            {
+                return Ok(Response::OnboardingTransition(
+                    cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+                ));
+            }
+            let Some(_admission) = locked.admit_locked_mutation().await else {
+                return Err(locked.locked_mutation_denied());
+            };
+            let current = locked
+                .onboarding
+                .snapshot(locked.host_capabilities())
+                .await?
+                .context("onboarding run is absent")?;
+            // Admission covers every pre-vault stage; the authority's own
+            // legality rules (advances from Welcome/Profile, Back from
+            // Profile/SecureStore) reject everything else. A pre-vault stage
+            // must never offer a transition the locked matrix denies: that
+            // would make the stage uncompletable by keystroke.
+            anyhow::ensure!(
+                matches!(
+                    current.stage,
+                    cockpit_proto::OnboardingStage::Welcome
+                        | cockpit_proto::OnboardingStage::Profile
+                        | cockpit_proto::OnboardingStage::SecureStore
+                ),
+                "bootstrap is locked"
+            );
+            let (snapshot, receipt) = locked
+                .onboarding
+                .apply_transition(request, locked.host_capabilities())
+                .await?;
+            Ok(Response::OnboardingTransition(
+                cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+            ))
+        }
+        Request::ApplyOnboardingProfile(request) => {
+            let Some(_admission) = locked.admit_locked_mutation().await else {
+                return Err(locked.locked_mutation_denied());
+            };
+            apply_locked_onboarding_profile(locked, &request.display_name).await
+        }
+        // Ordinary services are unreachable until ready services publish.
+        // While the daemon-owned construction runs that is self-resolving.
+        _ => match locked.ready_construction_phase() {
+            cockpit_proto::LockedReadyConstruction::Constructing => {
+                Err(anyhow::Error::new(ReadyConstructionInProgress))
+            }
+            cockpit_proto::LockedReadyConstruction::Failed => Err(anyhow::anyhow!(
+                "ready services failed to start (see daemon.log); reopen cockpit or restart the daemon to retry"
+            )),
+            cockpit_proto::LockedReadyConstruction::AwaitingSecureStore => {
+                Err(anyhow::anyhow!("bootstrap is locked"))
+            }
+        },
+    }
+}
+
 async fn handle_locked_in_process_request(
     locked: &LockedServices,
     request: Request,
 ) -> std::result::Result<Response, ErrorPayload> {
-    if locked.locked_admission_denied() {
+    if locked.locked_connection_retired() {
         return Err(ErrorPayload {
             code: ErrorCode::BootstrapLocked,
-            message: "daemon bootstrap is locked: transition or shutdown is already in progress"
+            message: "daemon bootstrap is locked: ready handoff or shutdown is already in progress"
                 .into(),
         });
     }
-    let result: Result<Response> = async {
-        match request {
-            Request::DaemonStatus => locked_bootstrap_hello_for_any_platform(locked, true).await,
-            Request::GetOnboardingBootstrapSnapshot => Ok(Response::OnboardingBootstrapSnapshot(
-                locked
-                    .onboarding
-                    .snapshot(locked.host_capabilities())
-                    .await?,
-            )),
-            Request::BeginOrReopenOnboarding(request) => {
-                if !locked.begin_locked_mutation() {
-                    anyhow::bail!("bootstrap is locked");
-                }
-                let outcome = async {
-                    let (snapshot, receipt) = locked
-                        .onboarding
-                        .begin_or_reopen(request, locked.host_capabilities())
-                        .await?;
-                    Ok(Response::OnboardingTransition(
-                        cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-                    ))
-                }
-                .await;
-                locked.end_locked_mutation();
-                outcome
-            }
-            Request::GetOnboardingTransitionReceipt(query) => Ok(
-                Response::OnboardingTransitionReceipt(locked.onboarding.receipt(query).await?),
-            ),
-            Request::GetWorkspaceTrust { project_root } => {
-                let decision = locked
-                    .db
-                    .workspace_trust_by_root(PathBuf::from(&project_root).as_path())
-                    .await?;
-                Ok(Response::WorkspaceTrust {
-                    mode: decision.map(|decision| match decision.mode {
-                        crate::db::workspace_trust::WorkspaceTrustMode::Trust => {
-                            cockpit_proto::WorkspaceTrustMode::Trust
-                        }
-                        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig => {
-                            cockpit_proto::WorkspaceTrustMode::IgnoreConfig
-                        }
-                        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted => {
-                            cockpit_proto::WorkspaceTrustMode::Untrusted
-                        }
-                    }),
-                    config_generation: inventory::current_config_generation(),
-                })
-            }
-            Request::StopDaemon { .. } => {
-                locked.request_locked_stop();
-                Ok(Response::Ack)
-            }
-            Request::ApplyOnboardingTransition(request) => {
-                if !locked.begin_locked_mutation() {
-                    anyhow::bail!("bootstrap is locked");
-                }
-                let outcome = async {
-                    let current = locked
-                        .onboarding
-                        .snapshot(locked.host_capabilities())
-                        .await?
-                        .context("onboarding run is absent")?;
-                    // Admission covers every pre-vault stage; the authority's
-                    // own legality rules (advances from Welcome/Profile, Back
-                    // from Profile/SecureStore) reject everything else. A
-                    // pre-vault stage must never offer a transition the
-                    // locked matrix denies: that would make the stage
-                    // uncompletable by keystroke.
-                    anyhow::ensure!(
-                        matches!(
-                            current.stage,
-                            cockpit_proto::OnboardingStage::Welcome
-                                | cockpit_proto::OnboardingStage::Profile
-                                | cockpit_proto::OnboardingStage::SecureStore
-                        ),
-                        "bootstrap is locked"
-                    );
-                    let (snapshot, receipt) = locked
-                        .onboarding
-                        .apply_transition(request, locked.host_capabilities())
-                        .await?;
-                    Ok(Response::OnboardingTransition(
-                        cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-                    ))
-                }
-                .await;
-                locked.end_locked_mutation();
-                outcome
-            }
-            Request::ApplyOnboardingProfile(request) => {
-                if !locked.begin_locked_mutation() {
-                    anyhow::bail!("bootstrap is locked");
-                }
-                let outcome = apply_locked_onboarding_profile(locked, &request.display_name).await;
-                locked.end_locked_mutation();
-                outcome
-            }
-            _ => Err(anyhow::anyhow!("bootstrap is locked")),
-        }
+    let stop = matches!(&request, Request::StopDaemon { .. });
+    // In-process possession of the endpoint is the owner capability.
+    let result = dispatch_locked_bootstrap_request(locked, request, true).await;
+    if stop && result.is_ok() {
+        locked.request_locked_stop();
     }
-    .await;
     result.map_err(|error| {
-        tracing::warn!(%error, "locked in-process request rejected");
+        tracing::warn!(error = %format!("{error:#}"), "locked in-process request rejected");
         locked_error_payload(&error)
     })
 }
@@ -4926,7 +4999,7 @@ async fn locked_bootstrap_hello_for_any_platform(
     if authenticated {
         locked_bootstrap_hello(locked).await
     } else {
-        Ok(locked_bootstrap_hello_minimal())
+        Ok(locked_bootstrap_hello_minimal(locked))
     }
 }
 
@@ -4945,67 +5018,42 @@ fn classify_and_log_secure_intent_error(
     rejection
 }
 
+/// A secure-store intent that reaches ready services. Ready services exist
+/// only once the vault authority has committed, so the only possible answer
+/// is the idempotent replay of the exact committed submission (a response
+/// lost across the ready handoff); everything else is the fixed
+/// `InvalidRequest` denial. Materialization has exactly one funnel: the
+/// locked owner's [`LockedServices::apply_secure_intent_span`].
 pub(crate) async fn handle_ready_onboarding_secure_intent(
     ctx: &DaemonContext,
     payload: &[u8],
 ) -> cockpit_proto::SensitiveOnboardingIntentResponse {
-    let frame = match cockpit_proto::decode_sensitive_onboarding_intent(payload) {
-        Ok(frame) => frame,
-        Err(_) => {
-            return cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
-            );
-        }
+    let rejected = |error| cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(error);
+    let Ok(frame) = cockpit_proto::decode_sensitive_onboarding_intent(payload) else {
+        return rejected(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
     };
-    if ctx
-        .db
-        .blocking_write_for_sync_maintenance(cockpit_db::secret_vault::load_authority_conn)
-        .map(|authority| authority.is_some())
-        .unwrap_or(true)
-    {
-        return cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-            cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
-        );
-    }
     let capabilities = ctx
         .host_capabilities
         .current()
         .map(|snapshot| snapshot.as_ref().clone())
         .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished);
-    let db = ctx.db.clone();
-    let kek_dir = ctx
-        .secret_store_path
-        .clone()
-        .or_else(|| crate::secure_key::kek_dir_for_db(&db).ok());
-    let result = ctx
+    let submission = match ctx.onboarding.prepare_secure_intent(frame.request).await {
+        Ok(submission) => submission,
+        Err(error) => return rejected(classify_and_log_secure_intent_error(&error)),
+    };
+    match ctx
         .onboarding
-        .apply_secure_intent_with(
-            frame.request,
-            capabilities,
-            false,
-            move |placement, passphrase| {
-                let options = crate::onboarding::secure_vault_open_options(placement, passphrase)?;
-                let probe = crate::secure_key::probe_platform_keyring();
-                let kek_dir = kek_dir.context("resolving onboarding vault directory")?;
-                crate::secure_key::ensure_secret_vault_with_options(
-                    &db,
-                    &probe,
-                    &kek_dir,
-                    crate::secure_key::SecretStoreInjected::default(),
-                    options,
-                )
-                .map_err(|error| error.into_error())?;
-                Ok(())
-            },
-        )
-        .await;
-    match result {
-        Ok((snapshot, receipt)) => cockpit_proto::SensitiveOnboardingIntentResponse::Applied(
-            cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-        ),
-        Err(error) => cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-            classify_and_log_secure_intent_error(&error),
-        ),
+        .committed_secure_intent_replay(&submission.key(), capabilities)
+        .await
+    {
+        Ok(Some((snapshot, receipt))) => {
+            tracing::info!("replayed an already committed onboarding secure intent");
+            cockpit_proto::SensitiveOnboardingIntentResponse::Applied(
+                cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+            )
+        }
+        Ok(None) => rejected(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest),
+        Err(error) => rejected(classify_and_log_secure_intent_error(&error)),
     }
 }
 
@@ -5252,27 +5300,66 @@ pub(crate) struct LockedServices {
     /// this flag tells the locked run loop to tear every attached client
     /// down instead of waiting for the presence count to drain.
     stop_requested: AtomicBool,
+    /// Admitted onboarding mutations (ordinary and secure) not yet finished.
+    /// Only [`InflightMutation`] changes it, so a cancelled, failed, or
+    /// panicking mutation always gives its count back.
     inflight_mutations: AtomicUsize,
+    /// Woken whenever an admitted mutation ends (see
+    /// [`LockedServices::drain_inflight_mutations`]).
+    inflight_drained: tokio::sync::Notify,
     ready_transition_inflight: AtomicBool,
+    /// The ready-construction state machine: idle (never started, or its
+    /// owned commit step not yet handed to construction), running (a
+    /// construction or the secure intent's owned commit step owns it), or
+    /// failed (in memory, retryable). Owned by the construction funnel and
+    /// the secure intent's commit step, never by a client connection. The
+    /// reported [`cockpit_proto::LockedReadyConstruction`] is derived from it
+    /// together with `vault_committed` (see
+    /// [`LockedServices::ready_construction_phase`]).
+    ready_construction_phase: std::sync::atomic::AtomicU8,
+    /// Whether the durable vault authority exists: read at boot, set by
+    /// secure-store materialization the moment the vault commits, and
+    /// re-read from the durable authority after a materializer error. It
+    /// only ever tracks the authority row (monotonic while locked).
+    vault_committed: Arc<AtomicBool>,
+    /// The vault onboarding opened (with a passphrase vault's derived key
+    /// custody), handed to every ready-construction attempt so construction
+    /// never reopens it without the passphrase. Retries reuse it.
+    opened_vault: StdMutex<Option<crate::secure_key::EffectiveSecretStore>>,
+    /// Onboarding mutation exclusion. Ordinary locked onboarding mutations
+    /// (begin/reopen, transitions, the profile write) hold it shared; a
+    /// secure-store intent holds it exclusively across its whole span —
+    /// pending receipt, vault materialization, receipt settlement, and
+    /// construction admission — so no concurrent mutation can supersede its
+    /// attempt between the vault commit and the start of construction.
+    onboarding_exclusion: tokio::sync::RwLock<()>,
     ready_handoff: StdMutex<ReadyHandoffState>,
     ready_signal: watch::Sender<bool>,
     /// Locked bootstrap owns the same transport-lifetime invariant as the
     /// ready daemon. An ephemeral owner must retire after its final confirmed
     /// client disconnects even when no vault authority has been selected yet.
     client_presence: watch::Sender<ClientPresence>,
+    /// Test seam: hold ready construction at its start until released, so
+    /// tests can observe the locked owner while construction is in flight.
     #[cfg(test)]
-    fail_next_onboarding_snapshot: AtomicBool,
+    construction_gate: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Test seam: fail the next construction attempt with a real error that
+    /// takes the production rollback path.
+    #[cfg(test)]
+    fail_next_construction: AtomicBool,
+    /// Test seam: fail the retry's snapshot read after construction started.
+    #[cfg(test)]
+    fail_next_retry_snapshot: AtomicBool,
+    /// Test seam: panic inside the next secure-intent span after it was
+    /// admitted (counted), to prove unwinding gives the count back.
+    #[cfg(test)]
+    panic_next_secure_intent: AtomicBool,
 }
 
 /// Vault-bearing daemon composition. Ordinary dispatch and recovery accept
 /// this state only after the selected authority row has committed and opened.
 pub(crate) struct ReadyServices {
     pub(crate) context: DaemonContext,
-}
-
-pub(crate) enum BootServices {
-    Locked(LockedServices),
-    Ready(ReadyServices),
 }
 
 #[derive(Default)]
@@ -5325,15 +5412,13 @@ impl ReadyTransitionPermit {
         }
     }
 
-    async fn rollback(mut self) -> Result<()> {
-        let result = self.locked.rollback_failed_ready_handoff().await;
+    /// Roll back this permit's own failed attempt and release the permit.
+    /// Rollback is in-memory only (the retryable `failed` phase); the durable
+    /// installation state is unaffected by a failed construction.
+    fn rollback(mut self) {
         self.released = true;
-        if result.is_ok() {
-            self.locked.release_ready_transition();
-        } else {
-            tokio::spawn(rollback_and_release_ready_transition(self.locked.clone()));
-        }
-        result
+        self.locked.rollback_failed_ready_handoff();
+        self.locked.release_ready_transition();
     }
 }
 
@@ -5343,44 +5428,166 @@ impl Drop for ReadyTransitionPermit {
             return;
         }
         self.released = true;
-        if self.locked.closing.load(Ordering::Acquire) && !self.locked.ready.load(Ordering::Acquire)
+        // A permit dropped without publication or an explicit release is an
+        // abandoned attempt (its constructed services were never handed to
+        // a lifecycle owner): roll the in-memory phase back so a retry is
+        // admitted. Publication sets `ready` before releasing, so a
+        // published attempt never reaches this branch.
+        if !self.locked.ready.load(Ordering::Acquire) {
+            self.locked.rollback_failed_ready_handoff();
+        }
+        self.locked.release_ready_transition();
+    }
+}
+
+/// A locked mutation refused because the daemon-owned ready construction is
+/// running. Reported as [`ErrorCode::RetryLater`]: re-sending after the ready
+/// services publish is the documented recovery.
+#[derive(Debug)]
+struct ReadyConstructionInProgress;
+
+impl std::fmt::Display for ReadyConstructionInProgress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("onboarding ready construction is in progress")
+    }
+}
+
+impl std::error::Error for ReadyConstructionInProgress {}
+
+/// Another construction attempt holds the permit.
+#[derive(Debug)]
+struct ReadyConstructionAlreadyRunning;
+
+impl std::fmt::Display for ReadyConstructionAlreadyRunning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("onboarding ready construction is already in progress")
+    }
+}
+
+impl std::error::Error for ReadyConstructionAlreadyRunning {}
+
+/// Upper bound for one ready construction (ready-service boot plus
+/// pre-publication recovery). Past it the attempt fails into the retryable
+/// phase. It also bounds how long a supervisor stop waits for a worker that
+/// reports construction in progress before force-killing it.
+pub(crate) const READY_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// One admitted onboarding mutation's share of the inflight count. The
+/// guard exists before the count is incremented and is the only thing that
+/// decrements it, so a mutation that fails, is cancelled at any await, or
+/// unwinds always gives its count back and wakes the drain.
+struct InflightMutation<'a> {
+    locked: &'a LockedServices,
+    counted: bool,
+}
+
+impl<'a> InflightMutation<'a> {
+    /// Admit one mutation, or `None` when the owner is ready or closing.
+    fn begin(locked: &'a LockedServices) -> Option<Self> {
+        let mut guard = Self {
+            locked,
+            counted: false,
+        };
+        if locked.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        locked.inflight_mutations.fetch_add(1, Ordering::AcqRel);
+        guard.counted = true;
+        if locked.closing.load(Ordering::Acquire) {
+            // Dropping the guard gives the count back.
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+impl Drop for InflightMutation<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            self.counted = false;
+            self.locked
+                .inflight_mutations
+                .fetch_sub(1, Ordering::AcqRel);
+            self.locked.inflight_drained.notify_waiters();
+        }
+    }
+}
+
+/// One admitted ordinary locked onboarding mutation: counted in the
+/// inflight-mutation drain and holding the shared onboarding exclusion.
+struct LockedMutationAdmission<'a> {
+    _exclusion: tokio::sync::RwLockReadGuard<'a, ()>,
+    _inflight: InflightMutation<'a>,
+}
+
+/// The secure intent's owned commit step: from the vault commit until the
+/// commit is handed to a construction (which then owns the phase), the
+/// phase reports it running. If the span ends any other way — an error, a
+/// cancellation, an unwind — the phase becomes the retryable `failed`, never
+/// a permanent `constructing` that no construction owns.
+struct CommitStepGuard<'a> {
+    locked: &'a LockedServices,
+    handed_off: bool,
+}
+
+impl Drop for CommitStepGuard<'_> {
+    fn drop(&mut self) {
+        if self.handed_off || !self.locked.vault_committed() {
+            return;
+        }
+        let failed = self
+            .locked
+            .ready_construction_phase
+            .compare_exchange(
+                READY_CONSTRUCTION_RUNNING,
+                READY_CONSTRUCTION_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if self
+            .locked
+            .ready_transition_inflight
+            .load(Ordering::Acquire)
         {
-            let locked = self.locked.clone();
-            tokio::spawn(rollback_and_release_ready_transition(locked));
-        } else {
-            self.locked.release_ready_transition();
+            // A construction admitted meanwhile (a concurrent retry) owns the
+            // phase: it is running.
+            self.locked
+                .ready_construction_phase
+                .store(READY_CONSTRUCTION_RUNNING, Ordering::Release);
+            return;
+        }
+        if failed {
+            self.locked.wake_locked_run_loop();
         }
     }
 }
 
-async fn rollback_and_release_ready_transition(locked: Arc<LockedServices>) {
-    loop {
-        match locked.rollback_failed_ready_handoff().await {
-            Ok(()) => {
-                locked.release_ready_transition();
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    "ready-transition rollback failed; retaining ownership"
-                );
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        }
-    }
+/// Outcome of [`LockedServices::start_ready_construction`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadyConstructionStart {
+    Started,
+    AlreadyInProgress,
 }
 
+/// State encodings of [`LockedServices::ready_construction_phase`].
+const READY_CONSTRUCTION_IDLE: u8 = 0;
+const READY_CONSTRUCTION_RUNNING: u8 = 1;
+const READY_CONSTRUCTION_FAILED: u8 = 2;
+
+/// Ready services that finished construction and pre-publication recovery
+/// under the exclusive transition permit, waiting to be published by the
+/// lifecycle owner (the locked run loop or the in-process endpoint).
 struct ConstructedReady {
     locked: Arc<LockedServices>,
-    ready: Option<ReadyServices>,
+    ready: Option<Arc<DaemonContext>>,
     permit: ReadyTransitionPermit,
 }
 
 impl ConstructedReady {
     fn new(
         locked: Arc<LockedServices>,
-        ready: ReadyServices,
+        ready: Arc<DaemonContext>,
         permit: ReadyTransitionPermit,
     ) -> Self {
         Self {
@@ -5390,7 +5597,7 @@ impl ConstructedReady {
         }
     }
 
-    fn take_ready(&mut self) -> ReadyServices {
+    fn take_ready(&mut self) -> Arc<DaemonContext> {
         self.ready.take().expect("ready services already consumed")
     }
 
@@ -5399,22 +5606,20 @@ impl ConstructedReady {
         locked.store_achieved_ready(self);
     }
 
-    fn publish_returned(mut self) -> ReadyServices {
+    /// Publish to the owner that returns the ready context to
+    /// `run_foreground_inner`. The context has already been recovered.
+    fn publish_returned(mut self) -> Arc<DaemonContext> {
         let ready = self.take_ready();
         self.locked.ready.store(true, Ordering::Release);
         self.permit.release();
         ready
     }
 
-    async fn publish_context_to_watch(
+    fn publish_context_to_watch(
         mut self,
         ready_tx: &watch::Sender<Option<Arc<DaemonContext>>>,
     ) -> Result<()> {
-        let ready = self.take_ready();
-        let ctx = Arc::new(ready.context);
-        if let Err(error) = recover_before_socket_publish(&ctx).await {
-            return Err(error);
-        }
+        let ctx = self.take_ready();
         if ready_tx.send(Some(ctx)).is_err() {
             anyhow::bail!("ready context receiver closed before publication");
         }
@@ -5423,31 +5628,13 @@ impl ConstructedReady {
         Ok(())
     }
 
-    async fn finalize_sensitive_in_process(
-        self,
-        ready_tx: &watch::Sender<Option<Arc<DaemonContext>>>,
-        result: cockpit_proto::OnboardingTransitionResult,
-    ) -> cockpit_proto::SensitiveOnboardingIntentResponse {
-        if self.publish_context_to_watch(ready_tx).await.is_err() {
-            return cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
-            );
-        }
-        cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result)
-    }
-
-    async fn finalize_sensitive_wire(
-        self,
-        stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
-        result: cockpit_proto::OnboardingTransitionResult,
-    ) -> Result<ReadyServices> {
-        let response = cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result);
-        let bytes = cockpit_proto::encode_sensitive_onboarding_response(&response)
-            .map_err(anyhow::Error::msg)?;
-        stream.write_all(&bytes).await?;
-        stream.flush().await?;
-        stream.shutdown().await?;
-        Ok(self.publish_returned())
+    /// A stop was acknowledged while construction ran. Construction itself
+    /// succeeded and recorded its recovery, so this is not a failed handoff:
+    /// release the permit without the failure rollback (the next boot opens
+    /// the committed vault and boots ready) and drop the unpublished services.
+    fn retire_for_stop(mut self) {
+        drop(self.take_ready());
+        self.permit.release();
     }
 }
 
@@ -5532,12 +5719,23 @@ impl LockedServices {
             closing: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
             inflight_mutations: AtomicUsize::new(0),
+            inflight_drained: tokio::sync::Notify::new(),
             ready_transition_inflight: AtomicBool::new(false),
+            ready_construction_phase: std::sync::atomic::AtomicU8::new(READY_CONSTRUCTION_IDLE),
+            vault_committed: Arc::new(AtomicBool::new(false)),
+            opened_vault: StdMutex::new(None),
+            onboarding_exclusion: tokio::sync::RwLock::new(()),
             ready_handoff: StdMutex::new(ReadyHandoffState::default()),
             ready_signal,
             client_presence,
             #[cfg(test)]
-            fail_next_onboarding_snapshot: AtomicBool::new(false),
+            construction_gate: StdMutex::new(None),
+            #[cfg(test)]
+            fail_next_construction: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_retry_snapshot: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_next_secure_intent: AtomicBool::new(false),
         })
     }
 
@@ -5552,12 +5750,141 @@ impl LockedServices {
         self.closing.load(Ordering::Acquire) || self.ready.load(Ordering::Acquire)
     }
 
+    /// A locked connection is retired only by the ready handoff or an
+    /// acknowledged stop. Ready construction closes mutation admission
+    /// (`closing`) but keeps every attached connection served: hellos,
+    /// status, snapshot, and receipt reads keep answering while the ready
+    /// graph is built, so no client has to guess readiness from timeouts.
+    fn locked_connection_retired(&self) -> bool {
+        self.ready.load(Ordering::Acquire) || self.stop_requested.load(Ordering::Acquire)
+    }
+
+    /// The ready-construction phase every locked hello reports, derived
+    /// from the construction state machine and the durable vault evidence:
+    ///
+    /// * running (a construction, or the secure intent's owned commit step,
+    ///   holds it) → `Constructing`;
+    /// * failed → `Failed` (retryable);
+    /// * idle with a committed vault → `Failed`: no construction owns the
+    ///   committed choice, and a retry (or the next intent, or the next
+    ///   boot) starts one — never a `Constructing` nothing is doing;
+    /// * idle without a vault → `AwaitingSecureStore`.
+    ///
+    /// So a hello never reports `awaiting_secure_store` while a vault exists
+    /// and never reports `constructing` without an owner.
+    pub(crate) fn ready_construction_phase(&self) -> cockpit_proto::LockedReadyConstruction {
+        match self.ready_construction_phase.load(Ordering::Acquire) {
+            READY_CONSTRUCTION_RUNNING => cockpit_proto::LockedReadyConstruction::Constructing,
+            READY_CONSTRUCTION_FAILED => cockpit_proto::LockedReadyConstruction::Failed,
+            _ if self.vault_committed.load(Ordering::Acquire) => {
+                cockpit_proto::LockedReadyConstruction::Failed
+            }
+            _ => cockpit_proto::LockedReadyConstruction::AwaitingSecureStore,
+        }
+    }
+
+    /// Record durable evidence that the vault authority exists. With
+    /// `custody`, the store onboarding just opened is kept for construction.
+    /// The phase is set running first (the owned commit step), so no
+    /// observer sees a committed vault that nothing owns.
+    fn commit_vault(&self, custody: Option<crate::secure_key::EffectiveSecretStore>) {
+        let _ = self.ready_construction_phase.compare_exchange(
+            READY_CONSTRUCTION_IDLE,
+            READY_CONSTRUCTION_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if let Some(custody) = custody {
+            *self
+                .opened_vault
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(custody);
+        }
+        self.vault_committed.store(true, Ordering::Release);
+    }
+
+    /// Re-read the durable authority (after a materializer error) and record
+    /// it when present.
+    fn refresh_vault_evidence(&self) {
+        if !self.vault_committed() && self.vault_authority_exists().unwrap_or(false) {
+            self.commit_vault(None);
+        }
+    }
+
+    /// The vault onboarding opened, if this process opened it.
+    fn opened_vault(&self) -> Option<crate::secure_key::EffectiveSecretStore> {
+        self.opened_vault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Start construction for a committed vault that no construction owns
+    /// (idle, or failed and retryable). Idempotent; a no-op without a vault,
+    /// once ready, or while stopping.
+    fn ensure_construction_started(self: &Arc<Self>) {
+        if !self.vault_committed()
+            || self.ready.load(Ordering::Acquire)
+            || self.stop_requested.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if let Err(error) = self.start_ready_construction() {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "ready construction for the committed vault could not start"
+            );
+        }
+    }
+
+    /// Whether a vault authority exists (see [`Self::vault_committed`]).
+    pub(crate) fn vault_committed(&self) -> bool {
+        self.vault_committed.load(Ordering::Acquire)
+    }
+
+    /// Admit one ordinary locked onboarding mutation: counted for teardown
+    /// draining and holding the shared onboarding exclusion. `None` when the
+    /// owner is closing (a stop, or ready construction admitted) or a
+    /// secure-store intent has since committed and closed admission.
+    async fn admit_locked_mutation(&self) -> Option<LockedMutationAdmission<'_>> {
+        // Counted before waiting for the exclusion (a stop or construction
+        // drain waits for it), by a guard that gives the count back if this
+        // future is cancelled while it waits.
+        let inflight = InflightMutation::begin(self)?;
+        let exclusion = self.onboarding_exclusion.read().await;
+        // Re-check under the exclusion: a secure-store intent that held it
+        // exclusively may have committed the vault and admitted construction.
+        if self.locked_admission_denied() {
+            return None;
+        }
+        Some(LockedMutationAdmission {
+            _exclusion: exclusion,
+            _inflight: inflight,
+        })
+    }
+
+    fn set_ready_construction_phase(&self, phase: u8) {
+        self.ready_construction_phase
+            .store(phase, Ordering::Release);
+    }
+
+    /// The typed denial for a locked mutation refused by the admission gate.
+    /// While ready construction runs the cause is named, so a client can
+    /// wait for readiness instead of treating the refusal as a hard failure.
+    fn locked_mutation_denied(&self) -> anyhow::Error {
+        if self.ready_construction_phase() == cockpit_proto::LockedReadyConstruction::Constructing {
+            anyhow::Error::new(ReadyConstructionInProgress)
+        } else {
+            anyhow::anyhow!("bootstrap is locked")
+        }
+    }
+
     /// Record an acknowledged locked-mode `StopDaemon`. The locked run loop
     /// must stop with the ready dispatch's teardown semantics: an attached
     /// onboarding wizard stays blocked in `recv` and never drains the
     /// presence count, so waiting for `count == 0` would stall the stop
     /// until the client's command deadline.
-    fn request_locked_stop(&self) {
+    pub(crate) fn request_locked_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
         self.closing.store(true, Ordering::Release);
         self.wake_locked_run_loop();
@@ -5578,50 +5905,24 @@ impl LockedServices {
         self.client_presence.subscribe()
     }
 
-    fn ready_construction_pending(&self) -> bool {
-        !self.ready.load(Ordering::Acquire) && self.vault_authority_exists().unwrap_or(false)
-    }
-
-    fn begin_locked_mutation(&self) -> bool {
-        if self.ready.load(Ordering::Acquire) {
-            return false;
-        }
-        self.inflight_mutations.fetch_add(1, Ordering::AcqRel);
-        if self.closing.load(Ordering::Acquire) {
-            self.inflight_mutations.fetch_sub(1, Ordering::AcqRel);
-            return false;
-        }
-        true
-    }
-
-    fn end_locked_mutation(&self) {
-        self.inflight_mutations.fetch_sub(1, Ordering::AcqRel);
-    }
-
+    /// Wait until every admitted mutation has ended. Woken by each
+    /// [`InflightMutation`] drop (registered before the count is re-read, so
+    /// a decrement between the read and the wait is never missed).
     async fn drain_inflight_mutations(&self) {
-        while self.inflight_mutations.load(Ordering::Acquire) > 0 {
-            tokio::task::yield_now().await;
+        loop {
+            let drained = self.inflight_drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.inflight_mutations.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            drained.await;
         }
     }
 
-    async fn begin_locked_to_ready_transition(&self) {
-        self.closing.store(true, Ordering::Release);
-        self.drain_inflight_mutations().await;
-    }
-
-    async fn mark_ready_construction_failed(&self) -> Result<()> {
-        self.onboarding
-            .mark_ready_construction_failed(self.host_capabilities())
-            .await
-            .context("recording ready-construction failure")?;
-        Ok(())
-    }
-
-    async fn mark_ready_construction_recovered(&self) -> Result<()> {
-        self.onboarding
-            .mark_ready_construction_recovered()
-            .await
-            .context("recording ready-construction recovery")
+    #[cfg(all(test, unix))]
+    pub(crate) fn inflight_mutation_count(&self) -> usize {
+        self.inflight_mutations.load(Ordering::Acquire)
     }
 
     fn try_acquire_ready_transition(&self) -> bool {
@@ -5638,15 +5939,23 @@ impl LockedServices {
         self.wake_locked_run_loop();
     }
 
-    async fn rollback_failed_ready_handoff(&self) -> Result<()> {
+    /// In-memory rollback of a failed or abandoned construction attempt: the
+    /// owner stays locked with the retryable `failed` phase and reopens
+    /// admission (unless a stop owns it). Nothing durable changes: the vault
+    /// and the committed onboarding stage stand, and every later boot
+    /// reconstructs from them.
+    fn rollback_failed_ready_handoff(&self) {
+        // Publish the failed phase before signalling: a waiter woken by the
+        // signal must read `failed`, never a stale `constructing`.
+        self.set_ready_construction_phase(READY_CONSTRUCTION_FAILED);
         self.ready.store(false, Ordering::Release);
         let _ = self.ready_signal.send(false);
-        self.mark_ready_construction_failed().await?;
-        self.closing.store(false, Ordering::Release);
+        if !self.stop_requested.load(Ordering::Acquire) {
+            self.closing.store(false, Ordering::Release);
+        }
         // Reopening admission changes the loop's teardown predicate (the
         // last-client handoff grace applies again); wake it to re-evaluate.
         self.wake_locked_run_loop();
-        Ok(())
     }
 
     /// Wake `run_locked_until_ready` to re-evaluate its teardown predicate
@@ -5656,62 +5965,157 @@ impl LockedServices {
         self.client_presence.send_modify(|_| {});
     }
 
-    async fn onboarding_snapshot_present(
-        &self,
-    ) -> Result<cockpit_proto::OnboardingBootstrapSnapshot> {
-        #[cfg(test)]
-        if self
-            .fail_next_onboarding_snapshot
-            .swap(false, Ordering::AcqRel)
-        {
-            anyhow::bail!("injected onboarding snapshot failure");
-        }
-        self.onboarding
-            .snapshot(self.host_capabilities())
-            .await?
-            .context("onboarding run is absent")
+    /// Construct ready services inline under a freshly acquired permit.
+    /// Production never calls this from a connection: it goes through
+    /// [`Self::start_ready_construction`], whose daemon-owned task cannot be
+    /// cancelled by any client. Kept for the permit-ownership unit tests.
+    #[cfg(test)]
+    async fn finish_ready_transition(self: &Arc<Self>) -> Result<ConstructedReady> {
+        let permit = self.admit_ready_construction()?;
+        self.construct_ready_under_permit(permit).await
     }
 
-    async fn finish_ready_transition(self: &Arc<Self>) -> Result<ConstructedReady> {
+    /// Acquire the exclusive construction permit and re-check eligibility
+    /// *under* it. A stale entrant (a duplicate retry or secure intent that
+    /// observed an older state and paused) can therefore never construct, or
+    /// roll back, after a publication or an acknowledged stop: those set
+    /// their flags before releasing the permit, and the checks below run only
+    /// once the permit is held. Admission closes mutation admission before
+    /// the permit is observable as held by a running attempt.
+    fn admit_ready_construction(self: &Arc<Self>) -> Result<ReadyTransitionPermit> {
+        if !self.try_acquire_ready_transition() {
+            return Err(anyhow::Error::new(ReadyConstructionAlreadyRunning));
+        }
+        let ineligible = if self.ready.load(Ordering::Acquire) {
+            Some("onboarding ready services are already published")
+        } else if self.stop_requested.load(Ordering::Acquire) {
+            Some("the locked daemon is stopping")
+        } else if !self.vault_committed() {
+            Some("onboarding ready construction is not pending")
+        } else {
+            None
+        };
+        if let Some(reason) = ineligible {
+            // Not this attempt's rollback: release without touching state.
+            self.release_ready_transition();
+            anyhow::bail!(reason);
+        }
+        self.closing.store(true, Ordering::Release);
+        self.set_ready_construction_phase(READY_CONSTRUCTION_RUNNING);
+        Ok(ReadyTransitionPermit::new(self.clone()))
+    }
+
+    /// Whether a lifecycle owner is registered to receive constructed ready
+    /// services (the locked run loop, the in-process endpoint's publisher,
+    /// or an in-process boot). Construction starts only while one is: its
+    /// result is then always delivered, never discarded for lack of a
+    /// consumer.
+    fn ready_consumer_registered(&self) -> bool {
+        self.ready_handoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .consumers
+            > 0
+    }
+
+    /// The single ready-construction funnel. Once a committed vault authority
+    /// exists, construction is owned by the daemon — not by the connection
+    /// that committed the secure-store choice or asked for a retry — so a
+    /// client disconnect, a response write failure (EPIPE), a superseding
+    /// client request, or an aborted connection task can never cancel it or
+    /// discard its result.
+    ///
+    /// Idempotent: a call while construction is already running reports
+    /// `AlreadyInProgress` and starts nothing. The phase flips to
+    /// `Constructing` before this returns, so the caller's response and every
+    /// later hello already report it.
+    pub(crate) fn start_ready_construction(self: &Arc<Self>) -> Result<ReadyConstructionStart> {
         anyhow::ensure!(
-            self.ready_construction_pending(),
-            "onboarding ready construction is not pending"
+            self.ready_consumer_registered(),
+            "no lifecycle owner is registered to receive ready services"
         );
-        anyhow::ensure!(
-            self.try_acquire_ready_transition(),
-            "onboarding ready construction is already in progress"
-        );
-        let permit = ReadyTransitionPermit::new(self.clone());
-        self.begin_locked_to_ready_transition().await;
-        let outcome = match self.into_ready().await {
-            Ok(ready) => match self.mark_ready_construction_recovered().await {
-                Ok(()) => Ok(ready),
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
+        let permit = match self.admit_ready_construction() {
+            Ok(permit) => permit,
+            Err(error) if error.is::<ReadyConstructionAlreadyRunning>() => {
+                return Ok(ReadyConstructionStart::AlreadyInProgress);
+            }
+            Err(error) => return Err(error),
+        };
+        let locked = self.clone();
+        tokio::spawn(async move {
+            match locked.construct_ready_under_permit(permit).await {
+                Ok(constructed) => constructed.publish_stored(),
+                Err(error) => {
+                    // The in-memory rollback already ran under the permit
+                    // and published the retryable `failed` phase.
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "onboarding ready construction failed; the locked bootstrap stays available for retry"
+                    );
+                }
+            }
+        });
+        Ok(ReadyConstructionStart::Started)
+    }
+
+    async fn construct_ready_under_permit(
+        self: &Arc<Self>,
+        permit: ReadyTransitionPermit,
+    ) -> Result<ConstructedReady> {
+        // Admission closed mutation admission; wait out mutations admitted
+        // before it so construction never races an onboarding write.
+        self.drain_inflight_mutations().await;
+        #[cfg(test)]
+        {
+            let gate = self
+                .construction_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+        }
+        #[cfg(test)]
+        let injected_failure = self.fail_next_construction.swap(false, Ordering::AcqRel);
+        let construction = async {
+            #[cfg(test)]
+            if injected_failure {
+                anyhow::bail!("injected ready-construction failure");
+            }
+            // The committed choice's bookkeeping is part of construction:
+            // settle any unsettled secure-store receipt and advance a stage
+            // still at `materializing` from the vault evidence. Idempotent,
+            // so every attempt (including a retry after the intent's own
+            // settlement failed) converges the durable state first.
+            self.onboarding
+                .reconcile_materializing_secure_intent(true, self.host_capabilities())
+                .await
+                .context("settling the committed secure-store choice")?;
+            let ready = self.into_ready().await?;
+            let ctx = Arc::new(ready.context);
+            // Pre-publication recovery belongs to construction: while it runs
+            // the locked owner keeps answering hellos, and a context that
+            // reaches publication is already safe to serve.
+            recover_before_socket_publish(&ctx)
+                .await
+                .context("recovering ready services before publication")?;
+            Ok::<_, anyhow::Error>(ctx)
+        };
+        let outcome = match tokio::time::timeout(READY_CONSTRUCTION_TIMEOUT, construction).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(anyhow::anyhow!(
+                "onboarding ready construction exceeded its {}s deadline",
+                READY_CONSTRUCTION_TIMEOUT.as_secs()
+            )),
         };
         match outcome {
-            Ok(ready) => Ok(ConstructedReady::new(self.clone(), ready, permit)),
+            Ok(ctx) => Ok(ConstructedReady::new(self.clone(), ctx, permit)),
             Err(error) => {
-                let _ = permit.rollback().await;
+                permit.rollback();
                 Err(error)
             }
         }
-    }
-
-    async fn prepare_retry_ready_handoff(self: &Arc<Self>) -> Result<(Response, ConstructedReady)> {
-        let constructed = self.finish_ready_transition().await?;
-        let snapshot = match self.onboarding_snapshot_present().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                drop(constructed);
-                return Err(error);
-            }
-        };
-        Ok((
-            Response::OnboardingBootstrapSnapshot(Some(snapshot)),
-            constructed,
-        ))
     }
 
     fn subscribe_ready_handoff(self: &Arc<Self>) -> ReadyHandoffReceiver {
@@ -5769,14 +6173,229 @@ impl LockedServices {
             .map(|authority| authority.is_some())
     }
 
-    pub(crate) async fn apply_secure_intent(
+    /// The secure-store intent's single ownership span.
+    ///
+    /// 1. Replay first: the exact submission's receipt (kind, placement, and
+    ///    passphrase binding) answers before any admission check, and again
+    ///    under the exclusion, so a duplicate that waited behind the original
+    ///    returns the original outcome. A committed receipt also ensures
+    ///    construction owns the committed choice.
+    /// 2. Under the exclusive onboarding exclusion and counted in the
+    ///    inflight-mutation drain (a stop or construction waits for it): the
+    ///    pending receipt, vault materialization, receipt settlement, stage
+    ///    advance, and construction admission — one owned step. From the
+    ///    vault commit until construction is admitted the phase reports it
+    ///    running; if the step ends any other way the phase becomes the
+    ///    retryable `failed`, and construction itself (at boot, on a retry, or
+    ///    on the next intent) settles the bookkeeping from the vault evidence.
+    pub(crate) async fn apply_secure_intent_span(
+        self: &Arc<Self>,
+        request: cockpit_proto::ApplyOnboardingSecureIntent,
+    ) -> std::result::Result<
+        cockpit_proto::OnboardingTransitionResult,
+        cockpit_proto::SensitiveOnboardingIntentError,
+    > {
+        let submission = match self.onboarding.prepare_secure_intent(request).await {
+            Ok(submission) => submission,
+            Err(error) => return Err(classify_and_log_secure_intent_error(&error)),
+        };
+        let key = submission.key();
+        if let Some(answer) = self.replay_secure_intent(&key).await {
+            return answer;
+        }
+        let _exclusive = self.onboarding_exclusion.write().await;
+        if let Some(answer) = self.replay_secure_intent(&key).await {
+            return answer;
+        }
+        let Some(_inflight) = InflightMutation::begin(self) else {
+            // Closing: a stop, or construction for a choice another
+            // submission committed.
+            self.ensure_construction_started();
+            return Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
+        };
+        if self.vault_committed() {
+            // Another submission committed the choice (its construction may
+            // have failed and reopened admission): this one cannot apply.
+            self.ensure_construction_started();
+            return Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
+        }
+        #[cfg(test)]
+        if self.panic_next_secure_intent.swap(false, Ordering::AcqRel) {
+            panic!("injected secure-intent span panic");
+        }
+        let mut commit_step = CommitStepGuard {
+            locked: self,
+            handed_off: false,
+        };
+        let applied = self.apply_secure_intent(submission).await;
+        // A materializer error may still have committed the authority row.
+        self.refresh_vault_evidence();
+        let result = match applied {
+            Ok(result) => Ok(result),
+            Err(error) if !self.vault_committed() => return Err(error),
+            Err(error) => {
+                // The vault committed but its bookkeeping (receipt
+                // settlement, stage advance) failed. Settle it from the vault
+                // evidence once, inline; construction repeats this
+                // idempotently on every attempt.
+                tracing::warn!(
+                    ?error,
+                    "secure-store bookkeeping failed after the vault committed; reconciling from the vault evidence"
+                );
+                Err(self
+                    .onboarding
+                    .reconcile_materializing_secure_intent(true, self.host_capabilities())
+                    .await)
+            }
+        };
+        // Construction admission happens before the exclusion is released:
+        // it closes mutation admission under the permit. The construction
+        // task drains this span's own count, so it starts only once the span
+        // has ended.
+        let started = self.start_ready_construction();
+        match started {
+            Ok(_) => commit_step.handed_off = true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "onboarding ready construction could not start after the secure intent committed"
+                );
+                return Err(cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed);
+            }
+        }
+        match result {
+            Ok(result) => Ok(result),
+            Err(reconciled) => {
+                if let Err(error) = reconciled {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "inline reconciliation of the committed secure-store choice failed; construction will settle it"
+                    );
+                }
+                // The vault committed and construction owns it now. Answer
+                // with the settled receipt when reconciliation got that far;
+                // otherwise the choice is committed but unconfirmed, which
+                // the client reconciles from the hello phase and receipt.
+                match self
+                    .onboarding
+                    .committed_secure_intent_replay(&key, self.host_capabilities())
+                    .await
+                {
+                    Ok(Some((snapshot, receipt))) => {
+                        Ok(cockpit_proto::OnboardingTransitionResult { snapshot, receipt })
+                    }
+                    _ => {
+                        Err(cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Answer `submission` from its own receipt, if it has one: a committed
+    /// receipt is the applied result (and construction must own the
+    /// committed choice); a rejected one is refused; an unsettled one with
+    /// a committed vault is settled from the vault evidence first. `None`:
+    /// no receipt, apply it.
+    async fn replay_secure_intent(
+        self: &Arc<Self>,
+        key: &crate::onboarding::SecureIntentKey,
+    ) -> Option<
+        std::result::Result<
+            cockpit_proto::OnboardingTransitionResult,
+            cockpit_proto::SensitiveOnboardingIntentError,
+        >,
+    > {
+        let lookup = self
+            .onboarding
+            .secure_intent_receipt(key, self.host_capabilities())
+            .await;
+        let (snapshot, receipt) = match lookup {
+            Ok(Some(found)) => found,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(classify_and_log_secure_intent_error(&error))),
+        };
+        let (snapshot, receipt) = match receipt.status {
+            cockpit_proto::OnboardingReceiptStatus::Committed => (snapshot, receipt),
+            cockpit_proto::OnboardingReceiptStatus::Rejected => {
+                return Some(Err(
+                    cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
+                ));
+            }
+            cockpit_proto::OnboardingReceiptStatus::Pending
+            | cockpit_proto::OnboardingReceiptStatus::Unknown => {
+                // In flight under the exclusion (the caller waits for it and
+                // asks again), or its outcome was never recorded.
+                self.refresh_vault_evidence();
+                if !self.vault_committed() {
+                    return None;
+                }
+                if let Err(error) = self
+                    .onboarding
+                    .reconcile_materializing_secure_intent(true, self.host_capabilities())
+                    .await
+                {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "settling an uncertain secure-store receipt failed"
+                    );
+                }
+                match self
+                    .onboarding
+                    .secure_intent_receipt(key, self.host_capabilities())
+                    .await
+                {
+                    Ok(Some((snapshot, receipt)))
+                        if receipt.status == cockpit_proto::OnboardingReceiptStatus::Committed =>
+                    {
+                        (snapshot, receipt)
+                    }
+                    _ => {
+                        self.ensure_construction_started();
+                        return Some(Err(
+                            cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
+                        ));
+                    }
+                }
+            }
+        };
+        tracing::info!("replayed an already committed onboarding secure intent");
+        self.ensure_construction_started();
+        Some(Ok(cockpit_proto::OnboardingTransitionResult {
+            snapshot,
+            receipt,
+        }))
+    }
+
+    /// Test entry to [`Self::apply_secure_intent`] without the span (no
+    /// exclusion, no construction start): the permit unit tests drive
+    /// construction themselves.
+    #[cfg(test)]
+    pub(crate) async fn apply_secure_intent_for_test(
         &self,
         request: cockpit_proto::ApplyOnboardingSecureIntent,
     ) -> std::result::Result<
         cockpit_proto::OnboardingTransitionResult,
         cockpit_proto::SensitiveOnboardingIntentError,
     > {
-        if self.vault_authority_exists().unwrap_or(true) {
+        let submission = self
+            .onboarding
+            .prepare_secure_intent(request)
+            .await
+            .map_err(|error| classify_and_log_secure_intent_error(&error))?;
+        self.apply_secure_intent(submission).await
+    }
+
+    /// Materialize the vault for a secure-store intent. Callers hold the
+    /// exclusive onboarding exclusion ([`Self::apply_secure_intent_span`]).
+    async fn apply_secure_intent(
+        &self,
+        submission: crate::onboarding::SecureIntentSubmission,
+    ) -> std::result::Result<
+        cockpit_proto::OnboardingTransitionResult,
+        cockpit_proto::SensitiveOnboardingIntentError,
+    > {
+        if self.vault_committed() || self.vault_authority_exists().unwrap_or(true) {
             return Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
         }
         // Placement availability is decided by the settled probes, never by
@@ -5801,14 +6420,14 @@ impl LockedServices {
         let keyring_probe = probes.keyring.clone();
         let kek_dir = self.kek_dir.clone();
         self.onboarding
-            .apply_secure_intent_with(
-                request,
+            .apply_prepared_secure_intent_with(
+                submission,
                 probes.snapshot.clone(),
                 false,
-                move |placement, passphrase| {
+                |placement, passphrase| {
                     let options =
                         crate::onboarding::secure_vault_open_options(placement, passphrase)?;
-                    crate::secure_key::ensure_secret_vault_with_options(
+                    let opened = crate::secure_key::ensure_secret_vault_with_options(
                         &db,
                         &keyring_probe,
                         &kek_dir,
@@ -5816,6 +6435,11 @@ impl LockedServices {
                         options,
                     )
                     .map_err(|error| error.into_error())?;
+                    // The vault is committed and open: keep the opened store
+                    // (a passphrase vault's derived key custody) for ready
+                    // construction, which must never reopen it without the
+                    // passphrase.
+                    self.commit_vault(Some(opened));
                     Ok(())
                 },
             )
@@ -5841,6 +6465,7 @@ impl LockedServices {
             &mut timer,
             self.terminal_factory.clone(),
             self.config_source.clone(),
+            self.opened_vault(),
         )
         .await?;
         timer.done();
@@ -5860,12 +6485,54 @@ impl Drop for LockedClientGuard {
     }
 }
 
-/// Bootstrap the daemon into either the restricted vault-free service graph or
-/// the ordinary ready graph. Called from `daemon::run_foreground`.
+/// What an in-process owner serves once booted.
+pub(crate) enum BootServices {
+    /// A first run: the locked bootstrap until the secure-store choice.
+    Locked(Arc<LockedServices>),
+    /// A committed vault: ready services (constructed before the in-process
+    /// endpoint is published, so in-process clients never observe the
+    /// constructing bootstrap owner).
+    Ready(Arc<DaemonContext>),
+}
+
+/// In-process owners (tests, embedded composition) keep "the published
+/// endpoint serves ready services" whenever a vault exists: they run the
+/// same daemon-owned ready construction the socket owner runs and wait for
+/// it before publishing.
+pub(crate) async fn in_process_boot_services(locked: LockedServices) -> Result<BootServices> {
+    let locked = Arc::new(locked);
+    if !locked.vault_committed() {
+        return Ok(BootServices::Locked(locked));
+    }
+    let mut handoff = locked.subscribe_ready_handoff();
+    locked.start_ready_construction()?;
+    loop {
+        handoff
+            .changed()
+            .await
+            .map_err(|_| anyhow::anyhow!("in-process ready construction publisher closed"))?;
+        if *handoff.borrow_and_update() {
+            if let Some(constructed) = locked.take_achieved_ready() {
+                return Ok(BootServices::Ready(constructed.publish_returned()));
+            }
+        } else if locked.ready_construction_phase()
+            == cockpit_proto::LockedReadyConstruction::Failed
+        {
+            anyhow::bail!("in-process ready construction failed; see the daemon log");
+        }
+    }
+}
+
+/// Bootstrap the daemon. Every boot — first run or a committed vault — comes
+/// up as the locked bootstrap owner right after DB/config initialization, so
+/// its hello and onboarding snapshot answer at once; with a committed vault
+/// the owner immediately starts its daemon-owned ready construction and
+/// ordinary services publish when it completes. Called from
+/// `daemon::run_foreground`.
 pub(crate) async fn boot(
     paths: DaemonPaths,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
-) -> Result<BootServices> {
+) -> Result<LockedServices> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::boot");
     let db = Db::open_default().context("opening session DB")?;
     let services = boot_with_db(
@@ -5885,7 +6552,7 @@ pub(crate) async fn boot(
 pub(crate) async fn boot_supervised_worker(
     paths: DaemonPaths,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
-) -> Result<BootServices> {
+) -> Result<LockedServices> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::boot");
     let db = Db::open_supervised_worker_default(crate::daemon::supervisor::worker_generation())
         .context("opening supervised session DB")?;
@@ -5937,7 +6604,7 @@ pub(crate) async fn boot_with_db(
     timer: &mut crate::startup::PhaseTimer,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
     config_source: crate::daemon::config_source::ConfigSource,
-) -> Result<BootServices> {
+) -> Result<LockedServices> {
     boot_with_db_and_probe_plan(
         paths,
         db,
@@ -5956,12 +6623,15 @@ pub(crate) async fn boot_with_db_and_probe_plan(
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
     config_source: crate::daemon::config_source::ConfigSource,
     probe_plan: LockedProbePlan,
-) -> Result<BootServices> {
+) -> Result<LockedServices> {
     reconcile_crash_interrupted_tools(&db).await?;
     let locked =
         LockedServices::prepare(paths, db, terminal_factory, config_source, probe_plan).await?;
     timer.phase("locked_services");
     let vault_authority_exists = locked.vault_authority_exists()?;
+    locked
+        .vault_committed
+        .store(vault_authority_exists, Ordering::Release);
     // The checkpoint reconciliation only projects the snapshot; the probing
     // placeholder is sufficient and keeps boot off the host probes.
     locked
@@ -5970,17 +6640,15 @@ pub(crate) async fn boot_with_db_and_probe_plan(
         .await
         .context("reconciling locked onboarding bootstrap checkpoint")?;
     if !vault_authority_exists {
-        // Only the locked graph needs the locked probe set. Start it now, in
-        // the background: the caller binds and publishes the socket without
-        // waiting, and the onboarding snapshot moves from probing
+        // Only the secure-store choice needs the locked probe set. Start it
+        // now, in the background: the caller binds and publishes the socket
+        // without waiting, and the onboarding snapshot moves from probing
         // (generation 0) to the settled generation when the probes land.
+        // With a committed vault the ready construction runs its own boot
+        // probes, so a vault-present boot pays for host probing once.
         locked.host_probes.start();
-        return Ok(BootServices::Locked(locked));
     }
-    // The ready graph runs its own boot probes (`boot_ready_with_db`); the
-    // locked probe set is never started on this path, so a ready boot pays
-    // for host probing once.
-    Ok(BootServices::Ready(locked.into_ready().await?))
+    Ok(locked)
 }
 
 pub(crate) async fn boot_ready_with_db(
@@ -5989,6 +6657,7 @@ pub(crate) async fn boot_ready_with_db(
     timer: &mut crate::startup::PhaseTimer,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
     config_source: crate::daemon::config_source::ConfigSource,
+    opened_store: Option<crate::secure_key::EffectiveSecretStore>,
 ) -> Result<DaemonContext> {
     let coverage_mode = if paths.ephemeral {
         crate::redact::coverage_authority::CoverageOwnerMode::Ephemeral
@@ -6087,14 +6756,20 @@ pub(crate) async fn boot_ready_with_db(
         let configured_kek_dir = effective_kek_dir.clone();
         move || {
             let kek_dir = configured_kek_dir;
-            let effective = crate::secure_key::ensure_secret_vault(
-                &db,
-                &keyring_probe,
-                &kek_dir,
-                crate::secure_key::SecretStoreInjected::default(),
-            )
-            .map_err(|error| error.into_error())
-            .context("opening daemon vault for redaction")?;
+            // The store onboarding opened in this process carries its key
+            // custody (a passphrase vault cannot be reopened without the
+            // passphrase): use it instead of reopening.
+            let effective = match opened_store {
+                Some(opened) => opened,
+                None => crate::secure_key::ensure_secret_vault(
+                    &db,
+                    &keyring_probe,
+                    &kek_dir,
+                    crate::secure_key::SecretStoreInjected::default(),
+                )
+                .map_err(|error| error.into_error())
+                .context("opening daemon vault for redaction")?,
+            };
             Ok::<_, anyhow::Error>((effective, kek_dir))
         }
     });
@@ -6979,11 +7654,14 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, mut listener: DaemonListen
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
-fn locked_bootstrap_hello_minimal() -> Response {
+/// The unauthenticated locked hello. It still carries the ready-construction
+/// phase: the phase is non-secret lifecycle state, and it is what lets a
+/// client wait on readiness from the connection hello alone.
+fn locked_bootstrap_hello_minimal(locked: &LockedServices) -> Response {
     Response::LockedBootstrapHello(cockpit_proto::LockedBootstrapHello {
         protocol_version: cockpit_proto::PROTOCOL_VERSION,
         bootstrap_available: true,
+        ready_construction: locked.ready_construction_phase(),
         host_capabilities: cockpit_proto::HostCapabilitySnapshot::unpublished(),
         snapshot: None,
     })
@@ -6998,6 +7676,7 @@ async fn locked_bootstrap_hello(locked: &LockedServices) -> Result<Response> {
         cockpit_proto::LockedBootstrapHello {
             protocol_version: cockpit_proto::PROTOCOL_VERSION,
             bootstrap_available: true,
+            ready_construction: locked.ready_construction_phase(),
             host_capabilities: snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.host_capabilities.clone())
@@ -7020,11 +7699,11 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
     proto_stream
         .send(&Envelope::response(
             Uuid::nil(),
-            locked_bootstrap_hello_minimal(),
+            locked_bootstrap_hello_minimal(&locked),
         ))
         .await?;
     while let Some(frame) = proto_stream.recv().await? {
-        if locked.locked_admission_denied() {
+        if locked.locked_connection_retired() {
             break;
         }
         let RecvFrame::Envelope(envelope) = frame else {
@@ -7039,7 +7718,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
         else {
             continue;
         };
-        if locked.locked_admission_denied() {
+        if locked.locked_connection_retired() {
             break;
         }
         if let Some(token) = owner_capability.as_ref()
@@ -7066,34 +7745,15 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                     .await?;
                 continue;
             }
-            match locked.prepare_retry_ready_handoff().await {
-                Ok((response, constructed)) => {
-                    if proto_stream
-                        .send(&Envelope::response(id, response))
-                        .await
-                        .is_ok()
-                    {
-                        constructed.publish_stored();
-                    }
-                }
-                Err(error) => {
-                    proto_stream
-                        .send(&Envelope::error(
-                            Some(id),
-                            ErrorPayload {
-                                code: ErrorCode::BootstrapLocked,
-                                message: format!("daemon bootstrap is locked: {error}"),
-                            },
-                        ))
-                        .await?;
-                }
-            }
+            let envelope = match retry_locked_ready_construction(&locked).await {
+                Ok(response) => Envelope::response(id, response),
+                Err(error) => Envelope::error(Some(id), error),
+            };
+            proto_stream.send(&envelope).await?;
             continue;
         }
         let stop_after_response = matches!(&request, Request::StopDaemon { .. });
         let result = match request {
-            Request::DaemonStatus if authenticated_owner => locked_bootstrap_hello(&locked).await,
-            Request::DaemonStatus => Ok(locked_bootstrap_hello_minimal()),
             Request::ExchangeLocalPeerCredential => {
                 use crate::daemon::peer_authority::{
                     attest_local_client_role, default_agent_child_grants, proto_local_role,
@@ -7152,100 +7812,9 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                     role: proto_local_role(role),
                 })
             }
-            _ if !authenticated_owner => {
-                Err(anyhow::anyhow!("bootstrap peer is not authenticated"))
+            request => {
+                dispatch_locked_bootstrap_request(&locked, request, authenticated_owner).await
             }
-            Request::GetOnboardingBootstrapSnapshot => Ok(Response::OnboardingBootstrapSnapshot(
-                locked
-                    .onboarding
-                    .snapshot(locked.host_capabilities())
-                    .await?,
-            )),
-            Request::BeginOrReopenOnboarding(request) => {
-                if !locked.begin_locked_mutation() {
-                    anyhow::bail!("bootstrap is locked");
-                }
-                let outcome = async {
-                    let (snapshot, receipt) = locked
-                        .onboarding
-                        .begin_or_reopen(request, locked.host_capabilities())
-                        .await?;
-                    Ok(Response::OnboardingTransition(
-                        cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-                    ))
-                }
-                .await;
-                locked.end_locked_mutation();
-                outcome
-            }
-            Request::GetOnboardingTransitionReceipt(query) => Ok(
-                Response::OnboardingTransitionReceipt(locked.onboarding.receipt(query).await?),
-            ),
-            Request::GetWorkspaceTrust { project_root } => {
-                let decision = locked
-                    .db
-                    .workspace_trust_by_root(PathBuf::from(&project_root).as_path())
-                    .await?;
-                Ok(Response::WorkspaceTrust {
-                    mode: decision.map(|decision| match decision.mode {
-                        crate::db::workspace_trust::WorkspaceTrustMode::Trust => {
-                            cockpit_proto::WorkspaceTrustMode::Trust
-                        }
-                        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig => {
-                            cockpit_proto::WorkspaceTrustMode::IgnoreConfig
-                        }
-                        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted => {
-                            cockpit_proto::WorkspaceTrustMode::Untrusted
-                        }
-                    }),
-                    config_generation: inventory::current_config_generation(),
-                })
-            }
-            Request::StopDaemon { .. } => Ok(Response::Ack),
-            Request::ApplyOnboardingTransition(request) => {
-                if !locked.begin_locked_mutation() {
-                    anyhow::bail!("bootstrap is locked");
-                }
-                let outcome = async {
-                    let snapshot = locked
-                        .onboarding
-                        .snapshot(locked.host_capabilities())
-                        .await?
-                        .context("onboarding run is absent")?;
-                    // Same pre-vault admission contract as the in-process
-                    // locked handler: every pre-vault stage is admitted and
-                    // the authority's legality rules reject the rest, so no
-                    // pre-vault stage offers an uncompletable transition.
-                    anyhow::ensure!(
-                        matches!(
-                            snapshot.stage,
-                            cockpit_proto::OnboardingStage::Welcome
-                                | cockpit_proto::OnboardingStage::Profile
-                                | cockpit_proto::OnboardingStage::SecureStore
-                        ),
-                        "bootstrap is locked"
-                    );
-                    let (snapshot, receipt) = locked
-                        .onboarding
-                        .apply_transition(request, locked.host_capabilities())
-                        .await?;
-                    Ok(Response::OnboardingTransition(
-                        cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-                    ))
-                }
-                .await;
-                locked.end_locked_mutation();
-                outcome
-            }
-            Request::ApplyOnboardingProfile(request) => {
-                if !locked.begin_locked_mutation() {
-                    anyhow::bail!("bootstrap is locked");
-                }
-                let outcome = apply_locked_onboarding_profile(&locked, &request.display_name).await;
-                locked.end_locked_mutation();
-                outcome
-            }
-            _ => Err(anyhow::anyhow!("bootstrap is locked")),
         };
         let response = match result {
             Ok(response) => Envelope::response(id, response),
@@ -7267,12 +7836,171 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
 }
 
 pub(crate) enum LockedRunOutcome {
+    /// The daemon-owned construction published ready services. The context
+    /// has already completed pre-publication recovery.
     Ready(
-        ReadyServices,
+        Arc<DaemonContext>,
         DaemonListener,
         crate::daemon::leak_reveal_socket::BoundRevealSocket,
     ),
     Shutdown,
+}
+
+/// Serve one connection on the locked sensitive sibling: one bounded frame
+/// read, owner authentication, then the shared secure-intent funnel. Each
+/// connection runs on its own task so a slow or silent peer never stalls the
+/// control accept loop, and the response write is best-effort: the committed
+/// transition is durable and the ready construction it starts is owned by the
+/// daemon, so an undeliverable response (EPIPE after a client gave up or was
+/// superseded) changes nothing but the log.
+#[cfg(any(unix, windows))]
+async fn handle_locked_sensitive_connection(
+    mut stream: DaemonStream,
+    locked: Arc<LockedServices>,
+) -> Result<()> {
+    let peer = socket_peer_identity(&stream)?;
+    let frame = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::daemon::leak_reveal_socket::read_sensitive_request_frame(&mut stream),
+    )
+    .await
+    .ok()
+    .flatten();
+    let Some(crate::daemon::leak_reveal_socket::SensitiveRequestFrame::Onboarding(payload)) = frame
+    else {
+        return Ok(());
+    };
+    let response = match cockpit_proto::decode_sensitive_onboarding_intent(&payload) {
+        Ok(frame) => {
+            let authenticated = frame
+                .owner_capability
+                .as_ref()
+                .and_then(|token| {
+                    locked
+                        .peer_credential_registry
+                        .verify_sensitive_peer(peer, token.as_str())
+                })
+                .is_some_and(|(role, _)| role.is_owner_class());
+            if authenticated {
+                apply_locked_secure_intent(&locked, frame.request).await
+            } else {
+                cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+                    cockpit_proto::SensitiveOnboardingIntentError::Unauthorized,
+                )
+            }
+        }
+        Err(_) => cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
+            cockpit_proto::SensitiveOnboardingIntentError::Unauthorized,
+        ),
+    };
+    let bytes = cockpit_proto::encode_sensitive_onboarding_response(&response)
+        .map_err(anyhow::Error::msg)?;
+    let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+        stream.write_all(&bytes).await?;
+        stream.flush().await?;
+        stream.shutdown().await
+    })
+    .await;
+    if !matches!(delivered, Ok(Ok(()))) {
+        tracing::info!(
+            applied = matches!(
+                response,
+                cockpit_proto::SensitiveOnboardingIntentResponse::Applied(_)
+            ),
+            "onboarding secure-intent response was not delivered; committed state is durable and ready construction continues"
+        );
+    }
+    Ok(())
+}
+
+/// How the locked run loop treats one failed `accept()`.
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptFailure {
+    /// Retry after the given backoff; the listener itself is healthy.
+    Transient(Duration),
+    /// The listener is unusable: settle construction, then exit.
+    Fatal,
+}
+
+/// Per-errno accept policy. A peer that aborted or reset before `accept`
+/// returned (`ECONNABORTED`/`ECONNRESET`), an interrupted or would-block
+/// accept, and a transient timeout say nothing about the listener: retry at
+/// once. Descriptor or buffer exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`,
+/// `ENOMEM`) is transient but resource-bound: back off so attached clients
+/// can release descriptors, instead of spinning or tearing down an owner that
+/// may be mid-construction. Anything else (`EBADF`, `EINVAL`, `ENOTSOCK`, a
+/// closed listener) means the listener is gone.
+fn classify_accept_error(error: &anyhow::Error) -> AcceptFailure {
+    let Some(io) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    else {
+        return AcceptFailure::Fatal;
+    };
+    match io.kind() {
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::TimedOut => return AcceptFailure::Transient(Duration::ZERO),
+        std::io::ErrorKind::OutOfMemory => {
+            return AcceptFailure::Transient(ACCEPT_RESOURCE_BACKOFF);
+        }
+        _ => {}
+    }
+    #[cfg(unix)]
+    if let Some(code) = io.raw_os_error()
+        && matches!(
+            code,
+            libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM
+        )
+    {
+        return AcceptFailure::Transient(ACCEPT_RESOURCE_BACKOFF);
+    }
+    AcceptFailure::Fatal
+}
+
+const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(100);
+
+#[cfg(any(unix, windows))]
+fn sensitive_listener_mut(
+    sensitive: &mut crate::daemon::leak_reveal_socket::BoundRevealSocket,
+) -> &mut DaemonListener {
+    sensitive
+        .listener
+        .as_mut()
+        .expect("locked bootstrap always owns its sensitive listener")
+}
+
+/// A fatal locked-loop exit. Stop admitting work, let an in-flight ready
+/// construction settle (bounded by its own deadline), and retire a
+/// construction that succeeded without rolling it back — the committed vault
+/// and a clean next boot reconstruct it — before returning the error.
+#[cfg(any(unix, windows))]
+async fn settle_construction_then_fail(
+    locked: &Arc<LockedServices>,
+    locked_clients: &mut tokio::task::JoinSet<()>,
+    error: anyhow::Error,
+) -> Result<LockedRunOutcome> {
+    tracing::error!(
+        error = %format!("{error:#}"),
+        "locked bootstrap loop failed; settling any in-flight ready construction before exit"
+    );
+    locked.request_locked_stop();
+    loop {
+        if let Some(constructed) = locked.take_achieved_ready() {
+            constructed.retire_for_stop();
+            break;
+        }
+        if !locked.ready_transition_inflight.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    locked.drain_inflight_mutations().await;
+    locked_clients.abort_all();
+    while locked_clients.join_next().await.is_some() {}
+    Err(error)
 }
 
 #[cfg(any(unix, windows))]
@@ -7282,7 +8010,13 @@ pub(crate) async fn run_locked_until_ready(
     mut sensitive: crate::daemon::leak_reveal_socket::BoundRevealSocket,
 ) -> Result<LockedRunOutcome> {
     let mut locked_clients = tokio::task::JoinSet::new();
+    let mut sensitive_clients = tokio::task::JoinSet::new();
     let mut ready_signal = locked.subscribe_ready_handoff();
+    // With a committed vault, construction starts only now that this loop
+    // is registered as its consumer: its result is read from the owner's
+    // mailbox, never lost to a broadcast sent before anyone listened. This is
+    // also the boot-time retry of a committed choice no construction owns.
+    locked.ensure_construction_started();
     let mut client_presence = locked.client_presence();
     // Start of the current last-client idle period, keyed by the attach
     // epoch that ended it (see `LAST_CLIENT_HANDOFF_GRACE`).
@@ -7309,11 +8043,15 @@ pub(crate) async fn run_locked_until_ready(
         };
         let idle_grace_elapsed =
             idle_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
-        // An acknowledged StopDaemon tears down every attached locked client
-        // — an onboarding wizard stays blocked in recv and never drains the
-        // presence count — with the same abort semantics the ready handoff
-        // uses. `closing` alone still waits for the count: a ready
-        // transition also sets it while clients remain attached.
+        // An acknowledged StopDaemon (or a forwarded shutdown signal) tears
+        // down every attached locked client — an onboarding wizard stays
+        // blocked in recv and never drains the presence count — with the
+        // same abort semantics the ready handoff uses. `closing` alone still
+        // waits for the count: a ready transition also sets it while clients
+        // remain attached. Every teardown this loop performs waits for an
+        // in-flight ready construction to settle. Only a forced process exit
+        // (a repeated shutdown signal, SIGKILL, a crash) can interrupt one;
+        // the committed vault makes the next boot reconstruct it.
         if (locked.stop_requested.load(Ordering::Acquire)
             || (closing && observed.count == 0)
             || idle_grace_elapsed)
@@ -7323,6 +8061,7 @@ pub(crate) async fn run_locked_until_ready(
             locked.drain_inflight_mutations().await;
             locked_clients.abort_all();
             while locked_clients.join_next().await.is_some() {}
+            sensitive_clients.detach_all();
             return Ok(LockedRunOutcome::Shutdown);
         }
         tokio::select! {
@@ -7335,6 +8074,14 @@ pub(crate) async fn run_locked_until_ready(
                 {
                     locked_clients.abort_all();
                     while locked_clients.join_next().await.is_some() {}
+                    // A response still being written on the sensitive
+                    // sibling finishes on its own task; nothing it does can
+                    // affect the published ready graph.
+                    sensitive_clients.detach_all();
+                    if locked.stop_requested.load(Ordering::Acquire) {
+                        constructed.retire_for_stop();
+                        return Ok(LockedRunOutcome::Shutdown);
+                    }
                     return Ok(LockedRunOutcome::Ready(
                         constructed.publish_returned(),
                         listener,
@@ -7344,7 +8091,17 @@ pub(crate) async fn run_locked_until_ready(
             }
             changed = client_presence.changed() => {
                 if changed.is_err() {
-                    anyhow::bail!("locked client lifetime publisher closed");
+                    return settle_construction_then_fail(
+                        &locked,
+                        &mut locked_clients,
+                        anyhow::anyhow!("locked client lifetime publisher closed"),
+                    )
+                    .await;
+                }
+            }
+            joined = sensitive_clients.join_next(), if !sensitive_clients.is_empty() => {
+                if let Some(Ok(Err(error))) = joined {
+                    tracing::debug!(error = %format!("{error:#}"), "locked sensitive connection ended with error");
                 }
             }
             // Wake once the handoff grace elapses. An elapsed deadline that
@@ -7359,7 +8116,19 @@ pub(crate) async fn run_locked_until_ready(
                 }
             } => {}
             accepted = accept_daemon_stream(&mut listener) => {
-                let stream = accepted?;
+                let stream = match accepted {
+                    Ok(stream) => stream,
+                    Err(error) => match classify_accept_error(&error) {
+                        AcceptFailure::Transient(backoff) => {
+                            tracing::warn!(error = %format!("{error:#}"), "locked control accept failed; retrying");
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+                        AcceptFailure::Fatal => {
+                            return settle_construction_then_fail(&locked, &mut locked_clients, error).await;
+                        }
+                    },
+                };
                 if validate_peer_owner(&stream).is_err() {
                     continue;
                 }
@@ -7368,70 +8137,24 @@ pub(crate) async fn run_locked_until_ready(
                     let _ = handle_locked_client(stream, locked).await;
                 });
             }
-            accepted = accept_daemon_stream(
-                sensitive.listener.as_mut().context("locked sensitive listener is absent")?
-            ) => {
-                let mut stream = accepted?;
+            accepted = accept_daemon_stream(sensitive_listener_mut(&mut sensitive)) => {
+                let stream = match accepted {
+                    Ok(stream) => stream,
+                    Err(error) => match classify_accept_error(&error) {
+                        AcceptFailure::Transient(backoff) => {
+                            tracing::warn!(error = %format!("{error:#}"), "locked sensitive accept failed; retrying");
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+                        AcceptFailure::Fatal => {
+                            return settle_construction_then_fail(&locked, &mut locked_clients, error).await;
+                        }
+                    },
+                };
                 if validate_peer_owner(&stream).is_err() {
                     continue;
                 }
-                let peer = socket_peer_identity(&stream)?;
-                let frame = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    crate::daemon::leak_reveal_socket::read_sensitive_request_frame(&mut stream),
-                ).await.ok().flatten();
-                let Some(crate::daemon::leak_reveal_socket::SensitiveRequestFrame::Onboarding(payload)) = frame else {
-                    continue;
-                };
-                let decoded = cockpit_proto::decode_sensitive_onboarding_intent(&payload);
-                let authenticated = decoded.as_ref().ok().and_then(|frame| {
-                    let token = frame.owner_capability.as_ref()?;
-                    locked.peer_credential_registry.verify_sensitive_peer(peer, token.as_str())
-                }).is_some_and(|(role, _)| role.is_owner_class());
-                let outcome = if !authenticated {
-                    Err(cockpit_proto::SensitiveOnboardingIntentError::Unauthorized)
-                } else {
-                    locked.apply_secure_intent(decoded.expect("authenticated frame decoded").request).await
-                };
-                match outcome {
-                    Ok(result) => {
-                        locked_clients.abort_all();
-                        while locked_clients.join_next().await.is_some() {}
-                        match locked.finish_ready_transition().await {
-                            Ok(constructed) => {
-                                match constructed
-                                    .finalize_sensitive_wire(&mut stream, result)
-                                    .await
-                                {
-                                    Ok(ready) => {
-                                        return Ok(LockedRunOutcome::Ready(
-                                            ready,
-                                            listener,
-                                            sensitive,
-                                        ));
-                                    }
-                                    Err(_) => {}
-                                }
-                            }
-                            Err(_) => {
-                                let response = cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                                    cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
-                                );
-                                let bytes = cockpit_proto::encode_sensitive_onboarding_response(&response)
-                                    .map_err(anyhow::Error::msg)?;
-                                stream.write_all(&bytes).await?;
-                                stream.shutdown().await?;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let response = cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(error);
-                        let bytes = cockpit_proto::encode_sensitive_onboarding_response(&response)
-                            .map_err(anyhow::Error::msg)?;
-                        stream.write_all(&bytes).await?;
-                        stream.shutdown().await?;
-                    }
-                }
+                sensitive_clients.spawn(handle_locked_sensitive_connection(stream, locked.clone()));
             }
         }
     }

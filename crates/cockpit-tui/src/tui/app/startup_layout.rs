@@ -1,70 +1,257 @@
 use super::*;
 use cockpit_config::providers::AuthKind;
 
-#[cfg(test)]
-mod tests {
-    #[tokio::test(flavor = "current_thread")]
-    async fn coverage_postpaint_integration_uses_existing_upstream_firstpaint_seam() {
-        let namespace = tempfile::tempdir().expect("isolated startup trace root");
-        let workspace = namespace.path().join("workspace");
-        let runtime = namespace.path().join("runtime");
-        std::fs::create_dir_all(&workspace).expect("workspace fixture");
-        std::fs::create_dir_all(&runtime).expect("runtime fixture");
-        let trace = crate::tui::app::startup_first_paint_tests::run_startup_trace_case(
-            &workspace, &runtime, false, true,
-        )
-        .await;
-
-        let mut cursor = 0usize;
-        for event in [
-            "first-paint",
-            "coverage-phase-start",
-            "coverage-phase-complete",
-            "daemon-ready",
-            "first-model-request",
-        ] {
-            let relative = trace[cursor..]
-                .find(event)
-                .unwrap_or_else(|| panic!("missing `{event}` in startup trace: {trace}"));
-            cursor += relative + event.len();
-        }
-        assert!(trace.contains("scope_class=\"daemon_global\""));
-        assert!(trace.contains("correlation=\"opaque-test-correlation\""));
-        for forbidden in ["candidate", "matcher", "fingerprint", "source_inventory"] {
-            assert!(!trace.contains(forbidden), "trace exposed {forbidden}");
-        }
-    }
-}
-
 fn onboarding_ready_construction_retry_required(error: &cockpit_proto::ErrorPayload) -> bool {
     error.code == cockpit_proto::ErrorCode::Internal
         && error.message.contains("retry ready construction")
 }
 
-fn onboarding_handoff_retry_required(error: &cockpit_proto::ErrorPayload) -> bool {
-    // The local client reports a pre-request hello timeout as a protocol
-    // payload, even though no daemon transition was evaluated. The message
-    // is the transport-specific discriminator; ordinary daemon rejections
-    // still return immediately below.
-    error.message.contains("daemon hello timed out")
+/// How long the pre-screen startup may run silently before it prints its
+/// "Starting cockpit…" line on the normal terminal.
+pub(super) const STARTING_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// After this long the pre-screen line says startup is slow and how to quit.
+/// There is no deadline that paints anyway: a guessed first screen is never
+/// drawn. Startup either decides the screen, fails with a visible error, or
+/// is cancelled by the user.
+pub(super) const STARTING_SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The normal (pre-alternate-screen) terminal during first-screen settling:
+/// one status line, and input handling while nothing is drawn.
+pub(super) trait PrePaintTerminal {
+    /// Show `line` as the single status line (replacing any previous one).
+    fn show(&mut self, line: &str);
+    /// Erase the status line, leaving the cursor where it started.
+    fn clear(&mut self);
+    /// Drain pending input (typeahead never leaks into the first screen) and
+    /// report whether the user asked to quit (Ctrl-C).
+    fn cancel_requested(&mut self) -> bool;
+}
+
+pub(super) const STARTING_NOTICE_TEXT: &str = "Starting cockpit…";
+
+/// In-chat status while ready services are still being constructed behind
+/// an already-decided first screen.
+pub(super) const STARTING_SERVICES_TEXT: &str = "Starting Cockpit services…";
+
+/// Production pre-paint terminal: raw mode without the alternate screen, so
+/// keystrokes are neither echoed nor buffered into the first frame, and
+/// Ctrl-C is read as input (and honored) instead of killing the process
+/// behind a half-initialized daemon handshake. Raw mode is restored on drop
+/// (including unwinding) unless ownership passes to the TUI terminal.
+pub(super) struct TerminalPrePaint {
+    raw_mode: bool,
+    shown: bool,
+}
+
+impl TerminalPrePaint {
+    pub(super) fn enter() -> Self {
+        let raw_mode = crossterm::terminal::enable_raw_mode().is_ok();
+        Self {
+            raw_mode,
+            shown: false,
+        }
+    }
+
+    /// Before the TUI terminal initializes: discard remaining typeahead and
+    /// erase the status line. Raw mode stays owned (and restored on drop)
+    /// until [`Self::release_to_tui`].
+    pub(super) fn prepare_hand_off(&mut self) {
+        let _ = self.cancel_requested();
+        self.clear();
+    }
+
+    /// Ownership of raw mode passes to the TUI terminal. Call only once that
+    /// terminal initialized successfully: until then a failure must still
+    /// restore the shell's cooked mode.
+    pub(super) fn release_to_tui(mut self) {
+        self.raw_mode = false;
+    }
+}
+
+impl Drop for TerminalPrePaint {
+    fn drop(&mut self) {
+        self.clear();
+        if self.raw_mode {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+impl PrePaintTerminal for TerminalPrePaint {
+    fn show(&mut self, line: &str) {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\r\x1b[2K{line}");
+        let _ = out.flush();
+        self.shown = true;
+    }
+
+    fn clear(&mut self) {
+        use std::io::Write as _;
+        if !self.shown {
+            return;
+        }
+        self.shown = false;
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\r\x1b[2K");
+        let _ = out.flush();
+    }
+
+    fn cancel_requested(&mut self) -> bool {
+        use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+        let mut cancelled = false;
+        while matches!(crossterm::event::poll(std::time::Duration::ZERO), Ok(true)) {
+            if let Ok(Event::Key(key)) = crossterm::event::read()
+                && key.kind != KeyEventKind::Release
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            {
+                cancelled = true;
+            }
+        }
+        cancelled
+    }
+}
+
+/// How the first-screen settling ended without a decided screen.
+#[derive(Debug)]
+pub(super) enum FirstScreenOutcome {
+    Decided,
+    Cancelled,
+    Failed(String),
+}
+
+/// Upper bound for one onboarding authority operation to reach a serving
+/// daemon across a handoff: a worker roll after a config write, or the
+/// daemon-owned ready construction after the secure-store choice commits.
+/// One end-to-end deadline: every nested stage (lifecycle resolution,
+/// connect, request, a construction retry) is bounded by what remains of
+/// it; a retry never restarts the window.
+///
+/// It equals the ready-services wait, which covers the daemon's own
+/// construction deadline plus a margin: the client never gives up on a
+/// construction the daemon is still legitimately running. It bails early on
+/// what the daemon reports — a construction that failed again after its one
+/// retry, an owner that exited, or an owner that can never be spoken to —
+/// and a user who re-submits the secure-store choice after a failure re-enters
+/// this wait (the daemon restarts construction for its committed choice), so
+/// restarting Cockpit is never the only recovery.
+pub(super) const ONBOARDING_HANDOFF_DEADLINE: std::time::Duration =
+    cockpit_client::READY_SERVICES_WAIT;
+const ONBOARDING_HANDOFF_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn handoff_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + ONBOARDING_HANDOFF_DEADLINE
+}
+
+/// `{error:#}`: the whole cause chain (e.g. the ENOENT behind "connecting to
+/// …/cockpit.sock"), never just the outermost context.
+fn error_chain(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+/// A daemon rejection that is resolved by re-sending the same request once
+/// the handoff completes: the documented `RetryLater` code (a locked owner
+/// refusing a mutation while its ready construction runs), or the client's
+/// pre-request hello timeout, which evaluated no daemon operation at all.
+fn onboarding_request_retryable(error: &cockpit_proto::ErrorPayload) -> bool {
+    error.code == cockpit_proto::ErrorCode::RetryLater
+        || error.message.contains("daemon hello timed out")
+}
+
+/// Whether a connect failure is terminal (never retried as transport),
+/// decided from its type: an incompatible or malformed hello, or a refused
+/// permission, cannot be resolved by waiting. After an owner was observed,
+/// an unreachable endpoint means that owner exited, which is terminal too.
+fn connect_error_terminal(error: &anyhow::Error, owner_observed: bool) -> bool {
+    let failure = cockpit_client::daemon_connect_failure(error);
+    failure.is_terminal() || (owner_observed && failure.owner_gone())
+}
+
+fn owner_stopped_or_chain(error: &anyhow::Error, owner_observed: bool) -> String {
+    if owner_observed && cockpit_client::daemon_connect_failure(error).owner_gone() {
+        format!("the Cockpit daemon stopped: {}", error_chain(error))
+    } else {
+        error_chain(error)
+    }
+}
+
+/// Run one stage of a handoff within the shared end-to-end deadline.
+async fn within_deadline<T>(
+    deadline: tokio::time::Instant,
+    last_observation: &str,
+    stage: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout_at(deadline, stage)
+        .await
+        .map_err(|_| deadline_message(last_observation))
+}
+
+fn deadline_message(last_observation: &str) -> String {
+    format!(
+        "the Cockpit daemon did not become ready within {}s ({last_observation})",
+        ONBOARDING_HANDOFF_DEADLINE.as_secs()
+    )
+}
+
+/// What an in-flight secure-store submission is waiting on, for the screen's
+/// progress line. Written by the async operation, read at render time.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OnboardingHandoffProgress {
+    phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnboardingHandoffPhase {
+    /// The secure-store choice is being applied.
+    Submitting,
+    /// The choice committed; the daemon is building its ready services.
+    PreparingServices,
+    /// The daemon connection dropped; re-attaching or confirming the outcome.
+    Reconnecting,
+}
+
+impl OnboardingHandoffProgress {
+    pub(crate) fn set(&self, phase: OnboardingHandoffPhase) {
+        self.phase
+            .store(phase as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn get(&self) -> OnboardingHandoffPhase {
+        match self.phase.load(std::sync::atomic::Ordering::Acquire) {
+            1 => OnboardingHandoffPhase::PreparingServices,
+            2 => OnboardingHandoffPhase::Reconnecting,
+            _ => OnboardingHandoffPhase::Submitting,
+        }
+    }
+}
+
+/// The owner phase behind `client` (the single `DaemonStatus` funnel lives
+/// in `cockpit-client`).
+pub(super) async fn onboarding_daemon_phase(
+    client: &cockpit_client::DaemonClient,
+) -> Result<cockpit_client::OwnerPhase, String> {
+    client
+        .owner_phase()
+        .await
+        .map_err(|error| error_chain(&error))
 }
 
 /// Resolve the daemon endpoint for an onboarding authority operation. The
 /// startup machine's resolved lifecycle endpoint is used when present;
-/// otherwise the app's lifecycle client resolves it — the same funnel the
-/// settings surfaces use. An onboarding request is never silently dropped
-/// because the startup machine has not pinned its selection yet.
+/// otherwise the app's lifecycle client resolves it (without waiting for
+/// ready services: onboarding observes the owner's phase itself).
 async fn onboarding_authority_endpoint(
     lifecycle: &cockpit_client::LifecycleClient,
     selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
-) -> Result<cockpit_client::ClientEndpoint, String> {
+) -> Result<cockpit_client::ClientEndpoint, cockpit_client::LifecycleError> {
     match selected_endpoint {
         Some(endpoint) => Ok(endpoint.clone()),
         None => lifecycle
-            .resolve_default()
+            .resolve_default_bootstrap()
             .await
-            .map(|resolved| resolved.endpoint)
-            .map_err(|error| error.to_string()),
+            .map(|resolved| resolved.endpoint),
     }
 }
 
@@ -83,101 +270,77 @@ async fn apply_onboarding_transition_after_handoff(
     ),
     String,
 > {
-    const HANDOFF_ATTEMPTS: usize = 6;
-    let mut last_transport_error = None;
-    for attempt in 0..HANDOFF_ATTEMPTS {
-        let endpoint = match onboarding_authority_endpoint(lifecycle, selected_endpoint).await {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                last_transport_error = Some(error);
-                if attempt + 1 < HANDOFF_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
-                }
-                break;
-            }
-        };
-        let client = match cockpit_client::DaemonClient::connect_endpoint(&endpoint).await {
-            Ok(client) => client,
-            Err(error) => {
-                last_transport_error = Some(error.to_string());
-                if attempt + 1 < HANDOFF_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
-                }
-                break;
-            }
-        };
-        match client
-            .request(cockpit_proto::Request::ApplyOnboardingTransition(
-                request.clone(),
-            ))
-            .await
-        {
-            Ok(Ok(cockpit_proto::Response::OnboardingTransition(result))) => {
-                return Ok((result, client));
-            }
-            Ok(Ok(other)) => return Err(format!("unexpected onboarding response: {other:?}")),
-            Ok(Err(error)) if onboarding_handoff_retry_required(&error) => {
-                last_transport_error = Some(error.to_string());
-            }
-            Ok(Err(error)) => return Err(error.to_string()),
-            Err(error) => last_transport_error = Some(error.to_string()),
-        }
-        if attempt + 1 < HANDOFF_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
+    match onboarding_request_after_handoff(
+        lifecycle,
+        selected_endpoint,
+        cockpit_proto::Request::ApplyOnboardingTransition(request),
+        handoff_deadline(),
+    )
+    .await?
+    {
+        (cockpit_proto::Response::OnboardingTransition(result), client) => Ok((result, client)),
+        (other, _) => Err(format!("unexpected onboarding response: {other:?}")),
     }
-    Err(last_transport_error.unwrap_or_else(|| {
-        "onboarding transition transport was unavailable after daemon handoff".into()
-    }))
 }
 
+/// The single onboarding request funnel across a daemon handoff. Transport
+/// failures (no socket yet, a hello that has not been answered, a connection
+/// closed by a retiring owner) and self-resolving refusals are retried until
+/// `deadline`, which also bounds every nested stage; an incompatible owner
+/// and any other daemon rejection return at once. The request is re-sent
+/// unchanged, so its client operation id makes a replay after a lost
+/// response idempotent.
 async fn onboarding_request_after_handoff(
     lifecycle: &cockpit_client::LifecycleClient,
     selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
     request: cockpit_proto::Request,
+    deadline: tokio::time::Instant,
 ) -> Result<(cockpit_proto::Response, cockpit_client::DaemonClient), String> {
-    const HANDOFF_ATTEMPTS: usize = 6;
-    let mut last_transport_error = None;
-    for attempt in 0..HANDOFF_ATTEMPTS {
-        let endpoint = match onboarding_authority_endpoint(lifecycle, selected_endpoint).await {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                last_transport_error = Some(error);
-                if attempt + 1 < HANDOFF_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
+    let mut last = String::from("no daemon answer yet");
+    let mut owner_observed = false;
+    loop {
+        let endpoint = within_deadline(
+            deadline,
+            &last,
+            onboarding_authority_endpoint(lifecycle, selected_endpoint),
+        )
+        .await?;
+        match endpoint {
+            Err(error) if error.is_terminal() => return Err(error.to_string()),
+            Err(error) => last = error.to_string(),
+            Ok(endpoint) => {
+                match within_deadline(
+                    deadline,
+                    &last,
+                    cockpit_client::DaemonClient::connect_endpoint_bootstrap(&endpoint),
+                )
+                .await?
+                {
+                    Err(error) if connect_error_terminal(&error, owner_observed) => {
+                        return Err(owner_stopped_or_chain(&error, owner_observed));
+                    }
+                    Err(error) => last = error_chain(&error),
+                    Ok(client) => {
+                        owner_observed = true;
+                        match within_deadline(deadline, &last, client.request(request.clone()))
+                            .await?
+                        {
+                            Ok(Ok(response)) => return Ok((response, client)),
+                            Ok(Err(error)) if onboarding_request_retryable(&error) => {
+                                last = error.to_string();
+                            }
+                            Ok(Err(error)) => return Err(error.to_string()),
+                            Err(error) => last = error_chain(&error),
+                        }
+                    }
                 }
-                break;
             }
-        };
-        let client = match cockpit_client::DaemonClient::connect_endpoint(&endpoint).await {
-            Ok(client) => client,
-            Err(error) => {
-                last_transport_error = Some(error.to_string());
-                if attempt + 1 < HANDOFF_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
-                }
-                break;
-            }
-        };
-        match client.request(request.clone()).await {
-            Ok(Ok(response)) => return Ok((response, client)),
-            Ok(Err(error)) if onboarding_handoff_retry_required(&error) => {
-                last_transport_error = Some(error.to_string());
-            }
-            Ok(Err(error)) => return Err(error.to_string()),
-            Err(error) => last_transport_error = Some(error.to_string()),
         }
-        if attempt + 1 < HANDOFF_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if tokio::time::Instant::now() + ONBOARDING_HANDOFF_POLL >= deadline {
+            return Err(deadline_message(&last));
         }
+        tokio::time::sleep(ONBOARDING_HANDOFF_POLL).await;
     }
-    Err(last_transport_error.unwrap_or_else(|| {
-        "onboarding request transport was unavailable after daemon handoff".into()
-    }))
 }
 
 async fn fetch_onboarding_provider_models(
@@ -196,7 +359,7 @@ async fn fetch_onboarding_provider_models(
             allow_fallback: false,
         })
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error_chain(&error))?
         .map_err(|error| error.to_string())?;
     let Response::ProviderModelsFetched {
         mut results,
@@ -252,28 +415,166 @@ async fn fetch_onboarding_provider_models(
     Ok((outcome, config_generation))
 }
 
-/// A locked control connection is closed when ready services take ownership.
-/// Acquire and retain a ready connection before presenting the next stage;
-/// otherwise the last one-shot RPC can tear down an incomplete daemon.
-async fn retain_ready_onboarding_client(
+/// Outcome of waiting for ready services.
+enum OnboardingReadyWait {
+    Ready(cockpit_client::DaemonClient),
+    /// A locked owner reports that construction failed; the client is a
+    /// connection to that locked owner (the only place a retry is valid).
+    ConstructionFailed(cockpit_client::DaemonClient),
+}
+
+/// Wait on the daemon's explicit readiness signal: a locked owner answers
+/// every hello with its `ready_construction` phase while it builds ready
+/// services, and ready services answer status as a ready daemon. A locked
+/// connection is closed when ready services take ownership; that, a hello
+/// not yet answered, or a missing socket is a transient reconnect, bounded by
+/// `deadline` (every nested stage included). The final error names the
+/// latest observation.
+async fn wait_for_ready_onboarding_daemon(
     lifecycle: &cockpit_client::LifecycleClient,
     selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
-) -> Result<cockpit_client::DaemonClient, String> {
-    let (response, client) = onboarding_request_after_handoff(
-        lifecycle,
-        selected_endpoint,
-        cockpit_proto::Request::GetOnboardingBootstrapSnapshot,
-    )
-    .await?;
-    match response {
-        cockpit_proto::Response::OnboardingBootstrapSnapshot(_) => Ok(client),
-        other => Err(format!("unexpected onboarding response: {other:?}")),
+    progress: &OnboardingHandoffProgress,
+    deadline: tokio::time::Instant,
+) -> Result<OnboardingReadyWait, String> {
+    let mut held: Option<cockpit_client::DaemonClient> = None;
+    let mut last = String::from("the daemon has not answered yet");
+    // Once an owner answered, an unreachable endpoint means it exited (the
+    // ready handoff keeps the same listener): fail at once instead of
+    // waiting out the deadline.
+    let mut owner_observed = false;
+    loop {
+        if held.is_none() {
+            match within_deadline(
+                deadline,
+                &last,
+                onboarding_authority_endpoint(lifecycle, selected_endpoint),
+            )
+            .await?
+            {
+                Err(error) if error.is_terminal() => return Err(error.to_string()),
+                Err(error) => last = error.to_string(),
+                Ok(endpoint) => match within_deadline(
+                    deadline,
+                    &last,
+                    cockpit_client::DaemonClient::connect_endpoint_bootstrap(&endpoint),
+                )
+                .await?
+                {
+                    Ok(client) => {
+                        owner_observed = true;
+                        held = Some(client);
+                    }
+                    Err(error) if connect_error_terminal(&error, owner_observed) => {
+                        return Err(owner_stopped_or_chain(&error, owner_observed));
+                    }
+                    Err(error) => last = error_chain(&error),
+                },
+            }
+        }
+        if let Some(client) = held.as_ref() {
+            match within_deadline(deadline, &last, onboarding_daemon_phase(client)).await? {
+                Ok(cockpit_client::OwnerPhase::Ready) => {
+                    let client = held.take().expect("held ready client");
+                    return Ok(OnboardingReadyWait::Ready(client));
+                }
+                Ok(cockpit_client::OwnerPhase::Bootstrap(
+                    cockpit_proto::LockedReadyConstruction::Constructing,
+                )) => {
+                    last = "still preparing its services".into();
+                    progress.set(OnboardingHandoffPhase::PreparingServices);
+                }
+                Ok(cockpit_client::OwnerPhase::Bootstrap(
+                    cockpit_proto::LockedReadyConstruction::Failed,
+                )) => {
+                    let client = held.take().expect("held locked client");
+                    return Ok(OnboardingReadyWait::ConstructionFailed(client));
+                }
+                Ok(cockpit_client::OwnerPhase::Bootstrap(
+                    cockpit_proto::LockedReadyConstruction::AwaitingSecureStore,
+                )) => {
+                    return Err(
+                        "the Cockpit daemon has no committed secure store; choose it again".into(),
+                    );
+                }
+                Err(error) => {
+                    held = None;
+                    last = error;
+                    progress.set(OnboardingHandoffPhase::Reconnecting);
+                }
+            }
+        }
+        if tokio::time::Instant::now() + ONBOARDING_HANDOFF_POLL >= deadline {
+            return Err(deadline_message(&last));
+        }
+        tokio::time::sleep(ONBOARDING_HANDOFF_POLL).await;
     }
 }
 
-async fn retry_onboarding_ready_construction_snapshot(
+/// Wait until the daemon serves ready services and return a retained ready
+/// connection. A construction the locked owner reports as failed is retried
+/// at most once, and only through that locked owner: a ready daemon never
+/// receives `retry_onboarding_ready_construction`. The retry shares the
+/// caller's deadline; it never restarts the window.
+async fn await_onboarding_ready_services(
     lifecycle: &cockpit_client::LifecycleClient,
     selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
+    progress: &OnboardingHandoffProgress,
+    deadline: tokio::time::Instant,
+) -> Result<cockpit_client::DaemonClient, String> {
+    let mut retried = false;
+    loop {
+        match wait_for_ready_onboarding_daemon(lifecycle, selected_endpoint, progress, deadline)
+            .await?
+        {
+            OnboardingReadyWait::Ready(client) => return Ok(client),
+            OnboardingReadyWait::ConstructionFailed(_) if retried => {
+                return Err(
+                    "Cockpit could not finish preparing its services; see daemon.log".into(),
+                );
+            }
+            OnboardingReadyWait::ConstructionFailed(locked) => {
+                retried = true;
+                progress.set(OnboardingHandoffPhase::PreparingServices);
+                match within_deadline(
+                    deadline,
+                    "retrying the failed ready construction",
+                    locked.retry_onboarding_ready_construction(),
+                )
+                .await?
+                .map_err(|error| error_chain(&error))?
+                {
+                    Ok(_) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+    }
+}
+
+/// The authoritative snapshot from a ready daemon.
+async fn ready_onboarding_snapshot(
+    client: &cockpit_client::DaemonClient,
+) -> Result<Option<cockpit_proto::OnboardingBootstrapSnapshot>, String> {
+    match client
+        .request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot)
+        .await
+        .map_err(|error| error_chain(&error))?
+    {
+        Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot)) => Ok(snapshot),
+        Ok(other) => Err(format!("unexpected onboarding response: {other:?}")),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Resolve an owner that is not (yet) serving ready services, observed on
+/// `client`: a locked owner that reports a failed construction gets the
+/// retry, one still constructing is waited on; a ready daemon is never asked
+/// to retry. Returns the authoritative snapshot and a ready connection.
+pub(super) async fn resolve_ready_onboarding_owner(
+    lifecycle: &cockpit_client::LifecycleClient,
+    selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
+    client: cockpit_client::DaemonClient,
+    deadline: tokio::time::Instant,
 ) -> Result<
     (
         Option<cockpit_proto::OnboardingBootstrapSnapshot>,
@@ -281,20 +582,70 @@ async fn retry_onboarding_ready_construction_snapshot(
     ),
     String,
 > {
-    let endpoint = onboarding_authority_endpoint(lifecycle, selected_endpoint).await?;
-    let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
-        .await
-        .map_err(|error| error.to_string())?;
-    match client
-        .retry_onboarding_ready_construction()
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        Ok(snapshot) => {
-            let ready_client = retain_ready_onboarding_client(lifecycle, selected_endpoint).await?;
-            Ok((Some(snapshot), ready_client))
+    let phase = within_deadline(
+        deadline,
+        "reading the daemon phase",
+        onboarding_daemon_phase(&client),
+    )
+    .await??;
+    let client = match phase {
+        cockpit_client::OwnerPhase::Ready => client,
+        cockpit_client::OwnerPhase::Bootstrap(_) => {
+            drop(client);
+            await_onboarding_ready_services(
+                lifecycle,
+                selected_endpoint,
+                &OnboardingHandoffProgress::default(),
+                deadline,
+            )
+            .await?
         }
-        Err(error) => Err(error.to_string()),
+    };
+    let snapshot = within_deadline(
+        deadline,
+        "reading the onboarding snapshot",
+        ready_onboarding_snapshot(&client),
+    )
+    .await??;
+    Ok((snapshot, client))
+}
+
+/// Reconcile a secure-store submission whose response was lost from the
+/// daemon's durable receipt for the exact client operation id. The intent is
+/// never re-sent. A pending receipt means the daemon is still applying it:
+/// wait (within the deadline) for its terminal status.
+async fn committed_secure_intent_receipt(
+    lifecycle: &cockpit_client::LifecycleClient,
+    selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
+    query: cockpit_proto::OnboardingReceiptQuery,
+    deadline: tokio::time::Instant,
+) -> Result<Option<cockpit_proto::OnboardingTransitionReceipt>, String> {
+    loop {
+        match onboarding_request_after_handoff(
+            lifecycle,
+            selected_endpoint,
+            cockpit_proto::Request::GetOnboardingTransitionReceipt(query.clone()),
+            deadline,
+        )
+        .await?
+        {
+            (cockpit_proto::Response::OnboardingTransitionReceipt(Some(receipt)), _)
+                if receipt.status == cockpit_proto::OnboardingReceiptStatus::Pending =>
+            {
+                if tokio::time::Instant::now() + ONBOARDING_HANDOFF_POLL >= deadline {
+                    return Err(deadline_message(
+                        "the secure-store choice is still being applied",
+                    ));
+                }
+                tokio::time::sleep(ONBOARDING_HANDOFF_POLL).await;
+            }
+            (cockpit_proto::Response::OnboardingTransitionReceipt(receipt), _) => {
+                return Ok(receipt.filter(|receipt| {
+                    receipt.status == cockpit_proto::OnboardingReceiptStatus::Committed
+                }));
+            }
+            (other, _) => return Err(format!("unexpected onboarding receipt response: {other:?}")),
+        }
     }
 }
 
@@ -302,6 +653,7 @@ async fn onboarding_snapshot_after_secure_intent(
     lifecycle: &cockpit_client::LifecycleClient,
     selected_endpoint: Option<&cockpit_client::ClientEndpoint>,
     request: cockpit_proto::ApplyOnboardingSecureIntent,
+    progress: OnboardingHandoffProgress,
 ) -> Result<
     (
         Option<cockpit_proto::OnboardingBootstrapSnapshot>,
@@ -310,50 +662,137 @@ async fn onboarding_snapshot_after_secure_intent(
     ),
     String,
 > {
-    let endpoint = onboarding_authority_endpoint(lifecycle, selected_endpoint).await?;
-    let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
-        .await
-        .map_err(|error| error.to_string())?;
+    // One end-to-end deadline for the whole submission: apply, reconcile a
+    // lost response, and wait for ready services.
+    let deadline = handoff_deadline();
+    progress.set(OnboardingHandoffPhase::Submitting);
+    let endpoint = within_deadline(
+        deadline,
+        "resolving the daemon",
+        onboarding_authority_endpoint(lifecycle, selected_endpoint),
+    )
+    .await?
+    .map_err(String::from)?;
+    let client = within_deadline(
+        deadline,
+        "connecting to the daemon",
+        cockpit_client::DaemonClient::connect_endpoint_bootstrap(&endpoint),
+    )
+    .await?
+    .map_err(|error| error_chain(&error))?;
+    // The retry path after a failed or abandoned wait: once the choice has
+    // committed (the owner is constructing, failed, or ready), re-submitting
+    // it re-enters the readiness wait — which retries a failed construction
+    // through the locked owner — instead of sending a second intent the
+    // daemon would refuse.
+    let phase = within_deadline(
+        deadline,
+        "reading the daemon phase",
+        onboarding_daemon_phase(&client),
+    )
+    .await??;
+    if phase
+        != cockpit_client::OwnerPhase::Bootstrap(
+            cockpit_proto::LockedReadyConstruction::AwaitingSecureStore,
+        )
+    {
+        drop(client);
+        progress.set(OnboardingHandoffPhase::PreparingServices);
+        let ready_client =
+            await_onboarding_ready_services(lifecycle, selected_endpoint, &progress, deadline)
+                .await?;
+        let snapshot = within_deadline(
+            deadline,
+            "reading the onboarding snapshot",
+            ready_onboarding_snapshot(&ready_client),
+        )
+        .await??;
+        return Ok((snapshot, None, ready_client));
+    }
     let receipt_query = cockpit_proto::OnboardingReceiptQuery {
         run_id: request.run_id,
         attempt_id: request.attempt_id,
         client_operation_id: request.client_operation_id.clone(),
     };
-    match client
-        .apply_onboarding_secure_intent(&endpoint, request)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        Ok(result) => {
-            let ready_client = retain_ready_onboarding_client(lifecycle, selected_endpoint).await?;
-            Ok((Some(result.snapshot), Some(result.receipt), ready_client))
-        }
-        Err(error) if onboarding_ready_construction_retry_required(&error) => {
-            let (snapshot, ready_client) =
-                retry_onboarding_ready_construction_snapshot(lifecycle, selected_endpoint).await?;
-            let receipt = match ready_client
-                .request(cockpit_proto::Request::GetOnboardingTransitionReceipt(
-                    receipt_query,
-                ))
-                .await
-                .map_err(|error| error.to_string())?
+    let sent = within_deadline(
+        deadline,
+        "applying the secure-store choice",
+        client.apply_onboarding_secure_intent(&endpoint, request),
+    )
+    .await?;
+    let committed = match sent {
+        Ok(Ok(result)) => Some(result.receipt),
+        // The vault committed but construction could not start; the
+        // readiness wait below sees the locked owner's `failed` phase and
+        // retries it there.
+        Ok(Err(error)) if onboarding_ready_construction_retry_required(&error) => None,
+        Ok(Err(error)) => return Err(error.to_string()),
+        // The frame may have been delivered and committed before the
+        // transport failed: the outcome is uncertain, so it is reconciled
+        // from the durable receipt, never by sending a second intent.
+        Err(error) => {
+            progress.set(OnboardingHandoffPhase::Reconnecting);
+            match committed_secure_intent_receipt(
+                lifecycle,
+                selected_endpoint,
+                receipt_query.clone(),
+                deadline,
+            )
+            .await?
             {
-                Ok(cockpit_proto::Response::OnboardingTransitionReceipt(Some(receipt))) => receipt,
-                Ok(cockpit_proto::Response::OnboardingTransitionReceipt(None)) => {
-                    return Err("secure onboarding receipt is unavailable".to_string());
-                }
-                Ok(other) => {
-                    return Err(format!("unexpected onboarding receipt response: {other:?}"));
-                }
-                Err(error) => return Err(error.to_string()),
-            };
-            Ok((snapshot, Some(receipt), ready_client))
+                Some(receipt) => Some(receipt),
+                None => return Err(error_chain(&error)),
+            }
         }
-        Err(error) => Err(error.to_string()),
-    }
+    };
+    drop(client);
+    progress.set(OnboardingHandoffPhase::PreparingServices);
+    let ready_client =
+        await_onboarding_ready_services(lifecycle, selected_endpoint, &progress, deadline).await?;
+    let receipt = match committed {
+        Some(receipt) => receipt,
+        None => match within_deadline(
+            deadline,
+            "reading the secure-store receipt",
+            ready_client.request(cockpit_proto::Request::GetOnboardingTransitionReceipt(
+                receipt_query,
+            )),
+        )
+        .await?
+        .map_err(|error| error_chain(&error))?
+        {
+            Ok(cockpit_proto::Response::OnboardingTransitionReceipt(Some(receipt)))
+                if receipt.status == cockpit_proto::OnboardingReceiptStatus::Committed =>
+            {
+                receipt
+            }
+            Ok(cockpit_proto::Response::OnboardingTransitionReceipt(_)) => {
+                return Err("secure onboarding receipt is not committed".to_string());
+            }
+            Ok(other) => {
+                return Err(format!("unexpected onboarding receipt response: {other:?}"));
+            }
+            Err(error) => return Err(error.to_string()),
+        },
+    };
+    let snapshot = within_deadline(
+        deadline,
+        "reading the onboarding snapshot",
+        ready_onboarding_snapshot(&ready_client),
+    )
+    .await??;
+    Ok((snapshot, Some(receipt), ready_client))
 }
 
 impl App {
+    /// The startup chain's end-to-end deadline while the first screen is
+    /// being decided; a fresh handoff deadline for any later fetch.
+    fn startup_deadline(&self) -> tokio::time::Instant {
+        self.startup_background
+            .deadline
+            .unwrap_or_else(handoff_deadline)
+    }
+
     pub(super) fn mark_startup_trace_milestone(&mut self, event: &'static str) -> bool {
         self.startup_background.trace_milestones.insert(event)
     }
@@ -361,13 +800,38 @@ impl App {
     pub(super) fn start_startup_lifecycle_resolution(&mut self) {
         let generation = self.startup_background.generation;
         let lifecycle = self.lifecycle.clone();
+        let deadline = self.startup_deadline();
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::Internal("startup.lifecycle"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
                 crate::tui::async_action::AsyncActionKey::new("startup.lifecycle"),
             ),
             async move {
-                let result = lifecycle.resolve_default().await.map(Into::into);
+                // First-screen decisions need only the bootstrap surface;
+                // ready services are awaited separately (`startup.services`).
+                // A handshake interrupted by an owner handoff (closed or
+                // slow hello) is retried within the startup deadline; any
+                // other failure is reported at once.
+                let result = loop {
+                    let attempt = within_deadline(
+                        deadline,
+                        "starting the daemon",
+                        lifecycle.resolve_default_bootstrap(),
+                    )
+                    .await;
+                    match attempt {
+                        Ok(Ok(resolution)) => break Ok(resolution.into()),
+                        Ok(Err(error))
+                            if error.is_handoff_transient()
+                                && tokio::time::Instant::now() + ONBOARDING_HANDOFF_POLL
+                                    < deadline =>
+                        {
+                            tokio::time::sleep(ONBOARDING_HANDOFF_POLL).await;
+                        }
+                        Ok(Err(error)) => break Err(String::from(error)),
+                        Err(expired) => break Err(expired),
+                    }
+                };
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::StartupLifecycleResolved {
                         generation,
@@ -618,6 +1082,7 @@ impl App {
             .startup_lifecycle
             .as_ref()
             .map(|selected| selected.endpoint.clone());
+        let deadline = self.startup_deadline();
         let request_id = uuid::Uuid::new_v4().to_string();
         let pending_request_id = request_id.clone();
         let started = self.async_actions.start(
@@ -626,84 +1091,43 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("onboarding.bootstrap"),
             ),
             async move {
-                let bootstrap_request_id = request_id.clone();
-                let endpoint =
-                    match onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref())
-                        .await
-                    {
-                        Ok(endpoint) => endpoint,
-                        Err(error) => {
-                            return Ok(
-                                crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
-                                    generation,
-                                    error,
-                                },
-                            );
-                        }
-                    };
-                let client = match cockpit_client::DaemonClient::connect_endpoint(&endpoint).await {
-                    Ok(client) => client,
-                    Err(error) => {
-                        return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
+                let failed = |error: String| {
+                    Ok(
+                        crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
                             generation,
-                            error: error.to_string(),
-                        });
-                    }
-                };
-                let current = match client
-                    .request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot)
-                    .await
-                {
-                    Ok(Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot))) => snapshot,
-                    Ok(Ok(other)) => {
-                        return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
-                            generation,
-                            error: format!("unexpected onboarding response: {other:?}"),
-                        });
-                    }
-                    Ok(Err(error)) => {
-                        return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
-                            generation,
-                            error: error.to_string(),
-                        });
-                    }
-                    Err(error) => {
-                        return Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
-                            generation,
-                            error: error.to_string(),
-                        });
-                    }
-                };
-                if current.as_ref().is_some_and(|snapshot| {
-                    snapshot.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
-                }) {
-                    return match retry_onboarding_ready_construction_snapshot(
-                        &lifecycle,
-                        selected_endpoint.as_ref(),
+                            error,
+                        },
                     )
-                    .await
-                    {
-                        Ok((snapshot, lifetime_client)) => Ok(
-                            crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
-                                generation,
-                                request_id,
-                                receipt: None,
-                                lifetime_client: Some(lifetime_client),
-                                snapshot,
-                            },
-                        ),
-                        Err(error) => Ok(
-                            crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
-                                generation,
-                                error,
-                            },
-                        ),
-                    };
-                }
+                };
+                let bootstrap_request_id = request_id.clone();
+                // Every stage shares the startup deadline and goes through the
+                // handoff funnel: a cold onboarded start reads the locked
+                // owner while its ready construction runs, and a read cut by
+                // the locked-to-ready handoff is re-sent, never fatal.
+                let (current, client) = match onboarding_request_after_handoff(
+                    &lifecycle,
+                    selected_endpoint.as_ref(),
+                    cockpit_proto::Request::GetOnboardingBootstrapSnapshot,
+                    deadline,
+                )
+                .await
+                {
+                    Ok((
+                        cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot),
+                        client,
+                    )) => (snapshot, client),
+                    Ok((other, _)) => {
+                        return failed(format!("unexpected onboarding response: {other:?}"));
+                    }
+                    Err(error) => return failed(error),
+                };
                 if current.as_ref().is_some_and(|snapshot| {
                     !force && snapshot.stage == cockpit_proto::OnboardingStage::Complete
                 }) || skip
                 {
+                    // An onboarded home decides its first screen (chat) from
+                    // the bootstrap answer alone; ready services are awaited
+                    // behind that first frame (`startup.services`).
                     return Ok(
                         crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
                             generation,
@@ -714,33 +1138,68 @@ impl App {
                         },
                     );
                 }
+                // An open run past the secure store needs ready services
+                // (its stages are ready-service settlements, and begin/reopen
+                // is a mutation a constructing owner defers). Wait for them
+                // (retrying a failed construction through the locked owner)
+                // before presenting it; a first run proceeds on the locked
+                // bootstrap surface.
+                let phase = match within_deadline(
+                    deadline,
+                    "reading the daemon phase",
+                    onboarding_daemon_phase(&client),
+                )
+                .await
+                {
+                    Ok(Ok(phase)) => phase,
+                    Ok(Err(error)) | Err(error) => return failed(error),
+                };
+                let (current, client) = match phase {
+                    cockpit_client::OwnerPhase::Ready
+                    | cockpit_client::OwnerPhase::Bootstrap(
+                        cockpit_proto::LockedReadyConstruction::AwaitingSecureStore,
+                    ) => (current, client),
+                    cockpit_client::OwnerPhase::Bootstrap(_) => {
+                        match resolve_ready_onboarding_owner(
+                            &lifecycle,
+                            selected_endpoint.as_ref(),
+                            client,
+                            deadline,
+                        )
+                        .await
+                        {
+                            Ok(resolved) => resolved,
+                            Err(error) => return failed(error),
+                        }
+                    }
+                };
+                drop(client);
                 let request = cockpit_proto::BeginOrReopenOnboarding {
                     expected_revision: current.as_ref().map(|snapshot| snapshot.revision),
                     client_operation_id: bootstrap_request_id,
                     reentry: force || current.is_some(),
                 };
-                match client.request(cockpit_proto::Request::BeginOrReopenOnboarding(request)).await {
-                    Ok(Ok(cockpit_proto::Response::OnboardingTransition(result))) => Ok(
-                            crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
-                                generation,
-                                request_id,
-                                receipt: Some(result.receipt),
-                                lifetime_client: Some(client),
-                                snapshot: Some(result.snapshot),
+                // The begin/reopen carries its client operation id, so a
+                // re-send after a handoff replays the same operation.
+                match onboarding_request_after_handoff(
+                    &lifecycle,
+                    selected_endpoint.as_ref(),
+                    cockpit_proto::Request::BeginOrReopenOnboarding(request),
+                    deadline,
+                )
+                .await
+                {
+                    Ok((cockpit_proto::Response::OnboardingTransition(result), client)) => Ok(
+                        crate::tui::async_action::AsyncActionPayload::StartupOnboardingBootstrap {
+                            generation,
+                            request_id,
+                            receipt: Some(result.receipt),
+                            lifetime_client: Some(client),
+                            snapshot: Some(result.snapshot),
                         },
                     ),
-                    Ok(Ok(other)) => Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
-                        generation,
-                        error: format!("unexpected onboarding response: {other:?}"),
-                    }),
-                    Ok(Err(error)) => Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
-                        generation,
-                        error: error.to_string(),
-                    }),
-                    Err(error) => Ok(crate::tui::async_action::AsyncActionPayload::StartupOnboardingFailed {
-                        generation,
-                        error: error.to_string(),
-                    }),
+                    Ok((other, _)) => failed(format!("unexpected onboarding response: {other:?}")),
+                    Err(error) => failed(error),
                 }
             },
         );
@@ -788,13 +1247,6 @@ impl App {
             // advanced the same run past it. Authority application is
             // monotonic: a same-run stale projection never regresses the
             // recorded one.
-            return;
-        }
-        if snapshot.as_ref().is_some_and(|current| {
-            current.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
-        }) {
-            self.onboarding_snapshot = snapshot;
-            self.start_onboarding_ready_construction_retry();
             return;
         }
         if let (Some(incoming), Some(recorded)) =
@@ -851,18 +1303,30 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("onboarding.capabilities"),
             ),
             async move {
-                let endpoint =
-                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
-                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
-                    .await
-                    .map_err(|error| error.to_string())?;
                 let budget = tokio::time::Instant::now() + POLL_BUDGET;
+                let endpoint = within_deadline(
+                    budget,
+                    "resolving the daemon",
+                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()),
+                )
+                .await?
+                .map_err(String::from)?;
+                let client = within_deadline(
+                    budget,
+                    "connecting to the daemon",
+                    cockpit_client::DaemonClient::connect_endpoint_bootstrap(&endpoint),
+                )
+                .await?
+                .map_err(|error| error_chain(&error))?;
                 loop {
                     tokio::time::sleep(POLL_INTERVAL).await;
-                    let current = match client
-                        .request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot)
-                        .await
-                        .map_err(|error| error.to_string())?
+                    let current = match within_deadline(
+                        budget,
+                        "reading the onboarding snapshot",
+                        client.request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot),
+                    )
+                    .await?
+                    .map_err(|error| error_chain(&error))?
                     {
                         Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot)) => {
                             snapshot
@@ -998,26 +1462,48 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("onboarding.bootstrap_refresh"),
             ),
             async move {
-                let endpoint =
-                    onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
-                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let current = match client
-                    .request(cockpit_proto::Request::GetOnboardingBootstrapSnapshot)
-                    .await
-                    .map_err(|error| error.to_string())?
+                let deadline = handoff_deadline();
+                let (current, client) = match onboarding_request_after_handoff(
+                    &lifecycle,
+                    selected_endpoint.as_ref(),
+                    cockpit_proto::Request::GetOnboardingBootstrapSnapshot,
+                    deadline,
+                )
+                .await?
                 {
-                    Ok(cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot)) => snapshot,
-                    Ok(other) => return Err(format!("unexpected onboarding response: {other:?}")),
-                    Err(error) => return Err(error.to_string()),
+                    (cockpit_proto::Response::OnboardingBootstrapSnapshot(snapshot), client) => {
+                        (snapshot, client)
+                    }
+                    (other, _) => return Err(format!("unexpected onboarding response: {other:?}")),
                 };
-                if current.as_ref().is_some_and(|snapshot| {
-                    snapshot.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Failed
-                }) {
-                    return retry_onboarding_ready_construction_snapshot(
+                // An open run past the secure store follows ready services;
+                // a failed construction is retried through the locked owner.
+                let open_past_secure_store = current.as_ref().is_some_and(|snapshot| {
+                    !matches!(
+                        snapshot.stage,
+                        cockpit_proto::OnboardingStage::Welcome
+                            | cockpit_proto::OnboardingStage::Profile
+                            | cockpit_proto::OnboardingStage::SecureStore
+                            | cockpit_proto::OnboardingStage::Complete
+                    )
+                });
+                let serving_ready = if open_past_secure_store {
+                    within_deadline(
+                        deadline,
+                        "reading the daemon phase",
+                        onboarding_daemon_phase(&client),
+                    )
+                    .await??
+                        == cockpit_client::OwnerPhase::Ready
+                } else {
+                    true
+                };
+                if !serving_ready {
+                    return resolve_ready_onboarding_owner(
                         &lifecycle,
                         selected_endpoint.as_ref(),
+                        client,
+                        deadline,
                     )
                     .await
                     .map(|(snapshot, client)| {
@@ -1097,6 +1583,8 @@ impl App {
             .as_ref()
             .map(|selected| selected.endpoint.clone());
         let failure_snapshot = snapshot.clone();
+        let lifecycle = self.lifecycle.clone();
+        let deadline = self.startup_deadline();
         self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("startup.workspace"),
             crate::tui::async_action::AsyncActionPolicy::Dedupe(
@@ -1115,22 +1603,24 @@ impl App {
                     let project_root = root.root.to_string_lossy().into_owned();
                     let endpoint = endpoint
                         .ok_or_else(|| "selected startup daemon is unavailable".to_string())?;
-                    let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let response = client
-                        .request(cockpit_proto::Request::GetWorkspaceTrust { project_root })
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    // Through the handoff funnel within the startup deadline:
+                    // on a cold onboarded start the locked owner answers and
+                    // may hand off to ready services mid-request.
+                    let (response, _) = onboarding_request_after_handoff(
+                        &lifecycle,
+                        Some(&endpoint),
+                        cockpit_proto::Request::GetWorkspaceTrust { project_root },
+                        deadline,
+                    )
+                    .await?;
                     let (mode, config_generation) = match response {
-                        Ok(cockpit_proto::Response::WorkspaceTrust {
+                        cockpit_proto::Response::WorkspaceTrust {
                             mode,
                             config_generation,
-                        }) => (mode, config_generation),
-                        Ok(other) => {
+                        } => (mode, config_generation),
+                        other => {
                             return Err(format!("unexpected workspace trust response: {other:?}"));
                         }
-                        Err(error) => return Err(error.to_string()),
                     };
                     Ok(StartupWorkspaceCompletion {
                         generation,
@@ -1347,50 +1837,6 @@ pub(crate) struct StartupOnboardingCompletion {
 }
 
 impl App {
-    fn start_onboarding_ready_construction_retry(&mut self) {
-        let generation = self.startup_background.generation;
-        let Some(current) = self.onboarding_snapshot.as_ref() else {
-            return;
-        };
-        let (run_id, attempt_id, expected_revision) =
-            (current.run_id, current.attempt_id, current.revision);
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let lifecycle = self.lifecycle.clone();
-        let selected_endpoint = self
-            .startup_lifecycle
-            .as_ref()
-            .map(|selected| selected.endpoint.clone());
-        let pending_request_id = request_id.clone();
-        let started = self.async_actions.start(
-            crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.ready_retry"),
-            crate::tui::async_action::AsyncActionPolicy::Dedupe(
-                crate::tui::async_action::AsyncActionKey::new("onboarding.ready_retry"),
-            ),
-            async move {
-                retry_onboarding_ready_construction_snapshot(&lifecycle, selected_endpoint.as_ref())
-                    .await
-                    .map(|(snapshot, lifetime_client)| {
-                        crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
-                            StartupOnboardingCompletion {
-                                lifetime_client: Some(lifetime_client),
-                                generation,
-                                run_id,
-                                attempt_id,
-                                expected_revision,
-                                request_id,
-                                receipt: None,
-                                snapshot,
-                            },
-                        )
-                    })
-            },
-        );
-        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
-            self.pending_startup_onboarding_operations
-                .insert(id, pending_request_id);
-        }
-    }
-
     fn request_onboarding_transition(
         &mut self,
         transition: cockpit_proto::OnboardingTransitionKind,
@@ -1434,81 +1880,34 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("onboarding.transition"),
             ),
             async move {
-                const HANDOFF_ATTEMPTS: usize = 6;
-                let mut last_transport_error = None;
-                for attempt in 0..HANDOFF_ATTEMPTS {
-                    let endpoint = match onboarding_authority_endpoint(
-                        &lifecycle,
-                        selected_endpoint.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(endpoint) => endpoint,
-                        Err(error) => {
-                            last_transport_error = Some(error);
-                            if attempt + 1 < HANDOFF_ATTEMPTS {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                continue;
-                            }
-                            break;
-                        }
-                    };
-                    let client = match cockpit_client::DaemonClient::connect_endpoint(&endpoint).await
-                    {
-                        Ok(client) => client,
-                        Err(error) => {
-                            last_transport_error = Some(error.to_string());
-                            if attempt + 1 < HANDOFF_ATTEMPTS {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                continue;
-                            }
-                            break;
-                        }
-                    };
-                    let request = cockpit_proto::ApplyOnboardingTransition {
-                        run_id: snapshot.run_id,
-                        attempt_id: snapshot.attempt_id,
-                        expected_revision: snapshot.revision,
-                        client_operation_id: request_id.clone(),
-                        transition,
-                        settlement: settlement.clone(),
-                    };
-                    match client
-                        .request(cockpit_proto::Request::ApplyOnboardingTransition(request))
-                        .await
-                    {
-                        Ok(Ok(cockpit_proto::Response::OnboardingTransition(result))) => {
-                            return Ok(
-                                crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
-                                    StartupOnboardingCompletion {
-                                        lifetime_client: Some(client),
-                                        generation,
-                                        run_id,
-                                        attempt_id,
-                                        expected_revision,
-                                        request_id,
-                                        receipt: Some(result.receipt),
-                                        snapshot: Some(result.snapshot),
-                                    },
-                                ),
-                            );
-                        }
-                        Ok(Ok(other)) => {
-                            return Err(format!("unexpected onboarding response: {other:?}"));
-                        }
-                        Ok(Err(error)) if onboarding_handoff_retry_required(&error) => {
-                            last_transport_error = Some(error.to_string());
-                        }
-                        Ok(Err(error)) => return Err(error.to_string()),
-                        Err(error) => last_transport_error = Some(error.to_string()),
-                    }
-                    if attempt + 1 < HANDOFF_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
-                }
-                Err(last_transport_error.unwrap_or_else(|| {
-                    "onboarding transition transport was unavailable after daemon handoff".into()
-                }))
+                let request = cockpit_proto::ApplyOnboardingTransition {
+                    run_id: snapshot.run_id,
+                    attempt_id: snapshot.attempt_id,
+                    expected_revision: snapshot.revision,
+                    client_operation_id: request_id.clone(),
+                    transition,
+                    settlement,
+                };
+                let (result, client) = apply_onboarding_transition_after_handoff(
+                    &lifecycle,
+                    selected_endpoint.as_ref(),
+                    request,
+                )
+                .await?;
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::StartupOnboardingTransition(
+                        StartupOnboardingCompletion {
+                            lifetime_client: Some(client),
+                            generation,
+                            run_id,
+                            attempt_id,
+                            expected_revision,
+                            request_id,
+                            receipt: Some(result.receipt),
+                            snapshot: Some(result.snapshot),
+                        },
+                    ),
+                )
             },
         );
         if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
@@ -1775,7 +2174,7 @@ impl App {
                     onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 let snapshot = client
                     .request(Request::GetProviderCatalogSnapshot {
                         project_root: project_root.clone(),
@@ -1783,7 +2182,7 @@ impl App {
                         snapshot_session_id: snapshot_session_id.clone(),
                     })
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error_chain(&error))?
                     .map_err(|error| error.to_string())?;
                 let Response::ProviderCatalogSnapshot {
                     layer_id,
@@ -1804,7 +2203,7 @@ impl App {
                         mutation,
                     })
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error_chain(&error))?
                     .map_err(|error| error.to_string())?;
                 let Response::ProviderMutationCommitted {
                     config_generation, ..
@@ -1857,7 +2256,7 @@ impl App {
                     onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 let outcome =
                     match fetch_onboarding_provider_models(&client, &project_root, &provider_id)
                         .await
@@ -1923,7 +2322,7 @@ impl App {
                     onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 let response = client
                     .request(cockpit_proto::Request::GetAuthoredAgentPackageReceipt(
                         cockpit_proto::AuthoredAgentPackageReceiptQuery {
@@ -1931,7 +2330,7 @@ impl App {
                         },
                     ))
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 match response {
                     Ok(cockpit_proto::Response::AuthoredAgentPackageReceipt(Some(receipt))) => {
                         Ok(crate::tui::async_action::AsyncActionPayload::StartupAgentAuthoringReceipt {
@@ -1973,11 +2372,11 @@ impl App {
                     onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 let response = client
                     .request(cockpit_proto::Request::GetAgentAuthoringProjection)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 match response {
                     Ok(cockpit_proto::Response::AgentAuthoringProjection(projection)) => {
                         Ok(crate::tui::async_action::AsyncActionPayload::StartupAgentAuthoringProjection {
@@ -2060,11 +2459,11 @@ impl App {
                     onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 let response = client
                     .request(cockpit_proto::Request::ApplyAuthoredAgentPackage(request))
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 match response {
                     Ok(cockpit_proto::Response::AuthoredAgentPackage(outcome)) => {
                         Ok(crate::tui::async_action::AsyncActionPayload::StartupAgentAuthoringOutcome {
@@ -2113,13 +2512,16 @@ impl App {
             .as_ref()
             .map(|selected| selected.endpoint.clone());
         let pending_request_id = request_id.clone();
+        let progress = OnboardingHandoffProgress::default();
+        let task_progress = progress.clone();
         let started = self.async_actions.start(
             crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.secure_intent"),
-            // A later explicit placement choice owns the slot: Replace
-            // aborts an in-flight secure intent the same way transitions
-            // are superseded. The daemon's revision CAS plus the one-shot
-            // receipt keep a loser inert.
-            crate::tui::async_action::AsyncActionPolicy::Replace(
+            // One secure-store submission at a time. Once sent, its outcome
+            // is decided by the daemon (the vault may already be committed),
+            // so it is never aborted or superseded: a repeated choice while
+            // one is in flight is dropped here, and the in-flight one
+            // reconciles a lost response from its committed receipt.
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
                 crate::tui::async_action::AsyncActionKey::new("onboarding.secure_intent"),
             ),
             async move {
@@ -2127,6 +2529,7 @@ impl App {
                     &lifecycle,
                     selected_endpoint.as_ref(),
                     request,
+                    task_progress,
                 )
                 .await
                 .map(|(snapshot, receipt, lifetime_client)| {
@@ -2145,9 +2548,39 @@ impl App {
                 })
             },
         );
-        if let crate::tui::async_action::AsyncActionStart::Started(id) = started {
-            self.pending_startup_onboarding_operations
-                .insert(id, pending_request_id);
+        match started {
+            crate::tui::async_action::AsyncActionStart::Started(id) => {
+                self.pending_startup_onboarding_operations
+                    .insert(id, pending_request_id);
+                self.onboarding_secure_intent_progress = Some((Instant::now(), progress));
+            }
+            crate::tui::async_action::AsyncActionStart::Existing(_) => {
+                self.show_toast("Still securing your secrets…", super::ToastKind::Info);
+            }
+        }
+    }
+
+    /// Mirror the in-flight secure-store submission onto the screen's
+    /// progress line. Called before each render; the pending action keeps
+    /// the animation tick running, so the elapsed time advances on its own.
+    pub(super) fn sync_onboarding_secure_intent_progress(&mut self) {
+        let text = self
+            .onboarding_secure_intent_progress
+            .as_ref()
+            .map(|(started, progress)| {
+                let elapsed = started.elapsed().as_secs();
+                match progress.get() {
+                    OnboardingHandoffPhase::Submitting => "Securing your secrets…".to_string(),
+                    OnboardingHandoffPhase::PreparingServices => {
+                        format!("Secure store ready. Preparing Cockpit services… ({elapsed}s)")
+                    }
+                    OnboardingHandoffPhase::Reconnecting => {
+                        format!("Reconnecting to the Cockpit daemon… ({elapsed}s)")
+                    }
+                }
+            });
+        if let Some(shell) = self.onboarding_shell.as_mut() {
+            shell.set_secure_store_progress(text);
         }
     }
 
@@ -2186,7 +2619,7 @@ impl App {
                     onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 let response = client
                     .request(cockpit_proto::Request::ApplyOnboardingProfile(
                         cockpit_proto::ApplyOnboardingProfile {
@@ -2195,7 +2628,7 @@ impl App {
                         },
                     ))
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 match response {
                     Ok(cockpit_proto::Response::SetupWizardApplied { .. }) => {}
                     Ok(other) => return Err(format!("unexpected profile response: {other:?}")),
@@ -2309,6 +2742,7 @@ impl App {
                         wizard_id: cockpit_core::wizard::MODEL_SETUP_WIZARD_ID.to_string(),
                         answers_json,
                     },
+                    handoff_deadline(),
                 )
                 .await?;
                 let config_generation = match response {
@@ -2431,7 +2865,7 @@ impl App {
                     onboarding_authority_endpoint(&lifecycle, selected_endpoint.as_ref()).await?;
                 let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 let response = client
                     .request(cockpit_proto::Request::ApplySetupWizard {
                         client_operation_id: uuid::Uuid::new_v4().to_string(),
@@ -2440,7 +2874,7 @@ impl App {
                         answers_json,
                     })
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error_chain(&error))?;
                 match response {
                     Ok(cockpit_proto::Response::SetupWizardApplied { .. }) => {}
                     Ok(other) => return Err(format!("unexpected lifetime response: {other:?}")),
@@ -2657,6 +3091,17 @@ impl App {
         if !self.first_paint_completed {
             return;
         }
+        self.begin_startup_background_tasks(policy);
+    }
+
+    /// Start the startup authority chain (lifetime policy, lifecycle,
+    /// onboarding bootstrap, workspace). Idempotent. Production starts it
+    /// before the first frame ([`Self::settle_first_screen_before_paint`]);
+    /// the post-paint hook remains the fallback for a shell that did not.
+    fn begin_startup_background_tasks<F>(&mut self, policy: F)
+    where
+        F: std::future::Future<Output = Result<bool, String>> + Send + 'static,
+    {
         if self.startup_background.started {
             return;
         }
@@ -2692,6 +3137,228 @@ impl App {
                 )
             },
         );
+    }
+
+    /// Wait (behind the first frame) for the selected owner's ready services.
+    /// An onboarded cold start decides and paints its first screen from the
+    /// locked bootstrap answer while the daemon-owned ready construction
+    /// runs; this keeps a retained ready connection once it publishes and
+    /// shows an in-chat "starting" status meanwhile.
+    pub(super) fn start_startup_services_wait(&mut self) {
+        let generation = self.startup_background.generation;
+        let lifecycle = self.lifecycle.clone();
+        let Some(endpoint) = self
+            .startup_lifecycle
+            .as_ref()
+            .map(|selected| selected.endpoint.clone())
+        else {
+            return;
+        };
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Internal("startup.services"),
+            crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                crate::tui::async_action::AsyncActionKey::new("startup.services"),
+            ),
+            async move {
+                let deadline = tokio::time::Instant::now() + cockpit_client::READY_SERVICES_WAIT;
+                let result = async {
+                    let client = within_deadline(
+                        deadline,
+                        "connecting to the daemon",
+                        cockpit_client::DaemonClient::connect_endpoint_bootstrap(&endpoint),
+                    )
+                    .await?
+                    .map_err(|error| error_chain(&error))?;
+                    let phase = within_deadline(
+                        deadline,
+                        "reading the daemon phase",
+                        onboarding_daemon_phase(&client),
+                    )
+                    .await??;
+                    match phase {
+                        cockpit_client::OwnerPhase::Ready
+                        | cockpit_client::OwnerPhase::Bootstrap(
+                            cockpit_proto::LockedReadyConstruction::AwaitingSecureStore,
+                        ) => Ok(None),
+                        cockpit_client::OwnerPhase::Bootstrap(_) => {
+                            drop(client);
+                            await_onboarding_ready_services(
+                                &lifecycle,
+                                Some(&endpoint),
+                                &OnboardingHandoffProgress::default(),
+                                deadline,
+                            )
+                            .await
+                            .map(Some)
+                        }
+                    }
+                }
+                .await;
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::StartupServicesReady {
+                        generation,
+                        result,
+                    },
+                )
+            },
+        );
+    }
+
+    /// Show the in-chat "starting services" status while the wait above has
+    /// been pending past the notice delay (never over a more specific toast).
+    pub(super) fn sync_startup_services_status(&mut self) {
+        let pending = self.async_actions.pending_kind_elapsed(
+            &crate::tui::async_action::AsyncActionKind::Internal("startup.services"),
+            Instant::now(),
+        );
+        if pending.is_some_and(|elapsed| elapsed >= STARTING_NOTICE_DELAY) && self.toast.is_none() {
+            self.show_blocking_toast(STARTING_SERVICES_TEXT, ToastKind::Info);
+        }
+    }
+
+    pub(super) fn clear_startup_services_status(&mut self) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.text == STARTING_SERVICES_TEXT)
+        {
+            self.toast = None;
+        }
+    }
+
+    /// Whether a startup-chain step (lifetime policy, lifecycle, onboarding
+    /// bootstrap, workspace decision) is still in flight, and which.
+    fn pending_startup_step(&self) -> Option<&'static str> {
+        use crate::tui::async_action::AsyncActionKind;
+        const STARTUP_CHAIN: [(AsyncActionKind, &str); 4] = [
+            (
+                AsyncActionKind::Blocking("startup.lifetime-policy"),
+                "reading settings",
+            ),
+            (
+                AsyncActionKind::Internal("startup.lifecycle"),
+                "starting the daemon",
+            ),
+            (
+                AsyncActionKind::DaemonRpc("onboarding.bootstrap"),
+                "reading setup state",
+            ),
+            (
+                AsyncActionKind::DaemonRpc("startup.workspace"),
+                "checking workspace trust",
+            ),
+        ];
+        STARTUP_CHAIN
+            .iter()
+            .find(|(kind, _)| self.async_actions.has_pending_kind(kind))
+            .map(|(_, step)| *step)
+    }
+
+    /// Whether the startup chain has decided what the first frame shows: the
+    /// onboarding shell or a startup modal is mounted, or the chain finished
+    /// without a failure (the chat UI or deferred limited mode). Never a
+    /// guess: a chain that ended in a failure has decided nothing.
+    pub(super) fn first_screen_settled(&self) -> bool {
+        self.exit_requested
+            || self.onboarding_shell.is_some()
+            || self.startup_modal_on_top().is_some()
+            || (self.pending_startup_step().is_none() && self.startup_background.retry.is_none())
+    }
+
+    /// The chain ended in a failure before any screen was decided.
+    fn first_screen_failure(&self) -> Option<String> {
+        if self.first_screen_settled()
+            || self.pending_startup_step().is_some()
+            || self.startup_background.retry.is_none()
+        {
+            return None;
+        }
+        Some(
+            self.toast
+                .as_ref()
+                .filter(|toast| matches!(toast.kind, ToastKind::Error))
+                .map(|toast| toast.text.clone())
+                .unwrap_or_else(|| "Cockpit could not start".to_string()),
+        )
+    }
+
+    /// Decide the first screen before the terminal enters the alternate
+    /// screen: run the startup chain (lifetime policy, daemon lifecycle —
+    /// spawning the daemon if needed —, the onboarding bootstrap, and for an
+    /// onboarded home the workspace decision) through the ordinary reducers
+    /// until [`Self::first_screen_settled`]. The first frame is then
+    /// onboarding or chat, never one replaced by the other.
+    ///
+    /// Nothing is drawn meanwhile and there is no paint-anyway deadline.
+    /// After [`STARTING_NOTICE_DELAY`] the normal terminal shows one status
+    /// line naming the pending step; after [`STARTING_SLOW_AFTER`] it says
+    /// startup is slow and that Ctrl-C quits. Startup ends decided, failed
+    /// (with the error, before any frame), or cancelled.
+    pub(super) async fn settle_first_screen_before_paint<F>(
+        &mut self,
+        policy: F,
+        terminal: &mut dyn PrePaintTerminal,
+    ) -> FirstScreenOutcome
+    where
+        F: std::future::Future<Output = Result<bool, String>> + Send + 'static,
+    {
+        let started = tokio::time::Instant::now();
+        let notify = self.async_actions.notifier();
+        // One end-to-end deadline for the whole startup chain, created at
+        // its entry; every startup stage is bounded by what remains of it.
+        self.startup_background.deadline = Some(handoff_deadline());
+        let outcome = self
+            .settle_first_screen_loop(policy, terminal, started, notify)
+            .await;
+        self.startup_background.deadline = None;
+        outcome
+    }
+
+    async fn settle_first_screen_loop<F>(
+        &mut self,
+        policy: F,
+        terminal: &mut dyn PrePaintTerminal,
+        started: tokio::time::Instant,
+        notify: std::sync::Arc<tokio::sync::Notify>,
+    ) -> FirstScreenOutcome
+    where
+        F: std::future::Future<Output = Result<bool, String>> + Send + 'static,
+    {
+        const INPUT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        self.begin_startup_background_tasks(policy);
+        let mut shown: Option<String> = None;
+        loop {
+            self.drain_async_actions();
+            if terminal.cancel_requested() {
+                terminal.clear();
+                return FirstScreenOutcome::Cancelled;
+            }
+            if self.first_screen_settled() {
+                terminal.clear();
+                return FirstScreenOutcome::Decided;
+            }
+            if let Some(failure) = self.first_screen_failure() {
+                terminal.clear();
+                return FirstScreenOutcome::Failed(failure);
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= STARTING_NOTICE_DELAY {
+                let step = self.pending_startup_step().unwrap_or("starting");
+                let line = if elapsed >= STARTING_SLOW_AFTER {
+                    format!("Still starting cockpit… {step} (Ctrl-C to quit)")
+                } else {
+                    format!("{STARTING_NOTICE_TEXT} {step}")
+                };
+                if shown.as_deref() != Some(line.as_str()) {
+                    terminal.show(&line);
+                    shown = Some(line);
+                }
+            }
+            tokio::select! {
+                () = notify.notified() => {}
+                () = tokio::time::sleep(INPUT_POLL) => {}
+            }
+        }
     }
 
     /// True while the post-paint startup machine has not yet accepted a workspace.

@@ -16,6 +16,61 @@ use crate::db::Db;
 #[error("onboarding revision conflict")]
 pub struct OnboardingRevisionConflict;
 
+/// A client operation id reused for a different request (another operation
+/// kind, other parameters, or another passphrase). Never a replay: the
+/// receipt answers only the exact request that created it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("onboarding client operation id was reused for a different request")]
+pub struct OnboardingOperationReused;
+
+/// The immutable identity of one onboarding operation, persisted with its
+/// receipt (`operation_kind`, `operation_digest`). A receipt replays only for
+/// a request with the same fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingOperationFingerprint {
+    kind: &'static str,
+    digest: String,
+}
+
+impl OnboardingOperationFingerprint {
+    /// A secure-store intent: the placement and, for a passphrase placement,
+    /// the caller's keyed binding of the passphrase value (never the value).
+    pub fn secure_store(
+        placement: OnboardingSecurePlacement,
+        passphrase_binding: Option<&str>,
+    ) -> Self {
+        Self {
+            kind: "secure_store",
+            digest: transition_digest(&format!(
+                "secure_store:{}:{}",
+                placement.as_str(),
+                passphrase_binding.unwrap_or("-")
+            )),
+        }
+    }
+
+    /// A client transition, fingerprinted by its canonical *request* (kind,
+    /// expected revision, settlement correlation): the request determines the
+    /// outcome at its revision, so a lost-acknowledgement retry of the same
+    /// request can be recognized after the checkpoint has moved on.
+    pub fn client_transition(canonical_request: &str) -> Self {
+        Self {
+            kind: "client_transition",
+            digest: transition_digest(&format!("client_transition:{canonical_request}")),
+        }
+    }
+
+    fn outcome(
+        stage: OnboardingStage,
+        state: OnboardingBootstrapState,
+        limited: bool,
+        placement: Option<OnboardingSecurePlacement>,
+    ) -> Self {
+        let (kind, digest) = transition_fingerprint(stage, state, limited, placement);
+        Self { kind, digest }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingStage {
     Welcome,
@@ -63,7 +118,6 @@ pub enum OnboardingBootstrapState {
     AwaitingPassphrase,
     Materializing,
     Ready,
-    Failed,
 }
 
 impl OnboardingBootstrapState {
@@ -73,7 +127,6 @@ impl OnboardingBootstrapState {
             Self::AwaitingPassphrase => "awaiting_passphrase",
             Self::Materializing => "materializing",
             Self::Ready => "ready",
-            Self::Failed => "failed",
         }
     }
 
@@ -83,7 +136,6 @@ impl OnboardingBootstrapState {
             "awaiting_passphrase" => Ok(Self::AwaitingPassphrase),
             "materializing" => Ok(Self::Materializing),
             "ready" => Ok(Self::Ready),
-            "failed" => Ok(Self::Failed),
             _ => bail!("invalid persisted onboarding bootstrap state"),
         }
     }
@@ -262,7 +314,7 @@ impl Db {
         client_operation_id: String,
         reentry: bool,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             begin_or_reopen_conn(conn, expected_revision, &client_operation_id, reentry)
         })
         .await
@@ -295,28 +347,157 @@ impl Db {
     }
 
     /// The secure-vault hand-off reserves its revision before performing an
-    /// external effect.  Its receipt stays pending until that effect reports
-    /// success, so a crash can be reconciled without pretending it committed.
-    pub async fn onboarding_transition_pending(
+    /// external effect. Its receipt is the distinct `secure_store` operation
+    /// kind (fingerprinted by the placement and whether a passphrase was
+    /// supplied) and stays pending until that effect reports success, so a
+    /// crash can be reconciled without pretending it committed.
+    pub async fn onboarding_secure_intent_pending(
         &self,
         snapshot: OnboardingSnapshotRow,
         client_operation_id: String,
+        placement: OnboardingSecurePlacement,
+        fingerprint: OnboardingOperationFingerprint,
+        stage_entry_config_generation: u64,
+    ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
+        self.transaction(move |conn| {
+            transition_conn_with_fingerprint(
+                conn,
+                &snapshot,
+                &client_operation_id,
+                OnboardingStage::SecureStore,
+                OnboardingBootstrapState::Materializing,
+                false,
+                Some(placement),
+                OnboardingReceiptStatus::Pending,
+                stage_entry_config_generation,
+                fingerprint,
+            )
+        })
+        .await
+    }
+
+    /// The receipt for exactly this operation: same run, attempt, and client
+    /// operation id, *and* the same operation fingerprint. A receipt of any
+    /// other operation sharing the id is [`OnboardingOperationReused`], never
+    /// a replay.
+    pub async fn onboarding_receipt_with_fingerprint(
+        &self,
+        run_id: Uuid,
+        attempt_id: Uuid,
+        client_operation_id: String,
+        fingerprint: OnboardingOperationFingerprint,
+    ) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
+        self.read(move |conn| {
+            receipt_with_fingerprint_conn(
+                conn,
+                run_id,
+                attempt_id,
+                &client_operation_id,
+                fingerprint,
+            )
+        })
+        .await
+    }
+
+    /// Every unsettled secure-store receipt of the active attempt — still
+    /// `pending` (the effect's outcome was never recorded) or `unknown` (the
+    /// materializer reported an error whose effect is uncertain): the
+    /// operations reconciliation must settle from durable vault evidence.
+    pub async fn onboarding_uncertain_secure_intent_receipts(
+        &self,
+    ) -> Result<Vec<OnboardingReceiptRow>> {
+        self.read(|conn| {
+            let Some(current) = snapshot_conn(conn)? else {
+                return Ok(Vec::new());
+            };
+            let mut statement = conn.prepare(
+                "SELECT receipt_id, client_operation_id, consumed_revision, status
+                 FROM onboarding_receipts
+                 WHERE run_id = ?1 AND attempt_id = ?2 AND operation_kind = 'secure_store'
+                   AND status IN ('pending', 'unknown')
+                 ORDER BY consumed_revision",
+            )?;
+            let rows = statement.query_map(
+                params![current.run_id.to_string(), current.attempt_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
+            rows.map(|row| {
+                let (receipt_id, client_operation_id, consumed_revision, status) = row?;
+                Ok(OnboardingReceiptRow {
+                    receipt_id: uuid(receipt_id, "receipt id")?,
+                    run_id: current.run_id,
+                    attempt_id: current.attempt_id,
+                    client_operation_id,
+                    consumed_revision: u64::try_from(consumed_revision)?,
+                    status: OnboardingReceiptStatus::parse(&status)?,
+                    replayed: true,
+                })
+            })
+            .collect()
+        })
+        .await
+    }
+
+    /// Settle an unsettled (`pending` or `unknown`) receipt from durable
+    /// evidence. Idempotent across concurrent reconcilers: `false` when the
+    /// receipt was already settled.
+    pub async fn onboarding_settle_uncertain_receipt(
+        &self,
+        receipt_id: Uuid,
+        status: OnboardingReceiptStatus,
+    ) -> Result<bool> {
+        if matches!(
+            status,
+            OnboardingReceiptStatus::Pending | OnboardingReceiptStatus::Unknown
+        ) {
+            bail!("an uncertain onboarding receipt must settle to committed or rejected");
+        }
+        self.transaction(move |conn| {
+            let changed = conn.execute(
+                "UPDATE onboarding_receipts SET status = ?1
+                 WHERE receipt_id = ?2 AND status IN ('pending', 'unknown')",
+                params![status.as_str(), receipt_id.to_string()],
+            )?;
+            Ok(changed == 1)
+        })
+        .await
+    }
+
+    /// Commit a client transition whose receipt is fingerprinted by its
+    /// canonical request (see [`OnboardingOperationFingerprint::client_transition`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn onboarding_client_transition(
+        &self,
+        snapshot: OnboardingSnapshotRow,
+        client_operation_id: String,
+        fingerprint: OnboardingOperationFingerprint,
         next_stage: OnboardingStage,
         bootstrap_state: OnboardingBootstrapState,
         limited_mode: bool,
         selected_secure_placement: Option<OnboardingSecurePlacement>,
         stage_entry_config_generation: u64,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
-        self.onboarding_transition_with_receipt_status(
-            snapshot,
-            client_operation_id,
-            next_stage,
-            bootstrap_state,
-            limited_mode,
-            selected_secure_placement,
-            OnboardingReceiptStatus::Pending,
-            stage_entry_config_generation,
-        )
+        self.transaction(move |conn| {
+            transition_conn_with_fingerprint(
+                conn,
+                &snapshot,
+                &client_operation_id,
+                next_stage,
+                bootstrap_state,
+                limited_mode,
+                selected_secure_placement,
+                OnboardingReceiptStatus::Committed,
+                stage_entry_config_generation,
+                fingerprint,
+            )
+        })
         .await
     }
 
@@ -351,7 +532,7 @@ impl Db {
         receipt_status: OnboardingReceiptStatus,
         stage_entry_config_generation: u64,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             transition_conn(
                 conn,
                 &snapshot,
@@ -405,7 +586,7 @@ impl Db {
         if status == OnboardingReceiptStatus::Pending {
             bail!("onboarding receipt must settle to a terminal status");
         }
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let changed = conn.execute(
                 "UPDATE onboarding_receipts SET status = ?1 WHERE receipt_id = ?2 AND status = 'pending'",
                 params![status.as_str(), receipt_id.to_string()],
@@ -446,7 +627,7 @@ fn begin_or_reopen_conn(
             .optional()?;
         if let Some((receipt_id, attempt_id, consumed_revision, digest, status)) = replay {
             if digest != digest_begin(reentry) {
-                bail!("onboarding client operation id was reused for a different begin request");
+                return Err(OnboardingOperationReused.into());
             }
             return Ok((
                 existing.clone(),
@@ -520,6 +701,39 @@ fn transition_conn(
     receipt_status: OnboardingReceiptStatus,
     stage_entry_config_generation: u64,
 ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
+    let fingerprint = OnboardingOperationFingerprint::outcome(
+        next_stage,
+        bootstrap_state,
+        limited_mode,
+        selected_secure_placement,
+    );
+    transition_conn_with_fingerprint(
+        conn,
+        current,
+        client_operation_id,
+        next_stage,
+        bootstrap_state,
+        limited_mode,
+        selected_secure_placement,
+        receipt_status,
+        stage_entry_config_generation,
+        fingerprint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transition_conn_with_fingerprint(
+    conn: &rusqlite::Connection,
+    current: &OnboardingSnapshotRow,
+    client_operation_id: &str,
+    next_stage: OnboardingStage,
+    bootstrap_state: OnboardingBootstrapState,
+    limited_mode: bool,
+    selected_secure_placement: Option<OnboardingSecurePlacement>,
+    receipt_status: OnboardingReceiptStatus,
+    stage_entry_config_generation: u64,
+    fingerprint: OnboardingOperationFingerprint,
+) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
     if client_operation_id.is_empty() || client_operation_id.len() > 128 {
         bail!("invalid onboarding client operation id");
     }
@@ -541,15 +755,13 @@ fn transition_conn(
             },
         )
         .optional()?;
-    let (operation_kind, operation_digest) = transition_fingerprint(
-        next_stage,
-        bootstrap_state,
-        limited_mode,
-        selected_secure_placement,
-    );
+    let OnboardingOperationFingerprint {
+        kind: operation_kind,
+        digest: operation_digest,
+    } = fingerprint;
     if let Some((receipt_id, consumed_revision, replay_kind, replay_digest, status)) = replay {
         if replay_kind != operation_kind || replay_digest != operation_digest {
-            bail!("onboarding client operation id was reused for a different transition");
+            return Err(OnboardingOperationReused.into());
         }
         let refreshed = snapshot_conn(conn)?.context("onboarding run did not persist")?;
         return Ok((
@@ -625,12 +837,31 @@ fn transition_receipt_conn(
     limited_mode: bool,
     selected_secure_placement: Option<OnboardingSecurePlacement>,
 ) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
-    let (operation_kind, operation_digest) = transition_fingerprint(
-        next_stage,
-        bootstrap_state,
-        limited_mode,
-        selected_secure_placement,
-    );
+    receipt_with_fingerprint_conn(
+        conn,
+        run_id,
+        attempt_id,
+        client_operation_id,
+        OnboardingOperationFingerprint::outcome(
+            next_stage,
+            bootstrap_state,
+            limited_mode,
+            selected_secure_placement,
+        ),
+    )
+}
+
+fn receipt_with_fingerprint_conn(
+    conn: &rusqlite::Connection,
+    run_id: Uuid,
+    attempt_id: Uuid,
+    client_operation_id: &str,
+    fingerprint: OnboardingOperationFingerprint,
+) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
+    let OnboardingOperationFingerprint {
+        kind: operation_kind,
+        digest: operation_digest,
+    } = fingerprint;
     let receipt = conn
         .query_row(
             "SELECT receipt_id, consumed_revision, operation_kind, operation_digest, status
@@ -656,7 +887,7 @@ fn transition_receipt_conn(
         return Ok(None);
     };
     if stored_kind != operation_kind || stored_digest != operation_digest {
-        bail!("onboarding client operation id was reused for a different transition");
+        return Err(OnboardingOperationReused.into());
     }
     let snapshot = snapshot_conn(conn)?.context("onboarding run did not persist")?;
     Ok(Some((
@@ -691,7 +922,7 @@ fn reopen_conn(
     ).optional()?;
     if let Some((receipt_id, consumed_revision, replay_digest, status)) = replay {
         if replay_digest != digest {
-            bail!("onboarding client operation id was reused for a different begin request");
+            return Err(OnboardingOperationReused.into());
         }
         return Ok((
             snapshot_conn(conn)?.context("onboarding run did not persist")?,
@@ -950,6 +1181,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("reused"));
+    }
+
+    /// G10: a checkpoint advance and its receipt commit together. When the
+    /// receipt insert fails, the revision/stage update rolls back with it, so
+    /// no advanced checkpoint is ever left without its idempotency evidence.
+    #[tokio::test]
+    async fn transition_checkpoint_and_receipt_are_one_transaction() {
+        let db = Db::open_in_memory_async().await.unwrap();
+        let (begun, _) = db
+            .onboarding_begin_or_reopen(None, "begin".into(), false)
+            .await
+            .unwrap();
+        db.write(|conn| {
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER fail_onboarding_receipt BEFORE INSERT ON onboarding_receipts
+                 BEGIN SELECT RAISE(ABORT, 'injected receipt insert failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .onboarding_transition(
+                begun.clone(),
+                "advance".into(),
+                OnboardingStage::Profile,
+                OnboardingBootstrapState::AwaitingChoice,
+                false,
+                None,
+                0,
+            )
+            .await
+            .expect_err("the injected receipt failure fails the transition");
+        assert!(format!("{error:#}").contains("injected"), "{error:#}");
+        let after = db.onboarding_snapshot().await.unwrap().unwrap();
+        assert_eq!(after.revision, begun.revision, "the checkpoint rolled back");
+        assert_eq!(after.stage, begun.stage);
     }
 
     #[tokio::test]

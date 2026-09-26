@@ -6,7 +6,7 @@ use cockpit_proto::{
 };
 
 use super::{
-    BootServices, LockedProbeFuture, LockedProbePlan, LockedServices, boot_with_db_and_probe_plan,
+    LockedProbeFuture, LockedProbePlan, LockedServices, boot_with_db_and_probe_plan,
     handle_locked_in_process_request,
 };
 
@@ -49,10 +49,11 @@ async fn locked_services_with_probe_plan(
     )
     .await
     .expect("vault-free boot");
-    match services {
-        BootServices::Locked(locked) => (tmp, locked),
-        BootServices::Ready(_) => panic!("fresh boot must not materialize a default vault"),
-    }
+    assert!(
+        !services.vault_committed(),
+        "fresh boot must not materialize a default vault"
+    );
+    (tmp, services)
 }
 
 async fn advance_to_secure_store(
@@ -112,7 +113,7 @@ pub(super) async fn ready_construction() -> (
     let locked = std::sync::Arc::new(locked);
     let secure = advance_to_secure_store(&locked).await;
     let result = locked
-        .apply_secure_intent(ApplyOnboardingSecureIntent {
+        .apply_secure_intent_for_test(ApplyOnboardingSecureIntent {
             run_id: secure.run_id,
             attempt_id: secure.attempt_id,
             expected_revision: secure.revision,
@@ -147,7 +148,7 @@ async fn fresh_boot_is_locked_and_materializes_only_the_explicit_machine_bound_c
 
     let secure = advance_to_secure_store(&locked).await;
     let result = locked
-        .apply_secure_intent(ApplyOnboardingSecureIntent {
+        .apply_secure_intent_for_test(ApplyOnboardingSecureIntent {
             run_id: secure.run_id,
             attempt_id: secure.attempt_id,
             expected_revision: secure.revision,
@@ -418,7 +419,9 @@ async fn locked_owner_abandoned_during_a_rolled_back_transition_still_reaps() {
     // A ready transition takes the permit and closes admission.
     assert!(locked.try_acquire_ready_transition());
     let permit = super::ReadyTransitionPermit::new(locked.clone());
-    locked.begin_locked_to_ready_transition().await;
+    locked
+        .closing
+        .store(true, std::sync::atomic::Ordering::Release);
 
     // The last client leaves mid-transition: the loop must defer teardown.
     drop(client);
@@ -429,10 +432,7 @@ async fn locked_owner_abandoned_during_a_rolled_back_transition_still_reaps() {
     );
 
     // Construction fails and rolls back; nobody is attached any more.
-    permit
-        .rollback()
-        .await
-        .expect("ready-transition rollback commits");
+    permit.rollback();
     let outcome = tokio::time::timeout(
         super::LAST_CLIENT_HANDOFF_GRACE + std::time::Duration::from_secs(5),
         &mut run,
@@ -651,8 +651,11 @@ async fn ready_transition_keeps_the_acquired_permit_until_return_publication() {
     drop(ready);
 }
 
+/// An abandoned constructed graph (never handed to a lifecycle owner) rolls
+/// back in memory at once: the permit is released, admission reopens, and
+/// the phase reports the retryable failure. Nothing durable is written.
 #[tokio::test]
-async fn dropped_ready_construction_retains_permit_through_rollback() {
+async fn dropped_ready_construction_rolls_back_in_memory_and_releases_the_permit() {
     let (_tmp, locked, _) = ready_construction().await;
     let constructed = locked
         .finish_ready_transition()
@@ -661,16 +664,20 @@ async fn dropped_ready_construction_retains_permit_through_rollback() {
 
     drop(constructed);
     assert!(
-        locked
+        !locked
             .ready_transition_inflight
             .load(std::sync::atomic::Ordering::Acquire),
-        "a detached rollback must retain exclusive transition ownership"
+        "an abandoned attempt releases its permit"
     );
-    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!locked.closing.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Failed
+    );
 }
 
 #[tokio::test]
-async fn stored_ready_handoff_without_lifecycle_receiver_rolls_back_under_permit() {
+async fn stored_ready_handoff_without_lifecycle_receiver_rolls_back() {
     let (_tmp, locked, _) = ready_construction().await;
     let constructed = locked
         .finish_ready_transition()
@@ -679,12 +686,16 @@ async fn stored_ready_handoff_without_lifecycle_receiver_rolls_back_under_permit
 
     constructed.publish_stored();
     assert!(
-        locked
+        !locked
             .ready_transition_inflight
             .load(std::sync::atomic::Ordering::Acquire),
-        "failed lifecycle delivery must retain exclusive transition ownership"
+        "undeliverable publication rolls back and releases the permit"
     );
-    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Failed
+    );
+    assert!(!locked.ready.load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -746,55 +757,805 @@ async fn stored_ready_handoff_rolls_back_when_notified_lifecycle_consumer_is_can
     .expect("cancelled handoff must release ready resources and locked services");
 }
 
-#[tokio::test]
-async fn retry_snapshot_failure_retains_permit_for_detached_rollback() {
-    let (_tmp, locked, _) = ready_construction().await;
-    locked
-        .fail_next_onboarding_snapshot
-        .store(true, std::sync::atomic::Ordering::Release);
+/// Budget for a full ready construction in the served-owner tests. Generous:
+/// construction builds the whole ready graph and runs under a loaded shared
+/// test host.
+#[cfg(unix)]
+const READY_CONSTRUCTION_TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
 
-    let error = match locked.prepare_retry_ready_handoff().await {
-        Ok(_) => panic!("injected snapshot failure must reject retry publication"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("injected onboarding snapshot failure")
-    );
-    assert!(
-        locked
-            .ready_transition_inflight
-            .load(std::sync::atomic::Ordering::Acquire),
-        "snapshot-failure rollback must retain exclusive transition ownership"
-    );
-    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+/// Test-process peer identity, as the kernel reports it for a socket this
+/// process connects.
+#[cfg(unix)]
+fn test_process_peer() -> cockpit_host::peer_cred::PeerIdentity {
+    let pid = std::process::id();
+    let (uid, gid) = cockpit_host::daemon_lifecycle::read_process_credentials(pid)
+        .expect("test process uid/gid");
+    cockpit_host::peer_cred::PeerIdentity {
+        pid,
+        uid,
+        gid,
+        process_start: cockpit_host::daemon_lifecycle::process_start_identity(pid)
+            .expect("test process start identity"),
+    }
 }
 
-#[tokio::test]
-async fn sensitive_wire_disconnect_retains_permit_through_rollback() {
-    let (_tmp, locked, result) = ready_construction().await;
-    let constructed = locked
-        .finish_ready_transition()
-        .await
-        .expect("construct ready services");
-    let (mut writer, reader) = tokio::io::duplex(64);
-    drop(reader);
+/// A served locked owner on real sockets, with an owner-class credential
+/// minted for this test process.
+#[cfg(unix)]
+struct ServedLockedOwner {
+    tmp: tempfile::TempDir,
+    locked: std::sync::Arc<LockedServices>,
+    run: tokio::task::JoinHandle<super::LockedRunOutcome>,
+    owner_token: String,
+}
 
+#[cfg(unix)]
+async fn serve_locked_owner() -> ServedLockedOwner {
+    let (tmp, locked) = fresh_locked_services().await;
+    serve_prepared_locked_owner(tmp, locked).await
+}
+
+/// Serve an already booted locked owner (any probe plan) on real sockets.
+#[cfg(unix)]
+async fn serve_prepared_locked_owner(
+    tmp: tempfile::TempDir,
+    locked: LockedServices,
+) -> ServedLockedOwner {
+    let locked = std::sync::Arc::new(locked);
+    let listener =
+        crate::daemon::bind_private_socket(&locked.paths.socket).expect("bind control listener");
+    let reveal = crate::daemon::leak_reveal_socket::bind_reveal_socket(&locked.paths)
+        .expect("bind leak-reveal socket");
+    // Owner-class control connections: launch provenance bound to this test
+    // process plus the follower ticket the wire client resolves.
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    locked
+        .peer_credential_registry
+        .install_launch_provenance_for_test(&ticket, test_process_peer());
+    crate::daemon::peer_authority::persist_launch_ticket(&locked.paths.socket, &ticket)
+        .expect("persist locked launch ticket");
+    let owner_token = locked
+        .peer_credential_registry
+        .mint(
+            test_process_peer(),
+            uuid::Uuid::new_v4(),
+            crate::daemon::principal::LocalClientRole::Tui,
+            Vec::new(),
+        )
+        .0;
+    let loop_locked = locked.clone();
+    let run = tokio::spawn(async move {
+        super::run_locked_until_ready(loop_locked, listener, reveal)
+            .await
+            .expect("locked run loop")
+    });
+    ServedLockedOwner {
+        tmp,
+        locked,
+        run,
+        owner_token,
+    }
+}
+
+/// Send one secure-store intent on the sensitive sibling exactly as the
+/// client transport frames it. `read_response: false` models a client that
+/// gave up or was superseded: it closes without reading the answer.
+#[cfg(unix)]
+async fn send_secure_intent_on_wire(
+    served: &ServedLockedOwner,
+    secure: &cockpit_proto::OnboardingBootstrapSnapshot,
+    client_operation_id: &str,
+    read_response: bool,
+) -> Option<cockpit_proto::SensitiveOnboardingIntentResponse> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let payload = cockpit_proto::encode_sensitive_onboarding_intent(
+        cockpit_proto::SensitiveOnboardingIntentFrame {
+            connection_id: uuid::Uuid::nil(),
+            owner_capability: Some(cockpit_proto::OwnerCapabilityToken::new(
+                served.owner_token.clone(),
+            )),
+            request: ApplyOnboardingSecureIntent {
+                run_id: secure.run_id,
+                attempt_id: secure.attempt_id,
+                expected_revision: secure.revision,
+                client_operation_id: client_operation_id.into(),
+                placement: OnboardingSecurePlacement::MachineBoundFile,
+                passphrase: None,
+            },
+        },
+    )
+    .expect("encode secure intent");
+    let mut stream = tokio::net::UnixStream::connect(served.locked.paths.leak_reveal_socket())
+        .await
+        .expect("connect sensitive sibling");
+    stream.write_all(&payload).await.expect("write intent");
+    stream.flush().await.expect("flush intent");
+    stream.shutdown().await.expect("half-close intent");
+    if !read_response {
+        drop(stream);
+        return None;
+    }
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read intent response");
+    Some(cockpit_proto::decode_sensitive_onboarding_response(&response).expect("decode response"))
+}
+
+#[cfg(unix)]
+async fn wait_for_phase(locked: &LockedServices, phase: cockpit_proto::LockedReadyConstruction) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while locked.ready_construction_phase() != phase {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("locked owner never reached {phase:?}"));
+}
+
+/// Root cause of the first-run restart storm: ready construction used to be
+/// owned by the sensitive connection that committed the vault. The response
+/// was written only after construction, so a client that gave up (a hello
+/// timeout retry budget, a superseding `Replace` request) closed the stream;
+/// the write failed with EPIPE, the constructed ready graph was dropped, and
+/// the rollback recorded a (since removed) durable failed bootstrap state
+/// while the vault stayed committed. Construction is now daemon-owned: an abandoned response
+/// changes nothing and the owner still publishes ready services.
+#[cfg(unix)]
+#[tokio::test]
+async fn abandoned_secure_intent_response_never_discards_ready_construction() {
+    let served = serve_locked_owner().await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    // The client closes without reading: its response is undeliverable.
     assert!(
-        constructed
-            .finalize_sensitive_wire(&mut writer, result)
+        send_secure_intent_on_wire(&served, &secure, "abandoned-intent", false)
+            .await
+            .is_none()
+    );
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
+        .await
+        .expect("ready construction must complete without its requesting client")
+        .expect("locked run loop joined");
+    assert!(
+        matches!(outcome, super::LockedRunOutcome::Ready(..)),
+        "an abandoned response must not discard the constructed ready graph"
+    );
+    let snapshot = served
+        .locked
+        .onboarding
+        .snapshot(served.locked.host_capabilities())
+        .await
+        .expect("read onboarding checkpoint")
+        .expect("onboarding run exists");
+    assert_eq!(snapshot.stage, OnboardingStage::Provider);
+    assert_eq!(
+        snapshot.bootstrap_state,
+        cockpit_proto::OnboardingBootstrapState::Ready,
+        "an undeliverable response must never record a ready-construction failure"
+    );
+    drop(served.locked);
+    drop(served.tmp);
+}
+
+/// While ready construction runs the locked owner keeps accepting
+/// connections and answers every hello with the `constructing` phase. The
+/// previous design ran construction inline in the accept loop, so every new
+/// connection's hello timed out for the whole construction.
+#[cfg(unix)]
+#[tokio::test]
+async fn locked_owner_answers_hellos_with_constructing_phase_during_construction() {
+    let served = serve_locked_owner().await;
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *served.locked.construction_gate.lock().unwrap() = Some(gate);
+    let secure = advance_to_secure_store(&served.locked).await;
+    let response = send_secure_intent_on_wire(&served, &secure, "gated-intent", true)
+        .await
+        .expect("response is read");
+    let cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result) = response else {
+        panic!("committed intent must answer Applied before construction completes");
+    };
+    assert_eq!(result.snapshot.stage, OnboardingStage::Provider);
+    wait_for_phase(
+        &served.locked,
+        cockpit_proto::LockedReadyConstruction::Constructing,
+    )
+    .await;
+
+    // A brand-new bootstrap connection completes its hello while
+    // construction is held (a ready-services `connect` would wait).
+    let client = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cockpit_client::DaemonClient::connect_bootstrap(&served.locked.paths.socket),
+    )
+    .await
+    .expect("hello must not wait for ready construction")
+    .expect("connect during ready construction");
+    let status = client
+        .request(Request::DaemonStatus)
+        .await
+        .expect("status transport")
+        .expect("status answered");
+    let Response::LockedBootstrapHello(hello) = status else {
+        panic!("a locked owner answers status with its locked hello");
+    };
+    assert_eq!(
+        hello.ready_construction,
+        cockpit_proto::LockedReadyConstruction::Constructing
+    );
+    // Locked mutations are refused with the named in-progress cause.
+    let refused = client
+        .request(Request::BeginOrReopenOnboarding(BeginOrReopenOnboarding {
+            expected_revision: None,
+            client_operation_id: "during-construction".into(),
+            reentry: true,
+        }))
+        .await
+        .expect("refusal is a response, not a closed connection");
+    let error = refused.expect_err("mutation during construction is refused");
+    assert_eq!(error.code, ErrorCode::RetryLater);
+    assert!(
+        error.message.contains("ready construction is in progress"),
+        "{}",
+        error.message
+    );
+    assert!(!served.run.is_finished());
+
+    release.send(()).expect("release construction");
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
+        .await
+        .expect("construction completes after release")
+        .expect("locked run loop joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Ready(..)));
+    drop(client);
+    drop(served.locked);
+    drop(served.tmp);
+}
+
+/// A stop (StopDaemon, or the forwarded first shutdown signal) that arrives
+/// while construction runs waits for construction to settle instead of
+/// cancelling it mid-way, and a construction that succeeded is not recorded
+/// as a failure: the next boot opens the committed vault ready.
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_during_ready_construction_settles_before_exit() {
+    let served = serve_locked_owner().await;
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *served.locked.construction_gate.lock().unwrap() = Some(gate);
+    let secure = advance_to_secure_store(&served.locked).await;
+    send_secure_intent_on_wire(&served, &secure, "stopped-intent", true)
+        .await
+        .expect("response is read");
+    wait_for_phase(
+        &served.locked,
+        cockpit_proto::LockedReadyConstruction::Constructing,
+    )
+    .await;
+    served.locked.request_locked_stop();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !served.run.is_finished(),
+        "a stop must not cancel an in-flight ready construction"
+    );
+    release.send(()).expect("release construction");
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
+        .await
+        .expect("stop completes once construction settles")
+        .expect("locked run loop joined");
+    assert!(
+        matches!(outcome, super::LockedRunOutcome::Shutdown),
+        "an acknowledged stop still wins over publishing the constructed graph"
+    );
+    let snapshot = served
+        .locked
+        .onboarding
+        .snapshot(served.locked.host_capabilities())
+        .await
+        .expect("read onboarding checkpoint")
+        .expect("onboarding run exists");
+    assert_eq!(
+        snapshot.bootstrap_state,
+        cockpit_proto::OnboardingBootstrapState::Ready,
+        "a successful construction retired by stop is not a failure"
+    );
+    assert!(
+        !served
+            .locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    drop(served.locked);
+    drop(served.tmp);
+}
+
+/// Commit the secure-store choice directly (no construction started yet).
+async fn commit_secure_store(
+    locked: &super::LockedServices,
+    secure: &cockpit_proto::OnboardingBootstrapSnapshot,
+    client_operation_id: &str,
+) -> cockpit_proto::OnboardingTransitionResult {
+    locked
+        .apply_secure_intent_for_test(ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: client_operation_id.into(),
+            placement: OnboardingSecurePlacement::MachineBoundFile,
+            passphrase: None,
+        })
+        .await
+        .expect("commit secure intent without starting construction")
+}
+
+/// The production signal forwarder drives the stop: the first SIGTERM is an
+/// acknowledged locked stop that lets an in-flight construction settle (the
+/// owner keeps running while it is held), a repeated signal is the explicit
+/// force, and once released the settled construction ends in `Shutdown`.
+/// Signals are process-wide, so the scenario runs in an isolated child
+/// process of this test binary.
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_signals_stop_after_construction_settles_and_repeat_forces() {
+    const CHILD: &str = "COCKPIT_LOCKED_SIGNAL_FORWARDER_CHILD";
+    const OK: &str = "locked-signal-forwarder-child-ok";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .args([
+                "--exact",
+                "daemon::server::onboarding_bootstrap_tests::shutdown_signals_stop_after_construction_settles_and_repeat_forces",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("run the isolated signal scenario");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "child failed:\n{stdout}\n{stderr}");
+        assert!(
+            stderr.contains(OK) || stdout.contains(OK),
+            "child did not run the scenario:\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+    let served = serve_locked_owner().await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    commit_secure_store(&served.locked, &secure, "signal-intent").await;
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *served.locked.construction_gate.lock().unwrap() = Some(gate);
+    served
+        .locked
+        .start_ready_construction()
+        .expect("construction admitted");
+    let force = std::sync::Arc::new(tokio::sync::Notify::new());
+    let signals = crate::daemon::BootstrapShutdownSignals::new();
+    let forwarder = tokio::spawn(crate::daemon::forward_locked_bootstrap_signals(
+        served.locked.clone(),
+        force.clone(),
+        signals,
+    ));
+    // SAFETY: raising a signal this process handles (tokio streams above).
+    assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !served
+            .locked
+            .stop_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first signal requests the locked stop");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), force.notified())
             .await
             .is_err(),
-        "disconnected sensitive peer must prevent publication"
+        "one signal is never a force"
     );
     assert!(
-        locked
-            .ready_transition_inflight
-            .load(std::sync::atomic::Ordering::Acquire),
-        "wire-delivery rollback must retain exclusive transition ownership"
+        !served.run.is_finished(),
+        "a signalled stop waits for the in-flight construction"
     );
-    assert!(locked.closing.load(std::sync::atomic::Ordering::Acquire));
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(5), force.notified())
+        .await
+        .expect("a repeated signal is the explicit force");
+    forwarder.await.expect("forwarder joined");
+    release.send(()).expect("release construction");
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
+        .await
+        .expect("the stop completes once construction settles")
+        .expect("locked run loop joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Shutdown));
+    eprintln!("{OK}");
+}
+
+/// A real construction failure (an injected error on the production path,
+/// not a hand-set phase) rolls back to the retryable `failed` phase; the
+/// retry is idempotent and daemon-owned: it answers at once, a duplicate
+/// while construction runs starts nothing, and the owner then publishes
+/// ready services.
+#[cfg(unix)]
+#[tokio::test]
+async fn ready_construction_retry_is_idempotent_and_daemon_owned() {
+    let served = serve_locked_owner().await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    commit_secure_store(&served.locked, &secure, "retry-intent").await;
+    served
+        .locked
+        .fail_next_construction
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        served
+            .locked
+            .start_ready_construction()
+            .expect("first attempt admitted"),
+        super::ReadyConstructionStart::Started
+    );
+    wait_for_phase(
+        &served.locked,
+        cockpit_proto::LockedReadyConstruction::Failed,
+    )
+    .await;
+    assert!(
+        !served.run.is_finished(),
+        "a failed construction keeps the owner serving"
+    );
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *served.locked.construction_gate.lock().unwrap() = Some(gate);
+    let first = super::retry_locked_ready_construction(&served.locked)
+        .await
+        .expect("retry admitted");
+    assert!(matches!(
+        first,
+        Response::OnboardingBootstrapSnapshot(Some(_))
+    ));
+    assert_eq!(
+        served.locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Constructing
+    );
+    assert_eq!(
+        served
+            .locked
+            .start_ready_construction()
+            .expect("duplicate retry"),
+        super::ReadyConstructionStart::AlreadyInProgress
+    );
+    release.send(()).expect("release construction");
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
+        .await
+        .expect("retried construction completes")
+        .expect("locked run loop joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Ready(..)));
+    drop(served.locked);
+    drop(served.tmp);
+}
+
+/// A retry whose snapshot read fails after it admitted construction reports
+/// the error to its caller, but the spawned construction it started is not
+/// the caller's: it still completes and publishes ready services.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_retry_snapshot_cannot_cancel_the_spawned_construction() {
+    let served = serve_locked_owner().await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    commit_secure_store(&served.locked, &secure, "retry-snapshot-intent").await;
+    served
+        .locked
+        .fail_next_construction
+        .store(true, std::sync::atomic::Ordering::Release);
+    served
+        .locked
+        .start_ready_construction()
+        .expect("first attempt admitted");
+    wait_for_phase(
+        &served.locked,
+        cockpit_proto::LockedReadyConstruction::Failed,
+    )
+    .await;
+    served
+        .locked
+        .fail_next_retry_snapshot
+        .store(true, std::sync::atomic::Ordering::Release);
+    let error = super::retry_locked_ready_construction(&served.locked)
+        .await
+        .expect_err("the injected snapshot failure reaches the caller");
+    assert!(
+        error.message.contains("injected retry snapshot failure"),
+        "{}",
+        error.message
+    );
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, served.run)
+        .await
+        .expect("construction completes despite the failed retry response")
+        .expect("locked run loop joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Ready(..)));
+    drop(served.locked);
+    drop(served.tmp);
+}
+
+/// A secure intent that already committed replays idempotently — but only
+/// the exact operation: same ids, the `secure_store` operation kind, and the
+/// same request parameters. A different placement under the same id, the id
+/// of a different (begin) operation, or a still-pending secure-store receipt
+/// never replays as `Applied`.
+#[tokio::test]
+async fn committed_secure_intent_replays_only_the_exact_operation() {
+    let (_tmp, locked, committed) = ready_construction().await;
+    let intent = |client_operation_id: &str, placement| ApplyOnboardingSecureIntent {
+        run_id: committed.receipt.run_id,
+        attempt_id: committed.receipt.attempt_id,
+        expected_revision: committed.receipt.consumed_revision,
+        client_operation_id: client_operation_id.into(),
+        placement,
+        passphrase: None,
+    };
+    let replay = locked
+        .apply_secure_intent_span(intent(
+            "construct-ready",
+            OnboardingSecurePlacement::MachineBoundFile,
+        ))
+        .await
+        .expect("replay of the committed operation");
+    assert_eq!(replay.receipt, committed.receipt);
+    assert_eq!(replay.snapshot.stage, OnboardingStage::Provider);
+
+    // A different operation cannot apply once the choice committed.
+    assert!(
+        matches!(
+            locked
+                .apply_secure_intent_span(intent(
+                    "another-click",
+                    OnboardingSecurePlacement::MachineBoundFile
+                ))
+                .await,
+            Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest)
+        ),
+        "another client operation must not replay"
+    );
+    // The same id for another request is a conflict with the recorded one.
+    for (label, request) in [
+        (
+            "different parameters",
+            intent("construct-ready", OnboardingSecurePlacement::Keyring),
+        ),
+        // `commit-profile` is an ordinary transition receipt in this run.
+        (
+            "an ordinary transition's id",
+            intent(
+                "commit-profile",
+                OnboardingSecurePlacement::MachineBoundFile,
+            ),
+        ),
+    ] {
+        assert!(
+            matches!(
+                locked.apply_secure_intent_span(request).await,
+                Err(cockpit_proto::SensitiveOnboardingIntentError::RevisionConflict)
+            ),
+            "{label} must not replay"
+        );
+    }
+}
+
+/// F5: a pending secure-store receipt (materialization not yet settled) is
+/// not evidence of a commit. Driven through the production span: the
+/// operation neither replays as `Applied` nor is reported as a committed
+/// vault awaiting construction (`ReadyConstructionFailed`); nothing
+/// materializes.
+#[tokio::test]
+async fn pending_secure_intent_receipt_does_not_replay() {
+    let (_tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let secure = advance_to_secure_store(&locked).await;
+    let current = locked
+        .db
+        .onboarding_snapshot()
+        .await
+        .expect("snapshot")
+        .expect("run exists");
+    locked
+        .db
+        .onboarding_secure_intent_pending(
+            current,
+            "pending-intent".into(),
+            cockpit_db::onboarding::OnboardingSecurePlacement::MachineBoundFile,
+            cockpit_db::onboarding::OnboardingOperationFingerprint::secure_store(
+                cockpit_db::onboarding::OnboardingSecurePlacement::MachineBoundFile,
+                None,
+            ),
+            0,
+        )
+        .await
+        .expect("record the pending intent");
+    let outcome = locked
+        .apply_secure_intent_span(ApplyOnboardingSecureIntent {
+            run_id: secure.run_id,
+            attempt_id: secure.attempt_id,
+            expected_revision: secure.revision,
+            client_operation_id: "pending-intent".into(),
+            placement: OnboardingSecurePlacement::MachineBoundFile,
+            passphrase: None,
+        })
+        .await;
+    assert_eq!(
+        outcome,
+        Err(
+            cockpit_proto::SensitiveOnboardingIntentError::MaterializationFailed(
+                cockpit_proto::SecurePlacementFailureReason::Unclassified
+            )
+        ),
+        "a pending receipt answers by its own (uncertain) status"
+    );
+    assert!(!locked.vault_authority_exists().expect("authority query"));
+    assert!(!locked.vault_committed());
+}
+
+/// A client operation id of the maximum wire length completes end to end:
+/// the daemon's own follow-up operation ids are fixed-width in a reserved
+/// namespace, never derived by appending to the client id.
+#[tokio::test]
+async fn maximum_length_secure_intent_operation_id_completes() {
+    let (_tmp, locked) = fresh_locked_services().await;
+    let secure = advance_to_secure_store(&locked).await;
+    let id = "x".repeat(128);
+    let result = commit_secure_store(&locked, &secure, &id).await;
+    assert_eq!(result.snapshot.stage, OnboardingStage::Provider);
+    assert_eq!(
+        result.receipt.status,
+        cockpit_proto::OnboardingReceiptStatus::Committed
+    );
+    // The reserved namespace, on a fresh secure stage where only the
+    // namespace check can refuse it: no receipt, no revision, no vault.
+    let (_fresh_tmp, fresh) = fresh_locked_services().await;
+    let fresh = std::sync::Arc::new(fresh);
+    let fresh_secure = advance_to_secure_store(&fresh).await;
+    let reserved_id = "cockpit-internal:bootstrap-reconcile:1";
+    let reserved = fresh
+        .apply_secure_intent_span(ApplyOnboardingSecureIntent {
+            run_id: fresh_secure.run_id,
+            attempt_id: fresh_secure.attempt_id,
+            expected_revision: fresh_secure.revision,
+            client_operation_id: reserved_id.into(),
+            placement: OnboardingSecurePlacement::MachineBoundFile,
+            passphrase: None,
+        })
+        .await;
+    assert_eq!(
+        reserved,
+        Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest),
+        "the internal namespace is refused before any effect"
+    );
+    let receipt = fresh
+        .db
+        .onboarding_receipt(
+            fresh_secure.run_id,
+            fresh_secure.attempt_id,
+            reserved_id.into(),
+        )
+        .await
+        .expect("receipt lookup");
+    assert!(receipt.is_none(), "no receipt was written");
+    let after = fresh
+        .onboarding
+        .snapshot(fresh.host_capabilities())
+        .await
+        .expect("snapshot")
+        .expect("run exists");
+    assert_eq!(
+        after.revision, fresh_secure.revision,
+        "no revision consumed"
+    );
+    assert!(!fresh.vault_authority_exists().expect("authority query"));
+}
+
+/// D1: a boot with a committed vault comes up as the locked bootstrap owner
+/// right after DB/config initialization — its hello reports `constructing`,
+/// never `awaiting_secure_store` — and publishes ready services once the
+/// daemon-owned construction completes. There is no durable `failed` state
+/// to heal: the vault alone makes every boot reconstruct.
+#[cfg(unix)]
+#[tokio::test]
+async fn vault_present_boot_serves_the_bootstrap_hello_then_publishes_ready() {
+    let (tmp, locked, _) = ready_construction().await;
+    let config_dir = tmp.path().to_path_buf();
+    drop(locked);
+
+    let db = crate::db::Db::open(&config_dir.join("cockpit.db")).expect("reopen installation");
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_environment = false;
+    extended.redact.scan_dotenv = false;
+    extended.redact.scan_ssh_keys = false;
+    extended.daemon.boot.secret_store_backend =
+        crate::config::extended::DaemonSecretStoreBackend::File;
+    extended.daemon.boot.secret_store_path = Some(config_dir.join("secret-vault"));
+    let mut timer = crate::startup::PhaseTimer::start("vault_present_reboot");
+    let locked = std::sync::Arc::new(
+        boot_with_db_and_probe_plan(
+            crate::daemon::DaemonPaths {
+                socket: config_dir.join("cockpit.sock"),
+                pid_file: config_dir.join("cockpit.pid"),
+                ephemeral: true,
+            },
+            db,
+            &mut timer,
+            crate::daemon::terminal::test_host_factory(),
+            crate::daemon::config_source::ConfigSource::fixed(
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+            LockedProbePlan::production(),
+        )
+        .await
+        .expect("reboot the onboarded installation"),
+    );
+    assert!(locked.vault_committed());
+    // Before any construction owns the committed choice the phase is the
+    // retryable `failed`, never `awaiting_secure_store` (a vault exists) and
+    // never `constructing` (nothing is running).
+    assert_eq!(
+        locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Failed,
+    );
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    locked
+        .peer_credential_registry
+        .install_launch_provenance_for_test(&ticket, test_process_peer());
+    crate::daemon::peer_authority::persist_launch_ticket(&locked.paths.socket, &ticket)
+        .expect("persist locked launch ticket");
+    let listener =
+        crate::daemon::bind_private_socket(&locked.paths.socket).expect("bind control listener");
+    let reveal = crate::daemon::leak_reveal_socket::bind_reveal_socket(&locked.paths)
+        .expect("bind leak-reveal socket");
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *locked.construction_gate.lock().unwrap() = Some(gate);
+    let loop_locked = locked.clone();
+    // The run loop starts construction once it is registered as its
+    // consumer (the production boot path).
+    let run = tokio::spawn(async move {
+        super::run_locked_until_ready(loop_locked, listener, reveal)
+            .await
+            .expect("locked run loop")
+    });
+    // The bootstrap surface answers while ready services are still held.
+    let phase = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cockpit_client::probe_owner_hello_phase(&locked.paths.socket),
+    )
+    .await
+    .expect("the hello does not wait for ready services")
+    .expect("hello read");
+    assert_eq!(
+        phase,
+        Some(cockpit_proto::LockedReadyConstruction::Constructing)
+    );
+    let bootstrap = cockpit_client::DaemonClient::connect_bootstrap(&locked.paths.socket)
+        .await
+        .expect("bootstrap connection during construction");
+    // The owner's authenticated snapshot is served during construction.
+    let snapshot = match bootstrap
+        .request(Request::GetOnboardingBootstrapSnapshot)
+        .await
+        .expect("snapshot transport")
+        .expect("the owner's snapshot is served while construction runs")
+    {
+        Response::OnboardingBootstrapSnapshot(Some(snapshot)) => snapshot,
+        other => panic!("unexpected snapshot response: {other:?}"),
+    };
+    assert_eq!(snapshot.stage, OnboardingStage::Provider);
+    assert!(!run.is_finished(), "construction is still held");
+    release.send(()).expect("release construction");
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET, run)
+        .await
+        .expect("construction completes")
+        .expect("locked run loop joined");
+    assert!(matches!(outcome, super::LockedRunOutcome::Ready(..)));
+    drop(bootstrap);
+    drop(locked);
+    drop(tmp);
 }
 
 /// A locked probe plan whose run blocks on `gate`, then returns hermetic
@@ -896,7 +1657,7 @@ async fn apply_secure_intent_awaits_a_pending_probe() {
         let locked = locked.clone();
         async move {
             locked
-                .apply_secure_intent(ApplyOnboardingSecureIntent {
+                .apply_secure_intent_for_test(ApplyOnboardingSecureIntent {
                     run_id: secure.run_id,
                     attempt_id: secure.attempt_id,
                     expected_revision: secure.revision,
@@ -961,7 +1722,7 @@ async fn probe_timeout_settles_fail_closed() {
     );
 
     let rejected = locked
-        .apply_secure_intent(ApplyOnboardingSecureIntent {
+        .apply_secure_intent_for_test(ApplyOnboardingSecureIntent {
             run_id: secure.run_id,
             attempt_id: secure.attempt_id,
             expected_revision: secure.revision,
@@ -978,4 +1739,569 @@ async fn probe_timeout_settles_fail_closed() {
         )
     );
     assert!(!locked.vault_authority_exists().expect("authority query"));
+}
+
+fn secure_intent(
+    secure: &cockpit_proto::OnboardingBootstrapSnapshot,
+    client_operation_id: &str,
+    placement: OnboardingSecurePlacement,
+    passphrase: Option<&str>,
+) -> ApplyOnboardingSecureIntent {
+    ApplyOnboardingSecureIntent {
+        run_id: secure.run_id,
+        attempt_id: secure.attempt_id,
+        expected_revision: secure.revision,
+        client_operation_id: client_operation_id.into(),
+        placement,
+        passphrase: passphrase.map(|value| {
+            cockpit_proto::SensitiveOnboardingPassphrase::confirmed(value.into(), value.into())
+                .expect("confirmed passphrase")
+        }),
+    }
+}
+
+#[cfg(unix)]
+async fn await_ready_outcome(served: ServedLockedOwnerRun) {
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET_ANY, served)
+        .await
+        .expect("construction completes")
+        .expect("locked run loop joined");
+    assert!(
+        matches!(outcome, super::LockedRunOutcome::Ready(..)),
+        "the owner publishes ready services"
+    );
+}
+
+#[cfg(unix)]
+type ServedLockedOwnerRun = tokio::task::JoinHandle<super::LockedRunOutcome>;
+
+const READY_CONSTRUCTION_TEST_BUDGET_ANY: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// G1: a passphrase-file choice runs end to end to ready services. The vault
+/// onboarding opened (with the passphrase-derived key custody) is handed to
+/// construction; construction never reopens it without the passphrase. A
+/// failed first attempt's retry reuses the same custody.
+#[cfg(unix)]
+#[tokio::test]
+async fn passphrase_file_onboarding_runs_end_to_end_to_ready() {
+    let served = serve_locked_owner().await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    served
+        .locked
+        .fail_next_construction
+        .store(true, std::sync::atomic::Ordering::Release);
+    let applied = served
+        .locked
+        .apply_secure_intent_span(secure_intent(
+            &secure,
+            "passphrase-intent",
+            OnboardingSecurePlacement::PassphraseFile,
+            Some("correct horse battery staple"),
+        ))
+        .await
+        .expect("the passphrase choice commits");
+    assert_eq!(applied.snapshot.stage, OnboardingStage::Provider);
+    let authority = served
+        .locked
+        .db
+        .blocking_write_for_sync_maintenance(cockpit_db::secret_vault::load_authority_conn)
+        .expect("load vault authority")
+        .expect("authority row");
+    assert_eq!(
+        authority.file_kek_mode,
+        Some(SecretVaultFileKekMode::Passphrase)
+    );
+    // The injected first failure takes the production rollback; the retry
+    // must construct from the same custody.
+    wait_for_phase(
+        &served.locked,
+        cockpit_proto::LockedReadyConstruction::Failed,
+    )
+    .await;
+    super::retry_locked_ready_construction(&served.locked)
+        .await
+        .expect("retry admitted");
+    await_ready_outcome(served.run).await;
+}
+
+/// G2: a committed choice that no construction owns (its start failed)
+/// reports the retryable `failed` phase — never a permanent `constructing` —
+/// and the next owner registration (boot's run loop) starts construction.
+#[cfg(unix)]
+#[tokio::test]
+async fn committed_choice_without_a_construction_owner_reports_failed_and_is_retried() {
+    let (tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let secure = advance_to_secure_store(&locked).await;
+    // No lifecycle owner is registered: construction cannot start.
+    let outcome = locked
+        .apply_secure_intent_span(secure_intent(
+            &secure,
+            "unowned-intent",
+            OnboardingSecurePlacement::MachineBoundFile,
+            None,
+        ))
+        .await;
+    assert_eq!(
+        outcome,
+        Err(cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed)
+    );
+    assert!(locked.vault_committed());
+    assert_eq!(
+        locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Failed,
+        "nothing constructs, so nothing may report constructing"
+    );
+    assert!(
+        !locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    // The run loop registers as the consumer and starts construction.
+    let listener =
+        crate::daemon::bind_private_socket(&locked.paths.socket).expect("bind control listener");
+    let reveal = crate::daemon::leak_reveal_socket::bind_reveal_socket(&locked.paths)
+        .expect("bind leak-reveal socket");
+    let loop_locked = locked.clone();
+    let run = tokio::spawn(async move {
+        super::run_locked_until_ready(loop_locked, listener, reveal)
+            .await
+            .expect("locked run loop")
+    });
+    await_ready_outcome(run).await;
+    drop(locked);
+    drop(tmp);
+}
+
+/// G2: bookkeeping that fails right after the vault committed (receipt
+/// settlement) never strands the owner: the span settles the choice from the
+/// vault evidence, hands it to construction, and the owner reaches ready.
+#[cfg(unix)]
+#[tokio::test]
+async fn post_commit_bookkeeping_failure_still_hands_the_choice_to_construction() {
+    let served = serve_locked_owner().await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *served.locked.construction_gate.lock().unwrap() = Some(gate);
+    served.locked.onboarding.inject_post_commit_failure();
+    let applied = served
+        .locked
+        .apply_secure_intent_span(secure_intent(
+            &secure,
+            "bookkeeping-intent",
+            OnboardingSecurePlacement::MachineBoundFile,
+            None,
+        ))
+        .await
+        .expect("the committed choice is answered from its reconciled receipt");
+    assert_eq!(
+        applied.receipt.status,
+        cockpit_proto::OnboardingReceiptStatus::Committed
+    );
+    assert_eq!(applied.snapshot.stage, OnboardingStage::Provider);
+    assert!(
+        served
+            .locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "a construction owns the committed choice"
+    );
+    assert_eq!(
+        served.locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Constructing
+    );
+    release.send(()).expect("release construction");
+    await_ready_outcome(served.run).await;
+}
+
+/// G2: replaying the committed submission also ensures construction owns
+/// the committed choice: after a failed construction, the replayed intent
+/// restarts it.
+#[cfg(unix)]
+#[tokio::test]
+async fn replayed_committed_intent_restarts_a_failed_construction() {
+    let served = serve_locked_owner().await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    served
+        .locked
+        .fail_next_construction
+        .store(true, std::sync::atomic::Ordering::Release);
+    let request = || {
+        secure_intent(
+            &secure,
+            "replayed-intent",
+            OnboardingSecurePlacement::MachineBoundFile,
+            None,
+        )
+    };
+    let first = served
+        .locked
+        .apply_secure_intent_span(request())
+        .await
+        .expect("commit");
+    wait_for_phase(
+        &served.locked,
+        cockpit_proto::LockedReadyConstruction::Failed,
+    )
+    .await;
+    let replay = served
+        .locked
+        .apply_secure_intent_span(request())
+        .await
+        .expect("the committed submission replays");
+    assert_eq!(replay.receipt.receipt_id, first.receipt.receipt_id);
+    await_ready_outcome(served.run).await;
+}
+
+/// G3: a secure-intent span that is cancelled at an await or panics gives
+/// its inflight count back (one guard owns it), so construction and
+/// shutdown still settle afterwards.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_or_panicking_secure_span_gives_its_count_back() {
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (tmp, locked) = locked_services_with_probe_plan(gated_probe_plan(gate)).await;
+    let served = serve_prepared_locked_owner(tmp, locked).await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    // Cancelled while awaiting the (gated) probes inside the span.
+    let cancelled = tokio::spawn({
+        let locked = served.locked.clone();
+        let request = secure_intent(
+            &secure,
+            "cancelled-intent",
+            OnboardingSecurePlacement::MachineBoundFile,
+            None,
+        );
+        async move { locked.apply_secure_intent_span(request).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while served.locked.inflight_mutation_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the span is admitted and counted");
+    cancelled.abort();
+    let _ = cancelled.await;
+    assert_eq!(served.locked.inflight_mutation_count(), 0);
+    // Panicking after admission.
+    served
+        .locked
+        .panic_next_secure_intent
+        .store(true, std::sync::atomic::Ordering::Release);
+    let panicked = tokio::spawn({
+        let locked = served.locked.clone();
+        let request = secure_intent(
+            &secure,
+            "panicking-intent",
+            OnboardingSecurePlacement::MachineBoundFile,
+            None,
+        );
+        async move { locked.apply_secure_intent_span(request).await }
+    })
+    .await;
+    assert!(panicked.is_err_and(|error| error.is_panic()));
+    assert_eq!(served.locked.inflight_mutation_count(), 0);
+    // Construction (which drains the count first) still settles.
+    release.send(()).expect("release the probes");
+    served
+        .locked
+        .apply_secure_intent_span(secure_intent(
+            &secure,
+            "settling-intent",
+            OnboardingSecurePlacement::MachineBoundFile,
+            None,
+        ))
+        .await
+        .expect("commit after the cancelled and panicked spans");
+    await_ready_outcome(served.run).await;
+}
+
+/// G5: construction starts only while its consumer is registered, so its
+/// result is never discarded for lack of a listener. On a multi-threaded
+/// runtime (the production daemon's), a vault-present owner started through
+/// the production run loop reaches ready.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn construction_starts_only_with_a_registered_consumer() {
+    let (_tmp, locked, _) = ready_construction().await;
+    let error = locked
+        .start_ready_construction()
+        .expect_err("no consumer is registered yet");
+    assert!(
+        error.to_string().contains("no lifecycle owner"),
+        "{error:#}"
+    );
+    assert!(
+        !locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire),
+        "nothing was admitted"
+    );
+    let listener =
+        crate::daemon::bind_private_socket(&locked.paths.socket).expect("bind control listener");
+    let reveal = crate::daemon::leak_reveal_socket::bind_reveal_socket(&locked.paths)
+        .expect("bind leak-reveal socket");
+    let loop_locked = locked.clone();
+    let run = tokio::spawn(async move {
+        super::run_locked_until_ready(loop_locked, listener, reveal)
+            .await
+            .expect("locked run loop")
+    });
+    await_ready_outcome(run).await;
+}
+
+/// G9: a duplicate submission that waited behind the original (under the
+/// exclusion) returns the original outcome, not a refusal.
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_duplicate_secure_intents_return_the_original_outcome() {
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (tmp, locked) = locked_services_with_probe_plan(gated_probe_plan(gate)).await;
+    let served = serve_prepared_locked_owner(tmp, locked).await;
+    let secure = advance_to_secure_store(&served.locked).await;
+    let submit = |locked: std::sync::Arc<LockedServices>| {
+        let request = secure_intent(
+            &secure,
+            "duplicate-intent",
+            OnboardingSecurePlacement::MachineBoundFile,
+            None,
+        );
+        tokio::spawn(async move { locked.apply_secure_intent_span(request).await })
+    };
+    let original = submit(served.locked.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while served.locked.inflight_mutation_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the original holds the exclusion");
+    let duplicate = submit(served.locked.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !duplicate.is_finished(),
+        "the duplicate waits behind the original"
+    );
+    release.send(()).expect("release the probes");
+    let original = original.await.expect("joined").expect("original applied");
+    let duplicate = duplicate
+        .await
+        .expect("joined")
+        .expect("the duplicate returns the original outcome");
+    assert_eq!(duplicate.receipt.receipt_id, original.receipt.receipt_id);
+    await_ready_outcome(served.run).await;
+}
+
+/// G9: a locked transition re-sent after its acknowledgement was lost (the
+/// checkpoint already moved on) answers from its receipt before admission
+/// and revision checks.
+#[tokio::test]
+async fn locked_transition_retry_after_a_lost_ack_returns_the_original_result() {
+    let (_tmp, locked) = fresh_locked_services().await;
+    let (welcome, _) = locked
+        .onboarding
+        .begin_or_reopen(
+            BeginOrReopenOnboarding {
+                expected_revision: None,
+                client_operation_id: "begin-lost-ack".into(),
+                reentry: false,
+            },
+            locked.host_capabilities(),
+        )
+        .await
+        .expect("begin");
+    let request = ApplyOnboardingTransition {
+        run_id: welcome.run_id,
+        attempt_id: welcome.attempt_id,
+        expected_revision: welcome.revision,
+        client_operation_id: "advance-lost-ack".into(),
+        transition: OnboardingTransitionKind::Advance,
+        settlement: None,
+    };
+    let send = || {
+        handle_locked_in_process_request(
+            &locked,
+            Request::ApplyOnboardingTransition(request.clone()),
+        )
+    };
+    let Response::OnboardingTransition(first) = send().await.expect("first") else {
+        panic!("unexpected response");
+    };
+    let Response::OnboardingTransition(retried) = send().await.expect("lost-ack retry") else {
+        panic!("unexpected response");
+    };
+    assert_eq!(retried.receipt.receipt_id, first.receipt.receipt_id);
+    assert_eq!(retried.snapshot.revision, first.snapshot.revision);
+}
+
+/// G6: one connection contract for every transport. An in-process `Ready`
+/// connection waits while the owner constructs; a bootstrap connection
+/// does not.
+#[tokio::test]
+async fn in_process_ready_connection_waits_for_construction() {
+    let (_tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let (endpoint, _ready) = super::locked_in_process_endpoint(locked.clone());
+    let endpoint = cockpit_client::ClientEndpoint::InProcess(endpoint);
+    let secure = advance_to_secure_store(&locked).await;
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *locked.construction_gate.lock().unwrap() = Some(gate);
+    locked
+        .apply_secure_intent_span(secure_intent(
+            &secure,
+            "in-process-intent",
+            OnboardingSecurePlacement::MachineBoundFile,
+            None,
+        ))
+        .await
+        .expect("commit");
+    let bootstrap = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cockpit_client::DaemonClient::connect_endpoint_bootstrap(&endpoint),
+    )
+    .await
+    .expect("a bootstrap connection does not wait")
+    .expect("bootstrap connection");
+    assert_eq!(
+        bootstrap.owner_phase().await.expect("phase"),
+        cockpit_client::OwnerPhase::Bootstrap(cockpit_proto::LockedReadyConstruction::Constructing)
+    );
+    let ready = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move { cockpit_client::DaemonClient::connect_endpoint(&endpoint).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !ready.is_finished(),
+        "a Ready connection waits for construction"
+    );
+    release.send(()).expect("release construction");
+    let ready = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET_ANY, ready)
+        .await
+        .expect("ready services publish")
+        .expect("joined")
+        .expect("ready connection");
+    assert_eq!(
+        ready.owner_phase().await.expect("phase"),
+        cockpit_client::OwnerPhase::Ready
+    );
+}
+
+/// F10: a fatal locked-loop exit settles an in-flight construction before
+/// returning, and retires a successful one without rolling it back.
+#[cfg(unix)]
+#[tokio::test]
+async fn fatal_locked_loop_exit_settles_the_in_flight_construction() {
+    let (_tmp, locked, _) = ready_construction().await;
+    let _consumer = locked.subscribe_ready_handoff();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    *locked.construction_gate.lock().unwrap() = Some(gate);
+    locked
+        .start_ready_construction()
+        .expect("construction admitted");
+    let mut clients = tokio::task::JoinSet::new();
+    let settling = tokio::spawn({
+        let locked = locked.clone();
+        async move {
+            super::settle_construction_then_fail(
+                &locked,
+                &mut clients,
+                anyhow::anyhow!("injected fatal accept error"),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !settling.is_finished(),
+        "the exit waits for the in-flight construction"
+    );
+    release.send(()).expect("release construction");
+    let outcome = tokio::time::timeout(READY_CONSTRUCTION_TEST_BUDGET_ANY, settling)
+        .await
+        .expect("settles")
+        .expect("joined");
+    let Err(error) = outcome else {
+        panic!("the fatal error is returned after settlement");
+    };
+    assert!(error.to_string().contains("injected fatal accept error"));
+    assert!(
+        !locked
+            .ready_transition_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert_ne!(
+        locked.ready_construction_phase(),
+        cockpit_proto::LockedReadyConstruction::Failed,
+        "a successful construction retired by the exit is not rolled back"
+    );
+}
+
+/// F10: an in-process owner whose ready construction fails reports it
+/// instead of publishing (or hanging on) a half-built endpoint.
+#[tokio::test]
+async fn in_process_boot_reports_a_failed_construction() {
+    let (_tmp, locked, _) = ready_construction().await;
+    let locked = std::sync::Arc::try_unwrap(locked)
+        .unwrap_or_else(|_| panic!("the helper hands over the only owner"));
+    locked
+        .fail_next_construction
+        .store(true, std::sync::atomic::Ordering::Release);
+    let result = tokio::time::timeout(
+        READY_CONSTRUCTION_TEST_BUDGET_ANY,
+        super::in_process_boot_services(locked),
+    )
+    .await
+    .expect("the failure is reported, not awaited forever");
+    let Err(error) = result else {
+        panic!("a failed in-process construction must not publish");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("in-process ready construction failed"),
+        "{error:#}"
+    );
+}
+
+/// F10: the accept-error table: aborted/reset/interrupted peers retry at
+/// once, descriptor or buffer exhaustion backs off, a broken listener is
+/// fatal, and an error without an I/O cause is fatal.
+#[cfg(unix)]
+#[test]
+fn classify_accept_error_by_errno() {
+    use super::AcceptFailure;
+    let classify = |code| {
+        super::classify_accept_error(
+            &anyhow::Error::new(std::io::Error::from_raw_os_error(code)).context("accepting"),
+        )
+    };
+    for code in [
+        libc::ECONNABORTED,
+        libc::ECONNRESET,
+        libc::EINTR,
+        libc::EAGAIN,
+    ] {
+        assert!(
+            matches!(classify(code), AcceptFailure::Transient(backoff) if backoff.is_zero()),
+            "errno {code} retries at once"
+        );
+    }
+    for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+        assert!(
+            matches!(classify(code), AcceptFailure::Transient(backoff) if !backoff.is_zero()),
+            "errno {code} backs off"
+        );
+    }
+    for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+        assert!(
+            matches!(classify(code), AcceptFailure::Fatal),
+            "errno {code} is fatal"
+        );
+    }
+    assert!(matches!(
+        super::classify_accept_error(&anyhow::anyhow!("no io cause")),
+        AcceptFailure::Fatal
+    ));
 }

@@ -286,3 +286,110 @@ fn welcome_fly_in_drives_the_animation_tick() {
         "reduced-motion welcome must not hold the animation tick"
     );
 }
+
+/// The user's report: a secure-store transport failure showed the specific
+/// "Onboarding transition unavailable: …" toast, then the recovery refresh it
+/// triggered failed too and replaced it with a generic "Onboarding authority
+/// unavailable", hiding the cause. A follow-up refresh failure must keep a
+/// still-visible specific error on screen.
+#[tokio::test(flavor = "current_thread")]
+async fn onboarding_refresh_failure_keeps_the_specific_transition_error_toast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
+        cockpit_proto::OnboardingStage::SecureStore,
+    )));
+    let transition_id = crate::tui::async_action::AsyncActionId::from_raw_for_test(901);
+    app.pending_startup_onboarding_operations
+        .insert(transition_id, "secure-intent-request".into());
+    app.apply_async_action_result(crate::tui::async_action::AsyncActionResult {
+        id: transition_id,
+        kind: crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.secure_intent"),
+        presentation_stale: false,
+        payload: Err(
+            "connecting to /home/u/.cockpit/cockpit.sock: No such file or directory (os error 2)"
+                .into(),
+        ),
+    });
+    let specific = app
+        .toast
+        .as_ref()
+        .expect("transition error toast")
+        .text
+        .clone();
+    assert!(
+        specific.starts_with("Onboarding transition unavailable:")
+            && specific.contains("No such file or directory"),
+        "{specific}"
+    );
+
+    app.apply_async_action_result(crate::tui::async_action::AsyncActionResult {
+        id: crate::tui::async_action::AsyncActionId::from_raw_for_test(902),
+        kind: crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.bootstrap_refresh"),
+        presentation_stale: false,
+        payload: Err("daemon hello timed out".into()),
+    });
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.text.as_str()),
+        Some(specific.as_str()),
+        "the follow-up refresh failure must not replace the specific cause"
+    );
+
+    // Once the specific error has expired, a later refresh failure shows.
+    app.toast.as_mut().expect("toast").expires_at = Instant::now() - Duration::from_millis(1);
+    app.apply_async_action_result(crate::tui::async_action::AsyncActionResult {
+        id: crate::tui::async_action::AsyncActionId::from_raw_for_test(903),
+        kind: crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.bootstrap_refresh"),
+        presentation_stale: false,
+        payload: Err("daemon hello timed out".into()),
+    });
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.starts_with("Onboarding authority unavailable:")),
+    );
+}
+
+/// The in-flight secure-store submission's handoff progress is mirrored onto
+/// the secure-store screen and cleared once the submission settles.
+#[tokio::test(flavor = "current_thread")]
+async fn secure_store_screen_shows_and_clears_the_submission_progress() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(
+        cockpit_proto::OnboardingStage::SecureStore,
+    )));
+    let progress = super::startup_layout::OnboardingHandoffProgress::default();
+    progress.set(super::startup_layout::OnboardingHandoffPhase::PreparingServices);
+    app.onboarding_secure_intent_progress = Some((Instant::now(), progress));
+    app.sync_onboarding_secure_intent_progress();
+    let shown = app
+        .onboarding_shell
+        .as_ref()
+        .and_then(|shell| shell.test_secure_store_progress())
+        .expect("progress line on the secure-store screen");
+    assert!(
+        shown.starts_with("Secure store ready. Preparing Cockpit services…"),
+        "{shown}"
+    );
+
+    let id = crate::tui::async_action::AsyncActionId::from_raw_for_test(904);
+    app.pending_startup_onboarding_operations
+        .insert(id, "secure-intent-request".into());
+    app.apply_async_action_result(crate::tui::async_action::AsyncActionResult {
+        id,
+        kind: crate::tui::async_action::AsyncActionKind::DaemonRpc("onboarding.secure_intent"),
+        presentation_stale: false,
+        payload: Err("secure store rejected".into()),
+    });
+    assert!(app.onboarding_secure_intent_progress.is_none());
+    app.sync_onboarding_secure_intent_progress();
+    assert!(
+        app.onboarding_shell
+            .as_ref()
+            .and_then(|shell| shell.test_secure_store_progress())
+            .is_none()
+    );
+}

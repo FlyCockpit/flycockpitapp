@@ -241,6 +241,40 @@ impl RedactionCoverageKey {
     }
 }
 
+/// Sanitized category of a failed complete capture. Only type-level facts
+/// leave this function: error kinds of the redaction source errors and the
+/// `std::io::ErrorKind` of an I/O cause. Never a path, file name, value,
+/// matcher, or message text, so the category is safe for `daemon.log`.
+fn coverage_capture_failure_category(error: &anyhow::Error) -> String {
+    for cause in error.chain() {
+        if cause.is::<super::EnvFileOverLimitError>() {
+            return "source_file_over_limit".into();
+        }
+        if cause.is::<super::RedactionSourceUnreadableError>() {
+            return "source_unreadable".into();
+        }
+        if cause.is::<super::RedactionSourceChangedError>() {
+            return "source_changed".into();
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return format!("io_{:?}", io.kind());
+        }
+    }
+    "capture_failed".into()
+}
+
+/// Record why a capture failed before the error collapses into the fixed
+/// fail-closed [`CoverageError`] category every caller sees. Without this a
+/// boot that dies with `coverage_unavailable` leaves nothing to trace.
+fn log_coverage_capture_failure(scope_class: &str, correlation: &Uuid, category: &str) {
+    tracing::warn!(
+        scope_class,
+        correlation = %correlation,
+        category,
+        "redaction coverage capture failed; publishing no coverage (fail closed)"
+    );
+}
+
 /// Sanitized fail-closed result.  The variants intentionally carry no source
 /// details; callers may turn them into their generic coverage-unavailable UX.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,7 +293,7 @@ impl fmt::Display for CoverageError {
         formatter.write_str(match self {
             Self::Unavailable => "coverage_unavailable",
             Self::Saturated => "coverage_saturated",
-            Self::Invalidated => "coverage_unavailable",
+            Self::Invalidated => "coverage_invalidated",
             Self::SourceFileOverLimit => "redaction source exceeds the daemon file size limit",
         })
     }
@@ -766,21 +800,43 @@ impl RedactionCoverageAuthority {
                             build,
                             publish_revisions,
                         ),
-                        None => Err(CoverageError::Invalidated),
+                        None => {
+                            log_coverage_capture_failure(
+                                scope_class,
+                                &flight.correlation,
+                                "publish_fence_reread_failed",
+                            );
+                            Err(CoverageError::Invalidated)
+                        }
                     }
                 }
                 Ok(Ok(_)) => Err(CoverageError::Unavailable),
-                Ok(Err(error)) => Err(
-                    if error
-                        .chain()
-                        .any(|cause| cause.is::<super::EnvFileOverLimitError>())
-                    {
-                        CoverageError::SourceFileOverLimit
-                    } else {
-                        CoverageError::Unavailable
-                    },
-                ),
-                Err(_) => Err(CoverageError::Unavailable),
+                Ok(Err(error)) => {
+                    let category = coverage_capture_failure_category(&error);
+                    log_coverage_capture_failure(scope_class, &flight.correlation, &category);
+                    Err(
+                        if error
+                            .chain()
+                            .any(|cause| cause.is::<super::EnvFileOverLimitError>())
+                        {
+                            CoverageError::SourceFileOverLimit
+                        } else {
+                            CoverageError::Unavailable
+                        },
+                    )
+                }
+                Err(join_error) => {
+                    log_coverage_capture_failure(
+                        scope_class,
+                        &flight.correlation,
+                        if join_error.is_panic() {
+                            "capture_panicked"
+                        } else {
+                            "capture_cancelled"
+                        },
+                    );
+                    Err(CoverageError::Unavailable)
+                }
             },
             Some(_) | None => Err(CoverageError::Unavailable),
         };

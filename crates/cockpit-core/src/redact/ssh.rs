@@ -122,19 +122,24 @@ fn list_ssh_key_dir(dir: &SshKeyDir) -> Result<Option<Vec<PathBuf>>> {
             if absent && !dir.configured {
                 return Ok(None);
             }
-            return Err(anyhow::anyhow!(
-                "configured SSH source is unavailable during capture: {}",
-                if absent {
-                    "the configured redact.ssh_key_dir does not exist"
+            return Err(SshKeyDirUnavailableError {
+                path: dir.path.clone(),
+                configured: dir.configured,
+                reason: if absent {
+                    SshKeyDirUnavailableReason::Missing
                 } else {
-                    "the SSH key directory is a dangling link"
-                }
-            ));
+                    SshKeyDirUnavailableReason::DanglingLink
+                },
+            }
+            .into());
         }
         Err(error) => {
-            return Err(anyhow::anyhow!(
-                "configured SSH source is unavailable during capture: {error}"
-            ));
+            return Err(SshKeyDirUnavailableError {
+                path: dir.path.clone(),
+                configured: dir.configured,
+                reason: SshKeyDirUnavailableReason::Unreadable(error.kind()),
+            }
+            .into());
         }
     };
     let mut paths = read_dir
@@ -146,6 +151,31 @@ fn list_ssh_key_dir(dir: &SshKeyDir) -> Result<Option<Vec<PathBuf>>> {
         .collect::<Result<Vec<PathBuf>>>()?;
     paths.sort();
     Ok(Some(paths))
+}
+
+/// The SSH key directory redaction must scan cannot be listed. Coverage
+/// fails closed on it; the message names the directory and the settings that
+/// resolve it.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the {} SSH key directory {} {reason}; fix it, point `redact.ssh_key_dir` at the right directory, or set `redact.scan_ssh_keys` to false",
+    if *.configured { "configured (redact.ssh_key_dir)" } else { "default" },
+    .path.display()
+)]
+pub(crate) struct SshKeyDirUnavailableError {
+    pub(crate) path: PathBuf,
+    pub(crate) configured: bool,
+    pub(crate) reason: SshKeyDirUnavailableReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SshKeyDirUnavailableReason {
+    #[error("does not exist")]
+    Missing,
+    #[error("is a dangling link")]
+    DanglingLink,
+    #[error("cannot be read ({0})")]
+    Unreadable(std::io::ErrorKind),
 }
 
 /// Whether `path` is, right now, a private key the collector would register.
@@ -181,7 +211,8 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
     };
 
     let mut out: Vec<(String, String)> = Vec::new();
-    let mut collected = std::collections::BTreeSet::new();
+    // Every collected key's material, re-verified at closure.
+    let mut collected = std::collections::BTreeMap::new();
     for path in &discovered {
         let Some(file_name) = path.file_name() else {
             continue;
@@ -226,7 +257,7 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
         if target_before != target_after || content != confirm {
             anyhow::bail!("configured SSH source changed during capture");
         }
-        collected.insert(path.clone());
+        collected.insert(path.clone(), content.clone());
         let origin = format!("$ssh:{name}");
         let trimmed = content.trim().to_string();
         if !trimmed.is_empty() {
@@ -254,9 +285,23 @@ pub(super) fn collect_ssh_key_candidates_with_fence(
     let Some(after) = list_ssh_key_dir(dir)? else {
         anyhow::bail!("configured SSH source changed during capture");
     };
-    for path in after.iter().filter(|path| !collected.contains(*path)) {
+    for path in after.iter().filter(|path| !collected.contains_key(*path)) {
         if is_ssh_key_entry(path)? {
             anyhow::bail!("configured SSH source changed during capture: a key was added");
+        }
+    }
+    // Material closure: a key already collected under a name must still hold
+    // the material collected, or the name now carries a key the table does
+    // not cover. (A key removed since is tolerated: it adds nothing
+    // uncovered.) Replacement after this point is caught at use time, where
+    // coverage re-reads its sources before every daemon-global delivery.
+    for (path, content) in &collected {
+        match read_ssh_candidate(path)? {
+            Some(current) if &current == content => {}
+            None => {}
+            Some(_) => anyhow::bail!(
+                "configured SSH source changed during capture: a collected key was replaced"
+            ),
         }
     }
     Ok(out)

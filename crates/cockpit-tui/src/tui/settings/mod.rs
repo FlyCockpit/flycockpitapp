@@ -6329,7 +6329,7 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        let Some(path) = config_write_target_for_provider(cwd, provider_id) else {
+        let Ok(path) = config_write_target_for_provider(cwd, provider_id) else {
             return Self::open(cwd);
         };
         let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
@@ -6351,7 +6351,7 @@ impl Dialog {
     /// Open the existing provider-model editor directly for one configured provider.
     /// This is the canonical add-model surface used by scoped model recovery.
     pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
-        let Some(path) = config_write_target_for_provider(cwd, provider_id) else {
+        let Ok(path) = config_write_target_for_provider(cwd, provider_id) else {
             return Self::open(cwd);
         };
         let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());

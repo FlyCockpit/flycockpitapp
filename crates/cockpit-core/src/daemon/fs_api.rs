@@ -194,6 +194,8 @@ pub(crate) fn fs_read_sync(
             &resolved,
         )
         .map_err(|error| read_open_error(path, &error))?;
+    #[cfg(test)]
+    apply_fs_read_policy_hook_for_test(&resolved);
     ensure_read_allowed(policy.as_ref(), &requested, &resolved)?;
     #[cfg(test)]
     apply_fs_read_panic_for_test(&resolved);
@@ -273,6 +275,32 @@ pub(crate) fn set_fs_read_block_for_test(
         .lock()
         .unwrap()
         .insert(path, FsReadBlockHook { entered, release });
+}
+
+/// Test seam: runs once between the identity capture and the policy
+/// decision for `path`.
+#[cfg(test)]
+type FsReadPolicyHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+fn fs_read_policy_hooks() -> &'static StdMutex<std::collections::HashMap<PathBuf, FsReadPolicyHook>>
+{
+    static HOOKS: OnceLock<StdMutex<std::collections::HashMap<PathBuf, FsReadPolicyHook>>> =
+        OnceLock::new();
+    HOOKS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(all(test, feature = "remote"))]
+pub(crate) fn set_fs_read_policy_hook_for_test(path: PathBuf, hook: FsReadPolicyHook) {
+    fs_read_policy_hooks().lock().unwrap().insert(path, hook);
+}
+
+#[cfg(test)]
+fn apply_fs_read_policy_hook_for_test(path: &Path) {
+    let hook = fs_read_policy_hooks().lock().unwrap().remove(path);
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(test)]
@@ -1982,10 +2010,10 @@ fn entry_to_wire(
         .map(crate::gitignore::is_gitignored)
         .unwrap_or(false);
     let secret_blocked = policy.is_some_and(|policy| {
-        requested.is_some_and(|requested| policy.blocks(requested))
+        requested.is_some_and(|requested| policy.blocks(requested, !is_symlink && meta.is_dir()))
             || canonical
                 .as_deref()
-                .is_some_and(|resolved| policy.blocks(resolved))
+                .is_some_and(|resolved| policy.blocks(resolved, resolved.is_dir()))
     });
     let kind = if is_symlink {
         FsEntryKind::Symlink
@@ -2112,6 +2140,9 @@ fn read_open_error(what: &str, error: &anyhow::Error) -> ErrorPayload {
             code: ErrorCode::NotFound,
             message: format!("`{what}` no longer exists"),
         },
+        // Any other OS failure (including a permission denial of the
+        // daemon's own access) is not evidence of a missing file or a
+        // substitution; it is reported as an unreadable request.
         Some(io) => bad_request(format!("cannot open `{what}`: {io}")),
         None => bad_request(format!("cannot read `{what}`: {error}")),
     }
@@ -2120,19 +2151,19 @@ fn read_open_error(what: &str, error: &anyhow::Error) -> ErrorPayload {
 #[cfg(unix)]
 fn io_error_is_path_substitution(error: &std::io::Error) -> bool {
     // ELOOP: O_NOFOLLOW met a symlink. ENOTDIR: an O_DIRECTORY component is
-    // no longer a directory. EXDEV: a component became a mount point.
-    matches!(
-        error.raw_os_error(),
-        Some(libc::ELOOP | libc::ENOTDIR | libc::EXDEV)
-    )
+    // no longer a directory. (The walk uses plain `openat`, which crosses a
+    // mount point silently; a file substituted that way is caught by the
+    // identity comparison, not here.)
+    matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
 }
 
 #[cfg(not(unix))]
-fn io_error_is_path_substitution(_error: &std::io::Error) -> bool {
-    // Windows reports a reparse point met by the non-reparsing walk as an
-    // access failure; it keeps that meaning, and a regular-file substitution
-    // is still caught by the identity comparison.
-    false
+fn io_error_is_path_substitution(error: &std::io::Error) -> bool {
+    // The held walk opens every component without reparsing: a component
+    // that is no longer a directory was replaced. A reparse point met by the
+    // walk keeps its access-failure meaning, and a regular-file substitution
+    // is caught by the identity comparison.
+    error.kind() == std::io::ErrorKind::NotADirectory
 }
 
 fn ensure_read_allowed(
@@ -2140,7 +2171,10 @@ fn ensure_read_allowed(
     requested: &Path,
     resolved: &Path,
 ) -> Result<(), ErrorPayload> {
-    if policy.is_some_and(|policy| policy.blocks(requested) || policy.blocks(resolved)) {
+    // Both paths name the regular file whose identity was captured.
+    if policy
+        .is_some_and(|policy| policy.blocks(requested, false) || policy.blocks(resolved, false))
+    {
         return Err(ErrorPayload {
             code: ErrorCode::Authorization,
             message: "remote principal cannot read gitignored or dotenv-protected files".into(),
@@ -2157,20 +2191,29 @@ fn ensure_read_allowed(
 /// both as written and as their canonical target. A configured source whose
 /// resolution fails for any reason other than absence fails the request
 /// closed; an absent source protects nothing at decision time.
+///
+/// Every arm judges the exact path it is given, of the type the caller
+/// states: nothing is resolved again (the gitignore stack root is pinned
+/// with the rest of the policy), so a name swapped for a link while the
+/// policy runs cannot move the decision to a different object than the one
+/// whose identity `fs_read` captured.
 struct ShareeSecretPolicy {
     extra_paths: Vec<PathBuf>,
     extra_targets: Vec<PathBuf>,
     dotenv_matcher: ignore::gitignore::Gitignore,
+    gitignore_root: Option<PathBuf>,
 }
 
 impl ShareeSecretPolicy {
-    fn blocks(&self, path: &Path) -> bool {
-        crate::gitignore::is_gitignored(path)
+    fn blocks(&self, path: &Path, is_dir: bool) -> bool {
+        self.gitignore_root
+            .as_deref()
+            .is_some_and(|root| crate::gitignore::is_gitignored_pinned(root, path, is_dir))
             || self.extra_paths.iter().any(|extra| extra == path)
             || self.extra_targets.iter().any(|target| target == path)
             || matches!(
                 self.dotenv_matcher
-                    .matched_path_or_any_parents(path, path.is_dir()),
+                    .matched_path_or_any_parents(path, is_dir),
                 Match::Ignore(_)
             )
     }
@@ -2242,6 +2285,7 @@ fn sharee_secret_policy(
         extra_paths,
         extra_targets,
         dotenv_matcher: crate::gitignore::build_allowlist_matcher(root, &cfg.dotenv_patterns),
+        gitignore_root: crate::gitignore::gitignore_stack_root(root),
     }))
 }
 
@@ -2709,7 +2753,7 @@ mod tests {
             sharee_secret_policy(&ctx, &remote_project_files(root), root)
                 .unwrap()
                 .expect("sharee policy")
-                .blocks(&path)
+                .blocks(&path, false)
         );
         assert!(
             sharee_secret_policy(&ctx, &ClientPrincipal::owner(), root)
@@ -2739,7 +2783,7 @@ mod tests {
         std::fs::remove_file(root.join("secrets/link")).unwrap();
         let target = root.join("token.txt").canonicalize().unwrap();
         assert!(
-            policy.blocks(&target),
+            policy.blocks(&target, false),
             "the already-decided protected target stays protected"
         );
         assert!(ensure_read_allowed(Some(&policy), &root.join("token.txt"), &target).is_err());
@@ -2945,6 +2989,81 @@ mod tests {
         .await
         .expect_err("the sharee never receives the renamed protected file");
         assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+        assert!(!error.message.contains(PROTECTED));
+    }
+
+    /// T4: the sharee policy judges the pinned path whose identity was
+    /// captured, never a re-resolution of it. Swapping the gitignored name
+    /// for a link to an allowed file while the policy runs, then restoring
+    /// the original inode before the open, must not let the sharee read it.
+    #[cfg(all(unix, feature = "remote"))]
+    #[tokio::test]
+    async fn sharee_policy_is_not_redirected_by_a_swap_during_the_decision() {
+        const PROTECTED: &str = "policy-window-protected-content-6c3e";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "private.txt\n").unwrap();
+        std::fs::write(root.join("public.txt"), "public").unwrap();
+        let private = root.join("private.txt");
+        std::fs::write(&private, PROTECTED).unwrap();
+        let parked = root.join("parked.bin");
+        let ctx = Arc::new(test_ctx(&root));
+        // Preconditions: the sharee reads public.txt, not private.txt.
+        assert!(matches!(
+            fs_read_sync(
+                &ctx,
+                &remote_project_files(&root),
+                &root.to_string_lossy(),
+                "public.txt",
+                false
+            ),
+            Ok(Response::FsRead { .. })
+        ));
+        {
+            let private = private.clone();
+            let parked = parked.clone();
+            let public = root.join("public.txt");
+            set_fs_read_policy_hook_for_test(
+                private.clone(),
+                Box::new(move || {
+                    std::fs::rename(&private, &parked).unwrap();
+                    std::os::unix::fs::symlink(&public, &private).unwrap();
+                }),
+            );
+        }
+        // After the decision (if it allows the read), restore the original
+        // inode before the open, so the captured identity matches again.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        set_fs_read_block_for_test(private.clone(), entered_tx, release.clone());
+        let mut read_task = tokio::spawn(fs_read(
+            ctx,
+            remote_project_files(&root),
+            root.to_string_lossy().into_owned(),
+            "private.txt".to_string(),
+            false,
+        ));
+        let outcome = tokio::select! {
+            entered = entered_rx => {
+                entered.expect("fs_read passed its policy check");
+                std::fs::remove_file(&private).unwrap();
+                std::fs::rename(&parked, &private).unwrap();
+                let (lock, cvar) = &*release;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+                read_task.await.unwrap()
+            }
+            finished = &mut read_task => finished.unwrap(),
+        };
+        let error = match outcome {
+            Ok(Response::FsRead { content, .. }) => panic!(
+                "the sharee read the gitignored file: {}",
+                content.unwrap_or_default()
+            ),
+            Ok(other) => panic!("unexpected response {other:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::Authorization, "{error:?}");
         assert!(!error.message.contains(PROTECTED));
     }
 

@@ -612,11 +612,25 @@ fn authoritative_image_layer_trusted(
     // a discovered layer or a project `.cockpit/` scaffold. The user-level
     // global fallback would leak credentials into the home layer on a fresh
     // install.
-    let selected = defining
-        .or_else(|| {
-            cockpit_config::config::dirs::most_specific_existing_config_write_target(project_root)
-        })
-        .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
+    // A layer trust refuses to write is still the layer load reads (an
+    // explicit override inside an ignored project): select it so reads see
+    // the authoritative registry, and let the mutation's write gate refuse
+    // it. A refusal never selects some other layer.
+    let selected = match defining {
+        Some(defining) => defining,
+        None => {
+            match cockpit_config::config::dirs::most_specific_existing_config_write_target(
+                project_root,
+            ) {
+                Ok(Some(path)) => path,
+                Ok(None) => project_root.join(".cockpit").join(CONFIG_FILE),
+                Err(cockpit_config::config::dirs::ConfigWriteTargetError::Refused(refused)) => {
+                    refused.path
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
     let target = exact_target_path(&selected)?;
     let raw = read_document(&target)?;
     let registry = registry_from_document(raw.as_slice())?;

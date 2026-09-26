@@ -1795,11 +1795,12 @@ mod imp {
                 ptr::null_mut(),
             )
         };
-        ensure!(
-            raw != INVALID_HANDLE_VALUE,
-            "opening Windows workspace source metadata failed: {}",
-            std::io::Error::last_os_error()
-        );
+        if raw == INVALID_HANDLE_VALUE {
+            // Keep the typed OS error so callers classify it by kind (a
+            // vanished file is NotFound), never by message text.
+            return Err(anyhow::Error::from(std::io::Error::last_os_error())
+                .context("opening Windows workspace source metadata failed"));
+        }
         let file = unsafe { File::from_raw_handle(raw) };
         regular_file_identity(&file)
     }
@@ -3125,11 +3126,34 @@ mod imp {
                 0,
             )
         };
-        ensure!(
-            status >= STATUS_SUCCESS_MIN && !raw.is_null(),
-            "held Windows relative open failed with NTSTATUS {status:#x}"
-        );
+        if status < STATUS_SUCCESS_MIN || raw.is_null() {
+            return Err(
+                anyhow::Error::from(ntstatus_io_error(status)).context(format!(
+                    "held Windows relative open failed with NTSTATUS {status:#x}"
+                )),
+            );
+        }
         Ok(unsafe { File::from_raw_handle(raw) })
+    }
+
+    /// A typed [`std::io::Error`] for a failed `NtCreateFile`, with the kind
+    /// callers branch on: a missing name or path is `NotFound`, a component
+    /// that is no longer a directory is `NotADirectory`, a denial is
+    /// `PermissionDenied`.
+    fn ntstatus_io_error(status: i32) -> std::io::Error {
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+        const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+        let kind = match status as u32 {
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => {
+                std::io::ErrorKind::NotFound
+            }
+            STATUS_NOT_A_DIRECTORY => std::io::ErrorKind::NotADirectory,
+            STATUS_ACCESS_DENIED => std::io::ErrorKind::PermissionDenied,
+            _ => std::io::ErrorKind::Other,
+        };
+        std::io::Error::new(kind, format!("NTSTATUS {status:#x}"))
     }
 
     fn probe_relative(parent: &File, name: &[u16], access: u32) -> Result<RelativeProbe> {

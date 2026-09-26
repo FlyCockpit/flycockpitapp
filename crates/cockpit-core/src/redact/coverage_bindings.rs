@@ -273,6 +273,20 @@ pub(crate) fn machine_sources_binding(
     scope: RedactionSourceScope<'_>,
     table: Option<&RedactionTable>,
 ) -> anyhow::Result<CoverageBinding> {
+    machine_sources_binding_with_unsupported(
+        config,
+        scope,
+        table.map(RedactionTable::unsupported_files).unwrap_or(&[]),
+    )
+}
+
+/// [`machine_sources_binding`] against an explicit unsupported-file list (a
+/// capture's own, recorded on its table for use-time re-checks).
+pub(crate) fn machine_sources_binding_with_unsupported(
+    config: &RedactConfig,
+    scope: RedactionSourceScope<'_>,
+    unsupported: &[PathBuf],
+) -> anyhow::Result<CoverageBinding> {
     let dotenv = if config.scan_dotenv {
         let paths =
             matched_dotenv_sources(scope, &config.dotenv_patterns, &config.extra_dotenv_paths)?;
@@ -303,7 +317,6 @@ pub(crate) fn machine_sources_binding(
     } else {
         None
     };
-    let unsupported = table.map(RedactionTable::unsupported_files).unwrap_or(&[]);
     Ok(encode_machine_sources(
         dotenv.as_deref(),
         ssh.as_ref(),

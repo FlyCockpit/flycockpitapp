@@ -1440,7 +1440,12 @@ impl SessionWorkerHandle {
             .default_mode;
         let applied = super::evaluate_set_sandbox(requested, persisted_intent, caps)
             .map_err(super::SetSandboxError::CapabilityMissing)?;
-        persist_sandbox_intent(&self.project_root, applied.persisted_intent).map_err(|error| {
+        persist_sandbox_intent(
+            &self.project_root,
+            self.current_trust_policy(),
+            applied.persisted_intent,
+        )
+        .map_err(|error| {
             super::SetSandboxError::Persist(format!("persisting sandbox intent: {error:#}"))
         })?;
         {

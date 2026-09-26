@@ -1711,19 +1711,21 @@ fn redact_list_paths(redact: &Map<String, Value>, key: &str) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Append `glob` to the `gitignore_allow` list in the **nearest project**
-/// `.cockpit/config.json` (implementation note,
-/// "Approve for this project"). The target is the deepest ancestor of `cwd`
-/// that already holds a `.cockpit/` project layer; when none exists, a
-/// `.cockpit/config.json` is scaffolded at `cwd`. A duplicate glob is a no-op.
-/// Round-trips through [`ExtendedConfigDoc`] so sibling layer/provider metadata
-/// (and any unknown keys) are preserved.
+/// Append `glob` to the `gitignore_allow` list of this workspace's config
+/// layer ("Approve for this project"): the layer
+/// [`crate::config::dirs::workspace_config_write_target`] selects — the
+/// `COCKPIT_CONFIG` override when set, else the nearest trusted project
+/// layer, else the per-directory machine-local layer, scaffolding a project
+/// `.cockpit/` only under `Trust`. A refusal is an error, never a write to
+/// some other layer. A duplicate glob is a no-op. Round-trips through
+/// [`ExtendedConfigDoc`] so sibling layer/provider metadata (and any unknown
+/// keys) are preserved.
 pub fn append_gitignore_allow_to_project(cwd: &Path, glob: &str) -> Result<()> {
     let glob = glob.trim();
     if glob.is_empty() {
         return Ok(());
     }
-    let path = nearest_project_config_path(cwd);
+    let path = crate::config::dirs::workspace_config_write_target(cwd)?;
     let mut doc = ExtendedConfigDoc::load(&path)?;
     let mut cfg = doc.config();
     if !cfg.gitignore_allow.iter().any(|g| g == glob) {
@@ -1731,16 +1733,6 @@ pub fn append_gitignore_allow_to_project(cwd: &Path, glob: &str) -> Result<()> {
     }
     doc.write(&cfg)?;
     Ok(())
-}
-
-fn nearest_project_config_path(cwd: &Path) -> PathBuf {
-    use crate::config::dirs::CONFIG_FILE;
-    let project_dir = discover_config_dirs(cwd)
-        .into_iter()
-        .find(|d| d.kind == ConfigDirKind::Project)
-        .map(|d| d.path)
-        .unwrap_or_else(|| cwd.join(".cockpit"));
-    project_dir.join(CONFIG_FILE)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -4040,6 +4032,7 @@ impl ExtendedConfigDoc {
     /// Remove one raw path while preserving every sibling mutation made by
     /// another config writer since this document was loaded.
     pub fn remove_raw_path_and_save(&mut self, path: &[&str]) -> Result<bool> {
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = crate::config::files::ConfigMutationLock::acquire(&self.path)?;
         let mut current = Self::load(&self.path)?;
         let removed = remove_raw_path(&mut current.raw, path);
@@ -4055,6 +4048,7 @@ impl ExtendedConfigDoc {
     /// unknown fields while keeping the actual filesystem mutation outside
     /// the TUI process.
     pub fn remove_raw_path_rendered(&mut self, path: &[&str]) -> Result<(bool, String)> {
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = crate::config::files::ConfigMutationLock::acquire(&self.path)?;
         let mut current = Self::load(&self.path)?;
         let removed = remove_raw_path(&mut current.raw, path);
@@ -4081,6 +4075,7 @@ impl ExtendedConfigDoc {
     }
 
     fn persist_raw_unlocked(&self) -> Result<()> {
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let mut raw = self.raw.clone();
         strip_secret_store_key(&mut raw);
         let pretty = serde_json::to_string_pretty(&raw).context("serializing config.json")?;
@@ -4096,6 +4091,7 @@ impl ExtendedConfigDoc {
     pub fn write(&mut self, cfg: &ExtendedConfig) -> Result<()> {
         let originally_loaded = serde_json::to_value(self.config())
             .context("serializing originally loaded extended config")?;
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = crate::config::files::ConfigMutationLock::acquire(&self.path)?;
         let mut current = Self::load(&self.path)?;
         current.merge_config_raw(&originally_loaded, cfg)?;

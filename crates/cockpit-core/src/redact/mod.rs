@@ -1102,6 +1102,11 @@ pub struct RedactionTable {
     protected_path_conflicts: Vec<String>,
     /// When set, every scrub revalidates the admitting generation before egress.
     coverage_binding: Option<coverage_authority::CoverageTableBinding>,
+    /// The file-backed sources (dotenv bytes, SSH key material) the capture
+    /// that produced this table consumed, so a later use can re-read them and
+    /// tell whether the table still covers them. `None` for a table that is
+    /// not (derived from) a capture.
+    source_freshness: Option<std::sync::Arc<MachineSourceFreshness>>,
     /// Test-only fault injection: when set, [`Self::enforced_checked`] returns
     /// an error, so a caller's fail-closed-before-side-effect path (e.g. the
     /// external-harness runner constructing its scrub view before spawning a
@@ -1110,6 +1115,23 @@ pub struct RedactionTable {
     /// shipped build.
     #[cfg(test)]
     fail_enforced_view: bool,
+}
+
+/// The record of the file-backed sources one capture consumed, re-checkable
+/// at use time ([`RedactionTable::machine_sources_current`]).
+struct MachineSourceFreshness {
+    config: RedactConfig,
+    /// The capture's workspace root; `None` for daemon-global scope.
+    workspace: Option<PathBuf>,
+    binding: coverage_authority::CoverageBinding,
+    unsupported: Vec<PathBuf>,
+}
+
+impl std::fmt::Debug for MachineSourceFreshness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineSourceFreshness")
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for RedactionTable {
@@ -1462,14 +1484,23 @@ impl RedactionTable {
             entries.push((candidate.value, candidate.origin, candidate.source));
         }
 
-        Self::from_entries(
+        let mut table = Self::from_entries(
             entries,
             cfg.placeholder.clone(),
             !cfg.enabled,
             unsupported_files,
             protected,
-        )
-        .map(|table| (table, capture))
+        )?;
+        table.source_freshness = Some(std::sync::Arc::new(MachineSourceFreshness {
+            config: cfg.clone(),
+            workspace: match scope {
+                RedactionSourceScope::Workspace(root) => Some(root.to_path_buf()),
+                RedactionSourceScope::DaemonGlobal => None,
+            },
+            binding: coverage_bindings::captured_machine_sources_binding(&capture, &table),
+            unsupported: table.unsupported_files().to_vec(),
+        }));
+        Ok((table, capture))
     }
 
     /// Build a table from `(value, origin, source)` triples. Every triple
@@ -1570,6 +1601,7 @@ impl RedactionTable {
                 protected,
                 protected_path_conflicts,
                 coverage_binding: None,
+                source_freshness: None,
                 #[cfg(test)]
                 fail_enforced_view: false,
             });
@@ -1608,6 +1640,7 @@ impl RedactionTable {
             protected,
             protected_path_conflicts,
             coverage_binding: None,
+            source_freshness: None,
             #[cfg(test)]
             fail_enforced_view: false,
         })
@@ -1615,11 +1648,12 @@ impl RedactionTable {
 
     pub fn union(&self, other: &Self) -> Result<Self> {
         let mut merged = self.merged_entries(other)?;
-        merged.coverage_binding = match (&self.coverage_binding, &other.coverage_binding) {
+        // Which operand's generation the union adopts; its capture record is
+        // the one that describes the union's current source coverage.
+        let adopt_left = match (&self.coverage_binding, &other.coverage_binding) {
             (Some(left), Some(right)) => match left.binding_ordering(right) {
-                Some(std::cmp::Ordering::Equal) => Some(left.clone()),
-                Some(std::cmp::Ordering::Greater) => Some(left.clone()),
-                Some(std::cmp::Ordering::Less) => Some(right.clone()),
+                Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) => true,
+                Some(std::cmp::Ordering::Less) => false,
                 None => anyhow::bail!("coverage binding mismatch across union operands"),
             },
             // Unbound operands are monotonic additions: persisted historical
@@ -1627,10 +1661,45 @@ impl RedactionTable {
             // files can only add scrub candidates. They therefore adopt the
             // bound operand's generation without weakening its coverage. Two
             // bound operands are handled above and remain lineage-checked.
-            (Some(binding), None) | (None, Some(binding)) => Some(binding.clone()),
-            (None, None) => None,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            // Neither is bound: the later operand is the newer capture when it
+            // has a record at all (an accumulation `base.union(&new)`).
+            (None, None) => other.source_freshness.is_none(),
         };
+        let (adopted, added) = if adopt_left {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        merged.coverage_binding = adopted.coverage_binding.clone();
+        merged.source_freshness = adopted
+            .source_freshness
+            .clone()
+            .or_else(|| added.source_freshness.clone());
         Ok(merged)
+    }
+
+    /// Whether the file-backed sources this table's capture consumed are
+    /// unchanged: re-reads the configured dotenv files and SSH keys in the
+    /// capture's scope and compares their digest with the capture's. A table
+    /// that is not derived from a capture has nothing to re-read (`true`).
+    /// A source that can no longer be read is an error (fail closed).
+    /// Blocking I/O.
+    pub(crate) fn machine_sources_current(&self) -> Result<bool> {
+        let Some(freshness) = self.source_freshness.as_ref() else {
+            return Ok(true);
+        };
+        let scope = match freshness.workspace.as_deref() {
+            Some(root) => RedactionSourceScope::Workspace(root),
+            None => RedactionSourceScope::DaemonGlobal,
+        };
+        let live = coverage_bindings::machine_sources_binding_with_unsupported(
+            &freshness.config,
+            scope,
+            &freshness.unsupported,
+        )?;
+        Ok(live == freshness.binding)
     }
 
     /// Scrub-only merge of two tables of *any* coverage lineage.
@@ -1683,6 +1752,7 @@ impl RedactionTable {
             self.protected.clone(),
         )?;
         table.coverage_binding = self.coverage_binding.clone();
+        table.source_freshness = self.source_freshness.clone();
         Ok(table)
     }
 
@@ -1705,6 +1775,7 @@ impl RedactionTable {
             self.protected.clone(),
         )?;
         table.coverage_binding = self.coverage_binding.clone();
+        table.source_freshness = self.source_freshness.clone();
         Ok(table)
     }
 
@@ -1780,6 +1851,7 @@ impl RedactionTable {
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
             coverage_binding: self.coverage_binding.clone(),
+            source_freshness: self.source_freshness.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
@@ -2118,6 +2190,7 @@ impl RedactionTable {
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
             coverage_binding: self.coverage_binding.clone(),
+            source_freshness: self.source_freshness.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
@@ -2385,6 +2458,7 @@ impl RedactionTable {
             protected: ProtectedPaths::default(),
             protected_path_conflicts: Vec::new(),
             coverage_binding: None,
+            source_freshness: None,
             #[cfg(test)]
             fail_enforced_view: false,
         }

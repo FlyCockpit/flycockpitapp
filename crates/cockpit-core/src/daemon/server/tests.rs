@@ -10246,7 +10246,7 @@ async fn provider_config_save_redaction_failure_compensates_all_staged_secrets()
     .await;
     ctx.set_force_daemon_redaction_refresh_failure(false);
     let error = result.expect_err("redaction publication failure must reject save");
-    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(error.code, ErrorCode::Internal, "{error:?}");
 
     let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
     let staged_names = store
@@ -12339,7 +12339,8 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
 
     let expect_failed = |result: Result<Response, ErrorPayload>| {
         let error = result.expect_err("redaction publication failure must reject mutation");
-        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.code, ErrorCode::Internal, "{error:?}");
+        eprintln!("rejected as expected: {error:?}");
     };
 
     ctx.set_force_daemon_redaction_refresh_failure(true);
@@ -14203,6 +14204,14 @@ async fn remote_owner_import_policy_rejects_literal_credential_and_closes_ledger
     let ctx = persistent_test_ctx();
     let operation = remote_owner_operation().await;
     let tmp = tempfile::tempdir().unwrap();
+    // Policy bundles run under the workspace's durable trust decision.
+    ctx.db
+        .set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
     let literal_key = "LITERAL-REMOTE-APIKEY-8f7e6d5c";
     // A hand-crafted bundle carrying a literal `Authorization` header — the same
     // shape the local-path custody guard rejects (bundle version is 1).
@@ -43143,8 +43152,7 @@ async fn locked_services_never_admit_ordinary_payload_before_coverage() {
             .expect("constructed ready services")
             .context
             .global_coverage
-            .published_generation_for_test()
-            > 0,
+            .has_admitted_stamp_for_test(),
         "ReadyServices publication requires an admitted authority generation"
     );
     let _ready = constructed.publish_returned();
@@ -43153,31 +43161,6 @@ async fn locked_services_never_admit_ordinary_payload_before_coverage() {
         locked.finish_ready_transition().await.is_err(),
         "the LockedServices owner must not open ReadyServices twice"
     );
-}
-
-#[test]
-fn global_coverage_helper_has_no_legacy_builder() {
-    let source = include_str!("mod.rs");
-    let helper = source
-        .split("async fn acquire_daemon_redaction_table(")
-        .nth(1)
-        .and_then(|body| body.split("fn scrub_json_strings").next())
-        .expect("daemon coverage helper");
-    // #390 centralizes key construction in the complete bound-input owner;
-    // asserting both pieces keeps this a structural route test without
-    // requiring the superseded direct key constructor spelling.
-    assert!(helper.contains("DaemonGlobalCoverageInputs"));
-    assert!(helper.contains("coverage_key()"));
-    assert!(helper.contains("CoverageBuild::capture_without_sealed"));
-    // #390's authority helper returns only a table installed from the bound
-    // admission; callers then hold their own route-specific sink lease.
-    assert!(helper.contains("install_table"));
-    assert!(!helper.contains("build_daemon_redaction_table"));
-    assert!(!helper.contains("refresh_global_redaction_table"));
-    assert!(!helper.contains("RedactionTable::empty"));
-    // Daemon-global coverage has no root: the funnel must never consult the
-    // daemon's inherited working directory.
-    assert!(!helper.contains("current_dir"));
 }
 
 /// Daemon-global coverage is built from daemon-global sources only. Started
@@ -43258,7 +43241,8 @@ async fn daemon_global_coverage_never_reads_or_walks_the_daemon_cwd() {
         CoverageScope::DaemonGlobalRefresh,
     )
     .await
-    .expect("daemon-global coverage never walks the unlistable launch directory");
+    .expect("daemon-global coverage never walks the unlistable launch directory")
+    .table;
     let construction = current_redaction(&ctx.global_redaction);
 
     // The session capture funnel (the registry's SessionStart shape) for a
@@ -43612,7 +43596,8 @@ async fn session_originated_global_events_are_scrubbed_with_global_and_session_t
         crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
     )
     .await
-    .expect("bound daemon-global table");
+    .expect("bound daemon-global table")
+    .table;
     set_current_redaction(&ctx.global_redaction, global.clone());
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -43691,8 +43676,7 @@ async fn unavailable_global_coverage_still_delivers_content_free_events() {
     let mut ctx = Arc::try_unwrap(ctx).unwrap_or_else(|_| panic!("unique test context"));
     ctx.global_coverage = crate::daemon::global_coverage::GlobalCoverage::new(
         current_redaction(&ctx.global_redaction),
-        0,
-        0,
+        None,
         ctx.registry.coverage_authority().clone(),
         source.clone(),
         &ctx.secret_vault,
@@ -43804,7 +43788,8 @@ async fn composite_event_scrub_covers_overlaps_across_tables() {
         crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
     )
     .await
-    .expect("bound daemon-global table");
+    .expect("bound daemon-global table")
+    .table;
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(
         workspace.path().join(".env"),
@@ -43840,8 +43825,8 @@ async fn composite_event_scrub_covers_overlaps_across_tables() {
     assert!(!scrubbed.contains("WXYZ"), "{scrubbed}");
     assert!(!scrubbed.contains("cdefghij"), "{scrubbed}");
 
-    // The same composite is what the global bus delivers.
-    set_current_redaction(&ctx.global_redaction, global.clone());
+    // The same composite is what the global bus delivers (the bus acquires
+    // its own current global table; nothing is pre-published here).
     let bus = crate::daemon::GlobalEventBus {
         tx: ctx.global_events.clone(),
         coverage: ctx.global_coverage.clone(),
@@ -43952,6 +43937,409 @@ async fn session_originated_events_republish_stale_global_coverage() {
     );
 }
 
+fn ssh_key_pem(marker: &str) -> String {
+    format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{marker}\n-----END OPENSSH PRIVATE KEY-----\n")
+}
+
+/// T6/T7: replacing a configured file-backed source (an SSH key at an
+/// already-collected filename, an explicit dotenv file) changes neither the
+/// vault generation nor the authority epoch, and nothing invalidates the
+/// authority. The next global broadcast must still scrub the replacement:
+/// every delivery recomputes the coverage key from the live sources.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_coverage_notices_source_rotation_without_invalidation() {
+    const OLD_KEY: &str = "rotated-ssh-key-old-canary-5a01";
+    const NEW_KEY: &str = "rotated-ssh-key-new-canary-9b72";
+    const OLD_DOTENV: &str = "rotated-dotenv-old-canary-c3d4";
+    const NEW_DOTENV: &str = "rotated-dotenv-new-canary-e5f6";
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let sources = tempfile::tempdir().unwrap();
+    let ssh = sources.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    std::fs::write(ssh.join("id_rotated"), ssh_key_pem(OLD_KEY)).unwrap();
+    let dotenv = sources.path().join("global.env");
+    std::fs::write(&dotenv, format!("GLOBAL_TOKEN={OLD_DOTENV}\n")).unwrap();
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_environment = false;
+    extended.redact.scan_ssh_keys = true;
+    extended.redact.ssh_key_dir = Some(ssh.clone());
+    extended.redact.scan_dotenv = true;
+    extended.redact.extra_dotenv_paths = vec![dotenv.clone()];
+    let source =
+        crate::daemon::config_source::ConfigSource::fixed(stub_providers_config(), extended);
+    let ctx = test_ctx_with_config_source(source);
+    let mut rx = ctx.subscribe_global();
+    let notice = |text: String| proto::Event::LspNotice { text };
+
+    ctx.broadcast_global(notice(format!("{OLD_KEY} {OLD_DOTENV}")));
+    let proto::Event::LspNotice { text } = scrubbed_for_non_owner(rx.try_recv().unwrap()) else {
+        panic!("expected LspNotice");
+    };
+    assert!(
+        !text.contains(OLD_KEY) && !text.contains(OLD_DOTENV),
+        "{text}"
+    );
+
+    let generation = ctx.secret_vault.current_inventory_generation().unwrap();
+    let epoch = ctx.registry.coverage_authority().epoch();
+    std::fs::write(ssh.join("id_rotated"), ssh_key_pem(NEW_KEY)).unwrap();
+    std::fs::write(&dotenv, format!("GLOBAL_TOKEN={NEW_DOTENV}\n")).unwrap();
+    assert_eq!(
+        ctx.secret_vault.current_inventory_generation().unwrap(),
+        generation
+    );
+    assert_eq!(ctx.registry.coverage_authority().epoch(), epoch);
+
+    ctx.broadcast_global(notice(format!("{NEW_KEY} {NEW_DOTENV}")));
+    let proto::Event::LspNotice { text } = scrubbed_for_non_owner(rx.try_recv().unwrap()) else {
+        panic!("expected LspNotice");
+    };
+    assert!(
+        !text.contains(NEW_KEY),
+        "a rotated SSH key must be covered: {text}"
+    );
+    assert!(
+        !text.contains(NEW_DOTENV),
+        "a rotated dotenv source must be covered: {text}"
+    );
+
+    // The terminal host's clipboard events take the same funnel.
+    std::fs::write(ssh.join("id_rotated"), ssh_key_pem(OLD_KEY)).unwrap();
+    ctx.global_coverage.send_terminal_event(
+        &ctx.global_events,
+        proto::Event::TerminalClipboard {
+            terminal_id: Uuid::nil(),
+            text: format!("copied {OLD_KEY}"),
+        },
+    );
+    let proto::Event::TerminalClipboard { text, .. } =
+        scrubbed_for_non_owner(rx.try_recv().unwrap())
+    else {
+        panic!("expected TerminalClipboard");
+    };
+    assert!(
+        !text.contains(OLD_KEY),
+        "a clipboard copy after rotation must be covered: {text}"
+    );
+}
+
+/// T6 (session-originated): the originating session's table is re-checked
+/// against its own file-backed sources at use time. After the workspace's
+/// env file is rotated (no invalidation, no session rebuild), a non-owner
+/// receives the content-free form rather than text scrubbed with the stale
+/// session table; owners still receive the event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_originated_event_with_rotated_origin_sources_is_content_free() {
+    const OLD_SECRET: &str = "origin-rotated-old-canary-17aa";
+    const NEW_SECRET: &str = "origin-rotated-new-canary-28bb";
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_ssh_keys = false;
+    let source =
+        crate::daemon::config_source::ConfigSource::fixed(stub_providers_config(), extended);
+    let ctx = test_ctx_with_config_source(source);
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join(".env"),
+        format!("WORKSPACE_TOKEN={OLD_SECRET}\n"),
+    )
+    .unwrap();
+    let origin = bound_session_table(
+        &ctx,
+        workspace.path(),
+        crate::config::extended::RedactConfig {
+            scan_ssh_keys: false,
+            ..crate::config::extended::RedactConfig::default()
+        },
+    )
+    .await;
+    let bus = crate::daemon::GlobalEventBus {
+        tx: ctx.global_events.clone(),
+        coverage: ctx.global_coverage.clone(),
+    };
+    let mut rx = ctx.subscribe_global();
+
+    // Inverse: while the sources are unchanged the origin table is used.
+    bus.send_from_origin_async(
+        &origin,
+        proto::Event::LspNotice {
+            text: format!("echo {OLD_SECRET}"),
+        },
+    )
+    .await;
+    let proto::Event::LspNotice { text } = scrubbed_for_non_owner(rx.try_recv().unwrap()) else {
+        panic!("expected LspNotice");
+    };
+    assert!(!text.contains(OLD_SECRET), "{text}");
+
+    std::fs::write(
+        workspace.path().join(".env"),
+        format!("WORKSPACE_TOKEN={NEW_SECRET}\n"),
+    )
+    .unwrap();
+    bus.send_from_origin_async(
+        &origin,
+        proto::Event::LspNotice {
+            text: format!("echo {NEW_SECRET}"),
+        },
+    )
+    .await;
+    let envelope = rx.try_recv().unwrap();
+    assert!(
+        envelope
+            .redact
+            .project_for_non_owner(envelope.event.clone(), scrub_event_free_text)
+            .is_none(),
+        "stale origin coverage must not scrub a non-owner's copy"
+    );
+    let proto::Event::LspNotice { text } = envelope.event else {
+        panic!("expected LspNotice");
+    };
+    assert!(text.contains(NEW_SECRET), "owners still receive the event");
+}
+
+#[cfg(feature = "remote")]
+/// Publish a host-capability snapshot whose free-text fields carry `canary`
+/// (as a probe diagnostic from some workspace could).
+fn publish_host_capabilities_with_canary(ctx: &DaemonContext, canary: &str) {
+    let generation = ctx.host_capabilities.begin_refresh();
+    let mut snapshot = crate::daemon::session_worker::sandbox_capability_snapshot(
+        cockpit_proto::FeatureCapabilityState::Available,
+        cockpit_proto::FeatureCapabilityState::Available,
+    );
+    snapshot.generation = generation;
+    for row in &mut snapshot.features {
+        row.reason = format!("probe said {canary}");
+        row.remedy_text = Some(format!("remedy {canary}"));
+    }
+    ctx.host_capabilities.publish(snapshot);
+}
+
+#[cfg(feature = "remote")]
+fn assert_content_free_host_capabilities(response: Response, canary: &str) {
+    let Response::HostCapabilities { snapshot } = response else {
+        panic!("expected HostCapabilities");
+    };
+    let rendered = serde_json::to_string(&snapshot).unwrap();
+    assert!(!rendered.contains(canary), "{rendered}");
+    assert!(!snapshot.features.is_empty());
+    for row in &snapshot.features {
+        assert_eq!(
+            row.reason,
+            crate::daemon::global_coverage::CONTENT_FREE_REASON
+        );
+        assert!(row.remedy_text.is_none());
+    }
+}
+
+/// T2: `GetHostCapabilities` is a public read of the raw committed receipt,
+/// whichever workspace's probe produced it. A non-owner — unattached, or
+/// attached to a session in another workspace — receives the same
+/// content-free projection as for a `HostCapabilitiesChanged` event without
+/// origin coverage; the owner receives it unchanged.
+#[tokio::test]
+#[cfg(feature = "remote")]
+async fn host_capability_readback_is_content_free_for_non_owners() {
+    const CANARY: &str = "host-capability-readback-canary-4d8f";
+    let ctx = test_ctx();
+    publish_host_capabilities_with_canary(&ctx, CANARY);
+
+    // Unattached non-owner, through the socket transport.
+    let unattached = dispatch_authz_request_after(
+        &ctx,
+        remote_state_with_grants(Vec::new()).principal.clone(),
+        Vec::new(),
+        None,
+        None,
+        Request::GetHostCapabilities,
+    )
+    .await
+    .expect("public read");
+    assert_content_free_host_capabilities(unattached, CANARY);
+
+    // A caller attached to a session in a different workspace.
+    let other_workspace = tempfile::tempdir().unwrap();
+    let (mut state, _session_id) = attached_state(&ctx, other_workspace.path()).await;
+    state.principal = remote_state_with_grants(Vec::new()).principal.clone();
+    let attached = handle_request(Request::GetHostCapabilities, &mut state, &ctx)
+        .await
+        .expect("public read");
+    assert_content_free_host_capabilities(attached, CANARY);
+
+    // Inverse: the owner receives the snapshot unchanged.
+    let mut owner = owner_state();
+    let Response::HostCapabilities { snapshot } =
+        handle_request(Request::GetHostCapabilities, &mut owner, &ctx)
+            .await
+            .unwrap()
+    else {
+        panic!("expected HostCapabilities");
+    };
+    assert!(serde_json::to_string(&snapshot).unwrap().contains(CANARY));
+}
+
+/// N1: the vault's owner-publication callback holds the daemon-global
+/// coverage only weakly, so dropping the daemon context releases the vault
+/// (its key material, database handle and inventory) rather than leaking it
+/// through `vault -> publisher -> coverage -> config source -> vault`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_daemon_context_releases_the_vault() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.scan_ssh_keys = false;
+    let source =
+        crate::daemon::config_source::ConfigSource::fixed(stub_providers_config(), extended);
+    let ctx = test_ctx_with_config_source(source);
+    // Exercise the publisher once so the full graph is live.
+    ctx.broadcast_global(proto::Event::DaemonDraining { forced: false });
+    let vault = Arc::downgrade(&ctx.secret_vault);
+    let coverage = ctx.global_coverage.downgrade();
+    drop(ctx);
+    for _ in 0..50 {
+        if vault.upgrade().is_none() && coverage.upgrade().is_none() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!(
+        "context drop left vault alive: {}, coverage alive: {}",
+        vault.upgrade().is_some(),
+        coverage.upgrade().is_some()
+    );
+}
+
+/// T3 through the real `SetSandbox` entry point: under IgnoreConfig the
+/// per-project intent lands in the per-directory machine-local layer — never
+/// the ignored project's `.cockpit` (not even scaffolded) and never the
+/// user-global layer. With a `COCKPIT_CONFIG` override inside the ignored
+/// project the request fails instead of writing any other layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_sandbox_under_ignore_config_never_writes_project_or_global_layers() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    cockpit_config::config::dirs::ensure_global_config_dir().unwrap();
+    let global = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::write(&global, "{}\n").unwrap();
+    let (mut state, _session_id) = attached_state(&ctx, &root).await;
+    let ignore = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(&root).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+    };
+    state
+        .attached
+        .as_ref()
+        .unwrap()
+        .handle
+        .replace_trust_policy(ignore);
+    let set_off = || Request::SetSandbox {
+        mode: Some(crate::tools::sandbox_mode::SandboxMode::Off),
+        container_network_enabled: None,
+    };
+
+    handle_request(set_off(), &mut state, &ctx)
+        .await
+        .expect("sandbox intent persists to the workspace's machine-local layer");
+    let local = cockpit_config::config::dirs::local_config_dir_for(&root)
+        .unwrap()
+        .join(cockpit_config::config::dirs::CONFIG_FILE);
+    assert!(
+        std::fs::read_to_string(&local).unwrap().contains("\"off\""),
+        "the intent is persisted where load reads it"
+    );
+    assert!(
+        !root.join(".cockpit").exists(),
+        "no ignored-project scaffold"
+    );
+    assert_eq!(std::fs::read_to_string(&global).unwrap(), "{}\n");
+
+    // A COCKPIT_CONFIG override inside the ignored project is the only layer
+    // load reads; trust refuses writing it, so the request fails.
+    let project_config = root.join(".cockpit").join("config.json");
+    std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    std::fs::write(&project_config, "{}\n").unwrap();
+    let local_before = std::fs::read_to_string(&local).unwrap();
+    env.set_cockpit_config(&project_config);
+    let error = handle_request(set_off(), &mut state, &ctx)
+        .await
+        .expect_err("a refused override is an error, not a fallback");
+    assert!(error.message.contains("refusing to write"), "{error:?}");
+    assert_eq!(std::fs::read_to_string(&project_config).unwrap(), "{}\n");
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), local_before);
+    assert_eq!(std::fs::read_to_string(&global).unwrap(), "{}\n");
+}
+
+/// T3 through the real `ImportPolicy` entry point: the import runs under the
+/// workspace's durable trust decision. Under IgnoreConfig with an override
+/// inside the ignored project it is refused and writes nothing; with no
+/// override it lands in the machine-local layer, never the project or the
+/// global layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_policy_under_ignore_config_never_writes_project_or_global_layers() {
+    let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            &root,
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        )
+        .await
+        .unwrap();
+    cockpit_config::config::dirs::ensure_global_config_dir().unwrap();
+    let global = cockpit_config::config::dirs::global_config_file().unwrap();
+    std::fs::write(&global, "{}\n").unwrap();
+    let bundle = serde_json::json!({
+        "version": 1,
+        "providers": {"providers": {}},
+    })
+    .to_string();
+    let import = || Request::ImportPolicy {
+        project_root: root.to_string_lossy().into_owned(),
+        bundle_json: bundle.clone(),
+        replace: false,
+    };
+    let mut owner = owner_state();
+
+    let project_config = root.join(".cockpit").join("config.json");
+    std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    std::fs::write(&project_config, "{}\n").unwrap();
+    {
+        let _override = env.override_cockpit_config(&project_config);
+        let error = handle_request(import(), &mut owner, &ctx)
+            .await
+            .expect_err("a refused override is an error, not a fallback");
+        assert!(error.message.contains("refusing to write"), "{error:?}");
+        assert_eq!(std::fs::read_to_string(&project_config).unwrap(), "{}\n");
+        assert!(
+            !cockpit_config::config::dirs::local_config_dir_for(&root)
+                .unwrap()
+                .exists()
+        );
+    }
+    std::fs::remove_dir_all(root.join(".cockpit")).unwrap();
+
+    let Response::PolicyImported { target, .. } = handle_request(import(), &mut owner, &ctx)
+        .await
+        .expect("import into the workspace's machine-local layer")
+    else {
+        panic!("expected PolicyImported");
+    };
+    assert_eq!(
+        std::path::PathBuf::from(target),
+        cockpit_config::config::dirs::local_config_dir_for(&root)
+            .unwrap()
+            .join(cockpit_config::config::dirs::CONFIG_FILE)
+    );
+    assert!(
+        !root.join(".cockpit").exists(),
+        "no ignored-project scaffold"
+    );
+    assert_eq!(std::fs::read_to_string(&global).unwrap(), "{}\n");
+}
+
 struct FixedCommandOutput(&'static str);
 
 #[async_trait::async_trait]
@@ -43996,7 +44384,8 @@ async fn daemon_global_coverage_includes_resolved_command_secret_outputs() {
         crate::redact::coverage_authority::CoverageScope::DaemonGlobalRefresh,
     )
     .await
-    .expect("daemon-global coverage");
+    .expect("daemon-global coverage")
+    .table;
     assert!(
         !table.scrub(COMMAND_OUTPUT).contains(COMMAND_OUTPUT),
         "a resolved command secret must be covered by daemon-global coverage"

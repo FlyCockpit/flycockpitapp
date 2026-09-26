@@ -1144,6 +1144,7 @@ impl ConfigDoc {
     /// Replace the typed provider layer and persist to disk.
     pub fn write(&mut self, cfg: &ProvidersConfig) -> Result<()> {
         let originally_loaded = self.providers();
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut current = Self::load(&self.path)?;
         current.set_layer_metadata_raw(
@@ -1201,6 +1202,7 @@ impl ConfigDoc {
         model_catalog: ProviderModelCatalog,
         last_model_fetch: Option<ModelFetchStatus>,
     ) -> Result<()> {
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
         provider.insert(
@@ -1245,6 +1247,7 @@ impl ConfigDoc {
         &mut self,
         on_unlisted_models_fetch: Option<OnUnlistedModelsFetch>,
     ) -> Result<()> {
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut current = Self::load(&self.path)?;
         let obj = current.raw.as_object_mut().expect("root is an object");
@@ -1268,6 +1271,7 @@ impl ConfigDoc {
         model_id: &str,
         favorite: bool,
     ) -> Result<()> {
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
         apply_model_favorite(&mut provider, model_id, favorite);
@@ -1280,6 +1284,7 @@ impl ConfigDoc {
         provider_id: &str,
         model: &ModelEntry,
     ) -> Result<()> {
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
         let models = provider
@@ -1324,6 +1329,7 @@ impl ConfigDoc {
     }
 
     fn persist_raw_unlocked(&self) -> Result<()> {
+        crate::config::dirs::authorize_config_file_write(&self.path)?;
         let pretty = serde_json::to_string_pretty(&self.raw).context("serializing config.json")?;
         atomic_write(&self.path, format!("{pretty}\n").as_bytes())?;
         Ok(())
@@ -1358,6 +1364,7 @@ impl ConfigDoc {
         provider: Map<String, Value>,
     ) -> Result<()> {
         let path = provider_file_path_for_config(&self.path, provider_id)?;
+        crate::config::dirs::authorize_config_file_write(&path)?;
         let pretty = serde_json::to_string_pretty(&Value::Object(provider))
             .context("serializing provider")?;
         atomic_write(&path, format!("{pretty}\n").as_bytes())?;

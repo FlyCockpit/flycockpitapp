@@ -1195,6 +1195,15 @@ impl CoverageAdmission {
             .with_coverage_binding(self.coverage_binding_for_sink()))
     }
 
+    /// The exact coverage key and invalidation epoch the admitted generation
+    /// was published under. The authority publishes a generation only when
+    /// its capture-boundary revisions and its publication-fence revisions
+    /// both equal this key, so the key describes precisely the sources the
+    /// table covers — it is never sampled around the capture.
+    pub(crate) fn acquisition_stamp(&self) -> (RedactionCoverageKey, u64) {
+        (self.generation.key.clone(), self.generation.epoch)
+    }
+
     /// Install the admitted generation table with durable provenance binding.
     /// The raw generation [`Arc`] cannot escape; only this bound table may be
     /// persisted or installed for later historical folds.

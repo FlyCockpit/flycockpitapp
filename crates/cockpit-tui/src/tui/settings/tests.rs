@@ -7131,7 +7131,14 @@ fn model_wizard_tui_dialog_opens_descriptor() {
     });
     cfg.providers.insert("p".to_string(), provider);
     let mut doc = cockpit_config::providers::ConfigDoc::load(&config_path).unwrap();
-    doc.write(&cfg).unwrap();
+    cockpit_config::trust::with_workspace_trust_policy(
+        cockpit_config::trust::WorkspaceTrustPolicy {
+            root: cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: cockpit_config::WorkspaceTrustMode::Trust,
+        },
+        || doc.write(&cfg),
+    )
+    .unwrap();
 
     let d = Dialog::open_setup_wizard(tmp.path(), cockpit_core::wizard::MODEL_WIZARD_ID)
         .expect("model wizard opens");

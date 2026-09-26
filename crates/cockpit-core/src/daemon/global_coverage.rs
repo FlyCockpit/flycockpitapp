@@ -5,32 +5,45 @@
 //! refresh, and the vault's owner-publication callback — and read by every
 //! global event sender. [`GlobalCoverage`] is the one place that:
 //!
-//! * publishes a table together with the freshness stamps (vault inventory
-//!   generation and coverage-authority epoch) it was acquired under, in one
-//!   critical section, so the table and its stamps can never disagree;
-//! * refuses to let an older capture overwrite a newer one (the published
-//!   stamps only move forward);
+//! * publishes a table together with the exact coverage key and authority
+//!   epoch its admitted generation was published under
+//!   ([`CoverageStamp`]), in one critical section, so the table and its stamp
+//!   can never disagree. The key is the capture's own (the authority admits
+//!   a generation only when its capture-boundary and publication-fence
+//!   revisions equal it): vault inventory generation and command-secret
+//!   fingerprint, environment, installation redact policy, and the digest of
+//!   the file-backed sources (dotenv bytes, SSH key material) the capture
+//!   consumed. Nothing is sampled around the capture;
 //! * decides, for every global send, whether the published table is current
-//!   and republishes it when not ([`GlobalCoverage::deliver`]), so a
-//!   session-originated event gets the same freshness check as a plain
-//!   daemon-global broadcast.
+//!   by recomputing that key from the live sources — re-reading the
+//!   configured dotenv files and SSH keys — and comparing it with the
+//!   published stamp ([`GlobalCoverage::deliver`]). A mismatch republishes,
+//!   and the sender uses the table *it* acquired (never whatever happens to
+//!   be published), so every send is scrubbed with a table whose key equals
+//!   the live key it observed;
+//! * applies the same use-time check to the originating session's table of a
+//!   session-originated event: when that session's file-backed sources
+//!   changed since its table was captured, the origin coverage is stale and
+//!   non-owners get the content-free form.
 //!
 //! When coverage cannot be confirmed the event is delivered to owners
 //! unchanged and to everyone else only in its content-free form
 //! ([`content_free_global_event`]), or not at all.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result};
 
 use super::{EventEnvelope, EventScrub, EventSender, SharedRedactionTable, proto};
 use crate::redact::RedactionTable;
-use crate::redact::coverage_authority::CoverageScope;
+use crate::redact::coverage_authority::{CoverageScope, RedactionCoverageKey};
 
 /// Where a republish reads its sources. The vault and the registry's command
-/// cache are held weakly: the vault's publication callback and the registry's
-/// global bus both hold this value, and neither may keep the other alive.
+/// cache are held weakly. The ownership graph is acyclic: the vault's
+/// owner-publication callback holds only a [`WeakGlobalCoverage`], so the
+/// vault never keeps this state alive, while this state keeps the
+/// [`ConfigSource`](crate::daemon::config_source::ConfigSource) (which holds
+/// the vault) alive for as long as the daemon context does.
 struct GlobalCoverageSources {
     authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
     config_source: crate::daemon::config_source::ConfigSource,
@@ -39,34 +52,42 @@ struct GlobalCoverageSources {
         Arc<dyn Fn() -> Option<Arc<crate::secret_command::CommandSecretCache>> + Send + Sync>,
 }
 
-/// The freshness stamps a published table was acquired under, plus the
-/// publication ticket that orders captures with identical stamps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The exact coverage key and authority epoch of an admitted daemon-global
+/// generation (see the module documentation).
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CoverageStamp {
-    ticket: u64,
-    generation: u64,
+    key: RedactionCoverageKey,
     epoch: u64,
 }
 
-impl CoverageStamp {
-    /// Whether a capture stamped `self` may replace the published `current`.
-    /// Both counters are monotonic, so a capture is newer only when neither
-    /// counter moved backwards; equal counters are ordered by ticket. An
-    /// incomparable capture (one counter ahead, the other behind) is not
-    /// installed: it is not at least as fresh as what is published.
-    fn supersedes(&self, current: &Self) -> bool {
-        self.generation >= current.generation
-            && self.epoch >= current.epoch
-            && (self.generation > current.generation
-                || self.epoch > current.epoch
-                || self.ticket > current.ticket)
+impl std::fmt::Debug for CoverageStamp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoverageStamp")
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
     }
+}
+
+impl CoverageStamp {
+    pub(crate) fn new(key: RedactionCoverageKey, epoch: u64) -> Self {
+        Self { key, epoch }
+    }
+}
+
+/// A daemon-global table together with the stamp of the generation it was
+/// admitted as.
+pub(crate) struct AdmittedGlobalCoverage {
+    pub(crate) table: Arc<RedactionTable>,
+    pub(crate) stamp: CoverageStamp,
 }
 
 struct GlobalCoverageInner {
     table: SharedRedactionTable,
-    published: Mutex<CoverageStamp>,
-    next_ticket: AtomicU64,
+    /// The stamp of the published table. `None` for a table that was never
+    /// admitted (a test fixture): it is never current, so first use
+    /// republishes. Lock order: `published`, then `table`.
+    published: Mutex<Option<CoverageStamp>>,
     /// `None` only for a fixed test table, which is always current.
     sources: Option<GlobalCoverageSources>,
 }
@@ -75,6 +96,19 @@ struct GlobalCoverageInner {
 #[derive(Clone)]
 pub struct GlobalCoverage {
     inner: Arc<GlobalCoverageInner>,
+}
+
+/// A non-owning handle to [`GlobalCoverage`], for holders (the vault's
+/// owner-publication callback) that must not keep it alive.
+#[derive(Clone)]
+pub(crate) struct WeakGlobalCoverage {
+    inner: Weak<GlobalCoverageInner>,
+}
+
+impl WeakGlobalCoverage {
+    pub(crate) fn upgrade(&self) -> Option<GlobalCoverage> {
+        self.inner.upgrade().map(|inner| GlobalCoverage { inner })
+    }
 }
 
 impl std::fmt::Debug for GlobalCoverage {
@@ -86,13 +120,12 @@ impl std::fmt::Debug for GlobalCoverage {
 }
 
 impl GlobalCoverage {
-    /// Construct the daemon's publication state around the boot table.
-    /// `generation`/`epoch` are the stamps that table was admitted under;
-    /// `0`/`0` forces a republish on first use.
+    /// Construct the daemon's publication state around the boot table and
+    /// the stamp it was admitted under (`None`: never admitted; the first use
+    /// republishes).
     pub(crate) fn new(
         table: Arc<RedactionTable>,
-        generation: u64,
-        epoch: u64,
+        stamp: Option<CoverageStamp>,
         authority: crate::redact::coverage_authority::RedactionCoverageAuthority,
         config_source: crate::daemon::config_source::ConfigSource,
         vault: &Arc<crate::secure_key::SecretVault>,
@@ -101,12 +134,7 @@ impl GlobalCoverage {
         Self {
             inner: Arc::new(GlobalCoverageInner {
                 table: Arc::new(std::sync::RwLock::new(table)),
-                published: Mutex::new(CoverageStamp {
-                    ticket: 0,
-                    generation,
-                    epoch,
-                }),
-                next_ticket: AtomicU64::new(0),
+                published: Mutex::new(stamp),
                 sources: Some(GlobalCoverageSources {
                     authority,
                     config_source,
@@ -128,24 +156,26 @@ impl GlobalCoverage {
         Self {
             inner: Arc::new(GlobalCoverageInner {
                 table: Arc::new(std::sync::RwLock::new(table)),
-                published: Mutex::new(CoverageStamp {
-                    ticket: 0,
-                    generation: 0,
-                    epoch: 0,
-                }),
-                next_ticket: AtomicU64::new(0),
+                published: Mutex::new(None),
                 sources: None,
             }),
         }
     }
 
+    /// Whether the published table carries an admitted generation's stamp.
     #[cfg(test)]
-    pub(crate) fn published_generation_for_test(&self) -> u64 {
+    pub(crate) fn has_admitted_stamp_for_test(&self) -> bool {
         self.inner
             .published
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .generation
+            .is_some()
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakGlobalCoverage {
+        WeakGlobalCoverage {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     /// The published table (read side shared with the terminal host).
@@ -162,67 +192,7 @@ impl GlobalCoverage {
         self.inner.sources.as_ref()
     }
 
-    fn live_stamps(sources: &GlobalCoverageSources) -> Result<(u64, u64)> {
-        let vault = sources
-            .vault
-            .upgrade()
-            .context("daemon vault is no longer available")?;
-        let generation = vault
-            .current_inventory_generation()
-            .context("reading daemon redaction source revision")?;
-        Ok((generation, sources.authority.epoch()))
-    }
-
-    /// Whether the published table reflects the live vault generation *and*
-    /// the live coverage-authority epoch.
-    pub(crate) fn is_current(&self) -> bool {
-        let Some(sources) = self.sources() else {
-            return true;
-        };
-        let Ok((generation, epoch)) = Self::live_stamps(sources) else {
-            return false;
-        };
-        let published = self
-            .inner
-            .published
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        published.generation == generation && published.epoch == epoch
-    }
-
-    /// Take a publication ticket and read the stamps a capture starting now
-    /// is acquired under. The ticket is taken first so a later capture never
-    /// holds an earlier ticket.
-    fn begin(&self, sources: &GlobalCoverageSources) -> Result<CoverageStamp> {
-        let ticket = self.inner.next_ticket.fetch_add(1, Ordering::SeqCst) + 1;
-        let (generation, epoch) = Self::live_stamps(sources)?;
-        Ok(CoverageStamp {
-            ticket,
-            generation,
-            epoch,
-        })
-    }
-
-    /// Publish `table` with `stamp` unless a newer capture is already
-    /// published. Table and stamps change in one critical section. Returns
-    /// the table that is published afterwards (this one, or the newer one).
-    fn install(&self, stamp: CoverageStamp, table: Arc<RedactionTable>) -> Arc<RedactionTable> {
-        let mut published = self
-            .inner
-            .published
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if stamp.supersedes(&published) {
-            super::set_current_redaction(&self.inner.table, table.clone());
-            *published = stamp;
-            table
-        } else {
-            self.table()
-        }
-    }
-
     fn acquisition_inputs(
-        &self,
         sources: &GlobalCoverageSources,
     ) -> Result<(
         Arc<crate::secure_key::SecretVault>,
@@ -237,31 +207,73 @@ impl GlobalCoverage {
         Ok((vault, cache))
     }
 
-    /// Acquire and publish a fresh table from a synchronous context.
+    /// The stamp a capture starting now would be admitted under: the key
+    /// recomputed from the live sources (re-reading every file-backed source)
+    /// and the authority's live epoch. Blocking I/O.
+    fn live_stamp(sources: &GlobalCoverageSources) -> Result<CoverageStamp> {
+        let (vault, cache) = Self::acquisition_inputs(sources)?;
+        // Read the epoch first: an invalidation racing the key computation
+        // then makes the stamp compare unequal rather than stale-equal.
+        let epoch = sources.authority.epoch();
+        let key = crate::daemon::server::daemon_global_live_coverage_key(
+            &sources.config_source,
+            &vault,
+            &cache,
+        )?;
+        Ok(CoverageStamp::new(key, epoch))
+    }
+
+    /// The published table when its stamp equals `live`, read under the same
+    /// lock that publishes table and stamp together.
+    fn published_matching(&self, live: &CoverageStamp) -> Option<Arc<RedactionTable>> {
+        let published = self
+            .inner
+            .published
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (published.as_ref() == Some(live)).then(|| self.table())
+    }
+
+    /// Publish an admitted table with its own stamp. Table and stamp change
+    /// in one critical section, so the published pair always describes
+    /// itself; which of two racing captures ends up published does not
+    /// matter for correctness, because every use recomputes the live stamp.
+    fn install(&self, admitted: &AdmittedGlobalCoverage) {
+        let mut published = self
+            .inner
+            .published
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        super::set_current_redaction(&self.inner.table, admitted.table.clone());
+        *published = Some(admitted.stamp.clone());
+    }
+
+    /// Acquire and publish a fresh table from a synchronous context. Returns
+    /// the table this call acquired.
     pub(crate) fn republish_blocking(&self, purpose: CoverageScope) -> Result<Arc<RedactionTable>> {
         let Some(sources) = self.sources() else {
             return Ok(self.table());
         };
-        let stamp = self.begin(sources)?;
-        let (vault, cache) = self.acquisition_inputs(sources)?;
-        let table = crate::daemon::server::acquire_daemon_redaction_table_blocking(
+        let (vault, cache) = Self::acquisition_inputs(sources)?;
+        let admitted = crate::daemon::server::acquire_daemon_redaction_table_blocking(
             sources.authority.clone(),
             sources.config_source.clone(),
             vault,
             cache,
             purpose,
         )?;
-        Ok(self.install(stamp, table))
+        self.install(&admitted);
+        Ok(admitted.table)
     }
 
-    /// Acquire and publish a fresh table.
+    /// Acquire and publish a fresh table. Returns the table this call
+    /// acquired.
     pub(crate) async fn republish(&self, purpose: CoverageScope) -> Result<Arc<RedactionTable>> {
         let Some(sources) = self.sources() else {
             return Ok(self.table());
         };
-        let stamp = self.begin(sources)?;
-        let (vault, cache) = self.acquisition_inputs(sources)?;
-        let table = crate::daemon::server::acquire_daemon_redaction_table(
+        let (vault, cache) = Self::acquisition_inputs(sources)?;
+        let admitted = crate::daemon::server::acquire_daemon_redaction_table(
             sources.authority.clone(),
             &sources.config_source,
             &vault,
@@ -269,32 +281,89 @@ impl GlobalCoverage {
             purpose,
         )
         .await?;
-        Ok(self.install(stamp, table))
+        self.install(&admitted);
+        Ok(admitted.table)
     }
 
-    /// The published table when current, otherwise a freshly republished one.
+    /// A table whose stamp equals the live stamp: the published one when it
+    /// matches, otherwise one freshly acquired by this call.
     pub(crate) fn current_or_republish_blocking(&self) -> Result<Arc<RedactionTable>> {
-        if self.is_current() {
+        let Some(sources) = self.sources() else {
             return Ok(self.table());
+        };
+        // The live stamp re-reads files and the vault; on a multi-thread
+        // runtime worker, tell the runtime this thread blocks.
+        if let Ok(live) = blocking_io(|| Self::live_stamp(sources))
+            && let Some(table) = self.published_matching(&live)
+        {
+            return Ok(table);
         }
         self.republish_blocking(CoverageScope::DaemonGlobalEvent)
     }
 
     async fn current_or_republish(&self) -> Result<Arc<RedactionTable>> {
-        if self.is_current() {
+        if self.sources().is_none() {
             return Ok(self.table());
         }
+        // The live stamp re-reads files and the vault: keep it off the
+        // async worker.
+        let probe = self.clone();
+        let current = tokio::task::spawn_blocking(move || {
+            let sources = probe.sources()?;
+            let live = Self::live_stamp(sources).ok()?;
+            probe.published_matching(&live)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(table) = current {
+            return Ok(table);
+        }
         self.republish(CoverageScope::DaemonGlobalEvent).await
+    }
+
+    /// Publish a terminal-host event on the daemon-global bus. The PTY
+    /// stream (output, viewers, close, protocol violation) carries no free
+    /// text and is intentionally unscrubbed, so it rides the published table
+    /// without a currency check (one check per output chunk would re-read
+    /// every source). `TerminalClipboard` text is scrubbed, so it goes
+    /// through [`Self::deliver`]: current coverage, or the content-free form
+    /// (withheld) for non-owners.
+    pub fn send_terminal_event(&self, tx: &EventSender, event: proto::Event) {
+        match event {
+            event @ proto::Event::TerminalClipboard { .. } => self.deliver(tx, None, event),
+            event => {
+                let _ = tx.send(EventEnvelope {
+                    event,
+                    redact: EventScrub::single(self.table()),
+                });
+            }
+        }
+    }
+
+    /// A fixed table with no sources, for tests outside this crate (the CLI
+    /// terminal host's unit tests). Never current-checked or republished.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixed_for_tests(table: Arc<RedactionTable>) -> Self {
+        Self {
+            inner: Arc::new(GlobalCoverageInner {
+                table: Arc::new(std::sync::RwLock::new(table)),
+                published: Mutex::new(None),
+                sources: None,
+            }),
+        }
     }
 
     /// The one delivery funnel for the daemon-global bus.
     ///
     /// `origin` is the table of the session the event originates in, if
     /// any; the event is then scrubbed with the current global table and
-    /// that table matched together ([`EventScrub::with_origin`]). When
-    /// current global coverage cannot be established, or the two tables
-    /// cannot be combined, owners still receive the event and every other
-    /// principal receives only its content-free form (or nothing).
+    /// that table matched together ([`EventScrub::with_origin`]), provided
+    /// the origin table's file-backed sources are unchanged since it was
+    /// captured ([`RedactionTable::machine_sources_current`]). When current
+    /// coverage cannot be established, or the two tables cannot be combined,
+    /// owners still receive the event and every other principal receives
+    /// only its content-free form (or nothing).
     pub(crate) fn deliver(
         &self,
         tx: &EventSender,
@@ -302,6 +371,7 @@ impl GlobalCoverage {
         event: proto::Event,
     ) {
         let coverage = self.current_or_republish_blocking();
+        let origin = origin.map(|origin| blocking_io(|| origin_coverage(origin)));
         send_with_coverage(tx, coverage, origin, event);
     }
 
@@ -313,20 +383,59 @@ impl GlobalCoverage {
         event: proto::Event,
     ) {
         let coverage = self.current_or_republish().await;
+        let origin = match origin {
+            Some(origin) => {
+                let origin = origin.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || origin_coverage(&origin))
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("origin coverage probe panicked"))),
+                )
+            }
+            None => None,
+        };
         send_with_coverage(tx, coverage, origin, event);
+    }
+}
+
+/// Run blocking I/O from a synchronous caller that may be on a Tokio
+/// worker thread: on a multi-thread runtime the runtime is told the thread
+/// blocks (`block_in_place` is unavailable on a current-thread runtime).
+fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+/// The originating session's table, when its file-backed sources are
+/// unchanged since capture. Blocking I/O.
+fn origin_coverage(origin: &Arc<RedactionTable>) -> Result<Arc<RedactionTable>> {
+    if origin
+        .machine_sources_current()
+        .context("re-reading the originating session's redaction sources")?
+    {
+        Ok(origin.clone())
+    } else {
+        anyhow::bail!("the originating session's redaction sources changed since capture")
     }
 }
 
 fn send_with_coverage(
     tx: &EventSender,
     coverage: Result<Arc<RedactionTable>>,
-    origin: Option<&Arc<RedactionTable>>,
+    origin: Option<Result<Arc<RedactionTable>>>,
     event: proto::Event,
 ) {
     let redact = coverage.and_then(|global| match origin {
         None => Ok(EventScrub::single(global)),
-        Some(origin) => EventScrub::with_origin(&global, origin)
-            .context("combining daemon-global and originating-session coverage"),
+        Some(origin) => {
+            let origin = origin?;
+            EventScrub::with_origin(&global, &origin)
+                .context("combining daemon-global and originating-session coverage")
+        }
     });
     let redact = match redact {
         Ok(redact) => redact,
@@ -504,7 +613,7 @@ pub(crate) fn content_free_global_event(event: proto::Event) -> Option<proto::Ev
 /// Host capabilities without free text: states, ids, importance and targets
 /// are kept; every reason becomes [`CONTENT_FREE_REASON`] and every other
 /// free-text or probe-derived field is dropped.
-fn content_free_host_capability_snapshot(
+pub(crate) fn content_free_host_capability_snapshot(
     snapshot: proto::HostCapabilitySnapshot,
 ) -> proto::HostCapabilitySnapshot {
     proto::HostCapabilitySnapshot {
@@ -552,73 +661,71 @@ fn content_free_host_capability_snapshot(
 mod tests {
     use super::*;
 
-    #[test]
-    fn stamps_only_move_forward() {
-        let stamp = |ticket, generation, epoch| CoverageStamp {
-            ticket,
-            generation,
+    fn stamp(material: &[u8], epoch: u64) -> CoverageStamp {
+        use crate::redact::coverage_authority::CoverageBinding;
+        let binding = |domain: &[u8]| CoverageBinding::derive(domain, material);
+        CoverageStamp::new(
+            RedactionCoverageKey::daemon_global(
+                binding(b"principal"),
+                binding(b"owner-authorization"),
+                binding(b"environment"),
+                binding(b"credential-vault"),
+                binding(b"policy"),
+                binding(b"sealed"),
+                binding(b"override"),
+                binding(b"machine-sources"),
+            ),
             epoch,
-        };
-        let published = stamp(5, 10, 3);
-        assert!(
-            stamp(6, 10, 3).supersedes(&published),
-            "same stamps, later ticket"
-        );
-        assert!(
-            stamp(1, 11, 3).supersedes(&published),
-            "newer generation wins over ticket"
-        );
-        assert!(
-            stamp(1, 10, 4).supersedes(&published),
-            "newer epoch wins over ticket"
-        );
-        assert!(
-            !stamp(4, 10, 3).supersedes(&published),
-            "earlier ticket, same stamps"
-        );
-        assert!(
-            !stamp(9, 9, 3).supersedes(&published),
-            "older generation never wins"
-        );
-        assert!(
-            !stamp(9, 10, 2).supersedes(&published),
-            "older epoch never wins"
-        );
-        assert!(
-            !stamp(9, 11, 2).supersedes(&published),
-            "incomparable stamps never win"
-        );
+        )
     }
 
-    /// A delayed capture that finishes after a newer one never replaces the
-    /// newer table, and the published stamps stay with the published table.
+    /// Whatever order captures finish in, the published table and its stamp
+    /// describe each other, and a use only accepts the published table when
+    /// its stamp equals the stamp the user observed live: a caller whose own
+    /// observation is newer (or merely different) never receives a table
+    /// that does not cover it.
     #[test]
-    fn an_older_capture_never_overwrites_a_newer_publication() {
-        let boot = Arc::new(RedactionTable::empty());
-        let coverage = GlobalCoverage::fixed(boot);
-        let newer = Arc::new(RedactionTable::empty());
-        let older = Arc::new(RedactionTable::empty());
-        let newer_stamp = CoverageStamp {
-            ticket: 2,
-            generation: 5,
-            epoch: 2,
+    fn published_table_is_used_only_for_its_own_stamp() {
+        let coverage = GlobalCoverage::fixed(Arc::new(RedactionTable::empty()));
+        let newer = AdmittedGlobalCoverage {
+            table: Arc::new(RedactionTable::empty()),
+            stamp: stamp(b"rotated-key", 2),
         };
-        let older_stamp = CoverageStamp {
-            ticket: 1,
-            generation: 5,
-            epoch: 1,
+        let older = AdmittedGlobalCoverage {
+            table: Arc::new(RedactionTable::empty()),
+            stamp: stamp(b"old-key", 1),
         };
-        assert!(Arc::ptr_eq(
-            &coverage.install(newer_stamp, newer.clone()),
-            &newer
-        ));
-        let after = coverage.install(older_stamp, older.clone());
-        assert!(Arc::ptr_eq(&after, &newer), "the older capture is dropped");
-        assert!(Arc::ptr_eq(&coverage.table(), &newer));
+        coverage.install(&newer);
+        coverage.install(&older);
+        assert!(Arc::ptr_eq(&coverage.table(), &older.table));
         assert_eq!(
-            *coverage.inner.published.lock().unwrap(),
-            newer_stamp,
-            "stamps describe the published table"
+            coverage.inner.published.lock().unwrap().as_ref(),
+            Some(&older.stamp),
+            "the stamp describes the published table"
         );
+        assert!(
+            coverage.published_matching(&newer.stamp).is_none(),
+            "a caller that observed the newer sources must not get the older table"
+        );
+        assert!(
+            coverage.published_matching(&stamp(b"old-key", 2)).is_none(),
+            "a later invalidation epoch makes the published table stale"
+        );
+        assert!(Arc::ptr_eq(
+            &coverage.published_matching(&older.stamp).unwrap(),
+            &older.table
+        ));
+    }
+
+    /// The vault's owner-publication callback holds only a weak handle, so it
+    /// never keeps the publication state (and through it the config source
+    /// and vault) alive.
+    #[test]
+    fn weak_handle_does_not_keep_coverage_alive() {
+        let coverage = GlobalCoverage::fixed(Arc::new(RedactionTable::empty()));
+        let weak = coverage.downgrade();
+        assert!(weak.upgrade().is_some());
+        drop(coverage);
+        assert!(weak.upgrade().is_none());
     }
 }

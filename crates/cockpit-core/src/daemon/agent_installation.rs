@@ -411,6 +411,50 @@ struct WorkspaceConfigLayerAuthority {
     effective_default_journal_leaf: OsString,
     effective_default_backup_leaf: OsString,
     config_dir_kind: Option<crate::config::dirs::ConfigDirKind>,
+    trust_location: RetainedLayerTrustLocation,
+}
+
+/// Whether a retained configuration layer sits in a project `.cockpit`
+/// directory, classified once at attach from the spelled layer path *and*
+/// its canonical form (a `.cockpit` that is a symlink canonicalizes to its
+/// target, which alone would not be recognized). Later write decisions use
+/// this capture-time classification with the current policy's mode; they
+/// never re-resolve a pathname.
+#[derive(Debug, Clone)]
+struct RetainedLayerTrustLocation {
+    root: PathBuf,
+    project_located: bool,
+}
+
+impl RetainedLayerTrustLocation {
+    fn capture(
+        spelled_config_path: &Path,
+        canonical_config_path: &Path,
+        policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ) -> Self {
+        let root = policy.root.root.clone();
+        let project_located =
+            crate::config::trust::path_is_project_cockpit_layer(spelled_config_path, &root)
+                || crate::config::trust::path_is_project_cockpit_layer(
+                    canonical_config_path,
+                    &root,
+                );
+        Self {
+            root,
+            project_located,
+        }
+    }
+
+    /// The write gate for a retained layer under `policy`: a project-located
+    /// layer is writable only under `Trust`. A policy for a different root
+    /// than the one the layer was classified against is refused.
+    fn write_allowed(&self, policy: &crate::config::trust::WorkspaceTrustPolicy) -> bool {
+        if policy.root.root != self.root {
+            return false;
+        }
+        policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust
+            || !self.project_located
+    }
 }
 
 /// Non-serializable authority for one captured project/explicit hook source.
@@ -1124,12 +1168,14 @@ struct RetainedDefaultWriteTargetAuthority {
     canonical_config_path: PathBuf,
     scope: cockpit_config::config::effective_default::EffectiveDefaultScope,
     config_dir_kind: Option<crate::config::dirs::ConfigDirKind>,
+    trust_location: RetainedLayerTrustLocation,
 }
 
 fn capture_retained_default_layer(
     project_root: &Path,
     config_path: &Path,
     exclusive_config_override: bool,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
 ) -> Result<RetainedDefaultWriteTargetAuthority> {
     let config_directory_path = config_path
         .parent()
@@ -1180,6 +1226,11 @@ fn capture_retained_default_layer(
         config_leaf,
         effective_default_journal_leaf,
         effective_default_backup_leaf,
+        trust_location: RetainedLayerTrustLocation::capture(
+            config_path,
+            &canonical_config_path,
+            trust_policy,
+        ),
         canonical_config_path,
         scope,
         config_dir_kind,
@@ -1270,8 +1321,15 @@ impl WorkerWorkspaceConfigAuthority {
                     .file_name()
                     .context("effective-default backup has no file name")?
                     .to_os_string();
+            let config_directory = AuthorizedWorkspaceRoot::capture(config_directory)?;
+            let trust_location = RetainedLayerTrustLocation::capture(
+                &config_path,
+                &config_directory.canonical_path().join(&config_leaf),
+                trust_policy,
+            );
             config_layers.push(WorkspaceConfigLayerAuthority {
-                config_directory: AuthorizedWorkspaceRoot::capture(config_directory)?,
+                config_directory,
+                trust_location,
                 config_leaf,
                 effective_default_journal_leaf,
                 effective_default_backup_leaf,
@@ -1285,7 +1343,12 @@ impl WorkerWorkspaceConfigAuthority {
         let default_effective_layers = effective_paths
             .iter()
             .map(|config_path| {
-                capture_retained_default_layer(project_root, config_path, exclusive_config_override)
+                capture_retained_default_layer(
+                    project_root,
+                    config_path,
+                    exclusive_config_override,
+                    trust_policy,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         // `effective_paths` is low-to-high precedence, so the final retained
@@ -1532,10 +1595,7 @@ impl WorkerWorkspaceConfigAuthority {
                 .config_directory
                 .canonical_path()
                 .join(&layer.config_leaf);
-            if !cockpit_config::config::dirs::config_layer_write_allowed_for_policy(
-                &config_path,
-                Some(policy),
-            ) {
+            if !layer.trust_location.write_allowed(policy) {
                 continue;
             }
             let provider_path = cockpit_config::config::providers::provider_file_path_for_config(
@@ -1972,18 +2032,16 @@ impl WorkerWorkspaceConfigAuthority {
     /// Projection (readability) is necessary but not sufficient: the explicit
     /// override is projected in every trust mode, yet an override located in a
     /// project `.cockpit/` directory is written only while that project is
-    /// trusted. The decision itself is the shared config-layer write gate,
-    /// judged under the captured policy rather than the ambient one.
+    /// trusted. The decision uses the layer's attach-time trust location
+    /// (the shared classifier over its spelled and canonical paths) with the
+    /// captured policy's mode, never the ambient one.
     fn retained_layer_is_writable(
         &self,
         layer: &RetainedDefaultWriteTargetAuthority,
         policy: &crate::config::trust::WorkspaceTrustPolicy,
     ) -> bool {
         self.retained_layer_is_projected(layer, policy)
-            && cockpit_config::config::dirs::config_layer_write_allowed_for_policy(
-                &layer.canonical_config_path,
-                Some(policy),
-            )
+            && layer.trust_location.write_allowed(policy)
     }
 
     /// Index of the one legal effective-default write layer under `policy`:

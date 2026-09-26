@@ -264,6 +264,19 @@ fn real_first_run_app(cwd: &std::path::Path) -> App {
 /// deliberately cannot mint contract evidence themselves, so this stands in
 /// for that authority the same way the other fixtures seed provider config;
 /// every later daemon operation still runs for real.
+/// Seed a project-layer fixture as the workspace's trusted owner (the TUI
+/// process runs under a trust decision; config documents refuse to write a
+/// project `.cockpit` layer without one).
+fn with_trusted_fixture_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    cockpit_config::trust::with_workspace_trust_policy(
+        cockpit_config::trust::WorkspaceTrustPolicy {
+            root: cockpit_config::trust::resolve_trust_root(root).expect("fixture trust root"),
+            mode: cockpit_config::WorkspaceTrustMode::Trust,
+        },
+        f,
+    )
+}
+
 fn seed_computer_use_catalog_capabilities() {
     use cockpit_config::providers::{
         CapabilityStatus, ComputerUseCapability, ComputerUseContract, ModelCapabilities,
@@ -801,10 +814,12 @@ fn real_daemon_profile_continue_advances_to_secure_store_and_persists_name() {
         || {
             let cockpit = tmp.path().join(".cockpit");
             std::fs::create_dir_all(&cockpit).unwrap();
-            ConfigDoc::load(&cockpit.join("config.json"))
-                .unwrap()
-                .write(&ProvidersConfig::default())
-                .unwrap();
+            with_trusted_fixture_root(tmp.path(), || {
+                ConfigDoc::load(&cockpit.join("config.json"))
+                    .unwrap()
+                    .write(&ProvidersConfig::default())
+            })
+            .unwrap();
 
             let mut app = real_first_run_app(tmp.path());
             pump_onboarding(
@@ -859,10 +874,12 @@ fn first_run_settles_stages_against_the_real_daemon_offline() {
         || {
             let cockpit = tmp.path().join(".cockpit");
             std::fs::create_dir_all(&cockpit).unwrap();
-            ConfigDoc::load(&cockpit.join("config.json"))
-                .unwrap()
-                .write(&ProvidersConfig::default())
-                .unwrap();
+            with_trusted_fixture_root(tmp.path(), || {
+                ConfigDoc::load(&cockpit.join("config.json"))
+                    .unwrap()
+                    .write(&ProvidersConfig::default())
+            })
+            .unwrap();
 
             let mut app = real_first_run_app(tmp.path());
             advance_real_first_run_to_provider(&mut app);
@@ -905,10 +922,12 @@ fn real_daemon_first_run_ephemeral_lifetime_persists_background_agents_false() {
         || {
             let cockpit = tmp.path().join(".cockpit");
             std::fs::create_dir_all(&cockpit).unwrap();
-            ConfigDoc::load(&cockpit.join("config.json"))
-                .unwrap()
-                .write(&ProvidersConfig::default())
-                .unwrap();
+            with_trusted_fixture_root(tmp.path(), || {
+                ConfigDoc::load(&cockpit.join("config.json"))
+                    .unwrap()
+                    .write(&ProvidersConfig::default())
+            })
+            .unwrap();
 
             let mut app = real_first_run_app(tmp.path());
             advance_real_first_run_to_provider(&mut app);
@@ -994,10 +1013,12 @@ fn concurrent_client_defer_is_followed_by_the_read_only_refresh() {
     let _enter = fixture.runtime.enter();
     let cockpit = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
-    ConfigDoc::load(&cockpit.join("config.json"))
-        .unwrap()
-        .write(&ProvidersConfig::default())
-        .unwrap();
+    with_trusted_fixture_root(tmp.path(), || {
+        ConfigDoc::load(&cockpit.join("config.json"))
+            .unwrap()
+            .write(&ProvidersConfig::default())
+    })
+    .unwrap();
 
     let mut app = real_first_run_app(tmp.path());
     advance_real_first_run_to_provider(&mut app);

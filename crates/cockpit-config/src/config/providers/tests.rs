@@ -199,7 +199,11 @@ fn run_private_atomic_write_umask_case(root: &Path) {
     let explicit_named_like_default = explicit_dot_cockpit.join("custom.json");
     env.set_cockpit_config(&explicit_named_like_default);
     let mut explicit_named_doc = ConfigDoc::load(&explicit_named_like_default).unwrap();
+    // A file inside a `.cockpit` directory is written only under a trusted
+    // workspace decision for it.
+    let trusted_shared_project = enter_trusted_workspace(&root.join("shared-project"));
     explicit_named_doc.write(&cfg).unwrap();
+    drop(trusted_shared_project);
     assert_private_mode(&explicit_named_like_default, 0o600);
     assert_private_mode(&explicit_dot_cockpit, 0o755);
 

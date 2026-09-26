@@ -29,9 +29,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::daemon::EventSender;
+use crate::daemon::global_coverage::GlobalCoverage;
 use crate::daemon::proto::{self, ErrorCode, ErrorPayload, Response};
 use crate::daemon::terminal::AuthenticatedTerminalContext;
-use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
 #[cfg(test)]
 use crate::redact::RedactionTable;
 #[cfg(test)]
@@ -136,7 +137,7 @@ pub struct TerminalHost {
     inner: Arc<Mutex<TerminalHostInner>>,
     prepared_ingress: PreparedIngressQuotaMap,
     event_tx: EventSender,
-    redaction: SharedRedactionTable,
+    redaction: GlobalCoverage,
     temp_root: PathBuf,
     idle_ttl: Duration,
     #[cfg(test)]
@@ -644,7 +645,7 @@ fn osc_terminator_len(seq: &[u8]) -> Option<usize> {
 // ---- Host -----------------------------------------------------------------
 
 impl TerminalHost {
-    pub fn new(event_tx: EventSender, redaction: SharedRedactionTable, temp_root: PathBuf) -> Self {
+    pub fn new(event_tx: EventSender, redaction: GlobalCoverage, temp_root: PathBuf) -> Self {
         prepare_temp_root(&temp_root);
         Self {
             inner: Arc::new(Mutex::new(TerminalHostInner::default())),
@@ -660,7 +661,7 @@ impl TerminalHost {
 
     #[cfg(test)]
     pub fn new_for_test(event_tx: EventSender, temp_root: PathBuf) -> Self {
-        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+        let redaction = GlobalCoverage::fixed_for_tests(Arc::new(RedactionTable::empty()));
         Self::new(event_tx, redaction, temp_root)
     }
 
@@ -1208,14 +1209,15 @@ impl TerminalHost {
             .ok_or_else(|| unknown_terminal(terminal_id))
     }
 
-    /// Terminal events ride the daemon-global bus with the live daemon-global
-    /// table. By design the PTY stream (output, viewers, close) is not
-    /// scrubbed: the terminal is the owner's own shell, so a secret it prints
-    /// is already in the owner's hands and substituting bytes would only
-    /// corrupt the stream. Only `TerminalClipboard` text is scrubbed (see the
-    /// daemon's event scrubber). No terminal event is withheld for coverage.
+    /// Terminal events ride the daemon-global bus. By design the PTY stream
+    /// (output, viewers, close) is not scrubbed: the terminal is the owner's
+    /// own shell, so a secret it prints is already in the owner's hands and
+    /// substituting bytes would only corrupt the stream; it is never withheld.
+    /// Only `TerminalClipboard` text is scrubbed, with current daemon-global
+    /// coverage ([`GlobalCoverage::send_terminal_event`]); when that coverage
+    /// cannot be established, non-owners do not receive the clipboard text.
     fn emit(&self, event: proto::Event) {
-        send_current_event(&self.event_tx, &self.redaction, event);
+        self.redaction.send_terminal_event(&self.event_tx, event);
     }
 
     fn emit_output_chunks(&self, terminal_id: Uuid, bytes: Vec<u8>) {
@@ -1232,7 +1234,7 @@ impl TerminalHost {
     fn handle_pty_bytes(
         terminal: &Arc<Mutex<TerminalState>>,
         event_tx: &EventSender,
-        redaction: &SharedRedactionTable,
+        redaction: &GlobalCoverage,
         bytes: &[u8],
         prepared_ingress: &PreparedIngressQuotaMap,
     ) {
@@ -1254,9 +1256,8 @@ impl TerminalHost {
                 // or suffix bytes are present in passthrough on overflow.
                 drop(state);
                 for chunk in passthrough.chunks(OUTPUT_CHUNK_BYTES) {
-                    send_current_event(
+                    redaction.send_terminal_event(
                         event_tx,
-                        redaction,
                         proto::Event::TerminalOutput {
                             terminal_id: id,
                             bytes: chunk.to_vec(),
@@ -1264,9 +1265,8 @@ impl TerminalHost {
                     );
                 }
                 for text in clipboards {
-                    send_current_event(
+                    redaction.send_terminal_event(
                         event_tx,
-                        redaction,
                         proto::Event::TerminalClipboard {
                             terminal_id: id,
                             text,
@@ -1286,9 +1286,8 @@ impl TerminalHost {
             (filtered, id)
         };
         for chunk in filtered.passthrough.chunks(OUTPUT_CHUNK_BYTES) {
-            send_current_event(
+            redaction.send_terminal_event(
                 event_tx,
-                redaction,
                 proto::Event::TerminalOutput {
                     terminal_id,
                     bytes: chunk.to_vec(),
@@ -1303,9 +1302,8 @@ impl TerminalHost {
             if !still_open {
                 return;
             }
-            send_current_event(
+            redaction.send_terminal_event(
                 event_tx,
-                redaction,
                 proto::Event::TerminalClipboard { terminal_id, text },
             );
         }
@@ -1325,7 +1323,7 @@ fn close_generation_locked(
     state: &mut TerminalState,
     trigger: CloseTrigger,
     event_tx: &EventSender,
-    redaction: &SharedRedactionTable,
+    redaction: &GlobalCoverage,
     prepared_ingress: &PreparedIngressQuotaMap,
 ) -> TerminalCloseOutcome {
     if state.closed {
@@ -1391,9 +1389,8 @@ fn close_generation_locked(
     // Only overflow emits Osc52ProtocolViolation, and only once.
     if matches!(trigger, CloseTrigger::Osc52Overflow) && !state.osc52_violation_emitted {
         state.osc52_violation_emitted = true;
-        send_current_event(
+        redaction.send_terminal_event(
             event_tx,
-            redaction,
             proto::Event::Osc52ProtocolViolation {
                 terminal_id: state.id,
                 generation: state.generation,
@@ -1403,9 +1400,8 @@ fn close_generation_locked(
 
     state.close_outcome = Some(outcome);
     let reason = trigger.reason(outcome).to_string();
-    send_current_event(
+    redaction.send_terminal_event(
         event_tx,
-        redaction,
         proto::Event::TerminalClosed {
             terminal_id: state.id,
             reason,
@@ -1671,7 +1667,7 @@ fn spawn_terminal(
     rows: u16,
     temp_root: &Path,
     event_tx: EventSender,
-    redaction: SharedRedactionTable,
+    redaction: GlobalCoverage,
     prepared_ingress: PreparedIngressQuotaMap,
 ) -> Result<Arc<Mutex<TerminalState>>> {
     let rows = rows.max(1);

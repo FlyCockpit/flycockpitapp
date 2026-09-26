@@ -283,19 +283,22 @@ pub fn installation_config_file_paths() -> anyhow::Result<Vec<PathBuf>> {
     Ok(vec![global_config_file()?])
 }
 
-/// The one write gate for a durable `config.json` layer (or a file beside
-/// it, such as `providers/<id>.json` or the effective-default journal),
-/// judged under the ambient workspace-trust policy.
+/// The one write gate for a durable configuration file: a `config.json`
+/// layer, a file beside it (`providers/<id>.json`, `mcp.json`, the
+/// effective-default journal), judged under the ambient workspace-trust
+/// policy.
 ///
 /// Readability is not writability: the `COCKPIT_CONFIG` override is loaded
-/// regardless of trust, but a layer that sits in a project `.cockpit/`
-/// directory is written only while that project is trusted. Every durable
-/// config writer — the ambient pathname resolvers here and in
-/// `effective_default`, the literal-header migration, the image-control
-/// registry, and the daemon's retained attach-time capabilities (through
-/// [`config_layer_write_allowed_for_policy`]) — decides through this rule.
+/// regardless of trust, but a file that passes through a project `.cockpit`
+/// directory — judged on every location the path traverses, its spelled
+/// entries as well as their resolved targets
+/// ([`crate::config::trust::config_file_write_decision`]) — is written only
+/// while that project is trusted. The typed configuration documents
+/// (`ExtendedConfigDoc`, `providers::ConfigDoc`) enforce this inside every
+/// mutating method, so no caller can write one without passing it; target
+/// selectors report a refusal as [`ConfigWriteRefused`], never as absence.
 pub fn config_layer_write_allowed(path: &Path) -> bool {
-    config_layer_write_allowed_for_policy(path, crate::config::trust::runtime_policy().as_ref())
+    authorize_config_layer_write(path).is_ok()
 }
 
 /// [`config_layer_write_allowed`] against an explicit policy, for writers
@@ -304,14 +307,141 @@ pub fn config_layer_write_allowed_for_policy(
     path: &Path,
     policy: Option<&crate::config::trust::WorkspaceTrustPolicy>,
 ) -> bool {
-    let parent = path.parent().unwrap_or(Path::new(""));
-    // Only a conventional project `.cockpit/` directory requires workspace
-    // trust; the global and machine-local layers never do.
-    if parent.file_name().is_some_and(|name| name == ".cockpit") {
-        crate::config::trust::project_config_allowed_for_policy(parent, policy)
-    } else {
-        true
+    authorize_config_layer_write_for_policy(path, policy).is_ok()
+}
+
+/// [`config_layer_write_allowed`] with the refusal as a typed error.
+pub fn authorize_config_layer_write(path: &Path) -> Result<(), ConfigWriteRefused> {
+    authorize_config_layer_write_for_policy(path, crate::config::trust::runtime_policy().as_ref())
+}
+
+/// [`config_layer_write_allowed_for_policy`] with the refusal as a typed error.
+pub fn authorize_config_layer_write_for_policy(
+    path: &Path,
+    policy: Option<&crate::config::trust::WorkspaceTrustPolicy>,
+) -> Result<(), ConfigWriteRefused> {
+    crate::config::trust::config_file_write_decision(path, policy).map_err(|reason| {
+        ConfigWriteRefused {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })
+}
+
+/// The gate the typed configuration documents run inside every mutating
+/// method, before the mutation lock (whose acquisition creates the parent
+/// directory) and again before each file is committed.
+pub(crate) fn authorize_config_file_write(path: &Path) -> anyhow::Result<()> {
+    authorize_config_layer_write(path).map_err(anyhow::Error::from)
+}
+
+/// A configuration write refused by workspace trust. Target selectors return
+/// this instead of `None`, so a refusal can never be mistaken for "no layer
+/// exists yet" and turned into a write to some other layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWriteRefused {
+    pub path: PathBuf,
+    pub reason: crate::config::trust::ConfigWriteRefusal,
+}
+
+impl std::fmt::Display for ConfigWriteRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to write {}: {}",
+            self.path.display(),
+            self.reason
+        )
     }
+}
+
+impl std::error::Error for ConfigWriteRefused {}
+
+/// Why a runtime configuration mutation has no target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigWriteTargetError {
+    /// Workspace trust refuses the only layer the mutation may target.
+    Refused(ConfigWriteRefused),
+    /// A workspace-bound mutation ran with no workspace-trust decision in
+    /// force, so no workspace layer can be chosen.
+    NoWorkspacePolicy,
+    /// The provider id cannot name a provider file.
+    InvalidProviderId(String),
+    /// The explicit override or the per-directory layer could not be resolved.
+    Unresolved(String),
+}
+
+impl std::fmt::Display for ConfigWriteTargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refused) => refused.fmt(f),
+            Self::NoWorkspacePolicy => f.write_str(
+                "no workspace-trust decision is in force, so no workspace config layer can be written",
+            ),
+            Self::InvalidProviderId(id) => write!(f, "`{id}` is not a valid provider id"),
+            Self::Unresolved(reason) => write!(f, "no config layer can be resolved: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigWriteTargetError {}
+
+impl From<ConfigWriteRefused> for ConfigWriteTargetError {
+    fn from(refused: ConfigWriteRefused) -> Self {
+        Self::Refused(refused)
+    }
+}
+
+/// The explicit `COCKPIT_CONFIG` override as a write target: `Ok(None)` when
+/// no override is set, the override when workspace trust allows writing it,
+/// otherwise the refusal. The override is the only layer load reads, so a
+/// refused override never falls back to any other layer.
+fn explicit_override_write_target() -> Result<Option<PathBuf>, ConfigWriteTargetError> {
+    let Some(path) = explicit_config_override()
+        .map_err(|error| ConfigWriteTargetError::Unresolved(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    authorize_config_layer_write(&path)?;
+    Ok(Some(path))
+}
+
+/// `config.json` target for a **workspace-bound** mutation (per-project
+/// sandbox intent, the "approve for this project" gitignore allowlist,
+/// review defaults, policy import): the layer that load reads for `cwd` and
+/// that belongs to this workspace, never the user-global layer.
+///
+/// 1. `COCKPIT_CONFIG`, the only layer load reads, when trust allows writing
+///    it; a refused override is an error (never a fallback).
+/// 2. The nearest discovered project layer (discovery is trust-gated).
+/// 3. The existing machine-local layer for `cwd`.
+/// 4. A scaffold: the project `<cwd>/.cockpit` under `Trust`, otherwise the
+///    machine-local layer for `cwd` (an ignored project's `.cockpit` is never
+///    scaffolded).
+///
+/// With no workspace-trust policy in force there is no workspace to bind to
+/// and the mutation is refused. The returned target has passed the write gate.
+pub fn workspace_config_write_target(cwd: &Path) -> Result<PathBuf, ConfigWriteTargetError> {
+    if let Some(path) = explicit_override_write_target()? {
+        return Ok(path);
+    }
+    let Some(policy) = crate::config::trust::runtime_policy() else {
+        return Err(ConfigWriteTargetError::NoWorkspacePolicy);
+    };
+    let dirs = discover_config_dirs(cwd);
+    let target = if let Some(project) = dirs.iter().find(|d| d.kind == ConfigDirKind::Project) {
+        project.path.join(CONFIG_FILE)
+    } else if let Some(local) = dirs.iter().find(|d| d.kind == ConfigDirKind::MachineLocal) {
+        local.path.join(CONFIG_FILE)
+    } else if policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust {
+        cwd.join(".cockpit").join(CONFIG_FILE)
+    } else {
+        local_config_dir_for(cwd)
+            .map_err(|error| ConfigWriteTargetError::Unresolved(format!("{error:#}")))?
+            .join(CONFIG_FILE)
+    };
+    authorize_config_layer_write_for_policy(&target, Some(&policy))?;
+    Ok(target)
 }
 
 /// `providers/<provider-id>.json` write target for a runtime mutation that
@@ -321,18 +451,18 @@ pub fn config_layer_write_allowed_for_policy(
 /// config therefore never returns `None` for a valid provider id unless an
 /// explicit `COCKPIT_CONFIG` override forbids the write. `COCKPIT_CONFIG` is
 /// a single-layer override, so provider files live beside that exact file.
-pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option<PathBuf> {
+pub fn config_write_target_for_provider(
+    cwd: &Path,
+    provider_id: &str,
+) -> Result<PathBuf, ConfigWriteTargetError> {
     if crate::config::providers::validate_provider_id_for_filename(provider_id).is_err() {
-        return None;
+        return Err(ConfigWriteTargetError::InvalidProviderId(
+            provider_id.to_string(),
+        ));
     }
-    if let Some(path) = std::env::var_os(COCKPIT_CONFIG_ENV)
-        && !path.is_empty()
-    {
-        let path = PathBuf::from(path);
-        if !config_layer_write_allowed(&path) {
-            return None;
-        }
-        return crate::config::providers::provider_file_path_for_config(&path, provider_id).ok();
+    if let Some(path) = explicit_override_write_target()? {
+        return crate::config::providers::provider_file_path_for_config(&path, provider_id)
+            .map_err(|error| ConfigWriteTargetError::Unresolved(format!("{error:#}")));
     }
 
     // Most-specific first: `target` is the nearest applicable layer (the
@@ -344,11 +474,8 @@ pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option
     let mut target = None;
     let mut defining = None;
     for dir in config_dirs_most_specific_first(cwd) {
-        let path =
-            match crate::config::providers::provider_file_path_for_dir(&dir.path, provider_id) {
-                Ok(path) => path,
-                Err(_) => return None,
-            };
+        let path = crate::config::providers::provider_file_path_for_dir(&dir.path, provider_id)
+            .map_err(|_| ConfigWriteTargetError::InvalidProviderId(provider_id.to_string()))?;
         if target.is_none() {
             target = Some(path.clone());
         }
@@ -356,38 +483,43 @@ pub fn config_write_target_for_provider(cwd: &Path, provider_id: &str) -> Option
             defining = Some(path);
         }
     }
-    defining
+    let path = defining
         .or(target)
         .or_else(|| global_provider_write_target(provider_id))
+        .ok_or_else(|| {
+            ConfigWriteTargetError::Unresolved("the global config directory is unknown".into())
+        })?;
+    authorize_config_layer_write(&path)?;
+    Ok(path)
 }
 
 /// Most-specific *discovered* runtime `config.json` write target.
 ///
-/// Honors `COCKPIT_CONFIG` as the sole layer. Returns `None` when that
-/// override forbids the write, or when no config directory currently exists
-/// on disk. Workspace-bound mutations (per-project sandbox intent, the
-/// secret-bearing image-generation registry, policy import/export) use this
-/// so they can scaffold a project `.cockpit/` instead of silently writing
-/// to the global layer.
-pub fn most_specific_existing_config_write_target(cwd: &Path) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(COCKPIT_CONFIG_ENV)
-        && !path.is_empty()
-    {
-        let path = PathBuf::from(path);
-        if config_layer_write_allowed(&path) {
-            return Some(path);
-        }
-        return None;
+/// Honors `COCKPIT_CONFIG` as the sole layer. `Ok(None)` means no config
+/// directory currently exists on disk (and no override is set); a refused
+/// override is an error, never absence. The returned target has passed the
+/// write gate.
+pub fn most_specific_existing_config_write_target(
+    cwd: &Path,
+) -> Result<Option<PathBuf>, ConfigWriteTargetError> {
+    if let Some(path) = explicit_override_write_target()? {
+        return Ok(Some(path));
     }
 
     // Nearest project layer wins (consistent with load precedence and the
     // gitignore write path); when no project layer applies, fall back to the
     // most-specific non-project layer that already exists on disk.
     let dirs = discover_config_dirs(cwd);
-    dirs.iter()
+    let Some(path) = dirs
+        .iter()
         .find(|d| d.kind == ConfigDirKind::Project)
         .or_else(|| dirs.last())
         .map(|d| d.path.join(CONFIG_FILE))
+    else {
+        return Ok(None);
+    };
+    authorize_config_layer_write(&path)?;
+    Ok(Some(path))
 }
 
 /// Most-specific runtime `config.json` write target for **user-level**
@@ -396,16 +528,15 @@ pub fn most_specific_existing_config_write_target(cwd: &Path) -> Option<PathBuf>
 /// falls back to the canonical global layer even when that directory does
 /// not yet exist.
 ///
-/// Workspace-bound mutations must use
-/// [`most_specific_existing_config_write_target`] plus their own project
-/// scaffold, not this fallback.
-pub fn most_specific_config_write_target(cwd: &Path) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(COCKPIT_CONFIG_ENV)
-        && !path.is_empty()
-    {
-        return most_specific_existing_config_write_target(cwd);
+/// Workspace-bound mutations must use [`workspace_config_write_target`].
+pub fn most_specific_config_write_target(cwd: &Path) -> Result<PathBuf, ConfigWriteTargetError> {
+    if let Some(path) = most_specific_existing_config_write_target(cwd)? {
+        return Ok(path);
     }
-    most_specific_existing_config_write_target(cwd).or_else(|| global_config_file().ok())
+    let path = global_config_file()
+        .map_err(|error| ConfigWriteTargetError::Unresolved(format!("{error:#}")))?;
+    authorize_config_layer_write(&path)?;
+    Ok(path)
 }
 
 /// Effective `mcp.json` files for runtime loading, ordered from least
@@ -880,8 +1011,8 @@ mod tests {
             installation_config_file_paths().unwrap(),
             vec![config.clone()]
         );
-        assert!(most_specific_config_write_target(&repo).is_none());
-        assert!(config_write_target_for_provider(&repo, "p").is_none());
+        assert!(most_specific_config_write_target(&repo).ok().is_none());
+        assert!(config_write_target_for_provider(&repo, "p").ok().is_none());
         assert!(!config_layer_write_allowed(&config));
         // The effective-default writer selects the same layer attach reads,
         // and refuses it rather than falling back.
@@ -936,12 +1067,12 @@ mod tests {
         );
 
         assert_eq!(
-            most_specific_config_write_target(&app),
+            most_specific_config_write_target(&app).ok(),
             Some(app.join(".cockpit").join(CONFIG_FILE)),
             "write target must be the nearest project layer"
         );
         assert_ne!(
-            most_specific_config_write_target(&app),
+            most_specific_config_write_target(&app).ok(),
             Some(root.join(".cockpit").join(CONFIG_FILE)),
             "must not resolve to the masked outermost project layer"
         );
@@ -970,8 +1101,14 @@ mod tests {
         let outer =
             crate::config::providers::provider_file_path_for_dir(&root.join(".cockpit"), "default")
                 .ok();
-        assert_eq!(config_write_target_for_provider(&app, "default"), nearest);
-        assert_ne!(config_write_target_for_provider(&app, "default"), outer);
+        assert_eq!(
+            config_write_target_for_provider(&app, "default").ok(),
+            nearest
+        );
+        assert_ne!(
+            config_write_target_for_provider(&app, "default").ok(),
+            outer
+        );
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
@@ -1002,7 +1139,7 @@ mod tests {
         std::fs::create_dir_all(outer.parent().unwrap()).unwrap();
         std::fs::write(&outer, "{}").unwrap();
         assert_eq!(
-            config_write_target_for_provider(&app, "default"),
+            config_write_target_for_provider(&app, "default").ok(),
             Some(outer.clone()),
             "only the outer layer defines it, so that is the definition"
         );
@@ -1010,7 +1147,7 @@ mod tests {
         std::fs::create_dir_all(inner.parent().unwrap()).unwrap();
         std::fs::write(&inner, "{}").unwrap();
         assert_eq!(
-            config_write_target_for_provider(&app, "default"),
+            config_write_target_for_provider(&app, "default").ok(),
             Some(inner),
             "nearest layer now defines it, so the mutation must target it"
         );
@@ -1038,12 +1175,12 @@ mod tests {
         let _ovr = env.override_cockpit_config(&override_cfg);
 
         assert_eq!(
-            most_specific_config_write_target(&app),
+            most_specific_config_write_target(&app).ok(),
             Some(override_cfg.clone()),
             "override wins over the nearest project layer"
         );
         assert_eq!(
-            config_write_target_for_provider(&app, "default"),
+            config_write_target_for_provider(&app, "default").ok(),
             crate::config::providers::provider_file_path_for_config(&override_cfg, "default").ok(),
             "provider file lives beside the exact override config"
         );
@@ -1064,7 +1201,7 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
 
         assert_eq!(
-            most_specific_config_write_target(&work),
+            most_specific_config_write_target(&work).ok(),
             Some(home.join(".config/cockpit").join(CONFIG_FILE)),
             "no project layer → canonical global layer; legacy home dotfile is ignored"
         );
@@ -1088,17 +1225,17 @@ mod tests {
         );
 
         assert_eq!(
-            config_write_target_for_provider(&work, "default"),
+            config_write_target_for_provider(&work, "default").ok(),
             crate::config::providers::provider_file_path_for_dir(&global, "default").ok(),
             "provider create/first-write falls back to the global layer path"
         );
         assert_eq!(
-            most_specific_existing_config_write_target(&work),
+            most_specific_existing_config_write_target(&work).unwrap(),
             None,
             "workspace-bound mutations must see no discovered layer on a fresh install"
         );
         assert_eq!(
-            most_specific_config_write_target(&work),
+            most_specific_config_write_target(&work).ok(),
             Some(global.join(CONFIG_FILE)),
             "user-level config.json mutations fall back to the global layer path"
         );
@@ -1222,6 +1359,341 @@ mod tests {
         let project = tmp.path().join("workspace/.cockpit");
         ensure_config_layer_dir(&project).unwrap();
         assert!(project.is_dir());
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// B1: workspace trust judges the entry location of every component as
+    /// well as its resolved target. A `.cockpit` that is itself a symlink —
+    /// to a directory inside the repository or outside it — is still the
+    /// project's `.cockpit` layer: under IgnoreConfig it is neither loaded
+    /// nor writable (nor is any file beneath it), whatever spelling of the
+    /// workspace the caller uses. Under Trust it loads and is writable.
+    #[cfg(unix)]
+    mod symlinked_project_layer {
+        use super::*;
+        use crate::db::workspace_trust::WorkspaceTrustMode;
+
+        struct Fixture {
+            _tmp: TempDir,
+            _env: test_support::IsolatedCockpitHome,
+            repo: PathBuf,
+            base: PathBuf,
+        }
+
+        /// `<base>/repo` with `.cockpit -> <target>` where `target` is
+        /// `in_repo` ? `<repo>/conf` : `<base>/outside/conf`, holding a
+        /// config.json that disables redaction.
+        fn fixture(in_repo: bool) -> Fixture {
+            let tmp = TempDir::new().unwrap();
+            let env = test_support::IsolatedCockpitHome::new(tmp.path());
+            crate::config::trust::clear_runtime_policy_for_tests();
+            let base = tmp.path().canonicalize().unwrap();
+            let repo = base.join("repo");
+            let target = if in_repo {
+                repo.join("conf")
+            } else {
+                base.join("outside/conf")
+            };
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::create_dir_all(target.join("providers")).unwrap();
+            std::fs::write(target.join(CONFIG_FILE), r#"{"redact":{"enabled":false}}"#).unwrap();
+            std::os::unix::fs::symlink(&target, repo.join(".cockpit")).unwrap();
+            Fixture {
+                _tmp: tmp,
+                _env: env,
+                repo,
+                base,
+            }
+        }
+
+        fn set_policy(repo: &Path, mode: WorkspaceTrustMode) {
+            let root = crate::config::trust::resolve_trust_root(repo).unwrap();
+            crate::config::trust::set_runtime_policy(root, mode);
+        }
+
+        fn assert_ignored(cwd: &Path, cockpit: &Path) {
+            assert!(
+                !crate::config::trust::project_config_allowed(cockpit),
+                "a symlinked .cockpit must be classified as the project layer: {}",
+                cockpit.display()
+            );
+            assert!(!config_layer_write_allowed(&cockpit.join(CONFIG_FILE)));
+            assert!(!config_layer_write_allowed(
+                &cockpit.join("providers").join("p.json")
+            ));
+            assert!(
+                !config_file_paths_for_load(cwd)
+                    .iter()
+                    .any(|path| path.starts_with(cockpit) || path.ends_with("conf/config.json")),
+                "the ignored project's layer must not load: {:?}",
+                config_file_paths_for_load(cwd)
+            );
+            assert!(
+                matches!(
+                    authorize_config_layer_write(&cockpit.join(CONFIG_FILE)),
+                    Err(ConfigWriteRefused {
+                        reason: crate::config::trust::ConfigWriteRefusal::UntrustedProjectLayer,
+                        ..
+                    })
+                ),
+                "the refusal is typed"
+            );
+        }
+
+        #[test]
+        fn in_repo_link_is_ignored_under_ignore_config() {
+            let f = fixture(true);
+            set_policy(&f.repo, WorkspaceTrustMode::IgnoreConfig);
+            assert_ignored(&f.repo, &f.repo.join(".cockpit"));
+            crate::config::trust::clear_runtime_policy_for_tests();
+        }
+
+        #[test]
+        fn out_of_repo_link_is_ignored_under_ignore_config() {
+            let f = fixture(false);
+            set_policy(&f.repo, WorkspaceTrustMode::IgnoreConfig);
+            assert_ignored(&f.repo, &f.repo.join(".cockpit"));
+            crate::config::trust::clear_runtime_policy_for_tests();
+        }
+
+        /// The caller spells the workspace through a symlinked checkout while
+        /// the trust root is canonical: the alias is canonicalized before the
+        /// `.cockpit` entry is judged.
+        #[test]
+        fn alias_workspace_spelling_with_linked_cockpit_is_ignored() {
+            let f = fixture(false);
+            let alias = f.base.join("alias");
+            std::os::unix::fs::symlink(&f.repo, &alias).unwrap();
+            set_policy(&f.repo, WorkspaceTrustMode::IgnoreConfig);
+            assert_ignored(&alias, &alias.join(".cockpit"));
+            crate::config::trust::clear_runtime_policy_for_tests();
+        }
+
+        /// A relative spelling is refused instead of being resolved against
+        /// the process working directory.
+        #[test]
+        fn relative_spelling_is_refused() {
+            let f = fixture(true);
+            set_policy(&f.repo, WorkspaceTrustMode::IgnoreConfig);
+            let relative = Path::new("repo/.cockpit");
+            assert!(!crate::config::trust::project_config_allowed(relative));
+            assert!(matches!(
+                authorize_config_layer_write(&relative.join(CONFIG_FILE)),
+                Err(ConfigWriteRefused {
+                    reason: crate::config::trust::ConfigWriteRefusal::Unclassifiable,
+                    ..
+                })
+            ));
+            crate::config::trust::clear_runtime_policy_for_tests();
+        }
+
+        /// Inverse: under Trust the linked layer is the project's layer and
+        /// loads and is writable.
+        #[test]
+        fn trusted_linked_layer_loads_and_is_writable() {
+            let f = fixture(true);
+            set_policy(&f.repo, WorkspaceTrustMode::Trust);
+            let cockpit = f.repo.join(".cockpit");
+            assert!(crate::config::trust::project_config_allowed(&cockpit));
+            assert!(config_layer_write_allowed(&cockpit.join(CONFIG_FILE)));
+            assert!(
+                config_file_paths_for_load(&f.repo).contains(&cockpit.join(CONFIG_FILE)),
+                "{:?}",
+                config_file_paths_for_load(&f.repo)
+            );
+            crate::config::trust::clear_runtime_policy_for_tests();
+        }
+
+        /// The sibling predicate: an in-repo entry linked outside the root
+        /// (a `.claude/skills` or agent dir) is still repository content and
+        /// is blocked; a directory genuinely outside the root is not.
+        #[test]
+        fn path_blocked_judges_in_repo_links_by_their_entry() {
+            let f = fixture(true);
+            let outside = f.base.join("outside-skills");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::create_dir_all(f.repo.join(".claude")).unwrap();
+            std::os::unix::fs::symlink(&outside, f.repo.join(".claude/skills")).unwrap();
+            set_policy(&f.repo, WorkspaceTrustMode::IgnoreConfig);
+            assert!(crate::config::trust::path_blocked_by_workspace_trust(
+                &f.repo.join(".claude/skills")
+            ));
+            assert!(!crate::config::trust::path_blocked_by_workspace_trust(
+                &outside
+            ));
+            // A link from outside into the repository is judged by its target.
+            let inbound = f.base.join("inbound");
+            std::os::unix::fs::symlink(f.repo.join("conf"), &inbound).unwrap();
+            assert!(crate::config::trust::path_blocked_by_workspace_trust(
+                &inbound
+            ));
+            crate::config::trust::clear_runtime_policy_for_tests();
+        }
+    }
+
+    /// A `.cockpit` below the trust root (a subdirectory of a git repository
+    /// the session's cwd lies in) is repository content: under IgnoreConfig
+    /// it neither loads nor is writable, exactly like `<root>/.cockpit`.
+    #[test]
+    fn nested_project_layer_below_git_root_is_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(sub.join(".cockpit")).unwrap();
+        std::fs::write(sub.join(".cockpit").join(CONFIG_FILE), "{}").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        let root = crate::config::trust::resolve_trust_root(&sub).unwrap();
+        assert_eq!(root.root, repo);
+        crate::config::trust::set_runtime_policy(
+            root.clone(),
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        );
+        assert!(
+            config_file_paths_for_load(&sub).is_empty(),
+            "{:?}",
+            config_file_paths_for_load(&sub)
+        );
+        assert!(!config_layer_write_allowed(
+            &sub.join(".cockpit").join(CONFIG_FILE)
+        ));
+        crate::config::trust::set_runtime_policy(
+            root,
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        );
+        assert_eq!(
+            config_file_paths_for_load(&sub),
+            vec![sub.join(".cockpit").join(CONFIG_FILE)]
+        );
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// B2: a workspace-bound mutation never writes the user-global layer,
+    /// never scaffolds an ignored project's `.cockpit`, and reports a
+    /// refused override as a typed refusal instead of choosing another
+    /// layer.
+    mod workspace_write_target {
+        use super::*;
+        use crate::db::workspace_trust::WorkspaceTrustMode;
+
+        fn setup() -> (TempDir, test_support::IsolatedCockpitHome, PathBuf) {
+            let tmp = TempDir::new().unwrap();
+            let env = test_support::IsolatedCockpitHome::new(tmp.path());
+            crate::config::trust::clear_runtime_policy_for_tests();
+            let repo = tmp.path().canonicalize().unwrap().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            // An existing global layer: the old selector fell back to it.
+            ensure_global_config_dir().unwrap();
+            std::fs::write(global_config_file().unwrap(), "{}").unwrap();
+            (tmp, env, repo)
+        }
+
+        fn set_policy(repo: &Path, mode: WorkspaceTrustMode) {
+            let root = crate::config::trust::resolve_trust_root(repo).unwrap();
+            crate::config::trust::set_runtime_policy(root, mode);
+        }
+
+        #[test]
+        fn ignore_config_targets_machine_local_not_global_or_project() {
+            let (_tmp, _env, repo) = setup();
+            set_policy(&repo, WorkspaceTrustMode::IgnoreConfig);
+            let target = workspace_config_write_target(&repo).unwrap();
+            assert_eq!(
+                target,
+                local_config_dir_for(&repo).unwrap().join(CONFIG_FILE)
+            );
+            assert!(!repo.join(".cockpit").exists());
+            crate::config::trust::clear_runtime_policy_for_tests();
+        }
+
+        #[test]
+        fn trust_scaffolds_the_project_layer_not_global() {
+            let (_tmp, _env, repo) = setup();
+            set_policy(&repo, WorkspaceTrustMode::Trust);
+            assert_eq!(
+                workspace_config_write_target(&repo).unwrap(),
+                repo.join(".cockpit").join(CONFIG_FILE)
+            );
+            crate::config::trust::clear_runtime_policy_for_tests();
+        }
+
+        #[test]
+        fn refused_override_is_a_typed_refusal_not_a_fallback() {
+            let (_tmp, env, repo) = setup();
+            let config = repo.join(".cockpit").join(CONFIG_FILE);
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(&config, "{}").unwrap();
+            set_policy(&repo, WorkspaceTrustMode::IgnoreConfig);
+            let _override = env.override_cockpit_config(&config);
+            for result in [
+                workspace_config_write_target(&repo),
+                most_specific_config_write_target(&repo),
+                most_specific_existing_config_write_target(&repo).map(|path| path.unwrap()),
+                config_write_target_for_provider(&repo, "p"),
+            ] {
+                assert!(
+                    matches!(result, Err(ConfigWriteTargetError::Refused(_))),
+                    "{result:?}"
+                );
+            }
+            crate::config::trust::clear_runtime_policy_for_tests();
+        }
+
+        #[test]
+        fn no_policy_is_refused() {
+            let (_tmp, _env, repo) = setup();
+            assert_eq!(
+                workspace_config_write_target(&repo),
+                Err(ConfigWriteTargetError::NoWorkspacePolicy)
+            );
+        }
+    }
+
+    /// B2: the configuration documents enforce the write gate inside every
+    /// mutating method, before the mutation lock (which would create the
+    /// layer's directory), so no caller can write an ignored project's layer
+    /// whatever target it selected.
+    #[test]
+    fn config_documents_refuse_an_ignored_project_layer() {
+        let tmp = TempDir::new().unwrap();
+        let _env = test_support::IsolatedCockpitHome::new(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let root = crate::config::trust::resolve_trust_root(&repo).unwrap();
+        crate::config::trust::set_runtime_policy(
+            root.clone(),
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        );
+        let target = repo.join(".cockpit").join(CONFIG_FILE);
+        let mut doc = crate::config::extended::ExtendedConfigDoc::load(&target).unwrap();
+        let mut cfg = doc.config();
+        cfg.gitignore_allow.push("secret/**".into());
+        let error = doc.write(&cfg).unwrap_err();
+        assert!(
+            error.downcast_ref::<ConfigWriteRefused>().is_some(),
+            "{error:#}"
+        );
+        let mut providers = crate::config::providers::ConfigDoc::load(&target).unwrap();
+        let layer = providers.providers();
+        assert!(providers.write(&layer).is_err());
+        assert!(
+            !repo.join(".cockpit").exists(),
+            "a refused write must not scaffold the ignored project's layer"
+        );
+        // Inverse: the same writes succeed once the project is trusted.
+        crate::config::trust::set_runtime_policy(
+            root,
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        );
+        doc.write(&cfg).unwrap();
+        assert!(target.is_file());
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 }

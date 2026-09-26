@@ -228,7 +228,16 @@ mod tests {
         });
         cfg.providers.insert("p".to_string(), provider);
         let mut doc = ConfigDoc::load(&cockpit.join("config.json")).unwrap();
-        doc.write(&cfg).unwrap();
+        // Seed the fixture as the workspace's trusted owner; the tests then
+        // clear the policy and exercise the undecided-trust startup path.
+        crate::config::trust::with_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(cwd).unwrap(),
+                mode: cockpit_config::WorkspaceTrustMode::Trust,
+            },
+            || doc.write(&cfg),
+        )
+        .unwrap();
     }
 
     #[test]

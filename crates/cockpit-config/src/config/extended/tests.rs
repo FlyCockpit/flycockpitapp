@@ -3941,6 +3941,8 @@ fn extended_config_ignores_secret_store_key() {
     let doc = ExtendedConfigDoc::load(&project.join(".cockpit/config.json")).unwrap();
     assert!(doc.raw_field("secretStore").is_none());
     let mut doc = doc;
+    // Writing a project layer requires a trusted workspace.
+    let _trust = enter_trusted_workspace(&project);
     doc.write(&cfg).unwrap();
     let raw: Value = serde_json::from_str(
         &std::fs::read_to_string(project.join(".cockpit/config.json")).unwrap(),

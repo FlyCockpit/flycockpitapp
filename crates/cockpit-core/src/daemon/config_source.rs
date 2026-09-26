@@ -33,7 +33,9 @@ type WorkspaceDaemonLoadFn = dyn Fn(
     ) -> Result<DaemonConfigLoad>
     + Send
     + Sync;
-type WriteTargetFn = dyn Fn(&Path, &str) -> Option<PathBuf> + Send + Sync;
+type WriteTargetFn = dyn Fn(&Path, &str) -> std::result::Result<PathBuf, crate::config::dirs::ConfigWriteTargetError>
+    + Send
+    + Sync;
 type WatchPathsFn = dyn Fn(&Path) -> ConfigWatchPaths + Send + Sync;
 type PrepareGlobalLayersFn = dyn Fn(&Path, &WorkspaceTrustPolicy) -> Result<()> + Send + Sync;
 
@@ -182,7 +184,13 @@ impl ConfigSource {
                 })
             }),
             load,
-            write_target: Arc::new(write_target),
+            write_target: Arc::new(move |cwd: &Path, provider_id: &str| {
+                write_target(cwd, provider_id).ok_or_else(|| {
+                    crate::config::dirs::ConfigWriteTargetError::Unresolved(
+                        "this config source has no provider write target".into(),
+                    )
+                })
+            }),
             watch_paths: Arc::new(watch_paths),
             prepare_global_layers: Arc::new(|_, _| Ok(())),
             vault: Arc::new(Mutex::new(None)),
@@ -218,7 +226,13 @@ impl ConfigSource {
             workspace_daemon_load: Arc::new(move |cwd, _workspace| {
                 workspace_daemon_load_source(cwd)
             }),
-            write_target: Arc::new(write_target),
+            write_target: Arc::new(move |cwd: &Path, provider_id: &str| {
+                write_target(cwd, provider_id).ok_or_else(|| {
+                    crate::config::dirs::ConfigWriteTargetError::Unresolved(
+                        "this config source has no provider write target".into(),
+                    )
+                })
+            }),
             watch_paths: Arc::new(watch_paths),
             prepare_global_layers: Arc::new(|_, _| Ok(())),
             vault: Arc::new(Mutex::new(None)),
@@ -512,7 +526,7 @@ impl ConfigSource {
         &self,
         cwd: &Path,
         provider_id: &str,
-    ) -> Option<PathBuf> {
+    ) -> std::result::Result<PathBuf, crate::config::dirs::ConfigWriteTargetError> {
         (self.write_target)(cwd, provider_id)
     }
 

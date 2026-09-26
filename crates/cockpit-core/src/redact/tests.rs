@@ -1798,8 +1798,17 @@ fn ssh_missing_configured_dir_fails_closed() {
     cfg.ssh_key_dir = Some(missing);
     let error = RedactionTable::build(&cfg, dir.path())
         .expect_err("a missing configured SSH directory fails the build");
+    let typed = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<super::ssh::SshKeyDirUnavailableError>())
+        .unwrap_or_else(|| panic!("typed SSH source error: {error:#}"));
+    assert!(typed.configured);
+    assert_eq!(
+        typed.reason,
+        super::ssh::SshKeyDirUnavailableReason::Missing
+    );
     assert!(
-        format!("{error:#}").contains("redact.ssh_key_dir does not exist"),
+        format!("{error:#}").contains("configured (redact.ssh_key_dir)"),
         "{error:#}"
     );
 }
@@ -3462,10 +3471,7 @@ fn ssh_key_dir_absence_is_only_an_absent_default() {
         let error = collect_ssh_key_candidates(Some(&dir))
             .expect_err(what)
             .to_string();
-        assert!(
-            error.contains("SSH source is unavailable"),
-            "{what}: {error}"
-        );
+        assert!(error.contains("SSH key directory"), "{what}: {error}");
     }
 }
 
@@ -3501,6 +3507,76 @@ fn ssh_collector_refuses_a_key_added_during_the_fence() {
             "{late_name}: {error:#}"
         );
     }
+}
+
+/// T7: replacing the material of an already-collected key (same filename)
+/// while a later key is confirmed refuses the capture: the closure re-reads
+/// every collected key, not only the directory's filenames.
+#[cfg(unix)]
+#[test]
+fn ssh_collector_refuses_a_collected_key_replaced_during_the_fence() {
+    use super::ssh::{SshKeyDir, collect_ssh_key_candidates_with_fence};
+    let pem = |marker: &str| {
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{marker}\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+    };
+    let dir = TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    std::fs::write(ssh.join("id_a"), pem("original-key-a-71c2")).unwrap();
+    std::fs::write(ssh.join("id_b"), pem("second-key-b-0d4e")).unwrap();
+    let id_a = ssh.join("id_a");
+    let result =
+        collect_ssh_key_candidates_with_fence(Some(&SshKeyDir::configured(&ssh)), |path| {
+            if path.ends_with("id_b") {
+                std::fs::write(&id_a, pem("replacement-key-a-9f35")).unwrap();
+            }
+        });
+    let error = result.expect_err("a collected key replaced during the fence must refuse capture");
+    assert!(
+        format!("{error:#}").contains("a collected key was replaced"),
+        "{error:#}"
+    );
+    // Inverse: with no replacement both keys are collected.
+    let keys =
+        collect_ssh_key_candidates_with_fence(Some(&SshKeyDir::configured(&ssh)), |_| {}).unwrap();
+    assert!(
+        keys.iter()
+            .any(|(value, _)| value.contains("replacement-key-a-9f35"))
+    );
+    assert!(
+        keys.iter()
+            .any(|(value, _)| value.contains("second-key-b-0d4e"))
+    );
+}
+
+/// F4: an unusable SSH key directory is a typed error naming the directory
+/// and the settings that resolve it, for the default directory as well.
+#[cfg(unix)]
+#[test]
+fn ssh_key_dir_unavailable_error_is_typed_and_actionable() {
+    use super::ssh::{
+        SshKeyDir, SshKeyDirUnavailableError, SshKeyDirUnavailableReason,
+        collect_ssh_key_candidates,
+    };
+    let dir = TempDir::new().unwrap();
+    let dangling = dir.path().join("dangling-ssh");
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+    let error = collect_ssh_key_candidates(Some(&SshKeyDir::default_dir(&dangling)))
+        .expect_err("a dangling default directory is unavailable");
+    let typed = error
+        .downcast_ref::<SshKeyDirUnavailableError>()
+        .expect("typed SSH source error");
+    assert_eq!(typed.reason, SshKeyDirUnavailableReason::DanglingLink);
+    assert!(!typed.configured);
+    let message = error.to_string();
+    assert!(message.contains("default"), "{message}");
+    assert!(
+        message.contains(&dangling.display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("redact.scan_ssh_keys"), "{message}");
 }
 
 #[cfg(unix)]

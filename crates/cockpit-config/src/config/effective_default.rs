@@ -2141,10 +2141,7 @@ fn journal_context_error(record: &JournalRecord, config_path: &Path) -> Option<&
     }
     // A project layer workspace trust no longer allows must not be rewritten
     // by recovery, exactly as attach would not read it.
-    let parent = config_parent(config_path);
-    if parent.file_name().is_some_and(|name| name == ".cockpit")
-        && !crate::config::trust::project_config_write_allowed(parent)
-    {
+    if !crate::config::dirs::config_layer_write_allowed(config_path) {
         return Some("journal target layer is no longer allowed by workspace trust");
     }
     if matches!(record.scope, EffectiveDefaultScope::Project)

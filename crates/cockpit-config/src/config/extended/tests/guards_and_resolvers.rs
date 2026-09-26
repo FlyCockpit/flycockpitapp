@@ -812,6 +812,7 @@ fn append_gitignore_allow_targets_project_and_dedups() {
     let cfg_path = project.join(".cockpit/config.json");
     std::fs::write(&cfg_path, r#"{"name":"Chris"}"#).unwrap();
 
+    let _trust = enter_trusted_workspace(&project);
     append_gitignore_allow_to_project(&project, "target/").unwrap();
     append_gitignore_allow_to_project(&project, "target/").unwrap(); // dup no-op
     append_gitignore_allow_to_project(&project, "dist/**").unwrap();
@@ -823,6 +824,45 @@ fn append_gitignore_allow_targets_project_and_dedups() {
     );
     // Sibling key preserved.
     assert_eq!(cfg.name.as_deref(), Some("Chris"));
+}
+
+/// "Approve for this project" is workspace-bound: with no trust decision it
+/// is refused, and under IgnoreConfig it lands in the per-directory
+/// machine-local layer — never the ignored project's `.cockpit` (not even
+/// scaffolded) and never the global layer.
+#[test]
+fn append_gitignore_allow_never_writes_an_ignored_project() {
+    let isolated = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+
+    assert!(append_gitignore_allow_to_project(&project, "target/").is_err());
+    assert!(!project.join(".cockpit").exists());
+
+    let _ignore = crate::config::trust::enter_workspace_trust_policy(
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&project).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        },
+    );
+    append_gitignore_allow_to_project(&project, "target/").unwrap();
+    assert!(!project.join(".cockpit").exists());
+    let local = crate::config::dirs::local_config_dir_for(&project)
+        .unwrap()
+        .join(crate::config::dirs::CONFIG_FILE);
+    assert_eq!(
+        ExtendedConfigDoc::load(&local)
+            .unwrap()
+            .config()
+            .gitignore_allow,
+        vec!["target/".to_string()]
+    );
+    assert!(
+        !crate::config::dirs::global_config_file().unwrap().exists(),
+        "the user-global layer is never the fallback"
+    );
 }
 
 /// `queuedMessagesAsSteering` defaults to `false` (Held). An omitted field

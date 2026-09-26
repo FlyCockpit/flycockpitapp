@@ -929,17 +929,17 @@ impl App {
     }
 
     /// True when any modal overlay/pane currently owns the screen — pin
-    /// modes don't stack on top of these.
+    /// modes don't stack on top of these. Any layer other than the surface
+    /// on top counts (from the layer stack, so none can be forgotten); then
+    /// the surface's own modal panes.
     pub(super) fn any_overlay_open(&self) -> bool {
-        self.dialog.is_active()
+        self.top_layer() != super::pointer::Layer::Surface
+            || self.dialog.is_active()
             || self.overlay.is_open()
             || self.pane.is_some()
-            || self.context_menu.is_some()
             || self.pin_pick.is_some()
             || self.fork_pick.is_some()
             || self.copy_pick.is_some()
-            || self.pins_review.is_some()
-            || self.rules_review.is_some()
     }
 }
 

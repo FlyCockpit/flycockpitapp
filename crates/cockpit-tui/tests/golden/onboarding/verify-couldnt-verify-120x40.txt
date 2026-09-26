@@ -1,12 +1,12 @@
  ‹ Back                                                                                                                 
                  ✗ Couldn't verify · step 4/8                                                                           
                  Credential rejected (401)                                                                              
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  The provider rejected this credential.                                                                 
                                                                                                                         
                  Step back to replace the credential, then retry.                                                       
-                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

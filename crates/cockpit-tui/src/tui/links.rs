@@ -49,6 +49,19 @@ impl LinkRegistry {
         }
     }
 
+    /// A surface was just painted over `rect`, on top of every link
+    /// registered so far this frame: any link it touches is gone from the
+    /// screen, so it is neither clickable, hoverable nor re-emitted as an
+    /// OSC 8 hyperlink over the covering surface. Links the covering surface
+    /// registers afterwards are its own and stay.
+    pub fn occlude(&mut self, rect: Rect) {
+        self.regions.retain(|link| !link.rect.intersects(rect));
+        self.hovered = self
+            .hovered_url
+            .as_deref()
+            .and_then(|url| self.regions.iter().position(|link| link.url == url));
+    }
+
     pub fn at(&self, col: u16, row: u16) -> Option<&LinkRegion> {
         self.regions.iter().find(|link| {
             col >= link.rect.x
@@ -263,6 +276,19 @@ impl LinkPointerGesture {
 
     fn tombstone_activation(&mut self) {
         self.pending_activation = None;
+    }
+
+    /// Whether a press is held (test inspection).
+    #[cfg(test)]
+    pub fn has_pending_press(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// End the pointer capture of a press in progress (its release can no
+    /// longer arrive) without touching a completed click: a scheduled
+    /// activation waiting out its multi-click window still fires.
+    pub fn end_press(&mut self) {
+        self.pending = None;
     }
 
     pub fn cancel(&mut self) {

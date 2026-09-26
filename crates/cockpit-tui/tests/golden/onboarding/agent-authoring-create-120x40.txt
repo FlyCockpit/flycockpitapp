@@ -1,12 +1,12 @@
  ‹ Back                                                                                                                 
                  Create your agent · step 6/8                                                                           
                  Everything is ready for the stable create operation.                                                   
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Status ────────────────────────────────────────────────────────────────────────────╮                 
                  │ ▣ Make default agent  on                                                           │                 
                  │ ◐  Ready to submit the stable create operation.                                    │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

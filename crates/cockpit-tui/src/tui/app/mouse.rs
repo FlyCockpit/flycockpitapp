@@ -1,4 +1,6 @@
+use super::pointer::Layer;
 use super::*;
+use ratatui::layout::Position;
 
 fn resolve_inner_scroll_target(
     regions: &[AffordanceScrollRegion],
@@ -43,20 +45,62 @@ impl App {
     /// - left-up → finalize drag-select (selection persists for copy).
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
-        if let Some(prompt) = self.daemon_restart_prompt.as_mut() {
-            let restart = point_in(prompt.restart_rect, mouse.column, mouse.row);
-            let quit = point_in(prompt.quit_rect, mouse.column, mouse.row);
-            if matches!(mouse.kind, MouseEventKind::Moved) {
-                if restart {
-                    prompt.focus = DaemonRestartFocus::Restart;
-                } else if quit {
-                    prompt.focus = DaemonRestartFocus::Quit;
-                }
-            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                if restart {
-                    self.accept_daemon_restart();
-                } else if quit {
-                    self.quit_after_daemon_stop();
+        // A layer may have opened or mounted since the last pointer event
+        // (by key, daemon event or async completion): end the captures the
+        // old owner can no longer release before routing this event.
+        self.sync_pointer_owner();
+        self.observe_pointer(mouse.column, mouse.row);
+        let owner = self.pointer_owner_at(Position::new(mouse.column, mouse.row));
+        // A capture belongs to the layer that received its press: an event
+        // routed to a different owner (a drag that crossed into a review
+        // box, say) means that owner will never see the release.
+        if self
+            .last_pointer_event_owner
+            .is_some_and(|previous| previous != owner)
+        {
+            self.end_pointer_captures();
+        }
+        self.last_pointer_event_owner = Some(owner);
+        // A press or scroll that goes to a layer above the onboarding base
+        // breaks a pending two-click confirmation there.
+        if owner != Layer::Onboarding
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Down(_)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            )
+        {
+            self.note_interaction_above_onboarding();
+        }
+        self.route_mouse(mouse, owner);
+        // A release ends every capture. Its owner has handled it; anything
+        // still latched had its release swallowed by another handler (an
+        // overlay inside the surface, a review box) and must not survive.
+        if matches!(mouse.kind, MouseEventKind::Up(_)) {
+            self.end_pointer_captures();
+        }
+    }
+
+    fn route_mouse(&mut self, mouse: MouseEvent, owner: Layer) {
+        if owner == Layer::DaemonRestartPrompt {
+            if let Some(prompt) = self.daemon_restart_prompt.as_mut() {
+                let restart = point_in(prompt.restart_rect, mouse.column, mouse.row);
+                let quit = point_in(prompt.quit_rect, mouse.column, mouse.row);
+                if matches!(mouse.kind, MouseEventKind::Moved) {
+                    if restart {
+                        prompt.focus = DaemonRestartFocus::Restart;
+                    } else if quit {
+                        prompt.focus = DaemonRestartFocus::Quit;
+                    }
+                } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if restart {
+                        self.accept_daemon_restart();
+                    } else if quit {
+                        self.quit_after_daemon_stop();
+                    }
                 }
             }
             return;
@@ -85,89 +129,98 @@ impl App {
             self.close_chat_header_popover_on_outside_press(mouse.column, mouse.row);
             self.close_composer_picker_on_outside_press(mouse.column, mouse.row);
         }
-        if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
-            if self.pending_workspace_trust.is_none() {
-                self.dialog.handle_workspace_trust_pointer(mouse);
-                if let Some((root, mode)) = self.dialog.take_workspace_trust_choice() {
-                    self.apply_workspace_trust_choice(root, mode);
-                }
-            }
-            return;
-        }
-        // The full-screen onboarding shell owns the whole screen while
-        // active: its native surfaces consume their events, engine screens
-        // route pointer input to the embedded settings dialog, and nothing
-        // underneath (chat rows, links, footer) reacts.
-        if self.startup_modal_on_top() != Some(StartupModal::WorkspaceTrust)
-            && self.onboarding_shell.is_some()
-        {
-            let outcome = self
-                .onboarding_shell
-                .as_mut()
-                .expect("shell presence checked above")
-                .handle_mouse(mouse, &mut self.dialog);
-            if outcome.consumed {
-                self.apply_onboarding_shell_action(outcome.action);
-                return;
-            }
-            let engine_screen = self.onboarding_shell.as_ref().is_some_and(|shell| {
-                shell.screen_kind()
-                    == crate::tui::onboarding::OnboardingScreenKind::EmbeddedSettings
-            });
-            if engine_screen {
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-                if matches!(mouse.kind, MouseEventKind::Moved) && !self.mouse_capture {
-                    return;
-                }
-                let _ = self.dialog.handle_settings_pointer(mouse);
-            }
-            return;
-        }
-        // The keys overlay is visually topmost and therefore owns pointer
-        // input before links or settings targets underneath it.
-        if let Some(overlay) = self.keys_overlay.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => overlay.scroll_up(),
-                MouseEventKind::ScrollDown => overlay.scroll_down(),
-                MouseEventKind::Down(_) => {
-                    self.invalidate_mouse_gesture(
-                        MouseGestureInvalidation::Cancel,
-                        self.event_loop_monotonic_now,
-                    );
-                }
-                _ => {}
-            }
-            return;
-        }
-        // A visible context menu is the next modal layer. It must preempt a
-        // settings dialog that may still be rendered underneath it.
-        if let Some(menu) = self.context_menu.clone() {
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    self.invalidate_mouse_gesture(
-                        MouseGestureInvalidation::Cancel,
-                        self.event_loop_monotonic_now,
-                    );
-                    let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
-                    if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
-                        self.context_menu = None;
-                        self.execute_context_menu_action(action, menu.clicked_chat_row);
-                    } else {
-                        self.context_menu = None;
+        // Route to the layer that owns the pointer here — the topmost one in
+        // the layer stack, the same order render paints in.
+        match owner {
+            Layer::DaemonRestartPrompt | Layer::Surface => {}
+            Layer::KeysOverlay => {
+                if let Some(overlay) = self.keys_overlay.as_mut() {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => overlay.scroll_up(),
+                        MouseEventKind::ScrollDown => overlay.scroll_down(),
+                        MouseEventKind::Down(_) => {
+                            self.invalidate_mouse_gesture(
+                                MouseGestureInvalidation::Cancel,
+                                self.event_loop_monotonic_now,
+                            );
+                        }
+                        _ => {}
                     }
                 }
-                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                    self.invalidate_mouse_gesture(
-                        MouseGestureInvalidation::Cancel,
-                        self.event_loop_monotonic_now,
-                    );
-                    self.context_menu = None;
-                }
-                _ => {}
+                return;
             }
-            return;
+            Layer::ContextMenu => {
+                if let Some(menu) = self.context_menu.clone() {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            self.invalidate_mouse_gesture(
+                                MouseGestureInvalidation::Cancel,
+                                self.event_loop_monotonic_now,
+                            );
+                            let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
+                            if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
+                                self.context_menu = None;
+                                self.execute_context_menu_action(action, menu.clicked_chat_row);
+                            } else {
+                                self.context_menu = None;
+                            }
+                        }
+                        MouseEventKind::Down(_)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown => {
+                            self.invalidate_mouse_gesture(
+                                MouseGestureInvalidation::Cancel,
+                                self.event_loop_monotonic_now,
+                            );
+                            self.context_menu = None;
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            // The review boxes are keyboard panels: the cells they paint
+            // take the pointer so nothing hidden under them reacts.
+            Layer::PinsReview | Layer::RulesReview => return,
+            Layer::WorkspaceTrust => {
+                if self.pending_workspace_trust.is_none() {
+                    self.dialog.handle_workspace_trust_pointer(mouse);
+                    if let Some((root, mode)) = self.dialog.take_workspace_trust_choice() {
+                        self.apply_workspace_trust_choice(root, mode);
+                    }
+                }
+                return;
+            }
+            // The full-screen onboarding shell owns the whole screen while
+            // it is the base: its native surfaces consume their events,
+            // engine screens route pointer input to the embedded settings
+            // dialog, and nothing underneath (chat rows, links, footer)
+            // reacts.
+            Layer::Onboarding => {
+                let outcome = self
+                    .onboarding_shell
+                    .as_mut()
+                    .expect("the onboarding layer has a shell")
+                    .handle_mouse(mouse, &mut self.dialog);
+                if outcome.consumed {
+                    self.apply_onboarding_shell_action(outcome.action);
+                    return;
+                }
+                let engine_screen = self.onboarding_shell.as_ref().is_some_and(|shell| {
+                    shell.screen_kind()
+                        == crate::tui::onboarding::OnboardingScreenKind::EmbeddedSettings
+                });
+                if engine_screen {
+                    self.hovered_suggestion = None;
+                    self.hovered_control_chip = None;
+                    self.hovered_affordance = None;
+                    if matches!(mouse.kind, MouseEventKind::Moved) && !self.mouse_capture {
+                        return;
+                    }
+                    let _ = self.dialog.handle_settings_pointer(mouse);
+                }
+                return;
+            }
         }
         if self.composer_controls.picker_scroll_drag {
             match mouse.kind {
@@ -204,58 +257,9 @@ impl App {
             }
         }
         if matches!(mouse.kind, MouseEventKind::Moved) {
-            if !pointer_in_composer_picker
-                && self.session_rail_owns_pointer(mouse.column, mouse.row)
-            {
-                self.link_registry.clear_hover();
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-                if self.mouse_capture {
-                    let _ = self.session_rail.handle_mouse(mouse);
-                }
-                return;
-            }
-            self.session_rail.clear_hover();
-            if self.mouse_capture {
-                let _ = self.button_registry.handle_mouse(mouse);
-                let hovered_picker_row = self
-                    .button_registry
-                    .hit(mouse.column, mouse.row)
-                    .and_then(|target| match &target.dispatch {
-                        crate::tui::button::ButtonDispatch::ComposerPickerRow { index } => {
-                            Some(*index)
-                        }
-                        _ => None,
-                    });
-                if let Some(index) = hovered_picker_row {
-                    self.hover_composer_picker_row(index);
-                }
-                self.update_queue_pointer(mouse);
-                let _link_hover_changed = self.link_registry.update_hover(mouse.column, mouse.row);
-            } else {
-                self.queue_hover = None;
-                self.link_registry.clear_hover();
-            }
-            if self.link_registry.hovered().is_some() {
-                self.dialog.clear_settings_pointer_hover();
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-                return;
-            }
-            if self.mouse_capture && self.dialog.handle_settings_pointer(mouse).is_some() {
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-                return;
-            }
-            self.update_hovered_affordance(&mouse);
-            if self.link_registry.hovered().is_some() {
-                self.hovered_suggestion = None;
-                self.hovered_control_chip = None;
-                self.hovered_affordance = None;
-            }
+            // Hover follows the pointer through the one surface resolver the
+            // redraw-time pass uses too.
+            self.resolve_surface_hover(Some(Position::new(mouse.column, mouse.row)), true);
             return;
         }
         if !self.mouse_capture {
@@ -973,11 +977,16 @@ impl App {
         (clamped_col, clamped_row)
     }
 
-    fn transcript_hover_suppressed(&self) -> bool {
-        self.dialog.is_active()
+    /// Whether the transcript is not what the pointer is over: a layer above
+    /// the base owns the pointer (the layer stack), or a panel inside the
+    /// surface layer occludes the transcript (the surface's own z-order:
+    /// dialogs, the question dialog, the composer picker, body overlays, an
+    /// embedded pane).
+    fn transcript_hover_suppressed(&self, mouse: &MouseEvent) -> bool {
+        self.pointer_owner_at(Position::new(mouse.column, mouse.row)) != Layer::Surface
+            || self.pointer_occluded(Position::new(mouse.column, mouse.row))
+            || self.dialog.is_active()
             || self.question_dialog.is_some()
-            || self.context_menu.is_some()
-            || self.keys_overlay.is_some()
             || self.composer_controls.picker.is_some()
             || matches!(
                 self.overlay,
@@ -1050,7 +1059,7 @@ impl App {
 
     fn control_chip_at_mouse(&self, mouse: &MouseEvent) -> Option<super::render::ControlChip> {
         if !self.mouse_capture
-            || self.transcript_hover_suppressed()
+            || self.transcript_hover_suppressed(mouse)
             || !self.mouse_in_chat_area(mouse)
         {
             return None;
@@ -1063,7 +1072,7 @@ impl App {
 
     fn affordance_target_at_mouse(&self, mouse: &MouseEvent) -> Option<AffordanceTarget> {
         if !self.mouse_capture
-            || self.transcript_hover_suppressed()
+            || self.transcript_hover_suppressed(mouse)
             || !self.mouse_in_chat_area(mouse)
         {
             return None;
@@ -1096,7 +1105,7 @@ impl App {
             .is_some_and(|area| point_in(area, mouse.column, mouse.row))
     }
 
-    fn update_hovered_affordance(&mut self, mouse: &MouseEvent) {
+    pub(super) fn update_hovered_affordance(&mut self, mouse: &MouseEvent) {
         self.hovered_suggestion = self.suggestion_target_at_mouse(mouse);
         if self.hovered_suggestion.is_some() {
             self.hovered_control_chip = None;
@@ -1598,6 +1607,7 @@ impl App {
     pub(super) fn drop_mouse_copy_ui_ownership(&mut self) {
         self.pending_mouse_copies.clear();
         self.mouse_gesture_state.invalidate_copy();
+        self.drop_orphaned_copy_payload();
     }
 
     pub(super) fn tombstone_cancelled_mouse_copies(&mut self, cancelled: &[AsyncActionResult]) {
@@ -1862,7 +1872,7 @@ impl App {
         self.reduce_mouse_gesture(input);
     }
 
-    fn reduce_mouse_gesture(
+    pub(super) fn reduce_mouse_gesture(
         &mut self,
         input: mouse_gesture::GestureInput,
     ) -> Vec<mouse_gesture::GestureEffect> {
@@ -1873,7 +1883,25 @@ impl App {
         let (next, effects) = mouse_gesture::reduce(state, &cfg, &input);
         self.mouse_gesture_state = next;
         self.apply_gesture_effects(&effects);
+        self.drop_orphaned_copy_payload();
         effects
+    }
+
+    /// The committed copy text lives exactly as long as its copy timer: once
+    /// the timer was fired or tombstoned (Esc, a new press, a view or
+    /// terminal change, a session change, shutdown), the text is dropped.
+    /// Called after every change to the gesture's copy timer.
+    pub(super) fn drop_orphaned_copy_payload(&mut self) {
+        let state = &self.mouse_gesture_state;
+        if self
+            .scheduled_copy_payload
+            .as_ref()
+            .is_some_and(|(token, _)| {
+                state.copy_token != Some(*token) || state.pending_copy_deadline.is_none()
+            })
+        {
+            self.scheduled_copy_payload = None;
+        }
     }
 
     fn apply_gesture_effects(&mut self, effects: &[mouse_gesture::GestureEffect]) {
@@ -1883,8 +1911,14 @@ impl App {
                 | mouse_gesture::GestureEffect::ScheduleActivation { .. }
                 | mouse_gesture::GestureEffect::CancelActivation { .. }
                 | mouse_gesture::GestureEffect::Activate { .. }
-                | mouse_gesture::GestureEffect::Notify { .. }
-                | mouse_gesture::GestureEffect::ScheduleCopyTimer { .. } => {}
+                | mouse_gesture::GestureEffect::Notify { .. } => {}
+                // A multi-click copy is committed when the click completes:
+                // capture its text now, so the timer copies what was
+                // selected even if the selection is cleared meanwhile (a
+                // resize voids it).
+                mouse_gesture::GestureEffect::ScheduleCopyTimer { token, .. } => {
+                    self.scheduled_copy_payload = Some((*token, self.snapshot_selection_text()));
+                }
                 mouse_gesture::GestureEffect::Select(request) => {
                     self.selection = self.materialize_gesture_selection(*request);
                 }
@@ -1936,8 +1970,15 @@ impl App {
     }
 
     fn schedule_mouse_copy(&mut self, token: u64, press_generation: u64) {
-        let text = self.snapshot_selection_text();
+        let text = match self.scheduled_copy_payload.take() {
+            Some((scheduled, text)) if scheduled == token => text,
+            _ => self.snapshot_selection_text(),
+        };
         let char_count = text.chars().count();
+        #[cfg(test)]
+        {
+            self.last_scheduled_mouse_copy_text = Some(text.clone());
+        }
         #[cfg(test)]
         if self.arm_controllable_mouse_copy {
             self.start_controllable_mouse_copy(token, press_generation, char_count);

@@ -1,15 +1,15 @@
  ‹ Back                                                                         
   Default thinking · step 5/8                                                   
   Choose the model-level thinking default.                                      
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ◆ Model  ·  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Thinking ────────────────────────────────────────────────────────────────╮  
   │ ◉ inherit                                                                │  
   │ ○ off                                                                    │  
   │ ○ low                                                                    │  
   │ ○ medium                                                                 │  
   │ ○ high                                                                   │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

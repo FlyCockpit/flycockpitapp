@@ -1,8 +1,9 @@
  ‹ Back                                                                                                                 
                  Let's add a provider · step 4/8                                                                        
                  Pick who you'll fly with.                                                                              
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Filter ────────────────────────────────────────────────────────────────────────────╮                 
                  │ filter by name                                                                     │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
@@ -24,7 +25,6 @@
                  │   DeepSeek  (API key)                                                              │                 
                  │   Anthropic (Claude API)  (API key)                                                │                 
                  │   Xiaomi MiMo  (API key)                                                           │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

@@ -28,6 +28,7 @@ mod chrome;
 mod lifetime;
 mod model;
 mod profile;
+mod progress;
 mod search;
 mod secure_store;
 mod ui;
@@ -93,16 +94,7 @@ pub(crate) const WELCOME_ANIMATION_FRAMES: usize = welcome::PROMPT_FRAME;
 /// user-visible checkpoints; `Profile` owns its own slot so a failed
 /// profile-engine mount can never strand the user on the Welcome "press
 /// any key" screen at a later stage (#425).
-const PROGRESS_STEPS: [&str; 8] = [
-    "Welcome",
-    "Name",
-    "Secure store",
-    "Provider",
-    "Model",
-    "Agent",
-    "Lifetime",
-    "Ready",
-];
+use progress::STEPS as PROGRESS_STEPS;
 
 fn progress_index(stage: OnboardingStage) -> usize {
     match stage {
@@ -115,6 +107,140 @@ fn progress_index(stage: OnboardingStage) -> usize {
         OnboardingStage::Lifetime => 6,
         OnboardingStage::Complete => 7,
     }
+}
+
+/// The full-screen shell's row layout: header (title + subtitle), the
+/// progress row, a rule, one blank line, the content, and the help/action
+/// footer. The rule and blank line close the chrome so the progress row never
+/// reads as the first item of the content's option list.
+///
+/// The layout is height-adaptive and sliced by hand rather than handed to the
+/// constraint solver, whose tie-breaking under pressure could shrink the
+/// footer. Allocation order, so the most important rows survive longest:
+///
+/// 1. the footer owns the last row;
+/// 2. one content row is reserved whenever it can coexist with the footer;
+/// 3. header (2) then progress (1) take what is left, so they shrink before
+///    content does;
+/// 4. the rule, then the blank line, appear only from their thresholds;
+/// 5. the rest goes to the content.
+///
+/// With these thresholds the content never has fewer rows than the
+/// pre-redesign fixed layout (`Length(3)` header with its rule, `Length(1)`
+/// progress, `Min(1)` content, `Length(1)` footer) gave it, except for the
+/// deliberate blank line on terminals of 24 rows or more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellRows {
+    header: Rect,
+    progress: Rect,
+    rule: Option<Rect>,
+    content: Rect,
+    footer: Rect,
+}
+
+impl ShellRows {
+    /// Column height from which the blank line below the rule is kept (a
+    /// 24-row terminal). Below it the blank row would cost content a row
+    /// relative to the pre-redesign layout.
+    const BLANK_MIN_HEIGHT: u16 = 22;
+    /// Column height from which the rule is kept (a 10-row terminal, whose
+    /// 3 content rows still hold a bordered field or three choices). With
+    /// the rule the content matches the pre-redesign layout exactly.
+    const RULE_MIN_HEIGHT: u16 = 8;
+
+    fn split(col: Rect) -> Self {
+        let mut budget = col.height;
+        let mut reserve = |want: u16| {
+            let got = want.min(budget);
+            budget -= got;
+            got
+        };
+        let footer_height = reserve(1);
+        let reserved_content = reserve(1);
+        let header_height = reserve(2);
+        let progress_height = reserve(1);
+        let rule_height = if col.height >= Self::RULE_MIN_HEIGHT {
+            reserve(1)
+        } else {
+            0
+        };
+        let blank_height = if col.height >= Self::BLANK_MIN_HEIGHT {
+            reserve(1)
+        } else {
+            0
+        };
+        let content_height = reserved_content + budget;
+
+        let mut y = col.y;
+        let mut take = |height: u16| {
+            let rect = Rect {
+                x: col.x,
+                y,
+                width: col.width,
+                height,
+            };
+            y += height;
+            rect
+        };
+        let header = take(header_height);
+        let progress = take(progress_height);
+        let rule = (rule_height > 0).then(|| take(rule_height));
+        take(blank_height);
+        let content = take(content_height);
+        let footer = take(footer_height);
+        Self {
+            header,
+            progress,
+            rule,
+            content,
+            footer,
+        }
+    }
+}
+
+/// Invariants every onboarding golden must hold, asserted on the freshly
+/// rendered buffer inside the shared golden path (never by re-reading fixture
+/// files, which a concurrent regeneration may be rewriting). `◆` is reserved
+/// for the progress row: it appears exactly once, on that row, and never on
+/// the edge-to-edge Welcome scene.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn assert_golden_invariants(screen: &str, buf: &ratatui::buffer::Buffer) {
+    let area = buf.area;
+    let rows: Vec<String> = (area.top()..area.bottom())
+        .map(|y| {
+            (area.left()..area.right())
+                .map(|x| buf[(x, y)].symbol())
+                .collect()
+        })
+        .collect();
+    let hits: Vec<u16> = rows
+        .iter()
+        .zip(area.top()..)
+        .filter(|(row, _)| row.contains(progress::CURRENT_MARK))
+        .map(|(_, y)| y)
+        .collect();
+    let total: usize = rows
+        .iter()
+        .map(|row| row.matches(progress::CURRENT_MARK).count())
+        .sum();
+    if screen.starts_with("welcome") {
+        assert_eq!(
+            total, 0,
+            "{screen}: the Welcome scene draws no progress row"
+        );
+        return;
+    }
+    let progress_row = ShellRows::split(ui::column(area)).progress;
+    let expected: Vec<u16> = if progress_row.height == 0 {
+        Vec::new()
+    } else {
+        vec![progress_row.y]
+    };
+    assert_eq!(
+        hits, expected,
+        "{screen}: `◆` must mark only the progress row"
+    );
+    assert_eq!(total, expected.len(), "{screen}: `◆` must appear once");
 }
 
 /// Deterministic reduced-motion detection shared by the shell.
@@ -351,7 +477,6 @@ struct EscapeMenu {
     cursor: usize,
     choices: Vec<EscapeChoice>,
     row_rects: Vec<Rect>,
-    hover: Option<usize>,
 }
 
 impl EscapeMenu {
@@ -396,7 +521,6 @@ impl EscapeMenu {
             cursor: 0,
             choices,
             row_rects: Vec::new(),
-            hover: None,
         })
     }
 
@@ -419,11 +543,13 @@ impl EscapeMenu {
         let pos = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
-                self.hover = self
+                // Hover itself is derived at render from the pointer; a
+                // move over a row also moves the keyboard cursor there.
+                if let Some(index) = self
                     .row_rects
                     .iter()
-                    .position(|rect| chrome::hit(*rect, pos));
-                if let Some(index) = self.hover {
+                    .position(|rect| chrome::hit(*rect, pos))
+                {
                     self.cursor = index;
                 }
                 EscapeMenuPointer::Tracked
@@ -489,7 +615,13 @@ pub struct OnboardingShell {
     /// Hit area of the last-rendered list body; wheel events are gated on it.
     list_area: Rect,
     back_rect: Rect,
-    back_hover: bool,
+    /// Last known pointer position, from any mouse event (`None` before the
+    /// first one and after focus is lost). Hover is never stored: every
+    /// render derives it from this position against that frame's layout.
+    pointer: Option<Position>,
+    /// Whether the shell, rather than an app-level modal over it, owns the
+    /// pointer this frame (set by the app before each render).
+    pointer_owned: bool,
     actions: ActionBar,
 }
 
@@ -514,7 +646,8 @@ impl OnboardingShell {
             list_row_rects: Vec::new(),
             list_area: Rect::default(),
             back_rect: Rect::default(),
-            back_hover: false,
+            pointer: None,
+            pointer_owned: true,
             actions: ActionBar::default(),
         }
     }
@@ -567,6 +700,55 @@ impl OnboardingShell {
 
     pub(crate) fn screen_is_agent_authoring(&self) -> bool {
         matches!(self.screen, OnboardingScreen::AgentAuthoring(_))
+    }
+
+    /// Whether a pointer capture (the provider scrollbar drag) is live.
+    #[cfg(test)]
+    pub(crate) fn test_pointer_captured(&self) -> bool {
+        matches!(&self.screen, OnboardingScreen::ProviderSearch(screen) if screen.dragging_scrollbar())
+    }
+
+    /// Mount the agent screen in model trust with route 0 ("exact-a")
+    /// pending confirmation (test setup).
+    #[cfg(test)]
+    pub(crate) fn test_mount_agent_model_trust(&mut self) {
+        let mut screen = agent::AgentAuthoringScreen::new(
+            agent::golden_sample_projection(),
+            "test-trust".into(),
+        );
+        screen.test_enter_model_trust();
+        self.screen = OnboardingScreen::AgentAuthoring(Box::new(screen));
+    }
+
+    /// The first two-click row of the agent screen, and whether route 0's
+    /// trust is confirmed (test inspection).
+    #[cfg(test)]
+    pub(crate) fn test_agent_trust(&self) -> Option<(Rect, bool)> {
+        match &self.screen {
+            OnboardingScreen::AgentAuthoring(screen) => Some(screen.test_trust_row_and_confirmed()),
+            _ => None,
+        }
+    }
+
+    /// Whether the shell owns the pointer this frame.
+    #[cfg(test)]
+    pub(crate) fn test_pointer_owned(&self) -> bool {
+        self.pointer_owned
+    }
+
+    /// The last reported pointer position the shell holds.
+    #[cfg(test)]
+    pub(crate) fn test_pointer(&self) -> Option<Position> {
+        self.pointer
+    }
+
+    /// The provider scrollbar rect of the last render, if any.
+    #[cfg(test)]
+    pub(crate) fn test_provider_scrollbar(&self) -> Option<Rect> {
+        match &self.screen {
+            OnboardingScreen::ProviderSearch(screen) => Some(screen.scrollbar_area()),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -1128,7 +1310,7 @@ impl OnboardingShell {
         )
     }
 
-    fn is_quit_chord(key: &KeyEvent) -> bool {
+    pub(crate) fn is_quit_chord(key: &KeyEvent) -> bool {
         key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     }
@@ -1521,6 +1703,11 @@ impl OnboardingShell {
         // provider mutation makes Back/Defer/Cancel unofferable.
         let authority_pending = engine.has_unsettled_local_authority();
         self.escape = EscapeMenu::open(self.stage, authority_pending, self.completion_detour);
+        if self.escape.is_some() {
+            // The modal captures the pointer from here on (including the
+            // release of any gesture in progress), so end that gesture now.
+            self.cancel_pointer_capture();
+        }
     }
 
     /// Translate a confirmed escape-menu choice. Shell-local navigation
@@ -1545,6 +1732,12 @@ impl OnboardingShell {
         engine: &mut Dialog,
     ) -> PointerOutcome {
         let pos = Position::new(mouse.column, mouse.row);
+        self.pointer = Some(pos);
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            // Every pointer event crosses the confirmation boundary, including
+            // those the shell consumes (chrome, the Escape menu, blank areas).
+            screen.note_pointer_event(&mouse);
+        }
         if let Some(menu) = self.escape.as_mut() {
             return match menu.handle_mouse(mouse) {
                 EscapeMenuPointer::Chosen(choice) => {
@@ -1563,8 +1756,6 @@ impl OnboardingShell {
             };
         }
 
-        self.back_hover = chrome::hit(self.back_rect, pos);
-        self.actions.track(pos);
         match mouse.kind {
             MouseEventKind::Moved => PointerOutcome::consumed(),
             MouseEventKind::Down(MouseButton::Left) if chrome::hit(self.back_rect, pos) => {
@@ -1883,16 +2074,28 @@ impl OnboardingShell {
         engine: &Dialog,
         links: &mut crate::tui::links::LinkRegistry,
     ) {
+        // Hit geometry is repopulated by this frame's renderers only. Clear
+        // all of it first — shell and screen — so an early return, a
+        // zero-height content area, or a screen swap can never leave a
+        // previous frame's rectangle clickable.
+        self.clear_hit_geometry();
         if area.width == 0 || area.height == 0 {
+            // No layout at all: nothing a captured gesture could still act
+            // on exists, so the gesture ends here.
+            self.cancel_pointer_capture();
             return;
         }
         frame.render_widget(Clear, area);
+        // A modal owns the pointer: nothing behind it shows hover.
+        let chrome_pointer = if self.escape.is_some() {
+            None
+        } else {
+            self.owned_pointer()
+        };
 
         // Welcome is an edge-to-edge cinematic scene. Its own prompt is the
         // only action affordance, and this stage never paints a Back button.
         if matches!(self.screen, OnboardingScreen::Welcome) {
-            self.back_rect = Rect::default();
-            self.actions = ActionBar::default();
             welcome::Scene::new(
                 area.width,
                 area.height,
@@ -1901,8 +2104,9 @@ impl OnboardingShell {
                 self.welcome_cloud_seed,
             )
             .render(frame, area);
+            let pointer = self.owned_pointer();
             if let Some(menu) = self.escape.as_mut() {
-                Self::render_escape_menu(frame, area, menu);
+                Self::render_escape_menu(frame, area, menu, pointer);
             }
             return;
         }
@@ -1913,17 +2117,20 @@ impl OnboardingShell {
                 if matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice)
         );
         let back_enabled = self.back_enabled();
+        let back_hovered = back_visible
+            && back_enabled
+            && chrome_pointer.is_some_and(|pos| chrome::hit(chrome::back_button_rect(area), pos));
         self.back_rect =
-            chrome::render_back_button(frame, area, back_visible, back_enabled, self.back_hover);
+            chrome::render_back_button(frame, area, back_visible, back_enabled, back_hovered);
 
         let col = ui::column(area);
-        let rows = Layout::vertical([
-            Constraint::Length(3), // header
-            Constraint::Length(1), // progress
-            Constraint::Min(1),    // content
-            Constraint::Length(1), // help + action bar
-        ])
-        .split(col);
+        let ShellRows {
+            header,
+            progress: progress_row,
+            rule,
+            content,
+            footer,
+        } = ShellRows::split(col);
 
         let title = format!(
             "{} · step {}/{}",
@@ -1941,57 +2148,148 @@ impl OnboardingShell {
             OnboardingScreen::AgentAuthoring(screen) if screen.header_is_failure() => BAD,
             _ => INK,
         };
-        ui::render_header_colored(frame, rows[0], &title, &subtitle, title_color);
-        self.render_progress(frame, rows[1]);
-        self.list_area = rows[2];
+        ui::render_header_colored(frame, header, &title, &subtitle, title_color);
+        self.render_progress(frame, progress_row);
+        if let Some(rule) = rule {
+            ui::render_rule(frame, rule);
+        }
+        self.list_area = content;
         match &mut self.screen {
             OnboardingScreen::Welcome => unreachable!("welcome returned above"),
-            OnboardingScreen::Profile(screen) => screen.render(frame, rows[2]),
+            OnboardingScreen::Profile(screen) => screen.render(frame, content),
             OnboardingScreen::SecureStore(screen) => {
                 if matches!(screen.phase, secure_store::SecureStoreInputPhase::Choice) {
-                    Self::render_secure_store(frame, rows[2], screen, &mut self.list_row_rects);
+                    Self::render_secure_store(frame, content, screen, &mut self.list_row_rects);
                 } else {
                     self.list_row_rects.clear();
-                    screen.render_password(frame, rows[2]);
+                    screen.render_password(frame, content);
                 }
             }
             OnboardingScreen::ProviderSearch(screen) => {
                 self.list_area =
-                    Self::render_search(frame, rows[2], screen, &mut self.list_row_rects);
+                    Self::render_search(frame, content, screen, &mut self.list_row_rects);
             }
-            OnboardingScreen::Authenticate(screen) => screen.render(frame, rows[2]),
-            OnboardingScreen::Verify(screen) => screen.render(frame, rows[2]),
+            OnboardingScreen::Authenticate(screen) => screen.render(frame, content),
+            OnboardingScreen::Verify(screen) => screen.render(frame, content),
             OnboardingScreen::AgentAuthoring(screen) => {
-                screen.render(frame, rows[2]);
+                screen.render(frame, content);
             }
             OnboardingScreen::Lifetime(screen) => {
-                Self::render_lifetime(frame, rows[2], screen, &mut self.list_row_rects);
+                Self::render_lifetime(frame, content, screen, &mut self.list_row_rects);
             }
-            OnboardingScreen::Model(screen) => screen.render(frame, rows[2]),
+            OnboardingScreen::Model(screen) => screen.render(frame, content),
             OnboardingScreen::Complete { summary, .. } => {
-                Self::render_complete(frame, rows[2], summary, &mut self.list_row_rects);
+                Self::render_complete(frame, content, summary, &mut self.list_row_rects);
             }
             OnboardingScreen::EmbeddedSettings => {
-                engine.render(frame, rows[2], links);
+                engine.render(frame, content, links);
             }
         }
         let buttons = Self::action_buttons(&self.screen);
         let bar_width = chrome::action_bar_width(&buttons);
-        let help_width = rows[3].width.saturating_sub(bar_width.saturating_add(1));
+        let help_width = footer.width.saturating_sub(bar_width.saturating_add(1));
         ui::render_help(
             frame,
             Rect {
-                x: rows[3].x,
-                y: rows[3].y,
+                x: footer.x,
+                y: footer.y,
                 width: help_width,
                 height: 1,
             },
             self.help_text(),
         );
-        self.actions.render(frame, rows[3], &buttons);
+        self.actions.render(frame, footer, &buttons, chrome_pointer);
+        let pointer = self.owned_pointer();
         if let Some(menu) = self.escape.as_mut() {
-            Self::render_escape_menu(frame, area, menu);
+            Self::render_escape_menu(frame, area, menu, pointer);
         }
+    }
+
+    /// Forget every clickable rectangle from the previous frame: the shell's
+    /// back button, action bar, list rows, and Escape menu rows, plus the
+    /// active screen's own geometry.
+    ///
+    /// Only per-frame geometry is cleared. Interaction state is kept, and is
+    /// never positional:
+    /// - hover (action bar, back button, Escape menu rows) is not stored at
+    ///   all; each render derives it from [`Self::pointer`] against that
+    ///   frame's layout;
+    /// - a pointer capture (the provider scrollbar drag) survives redraws but
+    ///   ends at every gesture boundary — see [`Self::cancel_pointer_capture`];
+    /// - pending two-click confirmations are keyed by the target's identity
+    ///   (the agent screen's `ArmedConfirmation`), not a row index.
+    fn clear_hit_geometry(&mut self) {
+        self.back_rect = Rect::default();
+        self.actions.clear_geometry();
+        self.list_row_rects.clear();
+        self.list_area = Rect::default();
+        if let Some(menu) = self.escape.as_mut() {
+            menu.row_rects.clear();
+        }
+        match &mut self.screen {
+            OnboardingScreen::Profile(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::SecureStore(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::ProviderSearch(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::Authenticate(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::Model(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::AgentAuthoring(screen) => screen.clear_hit_geometry(),
+            OnboardingScreen::Welcome
+            | OnboardingScreen::Verify(_)
+            | OnboardingScreen::Lifetime(_)
+            | OnboardingScreen::Complete { .. }
+            | OnboardingScreen::EmbeddedSettings => {}
+        }
+    }
+
+    /// End any pointer capture in progress (the provider scrollbar drag).
+    /// Called at every boundary where the gesture's owner can no longer see
+    /// its release or its target: the Escape menu or an app-level modal
+    /// opening, a frame with no layout, a terminal resize, and focus loss
+    /// (see [`Self::end_pointer_interactions`]). Switching screens drops the
+    /// capture with the screen.
+    pub(crate) fn cancel_pointer_capture(&mut self) {
+        if let OnboardingScreen::ProviderSearch(screen) = &mut self.screen {
+            screen.cancel_scrollbar_drag();
+        }
+    }
+
+    /// The terminal was resized or lost focus: every captured gesture ends,
+    /// and the pointer position is unknown until the next mouse event (after
+    /// a resize its old coordinates name a different cell), so nothing
+    /// hovers until the pointer is reported again.
+    pub(crate) fn end_pointer_interactions(&mut self) {
+        self.cancel_pointer_capture();
+        self.pointer = None;
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            screen.cancel_pending_confirmation();
+        }
+    }
+
+    /// Drop a pending two-click confirmation (the agent's trust/egress arm):
+    /// an interaction the shell never saw came between the clicks.
+    pub(crate) fn cancel_pending_confirmation(&mut self) {
+        if let OnboardingScreen::AgentAuthoring(screen) = &mut self.screen {
+            screen.cancel_pending_confirmation();
+        }
+    }
+
+    /// Record the last reported pointer position (`None` when it is unknown,
+    /// e.g. mouse capture was turned off). The app reports every mouse event
+    /// here, including those another layer consumes.
+    pub(crate) fn observe_pointer(&mut self, pointer: Option<Position>) {
+        self.pointer = pointer;
+    }
+
+    /// Whether the shell owns the pointer this frame. The app clears this
+    /// while an app-level modal (the daemon restart prompt) sits on top, so
+    /// nothing in the shell paints hover under it.
+    pub(crate) fn set_pointer_owned(&mut self, owned: bool) {
+        self.pointer_owned = owned;
+    }
+
+    /// The pointer as the shell's hover renderers may use it this frame.
+    fn owned_pointer(&self) -> Option<Position> {
+        self.pointer.filter(|_| self.pointer_owned)
     }
 
     fn screen_title(&self) -> &'static str {
@@ -2102,33 +2400,11 @@ impl OnboardingShell {
     }
 
     fn render_progress(&self, frame: &mut Frame, area: Rect) {
-        let current = progress_index(self.stage);
-        let mut spans = Vec::new();
-        for (index, step) in PROGRESS_STEPS.iter().enumerate() {
-            let (mark, color) = if index < current {
-                ("●", BRASS)
-            } else if index == current {
-                ("◐", BRASS)
-            } else {
-                ("○", NIGHT)
-            };
-            let mut style = Style::default().fg(color);
-            if index == current {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled(format!("{mark}{step}"), style));
-            if index + 1 < PROGRESS_STEPS.len() {
-                // The eight-step row (Profile got its own slot in #425) must
-                // stay on one line on an 80-column terminal: the marker is
-                // glued to its label and steps are single-space separated,
-                // which leaves the final "Ready" label legible.
-                spans.push(Span::raw(" "));
-            }
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
-            area,
-        );
+        // The row picks its own tier for the width (full, compact, minimal)
+        // and is never wrapped: a wrap into this single row used to cut the
+        // last steps off silently on narrow terminals.
+        let (_, line) = progress::progress_line(progress_index(self.stage), area.width);
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_secure_store(
@@ -2375,7 +2651,12 @@ impl OnboardingShell {
         frame.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), inner);
     }
 
-    fn render_escape_menu(frame: &mut Frame, area: Rect, menu: &mut EscapeMenu) {
+    fn render_escape_menu(
+        frame: &mut Frame,
+        area: Rect,
+        menu: &mut EscapeMenu,
+        pointer: Option<Position>,
+    ) {
         let width = 48.min(area.width.saturating_sub(4));
         let height = (menu.choices.len() as u16 + 4)
             .min(area.height.saturating_sub(2))
@@ -2424,7 +2705,13 @@ impl OnboardingShell {
                 break;
             }
             let selected = index == menu.cursor;
-            let hovered = menu.hover == Some(index);
+            let row = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            let hovered = pointer.is_some_and(|pos| chrome::hit(row, pos));
             let mut style = if selected {
                 Style::default().fg(BRASS).add_modifier(Modifier::BOLD)
             } else {

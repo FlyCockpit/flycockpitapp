@@ -448,11 +448,148 @@ impl App {
         }
     }
 
+    /// Keys for the floating layer on top of the stack, the daemon restart
+    /// prompt included.
+    fn route_floating_layer_key(&mut self, layer: super::pointer::Layer, key: KeyEvent) {
+        use super::pointer::Layer;
+        match layer {
+            // Which-key overlay (`which-key-overlay.md`): fully modal. The
+            // leader closes it; a listed leader action runs; any other key
+            // goes to it (scroll / Esc / q close). TUI-only — never touches
+            // the agent or history.
+            Layer::KeysOverlay => {
+                if is_keys_leader(&key) {
+                    self.keys_overlay = None;
+                } else if let Some(action) = keys_leader_action(&key)
+                    // The leader actions act on the chat surface (btw
+                    // focus, the scratchpad pane, transcript reveals); over
+                    // a full-screen onboarding or workspace-trust base they
+                    // would change a surface nobody can see, so the key is
+                    // an ordinary overlay key there.
+                    .filter(|_| self.base_layer() == Layer::Surface)
+                {
+                    self.keys_overlay = None;
+                    self.dispatch_keys_leader_action(action);
+                } else if let Some(overlay) = self.keys_overlay.as_mut()
+                    && overlay.handle_key(key)
+                {
+                    self.keys_overlay = None;
+                }
+            }
+            // Context menu: arrows / j-k move the focus, Enter executes, Esc
+            // dismisses, any other printable key dismisses without executing
+            // (so the user can resume typing without a stray menu).
+            Layer::ContextMenu => {
+                let Some(menu) = self.context_menu.clone() else {
+                    return;
+                };
+                match key.code {
+                    KeyCode::Esc => {
+                        self.context_menu = None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if let Some(m) = self.context_menu.as_mut() {
+                            m.move_cursor(-1);
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some(m) = self.context_menu.as_mut() {
+                            m.move_cursor(1);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        self.context_menu = None;
+                        if let Some(action) = menu.focused_action() {
+                            self.execute_context_menu_action(action, menu.clicked_chat_row);
+                        }
+                    }
+                    _ if !is_modifier_only(&key) => {
+                        self.context_menu = None;
+                    }
+                    _ => {}
+                }
+            }
+            // `/rules` review: ↑/↓/j/k scan, `d` / Space revoke, `p` promote,
+            // Esc closes.
+            Layer::RulesReview => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.rules_review_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.rules_review_down(),
+                KeyCode::Char('d') | KeyCode::Char(' ') => self.rules_review_revoke_selected(),
+                KeyCode::Char('p') => self.rules_review_promote_selected(),
+                KeyCode::Esc => self.close_rules_review(),
+                _ => {}
+            },
+            // `/pins` review (`pinned-messages`): ↑/↓/j/k scan the checklist
+            // (jumping the transcript to each pin), `d` / Space unpin, Esc
+            // closes and refocuses the composer.
+            Layer::PinsReview => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.pins_review_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.pins_review_down(),
+                KeyCode::Char('d') | KeyCode::Char(' ') => self.pins_review_unpin_selected(),
+                KeyCode::Esc => self.close_pins_review(),
+                _ => {}
+            },
+            Layer::DaemonRestartPrompt => self.handle_daemon_restart_prompt_key(key),
+            Layer::WorkspaceTrust | Layer::Onboarding | Layer::Surface => {}
+        }
+    }
+
+    /// The base layer's global keys: the only keys that reach the base while
+    /// a floating layer is on top. They go straight to the base's global
+    /// handlers. The chat surface (and the workspace-trust dialog over it)
+    /// has Ctrl-C (interrupt, or exit on a second press) and Ctrl-D (guarded
+    /// exit); the onboarding shell has its quit chord (Ctrl-C). Unlike the
+    /// same keys with no floating layer up, they are never forwarded to a
+    /// focused embedded PTY or btw pane underneath: that pane does not own
+    /// the keyboard while a floating layer is on top, so Ctrl-C interrupts
+    /// the agent and Ctrl-D is the guarded exit. The daemon restart prompt is
+    /// the exception: it owns quit itself (Ctrl-C quits after the stopped
+    /// daemon), so nothing passes it.
+    fn is_base_global_key(&self, key: &KeyEvent) -> bool {
+        match self.base_layer() {
+            super::pointer::Layer::Onboarding => {
+                crate::tui::onboarding::OnboardingShell::is_quit_chord(key)
+            }
+            _ => {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+            }
+        }
+    }
+
+    fn handle_base_global_key(&mut self, key: KeyEvent) -> bool {
+        match self.base_layer() {
+            super::pointer::Layer::Onboarding => self.handle_onboarding_shell_key(key),
+            _ if matches!(key.code, KeyCode::Char('d')) => self.request_guarded_exit(),
+            _ => self.handle_ctrl_c(),
+        }
+    }
+
+    /// Keys enter through the layer stack before any other stage: when a
+    /// floating layer is on top it gets the key — nothing underneath (queue
+    /// focus, the rail, panes, chords, the composer) sees it — except the
+    /// base's global keys. Returns `None` when the base is on top and the
+    /// ordinary key chain should run.
+    fn route_key_through_layer_stack(&mut self, key: KeyEvent) -> Option<bool> {
+        let top = self.key_owner();
+        if !top.is_floating() {
+            return None;
+        }
+        // Any interaction with a layer above onboarding breaks a pending
+        // two-click confirmation there.
+        self.note_interaction_above_onboarding();
+        if top != super::pointer::Layer::DaemonRestartPrompt && self.is_base_global_key(&key) {
+            return Some(self.handle_base_global_key(key));
+        }
+        self.route_floating_layer_key(top, key);
+        Some(false)
+    }
+
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.dialog.bind_lifecycle(self.lifecycle.clone());
-        if self.daemon_restart_prompt.is_some() {
-            self.handle_daemon_restart_prompt_key(key);
-            return false;
+        if let Some(exit) = self.route_key_through_layer_stack(key) {
+            return exit;
         }
         if key.code == KeyCode::Esc && self.cancel_queued_message_edit() {
             return false;
@@ -551,18 +688,6 @@ impl App {
 
         let embedded_pane_owns_input = self.pane.is_some() && self.pane_focused;
         if !embedded_pane_owns_input {
-            if self.keys_overlay.is_some() {
-                if is_keys_leader(&key) {
-                    self.keys_overlay = None;
-                    return Some(KeyRouterStage::CtrlChord);
-                }
-                if let Some(action) = keys_leader_action(&key) {
-                    self.keys_overlay = None;
-                    self.dispatch_keys_leader_action(action);
-                    return Some(KeyRouterStage::CtrlChord);
-                }
-            }
-
             if self.composer_chords_available()
                 && key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key
@@ -612,8 +737,9 @@ impl App {
                 && self.question_dialog.is_none()
                 && !self.dialog.is_active()
                 && matches!(self.overlay, Overlay::None)
-                && self.keys_overlay.is_none()
             {
+                // (No floating layer check: this stage runs only once the
+                // layer stack has handed the key to the surface.)
                 self.close_composer_picker();
                 self.composer_controls.selection = None;
                 self.session_rail.focus();
@@ -726,11 +852,11 @@ impl App {
         }
 
         // Full-screen onboarding owns Ctrl-C / Ctrl-Shift-C (quit) and every
-        // other key while it is open, so this must sit ahead of the chat
-        // interrupt/exit chords.
-        if self.startup_modal_on_top() != Some(StartupModal::WorkspaceTrust)
-            && self.onboarding_shell.is_some()
-        {
+        // other key while it is the top of the layer stack, so this must sit
+        // ahead of the chat interrupt/exit chords. A floating layer painted
+        // over it (which-key overlay, context menu, a review box) keeps the
+        // keys — and so can always be closed — until it is gone.
+        if self.base_layer() == super::pointer::Layer::Onboarding {
             return self.handle_onboarding_shell_key(key);
         }
 
@@ -787,19 +913,6 @@ impl App {
             self.last_user_interaction = Instant::now();
         }
 
-        // Which-key overlay (`which-key-overlay.md`). When open it is fully
-        // modal: route the key to it (scroll / Esc / q / leader-again close)
-        // and always consume so nothing leaks underneath. The leader key also
-        // closes it (toggle). TUI-only — never touches the agent or history.
-        if self.keys_overlay.is_some() {
-            if let Some(overlay) = self.keys_overlay.as_mut()
-                && overlay.handle_key(key)
-            {
-                self.keys_overlay = None;
-            }
-            return false;
-        }
-
         // Leader key opens the which-key overlay over the current context
         // (`which-key-overlay.md`). Routed here — after the toast dismiss but
         // ahead of the pane/dialog routing — so the leader works while a pane
@@ -835,40 +948,6 @@ impl App {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.commit_stop(),
                 _ => self.cancel_stop(),
-            }
-            return false;
-        }
-
-        // Context menu intercepts keys while open. Arrows / j-k move
-        // the focus, Enter executes, Esc dismisses, any other
-        // printable key dismisses without executing (so the user can
-        // resume typing into the composer without a stray menu).
-        if let Some(menu) = self.context_menu.clone() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.context_menu = None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if let Some(m) = self.context_menu.as_mut() {
-                        m.move_cursor(-1);
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if let Some(m) = self.context_menu.as_mut() {
-                        m.move_cursor(1);
-                    }
-                }
-                KeyCode::Enter => {
-                    self.context_menu = None;
-                    if let Some(action) = menu.focused_action() {
-                        self.execute_context_menu_action(action, menu.clicked_chat_row);
-                    }
-                }
-                _ if !is_modifier_only(&key) => {
-                    // Any other typed key dismisses without action.
-                    self.context_menu = None;
-                }
-                _ => {}
             }
             return false;
         }
@@ -913,33 +992,6 @@ impl App {
                 KeyCode::BackTab => self.copy_pick_cycle_target(-1),
                 KeyCode::Enter => self.open_copy_pick_format_menu(),
                 KeyCode::Esc => self.cancel_copy_pick(),
-                _ => {}
-            }
-            return false;
-        }
-
-        // `/pins` review mode (`pinned-messages`): modal while open.
-        // ↑/↓/j/k scan the checklist (jumping the transcript to each pin),
-        // `d` / Space (check) unpin the highlighted pin, Esc closes and
-        // refocuses the composer.
-        if self.pins_review.is_some() {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => self.pins_review_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.pins_review_down(),
-                KeyCode::Char('d') | KeyCode::Char(' ') => self.pins_review_unpin_selected(),
-                KeyCode::Esc => self.close_pins_review(),
-                _ => {}
-            }
-            return false;
-        }
-
-        if self.rules_review.is_some() {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => self.rules_review_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.rules_review_down(),
-                KeyCode::Char('d') | KeyCode::Char(' ') => self.rules_review_revoke_selected(),
-                KeyCode::Char('p') => self.rules_review_promote_selected(),
-                KeyCode::Esc => self.close_rules_review(),
                 _ => {}
             }
             return false;
@@ -3771,6 +3823,13 @@ impl App {
                         == crate::tui::structured_paste::PasteSource::NativePaste
             });
         }
+        // Paste enters through the layer stack like keys: a floating layer
+        // on top (none of which has a text field) drops it, so nothing
+        // underneath — btw pane, embedded PTY, composer, dialogs — gets it.
+        if self.key_owner().is_floating() {
+            self.note_interaction_above_onboarding();
+            return;
+        }
         if self.btw_pane.as_ref().is_some_and(|pane| pane.focused) {
             if let Some(pane) = self.btw_pane.as_mut() {
                 pane.paste(&data);
@@ -3803,12 +3862,9 @@ impl App {
                 | Overlay::Diff(_)
                 | Overlay::GuidanceReview(_)
                 | Overlay::Help(_)
-        ) || self.context_menu.is_some()
-            || self.pin_pick.is_some()
+        ) || self.pin_pick.is_some()
             || self.fork_pick.is_some()
             || self.copy_pick.is_some()
-            || self.pins_review.is_some()
-            || self.keys_overlay.is_some()
             || self.transcript_find.is_some()
         {
             return;
@@ -4044,53 +4100,67 @@ impl App {
         self.reset_slash_window();
     }
 
+    /// Whether the rapid-paste intake may buffer keys for the composer.
+    ///
+    /// Buffered keys are later replayed straight into the composer
+    /// ([`Self::handle_frozen_composer_key`]), bypassing [`Self::handle_key`],
+    /// so this must be true only while `handle_key` itself would give an
+    /// ordinary typing key (an unmodified character, Enter or Tab — what the
+    /// intake buffers) to the composer. Anything else would type into a
+    /// composer the user cannot see, or steal a key from the owner they can
+    /// (#425: the onboarding shell wedged at Welcome; #445: an Enter that
+    /// never reached the composer picker; the daemon restart prompt's
+    /// `r`/`q`/Enter/Tab typed into the hidden composer).
+    ///
+    /// Layers come from the layer stack — the same source of truth
+    /// [`Self::handle_key`] routes by — so no floating or base layer can be
+    /// forgotten here. [`Self::surface_composer_owns_typing`] covers the
+    /// surface's own key owners.
     pub(super) fn structured_paste_composer_eligible(&self) -> bool {
-        // The full-screen onboarding shell owns every key while it is open:
-        // its Enter/Space/arrows drive stage transitions, not the composer.
-        // If those keys are intake-buffered as rapid-paste candidates they
-        // are replayed through the frozen-composer route and never reach the
-        // shell, wedging a real-terminal first run at Welcome (#425). Paste
-        // events still route through `handle_paste`'s onboarding branch.
-        !(self.onboarding_shell.is_some()
-            || self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
-            || (self.pane_focused && self.pane.is_some()))
-            && !matches!(
-                self.overlay,
-                Overlay::Stats(_)
-                    | Overlay::Usage(_)
-                    | Overlay::Skills(_)
-                    | Overlay::Tools(_)
-                    | Overlay::GoalSettings(_)
-                    | Overlay::Permissions(_)
-                    | Overlay::Resources(_)
-                    | Overlay::Quick(_)
-                    | Overlay::Context(_)
-                    | Overlay::Diff(_)
-                    | Overlay::Multireview(_)
-                    | Overlay::Notes(_)
-                    | Overlay::Leaks(_)
-                    | Overlay::Sealed(_)
-                    | Overlay::GuidanceReview(_)
-                    | Overlay::Help(_)
-            )
-            && self.question_dialog.is_none()
-            && !self.dialog.is_active()
-            && self.context_menu.is_none()
+        self.key_owner() == super::pointer::Layer::Surface && self.surface_composer_owns_typing()
+    }
+
+    /// With the surface on top: whether no surface stage ahead of the
+    /// composer in [`Self::handle_key`] takes an ordinary typing key. Listed
+    /// in `handle_key`'s stage order; keep it in step when a stage is added
+    /// there. Owners that take only Esc, arrows or modified chords (the
+    /// queued-edit Esc, the subagent-view Esc, the global chords, selection
+    /// Esc) do not compete for typing keys and are not listed.
+    fn surface_composer_owns_typing(&self) -> bool {
+        // `handle_precedence_key`: the embedded pane forwards every key to
+        // its child; queue focus, a focused btw pane and a focused session
+        // rail take their keys first.
+        !(self.pane.is_some() && self.pane_focused)
+            && self.queue_focus.is_none()
+            && !self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
+            && !self.session_rail.is_focused()
+            // The composer control deck (open picker or pill selection)
+            // owns Enter/arrows/typing while it is up (#445).
+            && self.composer_controls.picker.is_none()
+            && self.composer_controls.selection.is_none()
+            // `handle_key_inner`: the armed `/prune`, resume-compaction and
+            // `/stop` confirmations take the next key (`y` commits).
+            && !self.pending_prune_confirm
+            && !self.pending_resume_compaction_confirm
+            && self.pending_stop_confirm.is_none()
+            // The pick modes are modal.
             && self.pin_pick.is_none()
             && self.fork_pick.is_none()
             && self.copy_pick.is_none()
-            && self.pins_review.is_none()
-            && self.rules_review.is_none()
-            && self.keys_overlay.is_none()
+            // A selected header pill takes `h`/`l`/Enter.
+            && !(self.header_pill_selection.is_some() && self.header_chrome_interactive())
+            // The answering dialog and the settings dialog are modal.
+            && self.question_dialog.is_none()
+            && !self.dialog.is_active()
+            // The focused inline session-setup pane takes its keys.
+            && !(self.session_setup_focused
+                && matches!(self.overlay, Overlay::None)
+                && self.session_setup_inline_visible())
+            // Every overlay pane takes every key (each `handle_key_inner`
+            // arm returns).
+            && !self.overlay.is_open()
+            // The transcript-find bar owns every key.
             && self.transcript_find.is_none()
-            // The composer control deck (open picker or pill selection)
-            // owns Enter/arrows/typing while it is up. Without this, an
-            // unmodified Enter is intake-buffered as a rapid-paste
-            // candidate and replayed through the frozen-composer route,
-            // never reaching the picker — so a live-terminal Enter could
-            // not commit it (#445).
-            && self.composer_controls.picker.is_none()
-            && self.composer_controls.selection.is_none()
     }
 
     fn start_paste_token_count(&mut self, block_id: u64, full: String) {

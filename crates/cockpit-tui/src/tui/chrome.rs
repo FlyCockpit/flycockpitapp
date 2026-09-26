@@ -240,12 +240,22 @@ pub(crate) fn action_bar_width(buttons: &[ActionButton<'_>]) -> u16 {
         + (buttons.len() as u16).saturating_sub(1)
 }
 
-pub(crate) fn render_action_bar(
-    frame: &mut Frame,
-    area: Rect,
-    buttons: &[ActionButton<'_>],
-    hover: Option<usize>,
-) -> Vec<Rect> {
+/// Right-aligned layout of an action bar in `area`: one rect per button, in
+/// button order.
+///
+/// A button is laid out only if it fits *whole*. When the bar is wider than
+/// `area` it is left-aligned and filled in order; the first button that does
+/// not fit, and every button after it, gets an empty rect, so it is neither
+/// painted (no `[ Sta` fragment) nor hoverable nor clickable.
+///
+/// Hidden actions must stay keyboard-reachable. Onboarding guarantees it:
+/// every footer button has a key — Enter for the primary action, Esc for
+/// Cancel/Back, and the keys in each screen's help text for the rest (`a`
+/// add subagent / add another provider, `^r` Reveal, `^e` Use env var, `r`
+/// Retry, ↑/↓ + Enter on the completion choices, Enter for device-code
+/// "Approve now"). Settings help-row actions (Save/Cancel/Open) mirror their
+/// page's own key bindings.
+pub(crate) fn action_bar_layout(area: Rect, buttons: &[ActionButton<'_>]) -> Vec<Rect> {
     let mut rects = vec![Rect::default(); buttons.len()];
     if area.width == 0 || area.height == 0 || buttons.is_empty() {
         return rects;
@@ -260,11 +270,30 @@ pub(crate) fn render_action_bar(
     } else {
         area.right() - total
     };
-    for (index, button) in buttons.iter().enumerate() {
-        if x >= area.right() {
+    for (index, width) in widths.iter().enumerate() {
+        if x.saturating_add(*width) > area.right() {
             break;
         }
-        let rect = Rect::new(x, area.y, widths[index].min(area.right() - x), 1);
+        // Keep geometry for disabled controls too.  Callers that own a
+        // pointer registry need to expose a dimmed control as an explicit,
+        // non-operable target rather than losing its identity at paint time.
+        rects[index] = Rect::new(x, area.y, *width, 1);
+        x = x.saturating_add(*width).saturating_add(1);
+    }
+    rects
+}
+
+pub(crate) fn render_action_bar(
+    frame: &mut Frame,
+    area: Rect,
+    buttons: &[ActionButton<'_>],
+    hover: Option<usize>,
+) -> Vec<Rect> {
+    let rects = action_bar_layout(area, buttons);
+    for (index, (button, rect)) in buttons.iter().zip(&rects).enumerate() {
+        if rect.is_empty() {
+            continue;
+        }
         let style = if !button.enabled {
             Style::new().fg(resolve_color(DISABLED, DISABLED_INDEX))
         } else if hover == Some(index) {
@@ -291,13 +320,8 @@ pub(crate) fn render_action_bar(
                 format!("[ {} ]", button.label),
                 style,
             ))),
-            rect,
+            *rect,
         );
-        // Keep geometry for disabled controls too.  Callers that own a
-        // pointer registry need to expose a dimmed control as an explicit,
-        // non-operable target rather than losing its identity at paint time.
-        rects[index] = rect;
-        x = x.saturating_add(widths[index]).saturating_add(1);
     }
     rects
 }
@@ -308,22 +332,47 @@ pub(crate) fn action_button_at(rects: &[Rect], pos: Position) -> Option<usize> {
         .position(|rect| rect.width > 0 && rect.height > 0 && rect.contains(pos))
 }
 
+/// Stateful action bar for a surface that owns its pointer routing.
+///
+/// It holds only per-frame geometry. Hover is never stored: each render
+/// derives it from the caller's last *reported* pointer position against
+/// that frame's layout, so a relayout, a screen or phase change, clipping,
+/// or a disabled button never moves the chip onto a button that position is
+/// not over. The position itself can be stale: crossterm has no mouse-leave
+/// event, so a pointer that leaves the terminal is reported nowhere. Callers
+/// therefore forget it at every boundary that invalidates coordinates
+/// (resize, focus loss, mouse capture off) and pass `None` while another
+/// layer owns the pointer.
 #[derive(Default)]
 pub(crate) struct ActionBar {
     rects: Vec<Rect>,
     enabled: Vec<bool>,
-    hover: Option<usize>,
 }
 
 impl ActionBar {
-    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect, buttons: &[ActionButton<'_>]) {
-        self.rects = render_action_bar(frame, area, buttons, self.hover);
+    /// Lay out and paint `buttons` in `area`, highlighting the rendered,
+    /// enabled button under `pointer` (pass `None` while a modal owns the
+    /// pointer).
+    pub(crate) fn render(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        buttons: &[ActionButton<'_>],
+        pointer: Option<Position>,
+    ) {
+        let layout = action_bar_layout(area, buttons);
+        let hover = pointer
+            .and_then(|pos| action_button_at(&layout, pos))
+            .filter(|index| buttons[*index].enabled);
+        self.rects = render_action_bar(frame, area, buttons, hover);
         self.enabled = buttons.iter().map(|button| button.enabled).collect();
     }
 
-    pub(crate) fn track(&mut self, pos: Position) {
-        self.hover = action_button_at(&self.rects, pos)
-            .filter(|index| self.enabled.get(*index).copied().unwrap_or(false));
+    /// Forget the previous frame's button rectangles so nothing stays
+    /// clickable until the next render lays the bar out again.
+    pub(crate) fn clear_geometry(&mut self) {
+        self.rects.clear();
+        self.enabled.clear();
     }
 
     pub(crate) fn clicked(&self, pos: Position) -> Option<usize> {
@@ -614,6 +663,101 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+
+    fn paint_bar(
+        bar: &mut ActionBar,
+        width: u16,
+        buttons: &[ActionButton<'_>],
+        pointer: Option<Position>,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| bar.render(frame, frame.area(), buttons, pointer))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn hovered_cells(buffer: &ratatui::buffer::Buffer) -> Vec<u16> {
+        (0..buffer.area.width)
+            .filter(|x| buffer[(*x, 0)].bg != Color::Reset)
+            .collect()
+    }
+
+    #[test]
+    fn action_bar_hover_is_derived_from_the_pointer_and_this_frames_layout() {
+        let mut bar = ActionBar::default();
+        let buttons = [
+            ActionButton::secondary("Back"),
+            ActionButton::primary("Next"),
+        ];
+        // 40 cells: "[ Back ] [ Next ]" is right-aligned at x 23..40.
+        let layout = action_bar_layout(Rect::new(0, 0, 40, 1), &buttons);
+        let next = layout[1];
+        let over_next = Position::new(next.x + 2, 0);
+
+        let hovered = paint_bar(&mut bar, 40, &buttons, Some(over_next));
+        assert_eq!(
+            hovered_cells(&hovered),
+            (next.x..next.right()).collect::<Vec<_>>()
+        );
+
+        // Same pointer, wider bar: the button moved away from the pointer, so
+        // nothing is hovered — neither at the old spot nor on the button.
+        let moved = paint_bar(&mut bar, 60, &buttons, Some(over_next));
+        assert!(
+            hovered_cells(&moved).is_empty(),
+            "{:?}",
+            hovered_cells(&moved)
+        );
+
+        // Same pointer and layout, button now disabled: no hover.
+        let disabled = [
+            ActionButton::secondary("Back"),
+            ActionButton::primary("Next").enabled(false),
+        ];
+        let off = paint_bar(&mut bar, 40, &disabled, Some(over_next));
+        assert!(hovered_cells(&off).is_empty());
+
+        // A different button set: hover is exactly the button now under the
+        // pointer (here: none, the pointer sits in the gap), never "index 1".
+        let swapped = [
+            ActionButton::secondary("A long first button"),
+            ActionButton::primary("B"),
+        ];
+        let swapped_layout = action_bar_layout(Rect::new(0, 0, 40, 1), &swapped);
+        let gap = Position::new(swapped_layout[0].right(), 0);
+        assert!(action_button_at(&swapped_layout, gap).is_none());
+        let swapped_frame = paint_bar(&mut bar, 40, &swapped, Some(gap));
+        assert!(hovered_cells(&swapped_frame).is_empty());
+
+        // No pointer (a modal owns it, or focus was lost): no hover.
+        let unowned = paint_bar(&mut bar, 40, &buttons, None);
+        assert!(hovered_cells(&unowned).is_empty());
+    }
+
+    #[test]
+    fn a_button_that_does_not_fit_whole_is_not_laid_out_painted_or_clickable() {
+        let buttons = [
+            ActionButton::secondary("Add another provider"),
+            ActionButton::primary("Start coding"),
+        ];
+        // 24 + 1 + 16 = 41 cells; at 30 only the first fits whole.
+        let layout = action_bar_layout(Rect::new(0, 0, 30, 1), &buttons);
+        assert_eq!(layout[0], Rect::new(0, 0, 24, 1));
+        assert!(layout[1].is_empty(), "{:?}", layout[1]);
+
+        let mut bar = ActionBar::default();
+        let pointer = Position::new(25, 0);
+        let buffer = paint_bar(&mut bar, 30, &buttons, Some(pointer));
+        let row: String = (0..30).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(
+            !row.contains('S') && row.trim_end().ends_with(']'),
+            "{row:?}"
+        );
+        assert!(hovered_cells(&buffer).is_empty());
+        assert_eq!(bar.clicked(pointer), None);
+        assert_eq!(bar.clicked(Position::new(2, 0)), Some(0));
+    }
 
     #[test]
     fn chip_style_applies_excoc_hover_rule() {

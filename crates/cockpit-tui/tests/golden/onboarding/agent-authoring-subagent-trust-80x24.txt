@@ -1,11 +1,11 @@
  ‹ Back                                                                         
   How much does this subagent see? · step 6/8                                   
   Confirm the shared trust classification for every unset model.                
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Trust ───────────────────────────────────────────────────────────────────╮  
   │ ○ Confirm vendor/exact-a as unset                                        │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   │                                                                          │  

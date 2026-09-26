@@ -17,6 +17,21 @@ use crate::tui::theme::{BRASS, DISABLED};
 
 const BACK_LABEL: &str = " ‹ Back ";
 
+/// Where the back button sits in `area` (its top-left corner), whether or
+/// not it is painted this frame. Callers derive hover from this rect and the
+/// pointer before painting.
+pub(super) fn back_button_rect(area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::default();
+    }
+    Rect {
+        x: area.x,
+        y: area.y,
+        width: (BACK_LABEL.chars().count() as u16).min(area.width),
+        height: 1,
+    }
+}
+
 /// Draw the back button in the top-left of `area` and return the rect it
 /// occupies so the caller can hit-test clicks against it. When the wizard is
 /// on its first step there is nowhere to go back to, so pass `visible = false`
@@ -36,13 +51,7 @@ pub(super) fn render_back_button(
     if !visible || area.width == 0 || area.height == 0 {
         return Rect::default();
     }
-    let width = BACK_LABEL.chars().count() as u16;
-    let rect = Rect {
-        x: area.x,
-        y: area.y,
-        width: width.min(area.width),
-        height: 1,
-    };
+    let rect = back_button_rect(area);
     let style = if !enabled {
         Style::new().fg(DISABLED)
     } else {
@@ -123,7 +132,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut action_bar = ActionBar::default();
         terminal
-            .draw(|frame| action_bar.render(frame, frame.area(), &buttons))
+            .draw(|frame| action_bar.render(frame, frame.area(), &buttons, None))
             .unwrap();
         assert_eq!(action_bar.clicked(Position::new(rect.x, rect.y)), None);
     }

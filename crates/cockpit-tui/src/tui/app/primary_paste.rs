@@ -21,11 +21,18 @@ impl App {
     }
 
     pub(super) fn primary_paste_layer_at(&self, mouse: &MouseEvent) -> PrimaryPasteLayer {
-        if self.keys_overlay.is_some() {
-            return PrimaryPasteLayer::KeysOverlay;
-        }
-        if self.context_menu.is_some() {
-            return PrimaryPasteLayer::ContextMenu;
+        // The layer that owns the pointer there, from the layer stack; only
+        // the surface is resolved further.
+        use super::pointer::Layer;
+        match self.pointer_owner_at(ratatui::layout::Position::new(mouse.column, mouse.row)) {
+            Layer::KeysOverlay => return PrimaryPasteLayer::KeysOverlay,
+            Layer::ContextMenu => return PrimaryPasteLayer::ContextMenu,
+            Layer::DaemonRestartPrompt
+            | Layer::RulesReview
+            | Layer::PinsReview
+            | Layer::WorkspaceTrust
+            | Layer::Onboarding => return PrimaryPasteLayer::Other,
+            Layer::Surface => {}
         }
         if self.dialog.is_active() {
             return PrimaryPasteLayer::Settings;

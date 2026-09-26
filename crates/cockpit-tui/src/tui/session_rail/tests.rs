@@ -122,8 +122,14 @@ fn golden_rail(
     } else {
         None
     };
-    rail.hovered_card = hovered;
-    rail.pointer_position = pointer;
+    // Card hover derives from the pointer: hovering card 1 means the pointer
+    // is over it (the card's title row at (5, 9) in this 120x40 layout).
+    let pointer = pointer.or(match hovered {
+        Some(1) => Some((5, 9)),
+        Some(other) => panic!("no fixture pointer for card {other}"),
+        None => None,
+    });
+    rail.set_pointer(pointer);
     rail.set_visible(visible);
     crate::tui::golden::render_frame(120, 40, |frame| {
         let persistent = visible.then_some(Rect::new(0, 0, 30, 40));
@@ -1446,4 +1452,58 @@ fn header_chips_route_visibility_and_new_session_outcomes() {
         }),
         Some(RailOutcome::ToggleVisibility)
     ));
+}
+
+#[test]
+fn a_confirm_button_is_painted_once_so_its_hover_reaches_the_frame() {
+    // The rail's registry paints the confirmation buttons and owns their
+    // hover; the app registry passed as `extra` only registers the same
+    // targets. A second paint from `extra` (whose hover is not the rail's)
+    // would overwrite the hovered style — visibly so on the focused Cancel
+    // button, whose focus style sets its own colours.
+    let id = Uuid::from_u128(1);
+    let mut s = summary(id, 10);
+    s.descendant_count = 4;
+    let mut rail = test_rail(vec![(s, Tier::Idle)]);
+    rail.set_visible(true);
+    rail.set_pointer_capture(true);
+    rail.handle_key(press(KeyCode::Char('d')));
+    assert!(matches!(
+        rail.step,
+        Step::Confirm {
+            choice: ConfirmChoice::Cancel,
+            ..
+        }
+    ));
+    let draw = |rail: &mut SessionRail,
+                registry: Option<&mut crate::tui::button::ButtonRegistry>| {
+        rail.begin_frame();
+        crate::tui::golden::render_frame(120, 40, |frame| {
+            let persistent = Some(Rect::new(0, 0, 30, 40));
+            rail.render(frame, persistent, None, registry, 120);
+        })
+    };
+    let mut app_registry = crate::tui::button::ButtonRegistry::default();
+    app_registry.begin_frame(true, 1);
+    let idle = draw(&mut rail, Some(&mut app_registry));
+    let cancel = app_registry
+        .targets()
+        .iter()
+        .find(|target| target.id == crate::tui::button::ButtonId::SessionsConfirmCancel)
+        .map(|target| target.rect)
+        .expect("the app registry registers the confirm targets");
+    let cell = (cancel.x + 1, cancel.y);
+    rail.set_pointer(Some(cell));
+    assert_eq!(
+        rail.confirm_hover(),
+        Some(crate::tui::button::ButtonId::SessionsConfirmCancel)
+    );
+    let rail_only = draw(&mut rail, None);
+    app_registry.begin_frame(true, 1);
+    let with_app_registry = draw(&mut rail, Some(&mut app_registry));
+    assert_ne!(rail_only[cell], idle[cell], "the rail paints the hover");
+    assert_eq!(
+        with_app_registry[cell], rail_only[cell],
+        "the app registry repainted the hovered button"
+    );
 }

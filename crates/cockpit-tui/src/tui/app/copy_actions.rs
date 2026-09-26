@@ -176,6 +176,7 @@ impl App {
     pub(super) fn copy_selection_plaintext(&mut self) {
         self.abort_pending_mouse_copies();
         self.mouse_gesture_state.invalidate_copy();
+        self.drop_orphaned_copy_payload();
         let recovery = self.clipboard_recovery;
         self.copy_selection_plaintext_with(move |text| {
             crate::clipboard::copy_plain(text, recovery)

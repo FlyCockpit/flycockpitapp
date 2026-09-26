@@ -58,6 +58,11 @@ impl ProfileScreen {
         self.status = None;
     }
 
+    /// Forget the previous frame's field rectangle.
+    pub(crate) fn clear_hit_geometry(&mut self) {
+        self.field_rect = Rect::default();
+    }
+
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.field_rect = Rect {
             x: area.x,

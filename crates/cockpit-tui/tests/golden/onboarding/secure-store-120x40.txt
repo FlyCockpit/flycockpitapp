@@ -1,14 +1,14 @@
                                                                                                                         
                  Secure your secrets · step 3/8                                                                         
                  Choose how Cockpit protects your API keys and sealed values.                                           
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ◐Secure store ○Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ◆ Secrets  · Provider  · Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ◉ Platform keyring  —  recommended                                                                     
                  ○ Passphrase-protected file  —  works without a keyring                                                
                  ○ Machine-bound encrypted file  —  tied to this machine                                                
                                                                                                                         
                  Use the operating system credential vault. No silent file fallback.                                    
-                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

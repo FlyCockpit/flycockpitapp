@@ -1,8 +1,9 @@
  ‹ Back                                                                         
   Ready to create · step 6/8                                                    
   Read the package back once before Cockpit creates it.                         
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ◆ Agent  ·  ·                                                  
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ╭ Summary ─────────────────────────────────────────────────────────────────╮  
   │ Agent  navigator                                                         │  
   │ ★ vendor/exact-a · untrusted                                             │  
@@ -16,7 +17,6 @@
   │ Self-verify Writes & edits  vendor/exact-a ×1                            │  
   │ Make default  yes                                                        │  
   │ Trust classification is shared global provider/model policy.             │  
-  │                                                                          │  
   │                                                                          │  
   │                                                                          │  
   ╰──────────────────────────────────────────────────────────────────────────╯  

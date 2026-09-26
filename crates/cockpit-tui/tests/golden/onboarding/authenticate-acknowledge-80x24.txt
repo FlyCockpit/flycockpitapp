@@ -1,13 +1,13 @@
  ‹ Back                                                                         
   Acknowledge the risk · step 4/8                                               
   Codex (ChatGPT Plus/Pro) signs in with your subscription.                     
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready         
+  ✓  ✓  ✓  ◆ Provider  ·  ·  ·  ·                                               
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   Using subscription credentials from a third-party client may violate the      
   provider's terms of service and could get your account suspended.             
                                                                                 
   Press Enter to acknowledge and continue, or Esc to go back.                   
-                                                                                
                                                                                 
                                                                                 
                                                                                 

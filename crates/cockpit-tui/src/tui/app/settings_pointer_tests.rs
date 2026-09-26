@@ -577,3 +577,37 @@ fn dispatch_overlay_surface(app: &mut App, surface: crate::tui::button::OverlayS
         })
         .expect("dispatch overlay surface");
 }
+
+fn app_with_rendered_settings(tmp: &std::path::Path) -> App {
+    let mut app = App::new(Some(tmp), false);
+    app.dialog = Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
+        tmp.join("config.json"),
+    )));
+    app.mouse_capture = true;
+    render_settings(&mut app, 80, 24);
+    app
+}
+
+#[test]
+fn settings_pointer_and_press_end_on_resize_focus_loss_and_capture_off() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    for event in [
+        crossterm::event::Event::Resize(90, 30),
+        crossterm::event::Event::FocusLost,
+    ] {
+        let mut app = app_with_rendered_settings(tmp.path());
+        app.handle_mouse(mouse(MouseEventKind::Moved, 10, 5));
+        app.dialog.test_press_settings_button(Rect::new(2, 2, 8, 1));
+        app.handle_terminal_event(event.clone());
+        assert!(app.dialog.test_help_row_pointer().is_none(), "{event:?}");
+        assert!(
+            !app.dialog.test_settings_button_pressed(),
+            "{event:?}: press → {event:?} → release must not activate"
+        );
+    }
+
+    let mut app = app_with_rendered_settings(tmp.path());
+    app.handle_mouse(mouse(MouseEventKind::Moved, 10, 5));
+    app.set_mouse_capture_live(false);
+    assert!(app.dialog.test_help_row_pointer().is_none());
+}

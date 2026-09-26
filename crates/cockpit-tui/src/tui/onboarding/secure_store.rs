@@ -412,6 +412,12 @@ impl SecureStoreScreen {
         lines
     }
 
+    /// Forget the previous frame's password field rectangles.
+    pub(crate) fn clear_hit_geometry(&mut self) {
+        self.password_rect = Rect::default();
+        self.confirmation_rect = Rect::default();
+    }
+
     pub(crate) fn render_password(&mut self, frame: &mut Frame, area: Rect) {
         let rows = ratatui::layout::Layout::vertical([
             ratatui::layout::Constraint::Length(3),
@@ -501,8 +507,7 @@ impl SecureStoreScreen {
         self.phase = SecureStoreInputPhase::Choice;
         self.status = None;
         self.revealed = false;
-        self.password_rect = Rect::default();
-        self.confirmation_rect = Rect::default();
+        self.clear_hit_geometry();
     }
 
     pub(crate) fn help_text(&self) -> &'static str {

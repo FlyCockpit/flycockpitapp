@@ -1,11 +1,11 @@
  ‹ Back                                                                                                                 
                  Pin a third-party agent · step 6/8                                                                     
                  Paste the immutable source locator you want Cockpit to pin.                                            
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Locator ───────────────────────────────────────────────────────────────────────────╮                 
                  │ pinned source locator                                                              │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

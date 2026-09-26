@@ -246,11 +246,7 @@ impl App {
             disable_mouse_capture_with_motion().is_ok()
         };
         if exec_ok {
-            self.mouse_capture = new_value;
-            self.invalidate_primary_paste();
-            if !new_value {
-                self.hovered_affordance = None;
-            }
+            self.commit_mouse_capture(new_value);
             let state = if new_value { "on" } else { "off" };
             self.show_toast(
                 format!("/mouse: capture {state} (this session only)"),
@@ -275,7 +271,7 @@ impl App {
         self.set_mouse_capture_live(want);
     }
 
-    fn set_mouse_capture_live(&mut self, want: bool) {
+    pub(super) fn set_mouse_capture_live(&mut self, want: bool) {
         if want == self.mouse_capture {
             return;
         }
@@ -285,15 +281,32 @@ impl App {
             disable_mouse_capture_with_motion()
         };
         if res.is_ok() {
-            self.mouse_capture = want;
-            self.invalidate_primary_paste();
-            if !want {
-                self.link_pointer_gesture.cancel();
-                self.hovered_affordance = None;
-                self.hovered_suggestion = None;
-                self.link_registry.clear_hover();
-                self.dialog.clear_settings_pointer_hover();
-            }
+            self.commit_mouse_capture(want);
+        }
+    }
+
+    /// After an external program returned the terminal: record the capture
+    /// state the restore actually achieved. Mouse capture was off on the
+    /// terminal for the whole time the program ran — releases and motion in
+    /// that interval never arrived — so every capture ends and the pointer is
+    /// forgotten even when the restore turned capture back on.
+    pub(super) fn sync_mouse_capture_after_restore(&mut self, live: bool) {
+        if live != self.mouse_capture {
+            self.commit_mouse_capture(live);
+        }
+        if live {
+            self.end_mouse_capture();
+        }
+    }
+
+    /// The one path for a live mouse-capture change, shared by `/mouse` and
+    /// the settings toggle. Turning capture off ends every capture and
+    /// forgets the pointer, so no hover or held press outlives it.
+    fn commit_mouse_capture(&mut self, enabled: bool) {
+        self.mouse_capture = enabled;
+        self.invalidate_primary_paste();
+        if !enabled {
+            self.end_mouse_capture();
         }
     }
 

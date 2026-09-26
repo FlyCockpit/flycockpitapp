@@ -29,7 +29,7 @@ fn key(code: KeyCode) -> KeyEvent {
     }
 }
 
-fn selectable_meta() -> render::ChatRowMeta {
+pub(super) fn selectable_meta() -> render::ChatRowMeta {
     render::ChatRowMeta {
         history_index: Some(0),
         row_kind: render::ChatRowKind::Message,
@@ -775,5 +775,149 @@ fn response_performance_chip_gesture_cancels_on_drag_release_outside_and_stale_g
             ..
         } => {}
         other => panic!("stale generation must cancel: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn resize_and_focus_loss_end_the_drag_but_keep_a_completed_copy() {
+    for (event, selection_survives) in [
+        (crossterm::event::Event::FocusLost, true),
+        (crossterm::event::Event::Resize(40, 10), false),
+    ] {
+        let mut app = app_with_hello_grid();
+        app.arm_controllable_mouse_copy = true;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 0));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, 0));
+        assert_eq!(app.pending_mouse_copies.len(), 1);
+        let runner = app.controllable_mouse_copy.take().unwrap();
+        app.handle_terminal_event(event.clone());
+        assert_eq!(
+            app.selection.is_some(),
+            selection_survives,
+            "{event:?}: only a resize voids the selection's coordinates"
+        );
+        assert_eq!(
+            app.pending_mouse_copies.len(),
+            1,
+            "{event:?}: the completed copy stays in flight"
+        );
+        runner.release(MouseCopyResult::Confirmed);
+        tokio::task::yield_now().await;
+        app.drain_async_actions();
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Copied 5 chars to clipboard."),
+            "{event:?}: the completed copy reports"
+        );
+    }
+}
+
+#[test]
+fn resize_and_focus_loss_end_an_in_progress_drag() {
+    for event in [
+        crossterm::event::Event::FocusLost,
+        crossterm::event::Event::Resize(40, 10),
+    ] {
+        let mut app = app_with_hello_grid();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 0));
+        assert!(app.mouse_gesture_state.dragging);
+        app.handle_terminal_event(event.clone());
+        assert!(!app.mouse_gesture_state.dragging, "{event:?}: drag ended");
+        assert!(app.mouse_gesture_state.pending_press.is_none(), "{event:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_scheduled_double_click_copy_keeps_its_word_across_a_resize() {
+    let mut app = app_with_hello_grid();
+    app.arm_controllable_mouse_copy = true;
+    app.event_loop_monotonic_now = Duration::from_millis(0);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0));
+    app.event_loop_monotonic_now = Duration::from_millis(20);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0));
+    assert!(app.mouse_gesture_state.pending_copy_deadline.is_some());
+    // The resize voids the selection's coordinates before the timer fires.
+    app.handle_terminal_event(crossterm::event::Event::Resize(40, 10));
+    assert!(app.selection.is_none());
+    app.service_due_mouse_gesture_timers(Duration::from_millis(500));
+    let copied: Vec<usize> = app
+        .pending_mouse_copies
+        .values()
+        .map(|copy| copy.char_count)
+        .collect();
+    assert_eq!(copied, [5], "the committed word copy must copy \"world\"");
+    assert_eq!(
+        app.last_scheduled_mouse_copy_text.as_deref(),
+        Some("world"),
+        "the committed word copy must copy exactly \"world\""
+    );
+    assert!(
+        app.scheduled_copy_payload.is_none(),
+        "the payload was consumed"
+    );
+}
+
+#[test]
+fn a_cancelled_scheduled_copy_drops_its_committed_text() {
+    // Every way the multi-click copy timer is tombstoned before it fires
+    // drops the text it captured; the timer firing consumes it.
+    type Cancel = fn(&mut App);
+    let cancels: [(&str, Cancel); 5] = [
+        ("esc", |app| {
+            app.handle_key(key(KeyCode::Esc));
+        }),
+        ("new press", |app| {
+            app.event_loop_monotonic_now = Duration::from_millis(100);
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        }),
+        ("view change", |app| {
+            app.invalidate_mouse_gesture(
+                MouseGestureInvalidation::ViewChange,
+                Duration::from_millis(40),
+            );
+        }),
+        ("terminal change", |app| {
+            app.invalidate_mouse_gesture(
+                MouseGestureInvalidation::TerminalChange,
+                Duration::from_millis(40),
+            );
+        }),
+        ("shutdown ownership", |app| {
+            app.drop_mouse_copy_ui_ownership()
+        }),
+    ];
+    for (name, cancel) in cancels {
+        let mut app = app_with_hello_grid();
+        app.arm_controllable_mouse_copy = true;
+        app.event_loop_monotonic_now = Duration::from_millis(0);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0));
+        app.event_loop_monotonic_now = Duration::from_millis(20);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0));
+        assert!(
+            app.scheduled_copy_payload
+                .as_ref()
+                .is_some_and(|(_, text)| text == "world"),
+            "{name}: the double click committed its word"
+        );
+        cancel(&mut app);
+        assert!(
+            app.mouse_gesture_state.pending_copy_deadline.is_none(),
+            "{name}: the timer was tombstoned"
+        );
+        assert!(
+            app.scheduled_copy_payload.is_none(),
+            "{name}: the text outlived its timer"
+        );
+        app.service_due_mouse_gesture_timers(Duration::from_millis(600));
+        assert!(
+            app.last_scheduled_mouse_copy_text.is_none(),
+            "{name}: a stale copy ran"
+        );
     }
 }

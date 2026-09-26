@@ -3,7 +3,7 @@
 use super::search::{ProviderSearchScreen, filter_catalog, onboarding_catalog};
 use super::*;
 use crate::tui::onboarding::auth::AuthPhase;
-use crate::tui::settings::{OAuthBeginResult, OAuthFlowRequest, OAuthPublicBegin};
+use crate::tui::settings::{OAuthBeginResult, OAuthFlowOp, OAuthFlowRequest, OAuthPublicBegin};
 use cockpit_config::providers::ProvidersConfig;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
@@ -225,11 +225,11 @@ fn profile_stage_presents_its_native_screen_and_step() {
         [
             "Welcome",
             "Name",
-            "Secure store",
+            "Secrets",
             "Provider",
             "Model",
             "Agent",
-            "Lifetime",
+            "Background",
             "Ready",
         ]
     );
@@ -924,6 +924,8 @@ fn provider_catalog_scrollbar_drag_changes_the_viewport_and_consumes_gesture() {
 
     let down = shell.handle_mouse(click(scrollbar.x, scrollbar.y), &mut engine);
     assert!(down.consumed);
+    // Every pointer event in a live terminal is followed by a redraw.
+    render_string(&mut shell, 80, 12, &engine);
     let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
         panic!("expected search screen");
     };
@@ -933,6 +935,7 @@ fn provider_catalog_scrollbar_drag_changes_the_viewport_and_consumes_gesture() {
     let bottom = scrollbar.bottom().saturating_sub(1);
     let drag = shell.handle_mouse(drag_left(scrollbar.x, bottom), &mut engine);
     assert!(drag.consumed);
+    render_string(&mut shell, 80, 12, &engine);
     let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
         panic!("expected search screen");
     };
@@ -944,6 +947,7 @@ fn provider_catalog_scrollbar_drag_changes_the_viewport_and_consumes_gesture() {
 
     let release = shell.handle_mouse(release_left(scrollbar.x, bottom), &mut engine);
     assert!(release.consumed);
+    render_string(&mut shell, 80, 12, &engine);
     let after_release = shell.handle_mouse(drag_left(scrollbar.x, scrollbar.y), &mut engine);
     assert!(!after_release.consumed);
     let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
@@ -951,6 +955,419 @@ fn provider_catalog_scrollbar_drag_changes_the_viewport_and_consumes_gesture() {
     };
     assert!(!screen.dragging_scrollbar());
     assert_eq!(screen.offset(), dragged_offset);
+}
+
+fn moved(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Moved,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn render_buffer(shell: &mut OnboardingShell, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut links = crate::tui::links::LinkRegistry::default();
+    let engine = Dialog::None;
+    terminal
+        .draw(|frame| shell.render(frame, frame.area(), &engine, &mut links))
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn find_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Position {
+    let area = buffer.area;
+    for y in area.top()..area.bottom() {
+        let row: String = (area.left()..area.right())
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        if let Some(byte) = row.find(needle) {
+            let x = row[..byte].chars().count() as u16;
+            return Position::new(area.x + x, y);
+        }
+    }
+    panic!("{needle:?} not rendered");
+}
+
+#[test]
+fn action_bar_hover_survives_the_geometry_clear_and_paints() {
+    // Continue must be enabled: hover only tracks enabled buttons.
+    let mut secure = snapshot(OnboardingStage::SecureStore);
+    secure.host_capabilities =
+        secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
+    let mut shell = OnboardingShell::new(&secure, false);
+    let mut engine = Dialog::None;
+    let idle = render_buffer(&mut shell, 80, 24);
+    let button = find_text(&idle, "[ Continue ]");
+    let label = Position::new(button.x + 2, button.y);
+    assert_eq!(idle[(label.x, label.y)].bg, ratatui::style::Color::Reset);
+
+    let outcome = shell.handle_mouse(moved(label.x, label.y), &mut engine);
+    assert!(outcome.consumed);
+    let hovered = render_buffer(&mut shell, 80, 24);
+    assert_ne!(
+        hovered[(label.x, label.y)].bg,
+        ratatui::style::Color::Reset,
+        "the hovered button must paint its hover chip"
+    );
+    // Hover persists across further frames until the pointer leaves.
+    let again = render_buffer(&mut shell, 80, 24);
+    assert_eq!(again[(label.x, label.y)].bg, hovered[(label.x, label.y)].bg);
+    shell.handle_mouse(moved(40, 12), &mut engine);
+    let left = render_buffer(&mut shell, 80, 24);
+    assert_eq!(left[(label.x, label.y)].bg, ratatui::style::Color::Reset);
+}
+
+#[test]
+fn provider_scrollbar_drag_survives_redraws_between_pointer_events() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 20, &engine);
+    let OnboardingScreen::ProviderSearch(screen) = &shell.screen else {
+        panic!("expected search screen");
+    };
+    let scrollbar = screen.scrollbar_area();
+    assert!(scrollbar.height >= 3, "need room to drag: {scrollbar:?}");
+    let offset = |shell: &OnboardingShell| match &shell.screen {
+        OnboardingScreen::ProviderSearch(screen) => screen.offset(),
+        _other => panic!("expected search screen"),
+    };
+
+    assert!(
+        shell
+            .handle_mouse(click(scrollbar.x, scrollbar.y), &mut engine)
+            .consumed
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    let middle = scrollbar.y + scrollbar.height / 2;
+    assert!(
+        shell
+            .handle_mouse(drag_left(scrollbar.x, middle), &mut engine)
+            .consumed
+    );
+    let at_middle = offset(&shell);
+    assert!(at_middle > 0, "the first drag must move the viewport");
+    render_string(&mut shell, 80, 20, &engine);
+    let bottom = scrollbar.bottom() - 1;
+    assert!(
+        shell
+            .handle_mouse(drag_left(scrollbar.x, bottom), &mut engine)
+            .consumed,
+        "a redraw must not cancel the drag"
+    );
+    assert!(offset(&shell) > at_middle, "the viewport keeps moving");
+}
+
+fn available_secure_store_shell() -> OnboardingShell {
+    let mut secure = snapshot(OnboardingStage::SecureStore);
+    secure.host_capabilities =
+        secure_store_capabilities(cockpit_proto::FeatureCapabilityState::Available);
+    OnboardingShell::new(&secure, false)
+}
+
+fn render_zero_area(shell: &mut OnboardingShell) {
+    let engine = Dialog::None;
+    let mut links = crate::tui::links::LinkRegistry::default();
+    crate::tui::golden::render_frame(80, 24, |frame| {
+        let area = frame.area();
+        shell.render(frame, Rect { height: 0, ..area }, &engine, &mut links);
+    });
+}
+
+#[test]
+fn a_frame_with_no_layout_leaves_no_stale_choice_rows() {
+    // Only the shell's own clear protects this path: a zero-area frame
+    // returns before any screen renderer runs, so no renderer re-clears.
+    let mut shell = available_secure_store_shell();
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 24, &engine);
+    let machine = shell.list_row_rects[2];
+    assert!(!machine.is_empty(), "{:?}", shell.list_row_rects);
+    render_zero_area(&mut shell);
+    assert!(
+        shell.list_row_rects.is_empty(),
+        "{:?}",
+        shell.list_row_rects
+    );
+    let before = shell.test_secure_store_cursor_placement();
+    let outcome = shell.handle_mouse(click(machine.x + 2, machine.y), &mut engine);
+    assert!(outcome.action.is_none());
+    assert_eq!(
+        shell.test_secure_store_cursor_placement(),
+        before,
+        "a stale row moved the cursor"
+    );
+}
+
+#[test]
+fn action_bar_hover_follows_the_pointer_not_the_button_index_across_a_resize() {
+    let mut shell = available_secure_store_shell();
+    let mut engine = Dialog::None;
+    let narrow = render_buffer(&mut shell, 80, 24);
+    let button = find_text(&narrow, "[ Continue ]");
+    let pointer = Position::new(button.x + 2, button.y);
+    shell.handle_mouse(moved(pointer.x, pointer.y), &mut engine);
+    let hovered = render_buffer(&mut shell, 80, 24);
+    assert_ne!(
+        hovered[(pointer.x, pointer.y)].bg,
+        ratatui::style::Color::Reset
+    );
+
+    // Wider terminal: the right-aligned button moves away from the pointer.
+    let wide = render_buffer(&mut shell, 100, 24);
+    let moved_button = find_text(&wide, "[ Continue ]");
+    assert_ne!(moved_button, button, "the resize must move the button");
+    for x in moved_button.x..moved_button.x + 12 {
+        assert_eq!(
+            wide[(x, moved_button.y)].bg,
+            ratatui::style::Color::Reset,
+            "hover must not follow the button away from the pointer"
+        );
+    }
+    assert_eq!(
+        wide[(pointer.x, pointer.y)].bg,
+        ratatui::style::Color::Reset
+    );
+}
+
+#[test]
+fn back_hover_is_owned_by_the_escape_menu_while_it_is_open() {
+    let mut shell = shell_at(OnboardingStage::Profile);
+    let mut engine = Dialog::None;
+    let idle = render_buffer(&mut shell, 80, 24);
+    let back = find_text(&idle, "‹ Back");
+    shell.handle_mouse(moved(back.x, back.y), &mut engine);
+    let hovered = render_buffer(&mut shell, 80, 24);
+    assert_ne!(hovered[(back.x, back.y)].bg, ratatui::style::Color::Reset);
+
+    // The modal owns the pointer: the chrome behind it shows no hover.
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let under_menu = render_buffer(&mut shell, 80, 24);
+    assert!(render_string(&mut shell, 80, 24, &engine).contains("Leave setup?"));
+    assert_eq!(
+        under_menu[(back.x, back.y)].bg,
+        ratatui::style::Color::Reset
+    );
+
+    // The pointer moves while the menu has it, then the menu closes: hover
+    // re-derives from where the pointer is now, not where it was.
+    shell.handle_mouse(moved(40, 20), &mut engine);
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let closed = render_buffer(&mut shell, 80, 24);
+    assert!(!render_string(&mut shell, 80, 24, &engine).contains("Leave setup?"));
+    assert_eq!(closed[(back.x, back.y)].bg, ratatui::style::Color::Reset);
+}
+
+fn search_screen(shell: &OnboardingShell) -> &ProviderSearchScreen {
+    match &shell.screen {
+        OnboardingScreen::ProviderSearch(screen) => screen,
+        _other => panic!("expected search screen"),
+    }
+}
+
+/// A provider shell at 80x20 with a scrollbar drag in progress.
+fn dragging_provider_shell() -> (OnboardingShell, Rect) {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 20, &engine);
+    let scrollbar = search_screen(&shell).scrollbar_area();
+    assert!(scrollbar.height >= 3, "{scrollbar:?}");
+    assert!(
+        shell
+            .handle_mouse(click(scrollbar.x, scrollbar.y), &mut engine)
+            .consumed
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    assert!(search_screen(&shell).dragging_scrollbar());
+    (shell, scrollbar)
+}
+
+#[test]
+fn a_selected_provider_does_not_snap_a_dragged_viewport_back() {
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 20, &engine);
+    // Select the first provider with a click on its row.
+    let first = shell.list_row_rects[0];
+    shell.handle_mouse(click(first.x + 3, first.y), &mut engine);
+    render_string(&mut shell, 80, 20, &engine);
+    assert_eq!(search_screen(&shell).cursor(), 0);
+
+    let scrollbar = search_screen(&shell).scrollbar_area();
+    assert!(
+        shell
+            .handle_mouse(click(scrollbar.x, scrollbar.y), &mut engine)
+            .consumed
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    let middle = scrollbar.y + scrollbar.height / 2;
+    assert!(
+        shell
+            .handle_mouse(drag_left(scrollbar.x, middle), &mut engine)
+            .consumed
+    );
+    let at_middle = search_screen(&shell).offset();
+    assert!(at_middle > 0);
+    render_string(&mut shell, 80, 20, &engine);
+    assert_eq!(
+        search_screen(&shell).offset(),
+        at_middle,
+        "a redraw snapped the dragged viewport back to the selected provider"
+    );
+    let bottom = scrollbar.bottom() - 1;
+    assert!(
+        shell
+            .handle_mouse(drag_left(scrollbar.x, bottom), &mut engine)
+            .consumed
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    assert!(search_screen(&shell).offset() > at_middle);
+
+    // The wheel sticks too.
+    let offset = search_screen(&shell).offset();
+    shell.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: first.x + 3,
+            row: first.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut engine,
+    );
+    render_string(&mut shell, 80, 20, &engine);
+    assert_eq!(search_screen(&shell).offset(), offset - 1);
+
+    // A cursor move brings the viewport back to the cursor.
+    shell.handle_key(key(KeyCode::Down), &mut engine);
+    render_string(&mut shell, 80, 20, &engine);
+    assert!(search_screen(&shell).offset() <= search_screen(&shell).cursor());
+}
+
+#[test]
+fn opening_the_escape_menu_ends_a_scrollbar_drag() {
+    let (mut shell, scrollbar) = dragging_provider_shell();
+    let mut engine = Dialog::None;
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    assert!(!search_screen(&shell).dragging_scrollbar());
+    // The release the menu swallows, then dismissing the menu, leave no
+    // latched drag that a later unrelated drag could drive.
+    shell.handle_mouse(release_left(scrollbar.x, scrollbar.y), &mut engine);
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    render_string(&mut shell, 80, 20, &engine);
+    let offset = search_screen(&shell).offset();
+    let later = shell.handle_mouse(drag_left(scrollbar.x, scrollbar.bottom() - 1), &mut engine);
+    assert!(!later.consumed);
+    assert_eq!(search_screen(&shell).offset(), offset);
+}
+
+#[test]
+fn a_changed_scrollbar_rect_ends_a_scrollbar_drag() {
+    let (mut shell, _) = dragging_provider_shell();
+    render_string(&mut shell, 80, 22, &Dialog::None);
+    assert!(!search_screen(&shell).dragging_scrollbar());
+}
+
+#[test]
+fn a_frame_with_no_layout_ends_a_scrollbar_drag() {
+    let (mut shell, _) = dragging_provider_shell();
+    render_zero_area(&mut shell);
+    assert!(!search_screen(&shell).dragging_scrollbar());
+}
+
+#[test]
+fn ending_pointer_interactions_ends_a_scrollbar_drag() {
+    let (mut shell, _) = dragging_provider_shell();
+    shell.end_pointer_interactions();
+    assert!(!search_screen(&shell).dragging_scrollbar());
+}
+
+#[test]
+fn ending_pointer_interactions_forgets_the_pointer_so_nothing_hovers() {
+    let mut shell = available_secure_store_shell();
+    let mut engine = Dialog::None;
+    let idle = render_buffer(&mut shell, 80, 24);
+    let button = find_text(&idle, "[ Continue ]");
+    shell.handle_mouse(moved(button.x + 2, button.y), &mut engine);
+    shell.end_pointer_interactions();
+    let after = render_buffer(&mut shell, 80, 24);
+    assert_eq!(
+        after[(button.x + 2, button.y)].bg,
+        ratatui::style::Color::Reset
+    );
+}
+
+#[test]
+fn an_app_modal_over_the_shell_owns_the_pointer() {
+    let mut shell = available_secure_store_shell();
+    let mut engine = Dialog::None;
+    let idle = render_buffer(&mut shell, 80, 24);
+    let button = find_text(&idle, "[ Continue ]");
+    shell.handle_mouse(moved(button.x + 2, button.y), &mut engine);
+    shell.set_pointer_owned(false);
+    let under_modal = render_buffer(&mut shell, 80, 24);
+    assert_eq!(
+        under_modal[(button.x + 2, button.y)].bg,
+        ratatui::style::Color::Reset,
+        "chrome under an app-level modal must not hover"
+    );
+    shell.set_pointer_owned(true);
+    let owned = render_buffer(&mut shell, 80, 24);
+    assert_ne!(
+        owned[(button.x + 2, button.y)].bg,
+        ratatui::style::Color::Reset
+    );
+}
+
+/// Rows of `buffer` that paint the Escape menu's hover background.
+fn escape_menu_hover_rows(buffer: &ratatui::buffer::Buffer) -> Vec<u16> {
+    let area = buffer.area;
+    (area.top()..area.bottom())
+        .filter(|y| {
+            (area.left()..area.right()).any(|x| buffer[(x, *y)].bg == crate::tui::theme::HOVER_BG)
+        })
+        .collect()
+}
+
+#[test]
+fn escape_menu_row_hover_follows_the_pointer_when_the_menu_moves_or_clips() {
+    let mut shell = shell_at(OnboardingStage::SecureStore);
+    let mut engine = Dialog::None;
+    shell.handle_key(key(KeyCode::Esc), &mut engine);
+    let opened = render_buffer(&mut shell, 80, 24);
+    let row = find_text(&opened, "Cancel setup for now");
+    shell.handle_mouse(moved(row.x + 2, row.y), &mut engine);
+    let hovered = render_buffer(&mut shell, 80, 24);
+    assert_eq!(escape_menu_hover_rows(&hovered), [row.y]);
+
+    // A shorter terminal recentres the menu: the row moves away from the
+    // pointer, and only a row actually under the pointer may hover.
+    let moved_menu = render_buffer(&mut shell, 80, 16);
+    let moved_row = find_text(&moved_menu, "Cancel setup for now");
+    assert_ne!(moved_row.y, row.y, "the menu must move");
+    let rows = escape_menu_hover_rows(&moved_menu);
+    assert!(rows.iter().all(|y| *y == row.y), "{rows:?}");
+    assert!(!rows.contains(&moved_row.y));
+
+    // Too short to show the rows at all: nothing hovers.
+    let clipped = render_buffer(&mut shell, 80, 6);
+    assert!(escape_menu_hover_rows(&clipped).is_empty());
+}
+
+#[test]
+fn shrinking_the_window_leaves_no_stale_choice_rows() {
+    // Non-zero-area relayout: at 80x24 the machine-bound row is on row 8; at
+    // 80x8 that row is the bottom margin (content is rows 4-5, footer 6).
+    let mut shell = available_secure_store_shell();
+    let mut engine = Dialog::None;
+    render_string(&mut shell, 80, 24, &engine);
+    let stale = shell.list_row_rects[2];
+    assert_eq!(stale.y, 8, "{:?}", shell.list_row_rects);
+    render_string(&mut shell, 80, 8, &engine);
+    let before = shell.test_secure_store_cursor_placement();
+    let outcome = shell.handle_mouse(click(stale.x + 2, stale.y), &mut engine);
+    assert!(outcome.action.is_none());
+    assert_eq!(shell.test_secure_store_cursor_placement(), before);
 }
 
 #[test]
@@ -1027,6 +1444,63 @@ fn authenticate_oauth_device_polling_escape_stays_on_authenticate() {
     shell.set_auth_phase_for_golden(AuthPhase::DevicePolling);
     let action = shell.handle_key(key(KeyCode::Esc), &mut engine);
     assert!(matches!(action, Some(OnboardingShellAction::OAuth(_))));
+    assert_eq!(shell.screen_kind(), OnboardingScreenKind::Authenticate);
+}
+
+#[test]
+fn authenticate_oauth_device_polling_enter_approves_now_without_the_button() {
+    // "Approve now" stays keyboard-reachable when a narrow footer hides it.
+    let mut shell = shell_at(OnboardingStage::Provider);
+    let mut engine = Dialog::None;
+    shell.present_authenticate(cockpit_core::providers::template_by_id("codex-oauth").unwrap());
+    let OAuthFlowRequest {
+        client_flow_id,
+        operation_id,
+        ..
+    } = match shell.handle_key(key(KeyCode::Enter), &mut engine) {
+        Some(OnboardingShellAction::OAuth(request)) => request,
+        other => panic!("acknowledge must queue OAuth, got {other:?}"),
+    };
+    let begin = shell
+        .apply_onboarding_oauth_acknowledgement(client_flow_id, operation_id, Ok(()))
+        .expect("successful acknowledgement must queue begin");
+    shell.apply_onboarding_oauth_begin(
+        begin.client_flow_id,
+        begin.operation_id,
+        OAuthBeginResult::Public(Ok(OAuthPublicBegin {
+            flow_id: "remote-flow".into(),
+            authorize_url: "https://auth.openai.com/codex/device".into(),
+            user_code: Some("WXYZ-1234".into()),
+        })),
+    );
+    // Enter on the idle device screen presents the code and starts polling;
+    // settle that presentation so the flow has no request in flight.
+    let present = match shell.handle_key(key(KeyCode::Enter), &mut engine) {
+        Some(OnboardingShellAction::OAuth(request)) => request,
+        other => panic!("device idle Enter must present, got {other:?}"),
+    };
+    shell.apply_onboarding_oauth_present(
+        present.client_flow_id,
+        present.operation_id,
+        Ok(crate::tui::settings::OAuthPresentationResult {
+            copied: false,
+            copy_unverified: false,
+            opened: true,
+            advance_flow: false,
+        }),
+    );
+    assert!(matches!(
+        &shell.screen,
+        OnboardingScreen::Authenticate(screen) if screen.auth_phase() == AuthPhase::DevicePolling
+    ));
+    let rendered = render_string(&mut shell, 28, 24, &engine);
+    assert!(!rendered.contains("Approve now ]"), "{rendered}");
+    let action = shell.handle_key(key(KeyCode::Enter), &mut engine);
+    assert!(
+        matches!(&action, Some(OnboardingShellAction::OAuth(request))
+            if matches!(request.op, OAuthFlowOp::Poll { .. })),
+        "{action:?}"
+    );
     assert_eq!(shell.screen_kind(), OnboardingScreenKind::Authenticate);
 }
 
@@ -1317,6 +1791,223 @@ fn superseding_same_stage_revision_discards_stale_local_search_state() {
 
 // ── Chrome ───────────────────────────────────────────────────────────────
 
+fn render_rows(shell: &mut OnboardingShell, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut links = crate::tui::links::LinkRegistry::default();
+    let engine = Dialog::None;
+    terminal
+        .draw(|frame| shell.render(frame, frame.area(), &engine, &mut links))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn progress_row_sits_between_header_and_rule_in_width_tiers() {
+    // Row layout inside the column (1-row top margin): title, subtitle,
+    // progress, rule, one blank line, then the content.
+    let cases = [
+        (
+            120u16,
+            "✓ Welcome  ✓ Name  ◆ Secrets  · Provider  · Model  · Agent  · Background  · Ready",
+        ),
+        (80, "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"),
+        (60, "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"),
+        (40, "✓  ✓  ◆ Secrets  ·  ·  ·  ·  ·"),
+        (30, "Step 3 of 8 · Secrets"),
+    ];
+    for (width, progress) in cases {
+        let mut shell = shell_at(OnboardingStage::SecureStore);
+        let rows = render_rows(&mut shell, width, 24);
+        let column = rows[1].find("Secure your secrets").expect("title row");
+        let at = |row: usize| rows[row].get(column..).unwrap_or_default().to_string();
+        assert!(
+            at(1).starts_with("Secure your secrets · step 3/8") || width < 40,
+            "{rows:#?}"
+        );
+        assert_eq!(at(3), progress, "{width} cols: {rows:#?}");
+        assert!(
+            !at(3).contains("step 3/8") || width < 40,
+            "count lives in the title"
+        );
+        let rule = at(4);
+        assert!(
+            !rule.is_empty() && rule.chars().all(|c| c == '─'),
+            "{rows:#?}"
+        );
+        assert!(at(5).is_empty(), "blank line before content: {rows:#?}");
+        assert!(
+            at(6).starts_with("◉ Platform keyring"),
+            "{width}: {rows:#?}"
+        );
+    }
+}
+
+/// Rows the pre-redesign layout gave the content, computed by running its
+/// actual ratatui constraints (header with its rule, progress, `Min(1)`
+/// content, footer) on the same column, so the comparison follows the
+/// solver's real behaviour under pressure rather than hand arithmetic.
+fn legacy_content_rows(col: Rect) -> u16 {
+    Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(col)[2]
+        .height
+}
+
+#[test]
+fn chrome_rows_never_give_content_less_than_the_legacy_layout_at_any_height() {
+    for height in 0..=40u16 {
+        let col = ui::column(Rect::new(0, 0, 80, height));
+        let rows = ShellRows::split(col);
+        let legacy = legacy_content_rows(col);
+        let blank = rows.content.y - rows.rule.unwrap_or(rows.progress).bottom();
+        let context = format!("{height} rows (column {}): {rows:?}", col.height);
+
+        // Contiguous, non-overlapping, and exactly filling the column.
+        assert_eq!(rows.header.y, col.y, "{context}");
+        assert_eq!(rows.progress.y, rows.header.bottom(), "{context}");
+        if let Some(rule) = rows.rule {
+            assert_eq!(rule.y, rows.progress.bottom(), "{context}");
+            assert_eq!(rule.height, 1, "{context}");
+        }
+        assert_eq!(rows.content.bottom(), rows.footer.y, "{context}");
+        assert_eq!(rows.footer.bottom(), col.bottom(), "{context}");
+
+        // The footer is never cut, and content keeps a row whenever it can
+        // coexist with the footer.
+        assert_eq!(rows.footer.height, col.height.min(1), "{context}");
+        assert_eq!(rows.content.height >= 1, col.height >= 2, "{context}");
+
+        // Decorative rows only from their thresholds.
+        assert_eq!(rows.rule.is_some(), col.height >= 8, "{context}");
+        assert_eq!(blank, u16::from(col.height >= 22), "{context}");
+
+        // Content never loses a row to the redesign, except the one
+        // deliberate blank line on terminals of 24 rows or more.
+        //
+        // Accepted deferral (coordinator decision): at a one-row column (a
+        // 3-row terminal) the footer owns the only row, so content has 0
+        // rows where the legacy solver gave that row to `Min(1)` content and
+        // dropped the footer. Footer > content there, explicitly.
+        if col.height < 2 {
+            continue;
+        }
+        assert!(
+            rows.content.height + blank >= legacy,
+            "{context}: content {} vs legacy {legacy}",
+            rows.content.height
+        );
+        if blank == 0 {
+            assert!(rows.content.height >= legacy, "{context}");
+        }
+    }
+}
+
+#[test]
+fn short_terminals_still_show_the_footer_fields_and_all_secure_choices() {
+    // Sampled heights plus both sides of each threshold: rule (9/10),
+    // the former blank threshold (15/16), and the blank line (23/24).
+    for height in [6u16, 8, 9, 10, 12, 15, 16, 23, 24] {
+        let mut shell = shell_at(OnboardingStage::SecureStore);
+        let rows = render_rows(&mut shell, 80, height);
+        let screen = rows.join("\n");
+        let footer = usize::from(height) - 2;
+        assert!(
+            rows[footer].contains("[ Continue ]"),
+            "{height} rows: footer missing\n{screen}"
+        );
+        let rule_rows = rows
+            .iter()
+            .filter(|row| row.trim_start().starts_with('─'))
+            .count();
+        assert_eq!(
+            rule_rows,
+            usize::from(height >= 10),
+            "{height} rows\n{screen}"
+        );
+        let first_choice = rows.iter().position(|row| row.contains("Platform keyring"));
+        if height >= 8 {
+            // Row 3 is progress; then the rule (from 10 rows) and the blank
+            // line (from 24 rows) push the first choice down.
+            let expected = 4 + usize::from(height >= 10) + usize::from(height >= 24);
+            assert_eq!(first_choice, Some(expected), "{height} rows\n{screen}");
+        }
+        if height >= 10 {
+            for choice in [
+                "Platform keyring",
+                "Passphrase-protected file",
+                "Machine-bound encrypted file",
+            ] {
+                assert!(screen.contains(choice), "{height} rows: {choice}\n{screen}");
+            }
+        }
+
+        let mut shell = shell_at(OnboardingStage::Profile);
+        shell.paste("Ada");
+        let rows = render_rows(&mut shell, 80, height);
+        let screen = rows.join("\n");
+        assert!(
+            rows[footer].contains("[ Continue ]"),
+            "{height} rows: footer missing\n{screen}"
+        );
+        if height >= 10 {
+            assert!(
+                screen.contains("Ada"),
+                "{height} rows: boxed name text\n{screen}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_step_label_names_the_step_its_screen_title_names() {
+    // One name per step: the progress label is the shortened wording of
+    // the step's entry-screen header (title, or subtitle for the profile
+    // question), so the row never disagrees with the header.
+    for (index, stage) in [
+        OnboardingStage::Profile,
+        OnboardingStage::SecureStore,
+        OnboardingStage::Provider,
+        OnboardingStage::Model,
+        OnboardingStage::Agent,
+        OnboardingStage::Lifetime,
+        OnboardingStage::Complete,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut shell = shell_at(stage);
+        if stage == OnboardingStage::Agent {
+            // The app mounts the authoring entry screen asynchronously.
+            shell.present_agent_authoring(agent::golden_sample_projection(), "label".into());
+        }
+        let label = PROGRESS_STEPS[index + 1];
+        let rows = render_rows(&mut shell, 120, 40);
+        let header = format!("{} {}", rows[1], rows[2]).to_lowercase();
+        assert!(
+            header.contains(&label.to_lowercase()),
+            "{stage:?}: label {label:?} absent from header {header:?}"
+        );
+        assert!(
+            rows[3].contains(&format!("◆ {label}")),
+            "{stage:?}: {:?}",
+            rows[3]
+        );
+    }
+}
+
 #[test]
 fn chrome_shows_progress_and_limited_mode_at_both_sizes() {
     for (width, height) in [(60u16, 20u16), (120, 40)] {
@@ -1324,9 +2015,8 @@ fn chrome_shows_progress_and_limited_mode_at_both_sizes() {
         let engine = Dialog::None;
         let rendered = render_string(&mut shell, width, height, &engine);
         assert!(rendered.contains("Secure your secrets"), "{width}x{height}");
-        assert!(rendered.contains("Welcome"), "{width}x{height}");
-        assert!(rendered.contains("Provider"), "{width}x{height}");
-        assert!(rendered.contains("Secure store"), "{width}x{height}");
+        // The current step is always labelled with the name the title uses.
+        assert!(rendered.contains("◆ Secrets"), "{width}x{height}");
 
         let mut limited = snapshot(OnboardingStage::Provider);
         limited.limited_mode = true;
@@ -1352,7 +2042,7 @@ fn provider_authenticate_renders_inside_full_screen_chrome_at_narrow_and_wide_si
         assert!(rendered.contains("API key"), "{rendered}");
         assert!(rendered.contains("[ Reveal ]"), "{rendered}");
         assert!(rendered.contains("[ Continue ]"), "{rendered}");
-        assert!(rendered.contains("◐Provider"), "{rendered}");
+        assert!(rendered.contains("◆ Provider"), "{rendered}");
     }
 }
 

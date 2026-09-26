@@ -1,15 +1,15 @@
  ‹ Back                                                                         
   Background agents · step 7/8                                                  
   Choose what happens after the last Cockpit window closes.                     
-  ────────────────────────────                                                  
-  ●Welcome ●Name ●Secure store ●Provider ●Model ●Agent ◐Lifetime ○Ready         
+  ✓  ✓  ✓  ✓  ✓  ✓  ◆ Background  ·                                             
+  ────────────────────────────────────────────────────────────────────────────  
+                                                                                
   ◉ Keep agents running in the background                                       
   ○ Stop the daemon when the last client leaves                                 
                                                                                 
   On keeps agents and sessions running so you can reattach later. Off uses an   
   ephemeral lifetime: closing the last client stops agents and owned            
   processes.                                                                    
-                                                                                
                                                                                 
                                                                                 
                                                                                 

@@ -277,12 +277,84 @@ fn key_router_precedence_matrix_covers_every_focus_and_picker_state() {
                     FocusState::Rail => app.session_rail.focus(),
                 }
 
+                // Observable targets for the leader continuations: a hidden
+                // reveal for `r`, and a btw pane for `b` in cells that have
+                // none.
+                app.history.push(HistoryEntry::User {
+                    text: "original".to_string(),
+                    cleaned: Some("cleaned".to_string()),
+                    expanded: false,
+                    timestamp: chrono::Local::now(),
+                    seq: Some(1),
+                    optimistic_submission_id: None,
+                    preflight_pending: false,
+                    persist_failed: false,
+                });
+                if matches!(chord, Chord::CtrlKb) && app.btw_pane.is_none() {
+                    app.btw_pane = Some(super::btw_pane::BtwPane::new(
+                        cockpit_proto::BtwForkInfo {
+                            session_id: Uuid::new_v4(),
+                            parent_session_id: Uuid::new_v4(),
+                            short_id: Some("btw002".to_string()),
+                            tangent: false,
+                            created_at: 1,
+                            message_count: 0,
+                        },
+                        false,
+                    ));
+                }
+
                 let keys = chord.keys();
                 let mut actual = KeyRouterStage::Composer;
                 for (index, key) in keys.iter().copied().enumerate() {
-                    actual = app
-                        .handle_precedence_key(key)
-                        .unwrap_or(KeyRouterStage::Composer);
+                    // Once the leader opened the which-key overlay it is the
+                    // top of the layer stack, which takes the next key ahead
+                    // of every precedence stage and runs the leader action.
+                    // The stage is read off what the key did: the overlay
+                    // closed, the chord's own action ran, and nothing under
+                    // the overlay (composer, queue focus, rail focus, the
+                    // picker the leader closed) saw the key.
+                    actual = if app.keys_overlay.is_some() {
+                        let cell = format!("chord={chord:?} focus={focus:?} picker={picker:?}");
+                        let composer = app.composer.text().to_string();
+                        let queue_focus = app.queue_focus;
+                        let rail_focused = app.session_rail.is_focused();
+                        let btw_focused = app.btw_pane.as_ref().map(|pane| pane.focused);
+                        app.handle_key(key);
+                        assert!(app.keys_overlay.is_none(), "overlay stayed open: {cell}");
+                        assert_eq!(app.composer.text(), composer, "composer saw it: {cell}");
+                        assert_eq!(app.queue_focus, queue_focus, "queue saw it: {cell}");
+                        assert_eq!(
+                            app.session_rail.is_focused(),
+                            rail_focused,
+                            "rail saw it: {cell}"
+                        );
+                        assert!(app.composer_controls.picker.is_none(), "picker: {cell}");
+                        let revealed = matches!(
+                            app.history.last(),
+                            Some(HistoryEntry::User { expanded: true, .. })
+                        );
+                        let notes_open = matches!(app.overlay, Overlay::Notes(_));
+                        let btw_now = app.btw_pane.as_ref().map(|pane| pane.focused);
+                        let (ran, others_untouched) = match chord {
+                            Chord::CtrlKb => (
+                                btw_now == btw_focused.map(|focused| !focused),
+                                !revealed && !notes_open,
+                            ),
+                            Chord::CtrlKn => (notes_open, !revealed && btw_now == btw_focused),
+                            Chord::CtrlKr => (revealed, !notes_open && btw_now == btw_focused),
+                            _ => (false, false),
+                        };
+                        assert!(others_untouched, "another leader action ran: {cell}");
+                        if ran {
+                            KeyRouterStage::CtrlChord
+                        } else {
+                            KeyRouterStage::Composer
+                        }
+                    } else {
+                        app.handle_precedence_key(key)
+                            .unwrap_or(KeyRouterStage::Composer)
+                    };
                     if index + 1 < keys.len() {
                         assert_eq!(
                             actual,

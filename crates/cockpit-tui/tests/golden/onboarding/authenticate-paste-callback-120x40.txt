@@ -1,8 +1,9 @@
  ‹ Back                                                                                                                 
                  Sign in to your subscription · step 4/8                                                                
                  Approve access in the browser, then paste the result back.                                             
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ◐Provider ○Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ◆ Provider  · Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  Open this URL and approve access:                                                                      
                                                                                                                         
                  https://auth.example.com/oauth/authorize                                                               
@@ -10,7 +11,6 @@
                  ╭ Callback URL or code ──────────────────────────────────────────────────────────────╮                 
                  │ Paste callback                                                                     │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
-                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

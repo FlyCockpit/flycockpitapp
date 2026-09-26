@@ -55,6 +55,7 @@ mod mouse_gesture;
 mod overlay_actions;
 mod panes;
 mod pins;
+mod pointer;
 mod prediction;
 mod primary_paste;
 mod render;
@@ -2501,6 +2502,9 @@ pub struct App {
     pub(super) pending_mouse_copies: HashMap<AsyncActionId, PendingMouseCopy>,
     #[cfg(test)]
     pub(super) arm_controllable_mouse_copy: bool,
+    /// The text of the last mouse copy started (tests assert what is copied).
+    #[cfg(test)]
+    pub(super) last_scheduled_mouse_copy_text: Option<String>,
     #[cfg(test)]
     pub(super) controllable_mouse_copy:
         Option<crate::tui::async_action::ControllableMouseCopyRunner>,
@@ -2781,6 +2785,10 @@ pub struct App {
     /// Popover body rect from the latest [`Self::render`] (for acceptance tests).
     #[cfg(any(test, feature = "test-support"))]
     pub(super) last_popover_rect: ratatui::layout::Rect,
+    /// This frame's surface popover (a body overlay, the settings dialog or
+    /// the workspace-trust dialog), painted over the transcript: nothing
+    /// painted under it takes the pointer there (`App::occlude_surface`).
+    pub(super) surface_occluder: Option<ratatui::layout::Rect>,
 
     /// Mutable confirmation row for rapid agent switching before the next turn.
     pub(super) pending_agent_switch_log: Option<PendingAgentSwitchLog>,
@@ -3118,6 +3126,20 @@ pub struct App {
     pub(super) pins_review: Option<crate::tui::pins_overlay::PinsReview>,
     /// Active `/rules` review panel.
     pub(super) rules_review: Option<crate::tui::rules_overlay::RulesReview>,
+    /// Cells the `/pins` and `/rules` review boxes painted last frame: the
+    /// region where those floating layers take the pointer.
+    pub(super) pins_review_rect: Option<Rect>,
+    pub(super) rules_review_rect: Option<Rect>,
+    /// Last reported pointer position (see `app/pointer.rs`).
+    pub(super) pointer: Option<ratatui::layout::Position>,
+    /// Text of a committed multi-click copy, captured when its timer was
+    /// armed, keyed by the copy token.
+    pub(super) scheduled_copy_payload: Option<(u64, String)>,
+    /// Layer that received the previous pointer event (captures belong to
+    /// it).
+    pub(super) last_pointer_event_owner: Option<pointer::Layer>,
+    /// Top layer seen by the last ownership sync.
+    pub(super) last_top_layer: Option<pointer::Layer>,
     /// Count of pinned messages in this session (`pinned-messages`). Drives
     /// the below-input indicator (hidden at zero). Refreshed from the DB on
     /// every pin/unpin and on attach.
@@ -3504,6 +3526,13 @@ pub(super) struct SelectionSpan {
     pub row: u16,
     pub start_col: u16,
     pub end_col: u16,
+}
+
+/// Why [`App::end_pointer_interactions`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PointerInteractionEnd {
+    Resize,
+    FocusLost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4333,6 +4362,7 @@ impl App {
             last_button_frame_key: None,
             #[cfg(any(test, feature = "test-support"))]
             last_popover_rect: ratatui::layout::Rect::default(),
+            surface_occluder: None,
 
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
@@ -4366,6 +4396,8 @@ impl App {
             pending_mouse_copies: HashMap::new(),
             #[cfg(test)]
             arm_controllable_mouse_copy: false,
+            #[cfg(test)]
+            last_scheduled_mouse_copy_text: None,
             #[cfg(test)]
             controllable_mouse_copy: None,
             pending_link_activation: None,
@@ -4451,6 +4483,12 @@ impl App {
             fork_pick: None,
             copy_pick: None,
             pins_review: None,
+            pins_review_rect: None,
+            rules_review_rect: None,
+            pointer: None,
+            last_top_layer: None,
+            scheduled_copy_payload: None,
+            last_pointer_event_owner: None,
             rules_review: None,
             pin_count: 0,
             pin_control_rows: Vec::new(),
@@ -4615,8 +4653,7 @@ impl App {
     }
 
     fn draw_frame_contents(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        self.link_registry.begin_frame();
-        terminal.draw(|frame| self.render(frame))?;
+        self.draw_resolving_pointer(terminal)?;
         self.after_completed_draw();
         crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
         self.sync_cursor_shape();
@@ -4919,14 +4956,11 @@ impl App {
                 false
             }
             Event::Resize(_, _) => {
-                self.link_pointer_gesture.cancel();
-                self.link_registry.invalidate_pointer_generation();
-                self.pending_link_activation = None;
-                self.dialog.cancel_settings_pointer_transients();
-                self.invalidate_mouse_gesture(
-                    MouseGestureInvalidation::ViewChange,
-                    self.event_loop_monotonic_now,
-                );
+                self.end_pointer_interactions(PointerInteractionEnd::Resize);
+                false
+            }
+            Event::FocusLost => {
+                self.end_pointer_interactions(PointerInteractionEnd::FocusLost);
                 false
             }
             _ => false,
@@ -5332,6 +5366,8 @@ mod local_cmd_tests;
 #[cfg(test)]
 #[cfg(test)]
 mod new_session_swap_tests;
+#[cfg(test)]
+mod pointer_tests;
 #[cfg(test)]
 mod prediction_lifecycle_tests;
 #[cfg(test)]

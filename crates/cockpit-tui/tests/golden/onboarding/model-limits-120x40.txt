@@ -1,8 +1,9 @@
  ‹ Back                                                                                                                 
                  Model limits · step 5/8                                                                                
                  Keep detected token limits or enter an override.                                                       
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Context window tokens ─────────────────────────────────────────────────────────────╮                 
                  │ Auto                                                                               │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
@@ -10,7 +11,6 @@
                  │ Auto                                                                               │                 
                  ╰────────────────────────────────────────────────────────────────────────────────────╯                 
                  Blank keeps Auto; overrides must be positive numbers.                                                  
-                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

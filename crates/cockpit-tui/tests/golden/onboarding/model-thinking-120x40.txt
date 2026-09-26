@@ -1,15 +1,15 @@
  ‹ Back                                                                                                                 
                  Default thinking · step 5/8                                                                            
                  Choose the model-level thinking default.                                                               
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ◐Model ○Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ◆ Model  · Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Thinking ──────────────────────────────────────────────────────────────────────────╮                 
                  │ ◉ inherit                                                                          │                 
                  │ ○ off                                                                              │                 
                  │ ○ low                                                                              │                 
                  │ ○ medium                                                                           │                 
                  │ ○ high                                                                             │                 
-                 │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 
                  │                                                                                    │                 

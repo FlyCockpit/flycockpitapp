@@ -1,12 +1,12 @@
  ‹ Back                                                                                                                 
                  Subagent · step 6/8                                                                                    
                  Name it, then choose its models, trust, tools, and helpers.                                            
-                 ────────────────────────────                                                                           
-                 ●Welcome ●Name ●Secure store ●Provider ●Model ◐Agent ○Lifetime ○Ready                                  
+                 ✓ Welcome  ✓ Name  ✓ Secrets  ✓ Provider  ✓ Model  ◆ Agent  · Background  · Ready                      
+                 ──────────────────────────────────────────────────────────────────────────────────────                 
+                                                                                                                        
                  ╭ Subagent ──────────────────────────────────────────────────────────────────────────╮                 
                  │ ╭ Name ──────────────────────────────────────────────────────────────────────────╮ │                 
                  │ │ runner                                                                         │ │                 
-                 │ │                                                                                │ │                 
                  │ │                                                                                │ │                 
                  │ │                                                                                │ │                 
                  │ │                                                                                │ │                 

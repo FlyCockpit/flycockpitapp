@@ -62,7 +62,7 @@ pub struct ReviewConfig {
 }
 
 pub fn persist_review_default_participants(cwd: &Path, participants: Vec<String>) -> Result<()> {
-    let path = nearest_project_config_path(cwd);
+    let path = crate::config::dirs::workspace_config_write_target(cwd)?;
     let mut doc = ExtendedConfigDoc::load(&path)?;
     let mut cfg = doc.config();
     cfg.review.default_participants = participants;

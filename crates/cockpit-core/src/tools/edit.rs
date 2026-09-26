@@ -321,7 +321,10 @@ impl Tool for EditTool {
                 .await
                 .is_empty()
         {
-            message.push_str(&lsp.diagnostics_after_write(&ctx.cwd, &path, &config).await);
+            message.push_str(
+                &lsp.diagnostics_after_write(&ctx.cwd, &path, &config, &ctx.redact)
+                    .await,
+            );
         }
         if let Some(note) = crate::tools::data_syntax::data_syntax_note(
             &ctx.redact,

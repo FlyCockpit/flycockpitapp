@@ -199,7 +199,11 @@ fn run_private_atomic_write_umask_case(root: &Path) {
     let explicit_named_like_default = explicit_dot_cockpit.join("custom.json");
     env.set_cockpit_config(&explicit_named_like_default);
     let mut explicit_named_doc = ConfigDoc::load(&explicit_named_like_default).unwrap();
+    // A file inside a `.cockpit` directory is written only under a trusted
+    // workspace decision for it.
+    let trusted_shared_project = enter_trusted_workspace(&root.join("shared-project"));
     explicit_named_doc.write(&cfg).unwrap();
+    drop(trusted_shared_project);
     assert_private_mode(&explicit_named_like_default, 0o600);
     assert_private_mode(&explicit_dot_cockpit, 0o755);
 
@@ -1843,6 +1847,7 @@ fn retained_model_favorite_target_writes_a_and_rejects_a_replaced_by_b() {
         retained_provider_model_source_from_workspace_layer_snapshots(
             &[crate::config::WorkspaceConfigLayerSnapshot {
                 origin: None,
+                project_root: None,
                 config_json: None,
                 provider_files: vec![("p".to_string(), bytes)],
                 effective_default_artifact_digest: None,
@@ -1943,6 +1948,7 @@ fn retained_model_favorite_post_write_authority_failure_is_durable_but_unpublish
     let source = retained_provider_model_source_from_workspace_layer_snapshots(
         &[crate::config::WorkspaceConfigLayerSnapshot {
             origin: None,
+            project_root: None,
             config_json: None,
             provider_files: vec![("p".to_string(), original.clone())],
             effective_default_artifact_digest: None,
@@ -1993,6 +1999,7 @@ fn retained_model_favorite_post_write_fence_preserves_external_replacement() {
     let source = retained_provider_model_source_from_workspace_layer_snapshots(
         &[crate::config::WorkspaceConfigLayerSnapshot {
             origin: None,
+            project_root: None,
             config_json: None,
             provider_files: vec![("p".to_string(), original)],
             effective_default_artifact_digest: None,
@@ -2048,6 +2055,7 @@ fn retained_model_favorite_target_rejects_changed_or_missing_captured_model() {
         retained_provider_model_source_from_workspace_layer_snapshots(
             &[crate::config::WorkspaceConfigLayerSnapshot {
                 origin: None,
+                project_root: None,
                 config_json: None,
                 provider_files: vec![("p".to_string(), bytes)],
                 effective_default_artifact_digest: None,
@@ -2091,6 +2099,7 @@ fn retained_model_favorite_target_rejects_changed_or_missing_captured_model() {
 fn retained_model_favorite_source_uses_the_observed_highest_precedence_layer() {
     let layer = |provider: &str| crate::config::WorkspaceConfigLayerSnapshot {
         origin: None,
+        project_root: None,
         config_json: None,
         provider_files: vec![("p".to_string(), provider.as_bytes().to_vec())],
         effective_default_artifact_digest: None,

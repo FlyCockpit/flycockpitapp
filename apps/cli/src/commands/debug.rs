@@ -125,6 +125,14 @@ fn config() -> Result<()> {
 }
 
 async fn context() -> Result<()> {
+    // The caller's workspace, canonicalized here: the daemon renders the
+    // fresh-session baseline a session at this root would carry and never
+    // substitutes its own working directory.
+    let project_root = std::fs::canonicalize(cwd()?)
+        .context("canonicalizing the current directory")?
+        .to_str()
+        .map(str::to_owned)
+        .context("the current directory is not valid UTF-8")?;
     let probe = discover().await;
     if probe.status != DaemonStatus::Running {
         bail!("coverage_unavailable: cockpit daemon is not running");
@@ -133,10 +141,13 @@ async fn context() -> Result<()> {
         .await
         .context("connecting to the running daemon")?;
     let response = client
-        .request(Request::GetRedactionCoverageStatus { session_id: None })
+        .request(Request::GetRedactionCoverageStatus {
+            session_id: None,
+            project_root: Some(project_root),
+        })
         .await
         .context("requesting daemon redaction coverage")?
-        .map_err(|_| anyhow::anyhow!("coverage_unavailable"))?;
+        .map_err(|error| anyhow::anyhow!("coverage_unavailable: {error}"))?;
     let Response::RedactionCoverageStatus(projection) = response else {
         bail!("daemon returned an unexpected redaction coverage response");
     };

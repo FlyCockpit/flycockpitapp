@@ -1604,6 +1604,17 @@ pub fn default_chat_system_prompt(cwd: &Path, session_short_id: &str) -> String 
     compose_system_prompt(BUILD_PROMPT, session_short_id, cwd)
 }
 
+/// [`default_chat_system_prompt`] against an already-resolved effective
+/// config (for example one loaded under a workspace-trust policy), so the
+/// caller controls which config layers contribute.
+pub(crate) fn default_chat_system_prompt_with_config(
+    cwd: &Path,
+    session_short_id: &str,
+    cfg: &crate::config::extended::ExtendedConfig,
+) -> String {
+    compose_system_prompt_with(BUILD_PROMPT, session_short_id, cwd, cfg)
+}
+
 /// Per-category token sizing of the composed chat system prompt, for the
 /// `/context` usage overlay. Splits the single composed block the engine
 /// sends into the three buckets that actually make it up, so the overlay
@@ -1670,6 +1681,15 @@ pub fn chat_system_prompt_breakdown(
 /// the absolute path + file body.
 pub fn load_agent_guidance(cwd: &Path) -> Option<(std::path::PathBuf, String)> {
     let cfg = load_extended_config(cwd);
+    find_agent_guidance(cwd, &cfg.agent_guidance_files)
+}
+
+/// [`load_agent_guidance`] with the guidance-file list taken from an
+/// already-resolved effective config instead of an ambient config load.
+pub(crate) fn load_agent_guidance_with_config(
+    cwd: &Path,
+    cfg: &crate::config::extended::ExtendedConfig,
+) -> Option<(std::path::PathBuf, String)> {
     find_agent_guidance(cwd, &cfg.agent_guidance_files)
 }
 

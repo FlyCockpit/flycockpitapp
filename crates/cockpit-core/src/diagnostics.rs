@@ -208,7 +208,7 @@ pub async fn cli_snapshot(
     .await;
     snapshot.network = network;
     snapshot.has_failures |= network_failed;
-    let (database, database_failed) = database_lines(&db_source, &extended).await;
+    let (database, database_failed) = database_lines(&db_source).await;
     snapshot.database = database;
     snapshot.has_failures |= database_failed;
     let (mut daemon, _) = daemon_lines().await;
@@ -216,6 +216,9 @@ pub async fn cli_snapshot(
         0,
         "diagnostic authority: in-process; daemon is not required".to_string(),
     );
+    let (redact_policy, redact_policy_failed) = installation_redact_report();
+    daemon.push(redact_policy);
+    snapshot.has_failures |= redact_policy_failed;
     snapshot.daemon = daemon;
     Ok(snapshot)
 }
@@ -565,10 +568,18 @@ fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -
     crate::daemon::session_worker::initial_active_agent(extended).to_string()
 }
 
-async fn database_lines(
-    db: &DiagnosticDb<'_>,
-    extended: &crate::config::extended::ExtendedConfig,
-) -> (Vec<String>, bool) {
+async fn database_lines(db: &DiagnosticDb<'_>) -> (Vec<String>, bool) {
+    // An unreadable retention policy is a failure in its own right: the
+    // daemon then sweeps with a stale policy or not at all.
+    let (retention, retention_failed) = installation_retention_report();
+    let (lines, failed) = database_lines_inner(db, retention).await;
+    (lines, failed || retention_failed)
+}
+
+#[cfg(test)]
+const RETENTION_FAILED_PREFIX: &str = "retention: FAILED";
+
+async fn database_lines_inner(db: &DiagnosticDb<'_>, retention: String) -> (Vec<String>, bool) {
     // `default_path` only resolves the on-disk location; it does NOT open,
     // create, or migrate anything, so the real path is always safe to report.
     let resolved_path = match db {
@@ -619,7 +630,7 @@ async fn database_lines(
                 lines.push("schema: unavailable because no database file exists yet".to_string());
                 lines
                     .push("integrity: unavailable because no database file exists yet".to_string());
-                append_database_failure_guidance(&mut lines, &extended.retention);
+                append_database_failure_guidance(&mut lines, &retention);
                 return (lines, false);
             } else {
                 lines.push(format!("openability: FAILED ({})", one_line(&message)));
@@ -628,7 +639,7 @@ async fn database_lines(
                 );
                 lines.push("integrity: unavailable because SQLite did not open".to_string());
             }
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
         // No DB at all (e.g. a TUI client): the resolved path stays visible but
@@ -637,7 +648,7 @@ async fn database_lines(
             lines.push("openability: unavailable (daemon not running)".to_string());
             lines.push("schema: unavailable".to_string());
             lines.push("integrity: unavailable (daemon not running)".to_string());
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     };
@@ -662,7 +673,7 @@ async fn database_lines(
                 .expect("one database read failed");
             lines.push(format!("schema: FAILED ({})", one_line(&error.to_string())));
             lines.push("integrity: unavailable because schema reads failed".to_string());
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -686,7 +697,7 @@ async fn database_lines(
                 "storage: FAILED ({})",
                 one_line(&error.to_string())
             ));
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -700,7 +711,7 @@ async fn database_lines(
                 "integrity: FAILED ({})",
                 one_line(&format!("{error:#}"))
             ));
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -716,7 +727,7 @@ async fn database_lines(
                 "retention protection: FAILED ({})",
                 one_line(&format!("{error:#}"))
             ));
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -732,7 +743,7 @@ async fn database_lines(
                 crate::db::retention::SESSIONS_EXPIRY_SKIPPED_MEDIA_BARRIER_KEY,
                 one_line(&format!("{error:#}"))
             ));
-            append_database_failure_guidance(&mut lines, &extended.retention);
+            append_database_failure_guidance(&mut lines, &retention);
             return (lines, true);
         }
     }
@@ -744,8 +755,56 @@ async fn database_lines(
         "repair: read-only doctor never edits SQLite; restore a validated sibling *.backup-*.sqlite or move the database aside and restart"
             .to_string(),
     );
-    lines.push(retention_line(&extended.retention));
+    lines.push(retention);
     (lines, false)
+}
+
+/// The retention line `cockpit doctor` reports: the installation-wide policy
+/// the daemon's sweeps apply, read through the same strict loader. An
+/// unreadable policy is a doctor failure; it never falls back to defaults.
+fn installation_retention_report() -> (String, bool) {
+    match crate::config::extended::load_installation_retention_policy() {
+        Ok(policy) => (retention_line(&policy), false),
+        Err(error) => (
+            format!(
+                "retention: FAILED ({}); the daemon keeps sweeping with the last retention policy it loaded, or skips sweeps if it has loaded none, until this is fixed",
+                one_line(&error.to_string())
+            ),
+            true,
+        ),
+    }
+}
+
+/// The installation-wide redact policy line `cockpit doctor` reports, and
+/// whether it is a failure. An invalid redact section stops the daemon from
+/// starting (daemon-global coverage fails closed), and the settings editor
+/// needs a running daemon, so the line names the file and key to fix by
+/// hand. The error is value-free: it never quotes the layer's contents.
+fn installation_redact_report() -> (String, bool) {
+    match crate::config::extended::load_installation_redact_policy() {
+        Ok(_) => ("installation redaction policy: ok".to_string(), false),
+        Err(error) => {
+            let location = match (&error.path, error.section, &error.key) {
+                (Some(path), Some(section), Some(key)) => {
+                    format!("edit `{}.{key}` in {}", section.key(), path.display())
+                }
+                (Some(path), Some(section), None) => {
+                    format!("edit `{}` in {}", section.key(), path.display())
+                }
+                (Some(path), None, _) => format!("fix {}", path.display()),
+                (None, _, _) => {
+                    "fix the COCKPIT_CONFIG override or the global config layer".to_string()
+                }
+            };
+            (
+                format!(
+                    "installation redaction policy: FAILED ({}); the daemon will not start until this is fixed — {location} by hand (the settings editor needs a running daemon)",
+                    one_line(&error.to_string())
+                ),
+                true,
+            )
+        }
+    }
 }
 
 fn is_absent_database(message: &str) -> bool {
@@ -791,10 +850,7 @@ fn retention_line(retention: &crate::db::retention::RetentionConfig) -> String {
     )
 }
 
-fn append_database_failure_guidance(
-    lines: &mut Vec<String>,
-    retention: &crate::db::retention::RetentionConfig,
-) {
+fn append_database_failure_guidance(lines: &mut Vec<String>, retention: &str) {
     lines.push(
         "export: unavailable while database health is failed; do not bypass daemon validation"
             .to_string(),
@@ -803,7 +859,7 @@ fn append_database_failure_guidance(
         "repair: read-only doctor never edits SQLite; restore a validated sibling *.backup-*.sqlite or move the database aside and restart"
             .to_string(),
     );
-    lines.push(retention_line(retention));
+    lines.push(retention.to_string());
 }
 
 async fn daemon_lines() -> (Vec<String>, bool) {
@@ -2746,6 +2802,68 @@ mod tests {
         ));
     }
 
+    /// An unreadable installation retention policy is a doctor failure (the
+    /// daemon sweeps with a stale policy or not at all), and the message says
+    /// exactly that.
+    #[tokio::test]
+    async fn unreadable_retention_policy_fails_doctor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+        let db = crate::db::Db::open(&tmp.path().join("doctor.db")).unwrap();
+        let (lines, failed) = database_lines(&DiagnosticDb::Open(&db)).await;
+        assert!(!failed, "{lines:?}");
+
+        let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+        std::fs::write(
+            config_dir.join(crate::config::dirs::CONFIG_FILE),
+            r#"{"retention":{"transcript_window_days":"never"}}"#,
+        )
+        .unwrap();
+        let (lines, failed) = database_lines(&DiagnosticDb::Open(&db)).await;
+        assert!(failed, "{lines:?}");
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with(RETENTION_FAILED_PREFIX))
+            .expect("retention failure line");
+        assert!(line.contains("last retention policy it loaded"), "{line}");
+        assert!(line.contains("retention.transcript_window_days"), "{line}");
+    }
+
+    /// T10: an invalid installation redact section (which stops the daemon
+    /// from starting) is a doctor failure whose line names the exact file and
+    /// key to hand-edit, and quotes no value.
+    #[test]
+    fn invalid_installation_redact_policy_is_reported_precisely() {
+        const VALUE: &str = "sk-doctor-redact-value-6c90";
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let (line, failed) = installation_redact_report();
+        assert!(!failed, "{line}");
+
+        let config_dir = crate::config::dirs::ensure_global_config_dir().unwrap();
+        let config = config_dir.join(crate::config::dirs::CONFIG_FILE);
+        std::fs::write(
+            &config,
+            format!(r#"{{"redact":{{"denyList":["{VALUE}"]}}}}"#),
+        )
+        .unwrap();
+        let (line, failed) = installation_redact_report();
+        assert!(failed, "{line}");
+        assert!(line.contains("will not start"), "{line}");
+        assert!(line.contains("`redact.denyList`"), "{line}");
+        assert!(line.contains(&config.display().to_string()), "{line}");
+        assert!(!line.contains(VALUE), "{line}");
+
+        // A malformed layer is located by file, still without its bytes.
+        std::fs::write(&config, format!(r#"[{{"redact":"{VALUE}"}}]"#)).unwrap();
+        let (line, failed) = installation_redact_report();
+        assert!(
+            failed && line.contains(&config.display().to_string()),
+            "{line}"
+        );
+        assert!(!line.contains(VALUE), "{line}");
+    }
+
     #[test]
     fn database_failure_guidance_is_actionable_and_zero_windows_are_unlimited() {
         let retention = crate::db::retention::RetentionConfig {
@@ -2756,7 +2874,7 @@ mod tests {
             ..crate::db::retention::RetentionConfig::default()
         };
         let mut lines = Vec::new();
-        append_database_failure_guidance(&mut lines, &retention);
+        append_database_failure_guidance(&mut lines, &retention_line(&retention));
 
         assert!(
             lines

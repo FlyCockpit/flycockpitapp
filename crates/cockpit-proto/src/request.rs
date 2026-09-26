@@ -489,9 +489,22 @@ pub struct RunInvocationOptions {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case", content = "params")]
 pub enum Request {
+    /// Redaction coverage status, plus (for owner principals) the redacted
+    /// and bounded fresh-session context baseline. Scope is exactly one of:
+    /// a live `session_id`; a caller `project_root` (the client's canonical
+    /// absolute workspace, rendered as a fresh session at that root would
+    /// see it under that workspace's trust decision); or neither, which is
+    /// daemon-global and renders no workspace content. The daemon never
+    /// substitutes its own working directory.
     GetRedactionCoverageStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<Uuid>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_owner_optional_project_root"
+        )]
+        project_root: Option<String>,
     },
     RenderInputPrediction {
         session_id: Uuid,
@@ -4448,6 +4461,23 @@ impl Request {
                     }
                 }
             }
+            Self::GetRedactionCoverageStatus {
+                session_id,
+                project_root: Some(project_root),
+            } => {
+                if session_id.is_some() {
+                    return Err(
+                        "redaction coverage scope is either a session or a project root, not both"
+                            .to_string(),
+                    );
+                }
+                validate_owner_project_root(project_root)?;
+                // The daemon never resolves a relative root against its own
+                // working directory.
+                if !std::path::Path::new(project_root).is_absolute() {
+                    return Err("project root must be an absolute path".to_string());
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -4864,7 +4894,7 @@ impl Request {
 macro_rules! command {
     ($with_commands:ident $(, $context:ident)*) => {
         $with_commands! { ($($context),*) [
-            (Request::GetRedactionCoverageStatus { session_id }, "get_redaction_coverage_status", public_read, option_field(session_id), false, read_only, none, concurrent, none, "session_id:Option<Uuid>", [session_id: Option<Uuid> => session]);
+            (Request::GetRedactionCoverageStatus { session_id, project_root }, "get_redaction_coverage_status", public_read, option_field(session_id), false, read_only, none, concurrent, none, "session_id:Option<Uuid>|project_root:Option<String>", [session_id: Option<Uuid> => session, project_root: Option<String> => param]);
             (Request::RenderInputPrediction { session_id, turns, mode }, "render_input_prediction", owner_only, field(session_id), false, local_only, none, serialized, none, "session_id:Uuid|turns:Vec<InputPredictionTurn>|mode:InputPredictionMode", [session_id: Uuid => session, turns: Vec<$crate::InputPredictionTurn> => param, mode: $crate::InputPredictionMode => param]);
             (Request::ResolveTagPreview { session_id, input }, "resolve_tag_preview", owner_only, field(session_id), false, local_only, none, serialized, none, "session_id:Uuid|input:String", [session_id: Uuid => session, input: String => param]);
             (Request::CreateCodeRootV1(request), "create_code_root_v1", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:CreateCodeRootV1Request", [request: $crate::CreateCodeRootV1Request => param]);

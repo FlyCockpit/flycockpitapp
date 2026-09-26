@@ -537,6 +537,12 @@ async fn refresh_redaction_for_turn(
         redact_config: &cfg,
     }
     .coverage_key();
+    let current_key = match current_key {
+        Ok(key) => key,
+        Err(error) => {
+            return RedactionRefreshOutcome::Refused(format!("coverage_unavailable: {error:#}"));
+        }
+    };
     let coverage_key = installed_key.with_current_owned_revisions(&current_key);
     let capture_policy_digest = policy_digest.clone();
     let env_snapshot_for_capture = environment.clone();

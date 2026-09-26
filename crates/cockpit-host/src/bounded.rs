@@ -38,8 +38,9 @@ pub fn file_len(path: &Path) -> io::Result<u64> {
 }
 
 /// Open `path` for a bounded content read: non-regular files are rejected
-/// without blocking on a FIFO writer, and the returned handle is blocking.
-fn open_regular_file(path: &Path) -> Result<File, BoundedIoError> {
+/// without blocking on a FIFO writer (the open is non-blocking and the type is
+/// checked on the descriptor), and the returned handle is blocking.
+pub fn open_regular_file(path: &Path) -> Result<File, BoundedIoError> {
     let file = open_nonblocking_read(path)?;
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {
@@ -63,8 +64,10 @@ fn open_nonblocking_read(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
+/// Clear `O_NONBLOCK` on a descriptor opened non-blocking only so a FIFO or
+/// device could fail its type check without blocking the open.
 #[cfg(unix)]
-fn clear_nonblock(file: &File) -> io::Result<()> {
+pub(crate) fn clear_nonblock(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let fd = file.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
@@ -134,7 +137,20 @@ pub fn read_prefix_and_hash(
     prefix_cap: usize,
     max_len: u64,
 ) -> Result<PrefixedFile, BoundedIoError> {
-    let file = open_regular_file(path)?;
+    read_prefix_and_hash_from_file(open_regular_file(path)?, prefix_cap, max_len)
+}
+
+/// [`read_prefix_and_hash`] over an already-opened descriptor, so a caller
+/// that authorized one exact file (for example through a no-follow open)
+/// reads that same file and never reopens a pathname.
+pub fn read_prefix_and_hash_from_file(
+    file: File,
+    prefix_cap: usize,
+    max_len: u64,
+) -> Result<PrefixedFile, BoundedIoError> {
+    if !file.metadata()?.file_type().is_file() {
+        return Err(BoundedIoError::NotRegular { what: "file" });
+    }
     let len = file.metadata()?.len();
     if len > max_len {
         return Err(BoundedIoError::Limit {

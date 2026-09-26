@@ -7131,7 +7131,14 @@ fn model_wizard_tui_dialog_opens_descriptor() {
     });
     cfg.providers.insert("p".to_string(), provider);
     let mut doc = cockpit_config::providers::ConfigDoc::load(&config_path).unwrap();
-    doc.write(&cfg).unwrap();
+    cockpit_config::trust::with_workspace_trust_policy(
+        cockpit_config::trust::WorkspaceTrustPolicy {
+            root: cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: cockpit_config::WorkspaceTrustMode::Trust,
+        },
+        || doc.write(&cfg),
+    )
+    .unwrap();
 
     let d = Dialog::open_setup_wizard(tmp.path(), cockpit_core::wizard::MODEL_WIZARD_ID)
         .expect("model wizard opens");
@@ -10067,4 +10074,39 @@ fn ending_pointer_captures_keeps_a_committed_external_edit() {
         settings.test_page(),
         TestPageRef::Category(page) if page.pending_external_edit.is_none()
     ));
+}
+
+/// Global config has no project root, so a relative extra env-file path typed
+/// into the global layer is refused inline (the row stays in edit mode with an
+/// explanation) instead of being saved into a layer the daemon then refuses.
+#[test]
+fn relative_extra_env_path_in_global_layer_is_rejected_inline() {
+    use string_list::{RELATIVE_GLOBAL_PATH_ERROR, StringListPage};
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    let before = std::fs::read_to_string(&dialog.extended_path).unwrap();
+    dialog.extended_base.as_object_mut().unwrap().insert(
+        "__cockpit_settings_layer_kind".into(),
+        serde_json::to_value(cockpit_proto::CockpitConfigLayer::HomeXdg).unwrap(),
+    );
+    dialog.set_test_page(Page::StringList(Box::new(
+        StringListPage::extra_dotenv_paths(),
+    )));
+    dialog.handle_key(press(KeyCode::Char('a')));
+    for ch in "rel.env".chars() {
+        dialog.handle_key(press(KeyCode::Char(ch)));
+    }
+    dialog.handle_key(press(KeyCode::Enter));
+    match dialog.test_page() {
+        TestPageRef::StringList(page) => {
+            assert!(page.grabbed.is_some(), "the row stays in edit mode");
+            assert_eq!(page.status.as_deref(), Some(RELATIVE_GLOBAL_PATH_ERROR));
+        }
+        other => panic!("expected the string list page, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&dialog.extended_path).unwrap(),
+        before,
+        "nothing is saved"
+    );
 }

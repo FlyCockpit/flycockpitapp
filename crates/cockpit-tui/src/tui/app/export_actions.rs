@@ -479,8 +479,12 @@ mod tests {
         }));
     }
 
+    /// Bounded by a wall-clock deadline, not an iteration count: the export
+    /// publish fsyncs its file and directory, and under sustained writeback
+    /// pressure a single fsync can take seconds.
     async fn drain_until_idle(app: &mut App) {
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;
             app.drain_async_actions();
             if app.async_actions.pending_count() == 0 {

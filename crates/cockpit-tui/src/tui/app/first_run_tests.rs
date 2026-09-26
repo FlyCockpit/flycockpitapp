@@ -77,9 +77,31 @@ fn complete_detour_provider_verify(app: &mut App, provider_id: &str) {
     shell_key(app, KeyCode::Enter);
 }
 
+/// Seed a project-layer fixture as the workspace's trusted owner (the TUI
+/// process runs under a trust decision; config documents refuse to write a
+/// project `.cockpit` layer without one).
+fn with_trusted_fixture_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    cockpit_config::trust::with_workspace_trust_policy(
+        cockpit_config::trust::WorkspaceTrustPolicy {
+            root: cockpit_config::trust::resolve_trust_root(root).expect("fixture trust root"),
+            mode: cockpit_config::WorkspaceTrustMode::Trust,
+        },
+        f,
+    )
+}
+
 fn write_providers_at(path: &std::path::Path, cfg: &ProvidersConfig) {
     let mut doc = ConfigDoc::load(path).unwrap();
-    doc.write(cfg).unwrap();
+    // A project `.cockpit` layer is seeded as its trusted owner; the global
+    // layer needs no trust decision.
+    match path
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == ".cockpit"))
+        .and_then(std::path::Path::parent)
+    {
+        Some(root) => with_trusted_fixture_root(root, || doc.write(cfg)).unwrap(),
+        None => doc.write(cfg).unwrap(),
+    }
     // `active_model` is layer-wide default policy: an ordinary provider save
     // can no longer carry it, and only the authoritative effective-default
     // operation writes it. Seed it directly so this fixture still describes

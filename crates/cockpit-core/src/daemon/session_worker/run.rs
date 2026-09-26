@@ -1312,7 +1312,7 @@ async fn publish_one_completed_host_capability_refresh_operation_while_serialize
     operation_id: uuid::Uuid,
     receipt: crate::db::agent_tree_decisions::HostCapabilityRefreshSnapshotReceipt,
     runtime: &HostCapabilityRefreshRuntime,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
 ) -> std::result::Result<HostCapabilitiesRefreshCompletion, String> {
     // Parse and canonicalize before changing the store. The database also
@@ -1373,20 +1373,48 @@ async fn publish_one_completed_host_capability_refresh_operation_while_serialize
         // owns the one event.  In the crash-after-swap case `published` is
         // false on recovery but this is still the first durable publication
         // acknowledgement and therefore the one event emission.
+        // Delivered to every client. A receipt this session produced is
+        // scrubbed with the current daemon-global table and this session's
+        // table. A receipt recovered on behalf of another session is never
+        // scrubbed with *this* session's table (it does not cover the
+        // originating workspace): owners receive it, and every other
+        // principal receives its content-free projection.
         if let Some(global_bus) = global_bus {
-            crate::daemon::send_current_event(
+            publish_host_capabilities_changed(
                 global_bus,
-                redaction,
-                proto::Event::HostCapabilitiesChanged {
-                    snapshot: snapshot.clone(),
-                },
-            );
+                session.id,
+                source_session_id,
+                &crate::daemon::current_redaction(redaction),
+                snapshot.clone(),
+            )
+            .await;
         }
     }
     Ok(HostCapabilitiesRefreshCompletion {
         snapshot,
         published,
     })
+}
+
+/// Emit the one `HostCapabilitiesChanged` for an acknowledged receipt.
+/// `worker_table` is the coverage of the worker's own session: it covers the
+/// receipt only when that session produced it. A receipt recovered on behalf
+/// of another session is delivered without origin coverage (owners receive
+/// it, other principals its content-free projection), never scrubbed with an
+/// unrelated session's table.
+async fn publish_host_capabilities_changed(
+    global_bus: &crate::daemon::GlobalEventBus,
+    worker_session_id: uuid::Uuid,
+    source_session_id: uuid::Uuid,
+    worker_table: &std::sync::Arc<crate::redact::RedactionTable>,
+    snapshot: cockpit_proto::HostCapabilitySnapshot,
+) {
+    let event = proto::Event::HostCapabilitiesChanged { snapshot };
+    if source_session_id == worker_session_id {
+        global_bus.send_from_origin_async(worker_table, event).await;
+    } else {
+        global_bus.send_without_origin_coverage(event);
+    }
 }
 
 /// Drain the single durable refresh outbox for every session which shares the
@@ -1397,7 +1425,7 @@ async fn publish_one_completed_host_capability_refresh_operation_while_serialize
 async fn drain_completed_host_capability_refresh_outbox_while_serialized(
     session: &std::sync::Arc<crate::session::Session>,
     runtime: &HostCapabilityRefreshRuntime,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
 ) -> std::result::Result<
     Option<crate::db::agent_tree_decisions::HostCapabilityRefreshOutboxCursor>,
@@ -1525,7 +1553,7 @@ async fn execute_host_capability_refresh_operation(
     session: &std::sync::Arc<crate::session::Session>,
     operation_id: uuid::Uuid,
     runtime: &HostCapabilityRefreshRuntime,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
 ) -> std::result::Result<HostCapabilitiesRefreshCompletion, String> {
     // Keep the whole operation linearized with publication, not merely the
@@ -1550,7 +1578,7 @@ async fn execute_host_capability_refresh_operation_while_serialized(
     session: &std::sync::Arc<crate::session::Session>,
     operation_id: uuid::Uuid,
     runtime: &HostCapabilityRefreshRuntime,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
 ) -> std::result::Result<HostCapabilitiesRefreshCompletion, String> {
     // Before a new probe can reserve its generation, make every older
@@ -1812,7 +1840,7 @@ async fn execute_host_capability_refresh_operation_while_serialized(
 async fn spawn_ready_host_capability_refresh_operations(
     session: &std::sync::Arc<crate::session::Session>,
     runtime: Option<HostCapabilityRefreshRuntime>,
-    global_bus: &Option<EventSender>,
+    global_bus: &Option<crate::daemon::GlobalEventBus>,
     redaction: &SharedRedactionTable,
     registry: &Arc<WorkerAgentTreeResolverRegistry>,
     terminalization_failure_fence: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -6198,7 +6226,7 @@ pub(super) async fn run_worker(
         std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>,
     >,
     write_scope: crate::write_scope::WriteScopeSource,
-    global_bus: Option<EventSender>,
+    global_bus: Option<crate::daemon::GlobalEventBus>,
     park_commit: crate::engine::interrupt::ParkCommit,
     terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     terminal_closing: Arc<AtomicBool>,
@@ -13737,22 +13765,26 @@ pub(super) async fn run_worker(
                                                             redact_config: &effective_redact,
                                                         }
                                                         .coverage_key();
-                                                        let coverage_key = installed_key
-                                                            .with_current_owned_revisions(
-                                                                &current_key,
-                                                            );
-                                                        authority.invalidate_key(&installed_key);
-                                                        let capture_policy_digest =
-                                                            policy_digest.clone();
-                                                        let env = session_env.clone();
-                                                        let env_snapshot_for_capture =
-                                                            environment.clone();
-                                                        let publish_vault =
-                                                            session.secret_vault().clone();
-                                                        let publish_db = session.db.clone();
-                                                        let publish_command_cache =
-                                                            command_cache.clone();
-                                                        let publish_fence =
+                                                        match current_key {
+                                                            Err(error) => Err(error),
+                                                            Ok(current_key) => {
+                                                                let coverage_key = installed_key
+                                                                    .with_current_owned_revisions(
+                                                                        &current_key,
+                                                                    );
+                                                                authority
+                                                                    .invalidate_key(&installed_key);
+                                                                let capture_policy_digest =
+                                                                    policy_digest.clone();
+                                                                let env = session_env.clone();
+                                                                let env_snapshot_for_capture =
+                                                                    environment.clone();
+                                                                let publish_vault =
+                                                                    session.secret_vault().clone();
+                                                                let publish_db = session.db.clone();
+                                                                let publish_command_cache =
+                                                                    command_cache.clone();
+                                                                let publish_fence =
                                                             crate::daemon::session_worker::worker_coverage_publish_owners(
                                                                 &session,
                                                                 &env_overlay,
@@ -13763,7 +13795,7 @@ pub(super) async fn run_worker(
                                                                 publish_command_cache.clone(),
                                                             )
                                                             .publish_fence();
-                                                        match authority
+                                                                match authority
                                                             .acquire(
                                                                 coverage_key.clone(),
                                                                 crate::redact::coverage_authority::CoverageScope::RedactionOverride,
@@ -13856,6 +13888,8 @@ pub(super) async fn run_worker(
                                                             Err(error) => Err(anyhow::anyhow!(
                                                                 error.to_string()
                                                             )),
+                                                        }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -15622,5 +15656,123 @@ mod interrupt_redaction_tests {
                 },
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod host_capability_publication_tests {
+    use super::*;
+
+    fn table_covering(secret: &str) -> std::sync::Arc<crate::redact::RedactionTable> {
+        let workspace = tempfile::tempdir().unwrap();
+        std::sync::Arc::new(
+            crate::redact::RedactionTable::build_with_env_and_secrets(
+                &crate::config::extended::RedactConfig {
+                    scan_environment: false,
+                    scan_dotenv: false,
+                    scan_ssh_keys: false,
+                    ..crate::config::extended::RedactConfig::default()
+                },
+                workspace.path(),
+                &std::collections::HashMap::new(),
+                [("workspace-token".to_string(), secret.to_string())],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn snapshot_with_reason(reason: &str) -> cockpit_proto::HostCapabilitySnapshot {
+        let mut snapshot = cockpit_proto::HostCapabilitySnapshot::unpublished();
+        snapshot.generation = 3;
+        snapshot
+            .features
+            .push(cockpit_proto::host_capabilities::FeatureCapabilityRow {
+                id: "sandbox".into(),
+                state: cockpit_proto::host_capabilities::FeatureCapabilityState::Failed,
+                reason: reason.to_string(),
+                fix_command: None,
+                remedy_text: None,
+                dependency_ids: Vec::new(),
+            });
+        snapshot
+    }
+
+    fn reason_of(event: &proto::Event) -> String {
+        let proto::Event::HostCapabilitiesChanged { snapshot } = event else {
+            panic!("expected HostCapabilitiesChanged");
+        };
+        snapshot.features[0].reason.clone()
+    }
+
+    /// T2: a receipt session B recovers on behalf of session A is never
+    /// scrubbed with B's table. Non-owners get its content-free projection
+    /// (no table is consulted at all); owners get it unchanged.
+    #[tokio::test]
+    async fn recovered_foreign_receipt_is_never_scrubbed_with_the_worker_table() {
+        const SECRET_A: &str = "session-a-only-secret-5f02";
+        const SECRET_B: &str = "session-b-only-secret-9c11";
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let bus = crate::daemon::GlobalEventBus {
+            tx,
+            coverage: crate::daemon::global_coverage::GlobalCoverage::fixed(std::sync::Arc::new(
+                crate::redact::RedactionTable::empty(),
+            )),
+        };
+        let session_a = uuid::Uuid::new_v4();
+        let session_b = uuid::Uuid::new_v4();
+        let table_b = table_covering(SECRET_B);
+
+        publish_host_capabilities_changed(
+            &bus,
+            session_b,
+            session_a,
+            &table_b,
+            snapshot_with_reason(&format!("probe failed: {SECRET_A}")),
+        )
+        .await;
+        let envelope = rx.recv().await.unwrap();
+        assert!(
+            reason_of(&envelope.event).contains(SECRET_A),
+            "owners see it unchanged"
+        );
+        let projected = envelope
+            .redact
+            .project_for_non_owner(envelope.event, |_, _| {
+                panic!("a foreign receipt must not be scrubbed with any session table")
+            })
+            .expect("host capabilities have a content-free form");
+        assert_eq!(
+            reason_of(&projected),
+            crate::daemon::global_coverage::CONTENT_FREE_REASON
+        );
+
+        // The worker's own receipt is scrubbed with its own table.
+        let table_a = table_covering(SECRET_A);
+        publish_host_capabilities_changed(
+            &bus,
+            session_a,
+            session_a,
+            &table_a,
+            snapshot_with_reason(&format!("probe failed: {SECRET_A}")),
+        )
+        .await;
+        let envelope = rx.recv().await.unwrap();
+        let projected = envelope
+            .redact
+            .project_for_non_owner(envelope.event, |event, table| {
+                let proto::Event::HostCapabilitiesChanged { snapshot } = event else {
+                    return;
+                };
+                for row in &mut snapshot.features {
+                    row.reason = table.scrub(&row.reason);
+                }
+            })
+            .expect("own receipt is delivered");
+        assert!(
+            !reason_of(&projected).contains(SECRET_A),
+            "{}",
+            reason_of(&projected)
+        );
+        assert!(reason_of(&projected).starts_with("probe failed: "));
     }
 }

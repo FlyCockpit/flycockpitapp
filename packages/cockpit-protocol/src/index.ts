@@ -949,7 +949,9 @@ export const redactionCoverageStatusProjectionSchema = z
   .strict();
 
 const requestParamSchemas = {
-  get_redaction_coverage_status: z.object({ session_id: uuidSchema.optional() }).strict(),
+  get_redaction_coverage_status: z
+    .object({ session_id: uuidSchema.optional(), project_root: projectRootSchema.optional() })
+    .strict(),
   render_input_prediction: z
     .object({
       session_id: uuidSchema,

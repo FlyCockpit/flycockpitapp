@@ -19,6 +19,10 @@ use uuid::Uuid;
 
 use super::RedactionTable;
 
+/// Domain of every coverage binding digest, pinned in
+/// `internal_version_pins.rs`.
+pub(crate) const COVERAGE_BINDING_DOMAIN: &[u8] = b"flycockpit-redaction-coverage-binding-v1\0";
+
 pub(crate) const COVERAGE_WORKERS: usize = 2;
 pub(crate) const COVERAGE_QUEUE: usize = 32;
 pub(crate) const COVERAGE_FLIGHTS: usize = 64;
@@ -81,7 +85,7 @@ impl CoverageBinding {
     /// The result never crosses a protocol or diagnostic boundary.
     pub(crate) fn derive(domain: &[u8], identity: &[u8]) -> Self {
         let mut digest = Sha256::new();
-        digest.update(b"flycockpit-redaction-coverage-binding-v1\0");
+        digest.update(COVERAGE_BINDING_DOMAIN);
         digest.update(domain);
         digest.update([0]);
         digest.update(identity);
@@ -205,6 +209,36 @@ impl RedactionCoverageKey {
             principal,
             owner_authorization,
             session: Some(session),
+            workspace: Some(workspace),
+            environment,
+            credential_vault,
+            policy,
+            sealed,
+            override_revision,
+            machine_sources,
+        }
+    }
+
+    /// A sessionless workspace key: the coverage a fresh session at one
+    /// workspace root would capture, for a caller that has a root but no
+    /// session (debug-context projection). It never equals a session key
+    /// (no session binding) nor the daemon-global key (it binds a root).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn workspace(
+        principal: CoverageBinding,
+        owner_authorization: CoverageBinding,
+        workspace: CoverageBinding,
+        environment: CoverageBinding,
+        credential_vault: CoverageBinding,
+        policy: CoverageBinding,
+        sealed: CoverageBinding,
+        override_revision: CoverageBinding,
+        machine_sources: CoverageBinding,
+    ) -> Self {
+        Self {
+            principal,
+            owner_authorization,
+            session: None,
             workspace: Some(workspace),
             environment,
             credential_vault,
@@ -457,25 +491,33 @@ impl CoverageBuild {
         environment: &HashMap<String, String>,
         store: &crate::credentials::CredentialStore,
         sealed: &RedactionTable,
-        boundary_inputs: &super::coverage_bindings::SessionCoverageInputs<'_>,
+        boundary_inputs: &impl super::coverage_bindings::WorkspaceCaptureBoundary,
     ) -> Result<Self> {
-        let base =
-            RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
+        let (base, capture) = RedactionTable::build_with_env_and_credential_store_recorded(
+            config,
+            root,
+            environment,
+            store,
+        )?;
         let table = base.union(sealed)?;
-        let boundary_revisions = boundary_inputs.boundary_revisions(&table);
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table, &capture);
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 
+    /// Daemon-global capture. It takes no root: the build is scoped to
+    /// daemon-global sources and never walks a directory.
     pub(crate) fn capture_without_sealed(
         config: &crate::config::extended::RedactConfig,
-        root: &Path,
         environment: &HashMap<String, String>,
         store: &crate::credentials::CredentialStore,
         boundary_inputs: &super::coverage_bindings::DaemonGlobalCoverageInputs<'_>,
     ) -> Result<Self> {
-        let table =
-            RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
-        let boundary_revisions = boundary_inputs.boundary_revisions(&table);
+        let (table, capture) = RedactionTable::build_daemon_global_with_credential_store_recorded(
+            config,
+            environment,
+            store,
+        )?;
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table, &capture);
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 
@@ -486,9 +528,13 @@ impl CoverageBuild {
         store: &crate::credentials::CredentialStore,
         boundary_inputs: &super::coverage_bindings::SessionCoverageInputs<'_>,
     ) -> Result<Self> {
-        let table =
-            RedactionTable::build_with_env_and_credential_store(config, root, environment, store)?;
-        let boundary_revisions = boundary_inputs.boundary_revisions(&table);
+        let (table, capture) = RedactionTable::build_with_env_and_credential_store_recorded(
+            config,
+            root,
+            environment,
+            store,
+        )?;
+        let boundary_revisions = boundary_inputs.boundary_revisions(&table, &capture);
         Ok(Self::from_complete_table(table, boundary_revisions))
     }
 }
@@ -993,6 +1039,13 @@ impl RedactionCoverageAuthority {
 
     /// Revoke current coverage after any known owned mutation. Existing and
     /// late work becomes inert; the next acquisition performs a complete scan.
+    /// The authority's invalidation epoch. Every [`Self::invalidate`] advances
+    /// it, so a holder of a previously published table can tell that its
+    /// coverage was revoked even when no vault generation changed.
+    pub(crate) fn epoch(&self) -> u64 {
+        lock(&self.inner.state).epoch
+    }
+
     pub(crate) fn invalidate(&self) {
         let mut state = lock(&self.inner.state);
         state.epoch = state.epoch.wrapping_add(1).max(1);
@@ -1226,6 +1279,15 @@ impl CoverageAdmission {
             .enforced()
             .clone()
             .with_coverage_binding(self.coverage_binding_for_sink()))
+    }
+
+    /// The exact coverage key and invalidation epoch the admitted generation
+    /// was published under. The authority publishes a generation only when
+    /// its capture-boundary revisions and its publication-fence revisions
+    /// both equal this key, so the key describes precisely the sources the
+    /// table covers — it is never sampled around the capture.
+    pub(crate) fn acquisition_stamp(&self) -> (RedactionCoverageKey, u64) {
+        (self.generation.key.clone(), self.generation.epoch)
     }
 
     /// Install the admitted generation table with durable provenance binding.

@@ -1806,6 +1806,16 @@ pub fn resolve_effective_default_write_target(
         scope_for_config_path(cwd, &path)
     };
     let scope_label = scope.as_str().to_string();
+    // The layer attach reads is the only legal target, and reading it does
+    // not make it writable: an explicit override inside an ignored project
+    // `.cockpit/` is loaded but never written.
+    if !crate::config::dirs::config_layer_write_allowed(&path) {
+        return Err(EffectiveDefaultError::new(
+            "the highest-precedence config layer is not writable under the current trust policy",
+            "effective_default_trust_denied",
+            Some(scope_label),
+        ));
+    }
 
     let Some(parent) = path
         .parent()
@@ -2131,10 +2141,7 @@ fn journal_context_error(record: &JournalRecord, config_path: &Path) -> Option<&
     }
     // A project layer workspace trust no longer allows must not be rewritten
     // by recovery, exactly as attach would not read it.
-    let parent = config_parent(config_path);
-    if parent.file_name().is_some_and(|name| name == ".cockpit")
-        && !crate::config::trust::project_config_write_allowed(parent)
-    {
+    if !crate::config::dirs::config_layer_write_allowed(config_path) {
         return Some("journal target layer is no longer allowed by workspace trust");
     }
     if matches!(record.scope, EffectiveDefaultScope::Project)
@@ -2353,12 +2360,29 @@ pub fn recover_layer_journals(
                 // It is still the right place to sweep crash-window debris:
                 // an orphan backup or a stale temporary replacement with no
                 // owning journal can only come from a process killed mid-
-                // transaction.
-                sweep_orphans(path);
+                // transaction. Sweeping deletes files, so it is a write and
+                // only runs where the trust policy permits writing the layer.
+                if crate::config::dirs::config_layer_write_allowed(path) {
+                    sweep_orphans(path);
+                }
                 continue;
             }
             AmbientJournalClassification::RetainedDefaultUpdate => continue,
             AmbientJournalClassification::NonRetained(_) => {}
+        }
+        // Rolling a journal forward or back writes the layer. A layer that is
+        // readable but not writable under the current trust policy (an
+        // explicit override inside an ignored project `.cockpit/`) keeps its
+        // pending journal, and the caller fails closed on it.
+        if !crate::config::dirs::config_layer_write_allowed(path) {
+            if first_error.is_none() {
+                first_error = Some(anyhow!(
+                    "an effective-default journal is pending in a config layer the current \
+                     workspace trust policy does not permit writing; trust the workspace to \
+                     recover it"
+                ));
+            }
+            continue;
         }
         let journal_path = journal_path_for_config(path);
         if !recovery.forced
@@ -2463,6 +2487,10 @@ fn capture_ambient_recovery_mutation(
         .position(|path| canonical_config_path(path) == canonical_config_path(config_path))
         .context("effective-default journal target is no longer an active config layer")?;
     let selected_path = &paths[target_index];
+    anyhow::ensure!(
+        crate::config::dirs::config_layer_write_allowed(selected_path),
+        "effective-default journal target is not writable under the current workspace trust policy"
+    );
     // Every pathname-backed layer snapshot is acquired before the target
     // directory is captured. Once the target exists, recovery only touches
     // those immutable bytes and its held directory capability.

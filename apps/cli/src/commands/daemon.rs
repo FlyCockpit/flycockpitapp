@@ -925,10 +925,9 @@ fn render_supervised_running_status(
     output
 }
 
-/// Text status for a daemon whose worker is waiting for first-run
-/// onboarding. The locked hello is redacted metadata; only its protocol
-/// version is shown (never the capability snapshot).
 /// Human status line for a locked owner, by its ready-construction phase.
+/// The locked hello is redacted metadata: only its phase and protocol
+/// version are shown (never the capability snapshot).
 fn locked_status_headline(ready_construction: proto::LockedReadyConstruction) -> &'static str {
     match ready_construction {
         proto::LockedReadyConstruction::AwaitingSecureStore => {

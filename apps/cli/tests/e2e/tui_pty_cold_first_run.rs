@@ -706,7 +706,87 @@ fn tui_pty_first_frame_is_chat_on_a_cold_onboarded_home() {
             .expect("first frame timestamp")
             .as_millis()
     );
+    // The first frame was painted from the locked bootstrap answer; observe
+    // the handoff to ready services behind it: the daemon reports ready, the
+    // in-chat "starting services" status clears, and no frame across the
+    // whole window drew onboarding or a startup failure.
+    let deadline = Instant::now() + COLD_WELCOME_TIMEOUT;
+    loop {
+        let status = session.daemon_status_json();
+        if status["state"] == "ready" {
+            break;
+        }
+        assert_ne!(
+            status["state"], "ready_construction_failed",
+            "ready construction failed behind the first frame: {status}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never became ready: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    session
+        .wait_until_screen("services ready", ASYNC_STAGE_TIMEOUT, |screen| {
+            screen.contains(COMPOSER_PLACEHOLDER) && !screen.contains("Starting Cockpit services")
+        })
+        .expect("the starting-services status clears once ready services publish");
+    for (index, frame) in session.synchronized_frame_snapshots().iter().enumerate() {
+        for marker in ONBOARDING_MARKERS
+            .iter()
+            .chain(["could not start", "Daemon lifecycle unavailable"].iter())
+        {
+            assert!(
+                !frame.contains(marker),
+                "frame {index} across the ready handoff drew `{marker}`:\n{}",
+                frame.contents()
+            );
+        }
+    }
     session.reap();
     session.stop_child_spawned_daemon();
     session.assert_reaped();
+}
+
+/// D7/F9: a startup that fails before the first frame reports its error on
+/// the normal terminal and leaves the terminal in cooked mode (echo and line
+/// input restored), exactly as it found it. The failure is forced by an
+/// endpoint that answers with a malformed hello (a terminal connect failure).
+#[cfg(unix)]
+#[test]
+fn tui_pty_pre_paint_failure_restores_the_terminal() {
+    let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
+    let socket = session.socket_path();
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent).expect("socket directory");
+    }
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind impostor");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let _ = stream.write_all(b"this is not a cockpit hello\n");
+        }
+    });
+    session
+        .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
+        .expect("spawn PTY child");
+    session
+        .wait_until_screen("startup failure", COLD_WELCOME_TIMEOUT, |screen| {
+            screen.contains("could not start")
+        })
+        .expect("the failure is reported on the normal terminal");
+    let succeeded = session.wait_for_child_exit_status();
+    assert_eq!(succeeded, Some(false), "a failed startup exits nonzero");
+    assert!(
+        session.synchronized_frame_snapshots().is_empty(),
+        "no frame is drawn for a startup that failed before deciding a screen"
+    );
+    assert_eq!(
+        session.pty_is_cooked(),
+        Some(true),
+        "the pre-paint raw mode is restored on failure"
+    );
+    session.reap();
+    let _ = std::fs::remove_file(&socket);
 }

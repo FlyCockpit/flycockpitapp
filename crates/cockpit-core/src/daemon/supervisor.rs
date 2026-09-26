@@ -747,6 +747,11 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
     use cockpit_host::daemon_lifecycle::{ForegroundMetadataGuard, reclaim_stale_and_reserve};
 
     super::daemon_log::set_process_role(super::daemon_log::DaemonLogRole::Supervisor);
+    // Registered for the supervisor's whole life: the first stop drains the
+    // worker (letting a ready construction settle), and a repeated stop
+    // during that drain is the user's force — never swallowed by a gap with
+    // no live signal stream.
+    let mut stop_signals = SupervisorStopSignals::new();
     super::validate_bind_socket_paths(&paths)?;
     let executable = std::env::current_exe()
         .and_then(std::fs::canonicalize)
@@ -919,8 +924,12 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
         remove_if_present(&paths.socket)?;
         remove_if_present(&paths.leak_reveal_socket())?;
         remove_if_present(&admin_path)?;
+        // Bound at staged paths: the public control and reveal sockets appear
+        // only once the first worker reports that it serves the bootstrap
+        // surface (DB/config boot done, hello answered), the same publication
+        // barrier the standalone daemon enforces.
         #[cfg(unix)]
-        let endpoint_owner = UnixEndpointOwner::bind(&paths)?;
+        let mut endpoint_owner = UnixEndpointOwner::bind_staged(&paths)?;
         #[cfg(windows)]
         let endpoint_owner = WindowsEndpointOwner;
         let admin = bind_admin(&admin_path)?;
@@ -943,6 +952,8 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
             hold_for_promotion: false,
         })
         .await?;
+        #[cfg(unix)]
+        endpoint_owner.publish(&paths)?;
         publish_generation(&paths, &receipt, worker.pid, generation, opened_at_unix_ms)?;
         metadata.track_endpoint_record(endpoint_record.clone());
         super::spawn_notify::report_ready(&paths.socket);
@@ -1027,7 +1038,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                     }
                     AdminCommand::Stop => {
                         reply_admin(&mut stream, &AdminResponse::Stopping { version: ADMIN_PROTOCOL_VERSION }).await;
-                        drain_and_reap_worker(&mut worker, false).await?;
+                        drain_and_reap_worker(&mut worker, false, Some(&mut stop_signals)).await?;
                         break;
                     }
                     command @ (AdminCommand::Roll | AdminCommand::Upgrade { .. }) => {
@@ -1233,7 +1244,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 let _ = terminate_worker(&mut successor, false);
                                 reap_worker_after_exit(successor);
                                 if stopping {
-                                    drain_and_reap_worker(&mut worker, false).await?;
+                                    drain_and_reap_worker(&mut worker, false, Some(&mut stop_signals)).await?;
                                     break 'supervision;
                                 }
                                 let reason = format!("waiting for predecessor boundary: {error:#}");
@@ -1297,7 +1308,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 let _ = terminate_worker(&mut successor, false);
                                 reap_worker_after_exit(successor);
                                 if stopping {
-                                    drain_and_reap_worker(&mut worker, false).await?;
+                                    drain_and_reap_worker(&mut worker, false, Some(&mut stop_signals)).await?;
                                     break 'supervision;
                                 }
                                 let reason = format!(
@@ -1305,7 +1316,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                                 );
                                 tracing::warn!(%reason, "worker handover failed after commitment; retiring predecessor");
                                 last_handover = Some(format!("failed after commitment: {reason}"));
-                                drain_and_reap_worker(&mut worker, false).await?;
+                                drain_and_reap_worker(&mut worker, false, Some(&mut stop_signals)).await?;
                                 let respawn_binary = worker.binary.clone();
                                 let Some(replacement) = retry_worker_spawn(
                                     &mut storm,
@@ -1349,7 +1360,7 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                             // existing shutdown path, then release only after
                             // the old process is definitely gone.
                             tracing::warn!(%error, pid = old_pid, "predecessor did not exit after handover commit; forcing it");
-                            drain_and_reap_worker(&mut worker, false).await?;
+                            drain_and_reap_worker(&mut worker, false, Some(&mut stop_signals)).await?;
                         }
                         if let Err(error) = release_ready_successor(
                             &mut successor,
@@ -1472,8 +1483,12 @@ pub async fn run(paths: DaemonPaths, no_sandbox: bool, resume_all_sessions: bool
                     }
                 }
             }
-            _ = shutdown_signal() => {
-                drain_and_reap_worker(&mut worker, false).await?;
+            received = stop_signals.recv() => {
+                if !received {
+                    // No signal source: this branch can never fire again.
+                    std::future::pending::<()>().await;
+                }
+                drain_and_reap_worker(&mut worker, false, Some(&mut stop_signals)).await?;
                 break;
             }
         }
@@ -1686,6 +1701,9 @@ struct Worker {
 #[cfg(unix)]
 struct UnixEndpointOwner {
     control: tokio::net::UnixListener,
+    /// The control socket's staged path until [`Self::publish`] moves it to
+    /// the public path; unlinked on drop if it was never published.
+    staged_control: Option<PathBuf>,
     reveal: super::leak_reveal_socket::BoundRevealSocket,
     /// Supervisor-liveness pipe. Workers inherit a duplicate of `read` at
     /// [`LIVENESS_FD`]; `write` never leaves this process (close-on-exec,
@@ -1696,14 +1714,51 @@ struct UnixEndpointOwner {
 
 #[cfg(unix)]
 impl UnixEndpointOwner {
-    fn bind(paths: &DaemonPaths) -> Result<Self> {
+    /// Bind the control and reveal listeners at staged (unpublished) paths
+    /// beside the public ones. Workers inherit the listeners; clients cannot
+    /// reach them until [`Self::publish`].
+    fn bind_staged(paths: &DaemonPaths) -> Result<Self> {
         let (liveness_read, liveness_write) = create_ready_pipe()?;
+        let staged_reveal = staged_socket_path(&paths.leak_reveal_socket());
+        let staged_control = staged_socket_path(&paths.socket);
+        remove_if_present(&staged_reveal)?;
+        remove_if_present(&staged_control)?;
+        let reveal = super::leak_reveal_socket::BoundRevealSocket::new(
+            super::bind_private_socket(&staged_reveal).with_context(|| {
+                format!(
+                    "binding staged leak-reveal socket {}",
+                    staged_reveal.display()
+                )
+            })?,
+            staged_reveal,
+        );
+        let control = super::bind_private_socket(&staged_control)?;
         Ok(Self {
-            reveal: super::leak_reveal_socket::bind_reveal_socket(paths)?,
-            control: super::bind_private_socket(&paths.socket)?,
+            reveal,
+            control,
+            staged_control: Some(staged_control),
             liveness_read,
             liveness_write,
         })
+    }
+
+    /// Publish the staged listeners at their public paths: the reveal
+    /// sibling first, the control socket last (the observable readiness
+    /// boundary). Each is one atomic same-directory rename of the bound
+    /// socket node, so a client either finds no socket or a served one.
+    fn publish(&mut self, paths: &DaemonPaths) -> Result<()> {
+        self.reveal
+            .rename_to(paths.leak_reveal_socket())
+            .context("publishing the leak-reveal socket")?;
+        if let Some(staged) = self.staged_control.take()
+            && let Err(error) = std::fs::rename(&staged, &paths.socket)
+        {
+            self.staged_control = Some(staged);
+            return Err(error).with_context(|| {
+                format!("publishing the control socket {}", paths.socket.display())
+            });
+        }
+        Ok(())
     }
 
     #[allow(clippy::type_complexity)]
@@ -1762,6 +1817,7 @@ impl UnixEndpointOwner {
         reveal.set_nonblocking(true)?;
         Ok(Self {
             control: tokio::net::UnixListener::from_std(control)?,
+            staged_control: None,
             reveal: super::leak_reveal_socket::BoundRevealSocket::new(
                 tokio::net::UnixListener::from_std(reveal)?,
                 paths.leak_reveal_socket(),
@@ -1770,6 +1826,25 @@ impl UnixEndpointOwner {
             liveness_write,
         })
     }
+}
+
+#[cfg(unix)]
+impl Drop for UnixEndpointOwner {
+    fn drop(&mut self) {
+        if let Some(staged) = self.staged_control.take() {
+            let _ = std::fs::remove_file(staged);
+        }
+    }
+}
+
+/// The unpublished path a supervisor binds a listener at before its first
+/// worker serves. Same directory as the public path (an atomic rename
+/// publishes it); a short suffix keeps it within the Unix socket path limit.
+#[cfg(unix)]
+fn staged_socket_path(path: &Path) -> PathBuf {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".n");
+    PathBuf::from(staged)
 }
 
 #[cfg(windows)]
@@ -2082,8 +2157,12 @@ fn reap_worker_after_exit(mut worker: Worker) {
     });
 }
 
-async fn drain_and_reap_worker(worker: &mut Worker, reconnect: bool) -> Result<()> {
-    await_drained_worker_exit(worker, reconnect).await?;
+async fn drain_and_reap_worker(
+    worker: &mut Worker,
+    reconnect: bool,
+    force: Option<&mut SupervisorStopSignals>,
+) -> Result<()> {
+    await_drained_worker_exit(worker, reconnect, force).await?;
     if let Some(child) = worker.child.as_mut() {
         child.wait().context("reaping supervised worker")?;
     } else {
@@ -2119,25 +2198,57 @@ async fn worker_reports_construction(worker: &Worker) -> bool {
     )
 }
 
-async fn await_drained_worker_exit(worker: &mut Worker, reconnect: bool) -> Result<()> {
-    await_drained_worker_exit_with_timeout(worker, reconnect, super::shutdown::SHUTDOWN_DRAIN_GRACE)
-        .await
+async fn await_drained_worker_exit(
+    worker: &mut Worker,
+    reconnect: bool,
+    force: Option<&mut SupervisorStopSignals>,
+) -> Result<()> {
+    await_drained_worker_exit_with_timeout(
+        worker,
+        reconnect,
+        super::shutdown::SHUTDOWN_DRAIN_GRACE,
+        force,
+    )
+    .await
+}
+
+/// Wait for the next stop signal from `force`, or forever without one.
+async fn next_force_signal(force: &mut Option<&mut SupervisorStopSignals>) {
+    if let Some(signals) = force.as_deref_mut()
+        && signals.recv().await
+    {
+        return;
+    }
+    std::future::pending::<()>().await
 }
 
 async fn await_drained_worker_exit_with_timeout(
     worker: &mut Worker,
     reconnect: bool,
     timeout: Duration,
+    mut force: Option<&mut SupervisorStopSignals>,
 ) -> Result<()> {
-    terminate_worker(worker, reconnect)?;
+    request_worker_stop(worker, reconnect).await?;
     let started = tokio::time::Instant::now();
     let mut deadline = started + timeout;
     // A worker still running its daemon-owned ready construction honors the
     // stop only once construction settles; it is never force-killed for
-    // that. The extension is bounded by construction's own deadline.
+    // that. The extension is bounded by construction's own deadline. A
+    // repeated stop signal to the supervisor meanwhile is the user's force.
     let construction_bound = started + timeout + super::server::READY_CONSTRUCTION_TIMEOUT;
     let exit = loop {
-        match tokio::time::timeout_at(deadline, worker.exited.recv()).await {
+        let waited = tokio::select! {
+            exit = tokio::time::timeout_at(deadline, worker.exited.recv()) => exit,
+            () = next_force_signal(&mut force) => {
+                tracing::warn!(
+                    pid = worker.pid,
+                    "repeated stop signal during the worker drain; forcing its exit"
+                );
+                force_kill_worker(worker)?;
+                break worker.exited.recv().await;
+            }
+        };
+        match waited {
             Ok(exit) => break exit,
             Err(_) => {
                 let now = tokio::time::Instant::now();
@@ -2164,6 +2275,136 @@ async fn await_drained_worker_exit_with_timeout(
         None => bail!("stable worker process watch stopped while draining"),
     }
     Ok(())
+}
+
+/// Ask the worker to stop. Unix delivers SIGTERM (SIGUSR1 for a reconnect
+/// handover), which the worker handles gracefully. Windows has no such
+/// signal for a worker without a console, so a shutdown drain first asks the
+/// worker's own control endpoint for an owner `StopDaemon` — the same
+/// graceful stop (construction settles first) a signal gives on Unix — and
+/// terminates the process only when that request cannot be delivered.
+#[cfg(unix)]
+async fn request_worker_stop(worker: &mut Worker, reconnect: bool) -> Result<()> {
+    terminate_worker(worker, reconnect)
+}
+
+#[cfg(windows)]
+async fn request_worker_stop(worker: &mut Worker, reconnect: bool) -> Result<()> {
+    // A retired predecessor (reconnect) no longer owns the public endpoint,
+    // which now names its successor: never send it a stop meant for them.
+    if !reconnect && request_graceful_worker_stop(worker).await {
+        return Ok(());
+    }
+    terminate_worker(worker, reconnect)
+}
+
+#[cfg(windows)]
+async fn request_graceful_worker_stop(worker: &Worker) -> bool {
+    let Some(socket) = worker.control_socket.clone() else {
+        return false;
+    };
+    let stop = async move {
+        let client = cockpit_client::DaemonClient::connect_bootstrap(&socket).await?;
+        client
+            .request(cockpit_proto::Request::StopDaemon { grace_secs: None })
+            .await
+    };
+    match tokio::time::timeout(Duration::from_secs(5), stop).await {
+        Ok(Ok(Ok(cockpit_proto::Response::Ack))) => true,
+        outcome => {
+            tracing::warn!(
+                pid = worker.pid,
+                ?outcome,
+                "graceful worker stop request failed; terminating the worker"
+            );
+            false
+        }
+    }
+}
+
+/// The supervisor's stop signals, registered once: SIGINT and SIGTERM on
+/// Unix; Ctrl-C, Ctrl-Break, console close, and system shutdown on Windows.
+struct SupervisorStopSignals {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    #[cfg(windows)]
+    ctrl_break: Option<tokio::signal::windows::CtrlBreak>,
+    #[cfg(windows)]
+    ctrl_close: Option<tokio::signal::windows::CtrlClose>,
+    #[cfg(windows)]
+    ctrl_shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
+
+impl SupervisorStopSignals {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                interrupt: signal(SignalKind::interrupt()).ok(),
+                terminate: signal(SignalKind::terminate()).ok(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+            Self {
+                ctrl_c: ctrl_c().ok(),
+                ctrl_break: ctrl_break().ok(),
+                ctrl_close: ctrl_close().ok(),
+                ctrl_shutdown: ctrl_shutdown().ok(),
+            }
+        }
+    }
+
+    /// The next stop signal. `false`: no source is available, so none can
+    /// ever arrive.
+    async fn recv(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            let Self {
+                interrupt,
+                terminate,
+                ..
+            } = self;
+            if interrupt.is_none() && terminate.is_none() {
+                return false;
+            }
+            tokio::select! {
+                _ = async { if let Some(signal) = interrupt.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(signal) = terminate.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+            }
+            true
+        }
+        #[cfg(windows)]
+        {
+            let Self {
+                ctrl_c,
+                ctrl_break,
+                ctrl_close,
+                ctrl_shutdown,
+                ..
+            } = self;
+            if ctrl_c.is_none()
+                && ctrl_break.is_none()
+                && ctrl_close.is_none()
+                && ctrl_shutdown.is_none()
+            {
+                return false;
+            }
+            tokio::select! {
+                _ = async { if let Some(signal) = ctrl_c.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(signal) = ctrl_break.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(signal) = ctrl_close.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(signal) = ctrl_shutdown.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+            }
+            true
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -2703,7 +2944,7 @@ fn terminate_worker(worker: &mut Worker, _reconnect: bool) -> Result<()> {
 #[cfg(windows)]
 fn reap_retired_worker(mut worker: Worker) {
     tokio::spawn(async move {
-        if let Err(error) = await_drained_worker_exit(&mut worker, true).await {
+        if let Err(error) = await_drained_worker_exit(&mut worker, true, None).await {
             tracing::error!(pid = worker.pid, %error, "retired worker process watch failed");
         }
         if let Some(mut child) = worker.child {
@@ -3128,22 +3369,6 @@ pub fn request_blocking(
     .map_err(|_| anyhow::anyhow!("supervisor admin request thread panicked"))?
 }
 
-#[cfg(unix)]
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut int = signal(SignalKind::interrupt()).ok();
-    let mut term = signal(SignalKind::terminate()).ok();
-    tokio::select! {
-        _ = async { if let Some(signal) = int.as_mut() { signal.recv().await; } } => {}
-        _ = async { if let Some(signal) = term.as_mut() { signal.recv().await; } } => {}
-    }
-}
-
-#[cfg(windows)]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-}
-
 fn remove_if_present(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -3438,9 +3663,14 @@ mod tests {
         };
         // Let the child install its SIGTERM disposition first.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        await_drained_worker_exit_with_timeout(&mut worker, false, Duration::from_millis(200))
-            .await
-            .unwrap();
+        await_drained_worker_exit_with_timeout(
+            &mut worker,
+            false,
+            Duration::from_millis(200),
+            None,
+        )
+        .await
+        .unwrap();
         worker.child.as_mut().unwrap().wait().unwrap()
     }
 
@@ -3468,6 +3698,133 @@ mod tests {
             Some(libc::SIGKILL),
             "without a construction report the grace still force-kills"
         );
+    }
+
+    /// G7: a repeated stop signal to the supervisor while it drains a worker
+    /// that is still constructing (so the drain extends) forces the worker's
+    /// exit at once. Real SIGINT through the supervisor's own registered
+    /// streams; signals are process-wide, so the scenario runs in an
+    /// isolated child process of this test binary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_stop_signal_forces_a_draining_worker() {
+        const CHILD: &str = "COCKPIT_SUPERVISOR_FORCE_SIGNAL_CHILD";
+        const OK: &str = "supervisor-force-signal-child-ok";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(CHILD, "1")
+                .args([
+                    "--exact",
+                    "daemon::supervisor::tests::repeated_stop_signal_forces_a_draining_worker",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .output()
+                .expect("run the isolated signal scenario");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "child failed:\n{stdout}\n{stderr}");
+            assert!(
+                stderr.contains(OK) || stdout.contains(OK),
+                "child did not run the scenario:\n{stdout}\n{stderr}"
+            );
+            return;
+        }
+        let mut signals = SupervisorStopSignals::new();
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let server = serve_constructing_hellos(&socket);
+        let binary = super::super::discover_daemon_spawn_harness_executable().unwrap();
+        let child = std::process::Command::new(&binary)
+            .args(["daemon", "worker"])
+            // Ignores SIGTERM for far longer than this test may take.
+            .env("COCKPIT_WORKER_DRAIN_TEST_IGNORE_TERM_MS", "120000")
+            .spawn()
+            .unwrap();
+        let receipt = worker_receipt(child.id(), &binary).unwrap();
+        let mut worker = Worker {
+            pid: child.id(),
+            binary: std::fs::canonicalize(&binary).unwrap(),
+            control_socket: Some(socket),
+            exited: watch_worker(&receipt).unwrap(),
+            child: Some(child),
+            promotion: None,
+            serving: None,
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = tokio::time::Instant::now();
+        let raise = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            // SAFETY: raising a signal this process handles (tokio streams).
+            assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        });
+        await_drained_worker_exit_with_timeout(
+            &mut worker,
+            false,
+            Duration::from_millis(200),
+            Some(&mut signals),
+        )
+        .await
+        .unwrap();
+        raise.await.unwrap();
+        let status = worker.child.as_mut().unwrap().wait().unwrap();
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "forced, not drained");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the force ends the extended drain promptly"
+        );
+        server.abort();
+        eprintln!("{OK}");
+    }
+
+    /// G4: the supervisor binds its listeners unpublished; the public
+    /// control and reveal sockets appear only on publication (after the
+    /// first worker reports serving), each by one atomic rename.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_listeners_are_published_only_after_worker_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let private = directory.path().join("run");
+        std::fs::create_dir(&private).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = DaemonPaths {
+            socket: private.join("cockpit.sock"),
+            pid_file: private.join("cockpit.pid"),
+            ephemeral: true,
+        };
+        let mut owner = UnixEndpointOwner::bind_staged(&paths).unwrap();
+        assert!(!paths.socket.exists(), "control socket is not public yet");
+        assert!(
+            !paths.leak_reveal_socket().exists(),
+            "reveal socket is not public yet"
+        );
+        assert!(
+            tokio::net::UnixStream::connect(&paths.socket)
+                .await
+                .is_err(),
+            "no client can reach an unpublished listener"
+        );
+        owner.publish(&paths).unwrap();
+        assert!(paths.socket.exists());
+        assert!(paths.leak_reveal_socket().exists());
+        assert!(!staged_socket_path(&paths.socket).exists());
+        // The published path reaches the very listener the worker inherits.
+        let _client = tokio::net::UnixStream::connect(&paths.socket)
+            .await
+            .unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(5), owner.control.accept())
+            .await
+            .expect("the published socket is the bound listener");
+        assert!(accepted.is_ok());
+        drop(owner);
+        // An owner dropped before publication leaves no staged socket.
+        let unpublished = UnixEndpointOwner::bind_staged(&paths).unwrap();
+        let staged = staged_socket_path(&paths.socket);
+        assert!(staged.exists());
+        drop(unpublished);
+        assert!(!staged.exists(), "an unpublished staged socket is removed");
     }
 
     #[cfg(windows)]

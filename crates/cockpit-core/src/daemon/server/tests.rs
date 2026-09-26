@@ -42786,6 +42786,7 @@ async fn boot_with_db_resolves_referenced_command_secret() {
         &mut timer,
         crate::daemon::terminal::test_host_factory(),
         config_source,
+        None,
     )
     .await
     .expect("boot_with_db must succeed with startup command resolution wired in");

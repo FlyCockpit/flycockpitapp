@@ -4624,8 +4624,10 @@ pub(crate) fn locked_in_process_endpoint(
     let locked_for_connections = locked.clone();
     let locked_for_client_connections = locked_for_connections.clone();
     let ready_tx_for_watch = ready_tx.clone();
+    // Registered before the endpoint exists, so any construction this owner
+    // starts always has its consumer.
+    let mut ready_signal = locked_for_connections.subscribe_ready_handoff();
     tokio::spawn(async move {
-        let mut ready_signal = locked_for_connections.subscribe_ready_handoff();
         while ready_signal.changed().await.is_ok() {
             if !*ready_signal.borrow_and_update() {
                 continue;
@@ -4904,6 +4906,17 @@ async fn dispatch_locked_bootstrap_request(
         }
         Request::StopDaemon { .. } => Ok(Response::Ack),
         Request::ApplyOnboardingTransition(request) => {
+            // A retried request whose acknowledgement was lost answers from
+            // its receipt before any admission or revision check.
+            if let Some((snapshot, receipt)) = locked
+                .onboarding
+                .transition_replay(&request, locked.host_capabilities())
+                .await?
+            {
+                return Ok(Response::OnboardingTransition(
+                    cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+                ));
+            }
             let Some(_admission) = locked.admit_locked_mutation().await else {
                 return Err(locked.locked_mutation_denied());
             };
@@ -4990,37 +5003,6 @@ async fn locked_bootstrap_hello_for_any_platform(
     }
 }
 
-/// The shared post-commit arm of both secure-intent handlers (locked and
-/// ready): a vault authority already exists, so only an idempotent replay of
-/// the exact committed submission may succeed. Everything else keeps the
-/// fixed `InvalidRequest` denial.
-async fn replay_committed_secure_intent(
-    onboarding: &crate::onboarding::OnboardingAuthority,
-    request: &cockpit_proto::ApplyOnboardingSecureIntent,
-    host_capabilities: cockpit_proto::HostCapabilitySnapshot,
-) -> std::result::Result<
-    cockpit_proto::OnboardingTransitionResult,
-    cockpit_proto::SensitiveOnboardingIntentError,
-> {
-    match onboarding
-        .committed_secure_intent_replay(request, host_capabilities)
-        .await
-    {
-        Ok(Some((snapshot, receipt))) => {
-            tracing::info!("replayed an already committed onboarding secure intent");
-            Ok(cockpit_proto::OnboardingTransitionResult { snapshot, receipt })
-        }
-        Ok(None) => Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest),
-        Err(error) => {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                "onboarding secure intent replay lookup failed"
-            );
-            Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest)
-        }
-    }
-}
-
 /// Classify a secure-intent failure by type and log its full cause locally.
 /// Only the fixed wire code leaves the daemon; the log keeps the detail an
 /// operator needs (KEK reasons are nonsecret by construction).
@@ -5036,70 +5018,42 @@ fn classify_and_log_secure_intent_error(
     rejection
 }
 
+/// A secure-store intent that reaches ready services. Ready services exist
+/// only once the vault authority has committed, so the only possible answer
+/// is the idempotent replay of the exact committed submission (a response
+/// lost across the ready handoff); everything else is the fixed
+/// `InvalidRequest` denial. Materialization has exactly one funnel: the
+/// locked owner's [`LockedServices::apply_secure_intent_span`].
 pub(crate) async fn handle_ready_onboarding_secure_intent(
     ctx: &DaemonContext,
     payload: &[u8],
 ) -> cockpit_proto::SensitiveOnboardingIntentResponse {
-    let frame = match cockpit_proto::decode_sensitive_onboarding_intent(payload) {
-        Ok(frame) => frame,
-        Err(_) => {
-            return cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-                cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
-            );
-        }
+    let rejected = |error| cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(error);
+    let Ok(frame) = cockpit_proto::decode_sensitive_onboarding_intent(payload) else {
+        return rejected(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
     };
     let capabilities = ctx
         .host_capabilities
         .current()
         .map(|snapshot| snapshot.as_ref().clone())
         .unwrap_or_else(cockpit_proto::HostCapabilitySnapshot::unpublished);
-    if ctx
-        .db
-        .blocking_write_for_sync_maintenance(cockpit_db::secret_vault::load_authority_conn)
-        .map(|authority| authority.is_some())
-        .unwrap_or(true)
-    {
-        return match replay_committed_secure_intent(&ctx.onboarding, &frame.request, capabilities)
-            .await
-        {
-            Ok(result) => cockpit_proto::SensitiveOnboardingIntentResponse::Applied(result),
-            Err(error) => cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(error),
-        };
-    }
-    let db = ctx.db.clone();
-    let kek_dir = ctx
-        .secret_store_path
-        .clone()
-        .or_else(|| crate::secure_key::kek_dir_for_db(&db).ok());
-    let result = ctx
+    let submission = match ctx.onboarding.prepare_secure_intent(frame.request).await {
+        Ok(submission) => submission,
+        Err(error) => return rejected(classify_and_log_secure_intent_error(&error)),
+    };
+    match ctx
         .onboarding
-        .apply_secure_intent_with(
-            frame.request,
-            capabilities,
-            false,
-            move |placement, passphrase| {
-                let options = crate::onboarding::secure_vault_open_options(placement, passphrase)?;
-                let probe = crate::secure_key::probe_platform_keyring();
-                let kek_dir = kek_dir.context("resolving onboarding vault directory")?;
-                crate::secure_key::ensure_secret_vault_with_options(
-                    &db,
-                    &probe,
-                    &kek_dir,
-                    crate::secure_key::SecretStoreInjected::default(),
-                    options,
-                )
-                .map_err(|error| error.into_error())?;
-                Ok(())
-            },
-        )
-        .await;
-    match result {
-        Ok((snapshot, receipt)) => cockpit_proto::SensitiveOnboardingIntentResponse::Applied(
-            cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
-        ),
-        Err(error) => cockpit_proto::SensitiveOnboardingIntentResponse::Rejected(
-            classify_and_log_secure_intent_error(&error),
-        ),
+        .committed_secure_intent_replay(&submission.key(), capabilities)
+        .await
+    {
+        Ok(Some((snapshot, receipt))) => {
+            tracing::info!("replayed an already committed onboarding secure intent");
+            cockpit_proto::SensitiveOnboardingIntentResponse::Applied(
+                cockpit_proto::OnboardingTransitionResult { snapshot, receipt },
+            )
+        }
+        Ok(None) => rejected(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest),
+        Err(error) => rejected(classify_and_log_secure_intent_error(&error)),
     }
 }
 
@@ -5346,19 +5300,32 @@ pub(crate) struct LockedServices {
     /// this flag tells the locked run loop to tear every attached client
     /// down instead of waiting for the presence count to drain.
     stop_requested: AtomicBool,
+    /// Admitted onboarding mutations (ordinary and secure) not yet finished.
+    /// Only [`InflightMutation`] changes it, so a cancelled, failed, or
+    /// panicking mutation always gives its count back.
     inflight_mutations: AtomicUsize,
+    /// Woken whenever an admitted mutation ends (see
+    /// [`LockedServices::drain_inflight_mutations`]).
+    inflight_drained: tokio::sync::Notify,
     ready_transition_inflight: AtomicBool,
-    /// Observable [`cockpit_proto::LockedReadyConstruction`] phase, reported
-    /// in every locked hello. Owned by the ready-construction funnel
-    /// ([`LockedServices::start_ready_construction`] and its rollback), never
-    /// by a client connection.
+    /// The ready-construction state machine: idle (never started, or its
+    /// owned commit step not yet handed to construction), running (a
+    /// construction or the secure intent's owned commit step owns it), or
+    /// failed (in memory, retryable). Owned by the construction funnel and
+    /// the secure intent's commit step, never by a client connection. The
+    /// reported [`cockpit_proto::LockedReadyConstruction`] is derived from it
+    /// together with `vault_committed` (see
+    /// [`LockedServices::ready_construction_phase`]).
     ready_construction_phase: std::sync::atomic::AtomicU8,
-    /// Whether a vault authority is known to exist: set at boot from the
-    /// durable authority row and by secure-store materialization the moment
-    /// the vault commits. The reported phase is derived from it together with
-    /// the construction phase, so a hello never says `awaiting_secure_store`
-    /// while a vault exists.
+    /// Whether the durable vault authority exists: read at boot, set by
+    /// secure-store materialization the moment the vault commits, and
+    /// re-read from the durable authority after a materializer error. It
+    /// only ever tracks the authority row (monotonic while locked).
     vault_committed: Arc<AtomicBool>,
+    /// The vault onboarding opened (with a passphrase vault's derived key
+    /// custody), handed to every ready-construction attempt so construction
+    /// never reopens it without the passphrase. Retries reuse it.
+    opened_vault: StdMutex<Option<crate::secure_key::EffectiveSecretStore>>,
     /// Onboarding mutation exclusion. Ordinary locked onboarding mutations
     /// (begin/reopen, transitions, the profile write) hold it shared; a
     /// secure-store intent holds it exclusively across its whole span —
@@ -5383,6 +5350,10 @@ pub(crate) struct LockedServices {
     /// Test seam: fail the retry's snapshot read after construction started.
     #[cfg(test)]
     fail_next_retry_snapshot: AtomicBool,
+    /// Test seam: panic inside the next secure-intent span after it was
+    /// admitted (counted), to prove unwinding gives the count back.
+    #[cfg(test)]
+    panic_next_secure_intent: AtomicBool,
 }
 
 /// Vault-bearing daemon composition. Ordinary dispatch and recovery accept
@@ -5501,16 +5472,94 @@ impl std::error::Error for ReadyConstructionAlreadyRunning {}
 /// reports construction in progress before force-killing it.
 pub(crate) const READY_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// One admitted onboarding mutation's share of the inflight count. The
+/// guard exists before the count is incremented and is the only thing that
+/// decrements it, so a mutation that fails, is cancelled at any await, or
+/// unwinds always gives its count back and wakes the drain.
+struct InflightMutation<'a> {
+    locked: &'a LockedServices,
+    counted: bool,
+}
+
+impl<'a> InflightMutation<'a> {
+    /// Admit one mutation, or `None` when the owner is ready or closing.
+    fn begin(locked: &'a LockedServices) -> Option<Self> {
+        let mut guard = Self {
+            locked,
+            counted: false,
+        };
+        if locked.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        locked.inflight_mutations.fetch_add(1, Ordering::AcqRel);
+        guard.counted = true;
+        if locked.closing.load(Ordering::Acquire) {
+            // Dropping the guard gives the count back.
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+impl Drop for InflightMutation<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            self.counted = false;
+            self.locked
+                .inflight_mutations
+                .fetch_sub(1, Ordering::AcqRel);
+            self.locked.inflight_drained.notify_waiters();
+        }
+    }
+}
+
 /// One admitted ordinary locked onboarding mutation: counted in the
 /// inflight-mutation drain and holding the shared onboarding exclusion.
 struct LockedMutationAdmission<'a> {
-    locked: &'a LockedServices,
     _exclusion: tokio::sync::RwLockReadGuard<'a, ()>,
+    _inflight: InflightMutation<'a>,
 }
 
-impl Drop for LockedMutationAdmission<'_> {
+/// The secure intent's owned commit step: from the vault commit until the
+/// commit is handed to a construction (which then owns the phase), the
+/// phase reports it running. If the span ends any other way — an error, a
+/// cancellation, an unwind — the phase becomes the retryable `failed`, never
+/// a permanent `constructing` that no construction owns.
+struct CommitStepGuard<'a> {
+    locked: &'a LockedServices,
+    handed_off: bool,
+}
+
+impl Drop for CommitStepGuard<'_> {
     fn drop(&mut self) {
-        self.locked.end_locked_mutation();
+        if self.handed_off || !self.locked.vault_committed() {
+            return;
+        }
+        let failed = self
+            .locked
+            .ready_construction_phase
+            .compare_exchange(
+                READY_CONSTRUCTION_RUNNING,
+                READY_CONSTRUCTION_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if self
+            .locked
+            .ready_transition_inflight
+            .load(Ordering::Acquire)
+        {
+            // A construction admitted meanwhile (a concurrent retry) owns the
+            // phase: it is running.
+            self.locked
+                .ready_construction_phase
+                .store(READY_CONSTRUCTION_RUNNING, Ordering::Release);
+            return;
+        }
+        if failed {
+            self.locked.wake_locked_run_loop();
+        }
     }
 }
 
@@ -5521,9 +5570,9 @@ pub(crate) enum ReadyConstructionStart {
     AlreadyInProgress,
 }
 
-/// Phase encodings for [`LockedServices::ready_construction_phase`].
-const READY_CONSTRUCTION_AWAITING_SECURE_STORE: u8 = 0;
-const READY_CONSTRUCTION_CONSTRUCTING: u8 = 1;
+/// State encodings of [`LockedServices::ready_construction_phase`].
+const READY_CONSTRUCTION_IDLE: u8 = 0;
+const READY_CONSTRUCTION_RUNNING: u8 = 1;
 const READY_CONSTRUCTION_FAILED: u8 = 2;
 
 /// Ready services that finished construction and pre-publication recovery
@@ -5670,11 +5719,11 @@ impl LockedServices {
             closing: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
             inflight_mutations: AtomicUsize::new(0),
+            inflight_drained: tokio::sync::Notify::new(),
             ready_transition_inflight: AtomicBool::new(false),
-            ready_construction_phase: std::sync::atomic::AtomicU8::new(
-                READY_CONSTRUCTION_AWAITING_SECURE_STORE,
-            ),
+            ready_construction_phase: std::sync::atomic::AtomicU8::new(READY_CONSTRUCTION_IDLE),
             vault_committed: Arc::new(AtomicBool::new(false)),
+            opened_vault: StdMutex::new(None),
             onboarding_exclusion: tokio::sync::RwLock::new(()),
             ready_handoff: StdMutex::new(ReadyHandoffState::default()),
             ready_signal,
@@ -5685,6 +5734,8 @@ impl LockedServices {
             fail_next_construction: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_retry_snapshot: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_next_secure_intent: AtomicBool::new(false),
         })
     }
 
@@ -5708,19 +5759,81 @@ impl LockedServices {
         self.ready.load(Ordering::Acquire) || self.stop_requested.load(Ordering::Acquire)
     }
 
-    /// The ready-construction phase every locked hello reports. Derived
-    /// from the in-memory construction phase together with the durable fact
-    /// that a vault exists: once the vault has committed the phase is never
-    /// `AwaitingSecureStore` (construction is either admitted, running, or
-    /// failed and retryable).
+    /// The ready-construction phase every locked hello reports, derived
+    /// from the construction state machine and the durable vault evidence:
+    ///
+    /// * running (a construction, or the secure intent's owned commit step,
+    ///   holds it) → `Constructing`;
+    /// * failed → `Failed` (retryable);
+    /// * idle with a committed vault → `Failed`: no construction owns the
+    ///   committed choice, and a retry (or the next intent, or the next
+    ///   boot) starts one — never a `Constructing` nothing is doing;
+    /// * idle without a vault → `AwaitingSecureStore`.
+    ///
+    /// So a hello never reports `awaiting_secure_store` while a vault exists
+    /// and never reports `constructing` without an owner.
     pub(crate) fn ready_construction_phase(&self) -> cockpit_proto::LockedReadyConstruction {
         match self.ready_construction_phase.load(Ordering::Acquire) {
-            READY_CONSTRUCTION_CONSTRUCTING => cockpit_proto::LockedReadyConstruction::Constructing,
+            READY_CONSTRUCTION_RUNNING => cockpit_proto::LockedReadyConstruction::Constructing,
             READY_CONSTRUCTION_FAILED => cockpit_proto::LockedReadyConstruction::Failed,
             _ if self.vault_committed.load(Ordering::Acquire) => {
-                cockpit_proto::LockedReadyConstruction::Constructing
+                cockpit_proto::LockedReadyConstruction::Failed
             }
             _ => cockpit_proto::LockedReadyConstruction::AwaitingSecureStore,
+        }
+    }
+
+    /// Record durable evidence that the vault authority exists. With
+    /// `custody`, the store onboarding just opened is kept for construction.
+    /// The phase is set running first (the owned commit step), so no
+    /// observer sees a committed vault that nothing owns.
+    fn commit_vault(&self, custody: Option<crate::secure_key::EffectiveSecretStore>) {
+        let _ = self.ready_construction_phase.compare_exchange(
+            READY_CONSTRUCTION_IDLE,
+            READY_CONSTRUCTION_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if let Some(custody) = custody {
+            *self
+                .opened_vault
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(custody);
+        }
+        self.vault_committed.store(true, Ordering::Release);
+    }
+
+    /// Re-read the durable authority (after a materializer error) and record
+    /// it when present.
+    fn refresh_vault_evidence(&self) {
+        if !self.vault_committed() && self.vault_authority_exists().unwrap_or(false) {
+            self.commit_vault(None);
+        }
+    }
+
+    /// The vault onboarding opened, if this process opened it.
+    fn opened_vault(&self) -> Option<crate::secure_key::EffectiveSecretStore> {
+        self.opened_vault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Start construction for a committed vault that no construction owns
+    /// (idle, or failed and retryable). Idempotent; a no-op without a vault,
+    /// once ready, or while stopping.
+    fn ensure_construction_started(self: &Arc<Self>) {
+        if !self.vault_committed()
+            || self.ready.load(Ordering::Acquire)
+            || self.stop_requested.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if let Err(error) = self.start_ready_construction() {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "ready construction for the committed vault could not start"
+            );
         }
     }
 
@@ -5734,20 +5847,19 @@ impl LockedServices {
     /// owner is closing (a stop, or ready construction admitted) or a
     /// secure-store intent has since committed and closed admission.
     async fn admit_locked_mutation(&self) -> Option<LockedMutationAdmission<'_>> {
-        if !self.begin_locked_mutation() {
-            return None;
-        }
+        // Counted before waiting for the exclusion (a stop or construction
+        // drain waits for it), by a guard that gives the count back if this
+        // future is cancelled while it waits.
+        let inflight = InflightMutation::begin(self)?;
         let exclusion = self.onboarding_exclusion.read().await;
         // Re-check under the exclusion: a secure-store intent that held it
         // exclusively may have committed the vault and admitted construction.
         if self.locked_admission_denied() {
-            drop(exclusion);
-            self.end_locked_mutation();
             return None;
         }
         Some(LockedMutationAdmission {
-            locked: self,
             _exclusion: exclusion,
+            _inflight: inflight,
         })
     }
 
@@ -5793,30 +5905,24 @@ impl LockedServices {
         self.client_presence.subscribe()
     }
 
-    fn ready_construction_pending(&self) -> bool {
-        !self.ready.load(Ordering::Acquire) && self.vault_committed()
-    }
-
-    fn begin_locked_mutation(&self) -> bool {
-        if self.ready.load(Ordering::Acquire) {
-            return false;
-        }
-        self.inflight_mutations.fetch_add(1, Ordering::AcqRel);
-        if self.closing.load(Ordering::Acquire) {
-            self.inflight_mutations.fetch_sub(1, Ordering::AcqRel);
-            return false;
-        }
-        true
-    }
-
-    fn end_locked_mutation(&self) {
-        self.inflight_mutations.fetch_sub(1, Ordering::AcqRel);
-    }
-
+    /// Wait until every admitted mutation has ended. Woken by each
+    /// [`InflightMutation`] drop (registered before the count is re-read, so
+    /// a decrement between the read and the wait is never missed).
     async fn drain_inflight_mutations(&self) {
-        while self.inflight_mutations.load(Ordering::Acquire) > 0 {
-            tokio::task::yield_now().await;
+        loop {
+            let drained = self.inflight_drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.inflight_mutations.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            drained.await;
         }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn inflight_mutation_count(&self) -> usize {
+        self.inflight_mutations.load(Ordering::Acquire)
     }
 
     fn try_acquire_ready_transition(&self) -> bool {
@@ -5839,9 +5945,11 @@ impl LockedServices {
     /// and the committed onboarding stage stand, and every later boot
     /// reconstructs from them.
     fn rollback_failed_ready_handoff(&self) {
+        // Publish the failed phase before signalling: a waiter woken by the
+        // signal must read `failed`, never a stale `constructing`.
+        self.set_ready_construction_phase(READY_CONSTRUCTION_FAILED);
         self.ready.store(false, Ordering::Release);
         let _ = self.ready_signal.send(false);
-        self.set_ready_construction_phase(READY_CONSTRUCTION_FAILED);
         if !self.stop_requested.load(Ordering::Acquire) {
             self.closing.store(false, Ordering::Release);
         }
@@ -5893,8 +6001,21 @@ impl LockedServices {
             anyhow::bail!(reason);
         }
         self.closing.store(true, Ordering::Release);
-        self.set_ready_construction_phase(READY_CONSTRUCTION_CONSTRUCTING);
+        self.set_ready_construction_phase(READY_CONSTRUCTION_RUNNING);
         Ok(ReadyTransitionPermit::new(self.clone()))
+    }
+
+    /// Whether a lifecycle owner is registered to receive constructed ready
+    /// services (the locked run loop, the in-process endpoint's publisher,
+    /// or an in-process boot). Construction starts only while one is: its
+    /// result is then always delivered, never discarded for lack of a
+    /// consumer.
+    fn ready_consumer_registered(&self) -> bool {
+        self.ready_handoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .consumers
+            > 0
     }
 
     /// The single ready-construction funnel. Once a committed vault authority
@@ -5909,6 +6030,10 @@ impl LockedServices {
     /// `Constructing` before this returns, so the caller's response and every
     /// later hello already report it.
     pub(crate) fn start_ready_construction(self: &Arc<Self>) -> Result<ReadyConstructionStart> {
+        anyhow::ensure!(
+            self.ready_consumer_registered(),
+            "no lifecycle owner is registered to receive ready services"
+        );
         let permit = match self.admit_ready_construction() {
             Ok(permit) => permit,
             Err(error) if error.is::<ReadyConstructionAlreadyRunning>() => {
@@ -5958,6 +6083,15 @@ impl LockedServices {
             if injected_failure {
                 anyhow::bail!("injected ready-construction failure");
             }
+            // The committed choice's bookkeeping is part of construction:
+            // settle any unsettled secure-store receipt and advance a stage
+            // still at `materializing` from the vault evidence. Idempotent,
+            // so every attempt (including a retry after the intent's own
+            // settlement failed) converges the durable state first.
+            self.onboarding
+                .reconcile_materializing_secure_intent(true, self.host_capabilities())
+                .await
+                .context("settling the committed secure-store choice")?;
             let ready = self.into_ready().await?;
             let ctx = Arc::new(ready.context);
             // Pre-publication recovery belongs to construction: while it runs
@@ -6039,13 +6173,21 @@ impl LockedServices {
             .map(|authority| authority.is_some())
     }
 
-    /// The secure-store intent's single ownership span: admission (counted
-    /// in the inflight-mutation drain, so a stop or last-client teardown
-    /// waits for it), the exclusive onboarding exclusion (no begin/reopen or
-    /// transition can supersede its attempt), the pending receipt, vault
-    /// materialization, receipt settlement, and construction admission. The
-    /// exclusion is released only after construction has been admitted and
-    /// mutation admission closed.
+    /// The secure-store intent's single ownership span.
+    ///
+    /// 1. Replay first: the exact submission's receipt (kind, placement, and
+    ///    passphrase binding) answers before any admission check, and again
+    ///    under the exclusion, so a duplicate that waited behind the original
+    ///    returns the original outcome. A committed receipt also ensures
+    ///    construction owns the committed choice.
+    /// 2. Under the exclusive onboarding exclusion and counted in the
+    ///    inflight-mutation drain (a stop or construction waits for it): the
+    ///    pending receipt, vault materialization, receipt settlement, stage
+    ///    advance, and construction admission — one owned step. From the
+    ///    vault commit until construction is admitted the phase reports it
+    ///    running; if the step ends any other way the phase becomes the
+    ///    retryable `failed`, and construction itself (at boot, on a retry, or
+    ///    on the next intent) settles the bookkeeping from the vault evidence.
     pub(crate) async fn apply_secure_intent_span(
         self: &Arc<Self>,
         request: cockpit_proto::ApplyOnboardingSecureIntent,
@@ -6053,55 +6195,202 @@ impl LockedServices {
         cockpit_proto::OnboardingTransitionResult,
         cockpit_proto::SensitiveOnboardingIntentError,
     > {
-        // A replay of an already committed submission is read-only and is
-        // answered in any phase (a response lost during construction).
-        if self.vault_committed() {
-            return replay_committed_secure_intent(
-                &self.onboarding,
-                &request,
-                self.host_capabilities(),
-            )
-            .await;
+        let submission = match self.onboarding.prepare_secure_intent(request).await {
+            Ok(submission) => submission,
+            Err(error) => return Err(classify_and_log_secure_intent_error(&error)),
+        };
+        let key = submission.key();
+        if let Some(answer) = self.replay_secure_intent(&key).await {
+            return answer;
         }
-        if !self.begin_locked_mutation() {
+        let _exclusive = self.onboarding_exclusion.write().await;
+        if let Some(answer) = self.replay_secure_intent(&key).await {
+            return answer;
+        }
+        let Some(_inflight) = InflightMutation::begin(self) else {
+            // Closing: a stop, or construction for a choice another
+            // submission committed.
+            self.ensure_construction_started();
+            return Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
+        };
+        if self.vault_committed() {
+            // Another submission committed the choice (its construction may
+            // have failed and reopened admission): this one cannot apply.
+            self.ensure_construction_started();
             return Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
         }
-        let result = async {
-            let _exclusive = self.onboarding_exclusion.write().await;
-            if self.locked_admission_denied() {
-                return Err(cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest);
+        #[cfg(test)]
+        if self.panic_next_secure_intent.swap(false, Ordering::AcqRel) {
+            panic!("injected secure-intent span panic");
+        }
+        let mut commit_step = CommitStepGuard {
+            locked: self,
+            handed_off: false,
+        };
+        let applied = self.apply_secure_intent(submission).await;
+        // A materializer error may still have committed the authority row.
+        self.refresh_vault_evidence();
+        let result = match applied {
+            Ok(result) => Ok(result),
+            Err(error) if !self.vault_committed() => return Err(error),
+            Err(error) => {
+                // The vault committed but its bookkeeping (receipt
+                // settlement, stage advance) failed. Settle it from the vault
+                // evidence once, inline; construction repeats this
+                // idempotently on every attempt.
+                tracing::warn!(
+                    ?error,
+                    "secure-store bookkeeping failed after the vault committed; reconciling from the vault evidence"
+                );
+                Err(self
+                    .onboarding
+                    .reconcile_materializing_secure_intent(true, self.host_capabilities())
+                    .await)
             }
-            // Another submission may have committed while this one waited.
-            if self.vault_committed() {
-                return replay_committed_secure_intent(
-                    &self.onboarding,
-                    &request,
-                    self.host_capabilities(),
-                )
-                .await;
-            }
-            let result = self.apply_secure_intent(request).await?;
-            // Construction admission happens before the exclusion is
-            // released: it closes mutation admission under the permit.
-            if let Err(error) = self.start_ready_construction() {
+        };
+        // Construction admission happens before the exclusion is released:
+        // it closes mutation admission under the permit. The construction
+        // task drains this span's own count, so it starts only once the span
+        // has ended.
+        let started = self.start_ready_construction();
+        match started {
+            Ok(_) => commit_step.handed_off = true,
+            Err(error) => {
                 tracing::warn!(
                     error = %format!("{error:#}"),
                     "onboarding ready construction could not start after the secure intent committed"
                 );
                 return Err(cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed);
             }
-            Ok(result)
         }
-        .await;
-        self.end_locked_mutation();
-        result
+        match result {
+            Ok(result) => Ok(result),
+            Err(reconciled) => {
+                if let Err(error) = reconciled {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "inline reconciliation of the committed secure-store choice failed; construction will settle it"
+                    );
+                }
+                // The vault committed and construction owns it now. Answer
+                // with the settled receipt when reconciliation got that far;
+                // otherwise the choice is committed but unconfirmed, which
+                // the client reconciles from the hello phase and receipt.
+                match self
+                    .onboarding
+                    .committed_secure_intent_replay(&key, self.host_capabilities())
+                    .await
+                {
+                    Ok(Some((snapshot, receipt))) => {
+                        Ok(cockpit_proto::OnboardingTransitionResult { snapshot, receipt })
+                    }
+                    _ => {
+                        Err(cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Answer `submission` from its own receipt, if it has one: a committed
+    /// receipt is the applied result (and construction must own the
+    /// committed choice); a rejected one is refused; an unsettled one with
+    /// a committed vault is settled from the vault evidence first. `None`:
+    /// no receipt, apply it.
+    async fn replay_secure_intent(
+        self: &Arc<Self>,
+        key: &crate::onboarding::SecureIntentKey,
+    ) -> Option<
+        std::result::Result<
+            cockpit_proto::OnboardingTransitionResult,
+            cockpit_proto::SensitiveOnboardingIntentError,
+        >,
+    > {
+        let lookup = self
+            .onboarding
+            .secure_intent_receipt(key, self.host_capabilities())
+            .await;
+        let (snapshot, receipt) = match lookup {
+            Ok(Some(found)) => found,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(classify_and_log_secure_intent_error(&error))),
+        };
+        let (snapshot, receipt) = match receipt.status {
+            cockpit_proto::OnboardingReceiptStatus::Committed => (snapshot, receipt),
+            cockpit_proto::OnboardingReceiptStatus::Rejected => {
+                return Some(Err(
+                    cockpit_proto::SensitiveOnboardingIntentError::InvalidRequest,
+                ));
+            }
+            cockpit_proto::OnboardingReceiptStatus::Pending
+            | cockpit_proto::OnboardingReceiptStatus::Unknown => {
+                // In flight under the exclusion (the caller waits for it and
+                // asks again), or its outcome was never recorded.
+                self.refresh_vault_evidence();
+                if !self.vault_committed() {
+                    return None;
+                }
+                if let Err(error) = self
+                    .onboarding
+                    .reconcile_materializing_secure_intent(true, self.host_capabilities())
+                    .await
+                {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "settling an uncertain secure-store receipt failed"
+                    );
+                }
+                match self
+                    .onboarding
+                    .secure_intent_receipt(key, self.host_capabilities())
+                    .await
+                {
+                    Ok(Some((snapshot, receipt)))
+                        if receipt.status == cockpit_proto::OnboardingReceiptStatus::Committed =>
+                    {
+                        (snapshot, receipt)
+                    }
+                    _ => {
+                        self.ensure_construction_started();
+                        return Some(Err(
+                            cockpit_proto::SensitiveOnboardingIntentError::ReadyConstructionFailed,
+                        ));
+                    }
+                }
+            }
+        };
+        tracing::info!("replayed an already committed onboarding secure intent");
+        self.ensure_construction_started();
+        Some(Ok(cockpit_proto::OnboardingTransitionResult {
+            snapshot,
+            receipt,
+        }))
+    }
+
+    /// Test entry to [`Self::apply_secure_intent`] without the span (no
+    /// exclusion, no construction start): the permit unit tests drive
+    /// construction themselves.
+    #[cfg(test)]
+    pub(crate) async fn apply_secure_intent_for_test(
+        &self,
+        request: cockpit_proto::ApplyOnboardingSecureIntent,
+    ) -> std::result::Result<
+        cockpit_proto::OnboardingTransitionResult,
+        cockpit_proto::SensitiveOnboardingIntentError,
+    > {
+        let submission = self
+            .onboarding
+            .prepare_secure_intent(request)
+            .await
+            .map_err(|error| classify_and_log_secure_intent_error(&error))?;
+        self.apply_secure_intent(submission).await
     }
 
     /// Materialize the vault for a secure-store intent. Callers hold the
     /// exclusive onboarding exclusion ([`Self::apply_secure_intent_span`]).
-    pub(crate) async fn apply_secure_intent(
+    async fn apply_secure_intent(
         &self,
-        request: cockpit_proto::ApplyOnboardingSecureIntent,
+        submission: crate::onboarding::SecureIntentSubmission,
     ) -> std::result::Result<
         cockpit_proto::OnboardingTransitionResult,
         cockpit_proto::SensitiveOnboardingIntentError,
@@ -6130,16 +6419,15 @@ impl LockedServices {
         let db = self.db.clone();
         let keyring_probe = probes.keyring.clone();
         let kek_dir = self.kek_dir.clone();
-        let vault_committed = self.vault_committed.clone();
         self.onboarding
-            .apply_secure_intent_with(
-                request,
+            .apply_prepared_secure_intent_with(
+                submission,
                 probes.snapshot.clone(),
                 false,
-                move |placement, passphrase| {
+                |placement, passphrase| {
                     let options =
                         crate::onboarding::secure_vault_open_options(placement, passphrase)?;
-                    crate::secure_key::ensure_secret_vault_with_options(
+                    let opened = crate::secure_key::ensure_secret_vault_with_options(
                         &db,
                         &keyring_probe,
                         &kek_dir,
@@ -6147,7 +6435,11 @@ impl LockedServices {
                         options,
                     )
                     .map_err(|error| error.into_error())?;
-                    vault_committed.store(true, Ordering::Release);
+                    // The vault is committed and open: keep the opened store
+                    // (a passphrase vault's derived key custody) for ready
+                    // construction, which must never reopen it without the
+                    // passphrase.
+                    self.commit_vault(Some(opened));
                     Ok(())
                 },
             )
@@ -6173,6 +6465,7 @@ impl LockedServices {
             &mut timer,
             self.terminal_factory.clone(),
             self.config_source.clone(),
+            self.opened_vault(),
         )
         .await?;
         timer.done();
@@ -6364,6 +6657,7 @@ pub(crate) async fn boot_ready_with_db(
     timer: &mut crate::startup::PhaseTimer,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
     config_source: crate::daemon::config_source::ConfigSource,
+    opened_store: Option<crate::secure_key::EffectiveSecretStore>,
 ) -> Result<DaemonContext> {
     let coverage_mode = if paths.ephemeral {
         crate::redact::coverage_authority::CoverageOwnerMode::Ephemeral
@@ -6462,14 +6756,20 @@ pub(crate) async fn boot_ready_with_db(
         let configured_kek_dir = effective_kek_dir.clone();
         move || {
             let kek_dir = configured_kek_dir;
-            let effective = crate::secure_key::ensure_secret_vault(
-                &db,
-                &keyring_probe,
-                &kek_dir,
-                crate::secure_key::SecretStoreInjected::default(),
-            )
-            .map_err(|error| error.into_error())
-            .context("opening daemon vault for redaction")?;
+            // The store onboarding opened in this process carries its key
+            // custody (a passphrase vault cannot be reopened without the
+            // passphrase): use it instead of reopening.
+            let effective = match opened_store {
+                Some(opened) => opened,
+                None => crate::secure_key::ensure_secret_vault(
+                    &db,
+                    &keyring_probe,
+                    &kek_dir,
+                    crate::secure_key::SecretStoreInjected::default(),
+                )
+                .map_err(|error| error.into_error())
+                .context("opening daemon vault for redaction")?,
+            };
             Ok::<_, anyhow::Error>((effective, kek_dir))
         }
     });
@@ -7712,6 +8012,11 @@ pub(crate) async fn run_locked_until_ready(
     let mut locked_clients = tokio::task::JoinSet::new();
     let mut sensitive_clients = tokio::task::JoinSet::new();
     let mut ready_signal = locked.subscribe_ready_handoff();
+    // With a committed vault, construction starts only now that this loop
+    // is registered as its consumer: its result is read from the owner's
+    // mailbox, never lost to a broadcast sent before anyone listened. This is
+    // also the boot-time retry of a committed choice no construction owns.
+    locked.ensure_construction_started();
     let mut client_presence = locked.client_presence();
     // Start of the current last-client idle period, keyed by the attach
     // epoch that ended it (see `LAST_CLIENT_HANDOFF_GRACE`).

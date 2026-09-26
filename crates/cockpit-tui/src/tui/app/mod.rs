@@ -2010,6 +2010,11 @@ struct StartupBackground {
     generation: u64,
     workspace_ready: bool,
     lifecycle_failure_started_at: Option<Instant>,
+    /// The startup chain's one end-to-end deadline, created at startup entry
+    /// and threaded through every startup await (lifecycle, bootstrap,
+    /// workspace); cleared once the first screen settles, so later fetches
+    /// get their own.
+    deadline: Option<tokio::time::Instant>,
     retry: Option<StartupRetry>,
     clipboard_reconcile_scheduled: bool,
     trace_milestones: HashSet<&'static str>,
@@ -4240,6 +4245,7 @@ impl App {
                 generation: 1,
                 workspace_ready: false,
                 lifecycle_failure_started_at: None,
+                deadline: None,
                 retry: None,
                 clipboard_reconcile_scheduled: false,
                 trace_milestones: HashSet::new(),
@@ -4512,7 +4518,7 @@ impl App {
             )
             .await
         {
-            startup_layout::FirstScreenOutcome::Decided => pre_paint.hand_off(),
+            startup_layout::FirstScreenOutcome::Decided => pre_paint.prepare_hand_off(),
             startup_layout::FirstScreenOutcome::Cancelled => {
                 drop(pre_paint);
                 self.exit_requested = true;
@@ -4524,7 +4530,17 @@ impl App {
                 anyhow::bail!("Cockpit could not start: {error}");
             }
         }
-        let mut terminal = ratatui::try_init()?;
+        // The pre-paint guard keeps owning (and restoring) raw mode until the
+        // TUI terminal exists: a failed initialization returns the shell to
+        // cooked mode.
+        let mut terminal = match ratatui::try_init() {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                drop(pre_paint);
+                return Err(error.into());
+            }
+        };
+        pre_paint.release_to_tui();
         install_synchronized_update_panic_hook();
         let mut terminal_mode_guard = TerminalModeGuard::with_sink_and_title_state(
             CrosstermTerminalModeSink,

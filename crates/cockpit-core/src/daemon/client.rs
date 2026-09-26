@@ -406,10 +406,12 @@ where
                 let _ = request.reply.send(Ok(resolution));
             }
             Err(error) => {
-                // Keep the whole cause chain (the I/O error behind a failed
-                // connect): the reply channel carries text, so flatten with
-                // `{:#}`, never `to_string()`.
-                let _ = request.reply.send(Err(format!("{error:#}")));
+                // Classify while the typed error still exists and keep the
+                // whole cause chain: callers decide terminal-versus-retry
+                // from the class, never from the text.
+                let _ = request
+                    .reply
+                    .send(Err(cockpit_client::LifecycleError::from_error(&error)));
             }
         }
     }

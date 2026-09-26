@@ -3148,6 +3148,7 @@ async fn run_foreground_inner_with_boot_db_impl(
         }
         None => server::boot(paths.clone(), terminal_factory).await?,
     };
+    let ready_signals: ReadySignalStreams;
     let (ctx, listener, reveal_listener) = {
         {
             let locked = std::sync::Arc::new(services);
@@ -3187,17 +3188,13 @@ async fn run_foreground_inner_with_boot_db_impl(
             }
             // Worker readiness means "serving the bootstrap surface"; ready
             // services are tracked separately (the hello phase). With a
-            // committed vault, start the daemon-owned ready construction now
-            // — after promotion, so a rolling successor never reconciles or
-            // attaches durable state while its predecessor still serves.
-            if locked.vault_committed()
-                && let Err(error) = locked.start_ready_construction()
-            {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "ready construction could not start at boot; the locked owner reports it as failed"
-                );
-            }
+            // committed vault the locked run loop starts the daemon-owned
+            // ready construction once it is registered as the construction's
+            // consumer — after promotion, so a rolling successor never
+            // reconciles or attaches durable state while its predecessor still
+            // serves, and after the signal streams below are registered, so no
+            // first signal can reach construction unprotected.
+            //
             // The first shutdown signal is an acknowledged locked stop, which
             // waits for an in-flight ready construction to settle instead of
             // dropping it mid-way. A repeated signal is the user's explicit
@@ -3205,9 +3202,16 @@ async fn run_foreground_inner_with_boot_db_impl(
             // only durable effects are idempotent recovery steps behind a
             // committed vault, the next boot simply constructs again.
             let force_exit = std::sync::Arc::new(tokio::sync::Notify::new());
-            // Register the signal streams before spawning, so no signal can
-            // arrive between the spawn and the forwarder's first poll.
+            // Register the signal streams before spawning (and before the run
+            // loop starts construction), so no signal can arrive between the
+            // spawn and the forwarder's first poll.
             let signals = BootstrapShutdownSignals::new();
+            // The ready phase's signal streams are registered now too: a
+            // registered-but-unpolled stream keeps a signal pending, so a
+            // stop that arrives during the locked-to-ready handoff or the
+            // ready boot steps before the ready signal task runs is still
+            // delivered to it (tokio drops a signal no live stream observes).
+            ready_signals = ReadySignalStreams::new();
             let mut signal_forwarder = ForegroundTask::new(tokio::spawn(
                 forward_locked_bootstrap_signals(locked.clone(), force_exit.clone(), signals),
             ));
@@ -3270,15 +3274,13 @@ async fn run_foreground_inner_with_boot_db_impl(
         tokio::spawn(async move {
             #[cfg(unix)]
             {
-                use tokio::signal::unix::{SignalKind, signal};
-                let mut int = signal(SignalKind::interrupt()).ok();
-                let mut term = signal(SignalKind::terminate()).ok();
-                let mut roll = signal(SignalKind::user_defined1()).ok();
-                let mut commit = signal(SignalKind::user_defined2()).ok();
-                // SIGWINCH belongs to the foreground terminal and is emitted
-                // on resize. Use the otherwise-unclaimed SIGURG control lane
-                // for the supervisor-only abort decision.
-                let mut abort = signal(SignalKind::from_raw(libc::SIGURG)).ok();
+                let ReadySignalStreams {
+                    mut int,
+                    mut term,
+                    mut roll,
+                    mut commit,
+                    mut abort,
+                } = ready_signals;
                 loop {
                     let signal = tokio::select! {
                         _ = async { if let Some(s) = int.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => 0,
@@ -3374,8 +3376,13 @@ async fn run_foreground_inner_with_boot_db_impl(
                 // console-close control events, consistent with the rest of
                 // the codebase's non-unix signal handling. A second Ctrl-C
                 // during drain shortens to force, same as unix.
+                let ReadySignalStreams { mut ctrl_c } = ready_signals;
                 loop {
-                    if tokio::signal::ctrl_c().await.is_err() {
+                    let received = match ctrl_c.as_mut() {
+                        Some(stream) => stream.recv().await.is_some(),
+                        None => false,
+                    };
+                    if !received {
                         break;
                     }
                     server::request_shutdown(&ctx);
@@ -3685,6 +3692,50 @@ async fn forward_locked_bootstrap_signals(
     }
     tracing::warn!("repeated shutdown signal during locked bootstrap; forcing exit");
     force_exit.notify_one();
+}
+
+/// The ready phase's signal streams, registered before the locked-to-ready
+/// handoff so no stop is lost between the two phases' signal handlers.
+#[cfg(any(unix, windows))]
+struct ReadySignalStreams {
+    #[cfg(unix)]
+    int: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    roll: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    commit: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    abort: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+}
+
+#[cfg(any(unix, windows))]
+impl ReadySignalStreams {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                int: signal(SignalKind::interrupt()).ok(),
+                term: signal(SignalKind::terminate()).ok(),
+                roll: signal(SignalKind::user_defined1()).ok(),
+                commit: signal(SignalKind::user_defined2()).ok(),
+                // SIGWINCH belongs to the foreground terminal and is emitted
+                // on resize. Use the otherwise-unclaimed SIGURG control lane
+                // for the supervisor-only abort decision.
+                abort: signal(SignalKind::from_raw(libc::SIGURG)).ok(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                ctrl_c: tokio::signal::windows::ctrl_c().ok(),
+            }
+        }
+    }
 }
 
 /// Shutdown-signal streams registered once, so a repeated signal is never

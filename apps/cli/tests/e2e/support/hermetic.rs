@@ -1800,6 +1800,31 @@ impl HermeticCockpit {
         self.pty.as_ref().map(|pty| (pty.cols, pty.rows))
     }
 
+    /// Whether the PTY's line discipline is back in cooked mode (echo and
+    /// canonical input), read from the master side. `None` without a PTY.
+    #[cfg(unix)]
+    pub fn pty_is_cooked(&self) -> Option<bool> {
+        let fd = self.pty.as_ref()?.master.as_raw_fd()?;
+        // SAFETY: `termios` is plain data; `fd` is the live PTY master.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; tcgetattr only writes into `termios`.
+        if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+            return None;
+        }
+        Some(termios.c_lflag & libc::ECHO != 0 && termios.c_lflag & libc::ICANON != 0)
+    }
+
+    /// Wait for the PTY child to exit and return whether it succeeded.
+    pub fn wait_for_child_exit_status(&mut self) -> Option<bool> {
+        let pty = self.pty.as_mut()?;
+        Some(
+            pty.child
+                .wait()
+                .expect("wait for exact PTY child exit")
+                .success(),
+        )
+    }
+
     pub fn wait_for_child_exit(&mut self) {
         let Some(pty) = self.pty.as_mut() else {
             return;

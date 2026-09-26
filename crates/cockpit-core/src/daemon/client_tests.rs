@@ -1037,7 +1037,9 @@ async fn accepted_promotion_terminal_failure_releases_the_lifecycle_host() {
     .expect("accepted promotion recovery must reach a terminal result")
     .expect_err("expired accepted-handoff deadline must reject the promotion");
     assert!(
-        terminal.contains("persistent Assistant daemon replacement"),
+        terminal
+            .message()
+            .contains("persistent Assistant daemon replacement"),
         "terminal policy must remain observable through lifecycle resolution"
     );
 

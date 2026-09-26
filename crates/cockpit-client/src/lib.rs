@@ -118,16 +118,17 @@ impl InProcessEndpoint {
     }
 
     async fn connect(&self) -> Result<InProcessConnection> {
+        let retired = || anyhow::Error::new(DaemonEndpointRetired);
         let (reply, receive) = oneshot::channel();
         tokio::time::timeout(REQUEST_TIMEOUT, self.connections.send(reply))
             .await
             .map_err(|_| anyhow!("in-process daemon connection enqueue timed out"))?
-            .map_err(|_| anyhow!("in-process daemon endpoint has retired"))?;
+            .map_err(|_| retired())?;
         tokio::time::timeout(REQUEST_TIMEOUT, receive)
             .await
             .map_err(|_| anyhow!("in-process daemon connection timed out"))?
-            .map_err(|_| anyhow!("in-process daemon endpoint dropped its reply"))?
-            .ok_or_else(|| anyhow!("in-process daemon endpoint has retired"))
+            .map_err(|_| retired())?
+            .ok_or_else(retired)
     }
 }
 
@@ -449,9 +450,87 @@ impl Drop for LifecycleSpawnPermit {
     }
 }
 
+/// A failed lifecycle resolution. The host classifies the failure where the
+/// typed error still exists (see [`DaemonConnectFailure`]) and carries that
+/// class across the reply channel with the full cause text, so callers
+/// decide terminal-versus-retry from the type, never from message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleError {
+    message: String,
+    failure: DaemonConnectFailure,
+}
+
+impl LifecycleError {
+    /// A resolver-local failure (enqueue, reply, deadline): not a connect
+    /// failure of the owner itself.
+    pub fn resolver(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            failure: DaemonConnectFailure::Other,
+        }
+    }
+
+    /// Classify `error` while its type is still available and keep its whole
+    /// cause chain as text.
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        Self {
+            message: format!("{error:#}"),
+            failure: daemon_connect_failure(error),
+        }
+    }
+
+    pub fn connect_failure(&self) -> DaemonConnectFailure {
+        self.failure
+    }
+
+    /// Whether waiting or retrying cannot resolve this failure.
+    pub fn is_terminal(&self) -> bool {
+        self.failure.is_terminal()
+    }
+
+    /// A handshake cut short by an owner handoff (a close during the
+    /// handshake, or a slow hello): re-resolving shortly is the recovery.
+    pub fn is_handoff_transient(&self) -> bool {
+        matches!(
+            self.failure,
+            DaemonConnectFailure::ClosedDuringHandshake | DaemonConnectFailure::HelloTimeout
+        )
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for LifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LifecycleError {}
+
+impl From<&str> for LifecycleError {
+    fn from(message: &str) -> Self {
+        Self::resolver(message)
+    }
+}
+
+impl From<String> for LifecycleError {
+    fn from(message: String) -> Self {
+        Self::resolver(message)
+    }
+}
+
+impl From<LifecycleError> for String {
+    fn from(error: LifecycleError) -> Self {
+        error.message
+    }
+}
+
 pub struct LifecycleRequest {
     pub intent: LifecycleIntent,
-    pub reply: oneshot::Sender<Result<LifecycleResolution, String>>,
+    pub reply: oneshot::Sender<Result<LifecycleResolution, LifecycleError>>,
     spawn_authority: Arc<LifecycleSpawnAuthority>,
 }
 
@@ -544,7 +623,12 @@ impl LifecycleClient {
         client
     }
 
-    pub async fn resolve(&self, intent: LifecycleIntent) -> Result<LifecycleResolution, String> {
+    /// Resolve an owner through the lifecycle host without waiting for
+    /// ready services.
+    pub async fn resolve_bootstrap(
+        &self,
+        intent: LifecycleIntent,
+    ) -> Result<LifecycleResolution, LifecycleError> {
         let (reply, receive) = oneshot::channel();
         let spawn_authority = LifecycleSpawnAuthority::new();
         let mut cancellation = LifecycleRequestCancellation::new(Arc::clone(&spawn_authority));
@@ -557,8 +641,8 @@ impl LifecycleClient {
             }),
         )
         .await
-        .map_err(|_| "daemon lifecycle request enqueue timed out".to_string())?
-        .map_err(|_| "daemon lifecycle resolver has stopped".to_string());
+        .map_err(|_| LifecycleError::resolver("daemon lifecycle request enqueue timed out"))?
+        .map_err(|_| LifecycleError::resolver("daemon lifecycle resolver has stopped"));
         if let Err(error) = enqueue {
             cancellation.cancel().await;
             return Err(error);
@@ -570,13 +654,17 @@ impl LifecycleClient {
             }
             Ok(Err(_)) => {
                 cancellation.cancel().await;
-                Err("daemon lifecycle resolver dropped its reply".to_string())
+                Err(LifecycleError::resolver(
+                    "daemon lifecycle resolver dropped its reply",
+                ))
             }
             Err(_) => {
                 // Do not return while a creation authorization is outstanding:
                 // that would let a timed-out request retain write authority.
                 cancellation.cancel().await;
-                Err("daemon lifecycle resolution timed out".to_string())
+                Err(LifecycleError::resolver(
+                    "daemon lifecycle resolution timed out",
+                ))
             }
         }
     }
@@ -584,9 +672,48 @@ impl LifecycleClient {
     /// Resolve using the lifetime selected for this presentation capability.
     /// The configured lifetime applies only if this request must create a new
     /// owner; the lifecycle host still attaches to an existing owner first.
-    pub async fn resolve_default(&self) -> Result<LifecycleResolution, String> {
-        let intent = LifecycleIntent::from_u8(self.default_intent.load(Ordering::Acquire));
-        self.resolve(intent).await
+    /// The resolution is to ready services (see [`Self::resolve`]).
+    pub async fn resolve_default(&self) -> Result<LifecycleResolution, LifecycleError> {
+        self.resolve(self.default_intent()).await
+    }
+
+    /// [`Self::resolve_default`] without waiting for ready services: the
+    /// resolution may be a locked owner whose ready construction is still
+    /// running. For first-screen decisions and onboarding, which observe the
+    /// owner's phase themselves.
+    pub async fn resolve_default_bootstrap(&self) -> Result<LifecycleResolution, LifecycleError> {
+        self.resolve_bootstrap(self.default_intent()).await
+    }
+
+    fn default_intent(&self) -> LifecycleIntent {
+        LifecycleIntent::from_u8(self.default_intent.load(Ordering::Acquire))
+    }
+
+    /// Resolve an owner and, when it is a locked owner whose daemon-owned
+    /// ready construction is still running, wait (client-side, without
+    /// blocking the lifecycle host) for its ready services; the returned
+    /// lifetime client is then a ready connection.
+    pub async fn resolve(
+        &self,
+        intent: LifecycleIntent,
+    ) -> Result<LifecycleResolution, LifecycleError> {
+        let mut resolution = self.resolve_bootstrap(intent).await?;
+        let constructing = match resolution.lifetime_client.as_ref() {
+            Some(client) => matches!(
+                client.owner_phase().await,
+                Ok(OwnerPhase::Bootstrap(
+                    proto::LockedReadyConstruction::Constructing
+                ))
+            ),
+            None => false,
+        };
+        if constructing {
+            let ready = DaemonClient::connect_endpoint(&resolution.endpoint)
+                .await
+                .map_err(|error| LifecycleError::from_error(&error))?;
+            resolution.lifetime_client = Some(ready);
+        }
+        Ok(resolution)
     }
 }
 
@@ -645,6 +772,173 @@ pub fn reset_connect_call_count() {
 #[cfg(feature = "test-support")]
 pub fn connect_call_count() -> usize {
     CONNECT_CALLS.with(std::cell::Cell::get)
+}
+
+/// What a connection needs from the daemon owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRequirement {
+    /// Ready services: wait while the owner's ready construction runs.
+    Ready,
+    /// Any serving owner, including the locked bootstrap surface.
+    Bootstrap,
+}
+
+/// Owner state observed through `DaemonStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerPhase {
+    Ready,
+    Bootstrap(proto::LockedReadyConstruction),
+}
+
+/// Upper bound a ready-services connection waits for a running ready
+/// construction. It matches the daemon's own construction deadline (after
+/// which the attempt fails into the retryable phase), plus a margin.
+pub const READY_SERVICES_WAIT: Duration = Duration::from_secs(630);
+const READY_SERVICES_POLL: Duration = Duration::from_millis(250);
+
+/// Read only the owner's hello at `socket` (never a lifetime reference) and
+/// report its ready-construction phase: `None` for ready services. Used by
+/// the supervisor to decide whether a draining worker is still constructing.
+#[cfg(any(unix, windows))]
+pub async fn probe_owner_hello_phase(
+    socket: &Path,
+) -> Result<Option<proto::LockedReadyConstruction>> {
+    let stream = connect_wire(socket).await?;
+    let mut proto = ProtoStream::new(stream);
+    let (_, phase) = negotiate_hello(&mut proto).await?;
+    Ok(phase)
+}
+
+/// Marker beneath a handshake error whose hello parsed but named a protocol
+/// this client does not speak: an incompatible owner, which no amount of
+/// waiting resolves (unlike a hello timeout or a retiring owner's close).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncompatibleDaemonProtocol;
+
+impl std::fmt::Display for IncompatibleDaemonProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon hello names an incompatible protocol")
+    }
+}
+
+impl std::error::Error for IncompatibleDaemonProtocol {}
+
+/// Whether `error` is an incompatible-protocol hello (see
+/// [`IncompatibleDaemonProtocol`]): terminal, never retried as transport.
+pub fn is_incompatible_daemon_protocol(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<IncompatibleDaemonProtocol>().is_some()
+}
+
+/// Marker beneath a handshake error whose first frame was not a parseable
+/// daemon hello: the peer is not a compatible Cockpit owner, which waiting
+/// does not resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedDaemonHello;
+
+impl std::fmt::Display for MalformedDaemonHello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon hello was malformed")
+    }
+}
+
+impl std::error::Error for MalformedDaemonHello {}
+
+/// Marker beneath a handshake error whose hello did not arrive in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonHelloTimeout;
+
+impl std::fmt::Display for DaemonHelloTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon hello timed out")
+    }
+}
+
+impl std::error::Error for DaemonHelloTimeout {}
+
+/// An in-process endpoint whose owner has retired: nothing serves it any
+/// more (the in-process sibling of a refused socket connection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonEndpointRetired;
+
+impl std::fmt::Display for DaemonEndpointRetired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("in-process daemon endpoint has retired")
+    }
+}
+
+impl std::error::Error for DaemonEndpointRetired {}
+
+/// Typed class of a failed daemon connection attempt, derived from the
+/// error's types (markers and `std::io::Error` kinds in its cause chain),
+/// never from its text. The single classifier every connect consumer uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonConnectFailure {
+    /// The hello named a protocol this client does not speak.
+    IncompatibleProtocol,
+    /// The first frame was not a parseable daemon hello.
+    MalformedHello,
+    /// The operating system refused access to the endpoint.
+    PermissionDenied,
+    /// Nothing serves the endpoint: the connection was refused, the socket
+    /// is absent, or an in-process endpoint has retired.
+    OwnerUnreachable,
+    /// The owner accepted and then closed during the handshake (a retiring
+    /// owner, or the locked-to-ready handoff).
+    ClosedDuringHandshake,
+    /// The hello did not arrive in time.
+    HelloTimeout,
+    /// Any other failure (transient I/O).
+    Other,
+}
+
+impl DaemonConnectFailure {
+    /// Waiting cannot resolve this failure: report it at once.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::IncompatibleProtocol | Self::MalformedHello | Self::PermissionDenied
+        )
+    }
+
+    /// Nothing serves the endpoint. Before any owner was observed that may
+    /// just mean "not started yet"; after a live owner was observed it means
+    /// that owner exited.
+    pub fn owner_gone(self) -> bool {
+        self == Self::OwnerUnreachable
+    }
+}
+
+/// Classify a daemon connect/handshake failure (see [`DaemonConnectFailure`]).
+pub fn daemon_connect_failure(error: &anyhow::Error) -> DaemonConnectFailure {
+    if is_incompatible_daemon_protocol(error) {
+        return DaemonConnectFailure::IncompatibleProtocol;
+    }
+    if error.downcast_ref::<MalformedDaemonHello>().is_some() {
+        return DaemonConnectFailure::MalformedHello;
+    }
+    if error.downcast_ref::<DaemonEndpointRetired>().is_some() {
+        return DaemonConnectFailure::OwnerUnreachable;
+    }
+    if is_daemon_closed_during_handshake(error) {
+        return DaemonConnectFailure::ClosedDuringHandshake;
+    }
+    if error.downcast_ref::<DaemonHelloTimeout>().is_some() {
+        return DaemonConnectFailure::HelloTimeout;
+    }
+    if let Some(lifecycle) = error.downcast_ref::<LifecycleError>() {
+        return lifecycle.connect_failure();
+    }
+    let io_kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind);
+    match io_kind {
+        Some(std::io::ErrorKind::PermissionDenied) => DaemonConnectFailure::PermissionDenied,
+        Some(std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound) => {
+            DaemonConnectFailure::OwnerUnreachable
+        }
+        _ => DaemonConnectFailure::Other,
+    }
 }
 
 /// Whether a daemon connection failed because the peer's wire protocol is
@@ -713,14 +1007,74 @@ impl DaemonClient {
     /// hello-only discovery probe and gives an ephemeral daemon its lifetime
     /// reference before the caller can be cancelled, dropped, or hand a live
     /// owner off to another client.
+    ///
+    /// The connection is to *ready services*: when the owner's hello reports
+    /// that its daemon-owned ready construction is still running, this waits
+    /// (hello-only probes, never a lifetime reference) until ready services
+    /// answer, bounded by [`READY_SERVICES_WAIT`]. A locked owner that is
+    /// awaiting the secure-store choice, or whose construction failed, is
+    /// returned as is; its requests then report why they are refused. Use
+    /// [`Self::connect_bootstrap`] to talk to the locked bootstrap surface
+    /// while construction runs.
     pub async fn connect(socket: &Path) -> Result<Self> {
+        Self::connect_with(socket, ServiceRequirement::Ready).await
+    }
+
+    /// Connect to whatever owner answers, including a locked owner whose
+    /// ready construction is still running (onboarding, first-screen
+    /// decisions, status, and stop paths).
+    pub async fn connect_bootstrap(socket: &Path) -> Result<Self> {
+        Self::connect_with(socket, ServiceRequirement::Bootstrap).await
+    }
+
+    pub async fn connect_with(socket: &Path, requirement: ServiceRequirement) -> Result<Self> {
         #[cfg(feature = "test-support")]
         CONNECT_CALLS.with(|calls| calls.set(calls.get() + 1));
         #[cfg(any(unix, windows))]
         {
-            let stream = connect_wire(socket).await?;
-            let mut proto = ProtoStream::new(stream);
-            let negotiated = negotiate_hello(&mut proto).await?;
+            let deadline = tokio::time::Instant::now() + READY_SERVICES_WAIT;
+            let mut observed_construction = false;
+            let (mut proto, negotiated) = loop {
+                let attempt = async {
+                    let stream = connect_wire(socket).await?;
+                    let mut proto = ProtoStream::new(stream);
+                    let (negotiated, phase) = negotiate_hello(&mut proto).await?;
+                    Ok::<_, anyhow::Error>((proto, negotiated, phase))
+                }
+                .await;
+                match attempt {
+                    Ok((_, _, Some(proto::LockedReadyConstruction::Constructing)))
+                        if requirement == ServiceRequirement::Ready =>
+                    {
+                        // Hello-only probe: dropped before the lifetime
+                        // confirmation, so it never counts as a client.
+                        observed_construction = true;
+                    }
+                    Ok((proto, negotiated, _)) => break (proto, negotiated),
+                    Err(error) if observed_construction => {
+                        // The ready handoff reuses the same listener, so
+                        // after construction was observed only a handshake
+                        // interrupted by the handoff (a close, a slow hello,
+                        // a transient I/O error) is worth waiting through.
+                        // An owner that is gone or can never be spoken to
+                        // ends the wait at once.
+                        let failure = daemon_connect_failure(&error);
+                        if failure.is_terminal() || failure.owner_gone() {
+                            return Err(error.context(
+                                "the Cockpit daemon stopped while preparing its services",
+                            ));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "the Cockpit daemon did not finish preparing its services within {}s",
+                        READY_SERVICES_WAIT.as_secs()
+                    ));
+                }
+                tokio::time::sleep(READY_SERVICES_POLL).await;
+            };
             let mut initial_events = confirm_client_lifetime(&mut proto).await?;
             let (exchange_events, owner_capability) =
                 exchange_peer_credential(&mut proto, socket).await?;
@@ -740,12 +1094,74 @@ impl DaemonClient {
         }
     }
 
+    /// [`Self::connect`] for any endpoint: the same ready-services contract
+    /// on the wire and in process.
     pub async fn connect_endpoint(endpoint: &ClientEndpoint) -> Result<Self> {
+        Self::connect_endpoint_with(endpoint, ServiceRequirement::Ready).await
+    }
+
+    /// [`Self::connect_bootstrap`] for any endpoint.
+    pub async fn connect_endpoint_bootstrap(endpoint: &ClientEndpoint) -> Result<Self> {
+        Self::connect_endpoint_with(endpoint, ServiceRequirement::Bootstrap).await
+    }
+
+    pub async fn connect_endpoint_with(
+        endpoint: &ClientEndpoint,
+        requirement: ServiceRequirement,
+    ) -> Result<Self> {
         match endpoint {
-            ClientEndpoint::Wire(socket) => Self::connect(socket).await,
+            ClientEndpoint::Wire(socket) => Self::connect_with(socket, requirement).await,
             ClientEndpoint::InProcess(endpoint) => {
-                Ok(Self::from_in_process(endpoint.connect().await?))
+                Self::connect_in_process_with(endpoint, requirement).await
             }
+        }
+    }
+
+    /// The in-process arm of the one connection contract: a `Ready`
+    /// connection waits, bounded by [`READY_SERVICES_WAIT`], while the owner
+    /// reports its ready construction running, exactly like the wire arm;
+    /// a retired endpoint ends the wait at once.
+    async fn connect_in_process_with(
+        endpoint: &InProcessEndpoint,
+        requirement: ServiceRequirement,
+    ) -> Result<Self> {
+        let deadline = tokio::time::Instant::now() + READY_SERVICES_WAIT;
+        loop {
+            let client = Self::from_in_process(endpoint.connect().await?);
+            if requirement == ServiceRequirement::Bootstrap {
+                return Ok(client);
+            }
+            match client.owner_phase().await {
+                Ok(OwnerPhase::Bootstrap(proto::LockedReadyConstruction::Constructing)) => {}
+                // Ready services, or a locked owner that is not constructing
+                // (its requests report why they are refused), or a phase read
+                // failure the caller's first request will surface.
+                _ => return Ok(client),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "the Cockpit daemon did not finish preparing its services within {}s",
+                    READY_SERVICES_WAIT.as_secs()
+                ));
+            }
+            tokio::time::sleep(READY_SERVICES_POLL).await;
+        }
+    }
+
+    /// Whether this connection's owner serves ready services, or is a locked
+    /// owner and in which ready-construction phase. The single funnel every
+    /// readiness decision uses.
+    pub async fn owner_phase(&self) -> Result<OwnerPhase> {
+        match self.request(Request::DaemonStatus).await? {
+            Ok(Response::DaemonStatus { .. }) => Ok(OwnerPhase::Ready),
+            Ok(Response::LockedBootstrapHello(hello)) => {
+                Ok(OwnerPhase::Bootstrap(hello.ready_construction))
+            }
+            Ok(other) => Err(anyhow!(
+                "unexpected daemon status response: {}",
+                other.wire_tag()
+            )),
+            Err(error) => Err(anyhow::Error::new(error)),
         }
     }
 
@@ -768,9 +1184,10 @@ impl DaemonClient {
         }
     }
 
-    /// Apply the one Rust-only onboarding secure intent through the dedicated
-    /// zeroizing local channel. The passphrase never enters the ordinary
-    /// request queue, serde, logs, or a clonable client command.
+    /// Ask a locked owner whose ready construction failed to start it again.
+    /// The daemon owns the construction and answers at once with the current
+    /// snapshot; readiness is observed through the locked hello's
+    /// `ready_construction` phase. Valid only against a locked owner.
     pub async fn retry_onboarding_ready_construction(
         &self,
     ) -> Result<std::result::Result<proto::OnboardingBootstrapSnapshot, ErrorPayload>> {
@@ -791,6 +1208,10 @@ impl DaemonClient {
         }
     }
 
+    /// Apply the one Rust-only onboarding secure intent through the dedicated
+    /// zeroizing local channel. The passphrase never enters the ordinary
+    /// request queue, serde, logs, or a clonable client command. `Applied`
+    /// means the choice committed; ready services follow asynchronously.
     pub async fn apply_onboarding_secure_intent(
         &self,
         endpoint: &ClientEndpoint,
@@ -1072,7 +1493,12 @@ async fn connect_named_pipe(identity: &Path) -> Result<NamedPipeClient> {
 }
 
 #[cfg(any(unix, windows))]
-async fn negotiate_hello<S>(proto_stream: &mut ProtoStream<S>) -> Result<proto::NegotiatedProtocol>
+async fn negotiate_hello<S>(
+    proto_stream: &mut ProtoStream<S>,
+) -> Result<(
+    proto::NegotiatedProtocol,
+    Option<proto::LockedReadyConstruction>,
+)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -1090,7 +1516,8 @@ where
             return Err(protocol_handshake_error("daemon hello could not be read"));
         }
         Err(_) => {
-            return Err(protocol_handshake_error("daemon hello timed out"));
+            return Err(anyhow::Error::new(DaemonHelloTimeout)
+                .context(protocol_handshake_payload("daemon hello timed out")));
         }
     };
 
@@ -1098,15 +1525,20 @@ where
         Ok(hello) => hello,
         Err(error) => {
             tracing::debug!(error = %error, "daemon hello unparseable");
-            return Err(protocol_handshake_error("daemon hello was malformed"));
+            return Err(anyhow::Error::new(MalformedDaemonHello)
+                .context(protocol_handshake_payload("daemon hello was malformed")));
         }
     }) else {
-        return Err(protocol_handshake_error(
-            "first daemon frame was not a daemon-status hello",
-        ));
+        return Err(
+            anyhow::Error::new(MalformedDaemonHello).context(protocol_handshake_payload(
+                "first daemon frame was not a daemon-status hello",
+            )),
+        );
     };
 
-    proto::NegotiatedProtocol::from_hello(&hello).map_err(anyhow::Error::new)
+    let negotiated = proto::NegotiatedProtocol::from_hello(&hello)
+        .map_err(|payload| anyhow::Error::new(IncompatibleDaemonProtocol).context(payload))?;
+    Ok((negotiated, hello.ready_construction))
 }
 
 /// Exchange a peer-bound credential after lifetime confirmation. Socket peers
@@ -1720,6 +2152,100 @@ mod tests {
     }
     #[cfg(unix)]
     use tokio::net::UnixListener;
+
+    #[cfg(unix)]
+    fn constructing_hello_line() -> String {
+        let hello = proto::Envelope::response(
+            Uuid::nil(),
+            proto::Response::LockedBootstrapHello(proto::LockedBootstrapHello {
+                protocol_version: proto::PROTOCOL_VERSION,
+                bootstrap_available: true,
+                ready_construction: proto::LockedReadyConstruction::Constructing,
+                host_capabilities: proto::HostCapabilitySnapshot::unpublished(),
+                snapshot: None,
+            }),
+        );
+        format!("{}\n", serde_json::to_string(&hello).unwrap())
+    }
+
+    /// G12: connect failures are classified from their types, never text:
+    /// an absent endpoint is "owner unreachable", a malformed hello is
+    /// terminal, and the lifecycle error carries the class across its
+    /// channel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_failures_are_classified_by_type() {
+        use tokio::io::AsyncWriteExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let absent = directory.path().join("absent.sock");
+        let error = DaemonClient::connect_bootstrap(&absent).await.unwrap_err();
+        assert_eq!(
+            daemon_connect_failure(&error),
+            DaemonConnectFailure::OwnerUnreachable
+        );
+        assert!(!daemon_connect_failure(&error).is_terminal());
+        let lifecycle = LifecycleError::from_error(&error);
+        assert_eq!(
+            lifecycle.connect_failure(),
+            DaemonConnectFailure::OwnerUnreachable
+        );
+        assert!(
+            lifecycle.message().contains("absent.sock"),
+            "{}",
+            lifecycle.message()
+        );
+
+        let garbage = directory.path().join("garbage.sock");
+        let listener = UnixListener::bind(&garbage).unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(b"not a daemon hello\n").await;
+            }
+        });
+        let error = DaemonClient::connect_bootstrap(&garbage).await.unwrap_err();
+        assert_eq!(
+            daemon_connect_failure(&error),
+            DaemonConnectFailure::MalformedHello
+        );
+        assert!(daemon_connect_failure(&error).is_terminal());
+        assert!(LifecycleError::from_error(&error).is_terminal());
+        server.abort();
+    }
+
+    /// F4/G12: a Ready connection that observed a constructing owner ends
+    /// its wait at once when that owner exits, instead of polling for the
+    /// whole ready-services window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ready_wait_fails_promptly_when_the_constructing_owner_exits() {
+        use tokio::io::AsyncWriteExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let line = constructing_hello_line();
+        let exit_path = socket.clone();
+        let server = tokio::spawn(async move {
+            // Two constructing hellos, then the owner dies: the socket node
+            // and the listener go away.
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.write_all(line.as_bytes()).await.unwrap();
+            }
+            drop(listener);
+            std::fs::remove_file(&exit_path).unwrap();
+        });
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(20), DaemonClient::connect(&socket))
+            .await
+            .expect("the wait ends promptly")
+            .expect_err("the owner exited");
+        assert!(
+            format!("{error:#}").contains("stopped while preparing its services"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+        server.await.unwrap();
+    }
 
     #[test]
     fn restart_storm_guard_has_one_rolling_window_policy() {

@@ -114,7 +114,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             let mut stop_acknowledged = false;
             if let Ok(Ok(client)) = tokio::time::timeout(
                 remaining_command_budget(deadline),
-                DaemonClient::connect(&paths.socket),
+                DaemonClient::connect_bootstrap(&paths.socket),
             )
             .await
             {
@@ -238,7 +238,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 let mut stop_acknowledged = false;
                 if let Ok(Ok(client)) = tokio::time::timeout(
                     remaining_command_budget(deadline),
-                    DaemonClient::connect(&paths.socket),
+                    DaemonClient::connect_bootstrap(&paths.socket),
                 )
                 .await
                 {
@@ -368,7 +368,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     last_handover,
                 };
                 let socket = paths.socket.display().to_string();
-                let worker_status = DaemonClient::connect(&paths.socket)
+                let worker_status = DaemonClient::connect_bootstrap(&paths.socket)
                     .await?
                     .request_ok(Request::DaemonStatus)
                     .await?;
@@ -417,6 +417,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                                 &socket,
                                 hello.protocol_version,
                                 hello.bootstrap_available,
+                                hello.ready_construction,
                             );
                             insert_supervisor_json_fields(&mut value, &supervisor);
                             println!("{}", serde_json::to_string_pretty(&value)?);
@@ -426,6 +427,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                                 render_awaiting_onboarding_status(
                                     &socket,
                                     hello.protocol_version,
+                                    hello.ready_construction,
                                     Some(&supervisor),
                                 )
                             );
@@ -466,12 +468,16 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                             )
                         );
                     }
-                    RunningStatusVersionRead::BootstrapLocked { protocol_version } => {
+                    RunningStatusVersionRead::BootstrapLocked {
+                        protocol_version,
+                        ready_construction,
+                    } => {
                         println!(
                             "{}",
                             render_awaiting_onboarding_status(
                                 &probe.paths.socket.display().to_string(),
                                 protocol_version,
+                                ready_construction,
                                 None,
                             )
                         );
@@ -480,6 +486,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                         let hello = proto::DaemonHello {
                             daemon_version: "unknown".to_string(),
                             protocol_version: 0,
+                            ready_construction: None,
                         };
                         println!(
                             "{}",
@@ -643,7 +650,7 @@ async fn print_json_status(probe: &crate::daemon::DaemonProbe) -> Result<()> {
             hello,
         );
     } else if probe.status == DaemonStatus::Running {
-        let response = match DaemonClient::connect(&probe.paths.socket)
+        let response = match DaemonClient::connect_bootstrap(&probe.paths.socket)
             .await?
             .request(Request::DaemonStatus)
             .await?
@@ -679,6 +686,7 @@ async fn print_json_status(probe: &crate::daemon::DaemonProbe) -> Result<()> {
                 &probe.paths.socket.display().to_string(),
                 hello.protocol_version,
                 hello.bootstrap_available,
+                hello.ready_construction,
             ),
             other => bail!("unexpected daemon status response: {}", other.wire_tag()),
         };
@@ -697,7 +705,10 @@ struct DaemonVersions {
 
 enum RunningStatusVersionRead {
     Versions(DaemonVersions),
-    BootstrapLocked { protocol_version: u32 },
+    BootstrapLocked {
+        protocol_version: u32,
+        ready_construction: proto::LockedReadyConstruction,
+    },
     ProtocolMismatch,
     ReadFailed(String),
 }
@@ -716,7 +727,7 @@ struct RunningJsonStatus {
 }
 
 async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
-    let client = match DaemonClient::connect(socket).await {
+    let client = match DaemonClient::connect_bootstrap(socket).await {
         Ok(client) => client,
         Err(error) if is_protocol_version_mismatch(&error) => {
             return RunningStatusVersionRead::ProtocolMismatch;
@@ -747,6 +758,7 @@ async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
         }),
         Response::LockedBootstrapHello(hello) => RunningStatusVersionRead::BootstrapLocked {
             protocol_version: hello.protocol_version,
+            ready_construction: hello.ready_construction,
         },
         other => RunningStatusVersionRead::ReadFailed(format!(
             "unexpected daemon status response: {}",
@@ -913,15 +925,36 @@ fn render_supervised_running_status(
     output
 }
 
-/// Text status for a daemon whose worker is waiting for first-run
-/// onboarding. The locked hello is redacted metadata; only its protocol
-/// version is shown (never the capability snapshot).
+/// Human status line for a locked owner, by its ready-construction phase.
+/// The locked hello is redacted metadata: only its phase and protocol
+/// version are shown (never the capability snapshot).
+fn locked_status_headline(ready_construction: proto::LockedReadyConstruction) -> &'static str {
+    match ready_construction {
+        proto::LockedReadyConstruction::AwaitingSecureStore => {
+            "daemon: running, awaiting onboarding"
+        }
+        proto::LockedReadyConstruction::Constructing => "daemon: running, starting ready services",
+        proto::LockedReadyConstruction::Failed => {
+            "daemon: running, ready services failed to start (see daemon.log)"
+        }
+    }
+}
+
+fn locked_status_state(ready_construction: proto::LockedReadyConstruction) -> &'static str {
+    match ready_construction {
+        proto::LockedReadyConstruction::AwaitingSecureStore => DAEMON_STATE_AWAITING_ONBOARDING,
+        proto::LockedReadyConstruction::Constructing => "starting",
+        proto::LockedReadyConstruction::Failed => "ready_construction_failed",
+    }
+}
+
 fn render_awaiting_onboarding_status(
     socket: &str,
     protocol_version: u32,
+    ready_construction: proto::LockedReadyConstruction,
     supervisor: Option<&SupervisorStatus>,
 ) -> String {
-    let mut output = "daemon: running, awaiting onboarding".to_string();
+    let mut output = locked_status_headline(ready_construction).to_string();
     if let Some(supervisor) = supervisor {
         render_supervisor_lines(&mut output, supervisor);
     }
@@ -939,10 +972,11 @@ fn awaiting_onboarding_json_status(
     socket_path: &str,
     protocol_version: u32,
     bootstrap_available: bool,
+    ready_construction: proto::LockedReadyConstruction,
 ) -> serde_json::Value {
     serde_json::json!({
         "status": "running",
-        "state": DAEMON_STATE_AWAITING_ONBOARDING,
+        "state": locked_status_state(ready_construction),
         "bootstrap_available": bootstrap_available,
         "pid": serde_json::Value::Null,
         "uptime_secs": serde_json::Value::Null,
@@ -1191,6 +1225,7 @@ mod tests {
         let hello = proto::DaemonHello {
             daemon_version: "0.0.old".to_string(),
             protocol_version: 0,
+            ready_construction: None,
         };
         let output = render_incompatible_protocol_status("/tmp/cockpit.sock", &hello);
 
@@ -1210,6 +1245,7 @@ mod tests {
         let hello = proto::DaemonHello {
             daemon_version: "0.0.old".to_string(),
             protocol_version: 0,
+            ready_construction: None,
         };
         let value =
             incompatible_protocol_json_status("/tmp/cockpit.sock", "/tmp/cockpit.db", &hello);
@@ -1382,6 +1418,7 @@ mod tests {
         let output = render_awaiting_onboarding_status(
             "/tmp/cockpit.sock",
             proto::PROTOCOL_VERSION,
+            proto::LockedReadyConstruction::AwaitingSecureStore,
             Some(&supervisor_status()),
         );
 
@@ -1398,12 +1435,40 @@ mod tests {
 
     #[test]
     fn awaiting_onboarding_status_text_without_supervisor_omits_pids() {
-        let output = render_awaiting_onboarding_status("/tmp/cockpit.sock", 1, None);
+        let output = render_awaiting_onboarding_status(
+            "/tmp/cockpit.sock",
+            1,
+            proto::LockedReadyConstruction::AwaitingSecureStore,
+            None,
+        );
 
         assert_eq!(
             output,
             "daemon: running, awaiting onboarding\n  protocol: v1\n  socket: /tmp/cockpit.sock"
         );
+    }
+
+    /// A vault-present owner comes up locked while it builds ready services;
+    /// status names that phase instead of claiming it awaits onboarding.
+    #[test]
+    fn locked_status_names_the_ready_construction_phase() {
+        let starting = render_awaiting_onboarding_status(
+            "/tmp/cockpit.sock",
+            1,
+            proto::LockedReadyConstruction::Constructing,
+            None,
+        );
+        assert!(
+            starting.starts_with("daemon: running, starting ready services"),
+            "{starting}"
+        );
+        let failed = awaiting_onboarding_json_status(
+            "/tmp/cockpit.sock",
+            1,
+            true,
+            proto::LockedReadyConstruction::Failed,
+        );
+        assert_eq!(failed["state"], "ready_construction_failed");
     }
 
     #[test]
@@ -1428,8 +1493,12 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        let mut value =
-            awaiting_onboarding_json_status("/tmp/cockpit.sock", proto::PROTOCOL_VERSION, true);
+        let mut value = awaiting_onboarding_json_status(
+            "/tmp/cockpit.sock",
+            proto::PROTOCOL_VERSION,
+            true,
+            proto::LockedReadyConstruction::AwaitingSecureStore,
+        );
         insert_supervisor_json_fields(&mut value, &supervisor_status());
         let object = value.as_object().expect("json object");
 
@@ -1484,7 +1553,12 @@ mod tests {
 
     #[test]
     fn awaiting_onboarding_status_json_without_supervisor_has_null_pid() {
-        let value = awaiting_onboarding_json_status("/tmp/cockpit.sock", 1, false);
+        let value = awaiting_onboarding_json_status(
+            "/tmp/cockpit.sock",
+            1,
+            false,
+            proto::LockedReadyConstruction::AwaitingSecureStore,
+        );
 
         assert_eq!(value["state"], "awaiting_onboarding");
         assert_eq!(value["bootstrap_available"], false);

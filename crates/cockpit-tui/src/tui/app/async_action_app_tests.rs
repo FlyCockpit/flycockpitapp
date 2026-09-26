@@ -81,7 +81,7 @@ still-booting"
         .expect("join hanging-child timeout");
         request
             .reply
-            .send(Err(error))
+            .send(Err(error.into()))
             .expect("deliver spawn timeout through lifecycle reply");
     });
 

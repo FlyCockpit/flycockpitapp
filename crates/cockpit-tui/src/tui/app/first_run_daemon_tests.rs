@@ -477,7 +477,7 @@ fn land_welcome(app: &mut App) {
 /// admission, followed by an ordinary stage advance in the same job) → the real
 /// sensitive secure-store intent that materializes the vault and hands the
 /// daemon off to ready services → the Provider stage's catalog.
-fn advance_real_first_run_to_provider(app: &mut App) {
+fn advance_real_first_run_to_secure_store_choice(app: &mut App) {
     pump_onboarding(
         app,
         |app| shell_kind(app) == Some(crate::tui::onboarding::OnboardingScreenKind::Welcome),
@@ -585,6 +585,10 @@ fn advance_real_first_run_to_provider(app: &mut App) {
         capability_available(app, "secret_store.file"),
         "the daemon must expose the file vault placement"
     );
+}
+
+fn advance_real_first_run_to_provider(app: &mut App) {
+    advance_real_first_run_to_secure_store_choice(app);
     submit_secure_placement(
         app,
         cockpit_proto::OnboardingSecurePlacement::MachineBoundFile,
@@ -1069,5 +1073,118 @@ fn concurrent_client_defer_is_followed_by_the_read_only_refresh() {
                 && app.onboarding_shell.is_none()
         },
         "the deferred authority through the broadcast-driven refresh",
+    );
+}
+
+/// One secure-store submission at a time: a repeated choice while the first
+/// is in flight is dropped with visible feedback instead of aborting the
+/// in-flight submission and re-sending with a stale revision (the user's
+/// repeated clicks that each replaced the previous connection). The single
+/// submission then carries the handoff through to the provider stage.
+#[test]
+fn repeated_secure_store_choice_while_in_flight_is_not_resent() {
+    let tmp = cockpit_test_support::latency_isolated_tempdir();
+    let fixture = real_daemon_onboarding(tmp.path());
+    let _enter = fixture.runtime.enter();
+    crate::tui::settings::with_settings_daemon_effect(
+        Arc::new(InProcessSettingsDaemonEffect),
+        || {
+            let cockpit = tmp.path().join(".cockpit");
+            std::fs::create_dir_all(&cockpit).unwrap();
+            ConfigDoc::load(&cockpit.join("config.json"))
+                .unwrap()
+                .write(&ProvidersConfig::default())
+                .unwrap();
+            let mut app = real_first_run_app(tmp.path());
+            advance_real_first_run_to_secure_store_choice(&mut app);
+            submit_secure_placement(
+                &mut app,
+                cockpit_proto::OnboardingSecurePlacement::MachineBoundFile,
+            );
+            assert!(
+                app.onboarding_secure_intent_progress.is_some(),
+                "an in-flight submission publishes its handoff progress"
+            );
+            let pending = app.pending_startup_onboarding_operations.len();
+            // Nothing is drained between the two keys, so the first
+            // submission is still in flight when the second arrives.
+            shell_key(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.pending_startup_onboarding_operations.len(),
+                pending,
+                "a repeated choice must not start (or replace) a second submission"
+            );
+            assert_eq!(
+                app.toast.as_ref().map(|toast| toast.text.as_str()),
+                Some("Still securing your secrets…")
+            );
+            pump_onboarding(
+                &mut app,
+                |app| {
+                    stage(app) == Some(OnboardingStage::Provider)
+                        && shell_kind(app)
+                            == Some(crate::tui::onboarding::OnboardingScreenKind::ProviderSearch)
+                },
+                "the single in-flight submission to reach the provider stage",
+            );
+            assert!(app.onboarding_secure_intent_progress.is_none());
+        },
+    );
+}
+
+/// A ready daemon is never asked to retry ready construction. The user's
+/// stuck install fed a stale `failed` checkpoint into the TUI, which called
+/// `retry_onboarding_ready_construction` against the ready daemon, was
+/// refused ("only valid while bootstrap is locked"), and looped. The
+/// phase-aware resolution asks the daemon what it is first and, for a ready
+/// daemon, answers with the authoritative snapshot.
+#[test]
+fn failed_checkpoint_resolution_never_retries_against_a_ready_daemon() {
+    let tmp = cockpit_test_support::latency_isolated_tempdir();
+    let fixture = real_daemon_onboarding(tmp.path());
+    let _enter = fixture.runtime.enter();
+    crate::tui::settings::with_settings_daemon_effect(
+        Arc::new(InProcessSettingsDaemonEffect),
+        || {
+            let cockpit = tmp.path().join(".cockpit");
+            std::fs::create_dir_all(&cockpit).unwrap();
+            ConfigDoc::load(&cockpit.join("config.json"))
+                .unwrap()
+                .write(&ProvidersConfig::default())
+                .unwrap();
+            let mut app = real_first_run_app(tmp.path());
+            advance_real_first_run_to_provider(&mut app);
+            let lifecycle = crate::tui::settings::test_lifecycle_client();
+            let (snapshot, client) = tokio::runtime::Handle::current().block_on(async {
+                let endpoint = lifecycle
+                    .resolve_default()
+                    .await
+                    .expect("resolve the ready daemon")
+                    .endpoint;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
+                    .await
+                    .expect("connect the ready daemon");
+                assert_eq!(
+                    super::startup_layout::onboarding_daemon_phase(&client).await,
+                    Ok(cockpit_client::OwnerPhase::Ready),
+                );
+                super::startup_layout::resolve_ready_onboarding_owner(
+                    &lifecycle,
+                    None,
+                    client,
+                    tokio::time::Instant::now()
+                        + super::startup_layout::ONBOARDING_HANDOFF_DEADLINE,
+                )
+                .await
+                .expect("a ready daemon resolves to its snapshot, never a refused retry")
+            });
+            let snapshot = snapshot.expect("onboarding run exists");
+            assert_eq!(snapshot.stage, OnboardingStage::Provider);
+            assert_eq!(
+                snapshot.bootstrap_state,
+                cockpit_proto::OnboardingBootstrapState::Ready
+            );
+            drop(client);
+        },
     );
 }

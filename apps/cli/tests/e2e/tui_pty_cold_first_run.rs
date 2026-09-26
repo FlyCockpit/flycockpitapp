@@ -584,3 +584,209 @@ fn tui_pty_cold_first_run_keyboard_completes_and_second_launch_is_ready() {
 fn tui_pty_cold_first_run_mouse_completes_and_second_launch_is_ready() {
     complete_cold_first_run(WalkthroughInput::Mouse);
 }
+
+/// Onboarding-screen markers that must never appear on an onboarded home.
+const ONBOARDING_MARKERS: [&str; 4] = [
+    "[press any button to continue]",
+    "What should Cockpit call you?",
+    "Secure your secrets",
+    "step 1/8",
+];
+
+/// Flicker-free startup: the TUI asks the daemon whether onboarding is needed
+/// before it enters the alternate screen, so the very first frame on a fresh
+/// home — and every frame after it — is the onboarding shell, never a chat UI
+/// that onboarding replaces a moment later.
+#[test]
+fn tui_pty_first_frame_is_onboarding_on_a_fresh_home() {
+    let mut session = HermeticCockpit::prepare_fresh(HermeticProfile::Default);
+    session.set_extra_env("COCKPIT_REDUCE_MOTION", "1");
+    session
+        .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
+        .expect("spawn cold first-run PTY child");
+    session
+        .wait_until_screen(
+            "cold first-run Welcome shell",
+            COLD_WELCOME_TIMEOUT,
+            |screen| screen.contains("[press any button to continue]"),
+        )
+        .expect("cold first-run reaches the Welcome shell");
+    let frames = session.synchronized_frame_snapshots();
+    assert!(!frames.is_empty(), "the TUI drew no synchronized frame");
+    assert!(
+        frames[0].contains("[press any button to continue]"),
+        "the first frame on a fresh home must already be the onboarding Welcome:\n{}",
+        frames[0].contents()
+    );
+    for (index, frame) in frames.iter().enumerate() {
+        assert!(
+            !frame.contains(COMPOSER_PLACEHOLDER) && !frame.contains("Starting cockpit"),
+            "frame {index} before the Welcome settled showed chat or the pre-screen notice:\n{}",
+            frame.contents()
+        );
+    }
+    eprintln!(
+        "first-frame-timing fresh-home launch_to_first_frame_ms={}",
+        session
+            .launch_to_first_frame()
+            .expect("first frame timestamp")
+            .as_millis()
+    );
+
+    session.reap();
+    session.stop_child_spawned_daemon();
+    session.assert_reaped();
+}
+
+fn assert_every_frame_is_chat_until_ready(session: &mut HermeticCockpit, label: &str) {
+    session
+        .wait_until_screen(label, COLD_WELCOME_TIMEOUT, |screen| {
+            screen.contains(COMPOSER_PLACEHOLDER)
+        })
+        .expect("an onboarded home opens the chat UI");
+    let frames = session.synchronized_frame_snapshots();
+    assert!(!frames.is_empty(), "the TUI drew no synchronized frame");
+    assert!(
+        frames[0].contains(COMPOSER_PLACEHOLDER),
+        "the first frame on an onboarded home must be the chat UI:\n{}",
+        frames[0].contents()
+    );
+    for (index, frame) in frames.iter().enumerate() {
+        for marker in ONBOARDING_MARKERS {
+            assert!(
+                !frame.contains(marker),
+                "frame {index} on an onboarded home drew onboarding (`{marker}`):\n{}",
+                frame.contents()
+            );
+        }
+    }
+}
+
+/// Flicker-free startup, onboarded home with a running daemon: every frame is
+/// the chat UI and no onboarding surface is ever drawn.
+#[test]
+fn tui_pty_first_frame_is_chat_on_an_onboarded_home() {
+    let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
+    session.start_trusted_daemon();
+    session
+        .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
+        .expect("spawn onboarded PTY child");
+    assert_every_frame_is_chat_until_ready(&mut session, "ready chat (warm daemon)");
+    eprintln!(
+        "first-frame-timing warm-onboarded launch_to_first_frame_ms={}",
+        session
+            .launch_to_first_frame()
+            .expect("first frame timestamp")
+            .as_millis()
+    );
+    session.reap();
+    session.assert_reaped();
+}
+
+/// Cold onboarded start: no daemon is running, so the TUI spawns it. The
+/// first frame is still the chat UI (decided from the daemon's early
+/// bootstrap answer), never onboarding, and it does not wait for the full
+/// ready-service boot.
+#[test]
+fn tui_pty_first_frame_is_chat_on_a_cold_onboarded_home() {
+    let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
+    // Record the workspace-trust decision, then stop that daemon: the PTY
+    // launch below starts from a cold (daemon-less) onboarded home.
+    session.start_trusted_daemon();
+    session.stop_child_spawned_daemon();
+    session.forget_fixture_daemon_ownership();
+    session
+        .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
+        .expect("spawn cold onboarded PTY child");
+    assert_every_frame_is_chat_until_ready(&mut session, "ready chat (cold daemon)");
+    eprintln!(
+        "first-frame-timing cold-onboarded launch_to_first_frame_ms={}",
+        session
+            .launch_to_first_frame()
+            .expect("first frame timestamp")
+            .as_millis()
+    );
+    // The first frame was painted from the locked bootstrap answer; observe
+    // the handoff to ready services behind it: the daemon reports ready, the
+    // in-chat "starting services" status clears, and no frame across the
+    // whole window drew onboarding or a startup failure.
+    let deadline = Instant::now() + COLD_WELCOME_TIMEOUT;
+    loop {
+        let status = session.daemon_status_json();
+        if status["state"] == "ready" {
+            break;
+        }
+        assert_ne!(
+            status["state"], "ready_construction_failed",
+            "ready construction failed behind the first frame: {status}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never became ready: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    session
+        .wait_until_screen("services ready", ASYNC_STAGE_TIMEOUT, |screen| {
+            screen.contains(COMPOSER_PLACEHOLDER) && !screen.contains("Starting Cockpit services")
+        })
+        .expect("the starting-services status clears once ready services publish");
+    for (index, frame) in session.synchronized_frame_snapshots().iter().enumerate() {
+        for marker in ONBOARDING_MARKERS
+            .iter()
+            .chain(["could not start", "Daemon lifecycle unavailable"].iter())
+        {
+            assert!(
+                !frame.contains(marker),
+                "frame {index} across the ready handoff drew `{marker}`:\n{}",
+                frame.contents()
+            );
+        }
+    }
+    session.reap();
+    session.stop_child_spawned_daemon();
+    session.assert_reaped();
+}
+
+/// D7/F9: a startup that fails before the first frame reports its error on
+/// the normal terminal and leaves the terminal in cooked mode (echo and line
+/// input restored), exactly as it found it. The failure is forced by an
+/// endpoint that answers with a malformed hello (a terminal connect failure).
+#[cfg(unix)]
+#[test]
+fn tui_pty_pre_paint_failure_restores_the_terminal() {
+    let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
+    let socket = session.socket_path();
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent).expect("socket directory");
+    }
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind impostor");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let _ = stream.write_all(b"this is not a cockpit hello\n");
+        }
+    });
+    session
+        .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
+        .expect("spawn PTY child");
+    session
+        .wait_until_screen("startup failure", COLD_WELCOME_TIMEOUT, |screen| {
+            screen.contains("could not start")
+        })
+        .expect("the failure is reported on the normal terminal");
+    let succeeded = session.wait_for_child_exit_status();
+    assert_eq!(succeeded, Some(false), "a failed startup exits nonzero");
+    assert!(
+        session.synchronized_frame_snapshots().is_empty(),
+        "no frame is drawn for a startup that failed before deciding a screen"
+    );
+    assert_eq!(
+        session.pty_is_cooked(),
+        Some(true),
+        "the pre-paint raw mode is restored on failure"
+    );
+    session.reap();
+    let _ = std::fs::remove_file(&socket);
+}

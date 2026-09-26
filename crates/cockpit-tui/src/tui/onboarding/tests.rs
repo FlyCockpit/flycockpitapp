@@ -2412,16 +2412,6 @@ fn lifetime_native_screen_renders_inside_full_screen_chrome_at_narrow_and_wide_s
 }
 
 #[test]
-fn failed_bootstrap_state_is_surfaced() {
-    let mut snap = snapshot(OnboardingStage::SecureStore);
-    snap.bootstrap_state = cockpit_proto::OnboardingBootstrapState::Failed;
-    let mut shell = OnboardingShell::new(&snap, false);
-    let engine = Dialog::None;
-    let rendered = render_string(&mut shell, 80, 24, &engine);
-    assert!(rendered.contains("Onboarding bootstrap failed"));
-}
-
-#[test]
 fn materializing_bootstrap_state_is_surfaced() {
     let mut snap = snapshot(OnboardingStage::SecureStore);
     snap.bootstrap_state = cockpit_proto::OnboardingBootstrapState::Materializing;

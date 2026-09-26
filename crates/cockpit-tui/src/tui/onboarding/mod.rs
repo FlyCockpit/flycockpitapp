@@ -1205,6 +1205,22 @@ impl OnboardingShell {
         matches!(&self.screen, OnboardingScreen::SecureStore(screen) if screen.probing())
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_secure_store_progress(&self) -> Option<String> {
+        match &self.screen {
+            OnboardingScreen::SecureStore(screen) => screen.progress.clone(),
+            _ => None,
+        }
+    }
+
+    /// Show (or clear) the in-flight submission's progress line on the
+    /// mounted secure-store screen. No-op on any other screen.
+    pub(crate) fn set_secure_store_progress(&mut self, progress: Option<String>) {
+        if let OnboardingScreen::SecureStore(screen) = &mut self.screen {
+            screen.progress = progress;
+        }
+    }
+
     pub(crate) fn apply_host_capabilities(
         &mut self,
         capabilities: &cockpit_proto::HostCapabilitySnapshot,
@@ -2332,9 +2348,6 @@ impl OnboardingShell {
         match self.bootstrap_state {
             OnboardingBootstrapState::Materializing => {
                 parts.push("Preparing the secure store…".to_string());
-            }
-            OnboardingBootstrapState::Failed => {
-                parts.push("Onboarding bootstrap failed; retrying ready construction…".to_string());
             }
             _ => {}
         }

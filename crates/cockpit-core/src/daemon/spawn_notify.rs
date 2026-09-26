@@ -134,7 +134,9 @@ pub(crate) fn report_err(error: &anyhow::Error) {
         report_line(&format!("AddrInUse{{{path}}}"));
         return;
     }
-    let reason = sanitize_report_payload(&format!("{error:#}"));
+    // The launcher attaches the current run's daemon.log tail itself; a tail
+    // already embedded in `error` would only repeat those lines.
+    let reason = sanitize_report_payload(&error_without_log_tail(error));
     report_line(&format!("Err{{{reason}}}"));
 }
 
@@ -356,6 +358,29 @@ pub(crate) fn last_log_lines(log_path: &Path, n: usize) -> String {
         .join("\n")
 }
 
+/// A spawn/readiness failure that carries the current run's `daemon.log`
+/// tail for the person reading the error. The tail is presentation only: a
+/// daemon process that writes this error back into `daemon.log` must log
+/// [`error_without_log_tail`] instead, or each later failure's tail would
+/// re-embed the previous tail (nested, ever-growing copies in one run).
+#[derive(Debug)]
+pub(crate) struct DaemonLogTailError {
+    reason: String,
+    tail: String,
+}
+
+impl std::fmt::Display for DaemonLogTailError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}\n--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{}",
+            self.reason, self.tail
+        )
+    }
+}
+
+impl std::error::Error for DaemonLogTailError {}
+
 pub(crate) fn error_with_log_tail(
     reason: impl std::fmt::Display,
     log_path: &Path,
@@ -364,8 +389,41 @@ pub(crate) fn error_with_log_tail(
     if tail.trim().is_empty() {
         anyhow::anyhow!("{reason}")
     } else {
-        anyhow::anyhow!("{reason}\n--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{tail}")
+        anyhow::Error::new(DaemonLogTailError {
+            reason: reason.to_string(),
+            tail,
+        })
     }
+}
+
+/// The error chain as `{error:#}` would print it, with every embedded
+/// `daemon.log` tail reduced to its reason. For logging into `daemon.log`
+/// itself, where the tail lines are already present.
+pub(crate) fn error_without_log_tail(error: &anyhow::Error) -> String {
+    // A tail attached as a context layer (`attach_log_tail`) appears in the
+    // chain as anyhow's private context wrapper, which does not downcast to
+    // `DaemonLogTailError`; anyhow's own `downcast_ref` does see it. Match
+    // that layer by its rendering, and drop the repeated reason the wrapped
+    // error then contributes.
+    let context_tail = error.downcast_ref::<DaemonLogTailError>();
+    let context_rendering = context_tail.map(ToString::to_string);
+    let mut parts: Vec<String> = Vec::new();
+    for cause in error.chain() {
+        let text = match cause.downcast_ref::<DaemonLogTailError>() {
+            Some(tailed) => tailed.reason.clone(),
+            None => {
+                let text = cause.to_string();
+                match (context_tail, context_rendering.as_deref()) {
+                    (Some(tailed), Some(rendering)) if text == rendering => tailed.reason.clone(),
+                    _ => text,
+                }
+            }
+        };
+        if parts.last() != Some(&text) {
+            parts.push(text);
+        }
+    }
+    parts.join(": ")
 }
 
 pub(crate) fn report_to_error(report: SpawnReport, log_path: &Path) -> anyhow::Error {
@@ -389,9 +447,7 @@ fn attach_log_tail(error: anyhow::Error, log_path: &Path) -> anyhow::Error {
     if tail.trim().is_empty() {
         error
     } else {
-        error.context(format!(
-            "{reason}\n--- daemon.log (last {LOG_TAIL_LINES} lines) ---\n{tail}"
-        ))
+        error.context(DaemonLogTailError { reason, tail })
     }
 }
 
@@ -731,6 +787,30 @@ fn windows_wait(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_tail_is_stripped_whether_the_error_or_its_context_carries_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("daemon.log");
+        std::fs::write(&log, "LOG-TAIL-SENTINEL line\n").unwrap();
+        let direct = super::error_with_log_tail("boot failed", &log);
+        assert!(format!("{direct:#}").contains("LOG-TAIL-SENTINEL"));
+        assert_eq!(super::error_without_log_tail(&direct), "boot failed");
+        let as_context = super::report_to_error(
+            super::SpawnReport::AddrInUse {
+                path: directory.path().join("cockpit.sock"),
+            },
+            &log,
+        );
+        assert!(format!("{as_context:#}").contains("LOG-TAIL-SENTINEL"));
+        let stripped = super::error_without_log_tail(&as_context);
+        assert!(!stripped.contains("LOG-TAIL-SENTINEL"), "{stripped}");
+        assert!(stripped.contains("cockpit.sock"), "{stripped}");
+        let wrapped = as_context.context("spawning the worker");
+        let stripped = super::error_without_log_tail(&wrapped);
+        assert!(!stripped.contains("LOG-TAIL-SENTINEL"), "{stripped}");
+        assert!(stripped.starts_with("spawning the worker: "), "{stripped}");
+    }
+
     use super::*;
     use std::process::Command;
 

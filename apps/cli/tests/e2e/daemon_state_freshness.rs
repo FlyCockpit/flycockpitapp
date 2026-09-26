@@ -371,10 +371,9 @@ async fn ephemeral_supervisor_suppresses_reaping_during_worker_roll() {
     assert_success("rolled ephemeral supervisor natural reap", &output, &home);
 }
 
-#[tokio::test]
-async fn daemon_refuses_newer_migration_ledger() {
-    // Doctor is read-only and never materializes SQLite. Boot (then stop) a
-    // real daemon so the ledger exists before we seed a future migration row.
+/// Boot (then stop) a real daemon so the ledger exists, then seed a future
+/// migration row. Doctor is read-only and never materializes SQLite.
+async fn daemon_with_newer_migration_ledger() -> SpawnedDaemon {
     let daemon = SpawnedDaemon::start().await;
     let stop = daemon.stop_via_command(0);
     assert_success(
@@ -402,14 +401,12 @@ async fn daemon_refuses_newer_migration_ledger() {
     )
     .expect("seed newer migration ledger");
     drop(conn);
+    daemon
+}
 
-    let output = daemon
-        .command()
-        .args(["daemon", "start", "--foreground"])
-        .output()
-        .expect("start daemon against newer migration ledger");
-    assert_failure("newer-ledger daemon start", &output, daemon.home());
-    let text = output_text(&output);
+fn assert_newer_ledger_refused(label: &str, daemon: &SpawnedDaemon, output: &std::process::Output) {
+    assert_failure(label, output, daemon.home());
+    let text = output_text(output);
     assert!(
         text.contains("incompatible prerelease database schema v2")
             && text.contains("Restore a compatible migration backup or move the database aside"),
@@ -425,4 +422,28 @@ async fn daemon_refuses_newer_migration_ledger() {
     );
     let endpoint = daemon.home().rendezvous_files().rendezvous;
     assert!(!endpoint.exists(), "newer-ledger daemon endpoint survived");
+}
+
+#[tokio::test]
+async fn daemon_refuses_newer_migration_ledger() {
+    let daemon = daemon_with_newer_migration_ledger().await;
+    let output = daemon
+        .command()
+        .args(["daemon", "start", "--foreground"])
+        .output()
+        .expect("start daemon against newer migration ledger");
+    assert_newer_ledger_refused("newer-ledger daemon start", &daemon, &output);
+}
+
+/// The detached launcher reports the supervised worker's own boot failure
+/// (carried worker -> supervisor -> launcher), not only that it exited.
+#[tokio::test]
+async fn detached_daemon_start_reports_newer_migration_ledger() {
+    let daemon = daemon_with_newer_migration_ledger().await;
+    let output = daemon
+        .command()
+        .args(["daemon", "start"])
+        .output()
+        .expect("start detached daemon against newer migration ledger");
+    assert_newer_ledger_refused("newer-ledger detached daemon start", &daemon, &output);
 }

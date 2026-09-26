@@ -406,7 +406,12 @@ where
                 let _ = request.reply.send(Ok(resolution));
             }
             Err(error) => {
-                let _ = request.reply.send(Err(error.to_string()));
+                // Classify while the typed error still exists and keep the
+                // whole cause chain: callers decide terminal-versus-retry
+                // from the class, never from the text.
+                let _ = request
+                    .reply
+                    .send(Err(cockpit_client::LifecycleError::from_error(&error)));
             }
         }
     }
@@ -671,16 +676,19 @@ async fn wait_for_restarting_owner(
     discovered: crate::daemon::DaemonProbe,
     mode: LifecycleMode,
     lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
+    requirement: cockpit_client::ServiceRequirement,
 ) -> Result<Option<ConnectedDaemon>> {
     let observed_pid = cockpit_host::daemon_lifecycle::read_pid_file(&discovered.paths.pid_file);
-    let client = match wait_for_shared_daemon(&discovered.paths.socket, observed_pid).await {
+    let client = match wait_for_shared_daemon(&discovered.paths.socket, observed_pid, requirement)
+        .await
+    {
         Ok(client) => client,
         Err(error) => match after_restart_wait(error) {
             RestartWaitPlan::WaitForReplacement => {
                 tracing::info!(
                     "canonical daemon pid released; waiting for the restart replacement"
                 );
-                match wait_for_shared_daemon(&discovered.paths.socket, None).await {
+                match wait_for_shared_daemon(&discovered.paths.socket, None, requirement).await {
                     Ok(client) => client,
                     Err(_) => {
                         tracing::info!("restart replacement never bound; spawning a replacement");
@@ -755,7 +763,7 @@ async fn promote_live_ephemeral_owner(
 ) -> Result<ConnectedDaemon> {
     let expected = ephemeral_owner_identity(paths)
         .ok_or_else(|| anyhow!("ephemeral daemon owner identity is unavailable for promotion"))?;
-    let client = connect_local_daemon(&paths.socket)
+    let client = connect_local_daemon(&paths.socket, cockpit_client::ServiceRequirement::Ready)
         .await
         .context("connecting to ephemeral daemon for live promotion")?;
     if ephemeral_owner_identity(paths) != Some(expected) {
@@ -778,7 +786,12 @@ async fn promote_live_ephemeral_owner(
     // The connection above already negotiated an exact `PROTOCOL_VERSION`
     // match, which is the wire compatibility gate; a binary-version skew is
     // surfaced by ordinary attach paths, not by restarting a promoted owner.
-    let mut connected = connect_shared_running(discovered.paths, None).await?;
+    let mut connected = connect_shared_running(
+        discovered.paths,
+        None,
+        cockpit_client::ServiceRequirement::Ready,
+    )
+    .await?;
     connected.promoted_from_ephemeral = true;
     Ok(connected)
 }
@@ -840,7 +853,12 @@ async fn promote_ephemeral_owner_with_recovery_policy(
         })?;
         let old_pid = Some(expected_predecessor.1.pid);
         let release = crate::daemon::capture_restart_release(&current_paths, old_pid);
-        let client = match connect_local_daemon(&current_paths.socket).await {
+        let client = match connect_local_daemon(
+            &current_paths.socket,
+            cockpit_client::ServiceRequirement::Ready,
+        )
+        .await
+        {
             Ok(client) => client,
             Err(error) if replacement_required => {
                 // The accepted predecessor can lose its socket between
@@ -867,8 +885,12 @@ async fn promote_ephemeral_owner_with_recovery_policy(
             let discovered = crate::daemon::discover().await;
             match discover_attach_plan(discovered.status, discovered.hello.is_some()) {
                 DiscoverAttachPlan::AttachRunning if !discovered.paths.ephemeral => {
-                    let mut connected =
-                        attach_running_with_skew_check(discovered.paths, None).await?;
+                    let mut connected = attach_running_with_skew_check(
+                        discovered.paths,
+                        None,
+                        cockpit_client::ServiceRequirement::Ready,
+                    )
+                    .await?;
                     connected.promoted_from_ephemeral = true;
                     return Ok(connected);
                 }
@@ -938,8 +960,12 @@ async fn promote_ephemeral_owner_with_recovery_policy(
             let discovered = crate::daemon::discover().await;
             match discover_attach_plan(discovered.status, discovered.hello.is_some()) {
                 DiscoverAttachPlan::AttachRunning if !discovered.paths.ephemeral => {
-                    let mut connected =
-                        attach_running_with_skew_check(discovered.paths, None).await?;
+                    let mut connected = attach_running_with_skew_check(
+                        discovered.paths,
+                        None,
+                        cockpit_client::ServiceRequirement::Ready,
+                    )
+                    .await?;
                     connected.promoted_from_ephemeral = true;
                     return Ok(connected);
                 }
@@ -1115,9 +1141,10 @@ async fn spawn_verified_persistent_replacement(
             permit.owner_created();
         }
         tracing::info!(pid, "in-process persistent Assistant replacement promoted");
-        let client = connect_local_daemon(&canonical.socket)
-            .await
-            .context("in-process persistent Assistant replacement did not publish a daemon")?;
+        let client =
+            connect_local_daemon(&canonical.socket, cockpit_client::ServiceRequirement::Ready)
+                .await
+                .context("in-process persistent Assistant replacement did not publish a daemon")?;
         return Ok(ConnectedDaemon {
             endpoint: local_daemon_endpoint(&canonical.socket),
             client,
@@ -1212,7 +1239,9 @@ async fn try_attach_verified_persistent_replacement(
     paths: crate::daemon::DaemonPaths,
 ) -> Option<ConnectedDaemon> {
     let identity = persistent_owner_identity(&paths)?;
-    let client = connect_local_daemon(&paths.socket).await.ok()?;
+    let client = connect_local_daemon(&paths.socket, cockpit_client::ServiceRequirement::Ready)
+        .await
+        .ok()?;
     if client.request_ok(Request::DaemonStatus).await.is_err() {
         return None;
     }
@@ -1281,6 +1310,16 @@ async fn probe_or_spawn_with_spawn_authorization(
     lifecycle_request: Option<&cockpit_client::LifecycleRequest>,
 ) -> Result<ConnectedDaemon> {
     use crate::daemon::{DaemonPaths, discover, spawn_detached_ephemeral};
+    // The lifecycle host resolves presentation requests on the bootstrap
+    // surface: a TUI decides its first screen while ready services are still
+    // being constructed and waits for them itself (client-side, never
+    // blocking this serialized host). Direct in-process callers need ready
+    // services.
+    let requirement = if lifecycle_request.is_some() {
+        cockpit_client::ServiceRequirement::Bootstrap
+    } else {
+        cockpit_client::ServiceRequirement::Ready
+    };
 
     // One recovery budget for every departing-owner wait in this resolution.
     let mut departing_owner_budget = DepartingOwnerBudget::default();
@@ -1298,7 +1337,8 @@ async fn probe_or_spawn_with_spawn_authorization(
                     }
                     let owner = DiscoveredOwner::capture(&discovered.paths);
                     let attached =
-                        attach_running_with_skew_check(discovered.paths.clone(), None).await;
+                        attach_running_with_skew_check(discovered.paths.clone(), None, requirement)
+                            .await;
                     match attached {
                         Ok(connected) => return Ok(connected),
                         // The owner answered discovery and then closed the
@@ -1321,7 +1361,8 @@ async fn probe_or_spawn_with_spawn_authorization(
                 }
                 DiscoverAttachPlan::WaitForRestart => {
                     if let Some(connected) =
-                        wait_for_restarting_owner(discovered, mode, lifecycle_request).await?
+                        wait_for_restarting_owner(discovered, mode, lifecycle_request, requirement)
+                            .await?
                     {
                         return Ok(connected);
                     }
@@ -1390,7 +1431,7 @@ async fn probe_or_spawn_with_spawn_authorization(
             break;
         }
         let owner = DiscoveredOwner::capture(&after_lock.paths);
-        match attach_running_with_skew_check(after_lock.paths.clone(), None).await {
+        match attach_running_with_skew_check(after_lock.paths.clone(), None, requirement).await {
             Ok(connected) => return Ok(connected),
             // Holding the start lock, a departing owner is awaited within the
             // shared recovery budget: once it has released its endpoint a
@@ -1422,7 +1463,7 @@ async fn probe_or_spawn_with_spawn_authorization(
         }
         DiscoverAttachPlan::WaitForRestart => {
             if let Some(connected) =
-                wait_for_restarting_owner(after_lock, mode, lifecycle_request).await?
+                wait_for_restarting_owner(after_lock, mode, lifecycle_request, requirement).await?
             {
                 return Ok(connected);
             }
@@ -1482,7 +1523,7 @@ async fn probe_or_spawn_with_spawn_authorization(
                 ephemeral = false,
                 "in-process persistent daemon promoted"
             );
-            let client = connect_local_daemon(&canonical.socket)
+            let client = connect_local_daemon(&canonical.socket, requirement)
                 .await
                 .with_context(|| {
                     format!(
@@ -1511,7 +1552,7 @@ async fn probe_or_spawn_with_spawn_authorization(
     // Wait for the socket + a successful handshake. In-process auto-promote
     // returns above after a registered-owner hello; this wait is only for
     // a spawned child (or an in-process attach that already published).
-    let client = wait_for_owned_daemon(&paths.socket, pid).await?;
+    let client = wait_for_owned_daemon(&paths.socket, pid, requirement).await?;
     if let Some(guard) = provisional_ephemeral_guard.as_ref() {
         guard.bind_published_receipt()?;
         guard.disarm();
@@ -1531,8 +1572,9 @@ async fn probe_or_spawn_with_spawn_authorization(
 async fn connect_shared_running(
     paths: crate::daemon::DaemonPaths,
     startup_notice: Option<String>,
+    requirement: cockpit_client::ServiceRequirement,
 ) -> Result<ConnectedDaemon> {
-    let client = connect_local_daemon(&paths.socket).await?;
+    let client = connect_local_daemon(&paths.socket, requirement).await?;
     Ok(ConnectedDaemon {
         endpoint: local_daemon_endpoint(&paths.socket),
         client,
@@ -1793,11 +1835,12 @@ async fn await_departing_owner(
 async fn attach_running_with_skew_check(
     paths: crate::daemon::DaemonPaths,
     fallback_notice: Option<String>,
+    requirement: cockpit_client::ServiceRequirement,
 ) -> Result<ConnectedDaemon> {
     match crate::daemon::skew_restart::restart_skewed_daemon_if_idle(&paths).await {
         Ok(crate::daemon::skew_restart::SkewRestartOutcome::Restarted { pid, reason }) => {
             tracing::info!(pid, "daemon version skew auto-restart completed");
-            let client = wait_for_owned_daemon(&paths.socket, pid).await?;
+            let client = wait_for_owned_daemon(&paths.socket, pid, requirement).await?;
             return Ok(ConnectedDaemon {
                 endpoint: local_daemon_endpoint(&paths.socket),
                 client,
@@ -1822,6 +1865,7 @@ async fn attach_running_with_skew_check(
             return connect_shared_running(
                 paths,
                 format_skew_restart_notice(skew_reason.as_deref(), reason.as_deref()),
+                requirement,
             )
             .await;
         }
@@ -1830,6 +1874,7 @@ async fn attach_running_with_skew_check(
             return connect_shared_running(
                 paths,
                 reason.map(|reason| format!("daemon version skew: {reason}")),
+                requirement,
             )
             .await;
         }
@@ -1841,7 +1886,7 @@ async fn attach_running_with_skew_check(
             tracing::debug!(error = %error, "daemon version skew auto-restart check failed");
         }
     }
-    connect_shared_running(paths, fallback_notice).await
+    connect_shared_running(paths, fallback_notice, requirement).await
 }
 
 fn format_skew_restart_notice(
@@ -1859,14 +1904,17 @@ fn format_skew_restart_notice(
 
 /// Connect by socket-path key: a registered in-process owner first, otherwise
 /// the Unix socket. In-process auto-promote never publishes an OS socket.
-async fn connect_local_daemon(socket: &Path) -> Result<DaemonClient> {
+async fn connect_local_daemon(
+    socket: &Path,
+    requirement: cockpit_client::ServiceRequirement,
+) -> Result<DaemonClient> {
     if let Some(endpoint) = crate::daemon::server::registered_in_process_endpoint(socket) {
         return DaemonClient::connect_endpoint(&cockpit_client::ClientEndpoint::InProcess(
             endpoint,
         ))
         .await;
     }
-    DaemonClient::connect(socket).await
+    DaemonClient::connect_with(socket, requirement).await
 }
 
 fn local_daemon_endpoint(socket: &Path) -> cockpit_client::ClientEndpoint {
@@ -1889,7 +1937,11 @@ enum SharedWaitError {
 /// wait carries no wall-clock budget; a dead child can never become ready and
 /// fails immediately. The detached child cannot be reaped here, so liveness is
 /// the only available completion signal for the failure case.
-async fn wait_for_owned_daemon(socket: &Path, pid: u32) -> Result<DaemonClient> {
+async fn wait_for_owned_daemon(
+    socket: &Path,
+    pid: u32,
+    requirement: cockpit_client::ServiceRequirement,
+) -> Result<DaemonClient> {
     let mut timer = crate::startup::PhaseTimer::start("wait_for_daemon");
     // A freshly-spawned daemon child binds and starts accepting quickly when
     // the machine is idle; ramp from 2ms to a 50ms ceiling so a slow spawn
@@ -1899,7 +1951,7 @@ async fn wait_for_owned_daemon(socket: &Path, pid: u32) -> Result<DaemonClient> 
         if crate::daemon::server::in_process_context(socket).is_some() || socket.exists() {
             // A connect error just means the socket exists but accept hasn't
             // started yet — fall through to the backoff retry.
-            if let Ok(client) = connect_local_daemon(socket).await {
+            if let Ok(client) = connect_local_daemon(socket, requirement).await {
                 // Sanity check — first request after connect.
                 if client.request_ok(Request::DaemonStatus).await.is_ok() {
                     timer.phase("spawn_to_ready");
@@ -1923,6 +1975,7 @@ async fn wait_for_owned_daemon(socket: &Path, pid: u32) -> Result<DaemonClient> 
 async fn wait_for_shared_daemon(
     socket: &Path,
     pid: Option<u32>,
+    requirement: cockpit_client::ServiceRequirement,
 ) -> std::result::Result<DaemonClient, SharedWaitError> {
     let mut timer = crate::startup::PhaseTimer::start("wait_for_daemon");
     let deadline = std::time::Instant::now() + SPAWN_DAEMON_TIMEOUT;
@@ -1942,7 +1995,7 @@ async fn wait_for_shared_daemon(
             // A connect error just means the socket exists but accept hasn't
             // started yet — fall through to the backoff retry. A registered
             // in-process owner hellos here without an OS socket.
-            if let Ok(client) = connect_local_daemon(socket).await {
+            if let Ok(client) = connect_local_daemon(socket, requirement).await {
                 // Sanity check — first request after connect.
                 if client.request_ok(Request::DaemonStatus).await.is_ok() {
                     timer.phase("spawn_to_ready");

@@ -47,7 +47,7 @@ pub use consumer::{
 pub use error::{KekFailureCause, SecureKeyError};
 pub use kek_store::{
     FileKekStore, KekStore, KeyringKekStore, MemoryKekStore, Passphrase, PassphraseKdfParams,
-    PassphraseKekStore, file_kek_supported, kek_file_path,
+    PassphraseKekStore, file_kek_supported, kek_file_path, onboarding_passphrase_binding,
 };
 pub use key_material::{KEY_BYTE_LEN, SecureKeyBytes, generate_key_bytes, key_digest};
 pub use migrate::{

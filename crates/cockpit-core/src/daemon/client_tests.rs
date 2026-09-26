@@ -803,7 +803,7 @@ async fn connect_uses_registered_in_process_context_without_socket() {
     let ctx = crate::daemon::boot_in_process_with_db(paths.clone(), db)
         .await
         .expect("boot local daemon context");
-    let client = connect_local_daemon(&paths.socket)
+    let client = connect_local_daemon(&paths.socket, cockpit_client::ServiceRequirement::Ready)
         .await
         .expect("connect by local socket key");
     let response = client
@@ -1037,7 +1037,9 @@ async fn accepted_promotion_terminal_failure_releases_the_lifecycle_host() {
     .expect("accepted promotion recovery must reach a terminal result")
     .expect_err("expired accepted-handoff deadline must reject the promotion");
     assert!(
-        terminal.contains("persistent Assistant daemon replacement"),
+        terminal
+            .message()
+            .contains("persistent Assistant daemon replacement"),
         "terminal policy must remain observable through lifecycle resolution"
     );
 
@@ -1072,7 +1074,7 @@ async fn boot_test_persistent_daemon_hellos_without_os_socket() {
         .expect("boot isolated test daemon");
 
     let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
-    let client = connect_local_daemon(&paths.socket)
+    let client = connect_local_daemon(&paths.socket, cockpit_client::ServiceRequirement::Ready)
         .await
         .expect("registered owner must hello");
     assert!(

@@ -13,6 +13,7 @@
       }
     },
     "protocol_version": 23,
+    "ready_construction": "awaiting_secure_store",
     "response": "locked_bootstrap_hello",
     "snapshot": {
       "attempt_id": "22222222-2222-4222-8222-222222222222",

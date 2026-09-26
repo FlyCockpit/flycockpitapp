@@ -36,6 +36,19 @@ fn run() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(30));
         return Ok(());
     }
+    // A draining worker that is still constructing ready services: it keeps
+    // running through SIGTERM (as the real worker defers its stop until
+    // construction settles) and then exits cleanly.
+    #[cfg(unix)]
+    if let Some(millis) = std::env::var("COCKPIT_WORKER_DRAIN_TEST_IGNORE_TERM_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        // SAFETY: installs the ignore disposition before any thread exists.
+        unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        std::thread::sleep(std::time::Duration::from_millis(millis));
+        return Ok(());
+    }
     if std::env::var_os("COCKPIT_WORKER_WATCH_TEST_EXIT_SUCCESS").is_some() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         return Ok(());

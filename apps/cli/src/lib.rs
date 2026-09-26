@@ -814,6 +814,10 @@ pub fn main_entry() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            // A supervised worker that fails before readiness reports the
+            // failure to its supervisor (no-op in any other process, or once
+            // reported), so `daemon start` shows why the worker failed.
+            cockpit_core::daemon::supervisor::report_worker_boot_failure(&err);
             // A supervisor or worker writes this line into daemon.log;
             // `stderr_line` stamps it with time, role, and pid there and
             // leaves every other command's error line unchanged.
@@ -974,6 +978,12 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
         format!("error: {}", usage.message())
     } else if let Some(required) = err.downcast_ref::<commands::InteractiveOnboardingRequired>() {
         format!("error: {}", required.message())
+    } else if cockpit_core::daemon::daemon_log::process_role().is_some() {
+        // A supervisor or worker's stderr is daemon.log itself.
+        format!(
+            "Error: {}",
+            cockpit_core::daemon::daemon_log::error_text_for_daemon_log(err)
+        )
     } else {
         format!("Error: {err:?}")
     }

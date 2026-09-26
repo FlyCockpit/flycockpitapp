@@ -15125,7 +15125,12 @@ fn oauth_stored_token_debug_and_drop_are_secret_safe() {
 }
 
 #[test]
-fn authority_recovery_precedes_both_socket_binds() {
+fn authority_recovery_precedes_ready_publication() {
+    // Every boot publishes the locked bootstrap surface after DB/config
+    // initialization; durable authority recovery belongs to the daemon-owned
+    // ready construction and must complete before a ready context exists
+    // (ordinary dispatch stays unreachable until then — the behavioural
+    // side is `locked_owner_answers_hellos_with_constructing_phase_during_construction`).
     let daemon = include_str!("../mod.rs");
     let boot_attr_end = daemon
         .find("async fn run_foreground_inner_with_boot_db")
@@ -15135,33 +15140,22 @@ fn authority_recovery_precedes_both_socket_binds() {
         boot_attr.contains("#[cfg(any(unix, windows))]"),
         "foreground boot must compile on Windows; found {boot_attr:?}"
     );
-    let boot = daemon[boot_attr_end..]
-        .split("#[cfg(not(any(unix, windows)))]")
-        .next()
-        .expect("foreground boot body");
-    let recovery = boot
-        .find("server::recover_before_socket_publish(&ctx).await?")
-        .expect("foreground boot must await authority recovery");
-    let nearest_cfg = boot[..recovery]
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| line.starts_with("#[cfg("));
+    let server_source = include_str!("mod.rs");
+    let construction = server_source
+        .split("async fn construct_ready_under_permit")
+        .nth(1)
+        .and_then(|tail| tail.split("\n    fn subscribe_ready_handoff").next())
+        .expect("ready construction body");
+    let recovery = construction
+        .find("recover_before_socket_publish(&ctx)")
+        .expect("ready construction must await authority recovery");
+    let constructed = construction
+        .find("ConstructedReady::new(")
+        .expect("ready construction yields a constructed context");
     assert!(
-        nearest_cfg.is_none_or(|cfg| cfg.contains("windows") || !cfg.contains("unix")),
-        "recovery call must not be unix-only inside windows-compiled boot; found {nearest_cfg:?}"
+        recovery < constructed,
+        "authority recovery must complete before a ready context can be published"
     );
-    let pair_publish = boot[recovery..]
-        .find("publish_socket_pair_with(&paths")
-        .expect("Unix socket-pair publication must follow recovery");
-    let windows_pair_publish = boot[recovery..]
-        .find("prepare_and_publish_socket_pair(&paths)")
-        .expect("Windows socket-pair publication must follow recovery");
-    assert!(
-        pair_publish < windows_pair_publish || windows_pair_publish < pair_publish,
-        "both platform publication paths must be present after recovery"
-    );
-
     let unix_pair = daemon
         .split("fn publish_socket_pair_with")
         .nth(1)
@@ -15188,7 +15182,7 @@ fn authority_recovery_precedes_both_socket_binds() {
         "Windows must bind hidden control and reveal identities before publishing control"
     );
 
-    let server = include_str!("mod.rs");
+    let server = server_source;
     let recover_prefix = server
         .split("async fn run_boot_housekeeping")
         .nth(1)
@@ -42792,6 +42786,7 @@ async fn boot_with_db_resolves_referenced_command_secret() {
         &mut timer,
         crate::daemon::terminal::test_host_factory(),
         config_source,
+        None,
     )
     .await
     .expect("boot_with_db must succeed with startup command resolution wired in");
@@ -43353,7 +43348,9 @@ async fn locked_services_never_admit_ordinary_payload_before_coverage() {
     let denied = handle_locked_in_process_request(&locked, Request::GetStorageReport)
         .await
         .expect_err("locked bootstrap must deny ordinary payloads");
-    assert_eq!(denied.code, ErrorCode::BootstrapLocked);
+    // The vault committed, so ready services are pending: a self-resolving
+    // refusal, never an ordinary payload.
+    assert_eq!(denied.code, ErrorCode::RetryLater);
 
     let constructed = locked
         .finish_ready_transition()
@@ -43364,7 +43361,6 @@ async fn locked_services_never_admit_ordinary_payload_before_coverage() {
             .ready
             .as_ref()
             .expect("constructed ready services")
-            .context
             .redaction_generation
             .load(std::sync::atomic::Ordering::Acquire)
             > 0,

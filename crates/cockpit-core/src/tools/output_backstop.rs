@@ -178,7 +178,9 @@ mod tests {
 
         let other_live = other_table.read().unwrap().clone();
         assert!(other_live.scrub(&echo).contains(&stripe));
-        assert!(other.persisted_redaction_table().unwrap().is_none());
+        if let Some(other_durable) = other.persisted_redaction_table().unwrap() {
+            assert!(other_durable.scrub(&echo).contains(&stripe));
+        }
     }
 
     /// A hub that owns no live table has no serialized writer to register

@@ -199,6 +199,14 @@ async fn bash_cat_of_unregistered_dotenv_secret_is_scrubbed_and_registered() {
     let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
     let sha = ["0d1a4b2c8e3f60718293", "a4b5c6d7e8f9a0b1c2d3"].concat();
     let uuid = "123e4567-e89b-42d3-a456-426614174000";
+    // `cut` prints the bare value with no key: only registration catches it.
+    let command = "cat other/.env && cut -d= -f2 other/.env";
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let live = install_live_redaction_hub(&mut ctx);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+    // Written AFTER the tool's table was built (its dotenv scan covers cwd),
+    // so the value is genuinely novel to the session table.
     std::fs::write(
         tmp.path().join("other").join(".env"),
         format!(
@@ -206,12 +214,12 @@ async fn bash_cat_of_unregistered_dotenv_secret_is_scrubbed_and_registered() {
         ),
     )
     .unwrap();
-    // `cut` prints the bare value with no key: only registration catches it.
-    let command = "cat other/.env && cut -d= -f2 other/.env";
-    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
-    let live = install_live_redaction_hub(&mut ctx);
-    ctx.session
-        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+    assert!(
+        ctx.redact
+            .scrub(&format!("x {stripe} x"))
+            .contains(stripe.as_str()),
+        "precondition: the session table has never seen the value"
+    );
 
     let output = BashTool::new()
         .call(serde_json::json!({ "command": command }), &ctx)

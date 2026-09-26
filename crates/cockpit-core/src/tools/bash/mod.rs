@@ -3268,7 +3268,7 @@ struct AdoptedOutputBackstop {
 impl AdoptedOutputBackstop {
     /// Scrub one captured stream. Fail-closed: when registration fails the
     /// stream is withheld rather than delivered with an unregistered secret.
-    async fn scrub(&self, redact: &crate::redact::RedactionTable, text: String) -> String {
+    async fn apply(&self, redact: &crate::redact::RedactionTable, text: String) -> String {
         match crate::tools::output_backstop::scrub_command_output(
             &self.interrupts,
             &self.session,
@@ -3344,8 +3344,8 @@ async fn spawn_adopted_shell_completion(
                         let stderr = boundary_safe_join(&redact, stderr_task.join().await);
                         // Narrow novel-secret backstop (secrets I2): this
                         // result lands as model-facing steering text.
-                        let stdout = backstop.scrub(&redact, stdout).await;
-                        let stderr = backstop.scrub(&redact, stderr).await;
+                        let stdout = backstop.apply(&redact, stdout).await;
+                        let stderr = backstop.apply(&redact, stderr).await;
                         let exit = status.code().unwrap_or(-1);
                         let signaled = !status.success() && status.code().is_none();
                         format_combined(&stdout, &stderr, exit, signaled)

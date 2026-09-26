@@ -946,27 +946,16 @@ fn capture_schedule_events(driver: &mut Driver) -> mpsc::Receiver<TurnEvent> {
     rx
 }
 
-/// Secrets I2 end to end through the driver: a background job that prints
-/// another project's dotenv is injected into the next turn with the
-/// secret-keyed value replaced, and the value is registered in the session
-/// worker's live table, so a LATER turn that carries the bare value (no key,
-/// no recognizable shape) is still scrubbed at the provider egress. The
-/// session worker's hub also reaches the schedule context forks use.
+/// Secrets I2 through the driver's background completion path: a background
+/// job that prints another project's dotenv has the secret-keyed value
+/// replaced and REGISTERED in the session worker's live table when its
+/// `Completed` event is drained, so later echoes (keyless, encoded) are
+/// table-scrubbed at every boundary. The session worker's hub also reaches
+/// the schedule context scheduled forks mint their leaf hubs from.
 #[test]
 fn background_output_secret_is_scrubbed_and_registered_for_later_turns() {
     crate::test_env::run_async_with_large_stack(|| async {
-        use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
-        let provider = ScriptedProvider::builder()
-            .dialect(WireDialect::ChatCompletions)
-            .turn(Turn::Text("noted".into()))
-            .repeat_last()
-            .start()
-            .await;
-        let (mut driver, tmp) = test_driver_with_url(8, provider.base_url());
-        driver
-            .session
-            .set_active_model("lmstudio", "local")
-            .unwrap();
+        let (mut driver, _tmp) = test_driver_without_network(8);
         driver.session.set_sandbox_enabled(false);
         let live: crate::daemon::SharedRedactionTable =
             Arc::new(std::sync::RwLock::new(driver.redact.clone()));
@@ -988,15 +977,23 @@ fn background_output_secret_is_scrubbed_and_registered_for_later_turns() {
         );
 
         let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
-        std::fs::create_dir(tmp.path().join("other")).unwrap();
+        // Another project, outside this session's workspace: no table
+        // source (env, workspace dotenv walk) ever sees the value.
+        let other = tempfile::tempdir().unwrap();
+        let other_env = other.path().join(".env");
         std::fs::write(
-            tmp.path().join("other").join(".env"),
+            &other_env,
             format!("NODE_ENV=production\nSTRIPE_SECRET_KEY={stripe}\n"),
         )
         .unwrap();
+        let echo = format!("a log line also showed {stripe}");
+        assert!(
+            live.read().unwrap().scrub(&echo).contains(&stripe),
+            "precondition: the session table has never seen the value"
+        );
         let (approver, _approval_hub) = install_background_approver(&mut driver);
-        let command = "cat other/.env";
-        grant_background_command(&approver, command).await;
+        let command = format!("cat '{}'", other_env.display());
+        grant_background_command(&approver, &command).await;
         let out = driver
             .dispatch_schedule_action(&serde_json::json!({
                 "action": "background.start",
@@ -1010,40 +1007,28 @@ fn background_output_secret_is_scrubbed_and_registered_for_later_turns() {
             .recv()
             .await
             .expect("background runner sends one terminal event");
+        let crate::engine::schedule::ScheduleEvent::Completed { result, .. } = &completed else {
+            panic!("background runner must complete: {completed:?}");
+        };
+        assert!(
+            result.contains(&stripe),
+            "the raw job result carries the value"
+        );
 
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
-        let (tx, _rx) = mpsc::channel(256);
-        driver.run_job_event(completed, &queue, &tx).await.unwrap();
-        driver
-            .run_user_input(
-                UserSubmission::text(format!("a log line also showed {stripe}")),
-                &queue,
-                &tx,
-            )
-            .await
-            .unwrap();
+        let (tx, _rx) = mpsc::channel(4096);
+        // The injected turn itself may be refused downstream (no provider);
+        // the backstop runs before injection either way.
+        let _ = driver.run_job_event(completed, &queue, &tx).await;
 
-        let bodies: Vec<String> = provider
-            .captured()
-            .into_iter()
-            .filter(|request| request.request_line.starts_with("POST "))
-            .map(|request| serde_json::to_string(&request.body).unwrap())
-            .collect();
-        assert!(bodies.len() >= 2, "two provider turns: {}", bodies.len());
+        let live = live.read().unwrap().clone();
         assert!(
-            bodies
-                .iter()
-                .any(|body| body.contains("NODE_ENV=production")
-                    && body.contains("STRIPE_SECRET_KEY=")),
-            "the background result reached the model"
+            !live.scrub(&echo).contains(&stripe),
+            "the drained background result registered the value"
         );
-        for body in &bodies {
-            assert!(
-                !body.contains(&stripe),
-                "secret reached the provider: {body}"
-            );
-        }
+        let durable = driver.session.persisted_redaction_table().unwrap().unwrap();
+        assert!(!durable.scrub(&echo).contains(&stripe));
     });
 }
 

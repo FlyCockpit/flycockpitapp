@@ -8,11 +8,19 @@ pub(crate) struct ProtectedPaths {
 }
 
 impl ProtectedPaths {
-    pub(crate) fn from_session(cwd: &Path, env: &HashMap<String, String>) -> Self {
+    /// Protected literals for one build scope. Only a workspace scope
+    /// contributes its root (and enclosing git worktree); daemon-global
+    /// coverage has no workspace and must not consult the process cwd.
+    pub(crate) fn from_scope(
+        scope: super::RedactionSourceScope<'_>,
+        env: &HashMap<String, String>,
+    ) -> Self {
         let mut paths = Vec::new();
-        collect_path_and_ancestors(cwd, &mut paths);
-        if let Some(root) = crate::git::find_worktree_root(cwd) {
-            collect_path_and_ancestors(&root, &mut paths);
+        if let super::RedactionSourceScope::Workspace(cwd) = scope {
+            collect_path_and_ancestors(cwd, &mut paths);
+            if let Some(root) = crate::git::find_worktree_root(cwd) {
+                collect_path_and_ancestors(&root, &mut paths);
+            }
         }
         for key in ["HOME", "TMPDIR"] {
             if let Some(value) = env.get(key) {

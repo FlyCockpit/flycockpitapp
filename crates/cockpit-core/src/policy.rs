@@ -86,11 +86,14 @@ pub fn export(cwd: &Path) -> Result<String> {
     let mut providers = crate::secret_ref::load_effective(cwd);
     providers.active_model = None;
     sanitize_providers(&mut providers);
-    let extended_path = crate::config::dirs::most_specific_existing_config_write_target(cwd)
-        .unwrap_or_else(|| cwd.join(".cockpit").join(crate::config::dirs::CONFIG_FILE));
-    let extended = ExtendedConfigDoc::load(&extended_path)
+    // Export the layer an import would write (the same trust-gated
+    // selection), else the effective merged view. A layer the policy does not
+    // allow (an ignored project's `.cockpit`) is never read.
+    let extended = crate::config::dirs::workspace_config_write_target(cwd)
+        .ok()
+        .and_then(|path| ExtendedConfigDoc::load_existing(&path).ok().flatten())
         .map(|doc| PortableExtendedPolicy::from_config(&doc.config()))
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|| {
             PortableExtendedPolicy::from_config(&crate::config::extended::load_for_cwd(cwd))
         });
     serde_json::to_string_pretty(&PolicyBundle {
@@ -268,19 +271,10 @@ fn sanitize_imported_provider_urls(providers: &mut ProvidersConfig) {
 }
 
 fn policy_write_target(cwd: &Path) -> Result<PathBuf> {
-    // Workspace-bound: import into a discovered layer, else the cwd-scoped
-    // creatable dirs (project `.cockpit/` then machine-local). Never the
-    // user-level global fallback — a fresh-install import must not become
-    // every project's default policy.
-    if let Some(path) = crate::config::dirs::most_specific_existing_config_write_target(cwd) {
-        return Ok(path);
-    }
-    let dir = crate::config::dirs::cwd_scoped_creatable_dirs(cwd)
-        .into_iter()
-        .next()
-        .map(|d| d.path)
-        .context("no writable config layer is available")?;
-    Ok(dir.join(crate::config::dirs::CONFIG_FILE))
+    // Workspace-bound: never the user-level global fallback — a
+    // fresh-install import must not become every project's default policy —
+    // and never a lower layer when trust refuses the one load reads.
+    Ok(crate::config::dirs::workspace_config_write_target(cwd)?)
 }
 
 fn sanitize_providers(cfg: &mut ProvidersConfig) {
@@ -390,12 +384,25 @@ fn is_false(value: &bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Enter a `Trust` decision for `root` on this thread (production runs
+    /// import/export under the workspace's durable decision).
+    fn trusted_workspace(root: &Path) -> crate::config::trust::ThreadWorkspaceTrustGuard {
+        crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(root).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+        )
+    }
+
     use super::*;
 
     #[test]
     fn fresh_install_policy_write_target_is_cwd_scoped_not_global() {
         let tmp = tempfile::tempdir().unwrap();
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        // Policy bundles are workspace-bound: they run under a trust decision.
+        let _trust = trusted_workspace(tmp.path());
         let cwd = tmp.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
         let global = crate::config::dirs::global_config_file().unwrap();
@@ -424,6 +431,8 @@ mod tests {
     fn export_strips_secret_embedded_in_provider_url() {
         let tmp = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        // Policy bundles are workspace-bound: they run under a trust decision.
+        let _trust = trusted_workspace(tmp.path());
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "{}\n").unwrap();
         env.set_cockpit_config(&config_path);
@@ -473,6 +482,8 @@ mod tests {
     fn export_drops_header_with_reference_plus_inline_literal_suffix() {
         let tmp = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        // Policy bundles are workspace-bound: they run under a trust decision.
+        let _trust = trusted_workspace(tmp.path());
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "{}\n").unwrap();
         env.set_cockpit_config(&config_path);
@@ -540,6 +551,8 @@ mod tests {
     fn import_rejects_literal_credential_header_and_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        // Policy bundles are workspace-bound: they run under a trust decision.
+        let _trust = trusted_workspace(tmp.path());
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "{}\n").unwrap();
         env.set_cockpit_config(&config_path);
@@ -588,6 +601,8 @@ mod tests {
     fn import_rejects_provider_reference_owned_by_foreign_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        // Policy bundles are workspace-bound: they run under a trust decision.
+        let _trust = trusted_workspace(tmp.path());
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "{}\n").unwrap();
         env.set_cockpit_config(&config_path);
@@ -678,6 +693,8 @@ mod tests {
     fn import_claims_unclaimed_provider_reference() {
         let tmp = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        // Policy bundles are workspace-bound: they run under a trust decision.
+        let _trust = trusted_workspace(tmp.path());
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "{}\n").unwrap();
         env.set_cockpit_config(&config_path);
@@ -733,6 +750,8 @@ mod tests {
     fn import_strips_secret_embedded_in_provider_url_before_persisting() {
         let tmp = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        // Policy bundles are workspace-bound: they run under a trust decision.
+        let _trust = trusted_workspace(tmp.path());
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "{}\n").unwrap();
         env.set_cockpit_config(&config_path);
@@ -820,6 +839,8 @@ mod tests {
     fn import_omits_opaque_provider_and_model_metadata_before_persisting() {
         let tmp = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        // Policy bundles are workspace-bound: they run under a trust decision.
+        let _trust = trusted_workspace(tmp.path());
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "{}\n").unwrap();
         env.set_cockpit_config(&config_path);
@@ -925,6 +946,8 @@ mod tests {
     fn export_omits_opaque_provider_and_model_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        // Policy bundles are workspace-bound: they run under a trust decision.
+        let _trust = trusted_workspace(tmp.path());
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "{}\n").unwrap();
         env.set_cockpit_config(&config_path);

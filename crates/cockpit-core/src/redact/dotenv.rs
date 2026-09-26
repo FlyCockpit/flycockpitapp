@@ -24,6 +24,76 @@ pub(crate) fn dotenv_max_depth(in_git_repo: bool) -> Option<usize> {
     if in_git_repo { None } else { Some(8) }
 }
 
+/// A configured redaction source path that cannot be placed without the
+/// process working directory: a relative path with no workspace root (the
+/// daemon-global scope), a relative workspace root, or a non-absolute path
+/// carrying a root or Windows drive prefix. Coverage fails closed on it.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "`{setting}` entry `{}` is not an absolute path and has no workspace root to resolve against",
+    path.display()
+)]
+pub(crate) struct UnanchoredRedactionSourcePath {
+    pub(crate) setting: &'static str,
+    pub(crate) path: PathBuf,
+}
+
+/// The env-file sources of one build scope: the single discovery funnel for
+/// table builds and coverage bindings.
+///
+/// A [`RedactionSourceScope::Workspace`] (whose root must be absolute) walks
+/// `patterns` below its root and adds the configured `extra` paths.
+/// [`RedactionSourceScope::DaemonGlobal`] walks nothing and honors absolute
+/// configured paths only. Layered config already anchors relative entries at
+/// their declaring project layer, so a relative entry reaching the
+/// daemon-global scope is an error, never a cwd lookup.
+pub(crate) fn matched_dotenv_sources(
+    scope: RedactionSourceScope<'_>,
+    patterns: &[String],
+    extra: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    match scope {
+        RedactionSourceScope::Workspace(root) => {
+            if !root.is_absolute() {
+                return Err(UnanchoredRedactionSourcePath {
+                    setting: "workspace root",
+                    path: root.to_path_buf(),
+                }
+                .into());
+            }
+            matched_dotenv_paths(root, patterns, extra)
+        }
+        RedactionSourceScope::DaemonGlobal => {
+            let mut out = Vec::new();
+            collect_explicit_dotenv_paths(scope, extra, &mut out)?;
+            out.sort();
+            out.dedup();
+            Ok(out)
+        }
+    }
+}
+
+/// Resolve one configured `extra_dotenv_paths` entry for `scope` with the
+/// same anchoring rule layered config applies
+/// ([`anchor_config_relative_path`](crate::config::extended::anchor_config_relative_path)):
+/// absolute paths as written, plain relative paths under an absolute
+/// workspace root, and an [`UnanchoredRedactionSourcePath`] error otherwise.
+pub(crate) fn resolve_explicit_dotenv_path(
+    scope: RedactionSourceScope<'_>,
+    path: &Path,
+) -> std::result::Result<PathBuf, UnanchoredRedactionSourcePath> {
+    let base = match scope {
+        RedactionSourceScope::Workspace(root) => Some(root),
+        RedactionSourceScope::DaemonGlobal => None,
+    };
+    crate::config::extended::anchor_config_relative_path(base, path).ok_or_else(|| {
+        UnanchoredRedactionSourcePath {
+            setting: "redact.extra_dotenv_paths",
+            path: path.to_path_buf(),
+        }
+    })
+}
+
 pub(crate) fn matched_dotenv_paths(
     cwd: &Path,
     patterns: &[String],
@@ -33,6 +103,7 @@ pub(crate) fn matched_dotenv_paths(
     use ignore::overrides::OverrideBuilder;
 
     let mut out: Vec<PathBuf> = Vec::new();
+    let scope = RedactionSourceScope::Workspace(cwd);
 
     let in_git_repo = crate::git::find_worktree_root(cwd).is_some();
     if !in_git_repo && dotenv_scan_start_is_unbounded(cwd) {
@@ -40,7 +111,7 @@ pub(crate) fn matched_dotenv_paths(
             cwd = %cwd.display(),
             "redaction `.env` walk skipped from unbounded filesystem start; explicit extra dotenv paths are still honored"
         );
-        collect_explicit_dotenv_paths(extra, &mut out)?;
+        collect_explicit_dotenv_paths(scope, extra, &mut out)?;
         out.sort();
         out.dedup();
         return Ok(out);
@@ -106,15 +177,20 @@ pub(crate) fn matched_dotenv_paths(
         }
     }
 
-    collect_explicit_dotenv_paths(extra, &mut out)?;
+    collect_explicit_dotenv_paths(scope, extra, &mut out)?;
 
     out.sort();
     out.dedup();
     Ok(out)
 }
 
-fn collect_explicit_dotenv_paths(extra: &[PathBuf], out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_explicit_dotenv_paths(
+    scope: RedactionSourceScope<'_>,
+    extra: &[PathBuf],
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
     for path in extra {
+        let path = &resolve_explicit_dotenv_path(scope, path)?;
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -124,11 +200,7 @@ fn collect_explicit_dotenv_paths(extra: &[PathBuf], out: &mut Vec<PathBuf>) -> R
             }
             Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::metadata(path) {
                 Ok(target) if target.is_file() => {
-                    std::fs::File::open(path).map_err(|error| {
-                        anyhow::anyhow!(
-                            "configured dotenv source is unavailable during capture: {error}"
-                        )
-                    })?;
+                    confirm_regular_source(path)?;
                     out.push(path.clone());
                 }
                 Ok(_) => {}
@@ -139,17 +211,27 @@ fn collect_explicit_dotenv_paths(extra: &[PathBuf], out: &mut Vec<PathBuf>) -> R
                 }
             },
             Ok(metadata) if metadata.is_file() => {
-                std::fs::File::open(path).map_err(|error| {
-                    anyhow::anyhow!(
-                        "configured dotenv source is unavailable during capture: {error}"
-                    )
-                })?;
+                confirm_regular_source(path)?;
                 out.push(path.clone());
             }
             Ok(_) => {}
         }
     }
     Ok(())
+}
+
+/// Confirm a discovered explicit source is still an openable regular file.
+///
+/// The open is non-blocking and the type is validated on the descriptor, so a
+/// source swapped for a FIFO between the metadata check and this open is an
+/// error instead of an open that blocks a coverage worker until a writer
+/// appears.
+pub(super) fn confirm_regular_source(path: &Path) -> Result<()> {
+    cockpit_host::bounded::open_regular_file(path)
+        .map(drop)
+        .map_err(|error| {
+            anyhow::anyhow!("configured dotenv source is unavailable during capture: {error}")
+        })
 }
 
 pub(crate) fn dotenv_scan_start_is_unbounded(cwd: &Path) -> bool {
@@ -197,23 +279,43 @@ pub(super) fn collect_env_file_candidates_with_fence(
     user_allowlist: &[String],
     before_confirm: impl FnOnce(),
 ) -> EnvFileScan {
+    collect_env_file_candidates_recorded(path, user_allowlist, before_confirm).0
+}
+
+/// Collect a source's candidates and return the digest of the exact
+/// confirmed bytes they were parsed from (`None` when the source was not
+/// read to completion). The coverage boundary binding is derived from this
+/// digest, so the binding and the table can never come from different reads.
+pub(super) fn collect_env_file_candidates_recorded(
+    path: &Path,
+    user_allowlist: &[String],
+    before_confirm: impl FnOnce(),
+) -> (EnvFileScan, Option<[u8; 32]>) {
     let first = match crate::resource_limits::read_for_tool(path) {
         Ok(bytes) => bytes,
         Err(crate::resource_limits::ResourceLimitError::ByteLimit { .. }) => {
-            return EnvFileScan::OverLimit;
+            return (EnvFileScan::OverLimit, None);
         }
-        Err(_) => return EnvFileScan::Unreadable,
+        Err(_) => return (EnvFileScan::Unreadable, None),
     };
     before_confirm();
     let bytes = match crate::resource_limits::read_for_tool(path) {
         Ok(bytes) if bytes == first => bytes,
-        Ok(_) => return EnvFileScan::Changed,
+        Ok(_) => return (EnvFileScan::Changed, None),
         Err(crate::resource_limits::ResourceLimitError::ByteLimit { .. }) => {
-            return EnvFileScan::OverLimit;
+            return (EnvFileScan::OverLimit, None);
         }
-        Err(_) => return EnvFileScan::Changed,
+        Err(_) => return (EnvFileScan::Changed, None),
     };
-    let text = String::from_utf8_lossy(&bytes);
+    let digest = super::coverage_bindings::source_bytes_digest(&bytes);
+    (
+        parse_env_file_bytes(path, &bytes, user_allowlist),
+        Some(digest),
+    )
+}
+
+fn parse_env_file_bytes(path: &Path, bytes: &[u8], user_allowlist: &[String]) -> EnvFileScan {
+    let text = String::from_utf8_lossy(bytes);
     let display = path.display().to_string();
 
     // (1) KEY=VALUE (dotenv). `parse_dotenv` returns `Some` when at least

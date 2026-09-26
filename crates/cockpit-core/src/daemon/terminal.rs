@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
+use crate::daemon::EventSender;
+use crate::daemon::global_coverage::GlobalCoverage;
 use crate::daemon::proto::{ErrorPayload, Response};
-use crate::daemon::{EventSender, SharedRedactionTable};
 
 pub type TerminalResult = std::result::Result<Response, ErrorPayload>;
 pub type TerminalHostHandle = Arc<dyn TerminalHost>;
@@ -111,13 +112,12 @@ pub trait TerminalHost: std::fmt::Debug + Send + Sync {
 
 #[derive(Clone)]
 pub struct TerminalHostFactory {
-    build:
-        Arc<dyn Fn(EventSender, SharedRedactionTable, PathBuf) -> TerminalHostHandle + Send + Sync>,
+    build: Arc<dyn Fn(EventSender, GlobalCoverage, PathBuf) -> TerminalHostHandle + Send + Sync>,
 }
 
 impl TerminalHostFactory {
     pub fn new(
-        build: impl Fn(EventSender, SharedRedactionTable, PathBuf) -> TerminalHostHandle
+        build: impl Fn(EventSender, GlobalCoverage, PathBuf) -> TerminalHostHandle
         + Send
         + Sync
         + 'static,
@@ -130,10 +130,10 @@ impl TerminalHostFactory {
     pub fn build(
         &self,
         events: EventSender,
-        redaction: SharedRedactionTable,
+        coverage: GlobalCoverage,
         temp_root: PathBuf,
     ) -> TerminalHostHandle {
-        (self.build)(events, redaction, temp_root)
+        (self.build)(events, coverage, temp_root)
     }
 }
 

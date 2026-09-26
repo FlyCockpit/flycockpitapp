@@ -70,6 +70,13 @@ pub struct WorkspaceConfigLayerSnapshot {
     /// ambient config paths after attachment. `None` is an explicit override
     /// (or a synthetic legacy/test layer) and therefore has project scope.
     pub origin: Option<dirs::ConfigDirKind>,
+    /// Absolute project root of a conventional `<root>/.cockpit/config.json`
+    /// layer, derived from the canonical path the layer was captured from.
+    /// Relative path settings declared by the layer (for example
+    /// `redact.extra_dotenv_paths`) are anchored here. `None` for layers
+    /// with no project root (global, explicit non-project overrides, empty
+    /// slots). Selection metadata only, like `origin`: not part of `digest`.
+    pub project_root: Option<std::path::PathBuf>,
     pub config_json: Option<Vec<u8>>,
     pub provider_files: Vec<(String, Vec<u8>)>,
     /// Opaque digest of the exact effective-default journal/backup pair read
@@ -86,6 +93,12 @@ impl WorkspaceConfigLayerSnapshot {
     /// of the filesystem payload.
     pub fn with_origin(mut self, origin: Option<dirs::ConfigDirKind>) -> Self {
         self.origin = origin;
+        self
+    }
+
+    /// Stamp the project root relative settings of this layer resolve against.
+    pub fn with_project_root(mut self, project_root: Option<std::path::PathBuf>) -> Self {
+        self.project_root = project_root;
         self
     }
 }

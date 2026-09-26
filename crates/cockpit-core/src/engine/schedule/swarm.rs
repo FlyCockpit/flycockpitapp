@@ -1246,7 +1246,15 @@ mod tests {
             },
         );
         let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
-        doc.write(&providers).unwrap();
+        // Fixture setup writes the project layer as its trusted owner.
+        crate::config::trust::with_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+            || doc.write(&providers),
+        )
+        .unwrap();
 
         let table = Arc::new(
             crate::redact::RedactionTable::empty()
@@ -1444,7 +1452,15 @@ mod tests {
             },
         );
         let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
-        doc.write(&providers).unwrap();
+        // Fixture setup writes the project layer as its trusted owner.
+        crate::config::trust::with_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+            || doc.write(&providers),
+        )
+        .unwrap();
 
         let table = Arc::new(crate::redact::RedactionTable::empty());
         let config =
@@ -1599,7 +1615,15 @@ mod tests {
             },
         );
         let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
-        doc.write(&providers).unwrap();
+        // Fixture setup writes the project layer as its trusted owner.
+        crate::config::trust::with_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+            || doc.write(&providers),
+        )
+        .unwrap();
 
         let table = Arc::new(crate::redact::RedactionTable::empty());
         let config =

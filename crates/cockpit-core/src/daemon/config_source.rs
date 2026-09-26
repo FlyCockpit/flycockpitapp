@@ -23,6 +23,9 @@ use crate::config::trust::WorkspaceTrustPolicy;
 
 type LoadFn = dyn Fn(&Path) -> Result<(ProvidersConfig, ExtendedConfig)> + Send + Sync;
 type BootLoadFn = dyn Fn() -> Result<crate::config::extended::DaemonBootConfig> + Send + Sync;
+type StrictRedactLoadFn =
+    dyn Fn(&Path) -> Result<crate::config::extended::RedactConfig> + Send + Sync;
+type GlobalRedactLoadFn = dyn Fn() -> Result<crate::config::extended::RedactConfig> + Send + Sync;
 type DaemonLoadFn = dyn Fn(&Path) -> Result<DaemonConfigLoad> + Send + Sync;
 type WorkspaceDaemonLoadFn = dyn Fn(
         &Path,
@@ -30,7 +33,9 @@ type WorkspaceDaemonLoadFn = dyn Fn(
     ) -> Result<DaemonConfigLoad>
     + Send
     + Sync;
-type WriteTargetFn = dyn Fn(&Path, &str) -> Option<PathBuf> + Send + Sync;
+type WriteTargetFn = dyn Fn(&Path, &str) -> std::result::Result<PathBuf, crate::config::dirs::ConfigWriteTargetError>
+    + Send
+    + Sync;
 type WatchPathsFn = dyn Fn(&Path) -> ConfigWatchPaths + Send + Sync;
 type PrepareGlobalLayersFn = dyn Fn(&Path, &WorkspaceTrustPolicy) -> Result<()> + Send + Sync;
 
@@ -93,6 +98,14 @@ impl ConfigWatchPaths {
 pub struct ConfigSource {
     load: Arc<LoadFn>,
     boot_load: Arc<BootLoadFn>,
+    /// Installation-wide redact policy for daemon-global coverage: the
+    /// `COCKPIT_CONFIG` explicit override when set, otherwise the canonical
+    /// global layer. Never resolved against a project root or the daemon's
+    /// inherited working directory.
+    global_redact_load: Arc<GlobalRedactLoadFn>,
+    /// Workspace redact policy read strictly, for security decisions that
+    /// must fail closed on a malformed protection policy.
+    strict_redact_load: Arc<StrictRedactLoadFn>,
     daemon_load: Arc<DaemonLoadFn>,
     workspace_daemon_load: Arc<WorkspaceDaemonLoadFn>,
     write_target: Arc<WriteTargetFn>,
@@ -142,6 +155,14 @@ impl ConfigSource {
                 let load = load.clone();
                 move || Ok(load(Path::new("/"))?.1.daemon.boot)
             }),
+            global_redact_load: Arc::new({
+                let load = load.clone();
+                move || Ok(load(Path::new("/"))?.1.redact)
+            }),
+            strict_redact_load: Arc::new({
+                let load = load.clone();
+                move |cwd| Ok(load(cwd)?.1.redact)
+            }),
             daemon_load: Arc::new(move |cwd| {
                 let (providers, extended) = daemon_source(cwd)?;
                 Ok(DaemonConfigLoad {
@@ -163,7 +184,13 @@ impl ConfigSource {
                 })
             }),
             load,
-            write_target: Arc::new(write_target),
+            write_target: Arc::new(move |cwd: &Path, provider_id: &str| {
+                write_target(cwd, provider_id).ok_or_else(|| {
+                    crate::config::dirs::ConfigWriteTargetError::Unresolved(
+                        "this config source has no provider write target".into(),
+                    )
+                })
+            }),
             watch_paths: Arc::new(watch_paths),
             prepare_global_layers: Arc::new(|_, _| Ok(())),
             vault: Arc::new(Mutex::new(None)),
@@ -187,11 +214,25 @@ impl ConfigSource {
                 let daemon_load = daemon_load.clone();
                 move || Ok(daemon_load(Path::new("/"))?.extended.daemon.boot)
             }),
+            global_redact_load: Arc::new({
+                let daemon_load = daemon_load.clone();
+                move || Ok(daemon_load(Path::new("/"))?.extended.redact)
+            }),
+            strict_redact_load: Arc::new({
+                let daemon_load = daemon_load.clone();
+                move |cwd| Ok(daemon_load(cwd)?.extended.redact)
+            }),
             daemon_load,
             workspace_daemon_load: Arc::new(move |cwd, _workspace| {
                 workspace_daemon_load_source(cwd)
             }),
-            write_target: Arc::new(write_target),
+            write_target: Arc::new(move |cwd: &Path, provider_id: &str| {
+                write_target(cwd, provider_id).ok_or_else(|| {
+                    crate::config::dirs::ConfigWriteTargetError::Unresolved(
+                        "this config source has no provider write target".into(),
+                    )
+                })
+            }),
             watch_paths: Arc::new(watch_paths),
             prepare_global_layers: Arc::new(|_, _| Ok(())),
             vault: Arc::new(Mutex::new(None)),
@@ -270,6 +311,14 @@ impl ConfigSource {
         Self {
             load,
             boot_load: Arc::new(crate::config::extended::load_installation_daemon_boot),
+            global_redact_load: Arc::new(|| {
+                Ok(crate::config::extended::load_installation_redact_policy()?)
+            }),
+            strict_redact_load: Arc::new(|cwd| {
+                Ok(crate::config::extended::load_redact_policy_strict_for_cwd(
+                    cwd,
+                )?)
+            }),
             daemon_load,
             workspace_daemon_load,
             write_target: Arc::new(|cwd, provider_id| {
@@ -343,6 +392,27 @@ impl ConfigSource {
 
     pub fn load_boot(&self) -> Result<crate::config::extended::DaemonBootConfig> {
         (self.boot_load)()
+    }
+
+    /// Installation-wide redact policy (the explicit override when set,
+    /// otherwise the global layer), read strictly. Daemon-global coverage uses
+    /// this rather than [`Self::load`], so no project root, and in particular
+    /// not the daemon's inherited working directory, participates.
+    pub fn load_global_redact(&self) -> Result<crate::config::extended::RedactConfig> {
+        (self.global_redact_load)()
+    }
+
+    /// The workspace redact policy for `cwd` under `policy`, read strictly:
+    /// an unreadable layer or a malformed `redact` section is an error rather
+    /// than being dropped by the permissive merge.
+    pub fn load_redact_policy_strict_with_trust(
+        &self,
+        cwd: &Path,
+        policy: &WorkspaceTrustPolicy,
+    ) -> Result<crate::config::extended::RedactConfig> {
+        crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
+            (self.strict_redact_load)(cwd)
+        })
     }
 
     /// Load the effective configs for `cwd` under a resolved workspace-trust
@@ -456,7 +526,7 @@ impl ConfigSource {
         &self,
         cwd: &Path,
         provider_id: &str,
-    ) -> Option<PathBuf> {
+    ) -> std::result::Result<PathBuf, crate::config::dirs::ConfigWriteTargetError> {
         (self.write_target)(cwd, provider_id)
     }
 
@@ -529,6 +599,7 @@ mod tests {
         let supplied = cockpit_config::config::workspace_config_layer_snapshot_chain(vec![
             cockpit_config::config::WorkspaceConfigLayerSnapshot {
                 origin: None,
+                project_root: None,
                 config_json: Some(
                     br#"{
                         "active_model": {"provider": "malicious", "model": "poisoned"},

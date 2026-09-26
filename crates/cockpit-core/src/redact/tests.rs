@@ -42,7 +42,7 @@ fn build_with_session_env(
 }
 
 fn protected_paths(cwd: &Path, env: &HashMap<String, String>) -> Vec<String> {
-    protected::ProtectedPaths::from_session(cwd, env).to_persisted()
+    protected::ProtectedPaths::from_scope(RedactionSourceScope::Workspace(cwd), env).to_persisted()
 }
 
 fn entry_origins(table: &RedactionTable) -> Vec<String> {
@@ -1487,6 +1487,93 @@ fn extra_dotenv_paths_still_honored() {
 }
 
 #[test]
+fn daemon_global_scope_discovers_only_absolute_configured_env_files() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join(".env"), "WALKED=walked-dotenv-secret-value\n").unwrap();
+    let absolute = root.join("absolute.secrets");
+    std::fs::write(&absolute, "ABS=absolute-extra-secret-value\n").unwrap();
+    let relative = PathBuf::from("absolute.secrets");
+
+    let paths = matched_dotenv_sources(
+        RedactionSourceScope::DaemonGlobal,
+        &crate::config::extended::default_dotenv_patterns(),
+        std::slice::from_ref(&absolute),
+    )
+    .unwrap();
+    assert_eq!(
+        paths,
+        vec![absolute.clone()],
+        "daemon-global scope walks nothing"
+    );
+    assert!(
+        matched_dotenv_sources(
+            RedactionSourceScope::DaemonGlobal,
+            &crate::config::extended::default_dotenv_patterns(),
+            &[absolute.clone(), relative.clone()],
+        )
+        .is_err(),
+        "daemon-global scope has no root: a relative configured path fails closed"
+    );
+
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    cfg.extra_dotenv_paths = vec![absolute];
+    let global = RedactionTable::build_scoped(
+        &cfg,
+        RedactionSourceScope::DaemonGlobal,
+        &HashMap::new(),
+        Vec::<(String, String)>::new(),
+    )
+    .unwrap();
+    assert_eq!(global.scrub("absolute-extra-secret-value"), "***REDACT***");
+    assert_eq!(
+        global.scrub("walked-dotenv-secret-value"),
+        "walked-dotenv-secret-value"
+    );
+}
+
+#[test]
+fn relative_extra_dotenv_paths_resolve_against_the_workspace_root() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::create_dir_all(workspace.path().join("secrets")).unwrap();
+    std::fs::write(
+        workspace.path().join("secrets/ci.env"),
+        "CI=workspace-relative-extra-value\n",
+    )
+    .unwrap();
+    let relative = PathBuf::from("secrets/ci.env");
+    assert_eq!(
+        resolve_explicit_dotenv_path(RedactionSourceScope::Workspace(workspace.path()), &relative)
+            .unwrap(),
+        workspace.path().join("secrets/ci.env")
+    );
+    assert!(
+        resolve_explicit_dotenv_path(RedactionSourceScope::DaemonGlobal, &relative).is_err(),
+        "daemon-global scope has no root: a relative entry is a typed error, never a cwd lookup"
+    );
+    assert!(
+        resolve_explicit_dotenv_path(
+            RedactionSourceScope::Workspace(Path::new("relative-root")),
+            &relative
+        )
+        .is_err(),
+        "a relative workspace root is rejected"
+    );
+
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    cfg.dotenv_patterns = Vec::new();
+    cfg.extra_dotenv_paths = vec![relative];
+    let table = RedactionTable::build(&cfg, workspace.path()).unwrap();
+    assert_eq!(
+        table.scrub("workspace-relative-extra-value"),
+        "***REDACT***",
+        "a relative configured path names a file in the session's workspace, not the process cwd"
+    );
+}
+
+#[test]
 fn dotenv_scan_refuses_filesystem_root_but_honors_explicit_extra_paths() {
     let dir = TempDir::new().unwrap();
     let extra = dir.path().join("explicit.env");
@@ -1698,16 +1785,32 @@ fn ssh_keys_skipped_when_disabled() {
     assert_eq!(t.scrub(ED25519_PRIVATE_KEY), ED25519_PRIVATE_KEY);
 }
 
+/// A *configured* SSH directory that does not exist is an unavailable
+/// source, not an empty one: the user asked for keys there, and coverage must
+/// not silently publish without them. (Only the unconfigured default
+/// `~/.ssh` may be absent; see `ssh_key_dir_absence_is_only_an_absent_default`.)
 #[test]
-fn ssh_missing_dir_is_silent() {
+fn ssh_missing_configured_dir_fails_closed() {
     let dir = TempDir::new().unwrap();
     let missing = dir.path().join("no-such-ssh-dir");
     let mut cfg = enabled_cfg();
     cfg.scan_ssh_keys = true;
     cfg.ssh_key_dir = Some(missing);
-    // Build succeeds (no error) with an empty table.
-    let t = RedactionTable::build(&cfg, dir.path()).unwrap();
-    assert!(t.is_empty());
+    let error = RedactionTable::build(&cfg, dir.path())
+        .expect_err("a missing configured SSH directory fails the build");
+    let typed = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<super::ssh::SshKeyDirUnavailableError>())
+        .unwrap_or_else(|| panic!("typed SSH source error: {error:#}"));
+    assert!(typed.configured);
+    assert_eq!(
+        typed.reason,
+        super::ssh::SshKeyDirUnavailableReason::Missing
+    );
+    assert!(
+        format!("{error:#}").contains("configured (redact.ssh_key_dir)"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -3049,4 +3152,457 @@ fn scrub_covers_multibyte_utf8_overlapping_literals() {
     assert!(!out.contains(b), "second multibyte secret survived: {out}");
     assert!(!out.contains("γδ"), "shared multibyte run leaked: {out}");
     assert_eq!(out, format!("X{ph}Y"));
+}
+
+#[cfg(unix)]
+fn make_fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+}
+
+/// Runs `probe` on a helper thread and fails (instead of hanging the suite)
+/// when it does not return promptly: a blocking open of a FIFO with no writer
+/// never returns.
+#[cfg(unix)]
+fn returns_promptly<T: Send + 'static>(probe: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(probe());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("source probe blocked on a FIFO instead of failing")
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_and_ssh_sources_never_block_on_a_fifo() {
+    let dir = TempDir::new().unwrap();
+    let fifo = dir.path().join("swapped.env");
+    make_fifo(&fifo);
+    let dotenv_probe = fifo.clone();
+    assert!(
+        returns_promptly(move || super::dotenv::confirm_regular_source(&dotenv_probe)).is_err(),
+        "an explicit source swapped for a FIFO is an error, not a blocking open"
+    );
+    let ssh_probe = fifo.clone();
+    assert!(
+        returns_promptly(move || super::ssh::read_ssh_source_text(&ssh_probe)).is_err(),
+        "an SSH source swapped for a FIFO is an error, not a blocking read"
+    );
+}
+
+#[test]
+fn ssh_key_dir_resolution_is_scope_aware_and_never_uses_the_cwd() {
+    let workspace = TempDir::new().unwrap();
+    let relative = Path::new("keys");
+    assert_eq!(
+        super::ssh::resolve_ssh_key_dir(
+            RedactionSourceScope::Workspace(workspace.path()),
+            Some(relative)
+        )
+        .unwrap(),
+        Some(super::ssh::SshKeyDir::configured(
+            workspace.path().join("keys")
+        ))
+    );
+    let error = super::ssh::resolve_ssh_key_dir(RedactionSourceScope::DaemonGlobal, Some(relative))
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<UnanchoredRedactionSourcePath>()
+            .is_some(),
+        "a relative daemon-global SSH directory is a typed error: {error:#}"
+    );
+    let absolute = workspace.path().join("abs-keys");
+    assert_eq!(
+        super::ssh::resolve_ssh_key_dir(RedactionSourceScope::DaemonGlobal, Some(&absolute))
+            .unwrap(),
+        Some(super::ssh::SshKeyDir::configured(absolute))
+    );
+
+    // With SSH scanning ENABLED, a daemon-global build refuses a relative
+    // directory instead of reading the process cwd.
+    let mut cfg = enabled_cfg();
+    cfg.scan_ssh_keys = true;
+    cfg.ssh_key_dir = Some(relative.to_path_buf());
+    let error = RedactionTable::build_scoped(
+        &cfg,
+        RedactionSourceScope::DaemonGlobal,
+        &HashMap::new(),
+        Vec::<(String, String)>::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<UnanchoredRedactionSourcePath>()),
+        "{error:#}"
+    );
+    assert!(
+        super::coverage_bindings::machine_sources_probe_binding(
+            &cfg,
+            RedactionSourceScope::DaemonGlobal
+        )
+        .is_err(),
+        "the coverage binding uses the same resolver and fails closed"
+    );
+
+    // A workspace build scans the anchored directory.
+    let keys = workspace.path().join("keys");
+    std::fs::create_dir(&keys).unwrap();
+    std::fs::write(
+        keys.join("id_test"),
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nworkspace-ssh-key-canary-9f2\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let table = RedactionTable::build_scoped(
+        &cfg,
+        RedactionSourceScope::Workspace(workspace.path()),
+        &HashMap::new(),
+        Vec::<(String, String)>::new(),
+    )
+    .unwrap();
+    assert!(
+        !table
+            .scrub("workspace-ssh-key-canary-9f2")
+            .contains("workspace-ssh-key-canary-9f2")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_binding_errors_never_hash_like_an_empty_source() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    let mut cfg = enabled_cfg();
+    cfg.scan_ssh_keys = true;
+    cfg.ssh_key_dir = Some(ssh.clone());
+    let scope = RedactionSourceScope::Workspace(dir.path());
+    assert!(
+        super::coverage_bindings::machine_sources_binding(&cfg, scope, None).is_ok(),
+        "an empty, readable SSH source binds"
+    );
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = std::fs::read_dir(&ssh).is_err();
+    let result = super::coverage_bindings::machine_sources_binding(&cfg, scope, None);
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Root bypasses directory modes; the property is only observable when the
+    // directory is actually unreadable to this process.
+    if unreadable {
+        assert!(
+            result.is_err(),
+            "an unreadable source is unavailable, not equal to the empty binding"
+        );
+    }
+}
+
+#[test]
+fn policy_digest_covers_every_table_affecting_field_unambiguously() {
+    use super::coverage_bindings::redact_config_digest;
+    let base = enabled_cfg();
+    let digest = redact_config_digest(&base);
+    type Mutation = Box<dyn Fn(&mut RedactConfig)>;
+    let variants: Vec<(&str, Mutation)> = vec![
+        (
+            "denylist",
+            Box::new(|c| c.denylist = vec!["new-literal".into()]),
+        ),
+        (
+            "allowlist",
+            Box::new(|c| c.allowlist = vec!["SAFE_NAME".into()]),
+        ),
+        ("min_secret_length", Box::new(|c| c.min_secret_length += 1)),
+        ("placeholder", Box::new(|c| c.placeholder = "[x]".into())),
+        (
+            "secret_path_patterns",
+            Box::new(|c| c.secret_path_patterns = vec!["*.key".into()]),
+        ),
+        ("enabled", Box::new(|c| c.enabled = !c.enabled)),
+        (
+            "ssh_key_dir",
+            Box::new(|c| c.ssh_key_dir = Some("/k".into())),
+        ),
+        (
+            "extra_dotenv_paths",
+            Box::new(|c| c.extra_dotenv_paths = vec!["/x.env".into()]),
+        ),
+    ];
+    for (field, mutate) in variants {
+        let mut changed = base.clone();
+        mutate(&mut changed);
+        assert_ne!(
+            redact_config_digest(&changed),
+            digest,
+            "`{field}` must change the policy digest"
+        );
+    }
+    let mut joined = base.clone();
+    joined.denylist = vec!["ab".into()];
+    let mut split = base.clone();
+    split.denylist = vec!["a".into(), "b".into()];
+    assert_ne!(
+        redact_config_digest(&joined),
+        redact_config_digest(&split),
+        "list boundaries are part of the encoding"
+    );
+    let mut moved = base.clone();
+    moved.allowlist = vec!["a".into()];
+    let mut other = base;
+    other.denylist = vec!["a".into()];
+    assert_ne!(
+        redact_config_digest(&moved),
+        redact_config_digest(&other),
+        "field tags are part of the encoding"
+    );
+}
+
+/// The boundary binding comes from the bytes the table was built from. A
+/// source that changes and changes back around the capture (A -> B -> A)
+/// leaves a fresh read equal to the key, but the captured binding (B) does
+/// not match, so the authority refuses to publish a table built from B.
+#[test]
+fn captured_source_binding_is_derived_from_the_bytes_the_table_used() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let env = root.join(".env");
+    let mut cfg = enabled_cfg();
+    cfg.scan_dotenv = true;
+    let scope = RedactionSourceScope::Workspace(root);
+
+    std::fs::write(&env, "TOKEN=aba-original-secret-value\n").unwrap();
+    let key_a = super::coverage_bindings::machine_sources_probe_binding(&cfg, scope).unwrap();
+    let (table_a, capture_a) =
+        RedactionTable::build_scoped_recorded(&cfg, scope, &HashMap::new(), Vec::new()).unwrap();
+    assert_eq!(
+        super::coverage_bindings::captured_machine_sources_binding(&capture_a, &table_a),
+        key_a,
+        "an unchanged source binds identically from a fresh read and from the capture"
+    );
+
+    std::fs::write(&env, "TOKEN=aba-replacement-secret-value\n").unwrap();
+    let (table_b, capture_b) =
+        RedactionTable::build_scoped_recorded(&cfg, scope, &HashMap::new(), Vec::new()).unwrap();
+    std::fs::write(&env, "TOKEN=aba-original-secret-value\n").unwrap();
+    assert_eq!(
+        super::coverage_bindings::machine_sources_probe_binding(&cfg, scope).unwrap(),
+        key_a,
+        "precondition: the restored source reads like the key again"
+    );
+    assert_ne!(
+        super::coverage_bindings::captured_machine_sources_binding(&capture_b, &table_b),
+        key_a,
+        "a table built from B must never bind as A"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_collector_skips_non_key_entries_and_directory_churn() {
+    let dir = TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    std::fs::write(
+        ssh.join("id_ed25519"),
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nchurn-key-canary-5d11\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    // A non-UTF-8 file (macOS `.DS_Store`), a ControlMaster socket, and a
+    // FIFO are not keys and must not fail capture.
+    std::fs::write(ssh.join(".DS_Store"), [0xff, 0xfe, 0x00, 0x81]).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(ssh.join("cm-user@host:22")).unwrap();
+    make_fifo(&ssh.join("pipe"));
+    let doomed = ssh.join("scratch");
+    std::fs::write(&doomed, "not a key").unwrap();
+    let keys = returns_promptly({
+        let ssh = ssh.clone();
+        move || {
+            super::ssh::collect_ssh_key_candidates_with_fence(
+                Some(&super::ssh::SshKeyDir::configured(&ssh)),
+                |_| {
+                    // Entries appear and disappear while the scan runs.
+                    let _ = std::fs::remove_file(ssh.join("scratch"));
+                    let _ = std::fs::write(ssh.join("editor.swp"), "tmp");
+                },
+            )
+        }
+    })
+    .expect("non-key entries and churn never fail the SSH collector");
+    assert!(
+        keys.iter()
+            .any(|(value, _)| value.contains("churn-key-canary-5d11")),
+        "the real key is still collected"
+    );
+}
+
+/// T5: only an absent *default* SSH directory is an empty source. A
+/// configured directory that is missing or a dangling link, and a default
+/// directory that is a dangling link, are unavailable sources.
+#[cfg(unix)]
+#[test]
+fn ssh_key_dir_absence_is_only_an_absent_default() {
+    use super::ssh::{SshKeyDir, collect_ssh_key_candidates};
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing");
+    let dangling = dir.path().join("dangling");
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+
+    assert!(
+        collect_ssh_key_candidates(Some(&SshKeyDir::default_dir(&missing)))
+            .expect("an absent default directory is an empty source")
+            .is_empty()
+    );
+    for (dir, what) in [
+        (
+            SshKeyDir::configured(&missing),
+            "missing configured directory",
+        ),
+        (
+            SshKeyDir::configured(&dangling),
+            "dangling configured directory",
+        ),
+        (
+            SshKeyDir::default_dir(&dangling),
+            "dangling default directory",
+        ),
+    ] {
+        let error = collect_ssh_key_candidates(Some(&dir))
+            .expect_err(what)
+            .to_string();
+        assert!(error.contains("SSH key directory"), "{what}: {error}");
+    }
+}
+
+/// T7: the collector is also the publication fence, so a key that appears
+/// while it runs (a new entry, or an existing non-key entry rewritten as a
+/// key) is refused by its source-set closure check, while non-key churn is
+/// still tolerated (see `ssh_collector_skips_non_key_entries_and_directory_churn`).
+#[cfg(unix)]
+#[test]
+fn ssh_collector_refuses_a_key_added_during_the_fence() {
+    use super::ssh::{SshKeyDir, collect_ssh_key_candidates_with_fence};
+    let pem = |marker: &str| {
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{marker}\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+    };
+    for late_name in ["id_aaa_added", "id_zzz_added", "a_notes"] {
+        let dir = TempDir::new().unwrap();
+        let ssh = dir.path().join("ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(ssh.join("id_mmm"), pem("existing-key-3c1d")).unwrap();
+        // `a_notes` exists as a non-key, is inspected (and skipped) before
+        // `id_mmm`, and is rewritten as a key while `id_mmm` is confirmed.
+        std::fs::write(ssh.join("a_notes"), "not a key").unwrap();
+        let late = ssh.join(late_name);
+        let result =
+            collect_ssh_key_candidates_with_fence(Some(&SshKeyDir::configured(&ssh)), |_| {
+                std::fs::write(&late, pem("late-key-8e2a")).unwrap();
+            });
+        let error = result.expect_err("a key added during the fence must refuse capture");
+        assert!(
+            format!("{error:#}").contains("a key was added"),
+            "{late_name}: {error:#}"
+        );
+    }
+}
+
+/// T7: replacing the material of an already-collected key (same filename)
+/// while a later key is confirmed refuses the capture: the closure re-reads
+/// every collected key, not only the directory's filenames.
+#[cfg(unix)]
+#[test]
+fn ssh_collector_refuses_a_collected_key_replaced_during_the_fence() {
+    use super::ssh::{SshKeyDir, collect_ssh_key_candidates_with_fence};
+    let pem = |marker: &str| {
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{marker}\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+    };
+    let dir = TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    std::fs::write(ssh.join("id_a"), pem("original-key-a-71c2")).unwrap();
+    std::fs::write(ssh.join("id_b"), pem("second-key-b-0d4e")).unwrap();
+    let id_a = ssh.join("id_a");
+    let result =
+        collect_ssh_key_candidates_with_fence(Some(&SshKeyDir::configured(&ssh)), |path| {
+            if path.ends_with("id_b") {
+                std::fs::write(&id_a, pem("replacement-key-a-9f35")).unwrap();
+            }
+        });
+    let error = result.expect_err("a collected key replaced during the fence must refuse capture");
+    assert!(
+        format!("{error:#}").contains("a collected key was replaced"),
+        "{error:#}"
+    );
+    // Inverse: with no replacement both keys are collected.
+    let keys =
+        collect_ssh_key_candidates_with_fence(Some(&SshKeyDir::configured(&ssh)), |_| {}).unwrap();
+    assert!(
+        keys.iter()
+            .any(|(value, _)| value.contains("replacement-key-a-9f35"))
+    );
+    assert!(
+        keys.iter()
+            .any(|(value, _)| value.contains("second-key-b-0d4e"))
+    );
+}
+
+/// F4: an unusable SSH key directory is a typed error naming the directory
+/// and the settings that resolve it, for the default directory as well.
+#[cfg(unix)]
+#[test]
+fn ssh_key_dir_unavailable_error_is_typed_and_actionable() {
+    use super::ssh::{
+        SshKeyDir, SshKeyDirUnavailableError, SshKeyDirUnavailableReason,
+        collect_ssh_key_candidates,
+    };
+    let dir = TempDir::new().unwrap();
+    let dangling = dir.path().join("dangling-ssh");
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+    let error = collect_ssh_key_candidates(Some(&SshKeyDir::default_dir(&dangling)))
+        .expect_err("a dangling default directory is unavailable");
+    let typed = error
+        .downcast_ref::<SshKeyDirUnavailableError>()
+        .expect("typed SSH source error");
+    assert_eq!(typed.reason, SshKeyDirUnavailableReason::DanglingLink);
+    assert!(!typed.configured);
+    let message = error.to_string();
+    assert!(message.contains("default"), "{message}");
+    assert!(
+        message.contains(&dangling.display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("redact.scan_ssh_keys"), "{message}");
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_collector_skips_an_entry_removed_before_it_is_read() {
+    let dir = TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    // `aaa` sorts first; removing `zzz` while `aaa` is confirmed simulates
+    // an entry vanishing between listing and inspection.
+    std::fs::write(
+        ssh.join("aaa"),
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nremoval-race-key-2b9e\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    std::fs::write(ssh.join("zzz"), "vanishing entry").unwrap();
+    let doomed = ssh.join("zzz");
+    let keys = super::ssh::collect_ssh_key_candidates_with_fence(
+        Some(&super::ssh::SshKeyDir::configured(&ssh)),
+        |_| {
+            let _ = std::fs::remove_file(&doomed);
+        },
+    )
+    .expect("a vanished entry is skipped");
+    assert!(
+        keys.iter()
+            .any(|(value, _)| value.contains("removal-race-key-2b9e"))
+    );
 }

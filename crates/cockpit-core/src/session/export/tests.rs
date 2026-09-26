@@ -4968,7 +4968,15 @@ async fn portable_export_stays_redacted_across_every_trust_class() {
         };
         providers.active_model = Some(selection.clone());
         let mut doc = ConfigDoc::load(&config_path).unwrap();
-        doc.write(&providers).unwrap();
+        // Fixture setup writes the project layer as its trusted owner.
+        crate::config::trust::with_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+            || doc.write(&providers),
+        )
+        .unwrap();
 
         let db = Db::open_in_memory().unwrap();
         let s = create_test_session(&db, "p", &root, "Build").await;

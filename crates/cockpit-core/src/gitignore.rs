@@ -39,6 +39,30 @@ pub fn is_gitignored(path: &Path) -> bool {
     matcher_matches(&matcher, &root, &resolved)
 }
 
+/// The root of the gitignore stack that governs `dir` (see
+/// [`is_gitignored`]), resolved once so a policy can pin it before any
+/// requested path is resolved.
+pub fn gitignore_stack_root(dir: &Path) -> Option<PathBuf> {
+    gitignore_root(&canonicalize_lenient(dir))
+}
+
+/// Whether `path` — already resolved by the caller and pinned to the object
+/// its decision is about — is gitignored under the stack rooted at `root`
+/// (from [`gitignore_stack_root`]). Unlike [`is_gitignored`], `path` is never
+/// resolved again and its type is supplied by the caller, so replacing the
+/// name with a link while the policy runs cannot redirect the decision to a
+/// different object. A path outside `root` is not gitignored.
+pub fn is_gitignored_pinned(root: &Path, path: &Path, is_dir: bool) -> bool {
+    if path.strip_prefix(root).is_err() {
+        return false;
+    }
+    let matcher = build_repo_matcher_typed(root, path, is_dir);
+    matches!(
+        matcher.matched_path_or_any_parents(path, is_dir),
+        Match::Ignore(_)
+    )
+}
+
 fn matcher_matches(matcher: &Gitignore, root: &Path, path: &Path) -> bool {
     if path.strip_prefix(root).is_err() {
         return false;
@@ -129,6 +153,10 @@ pub fn build_allowlist_matcher(project_root: &Path, globs: &[String]) -> Gitigno
 /// `ignore`-walk flags used elsewhere (`git_ignore`, `git_global`,
 /// `git_exclude`, `parents`).
 fn build_repo_matcher(root: &Path, target: &Path) -> Gitignore {
+    build_repo_matcher_typed(root, target, target.is_dir())
+}
+
+fn build_repo_matcher_typed(root: &Path, target: &Path, target_is_dir: bool) -> Gitignore {
     let mut builder = GitignoreBuilder::new(root);
     // The user's global ignore file (`core.excludesfile`), least specific.
     if let Some(global) = global_ignore_path() {
@@ -138,7 +166,7 @@ fn build_repo_matcher(root: &Path, target: &Path) -> Gitignore {
     let _ = builder.add(root.join(".git/info/exclude"));
     // Every `.gitignore` from the worktree root down to the target's
     // directory, root-first so a deeper file's negation wins.
-    for dir in ancestor_dirs_root_first(root, target) {
+    for dir in ancestor_dirs_root_first(root, target, target_is_dir) {
         let _ = builder.add(dir.join(".gitignore"));
     }
     builder.build().unwrap_or_else(|_| Gitignore::empty())
@@ -147,8 +175,8 @@ fn build_repo_matcher(root: &Path, target: &Path) -> Gitignore {
 /// The directories from `root` (inclusive) down to `target`'s containing
 /// directory (inclusive), root-first. When `target` lies outside `root` the
 /// list is just `[root]`.
-fn ancestor_dirs_root_first(root: &Path, target: &Path) -> Vec<PathBuf> {
-    let start = if target.is_dir() {
+fn ancestor_dirs_root_first(root: &Path, target: &Path, target_is_dir: bool) -> Vec<PathBuf> {
+    let start = if target_is_dir {
         target
     } else {
         target.parent().unwrap_or(target)

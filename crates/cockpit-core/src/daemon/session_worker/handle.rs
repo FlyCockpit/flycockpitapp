@@ -1440,7 +1440,12 @@ impl SessionWorkerHandle {
             .default_mode;
         let applied = super::evaluate_set_sandbox(requested, persisted_intent, caps)
             .map_err(super::SetSandboxError::CapabilityMissing)?;
-        persist_sandbox_intent(&self.project_root, applied.persisted_intent).map_err(|error| {
+        persist_sandbox_intent(
+            &self.project_root,
+            self.current_trust_policy(),
+            applied.persisted_intent,
+        )
+        .map_err(|error| {
             super::SetSandboxError::Persist(format!("persisting sandbox intent: {error:#}"))
         })?;
         {
@@ -2025,7 +2030,7 @@ impl SessionWorkerHandle {
             override_revision: 0,
             redact_config: &config,
         }
-        .coverage_key();
+        .coverage_key()?;
         let key = installed_key.with_current_owned_revisions(&current_key);
         let store = self.session.credential_store()?;
         let sealed = self.session.machine_scoped_sealed_redactions().await?;
@@ -2993,7 +2998,7 @@ pub(crate) fn spawn(
         std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>,
     >,
     write_scope: crate::write_scope::WriteScopeSource,
-    global_bus: Option<EventSender>,
+    global_bus: Option<crate::daemon::GlobalEventBus>,
     trust_policy: crate::config::trust::WorkspaceTrustPolicy,
     trust_revision: i64,
     cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,

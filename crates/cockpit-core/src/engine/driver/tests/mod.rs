@@ -882,7 +882,7 @@ fn bind_test_redaction_coverage(driver: &Driver) {
     };
     driver.session.set_redaction_coverage(
         crate::redact::coverage_authority::RedactionCoverageAuthority::default(),
-        inputs.coverage_key(),
+        inputs.coverage_key().expect("driver test coverage key"),
         policy_digest,
     );
 }

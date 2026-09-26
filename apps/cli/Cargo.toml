@@ -148,7 +148,7 @@ jsonrpsee = { version = "=0.24.11", default-features = false, features = ["serve
 jsonrpsee-types = { version = "=0.24.11" }
 # Official stable ACP v1 schema types (consistency check only, not a stdio
 # runtime). Unstable v2 / mcp-over-acp features stay disabled.
-agent-client-protocol-schema = { version = "=1.7.0", default-features = false }
+agent-client-protocol-schema = { version = "=1.9.1", default-features = false }
 # YAML syntax validation for native write tools. `serde_yaml` 0.9 is archived,
 # but YAML syntax is stable and this existing dependency is sufficient here.
 serde_yaml = { workspace = true }

@@ -43147,7 +43147,6 @@ async fn locked_services_never_admit_ordinary_payload_before_coverage() {
             .ready
             .as_ref()
             .expect("constructed ready services")
-            .context
             .global_coverage
             .has_admitted_stamp_for_test(),
         "ReadyServices publication requires an admitted authority generation"
@@ -43421,6 +43420,7 @@ async fn boot_test_ctx(
         &mut timer,
         crate::daemon::terminal::test_host_factory(),
         config_source,
+        None,
     )
     .await
 }

@@ -2172,6 +2172,7 @@ impl Driver {
                 write_scope: self.write_scope.clone(),
                 dream_read_scope: self.dream_read_scope.clone(),
                 budget: self.budget.clone(),
+                interrupts: self.interrupts.clone(),
             },
         );
         #[cfg(test)]

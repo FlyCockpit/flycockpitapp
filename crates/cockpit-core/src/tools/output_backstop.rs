@@ -34,8 +34,16 @@ use crate::session::Session;
 /// session table is NOT applied here, so trusted-model custody and the
 /// downstream egress chokepoint keep their existing behaviour.
 ///
-/// Fail-closed like the read tool's approved-secret registration: a
-/// persist failure is an error, never a silently unregistered value.
+/// Registration goes ONLY to the live table `interrupts` owns — the owning
+/// session worker's table, which a scheduled fork reaches through
+/// [`InterruptHub::leaf_sharing_redaction`] — never to the daemon-global
+/// table or another session's. It is fail-closed like the read tool's
+/// approved-secret registration: a persist failure is an error, never a
+/// silently unregistered value. A hub that owns no live table (tests, a
+/// standalone shim) registers nothing: persisting a union of the tool's
+/// table snapshot outside the owner's write lock could overwrite
+/// concurrently committed entries in the durable table (H1), so there the
+/// values are scrubbed from this output only.
 pub(crate) async fn scrub_command_output(
     interrupts: &InterruptHub,
     session: &Session,
@@ -53,11 +61,10 @@ pub(crate) async fn scrub_command_output(
         .await?
         .is_none()
     {
-        // Detached hub (tests / standalone shim): no shared live table to
-        // union onto, so persist a local union exactly like the read tool's
-        // approved-secret fallback.
-        let table = redact.with_observed_output_secrets(cfg, &found)?;
-        session.persist_redaction_table(&table)?;
+        tracing::debug!(
+            observed = found.len(),
+            "no live session redaction table to register observed output secrets into"
+        );
     }
     // Encoded / case variants of an observed value that appear elsewhere in
     // this same output are caught now, not only from the next turn on.
@@ -100,6 +107,113 @@ mod tests {
 
     fn git_sha() -> String {
         ["0d1a4b2c8e3f60718293", "a4b5c6d7e8f9a0b1c2d3"].concat()
+    }
+
+    fn test_session(db: &crate::db::Db, tmp: &tempfile::TempDir) -> Arc<Session> {
+        Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A session worker's hub: owns a live shared table for `session`.
+    fn live_hub(
+        db: &crate::db::Db,
+        session: &Session,
+        interactive_clients: usize,
+    ) -> (InterruptHub, crate::daemon::SharedRedactionTable) {
+        let table: crate::daemon::SharedRedactionTable =
+            Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+        let (events, _rx) = tokio::sync::broadcast::channel(16);
+        let hub = InterruptHub::new(
+            events,
+            table.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(interactive_clients)),
+            db.clone(),
+            session.id,
+        );
+        (hub, table)
+    }
+
+    /// A scheduled fork (loop iteration / swarm child) runs its tools on a
+    /// leaf of the owning session's hub. What its shell output backstop
+    /// observes lands in THAT session's live and durable table, never in
+    /// another session's; the leaf itself can never prompt a human.
+    #[tokio::test]
+    async fn fork_leaf_registers_secrets_into_the_owning_session_table_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let owner = test_session(&db, &tmp);
+        let other = test_session(&db, &tmp);
+        let (owner_hub, owner_table) = live_hub(&db, &owner, 1);
+        let (_other_hub, other_table) = live_hub(&db, &other, 1);
+        let leaf = owner_hub.leaf_sharing_redaction();
+        assert!(
+            !leaf.is_interactive_attached(),
+            "a fork leaf never counts as an interactive client"
+        );
+
+        let stripe = stripe_key();
+        let scrubbed = scrub_command_output(
+            &leaf,
+            &owner,
+            &RedactionTable::empty(),
+            &RedactConfig::default(),
+            &format!("STRIPE_SECRET_KEY={stripe}\n"),
+        )
+        .await
+        .unwrap();
+        assert!(!scrubbed.contains(&stripe), "{scrubbed}");
+
+        let echo = format!("echo {stripe}");
+        let owner_live = owner_table.read().unwrap().clone();
+        assert!(!owner_live.scrub(&echo).contains(&stripe));
+        let owner_durable = owner.persisted_redaction_table().unwrap().unwrap();
+        assert!(!owner_durable.scrub(&echo).contains(&stripe));
+
+        let other_live = other_table.read().unwrap().clone();
+        assert!(other_live.scrub(&echo).contains(&stripe));
+        assert!(other.persisted_redaction_table().unwrap().is_none());
+    }
+
+    /// A hub that owns no live table has no serialized writer to register
+    /// through. The backstop still scrubs the output, but it must not write
+    /// the durable table from the tool's (possibly stale) snapshot: that
+    /// would drop an entry another writer committed after the snapshot.
+    #[tokio::test]
+    async fn detached_hub_scrubs_without_rewriting_the_durable_secret_table() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = test_session(&db, &tmp);
+        let committed = ["committed", "LiteralQ7w2e9"].concat();
+        let durable = RedactionTable::empty()
+            .with_forced_literal(committed.clone(), "$leak:contained".to_string())
+            .unwrap();
+        session.persist_redaction_table(&durable).unwrap();
+
+        let stripe = stripe_key();
+        let stale_snapshot = RedactionTable::empty();
+        let scrubbed = scrub_command_output(
+            &InterruptHub::detached(),
+            &session,
+            &stale_snapshot,
+            &RedactConfig::default(),
+            &format!("STRIPE_SECRET_KEY={stripe}\n"),
+        )
+        .await
+        .unwrap();
+        assert!(!scrubbed.contains(&stripe), "{scrubbed}");
+
+        let after = session.persisted_redaction_table().unwrap().unwrap();
+        assert!(
+            !after.scrub(&committed).contains(&committed),
+            "the committed durable entry survives"
+        );
     }
 
     /// `cat other/.env`-style output reaching a live session: secret-keyed

@@ -946,6 +946,107 @@ fn capture_schedule_events(driver: &mut Driver) -> mpsc::Receiver<TurnEvent> {
     rx
 }
 
+/// Secrets I2 end to end through the driver: a background job that prints
+/// another project's dotenv is injected into the next turn with the
+/// secret-keyed value replaced, and the value is registered in the session
+/// worker's live table, so a LATER turn that carries the bare value (no key,
+/// no recognizable shape) is still scrubbed at the provider egress. The
+/// session worker's hub also reaches the schedule context forks use.
+#[test]
+fn background_output_secret_is_scrubbed_and_registered_for_later_turns() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        use cockpit_test_support::provider::{ScriptedProvider, Turn, WireDialect};
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Text("noted".into()))
+            .repeat_last()
+            .start()
+            .await;
+        let (mut driver, tmp) = test_driver_with_url(8, provider.base_url());
+        driver
+            .session
+            .set_active_model("lmstudio", "local")
+            .unwrap();
+        driver.session.set_sandbox_enabled(false);
+        let live: crate::daemon::SharedRedactionTable =
+            Arc::new(std::sync::RwLock::new(driver.redact.clone()));
+        let (events, _events_rx) = tokio::sync::broadcast::channel(16);
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            live.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            driver.session.db.clone(),
+            driver.session.id,
+        ));
+        driver.set_interrupt_hub(hub.clone());
+        assert!(
+            Arc::ptr_eq(
+                &driver.schedule.schedule_context_for_tests().interrupts,
+                &hub
+            ),
+            "scheduled forks must reach the session worker's hub"
+        );
+
+        let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
+        std::fs::create_dir(tmp.path().join("other")).unwrap();
+        std::fs::write(
+            tmp.path().join("other").join(".env"),
+            format!("NODE_ENV=production\nSTRIPE_SECRET_KEY={stripe}\n"),
+        )
+        .unwrap();
+        let (approver, _approval_hub) = install_background_approver(&mut driver);
+        let command = "cat other/.env";
+        grant_background_command(&approver, command).await;
+        let out = driver
+            .dispatch_schedule_action(&serde_json::json!({
+                "action": "background.start",
+                "args": { "command": command }
+            }))
+            .await
+            .unwrap();
+        assert!(out.starts_with("started background"), "got {out}");
+        let completed = driver
+            .job_event_rx
+            .recv()
+            .await
+            .expect("background runner sends one terminal event");
+
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+        let (tx, _rx) = mpsc::channel(256);
+        driver.run_job_event(completed, &queue, &tx).await.unwrap();
+        driver
+            .run_user_input(
+                UserSubmission::text(format!("a log line also showed {stripe}")),
+                &queue,
+                &tx,
+            )
+            .await
+            .unwrap();
+
+        let bodies: Vec<String> = provider
+            .captured()
+            .into_iter()
+            .filter(|request| request.request_line.starts_with("POST "))
+            .map(|request| serde_json::to_string(&request.body).unwrap())
+            .collect();
+        assert!(bodies.len() >= 2, "two provider turns: {}", bodies.len());
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("NODE_ENV=production")
+                    && body.contains("STRIPE_SECRET_KEY=")),
+            "the background result reached the model"
+        );
+        for body in &bodies {
+            assert!(
+                !body.contains(&stripe),
+                "secret reached the provider: {body}"
+            );
+        }
+    });
+}
+
 fn install_background_approver(
     driver: &mut Driver,
 ) -> (

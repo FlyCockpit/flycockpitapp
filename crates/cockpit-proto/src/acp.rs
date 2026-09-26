@@ -533,11 +533,21 @@ pub enum AcpForwardedMcpTransportV1 {
 }
 
 /// Explicit name/value pair used for env and headers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpForwardedMcpNameValuePairV1 {
     pub name: String,
     pub value: String,
+}
+
+// Env and header values carry credentials: diagnostics get the name only.
+impl std::fmt::Debug for AcpForwardedMcpNameValuePairV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcpForwardedMcpNameValuePairV1")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Deserialize)]
@@ -822,6 +832,30 @@ pub enum ResolveCodeRootInterruptResultV1 {
 mod forwarded_mcp_tests {
     use super::*;
     use serde_json::json;
+
+    /// Secrets I1 class sweep: forwarded env / header values never reach
+    /// `{:?}` output of the pair or of the declarations holding it.
+    #[test]
+    fn forwarded_pair_debug_never_prints_env_or_secret_values() {
+        const SENTINEL: &str = "pairDebugSentinel5d0e";
+        let declaration = AcpForwardedMcpDeclarationV1 {
+            name: "demo".to_string(),
+            transport: AcpForwardedMcpTransportV1::Stdio {
+                command: "/usr/bin/server".to_string(),
+                args: vec![],
+                env: vec![pair("API_TOKEN", SENTINEL)],
+            },
+        };
+        let header = pair("Authorization", &format!("Bearer {SENTINEL}"));
+        for rendered in [
+            format!("{declaration:?}"),
+            format!("{declaration:#?}"),
+            format!("{header:?}"),
+        ] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+        }
+        assert!(format!("{declaration:?}").contains("API_TOKEN"));
+    }
 
     fn pair(name: &str, value: &str) -> AcpForwardedMcpNameValuePairV1 {
         AcpForwardedMcpNameValuePairV1 {

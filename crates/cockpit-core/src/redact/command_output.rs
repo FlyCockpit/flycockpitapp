@@ -149,7 +149,11 @@ fn keyed_novel_value_is_visible(value: &str) -> bool {
 ///   (`scheme://user:PASS@host`), and drops the keyless opaque-token rule.
 ///   Short all-digit values under keys outside the `*_PIN`/`*_PASSWORD`/
 ///   `*_PASSWD`/`*_SECRET` family (`"max_tokens": 4096`) stay visible: they
-///   are counts, not credentials.
+///   are counts, not credentials. So do values that are only a braced
+///   interpolation reference (`API_KEY=${API_KEY}`,
+///   `token: ${{ secrets.GITHUB_TOKEN }}`, `postgres://u:${DB_PASSWORD}@db`):
+///   they name a secret's source, and registering them would rewrite every
+///   compose file and workflow the agent reads afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NovelScrubMode {
     Full,
@@ -247,10 +251,46 @@ fn strip_matching_quotes(value: &str) -> &str {
     }
 }
 
+/// `true` when `value` (one layer of matching quotes stripped) is nothing but
+/// a braced interpolation reference — `${NAME}` or a GitHub Actions
+/// `${{ secrets.NAME }}` expression — which names where a secret comes from
+/// rather than carrying one. Deliberately strict so no literal can hide
+/// behind the shape: the inner text must be a plain identifier (`${NAME}`,
+/// no `:-default` / `=default` operator, whose default could be a literal
+/// secret) or a dotted identifier path (`${{ secrets.NAME }}`, no operators
+/// or quoted literals). A bare `$NAME` is NOT exempt: a literal password may
+/// begin with `$`.
+fn is_interpolation_reference(value: &str) -> bool {
+    let bare = strip_matching_quotes(value);
+    if let Some(inner) = bare
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+    {
+        let path = inner.trim();
+        return !path.is_empty()
+            && path.starts_with(|c: char| c.is_ascii_alphabetic())
+            && path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    }
+    let Some(name) = bare
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Keyed-value visibility under `mode`: the shared plausibility floor, plus
-/// the [`NovelScrubMode::KeyedNarrow`] short-count exemption.
+/// the [`NovelScrubMode::KeyedNarrow`] exemptions — braced interpolation
+/// references ([`is_interpolation_reference`]) and short counts.
 fn keyed_value_is_visible(mode: NovelScrubMode, key: &str, value: &str) -> bool {
     if keyed_novel_value_is_visible(value) {
+        return true;
+    }
+    if mode == NovelScrubMode::KeyedNarrow && is_interpolation_reference(value) {
         return true;
     }
     if mode == NovelScrubMode::KeyedNarrow && !credential_shaped_key(key) {
@@ -462,7 +502,10 @@ fn scrub_url_userinfo_passwords(
             continue;
         };
         let password = &userinfo[colon + 1..];
-        if password.is_empty() || password == placeholder || keyed_novel_value_is_visible(password)
+        if password.is_empty()
+            || password == placeholder
+            || keyed_novel_value_is_visible(password)
+            || is_interpolation_reference(password)
         {
             search = authority_end;
             continue;
@@ -2226,6 +2269,32 @@ mod tests {
         );
         let registered = format!("app:{password}");
         assert_eq!(found_values(&out), vec![registered.as_str()]);
+    }
+
+    /// Braced interpolation references name a secret's source; the narrow
+    /// backstop leaves them (and their compose / workflow files) intact and
+    /// registers nothing. Anything that could carry a literal — a `:-`
+    /// default, a bare `$NAME`, a partial reference — is still scrubbed.
+    #[test]
+    fn narrow_mode_keeps_interpolation_references_but_scrubs_literals() {
+        let table = table_with_placeholder(PH);
+        let references = concat!(
+            "API_KEY=${API_KEY}\n",
+            "  token: ${{ secrets.GITHUB_TOKEN }}\n",
+            "{\"client_secret\": \"${CLIENT_SECRET}\"}\n",
+            "DATABASE_URL=postgres://app:${DB_PASSWORD}@db:5432/app\n",
+        );
+        let out = narrow(&table, references);
+        assert_eq!(out.text, references);
+        assert!(out.found.is_empty(), "{:?}", out.found);
+
+        let literal = ["hunter2", "hunter2"].concat();
+        let body = format!(
+            "DB_PASSWORD=${{DB_PASSWORD:-{literal}}}\nAPI_TOKEN=${literal}\nAUTH_TOKEN=prefix${{X}}\npostgres://app:${{P:-{literal}}}@db/app\n"
+        );
+        let out = narrow(&table, &body);
+        assert!(!out.text.contains(&literal), "{}", out.text);
+        assert!(out.text.contains("AUTH_TOKEN=[ph]"), "{}", out.text);
     }
 
     #[test]

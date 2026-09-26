@@ -278,9 +278,24 @@ pub struct ScheduleContext {
     /// Hierarchical spend pool this job charges. Swarm children share one
     /// pool; schedule/goal iterations receive a per-run allotment.
     pub budget: crate::engine::delegation_budget::BudgetPool,
+    /// The owning session worker's interrupt hub. Forks never use it directly
+    /// (they have no human on the other end); [`Self::fork_interrupts`] mints
+    /// each fork a leaf that shares only its live redaction table.
+    pub interrupts: Arc<crate::engine::interrupt::InterruptHub>,
 }
 
 impl ScheduleContext {
+    /// The interrupt hub for one scheduled fork (loop / timer iteration or
+    /// swarm child) of this session: detached for interrupts, but sharing the
+    /// owning session's live redaction table and write lock
+    /// ([`crate::engine::interrupt::InterruptHub::leaf_sharing_redaction`]), so
+    /// secrets the fork's tools register (the shell output backstop's observed
+    /// values included) reach the owning session's table instead of being
+    /// dropped.
+    pub(crate) fn fork_interrupts(&self) -> Arc<crate::engine::interrupt::InterruptHub> {
+        Arc::new(self.interrupts.leaf_sharing_redaction())
+    }
+
     /// Resolve the coordinator, if one has been installed.
     pub fn write_scope(&self) -> Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>> {
         self.write_scope
@@ -637,6 +652,13 @@ impl ScheduleAuthority {
     /// the next wake boundary rather than aborting that iteration.
     pub fn set_redaction_table(&mut self, table: Arc<RedactionTable>) {
         self.ctx.update(|ctx| ctx.redact = table);
+    }
+
+    /// Install the owning session worker's interrupt hub (known only after
+    /// the driver is built), so forks started afterwards share its live
+    /// redaction table ([`ScheduleContext::fork_interrupts`]).
+    pub fn set_interrupt_hub(&mut self, hub: Arc<crate::engine::interrupt::InterruptHub>) {
+        self.ctx.update(|ctx| ctx.interrupts = hub);
     }
 
     /// Refresh the session config reader handed to async-job turns. In-flight
@@ -1524,6 +1546,7 @@ mod tests {
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             agent,
             budget: crate::engine::delegation_budget::BudgetPool::defaults(),
+            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
         };
         let authority = ScheduleAuthority::new(
             event_tx,

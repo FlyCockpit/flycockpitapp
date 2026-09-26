@@ -171,12 +171,29 @@ async fn bash_output_secret_straddling_truncation_boundary_is_redacted() {
     );
 }
 
+/// Install a session worker's hub on `ctx`: a live shared redaction table
+/// the output backstop registers into (a detached test hub owns none).
+fn install_live_redaction_hub(ctx: &mut ToolCtx) -> crate::daemon::SharedRedactionTable {
+    let table: crate::daemon::SharedRedactionTable =
+        Arc::new(std::sync::RwLock::new(ctx.redact.clone()));
+    let (events, _rx) = tokio::sync::broadcast::channel(16);
+    ctx.interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
+        events,
+        table.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ctx.session.db.clone(),
+        ctx.session.id,
+    ));
+    table
+}
+
 // Secrets I2: `cat` of another project's `.env` reaches the model with the
 // secret-keyed value replaced (the table has never seen it), the value is
-// registered so a later echo is table-scrubbed, and ordinary assignments,
-// git SHAs and UUIDs are untouched.
+// registered in the session's live and durable table so a later echo is
+// table-scrubbed (a keyless echo in the same output included), and ordinary
+// assignments, git SHAs and UUIDs are untouched.
 #[tokio::test]
-async fn bash_cat_of_unregistered_dotenv_is_scrubbed_and_registered() {
+async fn bash_cat_of_unregistered_dotenv_secret_is_scrubbed_and_registered() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("other")).unwrap();
     let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
@@ -189,8 +206,10 @@ async fn bash_cat_of_unregistered_dotenv_is_scrubbed_and_registered() {
         ),
     )
     .unwrap();
-    let command = "cat other/.env";
-    let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    // `cut` prints the bare value with no key: only registration catches it.
+    let command = "cat other/.env && cut -d= -f2 other/.env";
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let live = install_live_redaction_hub(&mut ctx);
     ctx.session
         .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
 
@@ -217,12 +236,14 @@ async fn bash_cat_of_unregistered_dotenv_is_scrubbed_and_registered() {
         assert!(!sidecar.payload.to_string().contains(&stripe));
     }
 
+    let later = format!("deploy used {stripe} again");
+    let live = live.read().unwrap().clone();
+    assert!(!live.scrub(&later).contains(&stripe));
     let persisted = ctx
         .session
         .persisted_redaction_table()
         .unwrap()
         .expect("observed value persisted with the session table");
-    let later = format!("deploy used {stripe} again");
     assert!(!persisted.scrub(&later).contains(&stripe));
 }
 

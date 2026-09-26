@@ -622,7 +622,9 @@ async fn run_iteration(
     // `turn` signature. Cancellation is the session-work child the authority
     // minted: TUI Ctrl+C (`CancelTurn`) does not fire it, but Stop /
     // `loop.cancel` does, aborting in-flight provider calls.
-    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+    // It still shares the owning session's live redaction table, so
+    // secrets its tools register are not dropped.
+    let interrupts = ctx.fork_interrupts();
     let mut scheduled_lane_driver = crate::engine::driver::Driver::for_nested_turn_plans(
         session.clone(),
         ctx.locks.clone(),
@@ -1045,6 +1047,7 @@ mod tests {
             guidance_compiler: None,
             local_installations: crate::agents::LocalInstallationResolver::no_installations(),
             budget: crate::engine::delegation_budget::BudgetPool::defaults(),
+            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             agent: Arc::new(Agent {
                 name: "builder".into(),
                 system: String::new(),

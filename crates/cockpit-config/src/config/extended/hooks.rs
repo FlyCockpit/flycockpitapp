@@ -598,7 +598,7 @@ pub fn resolve_hooks_from_captured_sources(
     registry
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHook {
     #[serde(default)]
@@ -608,6 +608,21 @@ struct RawHook {
     timeout_secs: Option<u16>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+}
+
+// Hook env values and arguments may be literal credentials: env names and an
+// argument count only, like [`ResolvedHook`]'s `Debug`.
+impl fmt::Debug for RawHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawHook")
+            .field("matcher", &self.matcher)
+            .field("executable", &self.command.first())
+            .field("argument_count", &self.command.len().saturating_sub(1))
+            .field("timeout_secs", &self.timeout_secs)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug, Default)]

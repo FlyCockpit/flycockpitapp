@@ -156,7 +156,7 @@ impl Driver {
                 // shell output: replace and register secret-shaped values the
                 // session table has never seen before the result is injected.
                 // Fail-closed: a registration failure withholds the output.
-                let result = if matches!(kind, ScheduleKind::Background) {
+                let result = if matches!(kind, crate::engine::schedule::ScheduleKind::Background) {
                     match self.scrub_background_output(&result).await {
                         Ok(scrubbed) => scrubbed,
                         Err(error) => {

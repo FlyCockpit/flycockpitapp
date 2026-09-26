@@ -1490,7 +1490,12 @@ pub struct InterruptHub {
     /// Every critical section reads the LATEST table under the lock; no `.await`
     /// that could touch the table happens outside it. All writers are async, so
     /// they all serialize on this one `tokio` mutex without a sync/async split.
-    redaction_table_write_lock: tokio::sync::Mutex<()>,
+    ///
+    /// Shared (`Arc`) with every leaf hub minted by
+    /// [`Self::leaf_sharing_redaction`], so a loop-fork or swarm-child tool
+    /// that registers into this session's table serializes on the SAME lock
+    /// as the owning worker's writers.
+    redaction_table_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Shared park-commit rendezvous for the worker that owns this hub, or
     /// `None` for the many non-daemon hubs (tests, standalone shims) that have
     /// no drain/attach lifecycle. Only the daemon session worker installs one
@@ -1556,7 +1561,7 @@ impl InterruptHub {
             session_id: Some(session_id),
             live_session: None,
             interactive_clients,
-            redaction_table_write_lock: tokio::sync::Mutex::new(()),
+            redaction_table_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             park_commit: None,
         }
     }
@@ -1575,8 +1580,26 @@ impl InterruptHub {
             session_id: None,
             live_session: None,
             interactive_clients: Arc::new(AtomicUsize::new(0)),
-            redaction_table_write_lock: tokio::sync::Mutex::new(()),
+            redaction_table_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             park_commit: None,
+        }
+    }
+
+    /// A leaf hub for a scheduled fork of this hub's session (loop / timer
+    /// iterations, swarm children): detached for interrupts — no client
+    /// fan-out, no durable interrupt rows, never interactive, so a leaf can
+    /// never raise an answerable prompt — but sharing this hub's live
+    /// redaction table AND its write lock. Registrations a fork's tools make
+    /// (the output backstop's observed secrets, approved secret files, sealed
+    /// adoptions) therefore land in the owning session's live table under
+    /// the same H1 serialization as the worker's own writers, instead of
+    /// being dropped by a detached hub. A hub without a table (itself
+    /// detached) yields a plain detached leaf.
+    pub fn leaf_sharing_redaction(&self) -> Self {
+        Self {
+            redaction: self.redaction.clone(),
+            redaction_table_write_lock: self.redaction_table_write_lock.clone(),
+            ..Self::detached()
         }
     }
 

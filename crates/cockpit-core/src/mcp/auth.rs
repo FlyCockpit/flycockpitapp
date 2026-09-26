@@ -187,7 +187,7 @@ impl StoredTokens {
 
 /// Resolved auth artifacts for a single client construction: request
 /// headers (remote transports) and extra subprocess env (stdio).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ResolvedAuth {
     pub headers: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
@@ -196,6 +196,20 @@ pub struct ResolvedAuth {
     /// remote transports and are reported through `header_errors`.
     pub missing_env: Vec<String>,
     pub header_errors: Vec<String>,
+}
+
+// Resolved header and env values are live credentials: diagnostics get the
+// header / variable names only.
+impl std::fmt::Debug for ResolvedAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedAuth")
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("env_names", &self.env.keys().collect::<Vec<_>>())
+            .field("missing_env", &self.missing_env)
+            .field("header_errors", &self.header_errors)
+            .finish()
+    }
 }
 
 /// Resolve the non-OAuth parts of a server's auth into headers + env.
@@ -743,6 +757,24 @@ mod tests {
     use super::*;
     use crate::mcp::config::{HeaderAuth, ServerConfig, Transport};
     use std::collections::BTreeMap;
+
+    /// Secrets I1 class sweep: resolved header and env values (live
+    /// credentials) never reach `{:?}` output.
+    #[test]
+    fn resolved_auth_debug_never_prints_env_or_secret_values() {
+        const SENTINEL: &str = "resolvedDebugSentinel41b2";
+        let resolved = ResolvedAuth {
+            headers: BTreeMap::from([("Authorization".to_string(), format!("Bearer {SENTINEL}"))]),
+            env: BTreeMap::from([("GITHUB_TOKEN".to_string(), SENTINEL.to_string())]),
+            missing_env: vec![],
+            header_errors: vec![],
+        };
+        for rendered in [format!("{resolved:?}"), format!("{resolved:#?}")] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+            assert!(rendered.contains("GITHUB_TOKEN"), "{rendered}");
+            assert!(rendered.contains("Authorization"), "{rendered}");
+        }
+    }
 
     fn base_server() -> ServerConfig {
         ServerConfig {

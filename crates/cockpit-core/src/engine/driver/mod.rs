@@ -2311,7 +2311,7 @@ impl Driver {
         if let Some(agent_instance_id) = agent_instance_id {
             driver.set_root_agent_instance_id(agent_instance_id);
         }
-        driver.interrupts = interrupts;
+        driver.set_interrupt_hub(interrupts);
         driver.approver = approver;
         driver.resource_scheduler = resource_scheduler;
         driver.set_vnext_local_installation_resolver(local_installations);
@@ -2418,6 +2418,7 @@ impl Driver {
             write_scope: self.write_scope.clone(),
             dream_read_scope: self.dream_read_scope.clone(),
             budget: self.budget.clone(),
+            interrupts: self.interrupts.clone(),
         };
         let schedule = ScheduleAuthority::new(
             job_event_tx,
@@ -2808,6 +2809,9 @@ impl Driver {
         let (noninteractive_complete_tx, noninteractive_complete_rx) =
             mpsc::channel::<BackgroundNoninteractiveCompletion>(JOB_CHANNEL_CAPACITY);
         let dream_read_scope = session.dream_read_scope();
+        // Detached until the session worker installs its hub
+        // ([`Self::set_interrupt_hub`] updates the schedule context too).
+        let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
         let ctx = crate::engine::schedule::authority::ScheduleContext {
             session: session.clone(),
             locks: locks.clone(),
@@ -2822,6 +2826,7 @@ impl Driver {
             write_scope: None,
             dream_read_scope: dream_read_scope.clone(),
             budget: crate::engine::delegation_budget::BudgetPool::defaults(),
+            interrupts: interrupts.clone(),
         };
         let shared_budget = ctx.budget.share();
         // The authority needs the engine UI-event channel (`tx`) to emit
@@ -2931,7 +2936,7 @@ impl Driver {
             goal_scratch: None,
             pending_idle_reason: None,
             tool_recovery_projection_pending: false,
-            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            interrupts,
             skills_no_utility_model_logged: false,
             injection_no_scan_logged: false,
             preflight_override: None,
@@ -3738,6 +3743,7 @@ impl Driver {
     /// `set_turn_tx`: the channel-bearing dependency isn't known at
     /// construction.
     pub fn set_interrupt_hub(&mut self, hub: Arc<crate::engine::interrupt::InterruptHub>) {
+        self.schedule.set_interrupt_hub(hub.clone());
         self.interrupts = hub;
     }
 

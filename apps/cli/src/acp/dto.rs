@@ -85,10 +85,20 @@ pub(crate) enum McpServerDto {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct NameValueDto {
     pub name: String,
     pub value: String,
+}
+
+// Env and header values carry credentials: diagnostics get the name only.
+impl std::fmt::Debug for NameValueDto {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NameValueDto")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) fn decode_session_new(
@@ -276,4 +286,29 @@ pub(crate) fn initialize_result() -> serde_json::Value {
         },
         "authMethods": []
     })
+}
+
+#[cfg(test)]
+mod debug_hygiene_tests {
+    use super::*;
+
+    /// Secrets I1 class sweep: ACP-supplied MCP env / header values never
+    /// reach `{:?}` output of the DTOs.
+    #[test]
+    fn mcp_server_dto_debug_never_prints_env_or_secret_values() {
+        const SENTINEL: &str = "dtoDebugSentinel2c7f";
+        let server = McpServerDto::Stdio {
+            name: "demo".to_string(),
+            command: "/usr/bin/server".to_string(),
+            args: vec![],
+            env: vec![NameValueDto {
+                name: "API_TOKEN".to_string(),
+                value: SENTINEL.to_string(),
+            }],
+        };
+        for rendered in [format!("{server:?}"), format!("{server:#?}")] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+            assert!(rendered.contains("API_TOKEN"), "{rendered}");
+        }
+    }
 }

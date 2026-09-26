@@ -24,17 +24,41 @@ use super::protocol::ToolDescriptor;
 
 pub const SOURCE_ACP_FORWARDED: &str = "acp_forwarded";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AcpForwardedStdioV1 {
     command: PathBuf,
     args: Vec<String>,
     env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Editor-forwarded env values and arguments can carry credentials: env names
+// and an argument count only in diagnostics.
+impl fmt::Debug for AcpForwardedStdioV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcpForwardedStdioV1")
+            .field("command", &self.command)
+            .field("argument_count", &self.args.len())
+            .field("env_names", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct AcpForwardedRemoteV1 {
     url: String,
     headers: BTreeMap<String, String>,
+}
+
+// Forwarded header values carry authorization: names only in diagnostics.
+impl fmt::Debug for AcpForwardedRemoteV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcpForwardedRemoteV1")
+            .field("url", &self.url)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -586,6 +610,40 @@ fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Secrets I1 class sweep: editor-forwarded env, header values and stdio
+    /// arguments never reach `{:?}` output of a catalog entry.
+    #[test]
+    fn forwarded_entry_debug_never_prints_env_or_secret_values() {
+        const SENTINEL: &str = "forwardedDebugSentinel93c1";
+        let stdio = AcpForwardedMcpEntryV1 {
+            name: "stdio".to_string(),
+            transport: AcpForwardedTransportV1::Stdio(AcpForwardedStdioV1 {
+                command: PathBuf::from("/usr/bin/server"),
+                args: vec![format!("--token={SENTINEL}")],
+                env: BTreeMap::from([("API_KEY".to_string(), SENTINEL.to_string())]),
+            }),
+        };
+        let remote = AcpForwardedMcpEntryV1 {
+            name: "http".to_string(),
+            transport: AcpForwardedTransportV1::Http(AcpForwardedRemoteV1 {
+                url: "https://mcp.example.test".to_string(),
+                headers: BTreeMap::from([(
+                    "Authorization".to_string(),
+                    format!("Bearer {SENTINEL}"),
+                )]),
+            }),
+        };
+        for rendered in [
+            format!("{stdio:?}"),
+            format!("{stdio:#?}"),
+            format!("{remote:?}"),
+        ] {
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+        }
+        assert!(format!("{stdio:?}").contains("API_KEY"));
+        assert!(format!("{remote:?}").contains("Authorization"));
+    }
 
     fn ingress(declarations: Vec<AcpForwardedMcpDeclarationV1>) -> AcpForwardedMcpIngressV1 {
         AcpForwardedMcpIngressV1 {

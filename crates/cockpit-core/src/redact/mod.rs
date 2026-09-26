@@ -3333,6 +3333,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/skills/mod.rs",
         "crates/cockpit-core/src/tools/edit.rs",
         "crates/cockpit-core/src/tools/mcp_tool.rs",
+        "crates/cockpit-core/src/tools/output_backstop.rs",
         "crates/cockpit-core/src/tools/read.rs",
         "crates/cockpit-core/src/tools/recall.rs",
         "crates/cockpit-core/src/tools/session_search.rs",

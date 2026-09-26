@@ -698,6 +698,64 @@ mod tests {
         assert_eq!(p, vec!["valid".to_string()]);
     }
 
+    /// Secrets I2: a configured custom tool that prints another project's
+    /// dotenv reaches the model with the secret-keyed value replaced and the
+    /// value registered in the session's live table; plain assignments stay.
+    #[tokio::test]
+    async fn custom_tool_output_secret_is_scrubbed_and_registered() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("other")).unwrap();
+        let stripe = ["zq8Hc2Lm", "N4pR7tV1wX3y"].concat();
+        std::fs::write(
+            temp.path().join("other").join(".env"),
+            format!("NODE_ENV=production\nSTRIPE_SECRET_KEY={stripe}\n"),
+        )
+        .unwrap();
+        let template = ToolCommandTemplate {
+            enabled: true,
+            command: "cat other/.env".into(),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "show_env",
+            &template,
+            ToolTemplateProvenance::Configured {
+                source: "test".into(),
+            },
+        );
+        let mut ctx = crate::tools::common::test_ctx(temp.path());
+        let live: crate::daemon::SharedRedactionTable =
+            std::sync::Arc::new(std::sync::RwLock::new(ctx.redact.clone()));
+        let (events, _rx) = tokio::sync::broadcast::channel(16);
+        ctx.interrupts = std::sync::Arc::new(crate::engine::interrupt::InterruptHub::new(
+            events,
+            live.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ctx.session.db.clone(),
+            ctx.session.id,
+        ));
+
+        let output = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+        assert!(!output.content.contains(&stripe), "{}", output.content);
+        assert!(
+            output.content.contains("NODE_ENV=production"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("STRIPE_SECRET_KEY="),
+            "{}",
+            output.content
+        );
+        let live = live.read().unwrap().clone();
+        assert!(
+            !live
+                .scrub(&format!("echo {stripe}"))
+                .contains(stripe.as_str())
+        );
+    }
+
     #[tokio::test]
     async fn managed_worktree_refuses_custom_shell_before_template_execution() {
         let temp = tempfile::tempdir().unwrap();

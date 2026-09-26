@@ -7481,7 +7481,7 @@ CREATE TABLE onboarding_runs (
         'welcome', 'profile', 'secure_store', 'provider', 'model', 'agent', 'lifetime', 'complete'
     )),
     bootstrap_state     TEXT NOT NULL CHECK (bootstrap_state IN (
-        'awaiting_choice', 'awaiting_passphrase', 'materializing', 'ready', 'failed'
+        'awaiting_choice', 'awaiting_passphrase', 'materializing', 'ready'
     )),
     selected_secure_placement TEXT CHECK (selected_secure_placement IN (
         'automatic', 'keyring', 'passphrase_file', 'machine_bound_file'

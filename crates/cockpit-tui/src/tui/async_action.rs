@@ -195,7 +195,6 @@ impl AsyncActionKind {
                 | "note"
                 | "onboarding.bootstrap"
                 | "onboarding.profile"
-                | "onboarding.ready_retry"
                 | "onboarding.secure_intent"
                 | "onboarding.transition"
                 | "queue.control"
@@ -591,6 +590,13 @@ pub enum AsyncActionPayload {
     StartupLifecycleResolved {
         generation: u64,
         result: Result<crate::tui::agent_runner::SelectedLifecycle, String>,
+    },
+    /// The selected owner serves ready services (with a retained ready
+    /// connection when the wait had to follow a ready handoff), or it is a
+    /// first-run owner onboarding owns (`None`).
+    StartupServicesReady {
+        generation: u64,
+        result: Result<Option<cockpit_client::DaemonClient>, String>,
     },
     StartupLifetimePolicy {
         generation: u64,

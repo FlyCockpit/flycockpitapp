@@ -679,6 +679,7 @@ async fn host_capabilities_boot_with_db_populates_snapshot_when_keyring_missing(
             crate::config::providers::ProvidersConfig::default(),
             extended,
         ),
+        None,
     )
     .await
     .expect("boot_with_db");

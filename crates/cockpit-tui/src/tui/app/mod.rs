@@ -2011,6 +2011,11 @@ struct StartupBackground {
     generation: u64,
     workspace_ready: bool,
     lifecycle_failure_started_at: Option<Instant>,
+    /// The startup chain's one end-to-end deadline, created at startup entry
+    /// and threaded through every startup await (lifecycle, bootstrap,
+    /// workspace); cleared once the first screen settles, so later fetches
+    /// get their own.
+    deadline: Option<tokio::time::Instant>,
     retry: Option<StartupRetry>,
     clipboard_reconcile_scheduled: bool,
     trace_milestones: HashSet<&'static str>,
@@ -3086,6 +3091,11 @@ pub struct App {
     /// reopen the surface; only explicit re-entry (the no-provider send
     /// guard) clears the flag.
     pub(super) onboarding_dismissed: bool,
+    /// Progress of the in-flight secure-store submission (its daemon handoff
+    /// to ready services), shown on the secure-store screen. `Some` exactly
+    /// while an `onboarding.secure_intent` action is in flight.
+    pub(super) onboarding_secure_intent_progress:
+        Option<(Instant, startup_layout::OnboardingHandoffProgress)>,
     /// An open `/side` side conversation, or `None` in the main session. While
     /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
     /// shows the side indicator with `/side end` guidance, and the fork is
@@ -3702,7 +3712,12 @@ impl StartupFirstPaintTiming {
         }
     }
 
-    fn log_after_draw(&mut self) {
+    /// Log the launch-to-first-paint metric once. The first frame is drawn
+    /// only after the startup chain settled the first screen, so this
+    /// measures the time to the first *correct* screen; `screen` names it and
+    /// `settled` is false only when the pre-paint deadline forced an early
+    /// paint.
+    fn log_after_draw(&mut self, screen: &'static str, settled: bool) {
         if self.logged {
             return;
         }
@@ -3717,6 +3732,8 @@ impl StartupFirstPaintTiming {
             target: cockpit_core::startup::TARGET,
             event = "first-paint",
             launch_to_first_paint_ms = format_args!("{launch_to_first_paint_ms:.1}"),
+            screen,
+            settled,
             "startup"
         );
         #[cfg(test)]
@@ -4257,6 +4274,7 @@ impl App {
                 generation: 1,
                 workspace_ready: false,
                 lifecycle_failure_started_at: None,
+                deadline: None,
                 retry: None,
                 clipboard_reconcile_scheduled: false,
                 trace_milestones: HashSet::new(),
@@ -4474,6 +4492,7 @@ impl App {
             pending_setup_wizard: None,
             pending_provider_add_template: None,
             onboarding_dismissed: false,
+            onboarding_secure_intent_progress: None,
             side_conversation: None,
             daemon_draining: false,
             predict_setting,
@@ -4523,7 +4542,43 @@ impl App {
         // terminal viewport by default. GOALS §1d: alt screen during
         // the session for the clean full-screen experience; on exit
         // we leave alt screen and print the tail to stdout.
-        let mut terminal = ratatui::try_init()?;
+        // Flicker-free startup: ask the daemon (spawning it if needed)
+        // whether onboarding is needed before the alternate screen exists,
+        // so the first frame is already the correct screen.
+        let mut pre_paint = startup_layout::TerminalPrePaint::enter();
+        match self
+            .settle_first_screen_before_paint(
+                async {
+                    cockpit_config::extended::load_global_daemon_lifetime_policy()
+                        .map_err(|error| error.to_string())
+                },
+                &mut pre_paint,
+            )
+            .await
+        {
+            startup_layout::FirstScreenOutcome::Decided => pre_paint.prepare_hand_off(),
+            startup_layout::FirstScreenOutcome::Cancelled => {
+                drop(pre_paint);
+                self.exit_requested = true;
+                return Ok(());
+            }
+            startup_layout::FirstScreenOutcome::Failed(error) => {
+                drop(pre_paint);
+                self.exit_requested = true;
+                anyhow::bail!("Cockpit could not start: {error}");
+            }
+        }
+        // The pre-paint guard keeps owning (and restoring) raw mode until the
+        // TUI terminal exists: a failed initialization returns the shell to
+        // cooked mode.
+        let mut terminal = match ratatui::try_init() {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                drop(pre_paint);
+                return Err(error.into());
+            }
+        };
+        pre_paint.release_to_tui();
         install_synchronized_update_panic_hook();
         let mut terminal_mode_guard = TerminalModeGuard::with_sink_and_title_state(
             CrosstermTerminalModeSink,
@@ -4850,7 +4905,14 @@ impl App {
     {
         cockpit_core::startup::mark_interactive_first_paint();
         let first_paint = !self.first_paint_completed;
-        self.startup_first_paint_timing.log_after_draw();
+        let screen = if self.onboarding_shell.is_some() {
+            "onboarding"
+        } else {
+            "chat"
+        };
+        let settled = self.first_screen_settled();
+        self.startup_first_paint_timing
+            .log_after_draw(screen, settled);
         self.first_paint_completed = true;
         if first_paint {
             tracing::info!(target: cockpit_core::startup::TARGET, event = "input-ready", "startup");

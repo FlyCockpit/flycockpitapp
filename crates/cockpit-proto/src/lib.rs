@@ -109,15 +109,15 @@ pub use host_capabilities::{
 pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use onboarding::{
     ApplyOnboardingProfile, ApplyOnboardingSecureIntent, ApplyOnboardingTransition,
-    BeginOrReopenOnboarding, LockedBootstrapHello, MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES,
-    OnboardingBootstrapEvent, OnboardingBootstrapSnapshot, OnboardingBootstrapState,
-    OnboardingReceiptQuery, OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage,
-    OnboardingStageSettlement, OnboardingTransitionKind, OnboardingTransitionReceipt,
-    OnboardingTransitionResult, SecurePlacementFailureReason, SensitiveOnboardingIntentError,
-    SensitiveOnboardingIntentFrame, SensitiveOnboardingIntentResponse,
-    SensitiveOnboardingPassphrase, decode_sensitive_onboarding_intent,
-    decode_sensitive_onboarding_response, encode_sensitive_onboarding_intent,
-    encode_sensitive_onboarding_response,
+    BeginOrReopenOnboarding, LockedBootstrapHello, LockedReadyConstruction,
+    MAX_SENSITIVE_ONBOARDING_PASSPHRASE_BYTES, OnboardingBootstrapEvent,
+    OnboardingBootstrapSnapshot, OnboardingBootstrapState, OnboardingReceiptQuery,
+    OnboardingReceiptStatus, OnboardingSecurePlacement, OnboardingStage, OnboardingStageSettlement,
+    OnboardingTransitionKind, OnboardingTransitionReceipt, OnboardingTransitionResult,
+    SecurePlacementFailureReason, SensitiveOnboardingIntentError, SensitiveOnboardingIntentFrame,
+    SensitiveOnboardingIntentResponse, SensitiveOnboardingPassphrase,
+    decode_sensitive_onboarding_intent, decode_sensitive_onboarding_response,
+    encode_sensitive_onboarding_intent, encode_sensitive_onboarding_response,
 };
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
@@ -1471,6 +1471,9 @@ pub fn version_mismatch_message(v: u32) -> String {
 pub struct DaemonHello {
     pub daemon_version: String,
     pub protocol_version: u32,
+    /// `None` for a daemon serving ready services; the locked owner's
+    /// ready-construction phase otherwise (carried by every locked hello).
+    pub ready_construction: Option<LockedReadyConstruction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1525,10 +1528,12 @@ pub fn daemon_hello_from_envelope(env: &Envelope) -> Option<DaemonHello> {
         } => Some(DaemonHello {
             daemon_version: daemon_version.clone(),
             protocol_version: *protocol_version,
+            ready_construction: None,
         }),
         Response::LockedBootstrapHello(hello) => Some(DaemonHello {
             daemon_version: DAEMON_VERSION.to_string(),
             protocol_version: hello.protocol_version,
+            ready_construction: Some(hello.ready_construction),
         }),
         _ => None,
     }
@@ -5882,6 +5887,7 @@ mod tests {
         DaemonHello {
             daemon_version: "0.0.test-daemon".to_string(),
             protocol_version,
+            ready_construction: None,
         }
     }
 

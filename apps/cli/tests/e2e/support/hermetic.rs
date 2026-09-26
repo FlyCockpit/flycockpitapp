@@ -459,6 +459,18 @@ struct PtyObserver {
     /// screen's header already drawn over the previous screen's body — so
     /// screen predicates are evaluated against this completed frame.
     completed_frame: Option<vt100::Screen>,
+    /// The very first synchronized-update frame the child completed, kept
+    /// for the rest of the run. The TUI draws every frame inside a
+    /// synchronized update, so this is exactly what the user saw first.
+    first_synchronized_frame: Option<vt100::Screen>,
+    /// Every synchronized-update frame the child completed, oldest first
+    /// (bounded), so a test can assert over *all* frames up to a point, not
+    /// only the first and the latest.
+    synchronized_frames: Vec<vt100::Screen>,
+    /// When the observer was created (the PTY child was just spawned) and
+    /// when the first synchronized frame completed: launch-to-first-frame.
+    spawned_at: Instant,
+    first_frame_at: Option<Instant>,
     /// When output that is not part of a completed frame last arrived, if
     /// any arrived after the latest frame boundary. Bytes past a boundary are
     /// either a frame still being written (a burst that ends in its own
@@ -521,11 +533,15 @@ struct FrameBoundaryObserver {
     in_sync: bool,
 }
 
+/// Bound on recorded synchronized frames per PTY child.
+const MAX_RECORDED_FRAMES: usize = 400;
+
 /// A frame-mode event at an offset (exclusive end, within the fed bytes).
 enum FrameEvent {
     /// A synchronized-update end (or, outside one, a frame-ending cursor
-    /// command) completed a frame.
-    Completed(usize),
+    /// command) completed a frame. The flag is set for a synchronized-update
+    /// end, the TUI's own frame boundary.
+    Completed(usize, bool),
     /// The child left framed output; any captured frame is stale.
     Left(usize),
 }
@@ -571,14 +587,14 @@ impl FrameBoundaryObserver {
                 self.in_sync = false;
                 self.frame_completed_after_clear = self.clears;
                 if !self.outside_frames {
-                    events.push(FrameEvent::Completed(end - carried));
+                    events.push(FrameEvent::Completed(end - carried, true));
                 }
             } else if (prefix.ends_with(Self::HIDE_CURSOR) || prefix.ends_with(Self::SHOW_CURSOR))
                 && !self.in_sync
             {
                 self.frame_completed_after_clear = self.clears;
                 if !self.outside_frames {
-                    events.push(FrameEvent::Completed(end - carried));
+                    events.push(FrameEvent::Completed(end - carried, false));
                 }
             }
         }
@@ -611,6 +627,10 @@ impl PtyObserver {
             osc52: Osc52Observer::new(),
             frames: FrameBoundaryObserver::default(),
             completed_frame: None,
+            first_synchronized_frame: None,
+            synchronized_frames: Vec::new(),
+            spawned_at: Instant::now(),
+            first_frame_at: None,
             unframed_since_boundary: None,
             handed_off: false,
         }
@@ -624,12 +644,21 @@ impl PtyObserver {
         let mut fed = 0;
         for event in self.frames.feed(bytes) {
             let end = match event {
-                FrameEvent::Completed(end) | FrameEvent::Left(end) => end,
+                FrameEvent::Completed(end, _) | FrameEvent::Left(end) => end,
             };
             self.parser.process(&bytes[fed..end]);
             fed = end;
+            if matches!(event, FrameEvent::Completed(_, true)) {
+                if self.first_synchronized_frame.is_none() {
+                    self.first_synchronized_frame = Some(self.parser.screen().clone());
+                    self.first_frame_at = Some(Instant::now());
+                }
+                if self.synchronized_frames.len() < MAX_RECORDED_FRAMES {
+                    self.synchronized_frames.push(self.parser.screen().clone());
+                }
+            }
             self.completed_frame = match event {
-                FrameEvent::Completed(_) => Some(self.parser.screen().clone()),
+                FrameEvent::Completed(..) => Some(self.parser.screen().clone()),
                 // Outside the alternate screen, predicates read the live
                 // screen until the next framed redraw.
                 FrameEvent::Left(_) => {
@@ -1437,6 +1466,39 @@ impl HermeticCockpit {
         ScreenSnapshot::from_screen(observer.parser.screen())
     }
 
+    /// Every synchronized frame drawn so far (bounded), oldest first.
+    pub fn synchronized_frame_snapshots(&self) -> Vec<ScreenSnapshot> {
+        let Some(pty) = self.pty.as_ref() else {
+            return Vec::new();
+        };
+        let observer = pty.observer.lock().expect("pty observer lock");
+        observer
+            .synchronized_frames
+            .iter()
+            .map(ScreenSnapshot::from_screen)
+            .collect()
+    }
+
+    /// Time from spawning the PTY child to its first completed frame.
+    pub fn launch_to_first_frame(&self) -> Option<Duration> {
+        let pty = self.pty.as_ref()?;
+        let observer = pty.observer.lock().expect("pty observer lock");
+        observer
+            .first_frame_at
+            .map(|at| at.duration_since(observer.spawned_at))
+    }
+
+    /// The first frame the TUI drew (its first completed synchronized
+    /// update), or `None` before it has drawn one.
+    pub fn first_frame_snapshot(&self) -> Option<ScreenSnapshot> {
+        let pty = self.pty.as_ref()?;
+        let observer = pty.observer.lock().expect("pty observer lock");
+        observer
+            .first_synchronized_frame
+            .as_ref()
+            .map(ScreenSnapshot::from_screen)
+    }
+
     /// Snapshot of the last frame the child finished drawing (the live
     /// screen before the first frame and after the child's output ended).
     pub fn settled_snapshot(&self) -> ScreenSnapshot {
@@ -1736,6 +1798,31 @@ impl HermeticCockpit {
 
     pub fn pty_size(&self) -> Option<(u16, u16)> {
         self.pty.as_ref().map(|pty| (pty.cols, pty.rows))
+    }
+
+    /// Whether the PTY's line discipline is back in cooked mode (echo and
+    /// canonical input), read from the master side. `None` without a PTY.
+    #[cfg(unix)]
+    pub fn pty_is_cooked(&self) -> Option<bool> {
+        let fd = self.pty.as_ref()?.master.as_raw_fd()?;
+        // SAFETY: `termios` is plain data; `fd` is the live PTY master.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; tcgetattr only writes into `termios`.
+        if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+            return None;
+        }
+        Some(termios.c_lflag & libc::ECHO != 0 && termios.c_lflag & libc::ICANON != 0)
+    }
+
+    /// Wait for the PTY child to exit and return whether it succeeded.
+    pub fn wait_for_child_exit_status(&mut self) -> Option<bool> {
+        let pty = self.pty.as_mut()?;
+        Some(
+            pty.child
+                .wait()
+                .expect("wait for exact PTY child exit")
+                .success(),
+        )
     }
 
     pub fn wait_for_child_exit(&mut self) {

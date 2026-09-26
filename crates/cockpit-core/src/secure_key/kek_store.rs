@@ -418,6 +418,58 @@ impl PassphraseKekStore {
     }
 }
 
+/// Domain separator of [`onboarding_passphrase_binding`].
+const ONBOARDING_PASSPHRASE_BINDING_DOMAIN: &[u8] =
+    b"dev.flycockpit/onboarding/secure-intent-passphrase-binding/v1";
+
+/// A keyed, salted, domain-separated binding of an onboarding passphrase to
+/// one secure-store operation, so a receipt can tell a replay of the same
+/// submission from an operation id reused with a different passphrase
+/// without ever storing the passphrase.
+///
+/// Argon2id with the passphrase vault's own cost parameters and a salt
+/// derived from the operation identity (`context`) under a fixed domain: the
+/// digest is no cheaper to attack than the passphrase vault's persisted KDF
+/// metadata beside it in the same database, and a per-operation salt defeats
+/// precomputation across operations and installations. Returns lowercase hex.
+pub fn onboarding_passphrase_binding(
+    passphrase: &[u8],
+    context: &[u8],
+) -> Result<String, SecureKeyError> {
+    use sha2::{Digest, Sha256};
+    if passphrase.is_empty() {
+        return Err(SecureKeyError::Invalid(
+            "an onboarding passphrase binding requires a non-empty passphrase".into(),
+        ));
+    }
+    let mut salt = Sha256::new();
+    salt.update(ONBOARDING_PASSPHRASE_BINDING_DOMAIN);
+    salt.update((context.len() as u64).to_be_bytes());
+    salt.update(context);
+    let salt = salt.finalize();
+    let argon_params = Params::new(
+        PASSPHRASE_KDF_MEMORY_KIB,
+        PASSPHRASE_KDF_ITERATIONS,
+        PASSPHRASE_KDF_PARALLELISM,
+        Some(KEY_BYTE_LEN),
+    )
+    .map_err(|error| SecureKeyError::Invalid(format!("invalid binding KDF parameters: {error}")))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params.clone());
+    let mut output = Zeroizing::new([0_u8; KEY_BYTE_LEN]);
+    let mut memory = Argon2WorkMemory::new(argon_params.block_count())?;
+    argon
+        .hash_password_into_with_memory(passphrase, &salt, output.as_mut(), &mut memory)
+        .map_err(|error| {
+            SecureKeyError::Internal(format!("binding onboarding passphrase: {error}"))
+        })?;
+    let mut encoded = String::with_capacity(KEY_BYTE_LEN * 2);
+    for byte in output.iter() {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(encoded)
+}
+
 fn derive_passphrase_kek(
     passphrase: Passphrase,
     params: &PassphraseKdfParams,

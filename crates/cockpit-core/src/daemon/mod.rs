@@ -1171,6 +1171,7 @@ pub async fn discover() -> DaemonProbe {
                 Some(proto::DaemonHello {
                     daemon_version: record.daemon_version,
                     protocol_version: record.protocol_version,
+                    ready_construction: None,
                 }),
             );
         }
@@ -1238,6 +1239,7 @@ pub fn discover_blocking() -> DaemonProbe {
                 Some(proto::DaemonHello {
                     daemon_version: record.daemon_version,
                     protocol_version: record.protocol_version,
+                    ready_construction: None,
                 }),
             );
         }
@@ -1272,6 +1274,7 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
                     Some(proto::DaemonHello {
                         daemon_version: record.daemon_version,
                         protocol_version: record.protocol_version,
+                        ready_construction: None,
                     }),
                 );
             }
@@ -2317,9 +2320,15 @@ fn spawn_owned_in_process_daemon(
                                 return Ok(());
                             }
                         };
+                        let services = match server::in_process_boot_services(services).await {
+                            Ok(services) => services,
+                            Err(error) => {
+                                let _ = booted.send(Err(error));
+                                return Ok(());
+                            }
+                        };
                         let ctx = match services {
-                            server::BootServices::Ready(ready) => {
-                                let ctx = std::sync::Arc::new(ready.context);
+                            server::BootServices::Ready(ctx) => {
                                 let endpoint = server::register_in_process_context(ctx.clone());
                                 let force = ctx.shutdown_signal().clone();
                                 if booted
@@ -2332,7 +2341,7 @@ fn spawn_owned_in_process_daemon(
                             }
                             server::BootServices::Locked(locked) => {
                                 let (endpoint, mut ready) =
-                                    server::locked_in_process_endpoint(std::sync::Arc::new(locked));
+                                    server::locked_in_process_endpoint(locked);
                                 let force = shutdown::ShutdownSignal::new();
                                 if booted
                                     .send(Ok(InProcessBootReady {
@@ -2664,9 +2673,15 @@ fn spawn_owned_production_first_run_test_daemon(
                                     return Ok(());
                                 }
                             };
+                        let services = match server::in_process_boot_services(services).await {
+                            Ok(services) => services,
+                            Err(error) => {
+                                let _ = booted.send(Err(anyhow::anyhow!("{error:#}")));
+                                return Ok(());
+                            }
+                        };
                         match services {
-                            server::BootServices::Ready(ready) => {
-                                let ctx = std::sync::Arc::new(ready.context);
+                            server::BootServices::Ready(ctx) => {
                                 let _endpoint = server::register_in_process_context(ctx.clone());
                                 let force = ctx.shutdown_signal().clone();
                                 if booted
@@ -2687,7 +2702,7 @@ fn spawn_owned_production_first_run_test_daemon(
                             }
                             server::BootServices::Locked(locked) => {
                                 let (endpoint, mut ready) =
-                                    server::locked_in_process_endpoint(std::sync::Arc::new(locked));
+                                    server::locked_in_process_endpoint(locked);
                                 server::register_locked_in_process_context(&paths.socket, endpoint);
                                 let force = shutdown::ShutdownSignal::new();
                                 if booted
@@ -2927,6 +2942,9 @@ async fn run_foreground_inner_with_boot_db(
     )
     .await;
     if let Err(error) = &result {
+        // A supervised worker reports to its supervisor (a no-op after
+        // readiness); a standalone daemon reports to its launcher.
+        supervisor::report_worker_boot_failure(error);
         spawn_notify::report_err(error);
     }
     result
@@ -2973,6 +2991,14 @@ async fn run_foreground_inner_with_boot_db_impl(
     }
     timer.phase("global_config_dir");
     let supervised_worker = supervisor::is_worker_process();
+    if supervised_worker {
+        // Each worker generation starts its own `daemon.log` run: a
+        // readiness failure's tail then shows only this worker's lines,
+        // never an earlier generation's failure (with its own tail) that
+        // the supervisor already logged.
+        daemon_log::set_process_role(daemon_log::DaemonLogRole::Worker);
+        daemon_log::write_run_marker(std::io::stderr(), daemon_log::DaemonLogRole::Worker);
+    }
     let mut inherited_listeners = supervisor::take_worker_listeners(&paths)?;
     // A staged rolling successor proves only its inherited process identity on
     // fd 4.  In particular, it must not open the tenant database before fd 6:
@@ -3125,10 +3151,10 @@ async fn run_foreground_inner_with_boot_db_impl(
         }
         None => server::boot(paths.clone(), terminal_factory).await?,
     };
-    let mut published_listeners = None;
-    let ctx = match services {
-        server::BootServices::Ready(ready) => std::sync::Arc::new(ready.context),
-        server::BootServices::Locked(locked) => {
+    let ready_signals: ReadySignalStreams;
+    let (ctx, listener, reveal_listener) = {
+        {
+            let locked = std::sync::Arc::new(services);
             // Locked bootstrap is itself a fully booted, authenticated local
             // service. Publish only after DB/non-secret construction, then
             // keep ordinary recovery and dispatch unreachable until the
@@ -3163,17 +3189,47 @@ async fn run_foreground_inner_with_boot_db_impl(
                 supervisor::report_worker_ready()?;
                 supervisor::wait_for_worker_promotion()?;
             }
+            // Worker readiness means "serving the bootstrap surface"; ready
+            // services are tracked separately (the hello phase). With a
+            // committed vault the locked run loop starts the daemon-owned
+            // ready construction once it is registered as the construction's
+            // consumer — after promotion, so a rolling successor never
+            // reconciles or attaches durable state while its predecessor still
+            // serves, and after the signal streams below are registered, so no
+            // first signal can reach construction unprotected.
+            //
+            // The first shutdown signal is an acknowledged locked stop, which
+            // waits for an in-flight ready construction to settle instead of
+            // dropping it mid-way. A repeated signal is the user's explicit
+            // force: the process exits at once, and because construction's
+            // only durable effects are idempotent recovery steps behind a
+            // committed vault, the next boot simply constructs again.
+            let force_exit = std::sync::Arc::new(tokio::sync::Notify::new());
+            // Register the signal streams before spawning (and before the run
+            // loop starts construction), so no signal can arrive between the
+            // spawn and the forwarder's first poll.
+            let signals = BootstrapShutdownSignals::new();
+            // The ready phase's signal streams are registered now too: a
+            // registered-but-unpolled stream keeps a signal pending, so a
+            // stop that arrives during the locked-to-ready handoff or the
+            // ready boot steps before the ready signal task runs is still
+            // delivered to it (tokio drops a signal no live stream observes).
+            ready_signals = ReadySignalStreams::new();
+            let mut signal_forwarder = ForegroundTask::new(tokio::spawn(
+                forward_locked_bootstrap_signals(locked.clone(), force_exit.clone(), signals),
+            ));
             let locked_outcome = tokio::select! {
                 result = server::run_locked_until_ready(
-                    std::sync::Arc::new(locked),
+                    locked.clone(),
                     listener,
                     reveal_listener,
-                ) => result?,
-                () = wait_for_bootstrap_shutdown_signal() => {
-                    anyhow::bail!("daemon bootstrap interrupted by shutdown signal")
-                }
+                ) => result,
+                () = force_exit.notified() => Err(anyhow::anyhow!(
+                    "daemon bootstrap force-stopped by a repeated shutdown signal"
+                )),
             };
-            let (ready, listener, reveal_listener) = match locked_outcome {
+            signal_forwarder.abort_and_join().await;
+            let (ready, listener, reveal_listener) = match locked_outcome? {
                 server::LockedRunOutcome::Ready(ready, listener, reveal_listener) => {
                     (ready, listener, reveal_listener)
                 }
@@ -3186,61 +3242,16 @@ async fn run_foreground_inner_with_boot_db_impl(
                     return Ok(());
                 }
             };
-            published_listeners = Some((listener, reveal_listener));
-            std::sync::Arc::new(ready.context)
+            (ready, listener, reveal_listener)
         }
     };
     boot_dbg!("after_ctx_boot");
-    // Recovery is part of the socket-publication barrier. Neither the control
-    // socket nor its reveal sibling may be observable while durable authority
-    // is still being reconciled.
-    boot_dbg!("before_recover");
-    server::recover_before_socket_publish(&ctx).await?;
+    // Pre-publication recovery ran inside the ready construction, while the
+    // locked owner served only its bootstrap allowlist: no ordinary request
+    // could observe durable authority before it was reconciled.
     timer.phase("boot");
     boot_dbg!("after_recover");
 
-    // Complete both fallible publication operations before any owned
-    // background task exists. The metadata guard retracts a published endpoint
-    // if the subsequent control bind fails.
-    let (listener, reveal_listener) = match published_listeners {
-        Some(listeners) => listeners,
-        None => {
-            if let Some(pid_receipt) = pid_receipt.as_ref() {
-                if uses_supplied_boot_db {
-                    write_endpoint_record_with_receipt_and_canonical(&paths, &paths, pid_receipt)?;
-                } else {
-                    write_endpoint_record(&paths)?;
-                }
-                if let Some(metadata_guard) = metadata_guard.as_mut() {
-                    metadata_guard.track_endpoint_record(endpoint_record);
-                }
-            }
-            // Prepare both required endpoints before publishing control readiness.
-            // Unix reveal binding is observable but harmless until control appears;
-            // Windows binds an undiscoverable random control pipe first, derives the
-            // reveal sibling from that immutable name, and writes control identity
-            // only after the sibling is ready.
-            #[cfg(unix)]
-            let listeners = match inherited_listeners.take() {
-                Some(listeners) => listeners,
-                None => publish_socket_pair_with(&paths, || bind_private_socket(&paths.socket))?,
-            };
-            #[cfg(windows)]
-            let listeners = match inherited_listeners.take() {
-                Some(listeners) => listeners,
-                None => prepare_and_publish_socket_pair(&paths)?,
-            };
-            // A promoted standby reported only its identity before boot; the
-            // supervisor completes the roll on this second report.
-            if standby_promoted_before_recovery {
-                supervisor::report_promoted_worker_serving()?;
-            } else {
-                supervisor::report_worker_ready()?;
-                supervisor::wait_for_worker_promotion()?;
-            }
-            listeners
-        }
-    };
     // A staged rolling successor has reported boot readiness but remains
     // paused above until the predecessor has exited.  Do not attach paused
     // sessions before that promotion gate: attachment itself starts a local
@@ -3266,15 +3277,13 @@ async fn run_foreground_inner_with_boot_db_impl(
         tokio::spawn(async move {
             #[cfg(unix)]
             {
-                use tokio::signal::unix::{SignalKind, signal};
-                let mut int = signal(SignalKind::interrupt()).ok();
-                let mut term = signal(SignalKind::terminate()).ok();
-                let mut roll = signal(SignalKind::user_defined1()).ok();
-                let mut commit = signal(SignalKind::user_defined2()).ok();
-                // SIGWINCH belongs to the foreground terminal and is emitted
-                // on resize. Use the otherwise-unclaimed SIGURG control lane
-                // for the supervisor-only abort decision.
-                let mut abort = signal(SignalKind::from_raw(libc::SIGURG)).ok();
+                let ReadySignalStreams {
+                    mut int,
+                    mut term,
+                    mut roll,
+                    mut commit,
+                    mut abort,
+                } = ready_signals;
                 loop {
                     let signal = tokio::select! {
                         _ = async { if let Some(s) = int.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => 0,
@@ -3370,8 +3379,13 @@ async fn run_foreground_inner_with_boot_db_impl(
                 // console-close control events, consistent with the rest of
                 // the codebase's non-unix signal handling. A second Ctrl-C
                 // during drain shortens to force, same as unix.
+                let ReadySignalStreams { mut ctrl_c } = ready_signals;
                 loop {
-                    if tokio::signal::ctrl_c().await.is_err() {
+                    let received = match ctrl_c.as_mut() {
+                        Some(stream) => stream.recv().await.is_some(),
+                        None => false,
+                    };
+                    if !received {
                         break;
                     }
                     server::request_shutdown(&ctx);
@@ -3659,21 +3673,161 @@ async fn prepare_worker_handover(
 
 /// Locked bootstrap exists before `DaemonContext` and therefore before its
 /// shutdown actor. Still honor the platform shutdown signal while waiting for
-/// vault intent so a first-run daemon can never become an unkillable owner.
-async fn wait_for_bootstrap_shutdown_signal() {
+/// vault intent so a first-run daemon can never become an unkillable owner:
+/// the first SIGINT/SIGTERM (or Ctrl-C/console-close) is an acknowledged
+/// locked stop that lets an in-flight ready construction settle first; a
+/// repeated signal requests an immediate forced exit.
+#[cfg(any(unix, windows))]
+async fn forward_locked_bootstrap_signals(
+    locked: std::sync::Arc<server::LockedServices>,
+    force_exit: std::sync::Arc<tokio::sync::Notify>,
+    mut signals: BootstrapShutdownSignals,
+) {
+    if !signals.recv().await {
+        return;
+    }
+    tracing::info!(
+        "shutdown signal during locked bootstrap; stopping once any in-flight ready construction settles"
+    );
+    locked.request_locked_stop();
+    if !signals.recv().await {
+        return;
+    }
+    tracing::warn!("repeated shutdown signal during locked bootstrap; forcing exit");
+    force_exit.notify_one();
+}
+
+/// The ready phase's signal streams, registered before the locked-to-ready
+/// handoff so no stop is lost between the two phases' signal handlers.
+#[cfg(any(unix, windows))]
+struct ReadySignalStreams {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut int = signal(SignalKind::interrupt()).ok();
-        let mut term = signal(SignalKind::terminate()).ok();
-        tokio::select! {
-            _ = async { if let Some(signal) = int.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
-            _ = async { if let Some(signal) = term.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+    int: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    roll: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    commit: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    abort: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+}
+
+#[cfg(any(unix, windows))]
+impl ReadySignalStreams {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                int: signal(SignalKind::interrupt()).ok(),
+                term: signal(SignalKind::terminate()).ok(),
+                roll: signal(SignalKind::user_defined1()).ok(),
+                commit: signal(SignalKind::user_defined2()).ok(),
+                // SIGWINCH belongs to the foreground terminal and is emitted
+                // on resize. Use the otherwise-unclaimed SIGURG control lane
+                // for the supervisor-only abort decision.
+                abort: signal(SignalKind::from_raw(libc::SIGURG)).ok(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                ctrl_c: tokio::signal::windows::ctrl_c().ok(),
+            }
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Shutdown-signal streams registered once, so a repeated signal is never
+/// lost between two waits: SIGINT/SIGTERM on Unix; Ctrl-C, Ctrl-Break,
+/// console close, and system shutdown on Windows.
+#[cfg(any(unix, windows))]
+struct BootstrapShutdownSignals {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    #[cfg(windows)]
+    ctrl_break: Option<tokio::signal::windows::CtrlBreak>,
+    #[cfg(windows)]
+    ctrl_close: Option<tokio::signal::windows::CtrlClose>,
+    #[cfg(windows)]
+    ctrl_shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
+
+#[cfg(any(unix, windows))]
+impl BootstrapShutdownSignals {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                interrupt: signal(SignalKind::interrupt()).ok(),
+                terminate: signal(SignalKind::terminate()).ok(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+            Self {
+                ctrl_c: ctrl_c().ok(),
+                ctrl_break: ctrl_break().ok(),
+                ctrl_close: ctrl_close().ok(),
+                ctrl_shutdown: ctrl_shutdown().ok(),
+            }
+        }
+    }
+
+    /// Wait for the next shutdown signal. `false` means no signal source is
+    /// available, so no signal can ever arrive.
+    async fn recv(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            let Self {
+                interrupt,
+                terminate,
+            } = self;
+            if interrupt.is_none() && terminate.is_none() {
+                return false;
+            }
+            tokio::select! {
+                _ = async { if let Some(signal) = interrupt.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(signal) = terminate.as_mut() { signal.recv().await; } else { std::future::pending::<()>().await } } => {}
+            }
+            true
+        }
+        #[cfg(windows)]
+        {
+            let Self {
+                ctrl_c,
+                ctrl_break,
+                ctrl_close,
+                ctrl_shutdown,
+            } = self;
+            if ctrl_c.is_none()
+                && ctrl_break.is_none()
+                && ctrl_close.is_none()
+                && ctrl_shutdown.is_none()
+            {
+                return false;
+            }
+            // Console close and system shutdown give the process only a few
+            // seconds before Windows terminates it: the stop is requested
+            // like any other, and an interrupted construction is simply
+            // reconstructed by the next boot.
+            tokio::select! {
+                _ = async { if let Some(s) = ctrl_c.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(s) = ctrl_break.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(s) = ctrl_close.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+                _ = async { if let Some(s) = ctrl_shutdown.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+            }
+            true
+        }
     }
 }
 
@@ -4601,6 +4755,7 @@ mod tests {
             Some(proto::DaemonHello {
                 daemon_version: "0.0.old".to_string(),
                 protocol_version: 0,
+                ready_construction: None,
             })
         );
         listener.join().expect("listener thread");
@@ -4634,6 +4789,7 @@ mod tests {
             Some(proto::DaemonHello {
                 daemon_version: "future-daemon".to_string(),
                 protocol_version: proto::PROTOCOL_VERSION + 1,
+                ready_construction: None,
             })
         );
         let message = proto::incompatible_daemon_protocol_message(proto::PROTOCOL_VERSION + 1);
@@ -5491,14 +5647,33 @@ mod tests {
         });
         wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
         assert!(eph.pid_file.exists(), "ephemeral pid file written");
+        // The socket publishes with the bootstrap surface; the ready
+        // construction then runs against this same DB. Persist the session
+        // row only once ready services serve (a ready-requirement connect
+        // waits for them), as the first user message would: a synchronous
+        // write racing construction on this current-thread runtime would
+        // block the very task holding the writer.
+        let ready_probe = cockpit_client::DaemonClient::connect(&eph.socket)
+            .await
+            .expect("ready services serve before the session row is persisted");
+        // A private, empty project root: the shared temp dir is unbounded
+        // and walking it (workspace-root discovery, test redaction coverage)
+        // made these tests take minutes on a busy host.
+        let project_root = harness
+            .state_home
+            .parent()
+            .expect("harness root")
+            .join(format!("project-{name}"));
+        std::fs::create_dir_all(&project_root).expect("private project root");
         let session = crate::session::Session::create_for_test(
             harness.db.clone(),
-            std::env::temp_dir(),
+            project_root,
             "Build",
             crate::session::test_redaction_key_resolver(),
         )
         .expect("persist a session row");
         assert!(session.is_persisted(), "row is persisted");
+        drop(ready_probe);
         (eph, eph_task)
     }
 

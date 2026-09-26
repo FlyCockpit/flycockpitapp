@@ -63,6 +63,17 @@ impl BoundRevealSocket {
         }
     }
 
+    /// Move the bound socket node to `dest` (an atomic same-directory
+    /// rename), keeping ownership of the new path.
+    #[cfg(unix)]
+    pub(crate) fn rename_to(&mut self, dest: std::path::PathBuf) -> std::io::Result<()> {
+        if self.path != dest {
+            std::fs::rename(&self.path, &dest)?;
+            self.path = dest;
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd as _;

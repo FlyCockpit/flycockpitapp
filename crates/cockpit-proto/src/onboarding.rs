@@ -30,7 +30,6 @@ pub enum OnboardingBootstrapState {
     AwaitingPassphrase,
     Materializing,
     Ready,
-    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,12 +162,33 @@ pub struct OnboardingReceiptQuery {
     pub client_operation_id: String,
 }
 
+/// Ready-service construction phase of a locked (vault-free or
+/// vault-just-committed) daemon owner. Every locked hello carries it, including
+/// the unauthenticated connection hello, so a client that has just committed
+/// the secure-store choice can wait on an explicit readiness signal instead of
+/// guessing from transport timeouts. The phase carries no secret or path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockedReadyConstruction {
+    /// No vault authority exists yet: the owner is waiting for the explicit
+    /// secure-store choice.
+    AwaitingSecureStore,
+    /// The vault committed and the daemon-owned ready construction is
+    /// running. The owner keeps answering hellos; ordinary services publish
+    /// once construction completes.
+    Constructing,
+    /// The vault committed but ready construction failed. The owner stays
+    /// locked and accepts `retry_onboarding_ready_construction`.
+    Failed,
+}
+
 /// Redacted metadata sent after local peer authentication while normal daemon
 /// services remain locked behind first-run vault materialization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockedBootstrapHello {
     pub protocol_version: u32,
     pub bootstrap_available: bool,
+    pub ready_construction: LockedReadyConstruction,
     pub host_capabilities: HostCapabilitySnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<OnboardingBootstrapSnapshot>,

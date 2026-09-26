@@ -112,6 +112,10 @@ pub struct SecretStoreInjected {
     pub keyring_kek: Option<Arc<dyn KekStore>>,
 }
 
+/// An opened vault. Cloning shares the same unlocked vault (and, for a
+/// passphrase vault, its derived key custody): the daemon hands the store
+/// opened by onboarding to ready construction instead of reopening it.
+#[derive(Clone)]
 pub struct EffectiveSecretStore {
     pub vault: Arc<SecretVault>,
     pub snapshot: SecretStoreSnapshot,

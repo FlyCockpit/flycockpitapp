@@ -129,7 +129,7 @@ pub async fn restart_skewed_daemon_if_idle_with_cooldown(
 }
 
 async fn read_skew_kind(socket: &Path) -> Result<SkewKind> {
-    let client = match DaemonClient::connect(socket).await {
+    let client = match DaemonClient::connect_bootstrap(socket).await {
         Ok(client) => client,
         // A draining owner closes mid-handshake; that is not version skew and
         // must not trigger a restart attempt against a departing process.

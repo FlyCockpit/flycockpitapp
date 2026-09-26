@@ -11,7 +11,8 @@ workspace = true
 
 [features]
 # FlyCockpit service synchronization, remote principals, and remote attachment
-# ledgers are excluded from the public local v0.1 dependency surface.
+# ledger code is excluded from the public local v0.1 API surface. Their tables
+# still exist in every build's single unconditional `0001_initial.sql`.
 default = []
 remote = []
 # Host-approval settlement is an internal daemon composition capability, not a
@@ -34,8 +35,9 @@ test-support = ["dep:cockpit-test-support"]
 # composition capability.  A generic Db caller must not be able to persist an
 # automatically resolvable `low_risk` request merely by choosing that string.
 host-capability-refresh-composition = []
-# Future local-only product domains that are deliberately outside the public
-# v0.1 schema: durable cron and image generation/spend ledgers.
+# Future local-only product domains (durable cron and image generation/spend
+# ledgers). Features gate code only: their tables are part of the single
+# unconditional `0001_initial.sql` in every build and stay empty without it.
 extended = []
 
 [dependencies]

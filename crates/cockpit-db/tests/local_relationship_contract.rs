@@ -12,7 +12,7 @@ const EXTENDED_SECTION_MARKER: &str = "-- ==== extended domains";
 const REMOTE_SECTION_MARKER: &str = "-- ==== remote domains";
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const SCHEMA_REVIEW_DIGEST: &str =
-    "9a70bac3438b727a030eabf03762a595d29d58551e5f0934a178728f225db927";
+    "3fe21f108d81bd6f58e8fa5c401f5f49116a6dda5e71e0163607f533ed762ad4";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
     "ec7029db08e8f2cc2a6bdedcc421b97c403ad95ed13321facd482639e98b074a";
 
@@ -52,7 +52,7 @@ fn relationship_inventory()
         );
         assert!(
             matches!(fields[0], "local" | "extended"),
-            "unknown schema profile in relationship inventory: {line}"
+            "unknown schema section in relationship inventory: {line}"
         );
         let class = match fields[3] {
             "non_relationship" => RelationshipClass::NonRelationship,
@@ -1078,7 +1078,7 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
     );
     assert!(
         extended.tables.len() > local.tables.len(),
-        "extended profile must add its deferred-domain inventory"
+        "extended section must add its deferred-domain inventory"
     );
     assert_eq!(
         local.objects.len(),

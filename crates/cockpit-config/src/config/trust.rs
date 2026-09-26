@@ -1,6 +1,6 @@
 //! Workspace trust root resolution and runtime enforcement.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -261,7 +261,16 @@ pub fn current_workspace_trust_policy() -> Option<WorkspaceTrustPolicy> {
 }
 
 pub fn project_config_allowed(cockpit_dir: &Path) -> bool {
-    let Some(policy) = runtime_policy() else {
+    project_config_allowed_for_policy(cockpit_dir, runtime_policy().as_ref())
+}
+
+/// [`project_config_allowed`] against an explicit policy rather than the
+/// ambient one. `None` (no policy resolved) fails closed.
+pub fn project_config_allowed_for_policy(
+    cockpit_dir: &Path,
+    policy: Option<&WorkspaceTrustPolicy>,
+) -> bool {
+    let Some(policy) = policy else {
         return false;
     };
     if policy.mode == WorkspaceTrustMode::Trust {
@@ -307,7 +316,15 @@ pub async fn resolve_historical_workspace_trust_policy_from_db(
     match std::fs::symlink_metadata(path) {
         Ok(_) => resolve_workspace_trust_policy_from_db(db, path).await,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let root = lexical_absolute(path);
+            // The persisted root is absolute; a relative one is refused
+            // rather than resolved against the process working directory.
+            anyhow::ensure!(
+                path.is_absolute(),
+                "historical workspace {} is not an absolute path",
+                path.display()
+            );
+            let root = comparable_path(path)
+                .with_context(|| format!("inspecting historical workspace {}", path.display()))?;
             Ok(WorkspaceTrustPolicy {
                 root: TrustRoot {
                     opened_path: root.clone(),
@@ -363,27 +380,94 @@ pub fn apply_trusted_workspace(root: TrustRoot, mode: WorkspaceTrustMode) -> Res
     }
 }
 
-pub fn path_is_project_cockpit_under_root(path: &Path, trust_root: &Path) -> bool {
-    let cockpit = trust_root.join(".cockpit");
-    path == cockpit || path.starts_with(&cockpit)
-}
-
+/// Whether `path` is (or lies inside) a project `.cockpit` configuration
+/// layer relative to `trust_root`: some location the path passes through —
+/// the entry as spelled in its canonical parent, or its resolved target — has
+/// a `.cockpit` component whose parent is the trust root, an ancestor of it,
+/// or a directory inside it. See [`traversal_locations`].
+///
+/// A path that cannot be classified (relative, dangling link, I/O error) is a
+/// project layer: it cannot be proven outside the root (fail closed).
 pub fn path_is_project_cockpit_layer(path: &Path, trust_root: &Path) -> bool {
-    // An unresolvable spelling cannot be proven outside the trust root, so it
-    // is classified as a project layer (fail closed).
-    let (Some(path), Some(trust_root)) = (
-        trust_comparable_path(path),
-        trust_comparable_path(trust_root),
-    ) else {
-        return true;
-    };
-    if path_is_project_cockpit_under_root(&path, &trust_root) {
-        return true;
-    }
-    path.file_name().is_some_and(|name| name == ".cockpit")
-        && trust_root.starts_with(path.parent().unwrap_or_else(|| Path::new("/")))
+    classify_project_cockpit_layer(path, trust_root).unwrap_or(true)
 }
 
+fn classify_project_cockpit_layer(path: &Path, trust_root: &Path) -> std::io::Result<bool> {
+    let root = comparable_path(trust_root)?;
+    Ok(traversal_locations(path)?
+        .iter()
+        .any(|location| location_in_project_cockpit(location, &root)))
+}
+
+/// Whether `path` has a `.cockpit` component in any location it passes
+/// through, whatever root it belongs to. Without a trust policy no root is
+/// known, so every such path is treated as a project layer.
+fn path_traverses_any_cockpit_dir(path: &Path) -> std::io::Result<bool> {
+    Ok(traversal_locations(path)?.iter().any(|location| {
+        location.components().any(
+            |component| matches!(component, Component::Normal(name) if is_cockpit_dir_name(name)),
+        )
+    }))
+}
+
+/// The one write-side trust decision for a configuration file under an
+/// explicit policy (`None`: no policy is in force). A file that passes
+/// through a project `.cockpit` directory (see
+/// [`path_is_project_cockpit_layer`]) is writable only under `Trust`; with no
+/// policy, every file that passes through any `.cockpit` directory is
+/// refused. Files elsewhere (the global and machine-local layers, an operator
+/// override outside every project) need no trust.
+pub fn config_file_write_decision(
+    path: &Path,
+    policy: Option<&WorkspaceTrustPolicy>,
+) -> Result<(), ConfigWriteRefusal> {
+    match policy {
+        Some(policy) if policy.mode == WorkspaceTrustMode::Trust => Ok(()),
+        Some(policy) => match classify_project_cockpit_layer(path, &policy.root.root) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(ConfigWriteRefusal::UntrustedProjectLayer),
+            Err(_) => Err(ConfigWriteRefusal::Unclassifiable),
+        },
+        None => match path_traverses_any_cockpit_dir(path) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(ConfigWriteRefusal::NoWorkspacePolicy),
+            Err(_) => Err(ConfigWriteRefusal::Unclassifiable),
+        },
+    }
+}
+
+/// Why a configuration write was refused by workspace trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigWriteRefusal {
+    /// The file sits in a project `.cockpit` layer the policy does not trust.
+    UntrustedProjectLayer,
+    /// The file sits in a `.cockpit` layer and no workspace-trust policy is
+    /// in force, so it cannot be proven trusted.
+    NoWorkspacePolicy,
+    /// The path could not be classified (relative, a dangling link, or an
+    /// I/O error while resolving it).
+    Unclassifiable,
+}
+
+impl std::fmt::Display for ConfigWriteRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UntrustedProjectLayer => {
+                "it is in a project .cockpit layer that workspace trust does not allow writing"
+            }
+            Self::NoWorkspacePolicy => {
+                "it is in a project .cockpit layer and no workspace-trust decision is in force"
+            }
+            Self::Unclassifiable => "its location could not be resolved to check workspace trust",
+        })
+    }
+}
+
+/// Whether an ambient-trust-gated path (skill or agent definition directory,
+/// a command's working directory) must be ignored: outside `Trust`, every
+/// path any of whose traversed locations (entry as spelled, or resolved
+/// target) is at or under the trust root is blocked. No policy blocks
+/// everything, and an unclassifiable path is blocked (fail closed).
 pub fn path_blocked_by_workspace_trust(path: &Path) -> bool {
     let Some(policy) = runtime_policy() else {
         return true;
@@ -391,31 +475,163 @@ pub fn path_blocked_by_workspace_trust(path: &Path) -> bool {
     if policy.mode == WorkspaceTrustMode::Trust {
         return false;
     }
-    let (Some(path), Some(root)) = (
-        trust_comparable_path(path),
-        trust_comparable_path(&policy.root.root),
-    ) else {
-        return true;
+    let classify = || -> std::io::Result<bool> {
+        let root = comparable_path(&policy.root.root)?;
+        Ok(traversal_locations(path)?
+            .iter()
+            .any(|location| location.starts_with(&root)))
     };
-    path == root || path.starts_with(root)
+    classify().unwrap_or(true)
 }
 
-/// Spell `path` the way trust roots are recorded, so containment is decided
-/// on the filesystem object rather than on one of its many spellings.
+fn is_cockpit_dir_name(name: &std::ffi::OsStr) -> bool {
+    // Case-insensitive volumes (the macOS and Windows defaults) open
+    // `.COCKPIT` as `.cockpit`.
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        name.to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(".cockpit"))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        name == ".cockpit"
+    }
+}
+
+/// Whether `location` has a `.cockpit` component whose parent is `root`, an
+/// ancestor of `root`, or a directory inside `root`.
+fn location_in_project_cockpit(location: &Path, root: &Path) -> bool {
+    let mut parent = PathBuf::new();
+    for component in location.components() {
+        if let Component::Normal(name) = component
+            && is_cockpit_dir_name(name)
+            && (root.starts_with(&parent) || parent.starts_with(root))
+        {
+            return true;
+        }
+        parent.push(component.as_os_str());
+    }
+    false
+}
+
+/// Every location the filesystem visits when it opens `path`: for each
+/// component, its *entry* (the component as spelled, inside the canonical
+/// form of everything before it) and, when the entry exists, its *resolved*
+/// form (`canonicalize`). Trust must judge both — the entry because a
+/// `.cockpit` that is itself a symlink is still the project's `.cockpit`
+/// layer, and the resolved form because a link elsewhere can lead into one.
 ///
-/// Trust roots are canonical (`std::fs::canonicalize`), while candidate
-/// directories arrive in caller spelling (discovered from a cwd, a symlinked
-/// checkout, or — on Windows — an 8.3 short name such as `RUNNER~1` and a
-/// `C:\` rather than verbatim `\\?\C:\` prefix). A purely lexical
-/// comparison of the two never matches on Windows, which silently let an
-/// untrusted or ignore-config workspace's `.cockpit` layer load. Resolving
-/// through the nearest existing ancestor keeps a missing leaf comparable.
-/// `None` means the spelling could not be resolved; callers fail closed.
-fn trust_comparable_path(path: &Path) -> Option<PathBuf> {
-    let lexical = lexical_absolute(path);
-    cockpit_host::path_containment::effective_path(&lexical)
-        .ok()
-        .map(|effective| super::files::normalize_macos_system_path(&effective))
+/// Relative input is refused rather than resolved against the process
+/// working directory. `..` is applied to the canonical prefix (the physical
+/// parent, as the kernel applies it), never popped lexically across a link.
+/// A missing tail is appended as spelled (it contains no links). A dangling
+/// link or any error other than absence is an error; callers fail closed.
+fn traversal_locations(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    Ok(walk_path(path)?.0)
+}
+
+/// The canonical form of `path`'s existing prefix plus its missing tail, as
+/// the same walk as [`traversal_locations`] computes it.
+fn comparable_path(path: &Path) -> std::io::Result<PathBuf> {
+    Ok(walk_path(path)?.1)
+}
+
+fn walk_path(path: &Path) -> std::io::Result<(Vec<PathBuf>, PathBuf)> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`{}` is relative; workspace trust never resolves against the working directory",
+                path.display()
+            ),
+        ));
+    }
+    let mut locations = Vec::new();
+    let mut current = PathBuf::new();
+    // Number of trailing components of `current` that do not exist. They are
+    // plain names (a missing entry cannot be a link), so popping them is exact.
+    let mut missing = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => current.push(component.as_os_str()),
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                current = std::fs::canonicalize(&current)?;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                missing = missing.saturating_sub(1);
+                // `current` is canonical or a missing tail over a canonical
+                // prefix, so its parent is the physical parent.
+                current.pop();
+            }
+            Component::Normal(name) => {
+                let entry = current.join(name);
+                locations.push(entry.clone());
+                if missing > 0 {
+                    missing += 1;
+                    current = entry;
+                    continue;
+                }
+                match std::fs::canonicalize(&entry) {
+                    Ok(resolved) => {
+                        refuse_unprovable_reparse_spelling(&entry, name)?;
+                        locations.push(resolved.clone());
+                        current = resolved;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match std::fs::symlink_metadata(&entry) {
+                            Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {
+                                missing = 1;
+                                current = entry;
+                            }
+                            Ok(_) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    format!("`{}` is a dangling link", entry.display()),
+                                ));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok((locations, current))
+}
+
+/// On Windows an entry may be spelled by its 8.3 short name (`COCKPI~1`).
+/// For an ordinary entry the resolved form carries the long name, but for a
+/// reparse point (symlink or junction) the resolved form is the target, so
+/// the entry's own long name is never observed. Such a spelling cannot be
+/// classified and is refused.
+#[cfg(windows)]
+fn refuse_unprovable_reparse_spelling(entry: &Path, name: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let short_spelling = name.to_string_lossy().contains('~');
+    if short_spelling
+        && std::fs::symlink_metadata(entry)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`{}` is a link spelled by a short name; spell it by its long name",
+                entry.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn refuse_unprovable_reparse_spelling(
+    _entry: &Path,
+    _name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn canonical_dir_path(path: &Path) -> Result<PathBuf> {
@@ -430,31 +646,6 @@ fn canonical_dir_path(path: &Path) -> Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .context("path has no parent directory")
-}
-
-fn lexical_absolute(path: &Path) -> PathBuf {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    };
-    super::files::normalize_macos_system_path(&lexical_normalize(&abs))
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

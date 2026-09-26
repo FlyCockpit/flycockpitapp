@@ -2094,9 +2094,8 @@ pub fn persist_provider(
     provider_id: &str,
     entry: ProviderEntry,
 ) -> Result<()> {
-    let path = crate::config::dirs::config_write_target_for_provider(cwd, provider_id).ok_or_else(
-        || anyhow!("no cockpit config found — run `/settings` inside the TUI to create one"),
-    )?;
+    let path = crate::config::dirs::config_write_target_for_provider(cwd, provider_id)
+        .map_err(|error| anyhow!("cannot persist fetched models: {error}"))?;
     let mut doc = crate::config::providers::ConfigDoc::load(&path)?;
     doc.write_provider_models(
         provider_id,

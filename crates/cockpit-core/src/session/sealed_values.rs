@@ -107,6 +107,43 @@ fn validate_agent_acquired_sealed_value(
     Ok(())
 }
 
+/// Union every live machine-scoped sealed literal into `table`. The single
+/// sealed-source fold shared by sessions and sessionless workspace coverage
+/// (debug-context projection for a caller-supplied root).
+pub(crate) async fn union_machine_scoped_sealed_redactions(
+    db: &crate::db::Db,
+    vault: &std::sync::Arc<crate::secure_key::SecretVault>,
+    table: &crate::redact::RedactionTable,
+) -> Result<crate::redact::RedactionTable> {
+    let records = db.machine_scoped_sealed_redaction_records().await?;
+    let compartment = crate::sealed::compartment::SealedCompartment::from_vault(vault.clone());
+    let mut unioned = table.clone();
+
+    for record in records {
+        let locator = record
+            .compartment_key
+            .as_deref()
+            .context("live machine-scoped sealed value has no compartment locator")?;
+        let key = crate::sealed::compartment::SealedCompartmentKey::parse(locator)?;
+        let literal = compartment
+            .get_exact(&key)?
+            .context("live machine-scoped sealed value is missing its compartment literal")?;
+        let identity = crate::sealed::identity::SealedRedactionIdentity {
+            scope: record.scope,
+            record_id: Some(crate::sealed::identity::SealedRecordId::parse(
+                &record.record_id,
+            )?),
+            name: crate::sealed::identity::SealedName::canonical(&record.name)?,
+            version: u32::try_from(record.active_version)
+                .context("sealed value version does not fit the redaction identity")?,
+        };
+        unioned = unioned
+            .with_forced_sealed_literal(literal.expose_for_redaction().to_string(), identity)?;
+    }
+
+    Ok(unioned)
+}
+
 #[cfg(test)]
 mod agent_acquisition_tests {
     use super::*;
@@ -139,34 +176,7 @@ impl Session {
         &self,
         table: &crate::redact::RedactionTable,
     ) -> Result<crate::redact::RedactionTable> {
-        let records = self.db.machine_scoped_sealed_redaction_records().await?;
-        let compartment =
-            crate::sealed::compartment::SealedCompartment::from_vault(self.secret_vault.clone());
-        let mut unioned = table.clone();
-
-        for record in records {
-            let locator = record
-                .compartment_key
-                .as_deref()
-                .context("live machine-scoped sealed value has no compartment locator")?;
-            let key = crate::sealed::compartment::SealedCompartmentKey::parse(locator)?;
-            let literal = compartment
-                .get_exact(&key)?
-                .context("live machine-scoped sealed value is missing its compartment literal")?;
-            let identity = crate::sealed::identity::SealedRedactionIdentity {
-                scope: record.scope,
-                record_id: Some(crate::sealed::identity::SealedRecordId::parse(
-                    &record.record_id,
-                )?),
-                name: crate::sealed::identity::SealedName::canonical(&record.name)?,
-                version: u32::try_from(record.active_version)
-                    .context("sealed value version does not fit the redaction identity")?,
-            };
-            unioned = unioned
-                .with_forced_sealed_literal(literal.expose_for_redaction().to_string(), identity)?;
-        }
-
-        Ok(unioned)
+        union_machine_scoped_sealed_redactions(&self.db, &self.secret_vault, table).await
     }
 
     /// Capture the sealed portion of a fresh authority scan. This local empty

@@ -558,16 +558,21 @@ fn resolve_gitignore_allow_unions_layers_dedup() {
 fn resolve_redact_list_unions_layers_dedup_and_trim() {
     let tmp = TempDir::new().unwrap();
     let global = tmp.path().join("global.json");
-    let project = tmp.path().join("project.json");
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join(".cockpit")).unwrap();
+    let project = root.join(".cockpit/config.json");
+    let shared = tmp.path().join("shared/.env.ci");
+    let dup = root.join("dup.env");
     std::fs::write(
         &global,
-        r#"{
-                "redact": {
-                    "denylist": ["AKIA_HOME", "dup"],
-                    "allowlist": ["PATH", " HOME_ONLY "],
-                    "extra_dotenv_paths": ["../shared/.env.ci", "dup.env"]
-                }
-            }"#,
+        serde_json::json!({
+            "redact": {
+                "denylist": ["AKIA_HOME", "dup"],
+                "allowlist": ["PATH", " HOME_ONLY "],
+                "extra_dotenv_paths": [shared, dup]
+            }
+        })
+        .to_string(),
     )
     .unwrap();
     std::fs::write(
@@ -602,12 +607,94 @@ fn resolve_redact_list_unions_layers_dedup_and_trim() {
     );
     assert_eq!(
         merged.extra_dotenv_paths,
+        vec![shared, dup, root.join("project.env")],
+        "project-relative entries anchor at the declaring layer's root, then dedupe by path"
+    );
+}
+
+#[test]
+fn relative_extra_dotenv_paths_anchor_at_the_declaring_layer() {
+    let tmp = TempDir::new().unwrap();
+    let outer = tmp.path().join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(outer.join(".cockpit")).unwrap();
+    std::fs::create_dir_all(inner.join(".cockpit")).unwrap();
+    let global = tmp.path().join("global.json");
+    std::fs::write(
+        &global,
+        r#"{"redact":{"extra_dotenv_paths":["relative-in-global.env"]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        outer.join(".cockpit/config.json"),
+        r#"{"redact":{"extra_dotenv_paths":["secrets/outer.env", "../up.env"]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        inner.join(".cockpit/config.json"),
+        r#"{"redact":{"extra_dotenv_paths":["inner.env"]}}"#,
+    )
+    .unwrap();
+
+    let docs = load_existing_docs_from_paths(&[
+        global,
+        outer.join(".cockpit/config.json"),
+        inner.join(".cockpit/config.json"),
+    ]);
+    let mut warnings = Vec::new();
+    let merged = resolve_redact_list_unions_from_docs(&docs, &mut warnings);
+
+    assert_eq!(
+        merged.extra_dotenv_paths,
         vec![
-            PathBuf::from("../shared/.env.ci"),
-            PathBuf::from("dup.env"),
-            PathBuf::from("project.env"),
+            outer.join("secrets/outer.env"),
+            outer.join("../up.env"),
+            inner.join("inner.env"),
         ],
-        "relative paths are preserved verbatim and deduped by PathBuf equality"
+        "each relative entry anchors at its own layer, never a process cwd"
+    );
+    assert_eq!(
+        warnings,
+        vec![RELATIVE_EXTRA_DOTENV_PATH_WARNING.to_string()],
+        "a relative entry in a layer without a project root is rejected"
+    );
+}
+
+#[test]
+fn anchor_config_relative_path_rejects_rooted_and_prefixed_relative_paths() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    assert_eq!(
+        anchor_config_relative_path(Some(root), std::path::Path::new("a/.env")),
+        Some(root.join("a/.env"))
+    );
+    assert_eq!(
+        anchor_config_relative_path(None, std::path::Path::new("a/.env")),
+        None
+    );
+    assert_eq!(
+        anchor_config_relative_path(
+            Some(std::path::Path::new("relative-root")),
+            std::path::Path::new("a/.env")
+        ),
+        None,
+        "a non-absolute base never anchors"
+    );
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            anchor_config_relative_path(Some(root), std::path::Path::new(r"C:secrets.env")),
+            None
+        );
+        assert_eq!(
+            anchor_config_relative_path(Some(root), std::path::Path::new(r"\secrets.env")),
+            None
+        );
+    }
+    let absolute = root.join("abs.env");
+    assert_eq!(
+        anchor_config_relative_path(None, &absolute),
+        Some(absolute.clone())
     );
 }
 
@@ -636,16 +723,20 @@ fn load_for_cwd_unions_redact_lists_and_keeps_dotenv_patterns_replace() {
     let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
     let home_cfg = tmp.path().join("home/.config/cockpit/config.json");
     std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
+    // An absolute path on every platform (a bare `/abs/...` is not absolute
+    // on Windows).
+    let home_env = tmp.path().join("abs/home.env");
     std::fs::write(
         &home_cfg,
-        r#"{
-                "redact": {
-                    "denylist": ["home-secret"],
-                    "allowlist": ["HOME_OK"],
-                    "extra_dotenv_paths": ["home.env"],
-                    "dotenv_patterns": [".env.home"]
-                }
-            }"#,
+        serde_json::json!({
+            "redact": {
+                "denylist": ["home-secret"],
+                "allowlist": ["HOME_OK"],
+                "extra_dotenv_paths": [home_env],
+                "dotenv_patterns": [".env.home"]
+            }
+        })
+        .to_string(),
     )
     .unwrap();
     let project = tmp.path().join("repo");
@@ -675,7 +766,7 @@ fn load_for_cwd_unions_redact_lists_and_keeps_dotenv_patterns_replace() {
     );
     assert_eq!(
         cfg.redact.extra_dotenv_paths,
-        vec![PathBuf::from("home.env"), PathBuf::from("project.env")]
+        vec![home_env, project.join("project.env")]
     );
     assert_eq!(
         cfg.redact.dotenv_patterns,
@@ -721,6 +812,7 @@ fn append_gitignore_allow_targets_project_and_dedups() {
     let cfg_path = project.join(".cockpit/config.json");
     std::fs::write(&cfg_path, r#"{"name":"Chris"}"#).unwrap();
 
+    let _trust = enter_trusted_workspace(&project);
     append_gitignore_allow_to_project(&project, "target/").unwrap();
     append_gitignore_allow_to_project(&project, "target/").unwrap(); // dup no-op
     append_gitignore_allow_to_project(&project, "dist/**").unwrap();
@@ -732,6 +824,45 @@ fn append_gitignore_allow_targets_project_and_dedups() {
     );
     // Sibling key preserved.
     assert_eq!(cfg.name.as_deref(), Some("Chris"));
+}
+
+/// "Approve for this project" is workspace-bound: with no trust decision it
+/// is refused, and under IgnoreConfig it lands in the per-directory
+/// machine-local layer — never the ignored project's `.cockpit` (not even
+/// scaffolded) and never the global layer.
+#[test]
+fn append_gitignore_allow_never_writes_an_ignored_project() {
+    let isolated = TempDir::new().unwrap();
+    let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(isolated.path());
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+
+    assert!(append_gitignore_allow_to_project(&project, "target/").is_err());
+    assert!(!project.join(".cockpit").exists());
+
+    let _ignore = crate::config::trust::enter_workspace_trust_policy(
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&project).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        },
+    );
+    append_gitignore_allow_to_project(&project, "target/").unwrap();
+    assert!(!project.join(".cockpit").exists());
+    let local = crate::config::dirs::local_config_dir_for(&project)
+        .unwrap()
+        .join(crate::config::dirs::CONFIG_FILE);
+    assert_eq!(
+        ExtendedConfigDoc::load(&local)
+            .unwrap()
+            .config()
+            .gitignore_allow,
+        vec!["target/".to_string()]
+    );
+    assert!(
+        !crate::config::dirs::global_config_file().unwrap().exists(),
+        "the user-global layer is never the fallback"
+    );
 }
 
 /// `queuedMessagesAsSteering` defaults to `false` (Held). An omitted field

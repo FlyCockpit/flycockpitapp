@@ -9,8 +9,14 @@ use crate::tui::async_action::{
     AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult,
 };
 
+/// Completion is bounded by a wall-clock deadline, not an iteration count:
+/// the publish fsyncs the temp file and its directory, and on a disk under
+/// sustained writeback pressure one fsync alone can take seconds.
+const COPY_FILE_COMPLETION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn drain_until_idle(app: &mut App) {
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + COPY_FILE_COMPLETION_DEADLINE;
+    while std::time::Instant::now() < deadline {
         tokio::task::yield_now().await;
         app.drain_async_actions();
         if app.async_actions.pending_count() == 0 {

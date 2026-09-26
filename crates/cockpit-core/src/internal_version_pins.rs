@@ -226,6 +226,32 @@ fn hash_domain_labels_are_v1() {
         "complete_mcp_oauth_receipt_v1"
     );
 
+    // Redaction coverage binding labels (cockpit-core).
+    assert_eq!(
+        crate::redact::coverage_authority::COVERAGE_BINDING_DOMAIN,
+        b"flycockpit-redaction-coverage-binding-v1\0"
+    );
+    assert_eq!(
+        crate::redact::coverage_bindings::REDACT_POLICY_DIGEST_DOMAIN,
+        b"flycockpit-redact-policy-v1\0"
+    );
+    assert_eq!(
+        crate::redact::coverage_bindings::SOURCE_BYTES_DIGEST_DOMAIN,
+        b"flycockpit-redaction-source-bytes-v1\0"
+    );
+    assert_eq!(
+        crate::redact::coverage_bindings::SSH_CANDIDATES_DIGEST_DOMAIN,
+        b"flycockpit-redaction-ssh-candidates-v1\0"
+    );
+    assert_eq!(
+        crate::redact::coverage_bindings::MACHINE_SOURCES_DIGEST_DOMAIN,
+        b"flycockpit-redaction-machine-sources-v1\0"
+    );
+    assert_eq!(
+        crate::redact::coverage_bindings::SEALED_RECORDS_DIGEST_DOMAIN,
+        b"flycockpit-redaction-sealed-v1\0"
+    );
+
     // Daemon labels (cockpit-core).
     assert_eq!(
         crate::daemon::server::FCM2_MODEL_DIGEST_DOMAIN,

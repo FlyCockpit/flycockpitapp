@@ -103,6 +103,7 @@ impl Tool for LspTool {
                     character,
                 },
                 &config,
+                &ctx.redact,
             )
             .await;
         Ok(ToolOutput::text(out))

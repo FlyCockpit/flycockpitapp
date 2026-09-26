@@ -335,7 +335,9 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
         }
         match path_text {
             "crates/cockpit-core/src/redact/coverage_authority.rs"
-                if matched.contains("RedactionTable::build_with_env_and_credential_store") =>
+                if matched.contains("RedactionTable::build_with_env_and_credential_store")
+                    || matched
+                        .contains("RedactionTable::build_daemon_global_with_credential_store") =>
             {
                 authority_internal += 1;
             }
@@ -357,6 +359,8 @@ fn coverage_map_has_no_unclassified_builder_refresh_or_empty_admission() {
     // #390's final route inventory has three authority-owned complete-capture
     // shapes: session+sealed, daemon-global without sealed, and detached
     // session without sealed. They all remain inside this one authority file.
+    // The two session shapes build workspace-scoped tables; the daemon-global
+    // shape builds the rootless daemon-global table (no workspace walk).
     assert_eq!(authority_internal, 3, "authority capture funnel changed");
     assert_eq!(
         raw_export, 1,

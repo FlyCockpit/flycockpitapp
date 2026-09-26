@@ -44,6 +44,24 @@ use base64::Engine as _;
 
 use crate::config::extended::RedactConfig;
 
+/// Where file-backed redaction sources (env files, relative configured env
+/// paths, protected path literals) are discovered for one table build.
+///
+/// This is the single funnel that decides whether a build may touch a
+/// workspace. Daemon-global coverage has no workspace: it must never be rooted
+/// at the daemon's inherited working directory, which is wherever the daemon
+/// happened to be launched and can be an arbitrarily large tree.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RedactionSourceScope<'a> {
+    /// A session's workspace root: `dotenv_patterns` are walked below it and
+    /// relative `extra_dotenv_paths` resolve against it.
+    Workspace(&'a Path),
+    /// Daemon-wide coverage: environment, stored/command secrets, private SSH
+    /// keys and absolute `extra_dotenv_paths` only. No directory is walked;
+    /// workspace env files are covered by each session's own scope.
+    DaemonGlobal,
+}
+
 /// A redaction table could not be loaded on a security-relevant path.
 ///
 /// Callers must fail closed (refuse to send, fork, export, or acknowledge
@@ -88,9 +106,11 @@ mod command_output;
 pub(crate) mod coverage_authority;
 pub(crate) mod coverage_bindings;
 mod dotenv;
-pub(super) use dotenv::matched_dotenv_paths;
+pub(crate) use dotenv::{
+    UnanchoredRedactionSourcePath, matched_dotenv_sources, resolve_explicit_dotenv_path,
+};
 #[cfg(test)]
-pub(crate) use dotenv::{dotenv_max_depth, dotenv_scan_start_is_unbounded};
+pub(crate) use dotenv::{dotenv_max_depth, dotenv_scan_start_is_unbounded, matched_dotenv_paths};
 mod protected;
 pub(crate) mod protected_redaction_history;
 // The production key resolver is wired into the daemon / registry / Session
@@ -1082,6 +1102,11 @@ pub struct RedactionTable {
     protected_path_conflicts: Vec<String>,
     /// When set, every scrub revalidates the admitting generation before egress.
     coverage_binding: Option<coverage_authority::CoverageTableBinding>,
+    /// The file-backed sources (dotenv bytes, SSH key material) the capture
+    /// that produced this table consumed, so a later use can re-read them and
+    /// tell whether the table still covers them. `None` for a table that is
+    /// not (derived from) a capture.
+    source_freshness: Option<std::sync::Arc<MachineSourceFreshness>>,
     /// Test-only fault injection: when set, [`Self::enforced_checked`] returns
     /// an error, so a caller's fail-closed-before-side-effect path (e.g. the
     /// external-harness runner constructing its scrub view before spawning a
@@ -1090,6 +1115,23 @@ pub struct RedactionTable {
     /// shipped build.
     #[cfg(test)]
     fail_enforced_view: bool,
+}
+
+/// The record of the file-backed sources one capture consumed, re-checkable
+/// at use time ([`RedactionTable::machine_sources_current`]).
+struct MachineSourceFreshness {
+    config: RedactConfig,
+    /// The capture's workspace root; `None` for daemon-global scope.
+    workspace: Option<PathBuf>,
+    binding: coverage_authority::CoverageBinding,
+    unsupported: Vec<PathBuf>,
+}
+
+impl std::fmt::Debug for MachineSourceFreshness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineSourceFreshness")
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for RedactionTable {
@@ -1184,14 +1226,55 @@ impl RedactionTable {
         env: &HashMap<String, String>,
         store: &crate::credentials::CredentialStore,
     ) -> Result<Self> {
-        let mut entries = store
-            .named_secret_entries()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect::<Vec<_>>();
-        entries.extend(store.provider_credential_entries());
-        entries.extend(store.provider_auth_command_entries());
-        entries.extend(store.provider_oauth_descriptor_entries());
-        Self::build_with_env_and_secrets(cfg, cwd, env, entries)
+        Self::build_scoped(
+            cfg,
+            RedactionSourceScope::Workspace(cwd),
+            env,
+            credential_store_entries(store),
+        )
+    }
+
+    /// [`Self::build_with_env_and_credential_store`] plus the record of the
+    /// file-backed sources it consumed, for the coverage authority's
+    /// boundary binding.
+    pub(crate) fn build_with_env_and_credential_store_recorded(
+        cfg: &RedactConfig,
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<(Self, coverage_bindings::MachineSourceCapture)> {
+        Self::build_scoped_recorded(
+            cfg,
+            RedactionSourceScope::Workspace(cwd),
+            env,
+            credential_store_entries(store),
+        )
+    }
+
+    /// Daemon-global builder: the same collectors as a session build, minus
+    /// every workspace-rooted source (see [`RedactionSourceScope::DaemonGlobal`]).
+    pub(crate) fn build_daemon_global_with_credential_store(
+        cfg: &RedactConfig,
+        env: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<Self> {
+        Self::build_daemon_global_with_credential_store_recorded(cfg, env, store)
+            .map(|(table, _)| table)
+    }
+
+    /// [`Self::build_daemon_global_with_credential_store`] plus the record of
+    /// the file-backed sources it consumed.
+    pub(crate) fn build_daemon_global_with_credential_store_recorded(
+        cfg: &RedactConfig,
+        env: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<(Self, coverage_bindings::MachineSourceCapture)> {
+        Self::build_scoped_recorded(
+            cfg,
+            RedactionSourceScope::DaemonGlobal,
+            env,
+            credential_store_entries(store),
+        )
     }
 
     /// Hermetic table builder with an injected named-secret source. Production
@@ -1203,7 +1286,36 @@ impl RedactionTable {
         env: &HashMap<String, String>,
         stored_secrets: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self> {
-        let protected = ProtectedPaths::from_session(cwd, env);
+        Self::build_scoped(
+            cfg,
+            RedactionSourceScope::Workspace(cwd),
+            env,
+            stored_secrets,
+        )
+    }
+
+    /// The one table-build funnel. `scope` alone decides which file-backed
+    /// sources may be discovered.
+    pub(crate) fn build_scoped(
+        cfg: &RedactConfig,
+        scope: RedactionSourceScope<'_>,
+        env: &HashMap<String, String>,
+        stored_secrets: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self> {
+        Self::build_scoped_recorded(cfg, scope, env, stored_secrets).map(|(table, _)| table)
+    }
+
+    /// [`Self::build_scoped`], also returning the record of the file-backed
+    /// sources consumed (each env file's confirmed-bytes digest and the SSH
+    /// candidates digest), from the same reads that produced the table.
+    pub(crate) fn build_scoped_recorded(
+        cfg: &RedactConfig,
+        scope: RedactionSourceScope<'_>,
+        env: &HashMap<String, String>,
+        stored_secrets: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<(Self, coverage_bindings::MachineSourceCapture)> {
+        let mut capture = coverage_bindings::MachineSourceCapture::default();
+        let protected = ProtectedPaths::from_scope(scope, env);
         // `cfg.enabled == false` is a *scrub-time* opt-out, never a reason to
         // skip collection. The table is always built for real so that an
         // untrusted route can enforce it (see [`Self::enforced`]); the
@@ -1254,9 +1366,15 @@ impl RedactionTable {
 
         if cfg.scan_dotenv {
             let discovered =
-                matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?;
+                matched_dotenv_sources(scope, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?;
+            let mut consumed = Vec::with_capacity(discovered.len());
             for path in &discovered {
-                match collect_env_file_candidates(path, &cfg.allowlist) {
+                let (scan, digest) =
+                    dotenv::collect_env_file_candidates_recorded(path, &cfg.allowlist, || {});
+                if let Some(digest) = digest {
+                    consumed.push((path.clone(), digest));
+                }
+                match scan {
                     EnvFileScan::Candidates(file_entries) => {
                         for entry in file_entries {
                             candidates.push(entry);
@@ -1279,16 +1397,20 @@ impl RedactionTable {
             // capture must refuse this generation rather than publish coverage
             // for only one side of the mutable directory view.
             if discovered
-                != matched_dotenv_paths(cwd, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?
+                != matched_dotenv_sources(scope, &cfg.dotenv_patterns, &cfg.extra_dotenv_paths)?
             {
                 return Err(RedactionSourceChangedError.into());
             }
+            capture.dotenv = Some(consumed);
         }
 
         // Private SSH keys: each is registered as a forced (non-prunable)
         // secret — key material must never be dropped by the prune step.
         if cfg.scan_ssh_keys {
-            for (value, origin) in collect_ssh_key_candidates(cfg.ssh_key_dir.as_deref())? {
+            let ssh_key_dir = ssh::resolve_ssh_key_dir(scope, cfg.ssh_key_dir.as_deref())?;
+            let collected = collect_ssh_key_candidates(ssh_key_dir.as_ref())?;
+            capture.ssh = Some(coverage_bindings::ssh_candidates_digest(&collected));
+            for (value, origin) in collected {
                 candidates.push(Candidate::forced(value, origin, true));
             }
         }
@@ -1362,13 +1484,23 @@ impl RedactionTable {
             entries.push((candidate.value, candidate.origin, candidate.source));
         }
 
-        Self::from_entries(
+        let mut table = Self::from_entries(
             entries,
             cfg.placeholder.clone(),
             !cfg.enabled,
             unsupported_files,
             protected,
-        )
+        )?;
+        table.source_freshness = Some(std::sync::Arc::new(MachineSourceFreshness {
+            config: cfg.clone(),
+            workspace: match scope {
+                RedactionSourceScope::Workspace(root) => Some(root.to_path_buf()),
+                RedactionSourceScope::DaemonGlobal => None,
+            },
+            binding: coverage_bindings::captured_machine_sources_binding(&capture, &table),
+            unsupported: table.unsupported_files().to_vec(),
+        }));
+        Ok((table, capture))
     }
 
     /// Build a table from `(value, origin, source)` triples. Every triple
@@ -1469,6 +1601,7 @@ impl RedactionTable {
                 protected,
                 protected_path_conflicts,
                 coverage_binding: None,
+                source_freshness: None,
                 #[cfg(test)]
                 fail_enforced_view: false,
             });
@@ -1507,31 +1640,20 @@ impl RedactionTable {
             protected,
             protected_path_conflicts,
             coverage_binding: None,
+            source_freshness: None,
             #[cfg(test)]
             fail_enforced_view: false,
         })
     }
 
     pub fn union(&self, other: &Self) -> Result<Self> {
-        let mut entries = self.entries.clone();
-        entries.extend(other.entries.iter().cloned());
-        let mut unsupported_files = self.unsupported_files.clone();
-        unsupported_files.extend(other.unsupported_files.iter().cloned());
-        unsupported_files.sort();
-        unsupported_files.dedup();
-        let protected = self.protected.union(&other.protected);
-        let mut merged = Self::from_redaction_entries(
-            entries,
-            self.placeholder.clone(),
-            self.disabled && other.disabled,
-            unsupported_files,
-            protected,
-        )?;
-        merged.coverage_binding = match (&self.coverage_binding, &other.coverage_binding) {
+        let mut merged = self.merged_entries(other)?;
+        // Which operand's generation the union adopts; its capture record is
+        // the one that describes the union's current source coverage.
+        let adopt_left = match (&self.coverage_binding, &other.coverage_binding) {
             (Some(left), Some(right)) => match left.binding_ordering(right) {
-                Some(std::cmp::Ordering::Equal) => Some(left.clone()),
-                Some(std::cmp::Ordering::Greater) => Some(left.clone()),
-                Some(std::cmp::Ordering::Less) => Some(right.clone()),
+                Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) => true,
+                Some(std::cmp::Ordering::Less) => false,
                 None => anyhow::bail!("coverage binding mismatch across union operands"),
             },
             // Unbound operands are monotonic additions: persisted historical
@@ -1539,10 +1661,75 @@ impl RedactionTable {
             // files can only add scrub candidates. They therefore adopt the
             // bound operand's generation without weakening its coverage. Two
             // bound operands are handled above and remain lineage-checked.
-            (Some(binding), None) | (None, Some(binding)) => Some(binding.clone()),
-            (None, None) => None,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            // Neither is bound: the later operand is the newer capture when it
+            // has a record at all (an accumulation `base.union(&new)`).
+            (None, None) => other.source_freshness.is_none(),
         };
+        let (adopted, added) = if adopt_left {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        merged.coverage_binding = adopted.coverage_binding.clone();
+        merged.source_freshness = adopted
+            .source_freshness
+            .clone()
+            .or_else(|| added.source_freshness.clone());
         Ok(merged)
+    }
+
+    /// Whether the file-backed sources this table's capture consumed are
+    /// unchanged: re-reads the configured dotenv files and SSH keys in the
+    /// capture's scope and compares their digest with the capture's. A table
+    /// that is not derived from a capture has nothing to re-read (`true`).
+    /// A source that can no longer be read is an error (fail closed).
+    /// Blocking I/O.
+    pub(crate) fn machine_sources_current(&self) -> Result<bool> {
+        let Some(freshness) = self.source_freshness.as_ref() else {
+            return Ok(true);
+        };
+        let scope = match freshness.workspace.as_deref() {
+            Some(root) => RedactionSourceScope::Workspace(root),
+            None => RedactionSourceScope::DaemonGlobal,
+        };
+        let live = coverage_bindings::machine_sources_binding_with_unsupported(
+            &freshness.config,
+            scope,
+            &freshness.unsupported,
+        )?;
+        Ok(live == freshness.binding)
+    }
+
+    /// Scrub-only merge of two tables of *any* coverage lineage.
+    ///
+    /// Every entry of both tables is matched against the original text in one
+    /// pass, so the single-table overlap handling applies across the two
+    /// entry sets (applying the tables one after another would let the first
+    /// table's replacement cut a second-table match and leak its suffix). The
+    /// result carries **no** coverage binding: it is not the coverage of any
+    /// lineage and must never be installed or published. Only
+    /// [`crate::daemon::EventScrub`] holds one, and it exposes no table.
+    pub(crate) fn scrub_only_union(&self, other: &Self) -> Result<Self> {
+        self.merged_entries(other)
+    }
+
+    fn merged_entries(&self, other: &Self) -> Result<Self> {
+        let mut entries = self.entries.clone();
+        entries.extend(other.entries.iter().cloned());
+        let mut unsupported_files = self.unsupported_files.clone();
+        unsupported_files.extend(other.unsupported_files.iter().cloned());
+        unsupported_files.sort();
+        unsupported_files.dedup();
+        let protected = self.protected.union(&other.protected);
+        Self::from_redaction_entries(
+            entries,
+            self.placeholder.clone(),
+            self.disabled && other.disabled,
+            unsupported_files,
+            protected,
+        )
     }
 
     /// Add one caller-supplied ordinary literal to this table.  Sealed-value
@@ -1565,6 +1752,7 @@ impl RedactionTable {
             self.protected.clone(),
         )?;
         table.coverage_binding = self.coverage_binding.clone();
+        table.source_freshness = self.source_freshness.clone();
         Ok(table)
     }
 
@@ -1587,6 +1775,7 @@ impl RedactionTable {
             self.protected.clone(),
         )?;
         table.coverage_binding = self.coverage_binding.clone();
+        table.source_freshness = self.source_freshness.clone();
         Ok(table)
     }
 
@@ -1662,6 +1851,7 @@ impl RedactionTable {
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
             coverage_binding: self.coverage_binding.clone(),
+            source_freshness: self.source_freshness.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
@@ -2000,6 +2190,7 @@ impl RedactionTable {
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
             coverage_binding: self.coverage_binding.clone(),
+            source_freshness: self.source_freshness.clone(),
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
         }
@@ -2267,6 +2458,7 @@ impl RedactionTable {
             protected: ProtectedPaths::default(),
             protected_path_conflicts: Vec::new(),
             coverage_binding: None,
+            source_freshness: None,
             #[cfg(test)]
             fail_enforced_view: false,
         }
@@ -2313,6 +2505,21 @@ impl RedactionTable {
     pub fn protected_path_conflicts(&self) -> &[String] {
         &self.protected_path_conflicts
     }
+}
+
+/// Every stored-secret literal a credential store contributes to coverage:
+/// named secrets, provider credentials, provider auth commands, and OAuth
+/// descriptors. Shared by the workspace and daemon-global builders so the two
+/// scopes can never disagree about store-backed sources.
+fn credential_store_entries(store: &crate::credentials::CredentialStore) -> Vec<(String, String)> {
+    let mut entries = store
+        .named_secret_entries()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect::<Vec<_>>();
+    entries.extend(store.provider_credential_entries());
+    entries.extend(store.provider_auth_command_entries());
+    entries.extend(store.provider_oauth_descriptor_entries());
+    entries
 }
 
 /// Extract secret-bearing leaves from an MCP named-secret JSON record. Keep
@@ -2937,6 +3144,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/approval/policy.rs",
         "crates/cockpit-core/src/conversation_rules.rs",
         "crates/cockpit-core/src/daemon/fs_api.rs",
+        "crates/cockpit-core/src/daemon/mod.rs",
         "crates/cockpit-core/src/daemon/org_sync.rs",
         "crates/cockpit-core/src/daemon/remote_audit_upload.rs",
         "crates/cockpit-core/src/daemon/server/dispatch.rs",

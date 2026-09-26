@@ -31,8 +31,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::config::extended::{ExtendedConfig, LspAutoInstall};
-use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
-#[cfg(test)]
+use crate::daemon::EventSender;
 use crate::redact::RedactionTable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +97,7 @@ struct LspInner {
     statuses: RwLock<HashMap<String, LspServerStatus>>,
     prompted: Mutex<HashSet<String>>,
     installed: RwLock<HashMap<String, InstalledRecord>>,
-    notices: StdMutex<Option<(EventSender, SharedRedactionTable)>>,
+    notices: StdMutex<Option<crate::daemon::GlobalEventBus>>,
 }
 
 /// Evidence that an LSP operation has passed the manager-wide protection
@@ -183,8 +182,13 @@ impl LspManager {
         }
     }
 
-    pub fn set_notice_bus(&self, tx: EventSender, redaction: SharedRedactionTable) {
-        *crate::sync::lock_or_recover(&self.inner.notices) = Some((tx, redaction));
+    pub fn set_notice_bus(
+        &self,
+        tx: EventSender,
+        coverage: crate::daemon::global_coverage::GlobalCoverage,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.notices) =
+            Some(crate::daemon::GlobalEventBus { tx, coverage });
     }
 
     #[allow(dead_code)]
@@ -218,17 +222,24 @@ impl LspManager {
             .collect()
     }
 
+    /// `origin` is the calling session's coverage table: notices this
+    /// operation raises on the daemon-global bus are scrubbed with it (see
+    /// [`Self::notice`]).
     pub async fn diagnostics_after_write(
         &self,
         cwd: &Path,
         file: &Path,
         config: &ExtendedConfig,
+        origin: &Arc<RedactionTable>,
     ) -> String {
         if !config.lsp.enabled || !config.lsp.diagnostics.enabled {
             return String::new();
         }
         let operation = self.operation_lease().await;
-        let Some(client) = self.client_for_file(&operation, cwd, file, config).await else {
+        let Some(client) = self
+            .client_for_file(&operation, cwd, file, config, origin)
+            .await
+        else {
             return String::new();
         };
         let text = match read_file_for_diagnostics(file) {
@@ -261,13 +272,14 @@ impl LspManager {
         cwd: &Path,
         req: LspNavigationRequest,
         config: &ExtendedConfig,
+        origin: &Arc<RedactionTable>,
     ) -> String {
         if !config.lsp.enabled {
             return "LSP is disabled.".to_string();
         }
         let operation = self.operation_lease().await;
         let Some(client) = self
-            .client_for_file(&operation, cwd, &req.file, config)
+            .client_for_file(&operation, cwd, &req.file, config, origin)
             .await
         else {
             return "No available LSP server for this file.".to_string();
@@ -292,6 +304,7 @@ impl LspManager {
         server_id: &str,
         action: crate::daemon::proto::LspControlAction,
         config: &ExtendedConfig,
+        origin: &Arc<RedactionTable>,
     ) -> String {
         // Control actions can run install/uninstall commands or signal cached
         // opaque hosts.  Keep the read lease through the action so a newly
@@ -329,19 +342,21 @@ impl LspManager {
                     shell_join(&recipe.command)
                 )
             }
-            crate::daemon::proto::LspControlAction::Install => self.install(&recipe, cwd).await,
+            crate::daemon::proto::LspControlAction::Install => {
+                self.install(&recipe, cwd, origin).await
+            }
             crate::daemon::proto::LspControlAction::Uninstall => self.uninstall(&recipe, cwd).await,
             crate::daemon::proto::LspControlAction::Restart => self.restart(recipe.id).await,
         }
     }
 
-    async fn install(&self, recipe: &Recipe, cwd: &Path) -> String {
+    async fn install(&self, recipe: &Recipe, cwd: &Path, origin: &Arc<RedactionTable>) -> String {
         let Some(install) = recipe.install_command(cwd) else {
             let msg = format!(
                 "LSP `{}` has no automatic install recipe available. {}",
                 recipe.id, recipe.manual_guidance
             );
-            self.notice(msg.clone()).await;
+            self.notice(msg.clone(), origin).await;
             return msg;
         };
         self.inner
@@ -387,7 +402,7 @@ impl LspManager {
                     .write()
                     .await
                     .insert(recipe.id.to_string(), LspServerStatus::Missing);
-                self.notice(msg.clone()).await;
+                self.notice(msg.clone(), origin).await;
                 msg
             }
             CommandOutcome::Failure {
@@ -401,7 +416,7 @@ impl LspManager {
                     .write()
                     .await
                     .insert(recipe.id.to_string(), LspServerStatus::Missing);
-                self.notice(msg.clone()).await;
+                self.notice(msg.clone(), origin).await;
                 msg
             }
         }
@@ -524,14 +539,25 @@ impl LspManager {
         }
     }
 
-    async fn notice(&self, text: String) {
-        if let Some((tx, redaction)) = crate::sync::lock_or_recover(&self.inner.notices).as_ref() {
-            send_current_event(
-                tx,
-                redaction,
-                crate::daemon::proto::Event::LspNotice { text },
-            );
+    /// Broadcast an LSP notice on the daemon-global bus.
+    ///
+    /// Notice text can echo workspace content (installer or server output),
+    /// so it is scrubbed with the originating session's table as well as the
+    /// current daemon-global one ([`EventScrub`](crate::daemon::EventScrub):
+    /// both tables' entries matched together in one scrub-only pass). If that
+    /// coverage cannot be established, owners still receive the notice and
+    /// other principals do not (a notice is all free text).
+    async fn notice(&self, text: String, origin: &Arc<RedactionTable>) {
+        let bus = crate::sync::lock_or_recover(&self.inner.notices).clone();
+        if let Some(bus) = bus {
+            bus.send_from_origin_async(origin, crate::daemon::proto::Event::LspNotice { text })
+                .await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn notice_for_test(&self, text: String, origin: &Arc<RedactionTable>) {
+        self.notice(text, origin).await;
     }
 
     async fn operation_lease(&self) -> LspOperationLease<'_> {
@@ -552,6 +578,7 @@ impl LspManager {
         cwd: &Path,
         file: &Path,
         config: &ExtendedConfig,
+        origin: &Arc<RedactionTable>,
     ) -> Option<Arc<LspClient>> {
         let recipe = registry()
             .into_iter()
@@ -603,7 +630,7 @@ impl LspManager {
             return None;
         }
         if !lsp_recipe_available(&recipe, cwd) {
-            self.handle_missing(&recipe, cwd, config).await;
+            self.handle_missing(&recipe, cwd, config, origin).await;
             return None;
         }
         match LspClient::spawn(recipe.clone(), root).await {
@@ -648,7 +675,13 @@ impl LspManager {
         }
     }
 
-    async fn handle_missing(&self, recipe: &Recipe, cwd: &Path, config: &ExtendedConfig) {
+    async fn handle_missing(
+        &self,
+        recipe: &Recipe,
+        cwd: &Path,
+        config: &ExtendedConfig,
+        origin: &Arc<RedactionTable>,
+    ) {
         self.inner
             .statuses
             .write()
@@ -712,7 +745,7 @@ impl LspManager {
                             &stderr,
                         );
                         warn!("{msg}");
-                        self.notice(msg).await;
+                        self.notice(msg, origin).await;
                         self.inner
                             .statuses
                             .write()
@@ -732,7 +765,7 @@ impl LspManager {
                             &stderr,
                         );
                         warn!("{msg}");
-                        self.notice(msg).await;
+                        self.notice(msg, origin).await;
                         self.inner
                             .statuses
                             .write()
@@ -1965,6 +1998,7 @@ mod tests {
                 "never-execute",
                 crate::daemon::proto::LspControlAction::Check,
                 &ExtendedConfig::default(),
+                &Arc::new(RedactionTable::empty()),
             )
             .await;
         assert_eq!(
@@ -2029,6 +2063,48 @@ mod tests {
         assert!(!remove_lsp_pending(&pending, 7).await);
     }
 
+    /// LSP notices can echo workspace content (installer output) and travel
+    /// on the daemon-global bus, whose table has no workspace file sources:
+    /// the envelope must also carry the originating session's coverage.
+    #[tokio::test]
+    async fn notice_is_covered_by_the_originating_session_table() {
+        const WORKSPACE_SECRET: &str = "lsp-origin-workspace-secret-77c1";
+        let manager = LspManager::new();
+        let (tx, mut rx) = broadcast::channel(4);
+        manager.set_notice_bus(
+            tx,
+            crate::daemon::global_coverage::GlobalCoverage::fixed(
+                Arc::new(RedactionTable::empty()),
+            ),
+        );
+        let workspace = tempfile::tempdir().unwrap();
+        let origin = Arc::new(
+            RedactionTable::build_with_env_and_secrets(
+                &crate::config::extended::RedactConfig {
+                    scan_environment: false,
+                    scan_dotenv: false,
+                    scan_ssh_keys: false,
+                    ..crate::config::extended::RedactConfig::default()
+                },
+                workspace.path(),
+                &HashMap::new(),
+                [("workspace-token".to_string(), WORKSPACE_SECRET.to_string())],
+            )
+            .unwrap(),
+        );
+        manager
+            .notice(format!("install failed: {WORKSPACE_SECRET}"), &origin)
+            .await;
+        let envelope = rx.recv().await.unwrap();
+        let crate::daemon::proto::Event::LspNotice { text } = &envelope.event else {
+            panic!("expected LspNotice");
+        };
+        assert!(
+            !envelope.redact.scrub(text).contains(WORKSPACE_SECRET),
+            "the global-bus notice must be scrubbed with the originating coverage"
+        );
+    }
+
     #[tokio::test]
     async fn notice_bus_mutex_poison_is_recovered() {
         let manager = LspManager::new();
@@ -2039,9 +2115,18 @@ mod tests {
         }));
 
         let (tx, mut rx) = broadcast::channel(4);
-        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
-        manager.set_notice_bus(tx, redaction);
-        manager.notice("poison recovered".to_string()).await;
+        manager.set_notice_bus(
+            tx,
+            crate::daemon::global_coverage::GlobalCoverage::fixed(
+                Arc::new(RedactionTable::empty()),
+            ),
+        );
+        manager
+            .notice(
+                "poison recovered".to_string(),
+                &Arc::new(RedactionTable::empty()),
+            )
+            .await;
 
         match rx.recv().await.unwrap() {
             envelope

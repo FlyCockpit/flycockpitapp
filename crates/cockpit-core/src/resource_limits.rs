@@ -341,6 +341,23 @@ pub fn read_for_fs_read(path: &Path) -> Result<bounded::PrefixedFile, ResourceLi
     )
 }
 
+/// [`read_for_fs_read`] over an already-opened, already-authorized descriptor.
+pub fn read_file_for_fs_read(
+    file: std::fs::File,
+) -> Result<bounded::PrefixedFile, ResourceLimitError> {
+    let limits = ResourceLimits::defaults();
+    let prefix_cap = limits.fs_read_text_bytes.max(limits.fs_read_binary_bytes);
+    bounded::read_prefix_and_hash_from_file(file, prefix_cap, limits.fs_read_max_file_bytes)
+        .map_err(|error| match error {
+            BoundedIoError::Limit { actual, .. } => ResourceLimitError::byte_limit(
+                "filesystem read",
+                limits.fs_read_max_file_bytes,
+                actual,
+            ),
+            other => ResourceLimitError::Io(other),
+        })
+}
+
 /// Refuse a declared length before `vec![0; len]` or `with_capacity`.
 pub fn ensure_declared_len(
     len: u64,

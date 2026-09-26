@@ -18,11 +18,13 @@ pub(crate) fn read_workspace_config_bytes(path: &Path) -> Result<Option<Vec<u8>>
         {
             Ok(None)
         }
-        Err(cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. }) => {
-            anyhow::bail!(
+        Err(error @ cockpit_host::bounded::BoundedIoError::Limit { actual, limit, .. }) => {
+            // Keep the typed cause in the chain so callers can classify it
+            // without matching message text.
+            Err(anyhow::Error::new(error).context(format!(
                 "{} exceeds the {limit} byte limit ({actual} bytes)",
                 path.display()
-            )
+            )))
         }
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
@@ -1421,7 +1423,11 @@ pub(crate) fn snapshot_workspace_config_layer_from_retained_config_directory(
             backup_leaf,
         )?;
         if first.digest == second.digest {
-            return Ok(second);
+            return Ok(
+                second.with_project_root(crate::config::extended::layer_project_root(
+                    canonical_config_path,
+                )),
+            );
         }
     }
     anyhow::bail!("workspace configuration changed during retained snapshot capture")
@@ -1552,6 +1558,7 @@ fn workspace_snapshot(
     }
     crate::config::WorkspaceConfigLayerSnapshot {
         origin: None,
+        project_root: None,
         config_json,
         provider_files,
         effective_default_artifact_digest,
@@ -1581,7 +1588,8 @@ pub(crate) fn workspace_config_layer_snapshot_with_config_json(
         snapshot.provider_files.clone(),
         snapshot.effective_default_artifact_digest.clone(),
     )
-    .with_origin(snapshot.origin.clone())
+    .with_origin(snapshot.origin)
+    .with_project_root(snapshot.project_root.clone())
 }
 
 fn effective_default_artifact_digest(

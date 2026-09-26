@@ -206,32 +206,35 @@ pub(crate) fn daemon_no_sandbox() -> anyhow::Result<bool> {
 }
 
 /// Persist sandbox intent (`sandbox.defaultMode`). Capability-missing
-/// `SetSandbox` must not call this. Writes to the layer `load_for_cwd` reads
-/// (nearest project `.cockpit/config.json`, honoring `COCKPIT_CONFIG`) so a
-/// per-project `/sandbox` toggle takes effect and is not masked by a nearer
-/// project layer; scaffolds a project `.cockpit/` when no discovered layer
-/// exists yet. This is workspace-bound: it must not fall back to the global
-/// user-level layer.
+/// `SetSandbox` must not call this. Workspace-bound: the target is this
+/// workspace's layer as [`crate::config::dirs::workspace_config_write_target`]
+/// selects it under the session's own trust `policy` (the `COCKPIT_CONFIG`
+/// override when set, else the nearest trusted project layer, else the
+/// per-directory machine-local layer; a project `.cockpit/` is scaffolded
+/// only under `Trust`). It never falls back to the user-global layer, and a
+/// refusal is an error rather than a write somewhere else. The write itself
+/// runs under the same policy, so the configuration document's own gate
+/// judges the same decision.
 pub(super) fn persist_sandbox_intent(
     project_root: &std::path::Path,
+    policy: crate::config::trust::WorkspaceTrustPolicy,
     mode: crate::tools::sandbox_mode::SandboxIntent,
 ) -> anyhow::Result<()> {
-    use crate::config::dirs::{CONFIG_FILE, most_specific_existing_config_write_target};
     use crate::config::extended::ExtendedConfigDoc;
-    let target = most_specific_existing_config_write_target(project_root)
-        .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
-    let mut doc = ExtendedConfigDoc::load(&target)?;
-    let mut cfg = doc.config();
-    // Persist unconditionally. A previous "skip if unchanged" short-circuit
-    // compared against the ISOLATED target layer, which — now that the target
-    // is the nearest project layer (often a fresh/default doc) rather than the
-    // first existing file — could equal the requested mode while an outer layer
-    // still overrode it, silently dropping a toggle-to-default. Writing the
-    // intent to the nearest layer every time is idempotent and matches
-    // the other session-preference persist helpers.
-    cfg.sandbox.default_mode = mode;
-    doc.write(&cfg)?;
-    Ok(())
+    crate::config::trust::with_workspace_trust_policy(policy, || {
+        let target = crate::config::dirs::workspace_config_write_target(project_root)?;
+        let mut doc = ExtendedConfigDoc::load(&target)?;
+        let mut cfg = doc.config();
+        // Persist unconditionally. A previous "skip if unchanged"
+        // short-circuit compared against the ISOLATED target layer, which
+        // could equal the requested mode while an outer layer still overrode
+        // it, silently dropping a toggle-to-default. Writing the intent to
+        // the nearest layer every time is idempotent and matches the other
+        // session-preference persist helpers.
+        cfg.sandbox.default_mode = mode;
+        doc.write(&cfg)?;
+        Ok(())
+    })
 }
 
 /// Pure precedence resolver (highest wins): daemon `--no-sandbox` ->
@@ -287,7 +290,16 @@ mod persist_sandbox_intent_tests {
             "fresh-install fixture must not pre-create the global layer"
         );
 
-        persist_sandbox_intent(&project, crate::tools::sandbox_mode::SandboxIntent::Off).unwrap();
+        let trusted = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&project).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        persist_sandbox_intent(
+            &project,
+            trusted,
+            crate::tools::sandbox_mode::SandboxIntent::Off,
+        )
+        .unwrap();
 
         let project_config = project
             .join(".cockpit")

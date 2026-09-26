@@ -253,13 +253,26 @@ fn public_codex_begin(login: &cockpit_core::auth::codex_oauth::DeviceLogin) -> O
     }))
 }
 
+/// Seed a project-layer fixture as the workspace's trusted owner (the TUI
+/// process runs under a trust decision; config documents refuse to write a
+/// project `.cockpit` layer without one).
+fn with_trusted_fixture_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    cockpit_config::trust::with_workspace_trust_policy(
+        cockpit_config::trust::WorkspaceTrustPolicy {
+            root: cockpit_config::trust::resolve_trust_root(root).expect("fixture trust root"),
+            mode: cockpit_config::WorkspaceTrustMode::Trust,
+        },
+        f,
+    )
+}
+
 fn dialog_with_config(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join(".cockpit").join("config.json");
     std::fs::create_dir_all(path.parent().expect("provider fixture config parent")).unwrap();
     std::fs::write(&path, "{}").unwrap();
     let mut doc = ConfigDoc::load(&path).unwrap();
-    doc.write(&config).unwrap();
+    with_trusted_fixture_root(tmp.path(), || doc.write(&config)).unwrap();
     let mut dialog = super::super::tests::open_fixture_dialog(&path);
     dialog.active_project_root = Some(tmp.path().to_path_buf());
     let trust_root = cockpit_config::config::trust::resolve_trust_root(tmp.path())
@@ -5576,10 +5589,12 @@ fn provider_delete_removes_grok_oauth_provider_via_daemon() {
     )
     .unwrap();
     std::fs::write(&config_path, "{}").unwrap();
-    ConfigDoc::load(&config_path)
-        .unwrap()
-        .write(&oauth_provider_config(provider_id, provider_id))
-        .unwrap();
+    with_trusted_fixture_root(tmp.path(), || {
+        ConfigDoc::load(&config_path)
+            .unwrap()
+            .write(&oauth_provider_config(provider_id, provider_id))
+    })
+    .unwrap();
     let _daemon_fixture = ProviderDaemonFixture::with_config_path(Some(&config_path));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

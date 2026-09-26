@@ -2003,9 +2003,11 @@ mod tests {
             min_secret_length: 4,
             ..Default::default()
         };
+        // Sources resolve against an absolute workspace root, never the cwd.
+        let workspace = tempfile::tempdir().unwrap();
         let table = crate::redact::RedactionTable::build_with_env(
             &cfg,
-            std::path::Path::new("."),
+            workspace.path(),
             &std::collections::HashMap::from([("TOKEN".to_string(), SECRET.to_string())]),
         )
         .unwrap();

@@ -3757,9 +3757,10 @@ mod tests {
         };
         let env =
             std::collections::HashMap::from([("DEPLOY_TOKEN".to_string(), secret.to_string())]);
+        // Sources resolve against an absolute workspace root, never the cwd.
+        let workspace = tempfile::tempdir().unwrap();
         Arc::new(
-            crate::redact::RedactionTable::build_with_env(&cfg, std::path::Path::new("."), &env)
-                .unwrap(),
+            crate::redact::RedactionTable::build_with_env(&cfg, workspace.path(), &env).unwrap(),
         )
     }
 

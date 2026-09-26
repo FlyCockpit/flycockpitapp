@@ -67,8 +67,10 @@ pub(crate) fn spawn_retention_maintenance(ctx: Arc<DaemonContext>) -> tokio::tas
 }
 
 pub(crate) async fn run_retention_maintenance(ctx: Arc<DaemonContext>) {
-    let cfg = retention_config();
-    let period = Duration::from_secs((cfg.sweep_interval_hours.max(1) as u64) * 60 * 60);
+    // The cadence alone may fall back to the default interval; an unreadable
+    // policy still never reaches a sweep (see `run_retention_maintenance_pass`).
+    let sweep_interval_hours = retention_config().unwrap_or_default().sweep_interval_hours;
+    let period = Duration::from_secs((sweep_interval_hours.max(1) as u64) * 60 * 60);
     run_retention_maintenance_loop(ctx, period).await;
 }
 
@@ -105,7 +107,12 @@ pub(crate) async fn run_retention_maintenance_pass(ctx: Arc<DaemonContext>) {
     #[cfg(test)]
     apply_test_seam().await;
 
-    run_retention_tick(ctx, retention_config()).await;
+    match retention_config() {
+        Some(cfg) => run_retention_tick(ctx, cfg).await,
+        None => tracing::warn!(
+            "retention sweep skipped: the installation retention policy is unavailable"
+        ),
+    }
 }
 
 #[cfg(test)]

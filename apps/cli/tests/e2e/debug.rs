@@ -128,8 +128,11 @@ Use debug-context-secret-12345 only for this test.
         .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     let text = output_text(&output);
-    assert!(text.contains("assembled context (fresh-session baseline)"));
-    assert!(text.contains("System prompt:"));
+    assert!(
+        text.contains("assembled context (fresh-session baseline)"),
+        "{text}"
+    );
+    assert!(text.contains("System prompt:"), "{text}");
     assert!(text.contains("Project guidance (user-role prelude):"));
     assert!(text.contains("AGENTS.md"));
     assert!(text.contains("PROJECT_GUIDANCE_NONSECRET_MARKER"));

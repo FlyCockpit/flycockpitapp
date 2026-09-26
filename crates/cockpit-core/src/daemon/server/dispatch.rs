@@ -19886,20 +19886,251 @@ fn render_daemon_global_debug_context(table: &crate::redact::RedactionTable) -> 
 }
 
 fn render_debug_context(root: &Path, table: &crate::redact::RedactionTable) -> String {
-    const OUTPUT_LIMIT: usize = 16 * 1024;
     let mut rendered = format!(
         "System prompt:\n{}",
         crate::engine::builtin::default_chat_system_prompt(root, "")
     );
     if let Some((path, guidance)) = crate::engine::builtin::load_agent_guidance(root) {
-        rendered.push_str("\n\nProject guidance (user-role prelude): ");
-        rendered.push_str(&table.scrub(&path.display().to_string()));
-        rendered.push('\n');
-        rendered.push_str(&guidance);
+        push_debug_guidance(&mut rendered, &path, &guidance);
     }
-    let scrubbed = table.scrub(&rendered);
+    bound_debug_context(&table.scrub(&rendered))
+}
+
+fn push_debug_guidance(rendered: &mut String, path: &Path, guidance: &str) {
+    rendered.push_str("\n\nProject guidance (user-role prelude): ");
+    rendered.push_str(&path.display().to_string());
+    rendered.push('\n');
+    rendered.push_str(guidance);
+}
+
+/// How a caller workspace's trust decision was applied to its debug render.
+/// A session refuses an unset or untrusted root; this read-only projection
+/// instead degrades both to the `IgnoreConfig` projection (global layers
+/// only, never the project `.cockpit/` layer), the same fail-closed read
+/// policy user-level daemon reads use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugContextTrust {
+    Trust,
+    IgnoreConfig,
+    UnsetAsIgnoreConfig,
+    UntrustedAsIgnoreConfig,
+}
+
+impl DebugContextTrust {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Trust => "trust (project config applied)",
+            Self::IgnoreConfig => "ignore-config (project .cockpit config excluded)",
+            Self::UnsetAsIgnoreConfig => {
+                "unset; rendered as ignore-config (project .cockpit config excluded)"
+            }
+            Self::UntrustedAsIgnoreConfig => {
+                "untrusted; rendered as ignore-config (project .cockpit config excluded)"
+            }
+        }
+    }
+}
+
+/// Resolve the caller workspace's trust through the same classifier and DB
+/// decision a session uses (`resolve_workspace_trust_policy_with_revision_from_db`).
+/// A refusal (unset or untrusted) becomes the `IgnoreConfig` projection over
+/// the same classified root; any other failure stays fail-closed.
+async fn debug_context_trust_policy(
+    ctx: &DaemonContext,
+    root: &Path,
+) -> std::result::Result<
+    (
+        crate::config::trust::WorkspaceTrustPolicy,
+        i64,
+        DebugContextTrust,
+    ),
+    ErrorPayload,
+> {
+    match crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(&ctx.db, root)
+        .await
+    {
+        Ok(resolved) => {
+            let applied = match resolved.policy.mode {
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust => DebugContextTrust::Trust,
+                _ => DebugContextTrust::IgnoreConfig,
+            };
+            Ok((resolved.policy, resolved.revision, applied))
+        }
+        Err(error) => {
+            let applied = match error.downcast_ref::<crate::config::trust::WorkspaceTrustError>() {
+                Some(crate::config::trust::WorkspaceTrustError::Unset { .. }) => {
+                    DebugContextTrust::UnsetAsIgnoreConfig
+                }
+                Some(crate::config::trust::WorkspaceTrustError::Untrusted { .. }) => {
+                    DebugContextTrust::UntrustedAsIgnoreConfig
+                }
+                None => return Err(internal(error)),
+            };
+            let policy = user_level_trust_policy(root, error)?;
+            Ok((policy, 0, applied))
+        }
+    }
+}
+
+/// Debug context for a caller-supplied workspace: the fresh-session baseline
+/// a new session at `project_root` would carry (system prompt plus project
+/// guidance prelude), under that workspace's trust decision and scrubbed by
+/// the workspace-scoped coverage (env, workspace env files, SSH keys, vault
+/// and command secrets, sealed values) a session at that root captures.
+/// Never consults the daemon's working directory: the root is the caller's
+/// absolute path (validated in `validate_semantics`), canonicalized here.
+async fn workspace_debug_context(
+    ctx: &Arc<DaemonContext>,
+    project_root: &str,
+) -> std::result::Result<String, ErrorPayload> {
+    let root = crate::daemon::fs_api::canonical_project_root(project_root)?;
+    // Linearize the trust read and the config projection with trust
+    // decisions and config publication (as session creation does), so a
+    // concurrent IgnoreConfig decision cannot interleave with a
+    // project-derived load.
+    let (trust_revision, applied_trust, extended) = {
+        let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+        let (policy, revision, applied) = debug_context_trust_policy(ctx, &root).await?;
+        let (_, extended) = ctx
+            .config_source()
+            .load_effective_for_daemon(&root, &policy)
+            .map_err(daemon_config_error)?;
+        (revision, applied, extended)
+    };
+    let admission = acquire_workspace_debug_coverage(ctx, &root, trust_revision, &extended)
+        .await
+        .map_err(internal)?;
+    let mut rendered = format!(
+        "Workspace: {}\nWorkspace trust: {}\n\nSystem prompt:\n{}",
+        root.display(),
+        applied_trust.label(),
+        crate::engine::builtin::default_chat_system_prompt_with_config(&root, "", &extended)
+    );
+    if let Some((path, guidance)) =
+        crate::engine::builtin::load_agent_guidance_with_config(&root, &extended)
+    {
+        push_debug_guidance(&mut rendered, &path, &guidance);
+    }
+    admission
+        .use_at_sink(|table| Ok(bound_debug_context(&table.scrub(&rendered))))
+        .map_err(internal)
+}
+
+/// Acquire the workspace-scoped coverage a fresh session at `root` would
+/// capture, keyed without a session identity. The key, capture, and publish
+/// fence are the session-start ones with the session binding omitted.
+async fn acquire_workspace_debug_coverage(
+    ctx: &Arc<DaemonContext>,
+    root: &Path,
+    trust_revision: i64,
+    extended: &crate::config::extended::ExtendedConfig,
+) -> anyhow::Result<crate::redact::coverage_authority::CoverageAdmission> {
+    let config = extended.redact.clone();
+    let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&config);
+    let environment = ctx
+        .env_baseline
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let command_cache = ctx.registry.command_secret_cache();
+    let vault_revision = ctx
+        .secret_vault
+        .current_inventory_generation()
+        .map_err(|error| anyhow::anyhow!("reading redaction vault revision: {error}"))?;
+    let sealed_records = ctx.db.machine_scoped_sealed_redaction_records().await?;
+    let sealed_binding = crate::redact::coverage_bindings::sealed_records_binding(&sealed_records);
+    let principal = crate::daemon::principal::ClientPrincipal::owner();
+    let key = crate::redact::coverage_bindings::WorkspaceCoverageInputs {
+        principal: &principal,
+        owner_authorization_revision: trust_revision,
+        workspace_root: root,
+        environment: &environment,
+        vault_revision,
+        command_cache: &command_cache,
+        policy_digest: &policy_digest,
+        sealed: sealed_binding,
+        override_revision: 0,
+        redact_config: &config,
+    }
+    .coverage_key()?;
+    let sealed = crate::session::sealed_values::union_machine_scoped_sealed_redactions(
+        &ctx.db,
+        &ctx.secret_vault,
+        &crate::redact::RedactionTable::empty(),
+    )
+    .await?;
+    // Inject already-resolved command outputs only: a read-only debug
+    // projection never executes provider auth commands.
+    let mut store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())?;
+    store.inject_command_outputs(&command_cache);
+    let env_baseline = ctx.env_baseline.clone();
+    let publish_fence = crate::redact::coverage_bindings::session_publish_owners(
+        ctx.secret_vault.clone(),
+        ctx.db.clone(),
+        command_cache.clone(),
+        crate::redact::coverage_bindings::SessionCoveragePublishLive {
+            environment: Arc::new(move || {
+                Ok(env_baseline
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone())
+            }),
+            policy_digest: Arc::new({
+                let policy_digest = policy_digest.clone();
+                move || policy_digest.clone()
+            }),
+            override_revision: Arc::new(|| 0),
+            redact_config: Arc::new({
+                let config = config.clone();
+                move || config.clone()
+            }),
+            workspace_root: Arc::new({
+                let root = root.to_path_buf();
+                move || root.clone()
+            }),
+        },
+    )
+    .publish_fence();
+    let capture_root = root.to_path_buf();
+    ctx.registry
+        .coverage_authority()
+        .acquire(
+            key,
+            crate::redact::coverage_authority::CoverageScope::DebugContext,
+            move || {
+                let env = environment.vars().clone();
+                let capture_inputs = crate::redact::coverage_bindings::WorkspaceCoverageInputs {
+                    principal: &principal,
+                    owner_authorization_revision: trust_revision,
+                    workspace_root: &capture_root,
+                    environment: &environment,
+                    vault_revision,
+                    command_cache: &command_cache,
+                    policy_digest: &policy_digest,
+                    sealed: sealed_binding,
+                    override_revision: 0,
+                    redact_config: &config,
+                };
+                let build = crate::redact::coverage_authority::CoverageBuild::capture(
+                    &config,
+                    &capture_root,
+                    &env,
+                    &store,
+                    &sealed,
+                    &capture_inputs,
+                )?;
+                Ok(build.with_publish_fence(publish_fence))
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+/// Bound an already-scrubbed debug render to the projection limit.
+fn bound_debug_context(scrubbed: &str) -> String {
+    const OUTPUT_LIMIT: usize = 16 * 1024;
     if scrubbed.len() <= OUTPUT_LIMIT {
-        return scrubbed;
+        return scrubbed.to_string();
     }
     let cut = scrubbed
         .char_indices()
@@ -20257,9 +20488,30 @@ async fn handle_concurrent_request_impl(
     #[cfg(test)]
     apply_concurrent_request_test_hook(&request).await;
     match request {
-        Request::GetRedactionCoverageStatus { session_id } => {
+        Request::GetRedactionCoverageStatus {
+            session_id,
+            project_root,
+        } => {
             let owner = shared.principal.has_owner_level_authority();
-            if let Some(session_id) = session_id {
+            if let Some(project_root) = project_root {
+                // A caller workspace makes the daemon read that tree (its
+                // guidance, config layers, and env files): owner-only. Refuse
+                // before any filesystem access.
+                if !owner {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Authorization,
+                        message: "a workspace debug context requires owner authority".into(),
+                    });
+                }
+                let rendered = workspace_debug_context(&ctx, &project_root).await?;
+                Ok(Response::RedactionCoverageStatus(
+                    proto::RedactionCoverageStatusProjection {
+                        state: proto::RedactionCoverageState::Ready,
+                        owner_diagnostic: None,
+                        rendered_context: Some(rendered),
+                    },
+                ))
+            } else if let Some(session_id) = session_id {
                 let handle = ctx
                     .registry
                     .live_handle(session_id)

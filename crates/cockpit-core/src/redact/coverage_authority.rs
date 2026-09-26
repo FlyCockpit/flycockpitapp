@@ -219,6 +219,36 @@ impl RedactionCoverageKey {
         }
     }
 
+    /// A sessionless workspace key: the coverage a fresh session at one
+    /// workspace root would capture, for a caller that has a root but no
+    /// session (debug-context projection). It never equals a session key
+    /// (no session binding) nor the daemon-global key (it binds a root).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn workspace(
+        principal: CoverageBinding,
+        owner_authorization: CoverageBinding,
+        workspace: CoverageBinding,
+        environment: CoverageBinding,
+        credential_vault: CoverageBinding,
+        policy: CoverageBinding,
+        sealed: CoverageBinding,
+        override_revision: CoverageBinding,
+        machine_sources: CoverageBinding,
+    ) -> Self {
+        Self {
+            principal,
+            owner_authorization,
+            session: None,
+            workspace: Some(workspace),
+            environment,
+            credential_vault,
+            policy,
+            sealed,
+            override_revision,
+            machine_sources,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn daemon_global(
         principal: CoverageBinding,
@@ -461,7 +491,7 @@ impl CoverageBuild {
         environment: &HashMap<String, String>,
         store: &crate::credentials::CredentialStore,
         sealed: &RedactionTable,
-        boundary_inputs: &super::coverage_bindings::SessionCoverageInputs<'_>,
+        boundary_inputs: &impl super::coverage_bindings::WorkspaceCaptureBoundary,
     ) -> Result<Self> {
         let (base, capture) = RedactionTable::build_with_env_and_credential_store_recorded(
             config,

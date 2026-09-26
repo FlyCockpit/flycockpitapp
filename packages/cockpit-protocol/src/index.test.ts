@@ -849,6 +849,11 @@ describe("cockpit-proto daemon wire schemas", () => {
     expect(clientEnvelopeSchema.parse(requestsFixture.get_redaction_coverage_status)).toEqual(
       requestsFixture.get_redaction_coverage_status,
     );
+    const workspaceDebugContext = {
+      ...requestsFixture.get_redaction_coverage_status,
+      params: { project_root: "/workspace/project" },
+    };
+    expect(clientEnvelopeSchema.parse(workspaceDebugContext)).toEqual(workspaceDebugContext);
     expect(clientEnvelopeSchema.parse(requestsFixture.render_input_prediction)).toEqual(
       requestsFixture.render_input_prediction,
     );

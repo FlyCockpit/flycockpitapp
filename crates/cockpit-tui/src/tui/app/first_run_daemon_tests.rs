@@ -1112,10 +1112,12 @@ fn repeated_secure_store_choice_while_in_flight_is_not_resent() {
         || {
             let cockpit = tmp.path().join(".cockpit");
             std::fs::create_dir_all(&cockpit).unwrap();
-            ConfigDoc::load(&cockpit.join("config.json"))
-                .unwrap()
-                .write(&ProvidersConfig::default())
-                .unwrap();
+            with_trusted_fixture_root(tmp.path(), || {
+                ConfigDoc::load(&cockpit.join("config.json"))
+                    .unwrap()
+                    .write(&ProvidersConfig::default())
+            })
+            .unwrap();
             let mut app = real_first_run_app(tmp.path());
             advance_real_first_run_to_secure_store_choice(&mut app);
             submit_secure_placement(
@@ -1169,10 +1171,12 @@ fn failed_checkpoint_resolution_never_retries_against_a_ready_daemon() {
         || {
             let cockpit = tmp.path().join(".cockpit");
             std::fs::create_dir_all(&cockpit).unwrap();
-            ConfigDoc::load(&cockpit.join("config.json"))
-                .unwrap()
-                .write(&ProvidersConfig::default())
-                .unwrap();
+            with_trusted_fixture_root(tmp.path(), || {
+                ConfigDoc::load(&cockpit.join("config.json"))
+                    .unwrap()
+                    .write(&ProvidersConfig::default())
+            })
+            .unwrap();
             let mut app = real_first_run_app(tmp.path());
             advance_real_first_run_to_provider(&mut app);
             let lifecycle = crate::tui::settings::test_lifecycle_client();

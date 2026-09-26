@@ -43,6 +43,33 @@ pub(crate) struct SessionCoverageInputs<'a> {
     pub redact_config: &'a RedactConfig,
 }
 
+/// Inputs of a sessionless workspace coverage key: exactly what a fresh
+/// session at `workspace_root` binds, minus the session identity. Used by
+/// the debug-context projection for a caller-supplied workspace.
+pub(crate) struct WorkspaceCoverageInputs<'a> {
+    pub principal: &'a ClientPrincipal,
+    pub owner_authorization_revision: i64,
+    pub workspace_root: &'a Path,
+    pub environment: &'a EnvSnapshot,
+    pub vault_revision: u64,
+    pub command_cache: &'a crate::secret_command::CommandSecretCache,
+    pub policy_digest: &'a str,
+    pub sealed: CoverageBinding,
+    pub override_revision: u64,
+    pub redact_config: &'a RedactConfig,
+}
+
+/// Completed-scan boundary revisions for a workspace-rooted capture (a
+/// session or a sessionless workspace), consumed by
+/// [`CoverageBuild::capture`](super::coverage_authority::CoverageBuild::capture).
+pub(crate) trait WorkspaceCaptureBoundary {
+    fn boundary_revisions(
+        &self,
+        table: &RedactionTable,
+        capture: &MachineSourceCapture,
+    ) -> OwnedSourceRevisions;
+}
+
 /// Inputs of daemon-wide coverage. There is deliberately no root: daemon-global
 /// coverage is built from daemon-global sources only (the environment
 /// snapshot, vault/keyring and command secrets, and the installation-wide
@@ -375,6 +402,63 @@ impl SessionCoverageInputs<'_> {
     /// Revisions at the completed-scan boundary. The machine-source binding
     /// comes from the bytes the capture consumed (`capture`), not a reread.
     pub(crate) fn boundary_revisions(
+        &self,
+        table: &RedactionTable,
+        capture: &MachineSourceCapture,
+    ) -> OwnedSourceRevisions {
+        OwnedSourceRevisions {
+            environment: CoverageBinding::derive(
+                b"environment",
+                self.environment.digest().as_bytes(),
+            ),
+            credential_vault: credential_vault_binding(self.vault_revision, self.command_cache),
+            policy: CoverageBinding::derive(b"policy", self.policy_digest.as_bytes()),
+            sealed: self.sealed,
+            override_revision: CoverageBinding::derive(
+                b"override",
+                &self.override_revision.to_le_bytes(),
+            ),
+            machine_sources: captured_machine_sources_binding(capture, table),
+        }
+    }
+}
+
+impl WorkspaceCaptureBoundary for SessionCoverageInputs<'_> {
+    fn boundary_revisions(
+        &self,
+        table: &RedactionTable,
+        capture: &MachineSourceCapture,
+    ) -> OwnedSourceRevisions {
+        SessionCoverageInputs::boundary_revisions(self, table, capture)
+    }
+}
+
+impl WorkspaceCoverageInputs<'_> {
+    pub(crate) fn coverage_key(&self) -> anyhow::Result<RedactionCoverageKey> {
+        Ok(RedactionCoverageKey::workspace(
+            principal_binding(self.principal),
+            owner_authorization_binding(self.owner_authorization_revision),
+            CoverageBinding::derive(
+                b"workspace",
+                self.workspace_root.as_os_str().as_encoded_bytes(),
+            ),
+            CoverageBinding::derive(b"environment", self.environment.digest().as_bytes()),
+            credential_vault_binding(self.vault_revision, self.command_cache),
+            CoverageBinding::derive(b"policy", self.policy_digest.as_bytes()),
+            self.sealed,
+            CoverageBinding::derive(b"override", &self.override_revision.to_le_bytes()),
+            machine_sources_probe_binding(
+                self.redact_config,
+                RedactionSourceScope::Workspace(self.workspace_root),
+            )?,
+        ))
+    }
+}
+
+impl WorkspaceCaptureBoundary for WorkspaceCoverageInputs<'_> {
+    /// Identical derivation to the session boundary: the publish fence
+    /// (`SessionCoveragePublishOwners`) re-checks the same bindings.
+    fn boundary_revisions(
         &self,
         table: &RedactionTable,
         capture: &MachineSourceCapture,

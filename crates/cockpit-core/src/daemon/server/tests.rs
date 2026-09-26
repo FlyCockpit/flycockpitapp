@@ -23800,7 +23800,10 @@ impl ReadonlyDispatchCaseKind {
                 let ctx = test_ctx();
                 let response = dispatch_matrix_request(
                     &ctx,
-                    Request::GetRedactionCoverageStatus { session_id: None },
+                    Request::GetRedactionCoverageStatus {
+                        session_id: None,
+                        project_root: None,
+                    },
                 )
                 .await
                 .expect("get_redaction_coverage_status happy");
@@ -44405,7 +44408,10 @@ async fn daemon_global_debug_context_does_not_read_the_daemon_cwd() {
     let ctx = test_ctx();
     let response = dispatch_matrix_request(
         &ctx,
-        Request::GetRedactionCoverageStatus { session_id: None },
+        Request::GetRedactionCoverageStatus {
+            session_id: None,
+            project_root: None,
+        },
     )
     .await
     .expect("daemon-global coverage status");
@@ -44418,6 +44424,193 @@ async fn daemon_global_debug_context_does_not_read_the_daemon_cwd() {
         !rendered.contains(&launch.path().display().to_string()),
         "{rendered}"
     );
+}
+
+const WORKSPACE_DEBUG_DOTENV_SECRET: &str = "workspace-dotenv-secret-value-9f3e2a71";
+const WORKSPACE_DEBUG_PROJECT_NAME: &str = "PROJECT_LAYER_NAME_CANARY_7c1d";
+const WORKSPACE_DEBUG_TEAM_GUIDANCE: &str = "PROJECT_LAYER_GUIDANCE_CANARY_52ab";
+const WORKSPACE_DEBUG_AGENTS_GUIDANCE: &str = "DEFAULT_AGENTS_GUIDANCE_CANARY_e04f";
+
+/// A workspace whose project `.cockpit/config.json` layer renames the user
+/// and redirects the guidance file list, with a workspace `.env` secret that
+/// both guidance files quote.
+fn workspace_debug_fixture() -> tempfile::TempDir {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(workspace.path().join(".cockpit")).unwrap();
+    std::fs::write(
+        workspace.path().join(".cockpit/config.json"),
+        format!(
+            r#"{{"name":"{WORKSPACE_DEBUG_PROJECT_NAME}","agent_guidance_files":["TEAM.md"]}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join(".env"),
+        format!("API_TOKEN={WORKSPACE_DEBUG_DOTENV_SECRET}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("TEAM.md"),
+        format!("{WORKSPACE_DEBUG_TEAM_GUIDANCE}\nuse {WORKSPACE_DEBUG_DOTENV_SECRET}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("AGENTS.md"),
+        format!("{WORKSPACE_DEBUG_AGENTS_GUIDANCE}\nuse {WORKSPACE_DEBUG_DOTENV_SECRET}\n"),
+    )
+    .unwrap();
+    workspace
+}
+
+async fn render_workspace_debug_context(
+    mode: Option<crate::db::workspace_trust::WorkspaceTrustMode>,
+) -> String {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let workspace = workspace_debug_fixture();
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
+    let root = std::fs::canonicalize(workspace.path()).unwrap();
+    if let Some(mode) = mode {
+        let trust_root = crate::config::trust::resolve_trust_root(&root).unwrap();
+        ctx.db
+            .set_workspace_trust(&trust_root.root, mode)
+            .await
+            .unwrap();
+    }
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::GetRedactionCoverageStatus {
+            session_id: None,
+            project_root: Some(root.to_str().unwrap().to_owned()),
+        },
+    )
+    .await
+    .expect("workspace debug context");
+    let Response::RedactionCoverageStatus(status) = response else {
+        panic!("expected RedactionCoverageStatus");
+    };
+    status.rendered_context.expect("owner render")
+}
+
+/// A trusted caller workspace renders the fresh-session baseline with its
+/// project config layer applied, scrubbed by workspace-scoped coverage
+/// (the workspace `.env` value never appears).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_debug_context_applies_trusted_project_config_and_scrubs_dotenv() {
+    let rendered =
+        render_workspace_debug_context(Some(crate::db::workspace_trust::WorkspaceTrustMode::Trust))
+            .await;
+    assert!(rendered.contains("System prompt:"), "{rendered}");
+    assert!(rendered.contains("Workspace trust: trust"), "{rendered}");
+    assert!(
+        rendered.contains(WORKSPACE_DEBUG_PROJECT_NAME),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(WORKSPACE_DEBUG_TEAM_GUIDANCE),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(WORKSPACE_DEBUG_DOTENV_SECRET),
+        "{rendered}"
+    );
+}
+
+/// IgnoreConfig, untrusted, and unset workspaces never render project-layer
+/// config-derived content (the project user name or its redirected guidance
+/// list), still render the default guidance prelude, and still scrub the
+/// workspace `.env` secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_debug_context_excludes_project_config_unless_trusted() {
+    use crate::db::workspace_trust::WorkspaceTrustMode;
+    for (mode, label) in [
+        (
+            Some(WorkspaceTrustMode::IgnoreConfig),
+            "Workspace trust: ignore-config",
+        ),
+        (
+            Some(WorkspaceTrustMode::Untrusted),
+            "Workspace trust: untrusted",
+        ),
+        (None, "Workspace trust: unset"),
+    ] {
+        let rendered = render_workspace_debug_context(mode).await;
+        assert!(rendered.contains(label), "{mode:?}: {rendered}");
+        assert!(rendered.contains("System prompt:"), "{mode:?}: {rendered}");
+        assert!(
+            rendered.contains(WORKSPACE_DEBUG_AGENTS_GUIDANCE),
+            "{mode:?}: {rendered}"
+        );
+        assert!(
+            !rendered.contains(WORKSPACE_DEBUG_PROJECT_NAME),
+            "{mode:?}: {rendered}"
+        );
+        assert!(
+            !rendered.contains(WORKSPACE_DEBUG_TEAM_GUIDANCE),
+            "{mode:?}: {rendered}"
+        );
+        assert!(
+            !rendered.contains(WORKSPACE_DEBUG_DOTENV_SECRET),
+            "{mode:?}: {rendered}"
+        );
+    }
+}
+
+/// A relative root is refused at the wire boundary: the daemon never
+/// resolves it against its own working directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_debug_context_rejects_relative_root() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let ctx = test_ctx();
+    let error = dispatch_matrix_request(
+        &ctx,
+        Request::GetRedactionCoverageStatus {
+            session_id: None,
+            project_root: Some("relative/project".into()),
+        },
+    )
+    .await
+    .expect_err("relative root must be refused");
+    assert_eq!(error.code, ErrorCode::BadRequest, "{error:?}");
+}
+
+/// A non-owner principal cannot direct the daemon to read a workspace.
+#[cfg(feature = "remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_debug_context_requires_owner_authority() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let workspace = workspace_debug_fixture();
+    let ctx = test_ctx();
+    let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "debug-context-viewer".into(),
+        actor_binding: None,
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::Agent,
+                project_root: Some(workspace.path().to_string_lossy().into_owned()),
+            },
+        ]),
+    });
+    let result = dispatch_authz_request_after(
+        &ctx,
+        principal,
+        Vec::new(),
+        None,
+        None,
+        Request::GetRedactionCoverageStatus {
+            session_id: None,
+            project_root: Some(
+                std::fs::canonicalize(workspace.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        },
+    )
+    .await;
+    match result {
+        Err(error) => assert_eq!(error.code, ErrorCode::Authorization, "{error:?}"),
+        Ok(response) => panic!("non-owner workspace render must be refused: {response:?}"),
+    }
 }
 
 /// An unreadable installation retention policy never becomes the default

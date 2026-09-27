@@ -61,7 +61,7 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
     SessionSummary {
         session_id,
         session_entry_mode: "code".into(),
-        short_id: Some("abcdef".to_string()),
+        short_id: "abcdef".to_string(),
         project_root,
         project_id: "pid".to_string(),
         started_at_unix_ms: 1,

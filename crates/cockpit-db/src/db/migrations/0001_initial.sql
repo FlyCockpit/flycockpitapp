@@ -9095,9 +9095,13 @@ CREATE INDEX idx_agent_profile_snapshots_installation
 -- ============================================================================
 --
 -- Created unconditionally in every build. Only code compiled with the
--- `extended` Cargo feature reads or writes these tables; default/local
--- builds leave them empty. They reference base tables only, and no base
--- object references them.
+-- `extended` Cargo feature populates these tables, so default/local builds
+-- leave them empty. Feature-independent code may still touch them in every
+-- build: append-only ledger retention (`ledger_retention.rs`) prunes the
+-- image security-recovery ledgers, a no-op on empty tables. Their foreign
+-- keys to `external_journal_operations` are RESTRICT and never bind while the
+-- tables are empty. They reference base tables only, and no base object
+-- references them.
 
 -- Explicit, versioned image-generation monetary policy. JSON is validated by
 -- the typed boundary before insertion; old versions remain referenced by the
@@ -10339,9 +10343,12 @@ END;
 -- ============================================================================
 --
 -- Created unconditionally in every build. Only code compiled with the
--- `remote` Cargo feature reads or writes these tables; default/local builds
--- leave them empty. They reference base tables only, and no base object
--- references them.
+-- `remote` Cargo feature populates these tables, so default/local builds
+-- leave them empty. Feature-independent code may still touch them in every
+-- build: append-only ledger retention (`ledger_retention.rs`) prunes
+-- `remote_principal_audit`, and deleting a `sessions` row cascades into it;
+-- both are no-ops on empty tables. They reference base tables only, and no
+-- base object references them.
 
 -- ---- sync_state ------------------------------------------------------------------------------------
 -- Enterprise org-policy session log sync state. One row per control-plane

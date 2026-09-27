@@ -147,11 +147,7 @@ async fn list(args: SessionListArgs) -> Result<()> {
         return Ok(());
     }
     for session in sessions {
-        let display_id = session
-            .short_id
-            .as_deref()
-            .map(str::to_owned)
-            .unwrap_or_else(|| session.session_id.to_string());
+        let display_id = &session.short_id;
         let title = session.title.as_deref().unwrap_or("(untitled)");
         println!(
             "{display_id}\t{}\t{title}\t{}",

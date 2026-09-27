@@ -245,7 +245,7 @@ mod tests {
     ) -> Vec<(Uuid, String, String)> {
         db.read(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT session_id, active_agent, COALESCE(short_id, 'unknown')
+                "SELECT session_id, active_agent, short_id
                   FROM sessions
                   WHERE session_id != ?1
                   ORDER BY session_id",

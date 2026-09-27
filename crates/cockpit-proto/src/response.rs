@@ -2476,8 +2476,8 @@ pub struct ActiveModelState {
 pub struct BtwForkInfo {
     pub session_id: Uuid,
     pub parent_session_id: Uuid,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub short_id: Option<String>,
+    /// 6-char display id; every session row carries one (`NOT NULL`).
+    pub short_id: String,
     pub tangent: bool,
     pub created_at: i64,
     pub message_count: u32,

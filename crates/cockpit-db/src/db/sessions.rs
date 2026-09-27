@@ -4729,7 +4729,7 @@ impl Db {
         Ok(crate::db::wire::SessionSummary {
             session_id: row.session_id,
             session_entry_mode: row.session_entry_mode,
-            short_id: Some(row.short_id),
+            short_id: row.short_id,
             project_root: row.project_root,
             project_id: row.project_id,
             started_at_unix_ms: row.started_at_unix_ms,

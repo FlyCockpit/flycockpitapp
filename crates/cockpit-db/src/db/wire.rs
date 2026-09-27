@@ -24,8 +24,8 @@ pub struct SessionSummary {
     pub session_id: Uuid,
     /// Immutable daemon-owned entry setup copied from the durable session row.
     pub session_entry_mode: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub short_id: Option<String>,
+    /// 6-char display id; every session row carries one (`NOT NULL`).
+    pub short_id: String,
     pub project_root: String,
     pub project_id: String,
     pub started_at_unix_ms: i64,

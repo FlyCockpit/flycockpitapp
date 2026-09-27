@@ -366,7 +366,7 @@ pub(super) fn btw_info_to_proto(info: crate::db::sessions::BtwForkInfo) -> proto
     proto::BtwForkInfo {
         session_id: info.session_id,
         parent_session_id: info.parent_session_id,
-        short_id: Some(info.short_id),
+        short_id: info.short_id,
         tangent: info.tangent,
         created_at: info.created_at_unix_ms,
         message_count: info.message_count,
@@ -905,7 +905,7 @@ mod sessions_activity_tests {
         proto::SessionSummary {
             session_id: Uuid::new_v4(),
             session_entry_mode: "code".into(),
-            short_id: None,
+            short_id: "abc123".into(),
             project_root: "/proj".into(),
             project_id: "pid".into(),
             started_at_unix_ms: 1,

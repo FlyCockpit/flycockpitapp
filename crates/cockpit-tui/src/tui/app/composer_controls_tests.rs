@@ -265,7 +265,7 @@ fn key_router_precedence_matrix_covers_every_focus_and_picker_state() {
                             cockpit_proto::BtwForkInfo {
                                 session_id: Uuid::new_v4(),
                                 parent_session_id: Uuid::new_v4(),
-                                short_id: Some("btw001".to_string()),
+                                short_id: "btw001".to_string(),
                                 tangent: false,
                                 created_at: 1,
                                 message_count: 0,
@@ -295,7 +295,7 @@ fn key_router_precedence_matrix_covers_every_focus_and_picker_state() {
                         cockpit_proto::BtwForkInfo {
                             session_id: Uuid::new_v4(),
                             parent_session_id: Uuid::new_v4(),
-                            short_id: Some("btw002".to_string()),
+                            short_id: "btw002".to_string(),
                             tangent: false,
                             created_at: 1,
                             message_count: 0,
@@ -685,7 +685,7 @@ fn focused_btw_cannot_intercept_composer_model_menu_commit() {
         cockpit_proto::BtwForkInfo {
             session_id: Uuid::new_v4(),
             parent_session_id: Uuid::new_v4(),
-            short_id: Some("btw001".to_string()),
+            short_id: "btw001".to_string(),
             tangent: false,
             created_at: 1,
             message_count: 0,
@@ -801,7 +801,7 @@ fn ctrl_k_router_dispatches_b_n_and_r_continuations() {
         cockpit_proto::BtwForkInfo {
             session_id: Uuid::new_v4(),
             parent_session_id: Uuid::new_v4(),
-            short_id: Some("btw001".to_string()),
+            short_id: "btw001".to_string(),
             tangent: false,
             created_at: 1,
             message_count: 0,

@@ -52,7 +52,7 @@ impl App {
                 .title
                 .clone()
                 .filter(|title| !title.trim().is_empty())
-                .or_else(|| summary.short_id.clone().filter(|id| !id.trim().is_empty()));
+                .or_else(|| Some(summary.short_id.clone()).filter(|id| !id.trim().is_empty()));
             if title.is_some() {
                 return title;
             }

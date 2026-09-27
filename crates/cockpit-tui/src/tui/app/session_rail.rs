@@ -186,7 +186,7 @@ mod tests {
         SessionSummary {
             session_id: id,
             session_entry_mode: "code".into(),
-            short_id: Some("abc123".into()),
+            short_id: "abc123".into(),
             project_root: "/proj/alpha".into(),
             project_id: "pid".into(),
             started_at_unix_ms: 0,

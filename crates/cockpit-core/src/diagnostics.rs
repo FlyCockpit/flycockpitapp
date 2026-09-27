@@ -752,7 +752,7 @@ async fn database_lines_inner(db: &DiagnosticDb<'_>, retention: String) -> (Vec<
             .to_string(),
     );
     lines.push(
-        "repair: read-only doctor never edits SQLite; restore a validated sibling *.backup-*.sqlite or move the database aside and restart"
+        "repair: read-only doctor never edits SQLite; move the database aside and restart (the daemon creates a fresh one)"
             .to_string(),
     );
     lines.push(retention);
@@ -855,7 +855,7 @@ fn append_database_failure_guidance(lines: &mut Vec<String>, retention: &str) {
             .to_string(),
     );
     lines.push(
-        "repair: read-only doctor never edits SQLite; restore a validated sibling *.backup-*.sqlite or move the database aside and restart"
+        "repair: read-only doctor never edits SQLite; move the database aside and restart (the daemon creates a fresh one)"
             .to_string(),
     );
     lines.push(retention.to_string());

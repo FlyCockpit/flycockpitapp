@@ -631,7 +631,59 @@ mod tests {
         drop(guard);
         assert_eq!(crate::db::exact_ddl_fingerprint(&conn).unwrap(), before);
 
+        // An empty ledger skips the fence drop/recreate entirely.
         prune_append_only_ledgers_conn(&conn, 2_000, 2).unwrap();
         assert_eq!(crate::db::exact_ddl_fingerprint(&conn).unwrap(), before);
+
+        // A terminal recovery-attempt row older than the cutoff forces the
+        // real drop -> prune -> recreate path; the recreated fences must
+        // leave the fingerprint byte-identical and still forbid deletes.
+        let attempts = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM image_generation_artifact_security_recovery_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        for operation in ["op-old-a", "op-old-b"] {
+            conn.execute(
+                "INSERT INTO image_generation_artifact_security_recovery_attempts
+                     (recovery_operation_id, principal_digest, request_digest, state, created_at_unix_ms)
+                 VALUES (?1, ?2, ?3, 'received', 1)",
+                params![operation, "a".repeat(64), "b".repeat(64)],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE image_generation_artifact_security_recovery_attempts
+                    SET state = 'validated', outcome_digest = ?2, decided_at_unix_ms = 10
+                  WHERE recovery_operation_id = ?1",
+                params![operation, "c".repeat(64)],
+            )
+            .unwrap();
+        }
+        assert_eq!(attempts(&conn), 2);
+        let outcome = prune_append_only_ledgers_conn(&conn, 2_000, 1).unwrap();
+        assert_eq!(outcome.image_security_recovery_attempts_deleted, 2);
+        assert_eq!(attempts(&conn), 0);
+        assert_eq!(crate::db::exact_ddl_fingerprint(&conn).unwrap(), before);
+        conn.execute(
+            "INSERT INTO image_generation_artifact_security_recovery_attempts
+                 (recovery_operation_id, principal_digest, request_digest, state, created_at_unix_ms)
+             VALUES ('op-fenced', ?1, ?2, 'received', 1)",
+            params!["a".repeat(64), "b".repeat(64)],
+        )
+        .unwrap();
+        let error = conn
+            .execute(
+                "DELETE FROM image_generation_artifact_security_recovery_attempts",
+                [],
+            )
+            .expect_err("the recreated delete fence must be active")
+            .to_string();
+        assert!(
+            error.contains("security recovery attempt audit is durable"),
+            "{error}"
+        );
     }
 }

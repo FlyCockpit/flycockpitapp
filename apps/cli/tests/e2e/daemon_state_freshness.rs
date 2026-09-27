@@ -409,7 +409,7 @@ fn assert_newer_ledger_refused(label: &str, daemon: &SpawnedDaemon, output: &std
     let text = output_text(output);
     assert!(
         text.contains("incompatible database schema v2")
-            && text.contains("Restore a compatible migration backup or move the database aside"),
+            && text.contains("Run a Cockpit build that supports it, or move the database aside"),
         "{text}"
     );
     assert!(

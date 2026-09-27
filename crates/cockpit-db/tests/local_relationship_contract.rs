@@ -12,7 +12,7 @@ const EXTENDED_SECTION_MARKER: &str = "-- ==== extended domains";
 const REMOTE_SECTION_MARKER: &str = "-- ==== remote domains";
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const SCHEMA_REVIEW_DIGEST: &str =
-    "3fe21f108d81bd6f58e8fa5c401f5f49116a6dda5e71e0163607f533ed762ad4";
+    "a328d84ea06c6478c21b0c40f17e17b91b815d6105d8fac452142053d02fc0d8";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
     "ec7029db08e8f2cc2a6bdedcc421b97c403ad95ed13321facd482639e98b074a";
 

@@ -340,7 +340,7 @@ pub const fn shell_sandbox_supported() -> bool {
 /// ready for the caller to apply `process_group(0)` / `kill_on_drop` and
 /// run its cancel/timeout loop.
 ///
-/// `command` is the full (prelude-prefixed) shell line. `cwd` is the
+/// `command` is the exact approved shell text (no prelude or prefix). `cwd` is the
 /// agent working directory — read+write inside the sandbox. `tmp_dir`, when
 /// present, is the ephemeral per-session scratch; `workspace_scratch_dir` is
 /// the durable per-workspace, per-session scratch. Both are read+write and

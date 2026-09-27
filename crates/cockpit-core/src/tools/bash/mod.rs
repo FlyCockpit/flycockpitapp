@@ -7,10 +7,15 @@
 //! Per the tool-availability-policy memory: at startup we probe
 //! `$PATH` for `rg`/`fd` and (on macOS) `gsed`. The tool description
 //! advertises which of these are available so the model picks the
-//! right binary, and on macOS-with-gsed we prepend a small `sed()`
-//! shell function so `sed` invocations use the GNU implementation —
-//! BSD `sed` differs enough that scripts written for Linux fail
-//! silently on macOS.
+//! right binary. On macOS the description also states that `sed` is BSD
+//! sed and GNU sed is `gsed`; the shell text itself is never rewritten.
+//!
+//! Approval/effect identity: the command text the user or model approved is
+//! byte-for-byte the script handed to `sh -c` (host, sandboxed, and container
+//! runs alike) and the `execute.command` effect rechecked at the spawn
+//! boundary. Cockpit adds no shell prelude, wrapper, or platform prefix to
+//! that text; confinement, cwd, and environment plumbing live in the
+//! process launcher, never in the approved script.
 //!
 //! Safety:
 //!   - Output is capped at [`crate::tools::common::OUTPUT_BYTE_CAP`], and every
@@ -60,7 +65,6 @@ pub struct BashTool {
     /// The explicit, steering verbose (formerly defensive) description
     /// (implementation note).
     verbose_description: String,
-    prelude: String,
 }
 
 impl Default for BashTool {
@@ -71,8 +75,9 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
+        let mut description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
             .to_string();
+        description.push_str(MACOS_SED_NOTE);
 
         // The defensive, explicitly-steering form (the verbose steering
         // variant). Same PATH-probe hints, more guidance.
@@ -96,12 +101,12 @@ impl BashTool {
              unless the user explicitly wants a persistent workspace artifact, then inspect \
              focused slices or searches from that file. Never edit a file you intend to keep via bash — use \
              `read`+`write`/`edit`."
-                .to_string();
+                .to_string()
+                + MACOS_SED_NOTE;
 
         Self {
             description,
             verbose_description,
-            prelude: macos_sed_prelude(),
         }
     }
 
@@ -130,13 +135,15 @@ impl BashTool {
     }
 }
 
-fn macos_sed_prelude() -> String {
-    if cfg!(target_os = "macos") {
-        "sed() { if command -v gsed >/dev/null 2>&1; then command gsed \"$@\"; else command sed \"$@\"; fi; }; ".to_string()
-    } else {
-        String::new()
-    }
-}
+/// macOS ships BSD `sed`, whose flags (notably `-i`) differ from GNU sed.
+/// Steer the model to call `gsed` explicitly instead of rewriting the
+/// approved shell text: an injected `sed()` prelude would make the executed
+/// script differ from the approved one (#528).
+const MACOS_SED_NOTE: &str = if cfg!(target_os = "macos") {
+    " macOS: `sed` is BSD sed; GNU sed is `gsed`."
+} else {
+    ""
+};
 
 #[async_trait]
 impl Tool for BashTool {
@@ -217,7 +224,7 @@ impl Tool for BashTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        call_bash_inner(&self.prelude, args, ctx, BashRunOptions::default()).await
+        call_bash_inner(args, ctx, BashRunOptions::default()).await
     }
 }
 
@@ -368,9 +375,7 @@ pub(crate) async fn rerun_escalated_bash(
     ctx: &ToolCtx,
     approval_scope_recorded: Option<String>,
 ) -> Result<ToolOutput> {
-    let tool = BashTool::new();
     call_bash_inner(
-        &tool.prelude,
         args,
         ctx,
         BashRunOptions {
@@ -395,9 +400,7 @@ pub(crate) async fn rerun_escalated_bash_confined(
                 "workspace lease is unavailable before escalated bash: {error:#}"
             ))
         })?;
-    let tool = BashTool::new();
     call_bash_inner(
-        &tool.prelude,
         args,
         ctx,
         BashRunOptions {
@@ -410,7 +413,6 @@ pub(crate) async fn rerun_escalated_bash_confined(
 }
 
 async fn call_bash_inner(
-    prelude: &str,
     args: Value,
     ctx: &ToolCtx,
     options: BashRunOptions,
@@ -536,12 +538,6 @@ async fn call_bash_inner(
 
     tracing::debug!(command, timeout_ms, "bash: spawning");
 
-    let prefixed = if prelude.is_empty() {
-        command.to_string()
-    } else {
-        format!("{prelude}{command}")
-    };
-
     // Resolve whether to confine this run (sandboxing part 2):
     //
     //   - Windows: never (no zerobox backend) — run unconfined and
@@ -653,7 +649,6 @@ async fn call_bash_inner(
     if is_container_run {
         return run_container_bash(
             command,
-            &prefixed,
             &cwd,
             timeout_ms,
             &session_env,
@@ -843,7 +838,7 @@ async fn call_bash_inner(
 
     // First attempt: sandboxed (confined) or broadened/unconfined.
     let attempt = run_shell(
-        &prefixed,
+        command,
         &cwd,
         confine,
         tmp_dir.as_deref(),
@@ -883,7 +878,7 @@ async fn call_bash_inner(
             .with_bash_meta(meta, &resource_meta));
         }
         RunOutcome::SpawnError(e) => {
-            let mut message = render_spawn_error(&prefixed, &cwd, &e, Some(confine));
+            let mut message = render_spawn_error(command, &cwd, &e, Some(confine));
             message.push_str(
                 &crate::tools::command_resource_profiles::resource_profile_context(
                     &command_resource_plan,
@@ -990,7 +985,7 @@ async fn call_bash_inner(
             }
             meta.approval_scope_recorded = Some(scope.as_str().to_string());
             let rerun = run_shell(
-                &prefixed,
+                command,
                 &cwd,
                 false, // broadened — no confinement
                 tmp_dir.as_deref(),
@@ -1030,7 +1025,7 @@ async fn call_bash_inner(
                     .with_bash_meta(meta, &resource_meta));
                 }
                 RunOutcome::SpawnError(e) => {
-                    let mut message = render_spawn_error(&prefixed, &cwd, &e, Some(false));
+                    let mut message = render_spawn_error(command, &cwd, &e, Some(false));
                     message.push_str(
                         &crate::tools::command_resource_profiles::resource_profile_context(
                             &command_resource_plan,
@@ -2616,7 +2611,6 @@ fn looks_like_build_test_check(command: &str) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_container_bash(
-    display_command: &str,
     command: &str,
     cwd: &std::path::Path,
     timeout_ms: u64,
@@ -2704,7 +2698,7 @@ async fn run_container_bash(
         RunOutcome::Done(o) => o,
     };
     Ok(render_bash_outcome(
-        display_command,
+        command,
         cwd,
         final_outcome,
         ctx,

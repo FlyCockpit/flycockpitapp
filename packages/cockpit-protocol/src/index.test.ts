@@ -921,6 +921,7 @@ describe("cockpit-proto daemon wire schemas", () => {
     const summary = {
       session_id: "11111111-1111-4111-8111-111111111111",
       session_entry_mode: "code",
+      short_id: "abc123",
       project_root: "/tmp/project",
       project_id: "proj",
       started_at_unix_ms: 1,
@@ -942,6 +943,14 @@ describe("cockpit-proto daemon wire schemas", () => {
       responseEnvelopeSchema.safeParse({
         ...sessions,
         data: { sessions: [withoutFavorite] },
+      }).success,
+    ).toBe(false);
+    // Every session row carries a short id (NOT NULL); the wire requires it.
+    const { short_id: _shortId, ...withoutShortId } = summary;
+    expect(
+      responseEnvelopeSchema.safeParse({
+        ...sessions,
+        data: { sessions: [withoutShortId] },
       }).success,
     ).toBe(false);
   });

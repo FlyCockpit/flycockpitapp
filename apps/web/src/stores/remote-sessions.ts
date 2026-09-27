@@ -726,7 +726,7 @@ export function toWebSessionSummary(session: WireSessionSummary): WebSessionSumm
     sessionEntryMode: session.session_entry_mode,
     projectId: session.project_id,
     projectRoot: session.project_root,
-    title: session.title ?? session.short_id ?? session.session_id,
+    title: session.title ?? session.short_id,
     description: session.description ?? undefined,
     shortId: session.short_id,
     status: stringField(raw, "activity_state") ?? "idle",

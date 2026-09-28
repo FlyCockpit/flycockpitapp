@@ -91,3 +91,21 @@ fn bash_timeout_schema_declares_default_and_bounds_in_both_tiers() {
         serde_json::json!(MIN_QUEUE_TIMEOUT_MS)
     );
 }
+
+/// #528 follow-up: the macOS `sed` note reflects what the effective PATH
+/// resolves, and is never claimed for containers, other hosts, or a GNU
+/// `sed` shadowing the system one (Homebrew gnubin first on PATH).
+#[test]
+fn sed_flavor_note_describes_only_a_resolved_system_bsd_sed_on_a_macos_host() {
+    use crate::capabilities::ExecutionTarget::{Container, Host};
+    let bsd = Some(Path::new("/usr/bin/sed"));
+    let gnubin = Some(Path::new("/opt/homebrew/opt/gnu-sed/libexec/gnubin/sed"));
+    let with_gsed = sed_flavor_note(true, Host, bsd, true).expect("BSD sed on a macOS host");
+    assert!(with_gsed.contains("BSD sed") && with_gsed.contains("`gsed`"));
+    let without_gsed = sed_flavor_note(true, Host, bsd, false).expect("BSD sed without gsed");
+    assert!(without_gsed.contains("BSD sed") && !without_gsed.contains("gsed"));
+    assert_eq!(sed_flavor_note(true, Host, gnubin, true), None);
+    assert_eq!(sed_flavor_note(true, Host, None, true), None);
+    assert_eq!(sed_flavor_note(true, Container, bsd, true), None);
+    assert_eq!(sed_flavor_note(false, Host, bsd, true), None);
+}

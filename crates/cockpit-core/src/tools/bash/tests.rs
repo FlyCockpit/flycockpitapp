@@ -2090,30 +2090,53 @@ async fn approved_unconfined_command_runs_at_real_spawn_boundary() {
     assert_eq!(meta.approval_scope_recorded.as_deref(), Some("once"));
 }
 
-/// #528: the script handed to `sh -c` is byte-for-byte the approved command.
-/// The shell reports its own argv via `ps`; any prelude, wrapper, or platform
-/// prefix added between approval and exec shows up as a mismatch even if the
-/// effect binding were kept on the raw text. The trailing `:` keeps the shell
-/// alive (no exec-last-command optimization) so `$$` is still `sh`.
-#[cfg(unix)]
+/// #528: the script handed to the unconfined `sh -c` is byte-for-byte the
+/// approved command. Any prelude, wrapper, or platform prefix added between
+/// approval and exec shows up in the witness even if the effect binding were
+/// kept on the raw text.
 #[tokio::test]
 async fn executed_shell_script_is_exactly_the_approved_command() {
+    let Some(command) = super::exec_witness::command() else {
+        eprintln!("skipping: `sh` exposes neither $BASH_EXECUTION_STRING nor /proc/$$/cmdline");
+        return;
+    };
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path()).await;
     ctx.session.set_sandbox_enabled(false);
-    let command = "ps -ww -o args= -p $$; :";
     let resolver = approve_every_host_prompt(&ctx);
     let out = call_bash_host_effect_for_test(serde_json::json!({ "command": command }), &ctx)
         .await
         .expect("approved bash call returns");
     resolver.abort();
     assert_eq!(out.exit_code, Some(0), "{}", out.content);
-    let expected = format!("sh -c {command}");
+    assert!(!out.sandbox.expect("bash records sandbox metadata").confined);
+    super::exec_witness::assert_executed_exactly(&out.content, command);
+}
+
+/// #528: the confined first attempt (real seatbelt/bwrap spawn, no scripted
+/// outcome) hands the sandboxed `sh -c` exactly the approved text.
+#[tokio::test]
+async fn confined_shell_script_is_exactly_the_approved_command() {
+    let Some(command) = super::exec_witness::command() else {
+        eprintln!("skipping: `sh` exposes neither $BASH_EXECUTION_STRING nor /proc/$$/cmdline");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path()).await;
+    ctx.session.set_sandbox_enabled(true);
+    let out = call_bash_host_effect_for_test(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("confined bash call returns");
     assert!(
-        out.content.lines().any(|line| line.trim_end() == expected),
-        "executed argv must be `{expected}`; got:\n{}",
+        out.sandbox
+            .clone()
+            .expect("bash records sandbox metadata")
+            .confined,
+        "must run confined: {}",
         out.content
     );
+    assert_eq!(out.exit_code, Some(0), "{}", out.content);
+    super::exec_witness::assert_executed_exactly(&out.content, command);
 }
 
 /// #528: the approved run-fail-escalate rerun binds

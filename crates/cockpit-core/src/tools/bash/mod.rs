@@ -7,8 +7,10 @@
 //! Per the tool-availability-policy memory: at startup we probe
 //! `$PATH` for `rg`/`fd` and (on macOS) `gsed`. The tool description
 //! advertises which of these are available so the model picks the
-//! right binary. On macOS the description also states that `sed` is BSD
-//! sed and GNU sed is `gsed`; the shell text itself is never rewritten.
+//! right binary. On a macOS host whose effective `PATH` resolves `sed` to
+//! the system BSD sed, the description says so (and points at `gsed` when
+//! present); the note is derived from the probed environment, omitted for
+//! container targets, and the shell text itself is never rewritten.
 //!
 //! Approval/effect identity: the command text the user or model approved is
 //! byte-for-byte the script handed to `sh -c` (host, sandboxed, and container
@@ -75,9 +77,8 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let mut description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
+        let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
             .to_string();
-        description.push_str(MACOS_SED_NOTE);
 
         // The defensive, explicitly-steering form (the verbose steering
         // variant). Same PATH-probe hints, more guidance.
@@ -101,8 +102,7 @@ impl BashTool {
              unless the user explicitly wants a persistent workspace artifact, then inspect \
              focused slices or searches from that file. Never edit a file you intend to keep via bash — use \
              `read`+`write`/`edit`."
-                .to_string()
-                + MACOS_SED_NOTE;
+                .to_string();
 
         Self {
             description,
@@ -135,15 +135,31 @@ impl BashTool {
     }
 }
 
-/// macOS ships BSD `sed`, whose flags (notably `-i`) differ from GNU sed.
-/// Steer the model to call `gsed` explicitly instead of rewriting the
-/// approved shell text: an injected `sed()` prelude would make the executed
-/// script differ from the approved one (#528).
-const MACOS_SED_NOTE: &str = if cfg!(target_os = "macos") {
-    " macOS: `sed` is BSD sed; GNU sed is `gsed`."
-} else {
-    ""
-};
+/// macOS's system `sed` (`/usr/bin/sed`, SIP-protected) is BSD sed, whose
+/// flags (notably `-i`) differ from GNU sed. Steer the model with what the
+/// effective environment actually resolves instead of rewriting the approved
+/// shell text: an injected `sed()` prelude made the executed script differ
+/// from the approved one (#528). No note when `sed` resolves elsewhere (for
+/// example Homebrew's gnubin first on `PATH`), on other hosts, or for a
+/// container target, where the shell runs in a Linux image.
+fn sed_flavor_note(
+    macos_host: bool,
+    target: crate::capabilities::ExecutionTarget,
+    sed: Option<&Path>,
+    gsed_available: bool,
+) -> Option<&'static str> {
+    if !macos_host
+        || target != crate::capabilities::ExecutionTarget::Host
+        || sed != Some(Path::new("/usr/bin/sed"))
+    {
+        return None;
+    }
+    Some(if gsed_available {
+        " `sed` here is BSD sed; use `gsed` for GNU sed syntax."
+    } else {
+        " `sed` here is BSD sed (`sed -i ''` for in-place edits)."
+    })
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -165,6 +181,29 @@ impl Tool for BashTool {
 
     fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
         Self::declared_binary_requirements()
+    }
+
+    fn capability_description_note(
+        &self,
+        env: &std::collections::HashMap<String, String>,
+        cwd: &Path,
+        target: crate::capabilities::ExecutionTarget,
+    ) -> Option<String> {
+        let macos_host = cfg!(target_os = "macos");
+        if !macos_host || target != crate::capabilities::ExecutionTarget::Host {
+            return None;
+        }
+        use crate::external_runtime::ProbeExecutor;
+        let executor = crate::external_runtime::SystemProbeExecutor;
+        let path_env = env.get("PATH").map(String::as_str);
+        let resolve = |name: &str| {
+            executor
+                .resolve(name, None, path_env, cwd)
+                .filter(|path| executor.is_spawnable(path))
+        };
+        let sed = resolve("sed");
+        let gsed_available = resolve("gsed").is_some();
+        sed_flavor_note(macos_host, target, sed.as_deref(), gsed_available).map(str::to_string)
     }
 
     fn completed_call_effect(&self, args: &Value, _output: &ToolOutput) -> ToolEffect {
@@ -3498,3 +3537,41 @@ mod schema_tests;
 
 #[cfg(all(test, unix))]
 mod tests;
+
+/// Test-only witness for the #528 invariant: the script `sh -c` receives is
+/// byte-for-byte the approved command. The witness command prints its own
+/// script from inside the shell, so it works under seatbelt/bwrap (where
+/// `ps` may be denied) and needs no procps.
+#[cfg(all(test, unix))]
+pub(crate) mod exec_witness {
+    /// A command that prints the exact `sh -c` script it runs on its own
+    /// line: `$BASH_EXECUTION_STRING` when `sh` is bash (macOS), otherwise
+    /// the script argument from `/proc/$$/cmdline` (Linux dash). `None` when
+    /// this host's `sh` exposes neither; callers skip with a reason.
+    pub(crate) fn command() -> Option<&'static str> {
+        static CHOICE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+        *CHOICE.get_or_init(|| {
+            let bash_string = std::process::Command::new("sh")
+                .args(["-c", r#"printf %s "${BASH_EXECUTION_STRING-}""#])
+                .output()
+                .map(|output| !output.stdout.is_empty())
+                .unwrap_or(false);
+            if bash_string {
+                Some(r#"printf '%s\n' "$BASH_EXECUTION_STRING"; :"#)
+            } else if std::path::Path::new("/proc/self/cmdline").exists() {
+                Some(r#"tr '\000' '\n' < /proc/$$/cmdline; :"#)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Assert the witness output shows exactly `command` as the executed
+    /// script (any prelude, wrapper, or prefix makes the line differ).
+    pub(crate) fn assert_executed_exactly(content: &str, command: &str) {
+        assert!(
+            content.lines().any(|line| line.trim_end() == command),
+            "executed script must be exactly `{command}`; got:\n{content}"
+        );
+    }
+}

@@ -433,6 +433,15 @@ impl Tool for IdleWakeActionTool {
         self.inner.binary_requirements()
     }
 
+    fn capability_description_note(
+        &self,
+        env: &std::collections::HashMap<String, String>,
+        cwd: &std::path::Path,
+        target: crate::capabilities::ExecutionTarget,
+    ) -> Option<String> {
+        self.inner.capability_description_note(env, cwd, target)
+    }
+
     fn presentation(&self, args: &Value) -> crate::engine::tool::ToolPresentation {
         self.inner.presentation(args)
     }

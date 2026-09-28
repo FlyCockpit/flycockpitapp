@@ -3481,6 +3481,294 @@ mod tests {
         );
     }
 
+    /// A real, bound host-approval prompt (one single-select question
+    /// offering `approve_once` and `reject`) plus its pending final operation.
+    struct SeededHostApproval {
+        db: crate::db::Db,
+        lifecycle: AgentTreeLifecycle,
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        interrupt_id: Uuid,
+        operation_id: Uuid,
+        offered: InterruptQuestionSet,
+    }
+
+    impl SeededHostApproval {
+        async fn new() -> Self {
+            let db = crate::db::Db::open_in_memory().unwrap();
+            let session = db.create_session("project", "/repo", "tree").await.unwrap();
+            let lifecycle = AgentTreeLifecycle::new(db.clone());
+            let agent = running_agent(&db, session.session_id, true).await;
+            let operation = HostApprovalOperation::new(
+                "test-host-operation",
+                serde_json::json!({
+                    "operation": "test",
+                    "candidate_effects": [{
+                        "selection": crate::approval::ID_APPROVE_ONCE,
+                        "execute": {"operation": "test"},
+                    }],
+                }),
+            )
+            .unwrap();
+            let operation_id = operation.operation_id;
+            let question = InterruptQuestion::Single {
+                prompt: "Run `ls`?".into(),
+                options: [crate::approval::ID_APPROVE_ONCE, crate::approval::ID_REJECT]
+                    .into_iter()
+                    .map(|id| InterruptOption {
+                        id: id.into(),
+                        label: id.into(),
+                        description: None,
+                        secondary: false,
+                    })
+                    .collect(),
+                allow_freetext: false,
+                command_detail: None,
+                permission: true,
+                approval_class: None,
+                sandbox_escalation: None,
+            };
+            let offered = InterruptQuestionSet {
+                questions: vec![question.clone()],
+            };
+            let interrupt_id = db
+                .raise_interrupt_with_agent_instance(
+                    session.session_id,
+                    "host-approval-test",
+                    Some(agent.agent_instance_id),
+                    "approval prompt",
+                    Some(&question),
+                )
+                .await
+                .unwrap();
+            db.reserve_host_approval_final_operation(
+                session.session_id,
+                agent.agent_instance_id,
+                operation_id,
+                operation.authorization_group_id,
+                operation.tool_call_id.clone(),
+                operation.member_index,
+                operation.concrete_effect_digest.clone(),
+                operation.operation_kind.clone(),
+                operation.canonical_input_json.clone(),
+                operation.input_digest.clone(),
+                HostApprovalAuthority::trusted_host().into_db(),
+                19,
+            )
+            .await
+            .unwrap();
+            let request = NewDecisionContract::user_question_interrupt(
+                agent.agent_instance_id,
+                agent.revision,
+                &offered,
+                agent.workspace_ref.clone(),
+            )
+            .unwrap()
+            .with_host_approval_subject(operation, HostApprovalAuthority::trusted_host());
+            let decision = lifecycle
+                .request_decision_for_interrupt(session.session_id, request, interrupt_id, 20)
+                .await
+                .unwrap();
+            Self {
+                db,
+                lifecycle,
+                session_id: session.session_id,
+                decision_request_id: decision.decision_request_id,
+                interrupt_id,
+                operation_id,
+                offered,
+            }
+        }
+
+        /// The worker's settlement branch (`SessionWork::ResolveInterrupt`
+        /// for a `host_approval` decision): an allowing answer goes to the
+        /// trusted approval path, anything else to the decline path. Both
+        /// lifecycle paths re-check the answer against the persisted prompt
+        /// (and the DB transaction checks it once more for approval).
+        async fn settle(&self, response: &ResolveResponse, at: i64) -> Result<DecisionSettlement> {
+            let envelope = serde_json::to_string(response).unwrap();
+            self.settle_envelope(
+                &envelope,
+                crate::approval::host_approval_response_allows(response, &self.offered),
+                at,
+            )
+            .await
+        }
+
+        async fn settle_envelope(
+            &self,
+            envelope: &str,
+            allows: bool,
+            at: i64,
+        ) -> Result<DecisionSettlement> {
+            if allows {
+                self.lifecycle
+                    .resolve_host_approval(
+                        self.session_id,
+                        self.decision_request_id,
+                        self.interrupt_id,
+                        envelope,
+                        HostApprovalAuthority::trusted_host(),
+                        at,
+                    )
+                    .await
+            } else {
+                self.lifecycle
+                    .cancel_host_approval(
+                        self.session_id,
+                        self.decision_request_id,
+                        self.interrupt_id,
+                        envelope,
+                        at,
+                    )
+                    .await
+            }
+        }
+
+        async fn operation_state(&self) -> String {
+            let operation_id = self.operation_id.to_string();
+            self.db
+                .read(move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT state FROM agent_host_approval_operations WHERE operation_id = ?1",
+                        [operation_id],
+                        |row| row.get(0),
+                    )?)
+                })
+                .await
+                .unwrap()
+        }
+    }
+
+    /// #532: approval answers are built by the canonical
+    /// `ResolveResponse::from_answers` (the builder the TUI dialog uses for
+    /// every submit). A one-question approval answer must settle through the
+    /// real host-approval lifecycle; before the fix the TUI sent a one-element
+    /// `Batch`, which every settlement check refused, so the turn hung.
+    #[tokio::test]
+    async fn host_approval_settles_the_canonical_one_question_answer() {
+        let approve = ResolveResponse::from_answers(vec![QuestionAnswer::Single {
+            selected_id: crate::approval::ID_APPROVE_ONCE.into(),
+        }])
+        .unwrap();
+        let seeded = SeededHostApproval::new().await;
+        let settled = seeded.settle(&approve, 30).await.unwrap();
+        assert!(
+            settled.is_resolved(),
+            "approve-once from the canonical builder must settle: {settled:?}"
+        );
+        assert_eq!(seeded.operation_state().await, "approved");
+        // No double settle: a replayed approval is a CAS loser, not a second
+        // resolution, and a late decline cannot overwrite the approval.
+        assert!(matches!(
+            seeded.settle(&approve, 31).await.unwrap(),
+            DecisionSettlement::AlreadyTerminal(_)
+        ));
+        assert!(matches!(
+            seeded.settle(&ResolveResponse::Cancel, 32).await.unwrap(),
+            DecisionSettlement::AlreadyTerminal(_)
+        ));
+        assert_eq!(seeded.operation_state().await, "approved");
+
+        // Deny: the offered `reject` option, built the same way, declines.
+        let deny = ResolveResponse::from_answers(vec![QuestionAnswer::Single {
+            selected_id: crate::approval::ID_REJECT.into(),
+        }])
+        .unwrap();
+        let seeded = SeededHostApproval::new().await;
+        assert!(seeded.settle(&deny, 30).await.unwrap().is_resolved());
+        assert_eq!(seeded.operation_state().await, "cancelled");
+
+        // Cancel (Esc in the dialog) declines too.
+        let seeded = SeededHostApproval::new().await;
+        assert!(
+            seeded
+                .settle(&ResolveResponse::Cancel, 30)
+                .await
+                .unwrap()
+                .is_resolved()
+        );
+        assert_eq!(seeded.operation_state().await, "cancelled");
+    }
+
+    /// Malformed approval answers fail closed on both lifecycle paths and
+    /// leave the bound operation pending (still answerable, never approved).
+    #[tokio::test]
+    async fn host_approval_refuses_malformed_answers_and_stays_pending() {
+        let seeded = SeededHostApproval::new().await;
+        let approve_once = || QuestionAnswer::Single {
+            selected_id: crate::approval::ID_APPROVE_ONCE.into(),
+        };
+        let malformed = [
+            // A batch always answers >= 2 questions; this prompt has one.
+            ResolveResponse::from_answers(vec![approve_once(), approve_once()]).unwrap(),
+            ResolveResponse::from_answers(vec![approve_once(), QuestionAnswer::Cancel]).unwrap(),
+            // A real approval id this prompt did not offer.
+            ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_SESSION.into(),
+            },
+            ResolveResponse::Single {
+                selected_id: "foreign".into(),
+            },
+            ResolveResponse::Multi {
+                selected_ids: vec![crate::approval::ID_APPROVE_ONCE.into()],
+            },
+            ResolveResponse::Freetext {
+                text: crate::approval::ID_APPROVE_ONCE.into(),
+            },
+        ];
+        for (index, response) in malformed.iter().enumerate() {
+            assert!(
+                !crate::approval::host_approval_response_allows(response, &seeded.offered),
+                "{response:?} must not allow"
+            );
+            let at = 30 + index as i64;
+            assert!(
+                seeded.settle(response, at).await.is_err(),
+                "{response:?} must not settle (decline path)"
+            );
+            assert!(
+                seeded
+                    .settle_envelope(&serde_json::to_string(response).unwrap(), true, at)
+                    .await
+                    .is_err(),
+                "{response:?} must not settle even if a caller forces the approval path"
+            );
+        }
+        // The pre-fix TUI envelope (a one-element batch) is not a valid
+        // response at all: neither lifecycle path accepts it.
+        let one_element_batch = serde_json::json!({
+            "kind": "batch",
+            "data": { "responses": [
+                { "kind": "single", "data": { "selected_id": crate::approval::ID_APPROVE_ONCE } }
+            ] }
+        })
+        .to_string();
+        for allows in [true, false] {
+            assert!(
+                seeded
+                    .settle_envelope(&one_element_batch, allows, 40)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(seeded.operation_state().await, "pending");
+        // Still answerable: the refusals did not strand the prompt.
+        assert!(
+            seeded
+                .settle(
+                    &ResolveResponse::Single {
+                        selected_id: crate::approval::ID_APPROVE_ONCE.into(),
+                    },
+                    50,
+                )
+                .await
+                .unwrap()
+                .is_resolved()
+        );
+        assert_eq!(seeded.operation_state().await, "approved");
+    }
+
     #[tokio::test]
     async fn host_approval_deadline_cancels_its_bound_operation_and_interrupt() {
         let db = crate::db::Db::open_in_memory().unwrap();
@@ -4084,7 +4372,9 @@ use crate::db::agent_tree_decisions::{
     HostCapabilityRefreshAuthority as DbHostCapabilityRefreshAuthority, NewDecisionRequest,
     StoredQuestionOverride,
 };
-use crate::db::wire::{InterruptQuestion, InterruptQuestionSet, ResolveResponse};
+use crate::db::wire::{
+    BatchAnswers, InterruptQuestion, InterruptQuestionSet, QuestionAnswer, ResolveResponse,
+};
 
 /// Closed host-owned classification. Only `LowRisk` may enter automatic
 /// resolver routing; all other variants are intentionally non-auto-resolvable
@@ -4669,16 +4959,14 @@ impl RedactedInterruptQuestionSet {
         match response {
             ResolveResponse::Cancel => return Ok(()),
             ResolveResponse::Batch { responses } => {
+                // `BatchAnswers` holds >= 2 non-recursive answers by type, so
+                // a matching count also proves this is a multi-question set.
                 ensure!(
-                    self.questions.len() > 1 && responses.len() == self.questions.len(),
+                    responses.len() == self.questions.len(),
                     "QuestionTool batch answer does not match its durable question count"
                 );
-                for (question, response) in self.questions.iter().zip(responses) {
-                    ensure!(
-                        !matches!(response, ResolveResponse::Batch { .. }),
-                        "QuestionTool batch answer cannot nest a batch"
-                    );
-                    question.validate_response(response)?;
+                for (question, answer) in self.questions.iter().zip(responses) {
+                    question.validate_response(answer)?;
                 }
             }
             response => {
@@ -4686,7 +4974,11 @@ impl RedactedInterruptQuestionSet {
                     self.questions.len() == 1,
                     "QuestionTool multi-question answer must use a batch envelope"
                 );
-                self.questions[0].validate_response(response)?;
+                let answers = response.clone().into_batch(1);
+                let [answer] = answers.as_slice() else {
+                    bail!("QuestionTool one-question answer must be a single bare response");
+                };
+                self.questions[0].validate_response(answer)?;
             }
         }
         Ok(())
@@ -4714,15 +5006,15 @@ impl RedactedInterruptQuestion {
         }
     }
 
-    fn validate_response(&self, response: &ResolveResponse) -> Result<()> {
+    fn validate_response(&self, response: &QuestionAnswer) -> Result<()> {
         match (self, response) {
-            (_, ResolveResponse::Cancel) => Ok(()),
+            (_, QuestionAnswer::Cancel) => Ok(()),
             (
                 Self::Single {
                     option_ids,
                     allow_freetext: _,
                 },
-                ResolveResponse::Single { selected_id },
+                QuestionAnswer::Single { selected_id },
             ) => {
                 ensure!(
                     option_ids.iter().any(|id| id == selected_id),
@@ -4735,14 +5027,14 @@ impl RedactedInterruptQuestion {
                     allow_freetext: true,
                     ..
                 },
-                ResolveResponse::Freetext { text },
+                QuestionAnswer::Freetext { text },
             ) => validate_interrupt_free_text(text),
             (
                 Self::Multi {
                     option_ids,
                     allow_freetext: _,
                 },
-                ResolveResponse::Multi { selected_ids },
+                QuestionAnswer::Multi { selected_ids },
             ) => {
                 ensure!(
                     !selected_ids.is_empty() && selected_ids.len() <= option_ids.len(),
@@ -4765,9 +5057,9 @@ impl RedactedInterruptQuestion {
                     allow_freetext: true,
                     ..
                 },
-                ResolveResponse::Freetext { text },
+                QuestionAnswer::Freetext { text },
             ) => validate_interrupt_free_text(text),
-            (Self::Freetext, ResolveResponse::Freetext { text }) => {
+            (Self::Freetext, QuestionAnswer::Freetext { text }) => {
                 validate_interrupt_free_text(text)
             }
             _ => bail!("QuestionTool answer shape does not match its durable question contract"),
@@ -7460,15 +7752,39 @@ fn public_interrupt_response_from_private_continuation(
         },
         ResolveResponse::Freetext { text } => ResolveResponse::Freetext { text: text.clone() },
         ResolveResponse::Batch { responses } => ResolveResponse::Batch {
-            responses: responses
-                .iter()
-                .map(|response| {
-                    public_interrupt_response_from_private_continuation(response, mappings)
-                })
-                .collect::<Result<Vec<_>>>()?,
+            responses: map_batch_option_ids(responses, &to_public)?,
         },
         ResolveResponse::Cancel => ResolveResponse::Cancel,
     })
+}
+
+/// Map every option id in a batch's per-question answers, preserving the
+/// batch shape (same length, so the `BatchAnswers` bound still holds).
+fn map_batch_option_ids(
+    responses: &BatchAnswers,
+    map: impl Fn(&str) -> Result<String>,
+) -> Result<BatchAnswers> {
+    let answers = responses
+        .iter()
+        .map(|answer| {
+            Ok(match answer {
+                QuestionAnswer::Single { selected_id } => QuestionAnswer::Single {
+                    selected_id: map(selected_id)?,
+                },
+                QuestionAnswer::Multi { selected_ids } => QuestionAnswer::Multi {
+                    selected_ids: selected_ids
+                        .iter()
+                        .map(|id| map(id))
+                        .collect::<Result<Vec<_>>>()?,
+                },
+                QuestionAnswer::Freetext { text } => {
+                    QuestionAnswer::Freetext { text: text.clone() }
+                }
+                QuestionAnswer::Cancel => QuestionAnswer::Cancel,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BatchAnswers::new(answers)?)
 }
 
 /// After validation of a public opaque answer, recover the original local IDs
@@ -7524,10 +7840,7 @@ fn private_interrupt_response_for_continuation(
         },
         ResolveResponse::Freetext { text } => ResolveResponse::Freetext { text: text.clone() },
         ResolveResponse::Batch { responses } => ResolveResponse::Batch {
-            responses: responses
-                .iter()
-                .map(|response| private_interrupt_response_for_continuation(response, mappings))
-                .collect::<Result<Vec<_>>>()?,
+            responses: map_batch_option_ids(responses, &to_private)?,
         },
         ResolveResponse::Cancel => ResolveResponse::Cancel,
     })
@@ -7638,8 +7951,18 @@ fn validate_public_interrupt_response_option_tokens(response: &ResolveResponse) 
         }
         ResolveResponse::Freetext { .. } | ResolveResponse::Cancel => Ok(()),
         ResolveResponse::Batch { responses } => {
-            for response in responses {
-                validate_public_interrupt_response_option_tokens(response)?;
+            for answer in responses {
+                match answer {
+                    QuestionAnswer::Single { selected_id } => {
+                        validate_public_option_token(selected_id)?
+                    }
+                    QuestionAnswer::Multi { selected_ids } => {
+                        for selected_id in selected_ids {
+                            validate_public_option_token(selected_id)?;
+                        }
+                    }
+                    QuestionAnswer::Freetext { .. } | QuestionAnswer::Cancel => {}
+                }
             }
             Ok(())
         }

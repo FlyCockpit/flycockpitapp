@@ -774,7 +774,7 @@ describe("cockpit-proto daemon wire schemas", () => {
         const response = resolveResponseSchema.parse(requestFrame.data.params.response);
         responseKinds.add(response.kind);
         if (response.kind === "batch") {
-          expect(response.data.responses.some((child) => child.kind !== "batch")).toBe(true);
+          expect(response.data.responses.length).toBeGreaterThanOrEqual(2);
         }
       }
     }
@@ -789,6 +789,16 @@ describe("cockpit-proto daemon wire schemas", () => {
       { kind: "multi", data: { selected_ids: [] } },
       { kind: "freetext", data: { text: "" } },
       { kind: "batch", data: { responses: [] } },
+      { kind: "batch", data: { responses: [{ kind: "single", data: { selected_id: "a" } }] } },
+      {
+        kind: "batch",
+        data: {
+          responses: [
+            { kind: "cancel" },
+            { kind: "batch", data: { responses: [{ kind: "cancel" }, { kind: "cancel" }] } },
+          ],
+        },
+      },
     ]) {
       expect(resolveResponseSchema.safeParse(response).success).toBe(false);
     }

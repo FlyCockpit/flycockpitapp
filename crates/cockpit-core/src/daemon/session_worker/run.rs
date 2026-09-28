@@ -2917,7 +2917,7 @@ fn agent_tree_resolver_prompt(
         // checks that envelope against this same redacted contract.
         "Return exactly one JSON object with a `response` member containing a ResolveResponse envelope: \\
          {\"response\":{\"kind\":\"single\",\"data\":{\"selected_id\":\"...\"}}}, \\
-         or the matching `multi`, `freetext`, or `batch` envelope required by the redacted interrupt contract. \\
+         or the matching `multi`, `freetext`, or `cancel` envelope for a one-question contract; use a `batch` envelope (one answer per question, never nested) only when the redacted interrupt contract has two or more questions. \\
          Do not explain your choice or invent an option."
     } else {
         "Return exactly one JSON object: {\"option_id\":\"...\"} for one offered option, \\

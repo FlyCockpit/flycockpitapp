@@ -761,42 +761,54 @@ export const interruptQuestionSchema = z.discriminatedUnion("kind", [
 ]);
 export type InterruptQuestion = z.infer<typeof interruptQuestionSchema>;
 
-type ResolveResponseValue =
-  | { kind: "single"; data: { selected_id: string } }
-  | { kind: "multi"; data: { selected_ids: string[] } }
-  | { kind: "freetext"; data: { text: string } }
-  | { kind: "batch"; data: { responses: ResolveResponseValue[] } }
-  | { kind: "cancel" };
+const singleAnswerSchema = z
+  .object({
+    kind: z.literal("single"),
+    data: z.object({ selected_id: z.string().min(1) }).passthrough(),
+  })
+  .passthrough();
+const multiAnswerSchema = z
+  .object({
+    kind: z.literal("multi"),
+    data: z.object({ selected_ids: z.array(z.string().min(1)).min(1) }).passthrough(),
+  })
+  .passthrough();
+const freetextAnswerSchema = z
+  .object({
+    kind: z.literal("freetext"),
+    data: z.object({ text: z.string().min(1) }).passthrough(),
+  })
+  .passthrough();
+const cancelAnswerSchema = z.object({ kind: z.literal("cancel") }).passthrough();
 
-export const resolveResponseSchema: z.ZodType<ResolveResponseValue> = z.lazy(() =>
-  z.union([
-    z
-      .object({
-        kind: z.literal("single"),
-        data: z.object({ selected_id: z.string().min(1) }).passthrough(),
-      })
-      .passthrough(),
-    z
-      .object({
-        kind: z.literal("multi"),
-        data: z.object({ selected_ids: z.array(z.string().min(1)).min(1) }).passthrough(),
-      })
-      .passthrough(),
-    z
-      .object({
-        kind: z.literal("freetext"),
-        data: z.object({ text: z.string().min(1) }).passthrough(),
-      })
-      .passthrough(),
-    z
-      .object({
-        kind: z.literal("batch"),
-        data: z.object({ responses: z.array(resolveResponseSchema).min(1) }).passthrough(),
-      })
-      .passthrough(),
-    z.object({ kind: z.literal("cancel") }).passthrough(),
-  ]),
-);
+/**
+ * One question's answer inside a multi-question batch. Batches never nest.
+ */
+export const questionAnswerSchema = z.union([
+  singleAnswerSchema,
+  multiAnswerSchema,
+  freetextAnswerSchema,
+  cancelAnswerSchema,
+]);
+export type QuestionAnswer = z.infer<typeof questionAnswerSchema>;
+
+/**
+ * Canonical interrupt answer: a one-question interrupt is answered by a bare
+ * single/multi/freetext/cancel; only two or more questions use `batch`
+ * (matching the daemon's `BatchAnswers`, which rejects fewer than two).
+ */
+export const resolveResponseSchema = z.union([
+  singleAnswerSchema,
+  multiAnswerSchema,
+  freetextAnswerSchema,
+  z
+    .object({
+      kind: z.literal("batch"),
+      data: z.object({ responses: z.array(questionAnswerSchema).min(2) }).passthrough(),
+    })
+    .passthrough(),
+  cancelAnswerSchema,
+]);
 export type ResolveResponse = z.infer<typeof resolveResponseSchema>;
 
 /** Stable opaque position for daemon-owned agent tree and Attention pages. */

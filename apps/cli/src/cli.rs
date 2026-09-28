@@ -1534,7 +1534,9 @@ pub struct SessionAnswerArgs {
     #[arg(long, value_name = "TEXT")]
     pub text: Option<String>,
 
-    /// Batch answer JSON, either inline or a path to a JSON file.
+    /// Answer JSON, inline or a path to a JSON file: a ResolveResponse
+    /// envelope, or a compact array with one answer per question (one entry
+    /// sends the bare answer; two or more send a batch).
     #[arg(long, value_name = "JSON_OR_PATH")]
     pub answers_json: Option<String>,
 

@@ -4484,34 +4484,43 @@ impl Request {
     }
 }
 
-fn validate_agent_interrupt_response(response: &AgentInterruptResponse) -> Result<(), String> {
-    match response {
-        AgentInterruptResponse::Single { selected_id } => {
-            if selected_id.is_empty() {
-                return Err("agent interrupt selected id must not be empty".to_string());
-            }
+fn validate_agent_interrupt_response(response: &ResolveResponse) -> Result<(), String> {
+    fn nonempty_answer(
+        selected_id: Option<&str>,
+        selected_ids: Option<&[String]>,
+        text: Option<&str>,
+    ) -> Result<(), String> {
+        if selected_id.is_some_and(str::is_empty) {
+            return Err("agent interrupt selected id must not be empty".to_string());
         }
-        AgentInterruptResponse::Multi { selected_ids } => {
-            if selected_ids.is_empty() || selected_ids.iter().any(String::is_empty) {
-                return Err("agent interrupt selected ids must not be empty".to_string());
-            }
+        if selected_ids.is_some_and(|ids| ids.is_empty() || ids.iter().any(String::is_empty)) {
+            return Err("agent interrupt selected ids must not be empty".to_string());
         }
-        AgentInterruptResponse::Freetext { text } => {
-            if text.is_empty() {
-                return Err("agent interrupt free text must not be empty".to_string());
-            }
+        if text.is_some_and(str::is_empty) {
+            return Err("agent interrupt free text must not be empty".to_string());
         }
-        AgentInterruptResponse::Batch { responses } => {
-            if responses.is_empty() {
-                return Err("agent interrupt batch must not be empty".to_string());
-            }
-            for response in responses {
-                validate_agent_interrupt_response(response)?;
-            }
-        }
-        AgentInterruptResponse::Cancel => {}
+        Ok(())
     }
-    Ok(())
+    fn validate_answer(answer: &QuestionAnswer) -> Result<(), String> {
+        match answer {
+            QuestionAnswer::Single { selected_id } => {
+                nonempty_answer(Some(selected_id), None, None)
+            }
+            QuestionAnswer::Multi { selected_ids } => {
+                nonempty_answer(None, Some(selected_ids), None)
+            }
+            QuestionAnswer::Freetext { text } => nonempty_answer(None, None, Some(text)),
+            QuestionAnswer::Cancel => Ok(()),
+        }
+    }
+    match response {
+        // `BatchAnswers` already guarantees >= 2 non-recursive entries.
+        ResolveResponse::Batch { responses } => responses.iter().try_for_each(validate_answer),
+        ResolveResponse::Single { selected_id } => nonempty_answer(Some(selected_id), None, None),
+        ResolveResponse::Multi { selected_ids } => nonempty_answer(None, Some(selected_ids), None),
+        ResolveResponse::Freetext { text } => nonempty_answer(None, None, Some(text)),
+        ResolveResponse::Cancel => Ok(()),
+    }
 }
 #[macro_export]
 macro_rules! request_variants {
@@ -5761,19 +5770,42 @@ mod tests {
     #[test]
     fn agent_interrupt_response_rejects_the_same_empty_shapes_as_typescript() {
         for response in [
-            AgentInterruptResponse::Multi {
+            ResolveResponse::Multi {
                 selected_ids: Vec::new(),
             },
-            AgentInterruptResponse::Freetext {
+            ResolveResponse::Freetext {
                 text: String::new(),
             },
-            AgentInterruptResponse::Batch {
-                responses: Vec::new(),
-            },
+            ResolveResponse::from_answers(vec![
+                QuestionAnswer::Single {
+                    selected_id: "a".into(),
+                },
+                QuestionAnswer::Freetext {
+                    text: String::new(),
+                },
+            ])
+            .unwrap(),
         ] {
             assert!(
                 validate_agent_interrupt_response(&response).is_err(),
                 "empty response shape must be rejected: {response:?}"
+            );
+        }
+        for wire in [
+            serde_json::json!({ "kind": "batch", "data": { "responses": [] } }),
+            serde_json::json!({ "kind": "batch", "data": { "responses": [
+                { "kind": "single", "data": { "selected_id": "a" } }
+            ] } }),
+            serde_json::json!({ "kind": "batch", "data": { "responses": [
+                { "kind": "cancel" },
+                { "kind": "batch", "data": { "responses": [
+                    { "kind": "cancel" }, { "kind": "cancel" }
+                ] } }
+            ] } }),
+        ] {
+            assert!(
+                serde_json::from_value::<ResolveResponse>(wire.clone()).is_err(),
+                "an empty or one-element batch is not a representable answer: {wire}"
             );
         }
     }

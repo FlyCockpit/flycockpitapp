@@ -9,7 +9,7 @@ use crate::cli::{
     OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs, SessionMediaEgressCommand,
 };
 use crate::daemon::client::ensure_persistent_daemon;
-use crate::daemon::proto::{Request, ResolveResponse, Response};
+use crate::daemon::proto::{QuestionAnswer, Request, ResolveResponse, Response};
 
 pub async fn run(cmd: SessionCommand) -> Result<()> {
     match cmd {
@@ -512,28 +512,31 @@ fn parse_answers_json(source: &str) -> Result<ResolveResponse> {
         source.to_string()
     };
     let value: Value = serde_json::from_str(&body).context("parsing answers JSON")?;
-    if let Ok(response) = serde_json::from_value::<ResolveResponse>(value.clone()) {
-        return Ok(response);
-    }
-    let responses = value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("answers JSON must be a ResolveResponse or compact array"))?
+    let Some(entries) = value.as_array() else {
+        // A protocol envelope. Surface its own error (e.g. a one-element
+        // batch, which is not a canonical answer) instead of a generic one.
+        return serde_json::from_value::<ResolveResponse>(value)
+            .context("answers JSON must be a ResolveResponse or compact array");
+    };
+    let answers = entries
         .iter()
         .map(parse_compact_answer)
         .collect::<Result<Vec<_>>>()?;
-    Ok(ResolveResponse::Batch { responses })
+    // One compact answer is the bare response for a one-question interrupt;
+    // two or more form a batch. Same canonical builder as every client.
+    ResolveResponse::from_answers(answers).context("answers JSON compact array is empty")
 }
 
-fn parse_compact_answer(value: &Value) -> Result<ResolveResponse> {
+fn parse_compact_answer(value: &Value) -> Result<QuestionAnswer> {
     let kind = value
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("compact answer is missing `type`"))?;
     match kind {
-        "single" | "choice" => Ok(ResolveResponse::Single {
+        "single" | "choice" => Ok(QuestionAnswer::Single {
             selected_id: required_str(value, "selected_id")?.to_string(),
         }),
-        "multi" | "choices" => Ok(ResolveResponse::Multi {
+        "multi" | "choices" => Ok(QuestionAnswer::Multi {
             selected_ids: value
                 .get("selected_ids")
                 .and_then(Value::as_array)
@@ -546,10 +549,10 @@ fn parse_compact_answer(value: &Value) -> Result<ResolveResponse> {
                 })
                 .collect::<Result<Vec<_>>>()?,
         }),
-        "text" | "freetext" => Ok(ResolveResponse::Freetext {
+        "text" | "freetext" => Ok(QuestionAnswer::Freetext {
             text: required_str(value, "text")?.to_string(),
         }),
-        "cancel" => Ok(ResolveResponse::Cancel),
+        "cancel" => Ok(QuestionAnswer::Cancel),
         other => bail!("unknown compact answer type `{other}`"),
     }
 }
@@ -580,13 +583,13 @@ fn validate_response(
                     questions.len()
                 );
             }
-            responses.as_slice()
+            responses.to_vec()
         }
         ResolveResponse::Cancel => return Ok(()),
-        other if questions.len() == 1 => std::slice::from_ref(other),
+        other if questions.len() == 1 => other.clone().into_batch(1),
         _ => bail!("interrupt expects a batch answer"),
     };
-    for (question, response) in questions.iter().zip(responses) {
+    for (question, response) in questions.iter().zip(&responses) {
         validate_one(question, response)?;
     }
     Ok(())
@@ -595,22 +598,21 @@ fn validate_response(
 #[cfg(test)]
 fn validate_one(
     question: &crate::daemon::proto::InterruptQuestion,
-    response: &ResolveResponse,
+    response: &QuestionAnswer,
 ) -> Result<()> {
     use crate::daemon::proto::InterruptQuestion;
     match (question, response) {
-        (InterruptQuestion::Single { options, .. }, ResolveResponse::Single { selected_id }) => {
+        (InterruptQuestion::Single { options, .. }, QuestionAnswer::Single { selected_id }) => {
             validate_option(options, selected_id)
         }
-        (InterruptQuestion::Multi { options, .. }, ResolveResponse::Multi { selected_ids }) => {
+        (InterruptQuestion::Multi { options, .. }, QuestionAnswer::Multi { selected_ids }) => {
             for id in selected_ids {
                 validate_option(options, id)?;
             }
             Ok(())
         }
-        (InterruptQuestion::Freetext { .. }, ResolveResponse::Freetext { .. }) => Ok(()),
-        (_, ResolveResponse::Cancel) => Ok(()),
-        (_, ResolveResponse::Batch { .. }) => bail!("nested batch answers are not allowed"),
+        (InterruptQuestion::Freetext { .. }, QuestionAnswer::Freetext { .. }) => Ok(()),
+        (_, QuestionAnswer::Cancel) => Ok(()),
         (InterruptQuestion::Single { .. }, _) => bail!("interrupt expects a single choice answer"),
         (InterruptQuestion::Multi { .. }, _) => bail!("interrupt expects a multi-choice answer"),
         (InterruptQuestion::Freetext { .. }, _) => bail!("interrupt expects a text answer"),
@@ -757,20 +759,39 @@ mod tests {
         .unwrap();
         match response {
             ResolveResponse::Batch { responses } => {
-                assert!(matches!(responses[0], ResolveResponse::Single { .. }));
-                assert!(matches!(responses[1], ResolveResponse::Freetext { .. }));
+                assert!(matches!(responses[0], QuestionAnswer::Single { .. }));
+                assert!(matches!(responses[1], QuestionAnswer::Freetext { .. }));
             }
             other => panic!("expected batch, got {other:?}"),
         }
     }
 
     #[test]
+    fn compact_single_answer_json_is_the_bare_response() {
+        let response = parse_answers_json(r#"[{"type":"single","selected_id":"yes"}]"#).unwrap();
+        assert_eq!(
+            response,
+            ResolveResponse::Single {
+                selected_id: "yes".into()
+            }
+        );
+    }
+
+    #[test]
     fn protocol_batch_json_parses() {
         let response = parse_answers_json(
-            r#"{"kind":"batch","data":{"responses":[{"kind":"single","data":{"selected_id":"yes"}}]}}"#,
+            r#"{"kind":"batch","data":{"responses":[{"kind":"single","data":{"selected_id":"yes"}},{"kind":"cancel"}]}}"#,
         )
         .unwrap();
         assert!(matches!(response, ResolveResponse::Batch { .. }));
+        let error = parse_answers_json(
+            r#"{"kind":"batch","data":{"responses":[{"kind":"single","data":{"selected_id":"yes"}}]}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("at least 2"),
+            "a one-element protocol batch is refused: {error:#}"
+        );
     }
 
     #[tokio::test]

@@ -10,19 +10,7 @@ impl App {
         &mut self,
         result: crate::tui::dialog::question::QuestionResult,
     ) {
-        use crate::tui::dialog::question::QuestionResult;
-        use cockpit_proto::{Request, ResolveResponse};
-        let (interrupt_id, response) = match result {
-            QuestionResult::Submit {
-                interrupt_id,
-                responses,
-            } => (interrupt_id, ResolveResponse::Batch { responses }),
-            QuestionResult::Cancel { interrupt_id } => (interrupt_id, ResolveResponse::Cancel),
-        };
-        let request = Request::ResolveInterrupt {
-            interrupt_id,
-            response,
-        };
+        let request = result.into_resolve_request();
         let was_btw_dialog = self.question_dialog_btw;
         if was_btw_dialog {
             if let Some(Ok(runner)) = self.btw_pane.as_ref().and_then(|pane| pane.runner.as_ref()) {

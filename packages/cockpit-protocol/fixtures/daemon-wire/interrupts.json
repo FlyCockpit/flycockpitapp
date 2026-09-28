@@ -360,9 +360,15 @@
           "responses": [
             {
               "data": {
-                "selected_id": "approve_once"
+                "selected_id": "pg"
               },
               "kind": "single"
+            },
+            {
+              "data": {
+                "text": "Use the existing design"
+              },
+              "kind": "freetext"
             }
           ]
         },

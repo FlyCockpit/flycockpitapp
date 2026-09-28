@@ -518,22 +518,39 @@ impl CanonicalFcorValueV1 for crate::terminal::TerminalIngressMetadata {
     }
 }
 
+/// Upper bound on the per-question answers one batch may carry (one node for
+/// the batch itself plus at most 4095 answers keeps the historical 4096-node
+/// cap). Batches are non-recursive by type, so no depth bound is needed.
+const MAX_RESOLVE_BATCH_ANSWERS: usize = 4095;
+
+impl CanonicalFcorValueV1 for cockpit_db::wire::QuestionAnswer {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        // Same tags as the matching top-level `ResolveResponse` variants, so a
+        // per-question answer encodes exactly as it did when it was nested as
+        // a `ResolveResponse`.
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::Single { selected_id } => {
+                nested.push_u16(1);
+                selected_id.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Multi { selected_ids } => {
+                nested.push_u16(2);
+                selected_ids.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Freetext { text } => {
+                nested.push_u16(3);
+                text.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Cancel => nested.push_u16(5),
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
 impl CanonicalFcorValueV1 for cockpit_db::wire::ResolveResponse {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
-        fn count(value: &cockpit_db::wire::ResolveResponse, depth: u16) -> Result<u32> {
-            ensure!(depth <= 32, "resolve_response_depth_exceeded");
-            let mut nodes = 1_u32;
-            if let cockpit_db::wire::ResolveResponse::Batch { responses } = value {
-                for child in responses {
-                    nodes = nodes
-                        .checked_add(count(child, depth + 1)?)
-                        .ok_or_else(|| anyhow::anyhow!("resolve_response_nodes_exceeded"))?;
-                    ensure!(nodes <= 4096, "resolve_response_nodes_exceeded");
-                }
-            }
-            Ok(nodes)
-        }
-        count(self, 1)?;
         let mut nested = CanonicalParamsV1::new();
         match self {
             Self::Single { selected_id } => {
@@ -549,8 +566,14 @@ impl CanonicalFcorValueV1 for cockpit_db::wire::ResolveResponse {
                 text.encode_fcor_value_v1(&mut nested)?;
             }
             Self::Batch { responses } => {
+                ensure!(
+                    responses.len() <= MAX_RESOLVE_BATCH_ANSWERS,
+                    "resolve_response_nodes_exceeded"
+                );
                 nested.push_u16(4);
-                responses.encode_fcor_value_v1(&mut nested)?;
+                nested.push_list(responses.as_slice(), |nested, value| {
+                    value.encode_fcor_value_v1(nested)
+                })?;
             }
             Self::Cancel => nested.push_u16(5),
         }
@@ -1247,48 +1270,19 @@ mod tests {
         );
         assert_eq!(out.into_bytes(), vec![9]);
 
-        let mut response = cockpit_db::wire::ResolveResponse::Cancel;
-        for _ in 0..32 {
-            response = cockpit_db::wire::ResolveResponse::Batch {
-                responses: vec![response],
-            };
-        }
-        let mut out = CanonicalParamsV1::new();
-        out.push_u8(7);
-        assert_eq!(
-            response
-                .encode_fcor_value_v1(&mut out)
-                .unwrap_err()
-                .to_string(),
-            "resolve_response_depth_exceeded"
-        );
-        assert_eq!(out.into_bytes(), vec![7]);
-
-        let mut depth_32 = cockpit_db::wire::ResolveResponse::Cancel;
-        for _ in 0..31 {
-            depth_32 = cockpit_db::wire::ResolveResponse::Batch {
-                responses: vec![depth_32],
-            };
-        }
-        assert!(
-            depth_32
-                .encode_fcor_value_v1(&mut CanonicalParamsV1::new())
-                .is_ok()
-        );
-
-        let nodes_4096 = cockpit_db::wire::ResolveResponse::Batch {
-            responses: std::iter::repeat_n(cockpit_db::wire::ResolveResponse::Cancel, 4095)
-                .collect(),
-        };
+        let nodes_4096 = cockpit_db::wire::ResolveResponse::from_answers(
+            std::iter::repeat_n(cockpit_db::wire::QuestionAnswer::Cancel, 4095).collect(),
+        )
+        .unwrap();
         assert!(
             nodes_4096
                 .encode_fcor_value_v1(&mut CanonicalParamsV1::new())
                 .is_ok()
         );
-        let nodes_4097 = cockpit_db::wire::ResolveResponse::Batch {
-            responses: std::iter::repeat_n(cockpit_db::wire::ResolveResponse::Cancel, 4096)
-                .collect(),
-        };
+        let nodes_4097 = cockpit_db::wire::ResolveResponse::from_answers(
+            std::iter::repeat_n(cockpit_db::wire::QuestionAnswer::Cancel, 4096).collect(),
+        )
+        .unwrap();
         let mut out = CanonicalParamsV1::new();
         out.push_u8(6);
         assert_eq!(
@@ -1414,10 +1408,14 @@ mod tests {
             "00030000000178",
         );
         exact(
-            &cockpit_db::wire::ResolveResponse::Batch {
-                responses: vec![cockpit_db::wire::ResolveResponse::Cancel],
-            },
-            "0004000000010005",
+            &cockpit_db::wire::ResolveResponse::from_answers(vec![
+                cockpit_db::wire::QuestionAnswer::Single {
+                    selected_id: "x".into(),
+                },
+                cockpit_db::wire::QuestionAnswer::Cancel,
+            ])
+            .unwrap(),
+            "000400000002000100000001780005",
         );
         exact(&cockpit_db::wire::ResolveResponse::Cancel, "0005");
 

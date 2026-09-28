@@ -1982,7 +1982,7 @@ fn card_matches(summary: &SessionSummary, query: &str) -> bool {
     }
     let title = summary.title.as_deref().unwrap_or("");
     let description = summary.description.as_deref().unwrap_or("");
-    let short = summary.short_id.as_deref().unwrap_or("");
+    let short = summary.short_id.as_str();
     title.to_ascii_lowercase().contains(query)
         || description.to_ascii_lowercase().contains(query)
         || short.to_ascii_lowercase().contains(query)
@@ -1998,12 +1998,8 @@ pub fn card_description(s: &SessionSummary) -> String {
         && !t.trim().is_empty()
     {
         t.clone()
-    } else if let Some(sid) = &s.short_id
-        && !sid.is_empty()
-    {
-        sid.clone()
     } else {
-        short_id(&s.session_id.to_string())
+        s.short_id.clone()
     };
     match s
         .description

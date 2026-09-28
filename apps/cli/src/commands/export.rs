@@ -176,17 +176,14 @@ fn resolve_from_summaries(
         let short_id = sessions
             .iter()
             .find(|s| s.session_id == uuid)
-            .and_then(|s| s.short_id.clone());
+            .map(|s| s.short_id.clone());
         return Ok((uuid, short_id));
     }
 
-    let matches: Vec<&SessionSummary> = sessions
-        .iter()
-        .filter(|s| s.short_id.as_deref() == Some(ident))
-        .collect();
+    let matches: Vec<&SessionSummary> = sessions.iter().filter(|s| s.short_id == ident).collect();
     match matches.as_slice() {
         [] => Err(format!("no session with short id `{ident}`")),
-        [only] => Ok((only.session_id, only.short_id.clone())),
+        [only] => Ok((only.session_id, Some(only.short_id.clone()))),
         many => Err(format!(
             "short id `{ident}` is ambiguous — it matches {} sessions across projects; \
              pass the full UUID instead",
@@ -270,7 +267,7 @@ async fn download_export(
 mod tests {
     use super::*;
 
-    fn summary(short_id: Option<&str>, session_id: Uuid) -> SessionSummary {
+    fn summary(short_id: &str, session_id: Uuid) -> SessionSummary {
         // Build through serde so the many `#[serde(default)]` fields fill in;
         // only the resolution-relevant fields are set.
         serde_json::from_value(serde_json::json!({
@@ -338,10 +335,7 @@ mod tests {
     #[test]
     fn resolve_from_summaries_resolves_a_unique_short_id() {
         let id = Uuid::new_v4();
-        let sessions = vec![
-            summary(Some("aaaaaa"), Uuid::new_v4()),
-            summary(Some("same42"), id),
-        ];
+        let sessions = vec![summary("aaaaaa", Uuid::new_v4()), summary("same42", id)];
         let (session_id, short_id) = resolve_from_summaries(&sessions, "same42").unwrap();
         assert_eq!(session_id, id);
         assert_eq!(short_id.as_deref(), Some("same42"));
@@ -358,7 +352,7 @@ mod tests {
 
     #[test]
     fn resolve_from_summaries_rejects_unknown_short_id() {
-        let sessions = vec![summary(Some("aaaaaa"), Uuid::new_v4())];
+        let sessions = vec![summary("aaaaaa", Uuid::new_v4())];
         let err = resolve_from_summaries(&sessions, "zzzzzz").unwrap_err();
         assert_eq!(err, "no session with short id `zzzzzz`");
     }
@@ -366,8 +360,8 @@ mod tests {
     #[test]
     fn resolve_from_summaries_rejects_ambiguous_short_id() {
         let sessions = vec![
-            summary(Some("same42"), Uuid::new_v4()),
-            summary(Some("same42"), Uuid::new_v4()),
+            summary("same42", Uuid::new_v4()),
+            summary("same42", Uuid::new_v4()),
         ];
         let err = resolve_from_summaries(&sessions, "same42").unwrap_err();
         assert_eq!(

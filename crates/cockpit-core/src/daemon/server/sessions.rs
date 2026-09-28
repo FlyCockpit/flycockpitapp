@@ -356,7 +356,7 @@ pub(super) async fn fork_session(
     }
     Ok(Response::Forked {
         session_id: row.session_id,
-        short_id: row.short_id.unwrap_or_default(),
+        short_id: row.short_id,
         parent_session_id,
         fork_point_turn_id,
     })
@@ -905,7 +905,7 @@ mod sessions_activity_tests {
         proto::SessionSummary {
             session_id: Uuid::new_v4(),
             session_entry_mode: "code".into(),
-            short_id: None,
+            short_id: "abc123".into(),
             project_root: "/proj".into(),
             project_id: "pid".into(),
             started_at_unix_ms: 1,

@@ -1217,7 +1217,7 @@ mod tests {
         proto::BtwForkInfo {
             session_id: Uuid::new_v4(),
             parent_session_id: Uuid::new_v4(),
-            short_id: Some("btw001".to_string()),
+            short_id: "btw001".to_string(),
             tangent,
             created_at: 1,
             message_count: 0,

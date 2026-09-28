@@ -1162,12 +1162,10 @@ impl Session {
             Ok(persisted)
         }) {
             Ok(persisted) => {
-                if let Some(short_id) = persisted.short_id {
-                    *self
-                        .short_id
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = short_id;
-                }
+                *self
+                    .short_id
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = persisted.short_id;
             }
             Err(e) => {
                 // Restore the pending row so a transient failure can retry on
@@ -1355,10 +1353,7 @@ impl Session {
                 &row.knowledge_base_prompt_snapshot_json,
             ),
         ));
-        let short_id = row
-            .short_id
-            .clone()
-            .context("persisted session has no short_id")?;
+        let short_id = row.short_id.clone();
         let model_selection = match row.model_selection_json.as_deref() {
             Some(raw) => {
                 let selection =

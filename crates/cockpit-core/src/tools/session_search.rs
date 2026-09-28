@@ -390,9 +390,7 @@ async fn render_session_hits(
     let mut out = String::new();
     for hit in hits.iter().take(limit as usize) {
         let id = if hit.project_id == ctx.session.project_id {
-            hit.short_id
-                .clone()
-                .unwrap_or_else(|| hit.session_id.to_string())
+            hit.short_id.clone()
         } else {
             hit.session_id.to_string()
         };
@@ -455,9 +453,7 @@ async fn render_thread_list(
 
     let mut out = String::from("Assistant threads (most recently updated first):\n");
     for thread in threads {
-        let id = thread
-            .short_id
-            .unwrap_or_else(|| thread.session_id.to_string());
+        let id = thread.short_id;
         let title = redact_target_text(
             ctx,
             thread.session_id,
@@ -505,7 +501,7 @@ async fn render_lineage(
     let mut out = format!("Lineage history matches for `{query}`:\n");
     for hit in hits.into_iter().take(limit as usize) {
         let id = if hit.project_id == ctx.session.project_id {
-            hit.short_id.unwrap_or_else(|| hit.session_id.to_string())
+            hit.short_id
         } else {
             hit.session_id.to_string()
         };
@@ -672,7 +668,7 @@ mod tests {
             .call(json!({ "scope": "past", "query": "peregrine" }), &ctx)
             .await
             .unwrap();
-        assert!(out.content.contains(other.short_id.as_ref().unwrap()));
+        assert!(out.content.contains(other.short_id.as_str()));
         assert!(out.content.contains("peregrine") || out.content.contains('['));
     }
 
@@ -737,7 +733,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.content.contains(thread.short_id.as_deref().unwrap()),
+            out.content.contains(thread.short_id.as_str()),
             "active thread must be searchable in the listed thread collection: {}",
             out.content
         );
@@ -861,7 +857,7 @@ mod tests {
             .unwrap();
         assert!(!found.content.contains(secret), "{}", found.content);
 
-        let path = format!("cockpit://session/{}/transcript", other.short_id.unwrap());
+        let path = format!("cockpit://session/{}/transcript", other.short_id);
         let read = crate::tools::recall::read(&json!({ "path": path.clone() }), &ctx)
             .await
             .unwrap();

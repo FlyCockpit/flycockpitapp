@@ -31,8 +31,9 @@ uuid = { workspace = true }
 # daemon-level tests can replay the same failures. Only enabled by
 # `cockpit-core`'s dev-dependencies; never by a normal build.
 test-support = ["dep:cockpit-test-support"]
-# Image-spend ledger tables live in the extended schema profile. Do not
-# enable this on the default local-v0.1 graph.
+# Image-spend ledger code is owned by the extended feature (its tables exist
+# in every build's schema but stay empty). Do not enable this on the default
+# local-v0.1 graph.
 extended = ["cockpit-db/extended"]
 
 [target.'cfg(windows)'.dependencies]

@@ -4318,7 +4318,7 @@ mod tests {
         );
         assert!(s.is_persisted());
         let row = db.get_session(s.id).await.unwrap().expect("row now exists");
-        assert_eq!(row.short_id.as_deref(), Some(s.short_id().as_str()));
+        assert_eq!(row.short_id, s.short_id());
         assert_eq!(db.list_sessions(true, 100).await.unwrap().len(), 1);
 
         // Idempotent: a second flush is a no-op (returns `false`).
@@ -4360,12 +4360,12 @@ mod tests {
         .unwrap();
         let claimed = s.short_id();
         let mut competitor = db.new_session_row(&s.project_id, "/x", "a").await.unwrap();
-        competitor.short_id = Some(claimed.clone());
+        competitor.short_id = claimed.clone();
         let inserted = db
             .insert_session_row_without_redaction_custody(&competitor)
             .await
             .unwrap();
-        assert_eq!(inserted.short_id.as_deref(), Some(claimed.as_str()));
+        assert_eq!(inserted.short_id, claimed);
 
         assert!(s.persist_if_needed().unwrap());
         assert_ne!(
@@ -4374,7 +4374,7 @@ mod tests {
             "Attached must report the persisted id"
         );
         let row = db.get_session(s.id).await.unwrap().expect("row exists");
-        assert_eq!(row.short_id.as_deref(), Some(s.short_id().as_str()));
+        assert_eq!(row.short_id, s.short_id());
     }
 
     #[tokio::test]

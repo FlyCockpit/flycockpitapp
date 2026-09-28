@@ -718,6 +718,21 @@ impl SupervisorDatabaseOwner {
 }
 
 /// Read-only fence probe: never creates, migrates, or writes the database.
+///
+/// This is the one production read of the canonical database that does not
+/// go through [`Db::open`], so it classifies the file itself instead of
+/// assuming the migrated schema:
+///
+/// - absent, or present but *schema-less* (no migration ledger and no
+///   application objects: a 0-byte file, or one whose first migration rolled
+///   back because the process died, the disk filled, or the migration
+///   failed): no worker has ever advanced the fence, so the neutral value is
+///   `0`. The first worker's `Db::open` bootstraps exactly this state.
+/// - ledgered: the whole schema is verified exactly as a worker open would
+///   ([`verify_existing_database`]) before the fence is read, so a missing
+///   or altered fence table fails closed instead of reading as `0`.
+/// - unledgered with application objects: refused, as a worker's migration
+///   would refuse it.
 fn read_durable_writer_generation(path: &Path) -> Result<u64> {
     if !path.exists() {
         return Ok(0);
@@ -726,7 +741,19 @@ fn read_durable_writer_generation(path: &Path) -> Result<u64> {
         .with_context(|| format!("opening existing SQLite read-only at {}", path.display()))?;
     apply_connection_pragmas(&conn, false)
         .with_context(|| format!("setting pragmas on {}", path.display()))?;
-    tool_recovery::durable_writer_generation(&conn).map_err(annotate_database_storage_failure)
+    (|| -> Result<u64> {
+        if !table_exists(&conn, "schema_version")? {
+            if database_has_application_objects(&conn)? {
+                anyhow::bail!(
+                    "unledgered database contains application schema objects; refusing to read the worker generation fence from unproven data"
+                );
+            }
+            return Ok(0);
+        }
+        verify_existing_database(&conn, MIGRATIONS)?;
+        tool_recovery::durable_writer_generation(&conn)
+    })()
+    .map_err(annotate_database_storage_failure)
 }
 
 /// Shared side of the history-scope revocation fence.
@@ -1270,7 +1297,7 @@ impl Db {
         "unknown".to_string()
     }
 
-    /// Return the exact squashed-schema identity recorded in SQLite.
+    /// Return the SQLite `user_version` schema mirror.
     pub async fn schema_version(&self) -> Result<i64> {
         self.read(sqlite_schema_version).await
     }
@@ -1643,37 +1670,15 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 struct Migration {
     name: &'static str,
     sql: &'static str,
-    deferred_sql: &'static str,
-    extension_sql: &'static str,
 }
 
-#[cfg(all(feature = "remote", feature = "extended"))]
-const SCHEMA_PROFILE: &str = "remote-extended-v0.1";
-#[cfg(all(feature = "remote", not(feature = "extended")))]
-const SCHEMA_PROFILE: &str = "remote-v0.1";
-#[cfg(all(not(feature = "remote"), feature = "extended"))]
-const SCHEMA_PROFILE: &str = "extended-local-v0.1";
-#[cfg(all(not(feature = "remote"), not(feature = "extended")))]
-const SCHEMA_PROFILE: &str = "local-v0.1";
-
-/// Stable diagnostic identifier for attempting to open one prerelease build
-/// profile's database with the other profile. Profile transitions are not an
-/// in-place migration in v0.1: opt-in remote builds must use a separate data
-/// directory (or an explicit supported export/import flow).
-pub const SCHEMA_PROFILE_MISMATCH_CODE: &str = "FCDB_SCHEMA_PROFILE_MISMATCH";
-/// All schema migrations in version order. Pre-release: fold schema changes
-/// into `0001_initial.sql`. Do not append `0002_*`.
+/// All schema migrations in version order. The schema is identical in every
+/// build: the `remote`/`extended` Cargo features gate code only, never DDL.
+/// Pre-launch: fold schema changes into `0001_initial.sql`. Do not append
+/// `0002_*` until the #305 launch freeze.
 const MIGRATIONS: &[Migration] = &[Migration {
     name: "0001_initial.sql",
     sql: include_str!("migrations/0001_initial.sql"),
-    #[cfg(not(feature = "extended"))]
-    deferred_sql: "",
-    #[cfg(feature = "extended")]
-    deferred_sql: include_str!("migrations/0001_extended_profile.sql"),
-    #[cfg(not(feature = "remote"))]
-    extension_sql: "",
-    #[cfg(feature = "remote")]
-    extension_sql: include_str!("migrations/0001_remote_profile.sql"),
 }];
 
 /// Latest schema version understood by this build.
@@ -1681,12 +1686,6 @@ const MIGRATIONS: &[Migration] = &[Migration {
 /// Kept as a public compatibility constant for daemon protocol and diagnostics
 /// consumers; the migration runner remains the source of truth.
 pub const EXPECTED_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
-
-fn schema_profile_mismatch(database_profile: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "{SCHEMA_PROFILE_MISMATCH_CODE}: database schema profile is {database_profile}, binary requires {SCHEMA_PROFILE}; in-place local/remote profile transitions are unsupported in v0.1; use a separate data directory or a supported export/import flow"
-    )
-}
 
 fn migrate(conn: &Connection) -> Result<()> {
     migrate_with(conn, MIGRATIONS)
@@ -1700,25 +1699,15 @@ fn migration_hash(sql: &str) -> String {
 }
 
 fn migration_definition_hash(migration: &Migration) -> String {
-    // The checksum identifies the exact SQL applied by this build profile.
-    // Omitting the extension made two materially different schemas share a
-    // migration checksum and allowed an edited profile extension to pass the
-    // ledger check.
-    let mut definition = String::with_capacity(
-        migration.sql.len() + migration.deferred_sql.len() + migration.extension_sql.len(),
-    );
-    definition.push_str(migration.sql);
-    definition.push_str(migration.deferred_sql);
-    definition.push_str(migration.extension_sql);
-    migration_hash(&definition)
+    // The checksum identifies the exact SQL file applied; every build applies
+    // the same file.
+    migration_hash(migration.sql)
 }
 
 fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
     let expected = Connection::open_in_memory().context("opening expected-schema database")?;
     for migration in migrations {
         expected.execute_batch(migration.sql)?;
-        expected.execute_batch(migration.deferred_sql)?;
-        expected.execute_batch(migration.extension_sql)?;
     }
     expected.execute_batch(
         "CREATE TABLE schema_version (\
@@ -1726,7 +1715,6 @@ fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
             name TEXT NOT NULL CHECK (length(name) > 0), \
             sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
             schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
-            schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'extended-local-v0.1', 'remote-v0.1', 'remote-extended-v0.1')), \
             applied_at TEXT NOT NULL\
         );",
     )?;
@@ -1736,7 +1724,7 @@ fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
 /// Hash the exact persisted DDL text for every application-owned table,
 /// index, trigger, and view. This is deliberately an exact-DDL fingerprint,
 /// not a semantic schema hash: formatting or equivalent rewritten SQL is an
-/// amended prerelease schema and requires controlled recovery.
+/// amended schema and requires controlled recovery.
 fn exact_ddl_fingerprint(conn: &Connection) -> Result<String> {
     let mut stmt = conn.prepare(
         "SELECT type, name, tbl_name, COALESCE(sql, '') \
@@ -1769,7 +1757,7 @@ fn is_lower_hex_64(value: &str) -> bool {
 
 fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT version, name, sha256, schema_fingerprint, schema_profile \
+        "SELECT version, name, sha256, schema_fingerprint \
              FROM schema_version ORDER BY version",
     )?;
     for (idx, row) in stmt
@@ -1779,13 +1767,12 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
             ))
         })?
         .enumerate()
     {
         let expected_version = idx as i64 + 1;
-        let (version, name, hash, fingerprint, profile) = row?;
+        let (version, name, hash, fingerprint) = row?;
         if version != expected_version {
             anyhow::bail!(
                 "database migration ledger is corrupt: expected version {expected_version}, found {version}"
@@ -1793,7 +1780,7 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
         }
         if version > migrations.len() as i64 {
             anyhow::bail!(
-                "incompatible prerelease database schema v{version}; this binary supports v{}. Restore a compatible migration backup or move the database aside and restart",
+                "incompatible database schema v{version}; this binary supports v{}. Run a Cockpit build that supports it, or move the database aside and restart",
                 migrations.len()
             );
         }
@@ -1809,9 +1796,6 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             anyhow::bail!(
                 "migration checksum mismatch for {expected_name}: applied migration was amended"
             );
-        }
-        if profile != SCHEMA_PROFILE {
-            return Err(schema_profile_mismatch(&profile));
         }
         if version == current_schema_version(conn)? && fingerprint != exact_ddl_fingerprint(conn)? {
             anyhow::bail!(
@@ -1840,9 +1824,7 @@ fn verify_existing_database(conn: &Connection, migrations: &[Migration]) -> Resu
     }
     verify_user_version(conn, current)?;
     if exact_ddl_fingerprint(conn)? != compiled_expected_fingerprint(migrations)? {
-        anyhow::bail!(
-            "database schema does not match the exact DDL compiled for schema profile {SCHEMA_PROFILE}"
-        );
+        anyhow::bail!("database schema does not match the exact DDL compiled into this binary");
     }
     Ok(())
 }
@@ -1867,13 +1849,13 @@ fn database_has_application_objects(conn: &Connection) -> Result<bool> {
 fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     if !table_exists(conn, "schema_version")? && database_has_application_objects(conn)? {
         anyhow::bail!(
-            "unledgered prerelease database contains application schema objects; refusing to bootstrap over unproven data"
+            "unledgered database contains application schema objects; refusing to bootstrap over unproven data"
         );
     }
     let current_before_lock = current_schema_version(conn)?;
     if current_before_lock > migrations.len() as i64 {
         anyhow::bail!(
-            "incompatible prerelease database schema v{current_before_lock}; this binary supports v{}. Restore a compatible migration backup or move the database aside and restart",
+            "incompatible database schema v{current_before_lock}; this binary supports v{}. Run a Cockpit build that supports it, or move the database aside and restart",
             migrations.len()
         );
     }
@@ -1891,7 +1873,6 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
                 name TEXT NOT NULL CHECK (length(name) > 0), \
                 sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
                 schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
-                schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'extended-local-v0.1', 'remote-v0.1', 'remote-extended-v0.1')), \
                 applied_at TEXT NOT NULL\
             );",
         )
@@ -1910,23 +1891,14 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             }
             conn.execute_batch(migration.sql)
                 .with_context(|| format!("applying migration {version}"))?;
-            if !migration.deferred_sql.is_empty() {
-                conn.execute_batch(migration.deferred_sql)
-                    .with_context(|| format!("applying migration {version} deferred profile"))?;
-            }
-            if !migration.extension_sql.is_empty() {
-                conn.execute_batch(migration.extension_sql)
-                    .with_context(|| format!("applying migration {version} build profile"))?;
-            }
             let fingerprint = exact_ddl_fingerprint(conn)?;
             conn.execute(
-                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at) VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)",
+                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)",
                 rusqlite::params![
                     version,
                     migration.name,
                     migration_definition_hash(migration),
-                    fingerprint,
-                    SCHEMA_PROFILE
+                    fingerprint
                 ],
             )
             .with_context(|| format!("recording migration {version}"))?;
@@ -1938,9 +1910,7 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
         let actual = exact_ddl_fingerprint(conn)?;
         let expected = compiled_expected_fingerprint(migrations)?;
         if actual != expected {
-            anyhow::bail!(
-                "database schema does not match the exact DDL compiled for schema profile {SCHEMA_PROFILE}"
-            );
+            anyhow::bail!("database schema does not match the exact DDL compiled into this binary");
         }
 
         if fk_was_on {
@@ -2140,8 +2110,6 @@ mod tests {
             .map(|(index, sql)| Migration {
                 name: NAMES[index],
                 sql,
-                deferred_sql: "",
-                extension_sql: "",
             })
             .collect::<Vec<_>>();
         migrate_with(conn, &migrations)
@@ -2411,7 +2379,7 @@ mod tests {
     /// must create the media reservation ledger; there is no runtime ALTER
     /// path for an older ledger.
     #[test]
-    fn media_ledger_is_an_append_only_upgrade_for_existing_v2_databases() {
+    fn media_ledger_is_created_by_initial_migration() {
         let conn = Connection::open_in_memory().unwrap();
         migrate_with(&conn, &MIGRATIONS[..1]).unwrap();
         assert_eq!(
@@ -2441,15 +2409,15 @@ mod tests {
         let fingerprint = exact_ddl_fingerprint(&conn).unwrap();
         let future_hash = migration_hash("future");
         conn.execute(
-            "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at) VALUES (2, 'future', ?1, ?2, ?3, 'now')",
-            rusqlite::params![future_hash, fingerprint, SCHEMA_PROFILE],
+            "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at) VALUES (2, 'future', ?1, ?2, 'now')",
+            rusqlite::params![future_hash, fingerprint],
         )
         .unwrap();
         assert!(
             migrate_with(&conn, MIGRATIONS)
                 .unwrap_err()
                 .to_string()
-                .contains("incompatible prerelease database schema v2")
+                .contains("incompatible database schema v2")
         );
     }
 
@@ -2463,25 +2431,16 @@ mod tests {
             let fingerprint = exact_ddl_fingerprint(&conn).unwrap();
             let future_hash = migration_hash("future");
             conn.execute(
-                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at)
-                 VALUES (2, 'future', ?1, ?2, ?3, 'now')",
-                rusqlite::params![future_hash, fingerprint, SCHEMA_PROFILE],
+                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at)
+                 VALUES (2, 'future', ?1, ?2, 'now')",
+                rusqlite::params![future_hash, fingerprint],
             )
             .unwrap();
         }
         let err = Db::open(&path).unwrap_err().to_string();
         assert!(
-            err.contains("incompatible prerelease database schema v2"),
+            err.contains("incompatible database schema v2"),
             "future v2 must fail closed, not recreate: {err}"
-        );
-        assert!(
-            !temp
-                .path()
-                .read_dir()
-                .unwrap()
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().contains("pre-0.1.0")),
-            "future v2 must not be treated as a folded 0002–0005 ledger"
         );
     }
 
@@ -2509,7 +2468,7 @@ mod tests {
     /// disposition/phase plus control-job tables, and a new goal leases a
     /// planner before any root turn.
     #[tokio::test]
-    async fn goal_upgrade_preserves_v1_rows_and_validates_migration_ledger() {
+    async fn goal_schema_and_migration_ledger_are_created_by_initial_migration() {
         let db = Db::open_in_memory().unwrap();
         let columns: Vec<String> = db
             .read(|conn| {
@@ -2792,6 +2751,85 @@ mod tests {
         assert_eq!((fenced.attempted, fenced.current), (1, 1));
         drop(Db::open_supervised_worker_for_test(&path, 2).unwrap());
         assert_eq!(read_durable_writer_generation(&path).unwrap(), 2);
+    }
+
+    /// A crash, full disk, or failed first migration leaves `cockpit.db`
+    /// existing but schema-less (`Db::open` creates the file before the
+    /// first migration commits). The supervisor's fence read must report the
+    /// neutral generation for exactly that state, or no worker would ever
+    /// start to bootstrap the file and every restart would fail the same way.
+    #[test]
+    fn supervisor_fence_read_treats_schemaless_files_as_generation_zero() {
+        let tmp = TempDir::new().unwrap();
+        let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+        env.set_var("XDG_DATA_HOME", tmp.path());
+        let path = Db::default_path().unwrap();
+        files::ensure_parent_dir_private(&path).unwrap();
+        let owner = SupervisorDatabaseOwner::acquire_default().unwrap();
+
+        // 0-byte file: the process died right after creating it.
+        files::create_private_file_if_missing(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert_eq!(owner.durable_worker_generation().unwrap(), 0);
+
+        // Rolled-back first migration: the real runner applies the whole
+        // schema in its transaction and then fails, so nothing commits.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let failing: &'static str = Box::leak(
+                format!("{}\nCREATE TABLE migration_fails_here (", MIGRATIONS[0].sql)
+                    .into_boxed_str(),
+            );
+            let failing = [Migration {
+                name: "0001_initial.sql",
+                sql: failing,
+            }];
+            migrate_with(&conn, &failing).expect_err("the first migration must fail");
+            assert!(!table_exists(&conn, "schema_version").unwrap());
+            assert!(!database_has_application_objects(&conn).unwrap());
+        }
+        assert_eq!(owner.durable_worker_generation().unwrap(), 0);
+
+        // The first supervised worker bootstraps that file and advances the
+        // fence; the next read sees the migrated, verified value.
+        drop(Db::open_supervised_worker_default(1).unwrap());
+        assert_eq!(owner.durable_worker_generation().unwrap(), 1);
+    }
+
+    /// The neutral value is only for schema-less files. A ledgered database
+    /// whose fence table is missing (or any other schema drift), and an
+    /// unledgered file holding application objects, fail closed instead of
+    /// reading as generation 0, which could let a reused generation through.
+    #[test]
+    fn supervisor_fence_read_fails_closed_on_ledgered_or_unledgered_drift() {
+        let tmp = TempDir::new().unwrap();
+        let ledgered = tmp.path().join("ledgered.db");
+        drop(Db::open_supervised_worker_for_test(&ledgered, 3).unwrap());
+        assert_eq!(read_durable_writer_generation(&ledgered).unwrap(), 3);
+        {
+            let conn = Connection::open(&ledgered).unwrap();
+            conn.execute_batch("DROP TABLE worker_generation_fence;")
+                .unwrap();
+        }
+        let error = read_durable_writer_generation(&ledgered)
+            .expect_err("a ledgered database missing the fence table must fail closed")
+            .to_string();
+        assert!(
+            error.contains("does not match the exact DDL")
+                || error.contains("schema fingerprint mismatch"),
+            "{error}"
+        );
+
+        let unledgered = tmp.path().join("unledgered.db");
+        {
+            let conn = Connection::open(&unledgered).unwrap();
+            conn.execute_batch("CREATE TABLE stray (id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+        let error = read_durable_writer_generation(&unledgered)
+            .expect_err("an unledgered database with application objects must fail closed")
+            .to_string();
+        assert!(error.contains("unledgered database"), "{error}");
     }
 
     #[tokio::test]
@@ -3944,8 +3982,8 @@ mod tests {
         db.write(move |conn| {
             conn.execute(
                 "INSERT INTO sessions \
-                 (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms) \
-                 VALUES (?1, 'project', '/tmp/project', 1, 1)",
+                 (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, short_id) \
+                 VALUES (?1, 'project', '/tmp/project', 1, 1, lower(hex(randomblob(3))))",
                 [&session_id],
             )?;
 
@@ -4258,13 +4296,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "remote")]
-    async fn session_delete_cascades_to_remote_audit_extension() {
+    async fn session_delete_cascades_to_remote_audit_table() {
         let db = Db::open_in_memory().unwrap();
         let session_id = Uuid::new_v4();
         let id = session_id.to_string();
         db.write(move |conn| {
-            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
+            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, short_id) VALUES (?1, 'p', '/p', 1, 1, lower(hex(randomblob(3))))", [&id])?;
             conn.execute("INSERT INTO remote_principal_audit (ts_ms, principal, request_kind, session_id, verdict) VALUES (1, 'p', 'request', ?1, 'allowed')", [&id])?;
             Ok(())
         }).await.unwrap();
@@ -4350,7 +4387,7 @@ mod tests {
         std::fs::write(&sidecar, "payload").unwrap();
         let relative_for_db = relative.clone();
         db.write(move |conn| {
-            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
+            conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms, short_id) VALUES (?1, 'p', '/p', 1, 1, lower(hex(randomblob(3))))", [&id])?;
             conn.execute("INSERT INTO task_delegation_jobs (task_call_id, parent_session_id, parent_agent, status, created_at, updated_at) VALUES ('task', ?1, 'agent', 'completed', 1, 1)", [&id])?;
             conn.execute("INSERT INTO task_delegation_payloads (task_call_id, label, payload_hash, parent_session_id, parent_agent, child_agent, prompt_byte_len, sidecar_path, created_at) VALUES ('task', 'default', 'hash', ?1, 'agent', 'child', 7, ?2, 1)", rusqlite::params![id, relative_for_db])?;
             Ok(())
@@ -4373,7 +4410,7 @@ mod tests {
             let id = id.clone();
             let relative = relative.clone();
             move |conn| {
-                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms,short_id) VALUES(?1,'p','/p',1,1,lower(hex(randomblob(3))))",[&id])?;
                 conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
                 Db::enqueue_delegation_sidecar_cleanup_conn(conn, session_id, 2)?;
@@ -4416,7 +4453,7 @@ mod tests {
             let id = id.clone();
             let relative = relative.clone();
             move |conn| {
-                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms,short_id) VALUES(?1,'p','/p',1,1,lower(hex(randomblob(3))))",[&id])?;
                 conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
                 conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
                 conn.execute("INSERT INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms) VALUES(?1,?2,2)",rusqlite::params![relative,id])?;
@@ -4509,10 +4546,10 @@ mod tests {
 
     #[test]
     fn migration_files_on_disk_match_expected_set() {
-        // Pre-release: the directory contains the local base plus independent
-        // opt-in extended and remote profile extensions. The literal catches
-        // stray or deleted schema inputs without deriving expectations from
-        // MIGRATIONS.
+        // Pre-launch: the directory contains exactly one unconditional schema
+        // file shared by every build (features gate code, never DDL). The
+        // literal catches stray or deleted schema inputs without deriving
+        // expectations from MIGRATIONS.
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("db")
@@ -4524,13 +4561,6 @@ mod tests {
             .collect();
         migrations.sort();
 
-        assert_eq!(
-            migrations,
-            vec![
-                "0001_extended_profile.sql".to_string(),
-                "0001_initial.sql".to_string(),
-                "0001_remote_profile.sql".to_string(),
-            ]
-        );
+        assert_eq!(migrations, vec!["0001_initial.sql".to_string()]);
     }
 }

@@ -5,13 +5,14 @@ use sha2::{Digest, Sha256};
 #[path = "support/schema_parser.rs"]
 mod schema_parser;
 
+/// The single unconditional migration. Every build applies all of it; the
+/// section markers only record which Cargo feature's code owns a table.
 const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
-const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
+const EXTENDED_SECTION_MARKER: &str = "-- ==== extended domains";
+const REMOTE_SECTION_MARKER: &str = "-- ==== remote domains";
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
-const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "65058fc99e2bcbc238942a79bc5f0c10bc16648d90d2b6b337d1b88bbe5d90bc";
-const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
-    "a6eb995d785afd158764c928429f4e2937aef0f2e309b5e5e547f9f4fa81e2f2";
+const SCHEMA_REVIEW_DIGEST: &str =
+    "a328d84ea06c6478c21b0c40f17e17b91b815d6105d8fac452142053d02fc0d8";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
     "ec7029db08e8f2cc2a6bdedcc421b97c403ad95ed13321facd482639e98b074a";
 
@@ -51,7 +52,7 @@ fn relationship_inventory()
         );
         assert!(
             matches!(fields[0], "local" | "extended"),
-            "unknown schema profile in relationship inventory: {line}"
+            "unknown schema section in relationship inventory: {line}"
         );
         let class = match fields[3] {
             "non_relationship" => RelationshipClass::NonRelationship,
@@ -1026,10 +1027,33 @@ fn portable_relative_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn effective_profiles() -> [(&'static str, schema_parser::Schema); 2] {
+/// The base section and the extended-domain section of `0001_initial.sql`.
+/// The remote-domain section is not covered by the relationship inventory.
+fn schema_sections() -> (&'static str, &'static str) {
+    for marker in [EXTENDED_SECTION_MARKER, REMOTE_SECTION_MARKER] {
+        assert_eq!(
+            SCHEMA.matches(marker).count(),
+            1,
+            "0001_initial.sql must contain section marker {marker:?} exactly once"
+        );
+    }
+    let extended_start = SCHEMA.find(EXTENDED_SECTION_MARKER).unwrap();
+    let remote_start = SCHEMA.find(REMOTE_SECTION_MARKER).unwrap();
+    assert!(
+        extended_start < remote_start,
+        "0001_initial.sql sections must be ordered base, extended, remote"
+    );
+    (
+        &SCHEMA[..extended_start],
+        &SCHEMA[extended_start..remote_start],
+    )
+}
+
+fn effective_sections() -> [(&'static str, schema_parser::Schema); 2] {
+    let (base, extended) = schema_sections();
     [
-        ("local", schema_parser::parse(&[SCHEMA])),
-        ("extended", schema_parser::parse(&[SCHEMA, EXTENDED_SCHEMA])),
+        ("local", schema_parser::parse(&[base])),
+        ("extended", schema_parser::parse(&[base, extended])),
     ]
 }
 
@@ -1041,8 +1065,8 @@ fn schema_digest(schema: &str) -> String {
 }
 
 #[test]
-fn effective_schema_profiles_are_ordered_closed_and_indexed() {
-    let [(local_name, local), (extended_name, extended)] = effective_profiles();
+fn schema_sections_are_ordered_closed_and_indexed() {
+    let [(local_name, local), (extended_name, extended)] = effective_sections();
     assert_eq!(local_name, "local");
     assert_eq!(extended_name, "extended");
     assert!(
@@ -1054,7 +1078,7 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
     );
     assert!(
         extended.tables.len() > local.tables.len(),
-        "extended profile must add its deferred-domain inventory"
+        "extended section must add its deferred-domain inventory"
     );
     assert_eq!(
         local.objects.len(),
@@ -1152,7 +1176,7 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
     }
 
     assert!(
-        std::panic::catch_unwind(|| schema_parser::parse(&[EXTENDED_SCHEMA])).is_err(),
+        std::panic::catch_unwind(|| schema_parser::parse(&[schema_sections().1])).is_err(),
         "the extended layer unexpectedly became a standalone or first-applied schema"
     );
 }
@@ -1277,16 +1301,12 @@ fn validate_relationship_inventory(
 
 #[test]
 fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
-    assert_eq!(schema_digest(SCHEMA), LOCAL_SCHEMA_REVIEW_DIGEST);
-    assert_eq!(
-        schema_digest(EXTENDED_SCHEMA),
-        EXTENDED_SCHEMA_REVIEW_DIGEST
-    );
+    assert_eq!(schema_digest(SCHEMA), SCHEMA_REVIEW_DIGEST);
     assert_eq!(
         schema_digest(RELATIONSHIP_INVENTORY),
         RELATIONSHIP_INVENTORY_REVIEW_DIGEST
     );
-    let [(_, local), (_, extended)] = effective_profiles();
+    let [(_, local), (_, extended)] = effective_sections();
     let inventory = relationship_inventory();
     let local_objects = schema_parser::classified_objects(&local)
         .map(|(object, _)| object.to_owned())
@@ -1339,7 +1359,7 @@ fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
 
 #[test]
 fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
-    let [(_, mut local), _] = effective_profiles();
+    let [(_, mut local), _] = effective_sections();
     let objects = schema_parser::classified_objects(&local)
         .map(|(object, _)| object.to_owned())
         .collect::<std::collections::BTreeSet<_>>();
@@ -1635,7 +1655,7 @@ fn hot_query_inventory_is_exact_and_keeps_reviewed_leading_indexes() {
         "hot-query annotations drifted"
     );
 
-    let [(_, local), (_, extended)] = effective_profiles();
+    let [(_, local), (_, extended)] = effective_sections();
     for (
         marker,
         owner,

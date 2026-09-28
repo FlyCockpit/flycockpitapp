@@ -361,9 +361,7 @@ async fn resolve_session(ctx: &ToolCtx, id: &str) -> Result<Uuid> {
             let Some(session) = ctx.session.db.get_session(session_id).await? else {
                 continue;
             };
-            if session.project_id == ctx.session.project_id
-                && session.short_id.as_deref() == Some(id)
-            {
+            if session.project_id == ctx.session.project_id && session.short_id == id {
                 return Ok(session_id);
             }
         }
@@ -752,9 +750,7 @@ async fn history_entries(ctx: &ToolCtx) -> Result<Vec<String>> {
         {
             continue;
         }
-        let short = session
-            .short_id
-            .unwrap_or_else(|| session.session_id.to_string());
+        let short = session.short_id;
         entries.push(format!("cockpit://session/{short}/transcript"));
         if ctx
             .session
@@ -996,8 +992,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let source_short = source.short_id.unwrap();
-        let sibling_short = sibling.short_id.unwrap();
+        let source_short = source.short_id;
+        let sibling_short = sibling.short_id;
         *ctx.dream_read_scope.write().unwrap() =
             Some(std::collections::BTreeSet::from([source.session_id]));
 

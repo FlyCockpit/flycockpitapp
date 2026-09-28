@@ -391,8 +391,8 @@ async fn daemon_with_newer_migration_ledger() -> SpawnedDaemon {
         )
         .expect("read current schema fingerprint");
     conn.execute(
-        "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at) \
-         VALUES (?1, 'future', ?2, ?3, 'local-v0.1', CURRENT_TIMESTAMP)",
+        "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at) \
+         VALUES (?1, 'future', ?2, ?3, CURRENT_TIMESTAMP)",
         rusqlite::params![
             cockpit_cli::db::EXPECTED_SCHEMA_VERSION + 1,
             "0".repeat(64),
@@ -408,8 +408,8 @@ fn assert_newer_ledger_refused(label: &str, daemon: &SpawnedDaemon, output: &std
     assert_failure(label, output, daemon.home());
     let text = output_text(output);
     assert!(
-        text.contains("incompatible prerelease database schema v2")
-            && text.contains("Restore a compatible migration backup or move the database aside"),
+        text.contains("incompatible database schema v2")
+            && text.contains("Run a Cockpit build that supports it, or move the database aside"),
         "{text}"
     );
     assert!(

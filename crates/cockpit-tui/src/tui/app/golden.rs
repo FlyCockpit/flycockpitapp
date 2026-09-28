@@ -363,7 +363,7 @@ fn popover_fixture(name: &str) -> App {
             BtwForkInfo {
                 session_id: Uuid::from_u128(2),
                 parent_session_id: Uuid::from_u128(1),
-                short_id: Some("btw001".to_string()),
+                short_id: "btw001".to_string(),
                 tangent: false,
                 created_at: 1,
                 message_count: 0,

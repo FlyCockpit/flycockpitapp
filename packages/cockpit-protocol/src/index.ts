@@ -1921,6 +1921,8 @@ const sessionSummaryWireSchema = z
   .object({
     session_id: uuidSchema,
     session_entry_mode: sessionEntryModeSchema,
+    // Every session row carries a short id (`sessions.short_id NOT NULL`).
+    short_id: z.string(),
     project_root: projectRootSchema,
     project_id: z.string(),
     started_at_unix_ms: safeI64NumberSchema,
@@ -2045,7 +2047,7 @@ export const btwForkInfoSchema = z
   .object({
     session_id: uuidSchema,
     parent_session_id: uuidSchema,
-    short_id: z.string().optional(),
+    short_id: z.string(),
     tangent: z.boolean(),
     created_at: safeI64NumberSchema,
     message_count: z.number().int().nonnegative(),
@@ -3319,7 +3321,7 @@ export const sessionSummarySchema = z
   .object({
     session_id: uuidSchema,
     session_entry_mode: sessionEntryModeSchema,
-    short_id: z.string().optional(),
+    short_id: z.string(),
     project_root: projectRootSchema,
     project_id: z.string(),
     started_at_unix_ms: safeI64NumberSchema,

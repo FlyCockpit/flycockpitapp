@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use cockpit_db::secret_vault::{
-    SecretVaultFileKekMode, SecretVaultPlacement, SecretVaultSagaPhase, delete_passphrase_kdf_conn,
-    insert_saga_conn, list_open_sagas_conn, load_authority_conn, set_saga_phase_conn,
-    upsert_authority_with_file_kek_mode_conn,
+    SecretVaultFileKekMode, SecretVaultPlacement, SecretVaultSagaEndpoint, SecretVaultSagaPhase,
+    delete_passphrase_kdf_conn, insert_saga_conn, list_open_sagas_conn, load_authority_conn,
+    set_saga_phase_conn, upsert_authority_with_file_kek_mode_conn,
 };
 use cockpit_proto::FeatureCapabilityState;
 use uuid::Uuid;
@@ -130,10 +130,14 @@ pub fn migrate_kek_placement(
                 insert_saga_conn(
                     conn,
                     &op_id,
-                    source_placement,
-                    source_file_kek_mode,
-                    dest_placement,
-                    dest_file_kek_mode,
+                    SecretVaultSagaEndpoint {
+                        placement: source_placement,
+                        file_kek_mode: source_file_kek_mode,
+                    },
+                    SecretVaultSagaEndpoint {
+                        placement: dest_placement,
+                        file_kek_mode: dest_file_kek_mode,
+                    },
                     &fingerprint,
                     SecretVaultSagaPhase::Prepared,
                 )

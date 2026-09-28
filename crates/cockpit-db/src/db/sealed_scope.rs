@@ -543,16 +543,28 @@ pub fn create_session_sealed_value_conn(
 /// audit row in the same transaction. The ordinary scoped create uses INSERT
 /// (never UPSERT) for `sealed_value_records`, so an owner-authored or prior
 /// agent-acquired destination can never be replaced through this path.
+/// The pending acquisition-audit row an agent-acquired sealed value settles,
+/// and the tool call and time that settle it.
+#[derive(Debug, Clone, Copy)]
+pub struct SealedAcquisitionCompletion<'a> {
+    pub acquisition_id: &'a str,
+    pub source_tool_call_id: &'a str,
+    pub completed_at_ms: i64,
+}
+
 pub fn create_agent_acquired_session_sealed_value_conn(
     conn: &Connection,
     record: &NewSealedValueRecord,
     literal: &str,
     reason: &str,
     origin: &str,
-    acquisition_id: &str,
-    source_tool_call_id: &str,
-    completed_at_ms: i64,
+    completion: SealedAcquisitionCompletion<'_>,
 ) -> Result<SealedValueRecordRow> {
+    let SealedAcquisitionCompletion {
+        acquisition_id,
+        source_tool_call_id,
+        completed_at_ms,
+    } = completion;
     let legacy_exists: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM sealed_values WHERE session_id = ?1 AND value_id = ?2",

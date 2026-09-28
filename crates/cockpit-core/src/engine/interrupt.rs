@@ -151,6 +151,19 @@ impl HostApprovalEffectHandoff {
         }
     }
 
+    /// The exact final-operation identity every durable settlement of this
+    /// handoff must present.
+    fn final_operation(&self) -> crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+        crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+            session_id: self.session_id,
+            agent_instance_id: self.agent_instance_id,
+            operation_id: self.operation_id,
+            operation_kind: self.operation_kind.clone(),
+            canonical_input_json: self.canonical_input_json.clone(),
+            input_digest: self.input_digest.clone(),
+        }
+    }
+
     fn db_authority(
         &self,
     ) -> anyhow::Result<crate::db::agent_tree_decisions::HostApprovalAuthority> {
@@ -180,12 +193,7 @@ impl HostApprovalEffectHandoff {
                 .claimed_host_approval_effect_handoff_matches_candidate(
                     authority,
                     self.interrupt_id,
-                    self.session_id,
-                    self.agent_instance_id,
-                    self.operation_id,
-                    self.operation_kind.clone(),
-                    self.canonical_input_json.clone(),
-                    self.input_digest.clone(),
+                    self.final_operation(),
                     concrete_effects_json,
                 )
                 .await
@@ -204,12 +212,7 @@ impl HostApprovalEffectHandoff {
             .claim_host_approval_effect_handoff(
                 authority,
                 self.interrupt_id,
-                self.session_id,
-                self.agent_instance_id,
-                self.operation_id,
-                self.operation_kind.clone(),
-                self.canonical_input_json.clone(),
-                self.input_digest.clone(),
+                self.final_operation(),
                 concrete_effects_json,
                 crate::agent_tree::system_now_unix_ms(),
             )
@@ -234,12 +237,7 @@ impl HostApprovalEffectHandoff {
             .reject_unclaimed_host_approval_final_operation(
                 authority,
                 self.interrupt_id,
-                self.session_id,
-                self.agent_instance_id,
-                self.operation_id,
-                self.operation_kind.clone(),
-                self.canonical_input_json.clone(),
-                self.input_digest.clone(),
+                self.final_operation(),
                 crate::agent_tree::system_now_unix_ms(),
             )
             .await;
@@ -292,12 +290,7 @@ impl HostApprovalEffectHandoff {
             .complete_host_approval_final_operation(
                 authority,
                 self.interrupt_id,
-                self.session_id,
-                self.agent_instance_id,
-                self.operation_id,
-                self.operation_kind.clone(),
-                self.canonical_input_json.clone(),
-                self.input_digest.clone(),
+                self.final_operation(),
                 succeeded,
                 receipt,
                 crate::agent_tree::system_now_unix_ms(),
@@ -313,12 +306,7 @@ impl HostApprovalEffectHandoff {
                 .mark_host_approval_final_operation_submission_unknown(
                     authority,
                     self.interrupt_id,
-                    self.session_id,
-                    self.agent_instance_id,
-                    self.operation_id,
-                    self.operation_kind.clone(),
-                    self.canonical_input_json.clone(),
-                    self.input_digest.clone(),
+                    self.final_operation(),
                     crate::agent_tree::system_now_unix_ms(),
                 )
                 .await;
@@ -340,12 +328,7 @@ impl HostApprovalEffectHandoff {
             .mark_host_approval_final_operation_submission_unknown(
                 authority,
                 self.interrupt_id,
-                self.session_id,
-                self.agent_instance_id,
-                self.operation_id,
-                self.operation_kind.clone(),
-                self.canonical_input_json.clone(),
-                self.input_digest.clone(),
+                self.final_operation(),
                 crate::agent_tree::system_now_unix_ms(),
             )
             .await;
@@ -380,12 +363,14 @@ impl Drop for HostApprovalEffectHandoff {
                         .mark_host_approval_final_operation_submission_unknown(
                             db_authority,
                             interrupt_id,
-                            session_id,
-                            agent_instance_id,
-                            operation_id,
-                            operation_kind,
-                            canonical_input_json,
-                            input_digest,
+                            crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                                session_id,
+                                agent_instance_id,
+                                operation_id,
+                                operation_kind,
+                                canonical_input_json,
+                                input_digest,
+                            },
                             crate::agent_tree::system_now_unix_ms(),
                         )
                         .await;
@@ -394,12 +379,14 @@ impl Drop for HostApprovalEffectHandoff {
                         .reject_unclaimed_host_approval_final_operation(
                             db_authority,
                             interrupt_id,
-                            session_id,
-                            agent_instance_id,
-                            operation_id,
-                            operation_kind,
-                            canonical_input_json,
-                            input_digest,
+                            crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                                session_id,
+                                agent_instance_id,
+                                operation_id,
+                                operation_kind,
+                                canonical_input_json,
+                                input_digest,
+                            },
                             crate::agent_tree::system_now_unix_ms(),
                         )
                         .await;
@@ -2577,10 +2564,12 @@ async fn abort_unbound_host_capability_refresh_initialization(
     match db
         .abort_host_capability_refresh_initialization(
             crate::agent_tree::daemon_host_capability_refresh_authority(),
-            session_id,
-            operation.operation_id,
-            operation.request_id,
-            agent_instance_id,
+            crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationRef {
+                session_id,
+                operation_id: operation.operation_id,
+                request_id: operation.request_id,
+                agent_instance_id,
+            },
             raw_interrupt_id,
             crate::agent_tree::system_now_unix_ms(),
         )
@@ -2732,16 +2721,20 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                             Ok(operation) => operation,
                             Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
                         };
+                    let final_operation =
+                        crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                            session_id,
+                            agent_instance_id: decision.agent_instance_id,
+                            operation_id,
+                            operation_kind: operation.operation_kind.clone(),
+                            canonical_input_json: operation.canonical_input_json.clone(),
+                            input_digest: operation.input_digest.clone(),
+                        };
                     let dispatched = db
                         .consume_host_approval_final_operation(
                             db_authority,
                             interrupt_id,
-                            session_id,
-                            decision.agent_instance_id,
-                            operation_id,
-                            operation.operation_kind.clone(),
-                            operation.canonical_input_json.clone(),
-                            operation.input_digest.clone(),
+                            final_operation.clone(),
                             crate::agent_tree::system_now_unix_ms(),
                         )
                         .await;
@@ -2778,12 +2771,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                         .reject_unclaimed_host_approval_final_operation(
                                             db_authority,
                                             interrupt_id,
-                                            session_id,
-                                            decision.agent_instance_id,
-                                            operation_id,
-                                            operation.operation_kind.clone(),
-                                            operation.canonical_input_json.clone(),
-                                            operation.input_digest.clone(),
+                                            final_operation.clone(),
                                             crate::agent_tree::system_now_unix_ms(),
                                         )
                                         .await;
@@ -2795,12 +2783,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                     .reject_unclaimed_host_approval_final_operation(
                                         db_authority,
                                         interrupt_id,
-                                        session_id,
-                                        decision.agent_instance_id,
-                                        operation_id,
-                                        operation.operation_kind.clone(),
-                                        operation.canonical_input_json.clone(),
-                                        operation.input_digest.clone(),
+                                        final_operation.clone(),
                                         crate::agent_tree::system_now_unix_ms(),
                                     )
                                     .await;
@@ -2830,12 +2813,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                     .mark_host_approval_final_operation_submission_unknown(
                                         db_authority,
                                         interrupt_id,
-                                        session_id,
-                                        decision.agent_instance_id,
-                                        operation_id,
-                                        operation.operation_kind.clone(),
-                                        operation.canonical_input_json.clone(),
-                                        operation.input_digest.clone(),
+                                        final_operation.clone(),
                                         crate::agent_tree::system_now_unix_ms(),
                                     )
                                     .await;
@@ -2849,12 +2827,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                         .reject_unclaimed_host_approval_final_operation(
                                             db_authority,
                                             interrupt_id,
-                                            session_id,
-                                            decision.agent_instance_id,
-                                            operation_id,
-                                            operation.operation_kind.clone(),
-                                            operation.canonical_input_json.clone(),
-                                            operation.input_digest.clone(),
+                                            final_operation.clone(),
                                             crate::agent_tree::system_now_unix_ms(),
                                         )
                                         .await;
@@ -2866,12 +2839,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                                     .reject_unclaimed_host_approval_final_operation(
                                         db_authority,
                                         interrupt_id,
-                                        session_id,
-                                        decision.agent_instance_id,
-                                        operation_id,
-                                        operation.operation_kind.clone(),
-                                        operation.canonical_input_json.clone(),
-                                        operation.input_digest.clone(),
+                                        final_operation.clone(),
                                         crate::agent_tree::system_now_unix_ms(),
                                     )
                                     .await;
@@ -3030,16 +2998,20 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         };
         if let Err(error) = db
             .reserve_host_approval_final_operation(
-                session_id,
-                agent_instance_id,
-                operation.operation_id,
-                operation.authorization_group_id,
-                operation.tool_call_id.clone(),
-                operation.member_index,
-                operation.concrete_effect_digest.clone(),
-                operation.operation_kind.clone(),
-                operation.canonical_input_json.clone(),
-                operation.input_digest.clone(),
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id,
+                    agent_instance_id,
+                    operation_id: operation.operation_id,
+                    operation_kind: operation.operation_kind.clone(),
+                    canonical_input_json: operation.canonical_input_json.clone(),
+                    input_digest: operation.input_digest.clone(),
+                },
+                crate::db::agent_tree_decisions::HostAuthorizationGroupMember {
+                    authorization_group_id: operation.authorization_group_id,
+                    tool_call_id: operation.tool_call_id.clone(),
+                    member_index: operation.member_index,
+                    concrete_effect_digest: operation.concrete_effect_digest.clone(),
+                },
                 authority,
                 crate::agent_tree::system_now_unix_ms(),
             )
@@ -3169,12 +3141,14 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         .consume_host_approval_final_operation(
             db_authority,
             interrupt_id,
-            session_id,
-            agent_instance_id,
-            operation.operation_id,
-            operation.operation_kind.clone(),
-            operation.canonical_input_json.clone(),
-            operation.input_digest.clone(),
+            crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                session_id,
+                agent_instance_id,
+                operation_id: operation.operation_id,
+                operation_kind: operation.operation_kind.clone(),
+                canonical_input_json: operation.canonical_input_json.clone(),
+                input_digest: operation.input_digest.clone(),
+            },
             crate::agent_tree::system_now_unix_ms(),
         )
         .await
@@ -3206,12 +3180,14 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                         .reject_unclaimed_host_approval_final_operation(
                             db_authority,
                             interrupt_id,
-                            session_id,
-                            agent_instance_id,
-                            operation.operation_id,
-                            operation.operation_kind,
-                            operation.canonical_input_json,
-                            operation.input_digest,
+                            crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                                session_id,
+                                agent_instance_id,
+                                operation_id: operation.operation_id,
+                                operation_kind: operation.operation_kind,
+                                canonical_input_json: operation.canonical_input_json,
+                                input_digest: operation.input_digest,
+                            },
                             crate::agent_tree::system_now_unix_ms(),
                         )
                         .await;
@@ -3222,12 +3198,14 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                     .reject_unclaimed_host_approval_final_operation(
                         db_authority,
                         interrupt_id,
-                        session_id,
-                        agent_instance_id,
-                        operation.operation_id,
-                        operation.operation_kind,
-                        operation.canonical_input_json,
-                        operation.input_digest,
+                        crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                            session_id,
+                            agent_instance_id,
+                            operation_id: operation.operation_id,
+                            operation_kind: operation.operation_kind,
+                            canonical_input_json: operation.canonical_input_json,
+                            input_digest: operation.input_digest,
+                        },
                         crate::agent_tree::system_now_unix_ms(),
                     )
                     .await;
@@ -3249,12 +3227,14 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                     .mark_host_approval_final_operation_submission_unknown(
                         db_authority,
                         interrupt_id,
-                        session_id,
-                        agent_instance_id,
-                        operation.operation_id,
-                        operation.operation_kind,
-                        operation.canonical_input_json,
-                        operation.input_digest,
+                        crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                            session_id,
+                            agent_instance_id,
+                            operation_id: operation.operation_id,
+                            operation_kind: operation.operation_kind,
+                            canonical_input_json: operation.canonical_input_json,
+                            input_digest: operation.input_digest,
+                        },
                         crate::agent_tree::system_now_unix_ms(),
                     )
                     .await;
@@ -3268,12 +3248,14 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                         .reject_unclaimed_host_approval_final_operation(
                             db_authority,
                             interrupt_id,
-                            session_id,
-                            agent_instance_id,
-                            operation.operation_id,
-                            operation.operation_kind,
-                            operation.canonical_input_json,
-                            operation.input_digest,
+                            crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                                session_id,
+                                agent_instance_id,
+                                operation_id: operation.operation_id,
+                                operation_kind: operation.operation_kind,
+                                canonical_input_json: operation.canonical_input_json,
+                                input_digest: operation.input_digest,
+                            },
                             crate::agent_tree::system_now_unix_ms(),
                         )
                         .await;
@@ -3285,12 +3267,14 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                     .reject_unclaimed_host_approval_final_operation(
                         db_authority,
                         interrupt_id,
-                        session_id,
-                        agent_instance_id,
-                        operation.operation_id,
-                        operation.operation_kind,
-                        operation.canonical_input_json,
-                        operation.input_digest,
+                        crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                            session_id,
+                            agent_instance_id,
+                            operation_id: operation.operation_id,
+                            operation_kind: operation.operation_kind,
+                            canonical_input_json: operation.canonical_input_json,
+                            input_digest: operation.input_digest,
+                        },
                         crate::agent_tree::system_now_unix_ms(),
                     )
                     .await;
@@ -4043,10 +4027,12 @@ mod tests {
         assert_eq!(
             db.abort_host_capability_refresh_initialization(
                 crate::agent_tree::daemon_host_capability_refresh_authority(),
-                session.session_id,
-                operation.operation_id,
-                operation.request_id,
-                child.agent_instance_id,
+                crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationRef {
+                    session_id: session.session_id,
+                    operation_id: operation.operation_id,
+                    request_id: operation.request_id,
+                    agent_instance_id: child.agent_instance_id,
+                },
                 None,
                 21,
             )
@@ -6110,16 +6096,20 @@ mod tests {
             .await
             .unwrap();
         db.reserve_host_approval_final_operation(
-            session.session_id,
-            agent.agent_instance_id,
-            persisted_operation.operation_id,
-            persisted_operation.authorization_group_id,
-            persisted_operation.tool_call_id.clone(),
-            persisted_operation.member_index,
-            persisted_operation.concrete_effect_digest.clone(),
-            persisted_operation.operation_kind.clone(),
-            persisted_operation.canonical_input_json.clone(),
-            persisted_operation.input_digest.clone(),
+            crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                session_id: session.session_id,
+                agent_instance_id: agent.agent_instance_id,
+                operation_id: persisted_operation.operation_id,
+                operation_kind: persisted_operation.operation_kind.clone(),
+                canonical_input_json: persisted_operation.canonical_input_json.clone(),
+                input_digest: persisted_operation.input_digest.clone(),
+            },
+            crate::db::agent_tree_decisions::HostAuthorizationGroupMember {
+                authorization_group_id: persisted_operation.authorization_group_id,
+                tool_call_id: persisted_operation.tool_call_id.clone(),
+                member_index: persisted_operation.member_index,
+                concrete_effect_digest: persisted_operation.concrete_effect_digest.clone(),
+            },
             crate::agent_tree::HostApprovalAuthority::trusted_host().into_db(),
             3,
         )

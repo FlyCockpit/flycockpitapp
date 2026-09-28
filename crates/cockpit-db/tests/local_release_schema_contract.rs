@@ -1527,8 +1527,10 @@ fn sql_registry_edges(sql: &str, registry: &str) -> BTreeSet<String> {
         "SQL registry {registry} is malformed"
     );
     literals
-        .chunks_exact(2)
-        .map(|edge| format!("{}>{}", edge[0], edge[1]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[from, to]| format!("{from}>{to}"))
         .collect()
 }
 
@@ -1925,8 +1927,10 @@ fn ownership() -> BTreeMap<String, Ownership> {
             "family {name} Rust edge constant is malformed"
         );
         let rust_edges = rust_edge_values
-            .chunks_exact(2)
-            .map(|edge| format!("{}>{}", edge[0], edge[1]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[from, to]| format!("{from}>{to}"))
             .collect::<BTreeSet<_>>();
         let rust_conditional_edges = family
             .get("conditional_edges_symbol")
@@ -1939,8 +1943,10 @@ fn ownership() -> BTreeMap<String, Ownership> {
                     "family {name} Rust conditional edges malformed"
                 );
                 values
-                    .chunks_exact(2)
-                    .map(|edge| format!("{}>{}", edge[0], edge[1]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[from, to]| format!("{from}>{to}"))
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();

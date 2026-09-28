@@ -178,11 +178,10 @@ pub(crate) fn cockpit_data_dir() -> Result<PathBuf> {
         base.join("cockpit")
     };
     #[cfg(any(test, feature = "test-support"))]
-    {
+    let path = {
         use cockpit_test_support::home_isolation::{CockpitHomeKind, finalize_test_cockpit_path};
-        return Ok(finalize_test_cockpit_path(path, CockpitHomeKind::Data));
-    }
-    #[cfg(not(any(test, feature = "test-support")))]
+        finalize_test_cockpit_path(path, CockpitHomeKind::Data)
+    };
     Ok(path)
 }
 

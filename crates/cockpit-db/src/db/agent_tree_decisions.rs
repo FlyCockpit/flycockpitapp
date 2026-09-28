@@ -86,6 +86,54 @@ impl HostWorkspaceRef {
     }
 }
 
+/// The exact concrete final operation a host approval authorizes: its owner,
+/// operation identity, and canonical input. Every settlement of the operation
+/// must present the same identity it was reserved with.
+#[cfg(feature = "host-approval-composition")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostApprovalFinalOperation {
+    pub session_id: Uuid,
+    pub agent_instance_id: Uuid,
+    pub operation_id: Uuid,
+    pub operation_kind: String,
+    pub canonical_input_json: String,
+    pub input_digest: String,
+}
+
+/// One member of the host authorization group a final operation is reserved
+/// into: the group identity, its originating tool call, the concrete effect
+/// digest shared by the group, and this member's position in it.
+#[cfg(feature = "host-approval-composition")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostAuthorizationGroupMember {
+    pub authorization_group_id: Uuid,
+    pub tool_call_id: String,
+    pub member_index: u32,
+    pub concrete_effect_digest: String,
+}
+
+/// The decision a compare-and-set transition targets and the revision the
+/// caller observed; any other current revision is a `RevisionConflict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecisionRevisionRef {
+    pub session_id: Uuid,
+    pub decision_request_id: Uuid,
+    pub expected_revision: i64,
+}
+
+/// Optional state bound by a decision transition in the same transaction.
+/// The default binds nothing: no resolver route, no continuation payload,
+/// no code-root receipt, and no trusted host approval.
+#[derive(Debug, Default)]
+struct DecisionTransitionBindings {
+    resolver_route: Option<String>,
+    resume_payload_json: Option<String>,
+    host_selected_response_json: Option<String>,
+    trusted_host_approval: bool,
+    host_interrupt_id: Option<Uuid>,
+    code_root_receipt: Option<CodeRootInterruptReceiptWrite>,
+}
+
 /// Result of fencing one opaque host-approval handoff at a concrete effect
 /// boundary. `DifferentCandidate` is deliberately distinct from a stale
 /// capability so the boundary can fail closed on an exact-candidate mismatch,
@@ -179,6 +227,24 @@ pub struct HostCapabilityRefreshOperationRow {
     pub created_at_unix_ms: i64,
     /// Stable secondary ordering for the global completed-publication outbox.
     pub completed_at_unix_ms: Option<i64>,
+}
+
+/// The refresh initialization descriptor an abort terminalizes: the
+/// operation/request pair and the dedicated child published for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCapabilityRefreshInitializationRef {
+    pub session_id: Uuid,
+    pub operation_id: Uuid,
+    pub request_id: Uuid,
+    pub agent_instance_id: Uuid,
+}
+
+/// The refresh operation a newly created refresh decision is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCapabilityRefreshDecisionBinding {
+    pub operation_id: Uuid,
+    pub request_id: Uuid,
+    pub requires_dedicated_child_initialization: bool,
 }
 
 /// Keyset cursor for the daemon-global completed refresh publication outbox.
@@ -572,6 +638,25 @@ pub struct RecursiveNoninteractiveOutcome {
     pub report: String,
     pub failed: bool,
     pub completed_at_unix_ms: i64,
+}
+
+/// The terminal result a task-delegation child and its AgentTree executor are
+/// settled with in one transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDelegationChildSettlement {
+    pub outcome: TaskDelegationTerminalState,
+    pub report: Option<String>,
+    pub snapshot_json: Option<String>,
+    pub receipt_json: String,
+}
+
+/// The parent-visible result a recursive noninteractive child settles with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveChildOutcomeReport {
+    pub label: String,
+    pub child_agent: String,
+    pub report: String,
+    pub failed: bool,
 }
 
 /// One recursive child and its immutable launch/initial-continuation pair.
@@ -1580,8 +1665,8 @@ impl Db {
             })
             .await?;
         for row in &rows {
-            if let Some(snapshot_id) = row.resolved_profile_snapshot_id {
-                if let Err(error) = self
+            if let Some(snapshot_id) = row.resolved_profile_snapshot_id
+                && let Err(error) = self
                     .set_agent_auto_answer_from_resolved_profile(
                         session_id,
                         row.agent_instance_id,
@@ -1589,15 +1674,14 @@ impl Db {
                         now_unix_ms,
                     )
                     .await
-                {
-                    // The child snapshot and AgentTree identity are already
-                    // durable. Return that fact separately so one-shot
-                    // admission claims are retired rather than retried.
-                    return Ok(TaskDelegationPublication {
-                        children: rows,
-                        post_publication_error: Some(error),
-                    });
-                }
+            {
+                // The child snapshot and AgentTree identity are already
+                // durable. Return that fact separately so one-shot
+                // admission claims are retired rather than retried.
+                return Ok(TaskDelegationPublication {
+                    children: rows,
+                    post_publication_error: Some(error),
+                });
             }
         }
         Ok(TaskDelegationPublication {
@@ -1937,12 +2021,15 @@ impl Db {
         session_id: Uuid,
         parent_agent_instance_id: Uuid,
         child_agent_instance_id: Uuid,
-        label: String,
-        child_agent: String,
-        report: String,
-        failed: bool,
+        outcome: RecursiveChildOutcomeReport,
         now_unix_ms: i64,
     ) -> Result<bool> {
+        let RecursiveChildOutcomeReport {
+            label,
+            child_agent,
+            report,
+            failed,
+        } = outcome;
         self.transaction(move |conn| {
             let parent = load_agent(conn, session_id, parent_agent_instance_id)?
                 .context("recursive outcome parent is not authorized for this session")?;
@@ -2561,10 +2648,7 @@ impl Db {
         session_id: Uuid,
         task_call_id: String,
         label: String,
-        outcome: TaskDelegationTerminalState,
-        report: Option<String>,
-        snapshot_json: Option<String>,
-        receipt_json: String,
+        settlement: TaskDelegationChildSettlement,
         now_unix_ms: i64,
         // A successful interactive child can be the exact owner of an
         // already-accepted late user steer.  Its continuation receipt and
@@ -2573,6 +2657,12 @@ impl Db {
         // while popping the very child that completed it.
         late_user_steer_completion: Option<(Uuid, Uuid)>,
     ) -> Result<bool> {
+        let TaskDelegationChildSettlement {
+            outcome,
+            report,
+            snapshot_json,
+            receipt_json,
+        } = settlement;
         let receipt_json = redact_receipt_json(&receipt_json)?;
         self.transaction(move |conn| {
             let target_task_state = outcome.delegation_status();
@@ -3553,13 +3643,16 @@ impl Db {
     pub async fn create_host_capability_refresh_decision_for_interrupt(
         &self,
         input: NewDecisionRequest,
-        operation_id: Uuid,
-        request_id: Uuid,
-        requires_dedicated_child_initialization: bool,
+        binding: HostCapabilityRefreshDecisionBinding,
         interrupt_id: Uuid,
         authority: HostCapabilityRefreshAuthority,
         now_unix_ms: i64,
     ) -> Result<DecisionRequestRow> {
+        let HostCapabilityRefreshDecisionBinding {
+            operation_id,
+            request_id,
+            requires_dedicated_child_initialization,
+        } = binding;
         ensure!(
             !operation_id.is_nil() && !request_id.is_nil(),
             "host capability refresh operation identities must not be nil"
@@ -4201,14 +4294,29 @@ impl Db {
                     },
                 });
             }
-            let operation: Option<(String, Option<String>, Option<i64>, Option<String>, Option<String>)> = conn
+            struct RefreshOperationState {
+                state: String,
+                result_snapshot_json: Option<String>,
+                result_snapshot_generation: Option<i64>,
+                result_snapshot_digest: Option<String>,
+                error_text: Option<String>,
+            }
+            let operation = conn
                 .query_row(
                     "SELECT state, result_snapshot_json, result_snapshot_generation,
                             result_snapshot_digest, error_text
                        FROM host_capability_refresh_operations
                       WHERE operation_id = ?1 AND session_id = ?2",
                     params![operation_id.to_string(), session_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    |row| {
+                        Ok(RefreshOperationState {
+                            state: row.get(0)?,
+                            result_snapshot_json: row.get(1)?,
+                            result_snapshot_generation: row.get(2)?,
+                            result_snapshot_digest: row.get(3)?,
+                            error_text: row.get(4)?,
+                        })
+                    },
                 )
                 .optional()?;
             let another_refresh_blocks_execution: i64 = conn.query_row(
@@ -4228,8 +4336,13 @@ impl Db {
                 |row| row.get(0),
             )?;
             Ok(match operation {
-                Some((state, Some(result_snapshot_json), Some(generation), Some(digest), _))
-                    if state == "completed" =>
+                Some(RefreshOperationState {
+                    state,
+                    result_snapshot_json: Some(result_snapshot_json),
+                    result_snapshot_generation: Some(generation),
+                    result_snapshot_digest: Some(digest),
+                    error_text: _,
+                }) if state == "completed" =>
                 {
                     let generation = u64::try_from(generation)
                         .context("completed host capability refresh generation is invalid")?;
@@ -4246,20 +4359,24 @@ impl Db {
                         },
                     }
                 }
-                Some((state, _, _, _, _))
+                Some(RefreshOperationState { state, .. })
                     if state == "executing"
                         || (state == "allowed" && another_refresh_blocks_execution != 0) =>
                 {
                     HostCapabilityRefreshExecutionClaim::InFlight
                 }
-                Some((state, _, _, _, error_text)) if state == "failed" => {
+                Some(RefreshOperationState {
+                    state, error_text, ..
+                }) if state == "failed" => {
                     HostCapabilityRefreshExecutionClaim::Failed {
                         error_text: error_text.unwrap_or_else(|| {
                             "host capability refresh failed without a durable error".to_string()
                         }),
                     }
                 }
-                Some((state, _, _, _, error_text)) if state == "cancelled" => {
+                Some(RefreshOperationState {
+                    state, error_text, ..
+                }) if state == "cancelled" => {
                     HostCapabilityRefreshExecutionClaim::Cancelled {
                         error_text: error_text.unwrap_or_else(|| {
                             "host capability refresh was cancelled without a durable reason".to_string()
@@ -4283,11 +4400,14 @@ impl Db {
         session_id: Uuid,
         operation_id: Uuid,
         lease: &HostCapabilityRefreshExecutionLease,
-        result_snapshot_json: String,
-        result_snapshot_generation: u64,
-        result_snapshot_digest: String,
+        receipt: HostCapabilityRefreshSnapshotReceipt,
         now_unix_ms: i64,
     ) -> Result<bool> {
+        let HostCapabilityRefreshSnapshotReceipt {
+            result_snapshot_json,
+            generation: result_snapshot_generation,
+            digest: result_snapshot_digest,
+        } = receipt;
         let result_snapshot_json = validate_host_capability_refresh_snapshot_receipt(
             result_snapshot_json,
             result_snapshot_generation,
@@ -4466,24 +4586,18 @@ impl Db {
     pub async fn abort_host_capability_refresh_initialization(
         &self,
         _authority: HostCapabilityRefreshAuthority,
-        session_id: Uuid,
-        operation_id: Uuid,
-        request_id: Uuid,
-        agent_instance_id: Uuid,
+        initialization: HostCapabilityRefreshInitializationRef,
         raw_interrupt_id: Option<Uuid>,
         now_unix_ms: i64,
     ) -> Result<HostCapabilityRefreshInitializationAbort> {
         ensure!(
-            !operation_id.is_nil() && !request_id.is_nil(),
+            !initialization.operation_id.is_nil() && !initialization.request_id.is_nil(),
             "host capability refresh initialization identities must not be nil"
         );
         self.transaction(move |conn| {
             abort_host_capability_refresh_initialization_conn(
                 conn,
-                session_id,
-                operation_id,
-                request_id,
-                agent_instance_id,
+                initialization,
                 raw_interrupt_id,
                 "host capability refresh runtime failed before its real interrupt, decision, and operation were bound",
                 now_unix_ms,
@@ -4537,10 +4651,12 @@ impl Db {
                 let child_id = parse_uuid(child_id_raw.clone())?;
                 let outcome = abort_host_capability_refresh_initialization_conn(
                     conn,
-                    session_id,
-                    operation_id,
-                    request_id,
-                    child_id,
+                    HostCapabilityRefreshInitializationRef {
+                        session_id,
+                        operation_id,
+                        request_id,
+                        agent_instance_id: child_id,
+                    },
                     None,
                     "daemon stopped before host capability refresh child was bound to its real interrupt, decision, and operation",
                     now_unix_ms,
@@ -4723,19 +4839,25 @@ impl Db {
     #[cfg(feature = "host-approval-composition")]
     pub async fn reserve_host_approval_final_operation(
         &self,
-        session_id: Uuid,
-        agent_instance_id: Uuid,
-        operation_id: Uuid,
-        authorization_group_id: Uuid,
-        tool_call_id: String,
-        member_index: u32,
-        concrete_effect_digest: String,
-        operation_kind: String,
-        canonical_input_json: String,
-        input_digest: String,
+        operation: HostApprovalFinalOperation,
+        group_member: HostAuthorizationGroupMember,
         _authority: HostApprovalAuthority,
         now_unix_ms: i64,
     ) -> Result<()> {
+        let HostAuthorizationGroupMember {
+            authorization_group_id,
+            tool_call_id,
+            member_index,
+            concrete_effect_digest,
+        } = group_member;
+        let HostApprovalFinalOperation {
+            session_id,
+            agent_instance_id,
+            operation_id,
+            operation_kind,
+            canonical_input_json,
+            input_digest,
+        } = operation;
         ensure!(
             !operation_id.is_nil()
                 && !authorization_group_id.is_nil()
@@ -4820,14 +4942,17 @@ impl Db {
         &self,
         authority: HostApprovalAuthority,
         interrupt_id: Uuid,
-        session_id: Uuid,
-        agent_instance_id: Uuid,
-        operation_id: Uuid,
-        operation_kind: String,
-        canonical_input_json: String,
-        input_digest: String,
+        operation: HostApprovalFinalOperation,
         now_unix_ms: i64,
     ) -> Result<bool> {
+        let HostApprovalFinalOperation {
+            session_id,
+            agent_instance_id,
+            operation_id,
+            operation_kind,
+            canonical_input_json,
+            input_digest,
+        } = operation;
         validate_host_operation_binding(&operation_kind, &input_digest)?;
         validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
         self.transaction(move |conn| {
@@ -5018,15 +5143,18 @@ impl Db {
         &self,
         authority: HostApprovalAuthority,
         interrupt_id: Uuid,
-        session_id: Uuid,
-        agent_instance_id: Uuid,
-        operation_id: Uuid,
-        operation_kind: String,
-        canonical_input_json: String,
-        input_digest: String,
+        operation: HostApprovalFinalOperation,
         concrete_effects_json: String,
         now_unix_ms: i64,
     ) -> Result<HostApprovalEffectFence> {
+        let HostApprovalFinalOperation {
+            session_id,
+            agent_instance_id,
+            operation_id,
+            operation_kind,
+            canonical_input_json,
+            input_digest,
+        } = operation;
         validate_host_operation_binding(&operation_kind, &input_digest)?;
         validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
         let concrete_effects = validate_host_operation_concrete_effects(&concrete_effects_json)?;
@@ -5213,14 +5341,17 @@ impl Db {
         &self,
         authority: HostApprovalAuthority,
         interrupt_id: Uuid,
-        session_id: Uuid,
-        agent_instance_id: Uuid,
-        operation_id: Uuid,
-        operation_kind: String,
-        canonical_input_json: String,
-        input_digest: String,
+        operation: HostApprovalFinalOperation,
         concrete_effects_json: String,
     ) -> Result<bool> {
+        let HostApprovalFinalOperation {
+            session_id,
+            agent_instance_id,
+            operation_id,
+            operation_kind,
+            canonical_input_json,
+            input_digest,
+        } = operation;
         validate_host_operation_binding(&operation_kind, &input_digest)?;
         validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
         let concrete_effects = validate_host_operation_concrete_effects(&concrete_effects_json)?;
@@ -5290,14 +5421,17 @@ impl Db {
         &self,
         authority: HostApprovalAuthority,
         interrupt_id: Uuid,
-        session_id: Uuid,
-        agent_instance_id: Uuid,
-        operation_id: Uuid,
-        operation_kind: String,
-        canonical_input_json: String,
-        input_digest: String,
+        operation: HostApprovalFinalOperation,
         now_unix_ms: i64,
     ) -> Result<bool> {
+        let HostApprovalFinalOperation {
+            session_id,
+            agent_instance_id,
+            operation_id,
+            operation_kind,
+            canonical_input_json,
+            input_digest,
+        } = operation;
         validate_host_operation_binding(&operation_kind, &input_digest)?;
         validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
         self.transaction(move |conn| {
@@ -5461,16 +5595,19 @@ impl Db {
         &self,
         authority: HostApprovalAuthority,
         interrupt_id: Uuid,
-        session_id: Uuid,
-        agent_instance_id: Uuid,
-        operation_id: Uuid,
-        operation_kind: String,
-        canonical_input_json: String,
-        input_digest: String,
+        operation: HostApprovalFinalOperation,
         succeeded: bool,
         completion_receipt_json: String,
         now_unix_ms: i64,
     ) -> Result<bool> {
+        let HostApprovalFinalOperation {
+            session_id,
+            agent_instance_id,
+            operation_id,
+            operation_kind,
+            canonical_input_json,
+            input_digest,
+        } = operation;
         validate_host_operation_binding(&operation_kind, &input_digest)?;
         validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
         let completion_receipt_json = redact_receipt_json(&completion_receipt_json)?;
@@ -5578,14 +5715,17 @@ impl Db {
         &self,
         authority: HostApprovalAuthority,
         interrupt_id: Uuid,
-        session_id: Uuid,
-        agent_instance_id: Uuid,
-        operation_id: Uuid,
-        operation_kind: String,
-        canonical_input_json: String,
-        input_digest: String,
+        operation: HostApprovalFinalOperation,
         now_unix_ms: i64,
     ) -> Result<bool> {
+        let HostApprovalFinalOperation {
+            session_id,
+            agent_instance_id,
+            operation_id,
+            operation_kind,
+            canonical_input_json,
+            input_digest,
+        } = operation;
         validate_host_operation_binding(&operation_kind, &input_digest)?;
         validate_host_operation_canonical_input(&canonical_input_json, &input_digest)?;
         self.transaction(move |conn| {
@@ -7115,17 +7255,14 @@ impl Db {
         now_unix_ms: i64,
     ) -> Result<DecisionTransitionOutcome> {
         self.transition_decision_request(
-            session_id,
-            decision_request_id,
-            expected_revision,
+            DecisionRevisionRef {
+                session_id,
+                decision_request_id,
+                expected_revision,
+            },
             DecisionState::Resolving,
-            None,
             "{}",
-            None,
-            None,
-            false,
-            None,
-            None,
+            DecisionTransitionBindings::default(),
             now_unix_ms,
         )
         .await
@@ -7144,17 +7281,17 @@ impl Db {
     ) -> Result<DecisionTransitionOutcome> {
         validate_resolver_route(&resolver_route)?;
         self.transition_decision_request(
-            session_id,
-            decision_request_id,
-            expected_revision,
+            DecisionRevisionRef {
+                session_id,
+                decision_request_id,
+                expected_revision,
+            },
             DecisionState::Resolving,
-            Some(resolver_route),
             "{}",
-            None,
-            None,
-            false,
-            None,
-            None,
+            DecisionTransitionBindings {
+                resolver_route: Some(resolver_route),
+                ..Default::default()
+            },
             now_unix_ms,
         )
         .await
@@ -7218,17 +7355,14 @@ impl Db {
             "decision resolution must be terminal"
         );
         self.transition_decision_request(
-            session_id,
-            decision_request_id,
-            expected_revision,
+            DecisionRevisionRef {
+                session_id,
+                decision_request_id,
+                expected_revision,
+            },
             terminal_state,
-            None,
             receipt_json,
-            None,
-            None,
-            false,
-            None,
-            None,
+            DecisionTransitionBindings::default(),
             now_unix_ms,
         )
         .await
@@ -7239,9 +7373,7 @@ impl Db {
     /// contract validation and never appears in Attention or event rows.
     pub async fn resolve_decision_request_with_resume_payload(
         &self,
-        session_id: Uuid,
-        decision_request_id: Uuid,
-        expected_revision: i64,
+        target: DecisionRevisionRef,
         terminal_state: DecisionState,
         receipt_json: &str,
         resume_payload_json: &str,
@@ -7253,17 +7385,13 @@ impl Db {
         );
         let resume_payload_json = validate_resume_payload_json(resume_payload_json)?;
         self.transition_decision_request(
-            session_id,
-            decision_request_id,
-            expected_revision,
+            target,
             terminal_state,
-            None,
             receipt_json,
-            Some(resume_payload_json),
-            None,
-            false,
-            None,
-            None,
+            DecisionTransitionBindings {
+                resume_payload_json: Some(resume_payload_json),
+                ..Default::default()
+            },
             now_unix_ms,
         )
         .await
@@ -7274,9 +7402,7 @@ impl Db {
     /// never outlive the durable replay identity of the request that won it.
     pub async fn resolve_decision_request_with_resume_payload_and_code_root_receipt(
         &self,
-        session_id: Uuid,
-        decision_request_id: Uuid,
-        expected_revision: i64,
+        target: DecisionRevisionRef,
         terminal_state: DecisionState,
         receipt_json: &str,
         resume_payload_json: &str,
@@ -7289,17 +7415,14 @@ impl Db {
         );
         let resume_payload_json = validate_resume_payload_json(resume_payload_json)?;
         self.transition_decision_request(
-            session_id,
-            decision_request_id,
-            expected_revision,
+            target,
             terminal_state,
-            None,
             receipt_json,
-            Some(resume_payload_json),
-            None,
-            false,
-            None,
-            Some(code_root_receipt),
+            DecisionTransitionBindings {
+                resume_payload_json: Some(resume_payload_json),
+                code_root_receipt: Some(code_root_receipt),
+                ..Default::default()
+            },
             now_unix_ms,
         )
         .await
@@ -7311,11 +7434,9 @@ impl Db {
     #[cfg(feature = "host-approval-composition")]
     pub async fn resolve_host_approval_decision(
         &self,
-        session_id: Uuid,
-        decision_request_id: Uuid,
+        target: DecisionRevisionRef,
         interrupt_id: Uuid,
         _authority: HostApprovalAuthority,
-        expected_revision: i64,
         receipt_json: &str,
         resume_payload_json: &str,
         now_unix_ms: i64,
@@ -7330,17 +7451,16 @@ impl Db {
             String::from_utf8(canonical_json_bytes(&selected_response)?)
                 .context("canonical host approval selected response was not UTF-8")?;
         self.transition_decision_request(
-            session_id,
-            decision_request_id,
-            expected_revision,
+            target,
             DecisionState::Answered,
-            None,
             receipt_json,
-            Some(resume_payload_json),
-            Some(selected_response_json),
-            true,
-            Some(interrupt_id),
-            None,
+            DecisionTransitionBindings {
+                resume_payload_json: Some(resume_payload_json),
+                host_selected_response_json: Some(selected_response_json),
+                trusted_host_approval: true,
+                host_interrupt_id: Some(interrupt_id),
+                ..Default::default()
+            },
             now_unix_ms,
         )
         .await
@@ -7348,19 +7468,25 @@ impl Db {
 
     async fn transition_decision_request(
         &self,
-        session_id: Uuid,
-        decision_request_id: Uuid,
-        expected_revision: i64,
+        target: DecisionRevisionRef,
         next_state: DecisionState,
-        resolver_route: Option<String>,
         receipt_json: &str,
-        resume_payload_json: Option<String>,
-        host_selected_response_json: Option<String>,
-        trusted_host_approval: bool,
-        host_interrupt_id: Option<Uuid>,
-        code_root_receipt: Option<CodeRootInterruptReceiptWrite>,
+        bindings: DecisionTransitionBindings,
         now_unix_ms: i64,
     ) -> Result<DecisionTransitionOutcome> {
+        let DecisionTransitionBindings {
+            resolver_route,
+            resume_payload_json,
+            host_selected_response_json,
+            trusted_host_approval,
+            host_interrupt_id,
+            code_root_receipt,
+        } = bindings;
+        let DecisionRevisionRef {
+            session_id,
+            decision_request_id,
+            expected_revision,
+        } = target;
         let receipt_json = redact_receipt_json(receipt_json)?;
         let host_capability_refresh_allowed =
             host_capability_refresh_response_allows(resume_payload_json.as_deref());
@@ -7936,7 +8062,7 @@ fn is_host_workspace_ref(value: &str) -> bool {
     digest.len() == 64
         && digest
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || (byte >= b'a' && byte <= b'f'))
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Decision packets may expose only bounded opaque identifiers copied from
@@ -8387,14 +8513,17 @@ fn load_late_user_steer(
 /// unbound row that the still-initializing child could have produced.
 fn abort_host_capability_refresh_initialization_conn(
     conn: &Connection,
-    session_id: Uuid,
-    operation_id: Uuid,
-    request_id: Uuid,
-    agent_instance_id: Uuid,
+    initialization: HostCapabilityRefreshInitializationRef,
     raw_interrupt_id: Option<Uuid>,
     terminal_reason: &'static str,
     now_unix_ms: i64,
 ) -> Result<HostCapabilityRefreshInitializationAbort> {
+    let HostCapabilityRefreshInitializationRef {
+        session_id,
+        operation_id,
+        request_id,
+        agent_instance_id,
+    } = initialization;
     let descriptor: Option<(String, String)> = conn
         .query_row(
             "SELECT state, parent_agent_instance_id
@@ -9267,6 +9396,7 @@ fn is_automatically_resolvable_decision_class(value: &str) -> bool {
     matches!(value, "low_risk")
 }
 
+#[cfg(feature = "host-approval-composition")]
 fn validate_host_operation_binding(operation_kind: &str, input_digest: &str) -> Result<()> {
     ensure!(
         !operation_kind.is_empty()
@@ -9288,6 +9418,7 @@ fn validate_host_operation_binding(operation_kind: &str, input_digest: &str) -> 
 /// that the composition point persisted. A digest by itself is not enough at
 /// a concrete effect boundary: accepting alternate JSON spellings would make
 /// it impossible to prove which candidate set was actually approved.
+#[cfg(feature = "host-approval-composition")]
 fn validate_host_operation_canonical_input(
     canonical_input_json: &str,
     input_digest: &str,
@@ -9326,6 +9457,7 @@ fn validate_host_operation_canonical_input(
 /// legitimately require two capabilities (for example an out-of-workspace
 /// existing-file write has both a path-access and an exact-content approval),
 /// so every handoff must match one member of this finite set.
+#[cfg(feature = "host-approval-composition")]
 fn validate_host_operation_concrete_effects(concrete_effects_json: &str) -> Result<Vec<Value>> {
     ensure!(
         concrete_effects_json.len() <= 512 * 1024,
@@ -9351,6 +9483,7 @@ fn validate_host_operation_concrete_effects(concrete_effects_json: &str) -> Resu
 /// mutation are not caller authority; the exact effect field must match
 /// structurally, so a stale approval cannot be redirected to another command,
 /// request, connection, or filesystem mutation.
+#[cfg(feature = "host-approval-composition")]
 fn host_operation_candidate_matches_any_concrete_effect(
     candidate: &Value,
     concrete_effects: &[Value],
@@ -9382,6 +9515,7 @@ fn host_operation_candidate_matches_any_concrete_effect(
 /// Host approval is meaningful only for a finite, unambiguous candidate set.
 /// The selected response is an option ID, so duplicate IDs would make the
 /// terminal effect depend on producer ordering rather than the durable choice.
+#[cfg(feature = "host-approval-composition")]
 fn validate_host_operation_candidate_set(input: &serde_json::Value) -> Result<()> {
     let candidates = input
         .get("candidate_effects")
@@ -9557,7 +9691,7 @@ pub fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
             serde_json::Value::Object(values) => {
                 out.push(b'{');
                 let mut entries = values.iter().collect::<Vec<_>>();
-                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                entries.sort_unstable_by_key(|(key, _)| *key);
                 for (index, (key, value)) in entries.into_iter().enumerate() {
                     if index != 0 {
                         out.push(b',');
@@ -11954,6 +12088,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "host-approval-composition")]
     #[test]
     fn concrete_effect_fence_matches_only_the_selected_candidate_effect() {
         let selected = json!({
@@ -12552,13 +12687,15 @@ mod tests {
         .unwrap();
         assert!(matches!(
             db.resolve_decision_request_with_resume_payload(
-                session_id,
-                decision.decision_request_id,
-                decision.revision,
+                DecisionRevisionRef {
+                    session_id,
+                    decision_request_id: decision.decision_request_id,
+                    expected_revision: decision.revision
+                },
                 DecisionState::Answered,
                 "{\"source\":\"test\"}",
                 &resume_payload_json,
-                now + 3,
+                now + 3
             )
             .await
             .unwrap(),
@@ -12740,10 +12877,12 @@ mod tests {
                 session.session_id,
                 completed,
                 &completed_lease,
-                receipt_json,
-                completed_lease.snapshot_generation(),
-                receipt_digest,
-                72,
+                HostCapabilityRefreshSnapshotReceipt {
+                    result_snapshot_json: receipt_json,
+                    generation: completed_lease.snapshot_generation(),
+                    digest: receipt_digest
+                },
+                72
             )
             .await
             .unwrap()
@@ -13033,10 +13172,12 @@ mod tests {
                 session.session_id,
                 first,
                 &first_lease,
-                first_receipt_json,
-                first_lease.snapshot_generation(),
-                first_receipt_digest.clone(),
-                41,
+                HostCapabilityRefreshSnapshotReceipt {
+                    result_snapshot_json: first_receipt_json,
+                    generation: first_lease.snapshot_generation(),
+                    digest: first_receipt_digest.clone()
+                },
+                41
             )
             .await
             .unwrap()
@@ -13126,10 +13267,12 @@ mod tests {
                 first_session.session_id,
                 first,
                 &first_lease,
-                first_receipt_json,
-                first_lease.snapshot_generation(),
-                first_receipt_digest.clone(),
-                41,
+                HostCapabilityRefreshSnapshotReceipt {
+                    result_snapshot_json: first_receipt_json,
+                    generation: first_lease.snapshot_generation(),
+                    digest: first_receipt_digest.clone()
+                },
+                41
             )
             .await
             .unwrap()
@@ -13207,10 +13350,12 @@ mod tests {
                 session.session_id,
                 operation,
                 &lease,
-                receipt_json,
-                lease.snapshot_generation(),
-                receipt_digest.clone(),
-                41,
+                HostCapabilityRefreshSnapshotReceipt {
+                    result_snapshot_json: receipt_json,
+                    generation: lease.snapshot_generation(),
+                    digest: receipt_digest.clone()
+                },
+                41
             )
             .await
             .unwrap()
@@ -14223,11 +14368,13 @@ mod tests {
                 session.session_id,
                 parent.agent_instance_id,
                 child.agent_instance_id,
-                "child".to_string(),
-                "explore".to_string(),
-                "Error: provider failed".to_string(),
-                true,
-                106,
+                RecursiveChildOutcomeReport {
+                    label: "child".to_string(),
+                    child_agent: "explore".to_string(),
+                    report: "Error: provider failed".to_string(),
+                    failed: true
+                },
+                106
             )
             .await
             .unwrap()
@@ -14552,11 +14699,13 @@ mod tests {
                 session.session_id,
                 parent.agent_instance_id,
                 terminal_child.agent_instance_id,
-                "completed-child".to_string(),
-                "child".to_string(),
-                "durable terminal report".to_string(),
-                false,
-                15,
+                RecursiveChildOutcomeReport {
+                    label: "completed-child".to_string(),
+                    child_agent: "child".to_string(),
+                    report: "durable terminal report".to_string(),
+                    failed: false
+                },
+                15
             )
             .await
             .unwrap()
@@ -17453,7 +17602,6 @@ mod tests {
             options[field] = replacement;
             let malformed = canonical_json_string(&options).unwrap();
             db.write({
-                let decision_id = decision_id;
                 move |conn| {
                     conn.execute(
                         "UPDATE decision_requests SET options_contract_json = ?1 WHERE decision_request_id = ?2",
@@ -17471,7 +17619,6 @@ mod tests {
                 "malformed public {field} must not reach Attention"
             );
             db.write({
-                let decision_id = decision_id;
                 let original_options = original_options.clone();
                 move |conn| {
                     conn.execute(
@@ -17490,7 +17637,6 @@ mod tests {
             serde_json::Value::String("option:00000000-0000-4000-8000-000000000001".into());
         let malformed_options = canonical_json_string(&options).unwrap();
         db.write({
-            let decision_id = decision_id;
             move |conn| {
                 conn.execute(
                     "UPDATE decision_requests SET options_contract_json = ?1 WHERE decision_request_id = ?2",
@@ -17507,7 +17653,6 @@ mod tests {
                 .is_err()
         );
         db.write({
-            let decision_id = decision_id;
             let original_options = original_options.clone();
             move |conn| {
                 conn.execute(
@@ -17526,7 +17671,6 @@ mod tests {
             serde_json::Value::String("option:018f47a2-7b3c-7def-8123-000000000001".into());
         let malformed_recommendation = canonical_json_string(&recommendation).unwrap();
         db.write({
-            let decision_id = decision_id;
             move |conn| {
                 conn.execute(
                     "UPDATE decision_requests SET recommendation_json = ?1 WHERE decision_request_id = ?2",
@@ -17543,7 +17687,6 @@ mod tests {
                 .is_err()
         );
         db.write({
-            let decision_id = decision_id;
             let original_recommendation = original_recommendation.clone();
             move |conn| {
                 conn.execute(
@@ -17557,7 +17700,6 @@ mod tests {
         .unwrap();
 
         db.write({
-            let decision_id = decision_id;
             move |conn| {
                 conn.execute(
                     "DELETE FROM decision_private_option_mappings WHERE decision_request_id = ?1",
@@ -17575,7 +17717,6 @@ mod tests {
         );
 
         db.write({
-            let decision_id = decision_id;
             let session_id = session.session_id;
             move |conn| {
                 for mapping in original_mappings {

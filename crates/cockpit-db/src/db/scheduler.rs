@@ -55,7 +55,8 @@ pub struct ScheduledJobRunUpdate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConditionalScheduledJob<T> {
     Missing,
-    Current(ScheduledJobRow),
+    /// Boxed: the observed row is far larger than the other variants.
+    Current(Box<ScheduledJobRow>),
     Applied(T),
 }
 
@@ -321,7 +322,7 @@ fn conditional_scheduled_job_result<T>(
         return Ok(ConditionalScheduledJob::Applied(applied));
     }
     Ok(match get_scheduled_job_conn(conn, id)? {
-        Some(row) => ConditionalScheduledJob::Current(row),
+        Some(row) => ConditionalScheduledJob::Current(Box::new(row)),
         None => ConditionalScheduledJob::Missing,
     })
 }

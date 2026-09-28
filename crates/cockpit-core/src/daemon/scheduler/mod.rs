@@ -470,7 +470,7 @@ impl DaemonScheduler {
                 ConditionalScheduledJob::Current(current) => {
                     // A system/corrupt replacement fails closed here; a
                     // legitimate concurrent user update is re-evaluated.
-                    Self::client_visible_job(current)?;
+                    Self::client_visible_job(*current)?;
                 }
             }
         }
@@ -512,7 +512,7 @@ impl DaemonScheduler {
                 }
                 ConditionalScheduledJob::Missing => return Ok(None),
                 ConditionalScheduledJob::Current(current) => {
-                    Self::client_visible_job(current)?;
+                    Self::client_visible_job(*current)?;
                 }
             }
         }
@@ -536,7 +536,7 @@ impl DaemonScheduler {
                 }
                 ConditionalScheduledJob::Missing => bail!("scheduled job `{id}` not found"),
                 ConditionalScheduledJob::Current(current) => {
-                    Self::client_visible_job(current)?;
+                    Self::client_visible_job(*current)?;
                 }
             }
         }

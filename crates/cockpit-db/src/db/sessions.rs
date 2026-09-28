@@ -563,9 +563,10 @@ impl SessionRow {
 
 /// Principal visibility applied as a list eligibility predicate, before
 /// favorite grouping, durable ordering, or the card cap.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SessionListVisibility {
     /// Owner-level: every session matching the other predicates is eligible.
+    #[default]
     Unrestricted,
     /// Restricted peer: must own or be shared, and `project_root` must be in
     /// the allowlist. `project_roots = None` is a wildcard grant (any root).
@@ -574,12 +575,6 @@ pub enum SessionListVisibility {
         principal_tag: String,
         project_roots: Option<Vec<String>>,
     },
-}
-
-impl Default for SessionListVisibility {
-    fn default() -> Self {
-        Self::Unrestricted
-    }
 }
 
 /// One bounded `ListSessions` query. Eligibility (scope, archive policy,
@@ -1519,14 +1514,20 @@ fn compaction_fk_blocks_delete(
             parse_uuid(&raw)
         })
         .context("querying compaction FK referencers")?;
+    // Scan every referencer: the delete must fail if ANY referencer lies
+    // outside the delete set, regardless of the order SQLite returns rows in.
+    // Only when every referencer is itself pending deletion does `id` wait.
+    let mut blocked_by_member = false;
     for row in rows {
         let referencer = row.context("decoding compaction FK referencer")?;
-        if remaining.contains(&referencer) {
-            return Ok(true);
+        if !remaining.contains(&referencer) {
+            anyhow::bail!(
+                "session {id} is still referenced by {referencer} outside the delete set"
+            );
         }
-        anyhow::bail!("session {id} is still referenced by {referencer} outside the delete set");
+        blocked_by_member = true;
     }
-    Ok(false)
+    Ok(blocked_by_member)
 }
 
 /// Verify the deletion boundary after the session cascade has committed its
@@ -2891,18 +2892,21 @@ impl Db {
         )
         .context("moving legacy sealed values onto compaction successor")?;
         {
-            let grants: Vec<(
-                String,
-                i64,
-                String,
-                i64,
-                String,
-                i64,
-                i64,
-                i64,
-                Option<i64>,
-                Option<i64>,
-            )> = {
+            /// One predecessor sealed action grant, copied verbatim (under a
+            /// fresh grant id) onto the compaction successor.
+            struct PredecessorSealedGrant {
+                record_id: String,
+                value_version: i64,
+                project_key: String,
+                session_generation: i64,
+                action_id: String,
+                action_revision: i64,
+                use_epoch: i64,
+                issued_at_ms: i64,
+                expires_at_ms: Option<i64>,
+                revoked_at_ms: Option<i64>,
+            }
+            let grants: Vec<PredecessorSealedGrant> = {
                 let mut stmt = conn
                     .prepare(
                         "SELECT record_id, value_version, project_key, session_generation,
@@ -2913,18 +2917,18 @@ impl Db {
                     )
                     .context("listing predecessor sealed action grants")?;
                 stmt.query_map(params![predecessor_session_id.to_string()], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                    ))
+                    Ok(PredecessorSealedGrant {
+                        record_id: row.get(0)?,
+                        value_version: row.get(1)?,
+                        project_key: row.get(2)?,
+                        session_generation: row.get(3)?,
+                        action_id: row.get(4)?,
+                        action_revision: row.get(5)?,
+                        use_epoch: row.get(6)?,
+                        issued_at_ms: row.get(7)?,
+                        expires_at_ms: row.get(8)?,
+                        revoked_at_ms: row.get(9)?,
+                    })
                 })
                 .context("querying predecessor sealed action grants")?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -2939,33 +2943,21 @@ impl Db {
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 )
                 .context("preparing successor sealed action grant insert")?;
-            for (
-                record_id,
-                value_version,
-                project_key,
-                session_generation,
-                action_id,
-                action_revision,
-                use_epoch,
-                issued_at_ms,
-                expires_at_ms,
-                revoked_at_ms,
-            ) in grants
-            {
+            for grant in grants {
                 insert
                     .execute(params![
                         Uuid::new_v4().to_string(),
-                        record_id,
-                        value_version,
-                        project_key,
+                        grant.record_id,
+                        grant.value_version,
+                        grant.project_key,
                         session_id.to_string(),
-                        session_generation,
-                        action_id,
-                        action_revision,
-                        use_epoch,
-                        issued_at_ms,
-                        expires_at_ms,
-                        revoked_at_ms,
+                        grant.session_generation,
+                        grant.action_id,
+                        grant.action_revision,
+                        grant.use_epoch,
+                        grant.issued_at_ms,
+                        grant.expires_at_ms,
+                        grant.revoked_at_ms,
                     ])
                     .context("copying sealed action grant onto compaction successor")?;
             }
@@ -4333,16 +4325,15 @@ impl Db {
     }
 
     fn list_open_sessions_conn(conn: &Connection, limit: u32) -> Result<Vec<SessionRow>> {
-        Ok(conn
-            .prepare(
-                // schema-hot-query: local.sessions.open
-                "SELECT * FROM sessions WHERE ended_at_unix_ms IS NULL AND ephemeral = 0
+        conn.prepare(
+            // schema-hot-query: local.sessions.open
+            "SELECT * FROM sessions WHERE ended_at_unix_ms IS NULL AND ephemeral = 0
                  ORDER BY last_active_at_unix_ms DESC LIMIT ?1",
-            )
-            .context("preparing open session list")?
-            .query_map([limit], SessionRow::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("querying open sessions")?)
+        )
+        .context("preparing open session list")?
+        .query_map([limit], SessionRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("querying open sessions")
     }
 
     pub async fn list_sessions_for_assistant(
@@ -6640,6 +6631,51 @@ mod tests {
         assert!(db.get_session(window3.session_id).await.unwrap().is_none());
     }
 
+    /// Every compaction-FK referencer is inspected: one referencer outside the
+    /// delete set refuses the delete even when another referencer inside the
+    /// set happens to be returned first. Checking both one-outside sets covers
+    /// either SQLite row order.
+    #[tokio::test]
+    async fn compaction_fk_scan_refuses_any_referencer_outside_delete_set() {
+        let db = Db::open_in_memory().unwrap();
+        let window1 = db.create_session("p", "/proj", "Build").await.unwrap();
+        let window2 = db
+            .create_compaction_successor(window1.session_id)
+            .await
+            .unwrap();
+        let window3 = db
+            .create_compaction_successor(window2.session_id)
+            .await
+            .unwrap();
+        let (w1, w2, w3) = (window1.session_id, window2.session_id, window3.session_id);
+        db.read(move |conn| {
+            let set = |ids: &[Uuid]| {
+                ids.iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+            };
+            // window2 (predecessor) and window3 (lineage root) both reference
+            // window1; with both pending deletion, window1 waits.
+            assert!(compaction_fk_blocks_delete(conn, w1, &set(&[w1, w2, w3]))?);
+            // Nothing references the tip.
+            assert!(!compaction_fk_blocks_delete(conn, w3, &set(&[w1, w2, w3]))?);
+            for outside in [w2, w3] {
+                let inside = if outside == w2 { w3 } else { w2 };
+                let error = compaction_fk_blocks_delete(conn, w1, &set(&[w1, inside]))
+                    .expect_err("a referencer outside the delete set must refuse the delete");
+                assert!(
+                    error.to_string().contains(&format!(
+                        "still referenced by {outside} outside the delete set"
+                    )),
+                    "unexpected error: {error:#}"
+                );
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn forks_and_tangents_start_with_no_title_recovery_nudge() {
         let db = Db::open_in_memory().unwrap();
@@ -8167,13 +8203,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(from_successor.lineage_root_id, predecessor.session_id);
-        assert_eq!(
-            db.get_session(successor.session_id)
+        assert!(
+            !db.get_session(successor.session_id)
                 .await
                 .unwrap()
                 .unwrap()
-                .favorite,
-            false
+                .favorite
         );
         db.set_session_favorite(successor.session_id, false)
             .await
@@ -8433,8 +8468,10 @@ mod tests {
         assert_eq!(lineage.len(), 2);
         assert!(lineage.iter().all(|summary| summary.favorite));
 
-        let mut archived = SessionListQuery::default();
-        archived.include_archived = true;
+        let archived = SessionListQuery {
+            include_archived: true,
+            ..SessionListQuery::default()
+        };
         let archived = db.list_session_summaries(archived).await.unwrap();
         assert!(
             archived
@@ -8501,10 +8538,9 @@ mod tests {
             SessionListQuery::project(Some("pid"), 100),
             SessionListQuery::forks(Uuid::nil(), 100),
             SessionListQuery::lineage(Uuid::nil(), 100),
-            {
-                let mut query = SessionListQuery::default();
-                query.include_archived = true;
-                query
+            SessionListQuery {
+                include_archived: true,
+                ..SessionListQuery::default()
             },
             {
                 let mut query = SessionListQuery::project(Some("pid"), 100);

@@ -1238,8 +1238,7 @@ impl Db {
     }
 
     pub async fn default_agent_installation(&self) -> Result<Option<Uuid>> {
-        self.read(|conn| default_agent_installation_conn(conn))
-            .await
+        self.read(default_agent_installation_conn).await
     }
 
     /// Restore the machine-wide default captured by a cross-authority

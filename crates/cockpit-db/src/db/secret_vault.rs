@@ -805,13 +805,19 @@ fn map_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultItemRow>
     })
 }
 
+/// One side of a KEK-placement migrate saga: where the vault KEK lives and,
+/// for a database placement, which file-KEK construction protects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretVaultSagaEndpoint {
+    pub placement: SecretVaultPlacement,
+    pub file_kek_mode: Option<SecretVaultFileKekMode>,
+}
+
 pub fn insert_saga_conn(
     conn: &rusqlite::Connection,
     op_id: &str,
-    source: SecretVaultPlacement,
-    source_file_kek_mode: Option<SecretVaultFileKekMode>,
-    dest: SecretVaultPlacement,
-    dest_file_kek_mode: Option<SecretVaultFileKekMode>,
+    source: SecretVaultSagaEndpoint,
+    dest: SecretVaultSagaEndpoint,
     kek_fingerprint: &str,
     phase: SecretVaultSagaPhase,
 ) -> Result<()> {
@@ -823,10 +829,10 @@ pub fn insert_saga_conn(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
         params![
             op_id,
-            source.as_str(),
-            source_file_kek_mode.map(SecretVaultFileKekMode::as_str),
-            dest.as_str(),
-            dest_file_kek_mode.map(SecretVaultFileKekMode::as_str),
+            source.placement.as_str(),
+            source.file_kek_mode.map(SecretVaultFileKekMode::as_str),
+            dest.placement.as_str(),
+            dest.file_kek_mode.map(SecretVaultFileKekMode::as_str),
             kek_fingerprint,
             phase.as_str(),
             now

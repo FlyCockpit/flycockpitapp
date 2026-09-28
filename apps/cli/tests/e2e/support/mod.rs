@@ -263,10 +263,15 @@ impl IsolatedHome {
                 db.onboarding_transition(
                     snapshot,
                     "fixture-agent-stage".into(),
-                    cockpit_db::db::onboarding::OnboardingStage::Agent,
-                    cockpit_db::db::onboarding::OnboardingBootstrapState::Ready,
-                    false,
-                    Some(cockpit_db::db::onboarding::OnboardingSecurePlacement::MachineBoundFile),
+                    cockpit_db::db::onboarding::OnboardingTransitionOutcome {
+                        next_stage: cockpit_db::db::onboarding::OnboardingStage::Agent,
+                        bootstrap_state:
+                            cockpit_db::db::onboarding::OnboardingBootstrapState::Ready,
+                        limited_mode: false,
+                        selected_secure_placement: Some(
+                            cockpit_db::db::onboarding::OnboardingSecurePlacement::MachineBoundFile,
+                        ),
+                    },
                     0,
                 )
                 .await
@@ -323,10 +328,15 @@ impl IsolatedHome {
                 db.onboarding_transition(
                     snapshot,
                     "fixture-complete".into(),
-                    cockpit_db::db::onboarding::OnboardingStage::Complete,
-                    cockpit_db::db::onboarding::OnboardingBootstrapState::Ready,
-                    false,
-                    Some(cockpit_db::db::onboarding::OnboardingSecurePlacement::MachineBoundFile),
+                    cockpit_db::db::onboarding::OnboardingTransitionOutcome {
+                        next_stage: cockpit_db::db::onboarding::OnboardingStage::Complete,
+                        bootstrap_state:
+                            cockpit_db::db::onboarding::OnboardingBootstrapState::Ready,
+                        limited_mode: false,
+                        selected_secure_placement: Some(
+                            cockpit_db::db::onboarding::OnboardingSecurePlacement::MachineBoundFile,
+                        ),
+                    },
                     1,
                 )
                 .await

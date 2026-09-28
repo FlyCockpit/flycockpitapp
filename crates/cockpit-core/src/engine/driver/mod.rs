@@ -12324,14 +12324,16 @@ impl Driver {
                     self.session.live_id(),
                     pending.call_id.clone(),
                     "default".to_owned(),
-                    terminal_state,
-                    Some(report.clone()),
-                    None,
-                    serde_json::json!({
-                        "source": "interactive_task",
-                        "task_call_id": pending.call_id.as_str(),
-                    })
-                    .to_string(),
+                    crate::db::agent_tree_decisions::TaskDelegationChildSettlement {
+                        outcome: terminal_state,
+                        report: Some(report.clone()),
+                        snapshot_json: None,
+                        receipt_json: serde_json::json!({
+                            "source": "interactive_task",
+                            "task_call_id": pending.call_id.as_str(),
+                        })
+                        .to_string(),
+                    },
                     crate::agent_tree::system_now_unix_ms(),
                     late_user_steer_completion
                         .map(|permit| (permit.steer_id, permit.recovery_epoch)),
@@ -12523,14 +12525,16 @@ impl Driver {
                         self.session.live_id(),
                         pending.call_id.clone(),
                         "default".to_owned(),
-                        state,
-                        Some(report.clone()),
-                        None,
-                        serde_json::json!({
-                            "source": "interactive_task_unwind",
-                            "task_call_id": pending.call_id.as_str(),
-                        })
-                        .to_string(),
+                        crate::db::agent_tree_decisions::TaskDelegationChildSettlement {
+                            outcome: state,
+                            report: Some(report.clone()),
+                            snapshot_json: None,
+                            receipt_json: serde_json::json!({
+                                "source": "interactive_task_unwind",
+                                "task_call_id": pending.call_id.as_str(),
+                            })
+                            .to_string(),
+                        },
                         crate::agent_tree::system_now_unix_ms(),
                         None,
                     )

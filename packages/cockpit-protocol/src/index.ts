@@ -1921,6 +1921,8 @@ const sessionSummaryWireSchema = z
   .object({
     session_id: uuidSchema,
     session_entry_mode: sessionEntryModeSchema,
+    // Every session row carries a short id (`sessions.short_id NOT NULL`).
+    short_id: z.string(),
     project_root: projectRootSchema,
     project_id: z.string(),
     started_at_unix_ms: safeI64NumberSchema,

@@ -79,7 +79,7 @@ type InterruptDraft = {
 };
 
 function formatSessionTitle(session: SessionSummary) {
-  return session.title || session.short_id || session.session_id;
+  return session.title || session.short_id;
 }
 
 function sessionActivityLabel(session: SessionSummary) {

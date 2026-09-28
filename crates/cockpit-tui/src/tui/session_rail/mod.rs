@@ -1998,10 +1998,8 @@ pub fn card_description(s: &SessionSummary) -> String {
         && !t.trim().is_empty()
     {
         t.clone()
-    } else if !s.short_id.is_empty() {
-        s.short_id.clone()
     } else {
-        short_id(&s.session_id.to_string())
+        s.short_id.clone()
     };
     match s
         .description

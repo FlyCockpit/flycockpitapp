@@ -135,30 +135,82 @@ impl BashTool {
     }
 }
 
+/// How one launcher's child shell resolves `sed`/`gsed`.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChildSed<'a> {
+    sed: Option<&'a Path>,
+    gsed: bool,
+}
+
 /// macOS's system `sed` (`/usr/bin/sed`, SIP-protected) is BSD sed, whose
-/// flags (notably `-i`) differ from GNU sed. Steer the model with what the
-/// effective environment actually resolves instead of rewriting the approved
-/// shell text: an injected `sed()` prelude made the executed script differ
-/// from the approved one (#528). No note when `sed` resolves elsewhere (for
-/// example Homebrew's gnubin first on `PATH`), on other hosts, or for a
-/// container target, where the shell runs in a Linux image.
+/// flags (notably `-i`) differ from GNU sed. Steer the model with what each
+/// host launcher's child shell actually resolves instead of rewriting the
+/// approved shell text: an injected `sed()` prelude made the executed script
+/// differ from the approved one (#528). The sandboxed and unsandboxed
+/// launchers can see different `PATH`s (see [`bash_child_paths`]), so the
+/// note names the mode when only one of them gets BSD sed. No note when
+/// neither does (for example Homebrew's gnubin first on the child `PATH`),
+/// on other hosts, or for a container target (a Linux image).
 fn sed_flavor_note(
     macos_host: bool,
     target: crate::capabilities::ExecutionTarget,
-    sed: Option<&Path>,
-    gsed_available: bool,
-) -> Option<&'static str> {
-    if !macos_host
-        || target != crate::capabilities::ExecutionTarget::Host
-        || sed != Some(Path::new("/usr/bin/sed"))
-    {
+    sandboxed: ChildSed<'_>,
+    unsandboxed: ChildSed<'_>,
+) -> Option<String> {
+    if !macos_host || target != crate::capabilities::ExecutionTarget::Host {
         return None;
     }
-    Some(if gsed_available {
-        " `sed` here is BSD sed; use `gsed` for GNU sed syntax."
+    let bsd = |child: &ChildSed<'_>| child.sed == Some(Path::new("/usr/bin/sed"));
+    let (scope, gsed) = match (bsd(&sandboxed), bsd(&unsandboxed)) {
+        (true, true) => ("", sandboxed.gsed && unsandboxed.gsed),
+        (true, false) => (" in sandboxed runs", sandboxed.gsed),
+        (false, true) => (" in unsandboxed runs", unsandboxed.gsed),
+        (false, false) => return None,
+    };
+    let advice = if gsed {
+        "use `gsed` for GNU sed syntax."
     } else {
-        " `sed` here is BSD sed (`sed -i ''` for in-place edits)."
-    })
+        "`sed -i ''` edits in place."
+    };
+    Some(format!(" `sed` is BSD sed{scope}; {advice}"))
+}
+
+/// The `PATH` each host launcher gives the bash child, as
+/// `(sandboxed, unsandboxed)`. The sandboxed launcher keeps the daemon's
+/// `PATH` (zerobox's default env keys) with the session overlay on top; the
+/// unsandboxed
+/// launcher (`run_shell`) is `env_clear()` + overlay, so without an overlay
+/// `PATH` its `sh` falls back to the shell's compiled default.
+fn bash_child_paths(
+    overlay_path: Option<&str>,
+    process_path: Option<&str>,
+    shell_default_path: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    match overlay_path {
+        Some(path) => (Some(path.to_string()), Some(path.to_string())),
+        None => (
+            process_path.map(str::to_string),
+            shell_default_path.map(str::to_string),
+        ),
+    }
+}
+
+/// The `PATH` an `env_clear()`ed `sh -c` sees, i.e. the shell's compiled
+/// default. Asked of the real `sh` once per process rather than hard-coded.
+fn shell_default_path() -> Option<&'static str> {
+    static DEFAULT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DEFAULT
+        .get_or_init(|| {
+            let output = std::process::Command::new("sh")
+                .env_clear()
+                .args(["-c", r#"printf %s "${PATH-}""#])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            let path = String::from_utf8(output.stdout).ok()?;
+            (output.status.success() && !path.is_empty()).then_some(path)
+        })
+        .as_deref()
 }
 
 #[async_trait]
@@ -195,15 +247,35 @@ impl Tool for BashTool {
         }
         use crate::external_runtime::ProbeExecutor;
         let executor = crate::external_runtime::SystemProbeExecutor;
-        let path_env = env.get("PATH").map(String::as_str);
-        let resolve = |name: &str| {
-            executor
-                .resolve(name, None, path_env, cwd)
-                .filter(|path| executor.is_spawnable(path))
+        let process_path = std::env::var("PATH").ok();
+        let (sandboxed_path, unsandboxed_path) = bash_child_paths(
+            env.get("PATH").map(String::as_str),
+            process_path.as_deref(),
+            shell_default_path(),
+        );
+        // Resolve against exactly the child's PATH; an unknown PATH resolves
+        // nothing (the probe's own process-PATH fallback must not apply).
+        let resolve = |name: &str, path: Option<&str>| {
+            path.and_then(|path| {
+                executor
+                    .resolve(name, None, Some(path), cwd)
+                    .filter(|resolved| executor.is_spawnable(resolved))
+            })
         };
-        let sed = resolve("sed");
-        let gsed_available = resolve("gsed").is_some();
-        sed_flavor_note(macos_host, target, sed.as_deref(), gsed_available).map(str::to_string)
+        let sandboxed_sed = resolve("sed", sandboxed_path.as_deref());
+        let unsandboxed_sed = resolve("sed", unsandboxed_path.as_deref());
+        sed_flavor_note(
+            macos_host,
+            target,
+            ChildSed {
+                sed: sandboxed_sed.as_deref(),
+                gsed: resolve("gsed", sandboxed_path.as_deref()).is_some(),
+            },
+            ChildSed {
+                sed: unsandboxed_sed.as_deref(),
+                gsed: resolve("gsed", unsandboxed_path.as_deref()).is_some(),
+            },
+        )
     }
 
     fn completed_call_effect(&self, args: &Value, _output: &ToolOutput) -> ToolEffect {
@@ -3546,11 +3618,16 @@ mod tests;
 pub(crate) mod exec_witness {
     /// A command that prints the exact `sh -c` script it runs on its own
     /// line: `$BASH_EXECUTION_STRING` when `sh` is bash (macOS), otherwise
-    /// the script argument from `/proc/$$/cmdline` (Linux dash). `None` when
-    /// this host's `sh` exposes neither; callers skip with a reason.
+    /// the script argument from `/proc/$$/cmdline` (Linux dash).
+    ///
+    /// Guaranteed on macOS and Linux: there an unavailable witness is a test
+    /// environment defect and panics, so the exact-script tests can never
+    /// pass vacuously. Only on other unix hosts (for example FreeBSD with a
+    /// non-bash `sh` and no procfs) does this return `None`, and callers
+    /// skip with the reason printed to stderr.
     pub(crate) fn command() -> Option<&'static str> {
         static CHOICE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-        *CHOICE.get_or_init(|| {
+        let choice = *CHOICE.get_or_init(|| {
             let bash_string = std::process::Command::new("sh")
                 .args(["-c", r#"printf %s "${BASH_EXECUTION_STRING-}""#])
                 .output()
@@ -3563,7 +3640,18 @@ pub(crate) mod exec_witness {
             } else {
                 None
             }
-        })
+        });
+        if choice.is_none() {
+            assert!(
+                !cfg!(any(target_os = "macos", target_os = "linux")),
+                "exec witness unavailable on macOS/Linux: `sh` exposes neither \
+                 $BASH_EXECUTION_STRING nor /proc/$$/cmdline"
+            );
+            eprintln!(
+                "skipping exact-script check: `sh` exposes neither $BASH_EXECUTION_STRING nor /proc/$$/cmdline"
+            );
+        }
+        choice
     }
 
     /// Assert the witness output shows exactly `command` as the executed

@@ -2097,7 +2097,6 @@ async fn approved_unconfined_command_runs_at_real_spawn_boundary() {
 #[tokio::test]
 async fn executed_shell_script_is_exactly_the_approved_command() {
     let Some(command) = super::exec_witness::command() else {
-        eprintln!("skipping: `sh` exposes neither $BASH_EXECUTION_STRING nor /proc/$$/cmdline");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -2118,7 +2117,6 @@ async fn executed_shell_script_is_exactly_the_approved_command() {
 #[tokio::test]
 async fn confined_shell_script_is_exactly_the_approved_command() {
     let Some(command) = super::exec_witness::command() else {
-        eprintln!("skipping: `sh` exposes neither $BASH_EXECUTION_STRING nor /proc/$$/cmdline");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -2141,33 +2139,27 @@ async fn confined_shell_script_is_exactly_the_approved_command() {
 
 /// #528: the approved run-fail-escalate rerun binds
 /// `{"execute":{"command":<approved>,"sandbox":"unconfined"}}`; the real
-/// unconfined respawn must present that exact effect and run. Only the
-/// confined first attempt is scripted.
-#[cfg(unix)]
+/// unconfined respawn must present that exact effect and hand `sh -c` exactly
+/// the approved text. Only the confined first attempt is scripted.
 #[tokio::test]
-async fn approved_escalation_rerun_runs_at_real_spawn_boundary() {
+async fn approved_escalation_rerun_runs_exactly_the_approved_command() {
+    let Some(command) = super::exec_witness::command() else {
+        return;
+    };
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path()).await;
-    let resolver = resolve_next_interrupt_with_escalation(
-        ctx.session.db.clone(),
-        ctx.session.id,
-        ctx.interrupts.clone(),
-        ID_APPROVE_ONCE,
-    );
+    let resolver = approve_every_host_prompt(&ctx);
     let _guard = set_bash_test_overrides(
         Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
         Some((13, "sandbox denied".to_string())),
         [(true, shell_out("", "sandbox denied", 13))],
     );
-    let out = call_bash_host_effect_for_test(
-        serde_json::json!({ "command": "printf '%s-%s' escalated ran" }),
-        &ctx,
-    )
-    .await
-    .expect("bash call returns");
-    resolver.await.unwrap();
+    let out = call_bash_host_effect_for_test(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+    resolver.abort();
     assert_eq!(out.exit_code, Some(0), "{}", out.content);
-    assert!(out.content.contains("escalated-ran"), "{}", out.content);
+    super::exec_witness::assert_executed_exactly(&out.content, command);
     let meta = out.sandbox.expect("bash records sandbox metadata");
     assert!(meta.escalated);
     assert_eq!(meta.approval_scope_recorded.as_deref(), Some("once"));

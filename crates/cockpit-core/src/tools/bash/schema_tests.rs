@@ -92,20 +92,81 @@ fn bash_timeout_schema_declares_default_and_bounds_in_both_tiers() {
     );
 }
 
-/// #528 follow-up: the macOS `sed` note reflects what the effective PATH
-/// resolves, and is never claimed for containers, other hosts, or a GNU
+/// #528 follow-up: the macOS `sed` note reflects what each launcher's child
+/// shell resolves, and is never claimed for containers, other hosts, or a GNU
 /// `sed` shadowing the system one (Homebrew gnubin first on PATH).
 #[test]
 fn sed_flavor_note_describes_only_a_resolved_system_bsd_sed_on_a_macos_host() {
     use crate::capabilities::ExecutionTarget::{Container, Host};
-    let bsd = Some(Path::new("/usr/bin/sed"));
-    let gnubin = Some(Path::new("/opt/homebrew/opt/gnu-sed/libexec/gnubin/sed"));
-    let with_gsed = sed_flavor_note(true, Host, bsd, true).expect("BSD sed on a macOS host");
-    assert!(with_gsed.contains("BSD sed") && with_gsed.contains("`gsed`"));
-    let without_gsed = sed_flavor_note(true, Host, bsd, false).expect("BSD sed without gsed");
-    assert!(without_gsed.contains("BSD sed") && !without_gsed.contains("gsed"));
-    assert_eq!(sed_flavor_note(true, Host, gnubin, true), None);
-    assert_eq!(sed_flavor_note(true, Host, None, true), None);
-    assert_eq!(sed_flavor_note(true, Container, bsd, true), None);
-    assert_eq!(sed_flavor_note(false, Host, bsd, true), None);
+    let bsd = |gsed| ChildSed {
+        sed: Some(Path::new("/usr/bin/sed")),
+        gsed,
+    };
+    let gnubin = ChildSed {
+        sed: Some(Path::new("/opt/homebrew/opt/gnu-sed/libexec/gnubin/sed")),
+        gsed: true,
+    };
+    let both = sed_flavor_note(true, Host, bsd(true), bsd(true)).expect("BSD sed everywhere");
+    assert_eq!(both, " `sed` is BSD sed; use `gsed` for GNU sed syntax.");
+    let no_gsed = sed_flavor_note(true, Host, bsd(false), bsd(false)).expect("no gsed");
+    assert!(
+        no_gsed.contains("BSD sed") && !no_gsed.contains("gsed"),
+        "{no_gsed}"
+    );
+    let unsandboxed_only =
+        sed_flavor_note(true, Host, gnubin, bsd(true)).expect("unsandboxed BSD sed");
+    assert!(
+        unsandboxed_only.contains("in unsandboxed runs"),
+        "{unsandboxed_only}"
+    );
+    let sandboxed_only = sed_flavor_note(true, Host, bsd(true), gnubin).expect("sandboxed BSD");
+    assert!(
+        sandboxed_only.contains("in sandboxed runs"),
+        "{sandboxed_only}"
+    );
+    assert_eq!(sed_flavor_note(true, Host, gnubin, gnubin), None);
+    assert_eq!(
+        sed_flavor_note(true, Host, ChildSed::default(), ChildSed::default()),
+        None
+    );
+    assert_eq!(sed_flavor_note(true, Container, bsd(true), bsd(true)), None);
+    assert_eq!(sed_flavor_note(false, Host, bsd(true), bsd(true)), None);
+}
+
+/// G2: without a session-overlay `PATH` the unsandboxed child (`env_clear()`
+/// + overlay) sees the shell's default `PATH`, not the daemon's; the
+/// sandboxed child keeps the daemon's. An overlay `PATH` wins for both.
+#[test]
+fn bash_child_paths_follow_each_launcher() {
+    assert_eq!(
+        bash_child_paths(None, Some("/daemon/bin"), Some("/usr/bin:/bin")),
+        (
+            Some("/daemon/bin".to_string()),
+            Some("/usr/bin:/bin".to_string())
+        )
+    );
+    assert_eq!(
+        bash_child_paths(Some("/overlay/bin"), Some("/daemon/bin"), Some("/usr/bin")),
+        (
+            Some("/overlay/bin".to_string()),
+            Some("/overlay/bin".to_string())
+        )
+    );
+}
+
+/// G2 end to end on a real macOS host: with no overlay `PATH`, the
+/// unsandboxed child's `sh` default `PATH` resolves the system BSD sed, so
+/// the note must say so even when the daemon's own `PATH` puts GNU sed
+/// (Homebrew gnubin) first.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_note_reflects_the_unsandboxed_child_default_path() {
+    let note = BashTool::new()
+        .capability_description_note(
+            &std::collections::HashMap::new(),
+            Path::new("/"),
+            crate::capabilities::ExecutionTarget::Host,
+        )
+        .expect("an env_clear()ed macOS sh resolves /usr/bin/sed");
+    assert!(note.contains("BSD sed"), "{note}");
 }

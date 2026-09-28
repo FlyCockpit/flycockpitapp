@@ -455,10 +455,7 @@ mod tests {
         selected: &'static str,
         args: Value,
     ) -> Option<ToolOutput> {
-        let Some(command) = crate::tools::bash::exec_witness::command() else {
-            eprintln!("skipping: `sh` exposes neither $BASH_EXECUTION_STRING nor /proc/$$/cmdline");
-            return None;
-        };
+        let command = crate::tools::bash::exec_witness::command()?;
         let tmp = tempfile::tempdir().unwrap();
         let (ctx, _approver, db, session_id, hub) = ctx_with_approver(tmp.path()).await;
         ctx.session.set_sandbox_escalation_enabled(true);

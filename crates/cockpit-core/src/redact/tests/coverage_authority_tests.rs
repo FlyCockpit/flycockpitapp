@@ -18,6 +18,112 @@ use super::super::{
 
 const REDACTED: &str = "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**";
 
+#[cfg(unix)]
+#[tokio::test]
+async fn ssh_private_key_coverage_admits_and_scrubs_every_encoding() {
+    let env = crate::test_env::lock_async().await;
+    let home = tempfile::tempdir().unwrap();
+    env.set_isolated_home(home.path());
+    let ssh = home.path().join("home/.ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    let key_path = ssh.join("id_ed25519");
+    // Generate disposable material; never depend on a developer's SSH keys.
+    let status = std::process::Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "coverage-fixture",
+            "-f",
+        ])
+        .arg(&key_path)
+        .status()
+        .expect("ssh-keygen is required for this private-key regression");
+    assert!(status.success());
+    let secret = std::fs::read_to_string(key_path).unwrap();
+    let secret = secret.trim().to_owned();
+    let cfg = crate::config::extended::RedactConfig {
+        scan_environment: false,
+        scan_dotenv: false,
+        ..Default::default()
+    };
+    let table = RedactionTable::build_scoped(
+        &cfg,
+        super::super::RedactionSourceScope::DaemonGlobal,
+        &HashMap::new(),
+        std::iter::empty(),
+    )
+    .expect("complete private-key capture");
+    let artifact_bytes = table.measured_immutable_artifact_bytes();
+    let parts = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let authority = RedactionCoverageAuthority::default();
+    let admission = authority
+        .acquire(
+            key(parts),
+            CoverageScope::DaemonGlobalBootstrap,
+            move || {
+                Ok(CoverageBuild::from_complete_table(
+                    table,
+                    boundary_for(parts),
+                ))
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "private-key coverage must be admitted: {error}; artifact_bytes={artifact_bytes}"
+            )
+        });
+    admission
+        .use_at_sink(|table| {
+            let mut variants = super::super::encoded_secret_variants(&secret);
+            assert_eq!(variants.len(), 4);
+            for line in secret.lines() {
+                variants.push(line.to_owned());
+                variants.extend(super::super::encoded_secret_variants(line));
+            }
+            variants.push(secret);
+            for (index, variant) in variants.iter().enumerate() {
+                assert!(
+                    table.scrub(variant) == REDACTED,
+                    "private-key variant {index} must be fully redacted"
+                );
+            }
+            assert_eq!(table.scrub("ordinary public text"), "ordinary public text");
+            Ok(())
+        })
+        .expect("admitted SSH coverage is usable at the sink");
+
+    // An unavailable configured source must still refuse a fresh admission.
+    authority.invalidate();
+    let missing = crate::config::extended::RedactConfig {
+        ssh_key_dir: Some(ssh.join("missing")),
+        ..cfg
+    };
+    let refused = authority
+        .acquire(
+            key(parts),
+            CoverageScope::DaemonGlobalBootstrap,
+            move || {
+                let table = RedactionTable::build_scoped(
+                    &missing,
+                    super::super::RedactionSourceScope::DaemonGlobal,
+                    &HashMap::new(),
+                    std::iter::empty(),
+                )?;
+                Ok(CoverageBuild::from_complete_table(
+                    table,
+                    boundary_for(parts),
+                ))
+            },
+        )
+        .await;
+    assert!(matches!(refused, Err(CoverageError::Unavailable)));
+}
+
 fn binding(value: u8) -> CoverageBinding {
     CoverageBinding::from_daemon_bytes([value; 16])
 }

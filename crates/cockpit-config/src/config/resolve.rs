@@ -10,7 +10,7 @@
 //! Production [`cockpit_config_dir`] semantics are unchanged: platform defaults
 //! via `dirs::config_dir()` / XDG env vars, with no redirect.
 //!
-//! In test builds (`cfg(any(test, feature = "test-support"))`), the three public
+//! In test builds (`cfg(any(test, feature = "test-support"))`), the profile and installation
 //! resolvers below pass through [`cockpit_test_support::home_isolation`]:
 //!
 //! 1. Explicit env overrides installed by [`cockpit_test_support::TestEnvGuard`]
@@ -37,6 +37,17 @@ use anyhow::{Context, Result};
 
 #[cfg(any(test, feature = "test-support"))]
 use cockpit_test_support::home_isolation::{CockpitHomeKind, finalize_test_cockpit_path};
+
+/// User profile home for user-global sources such as SSH private keys.
+/// Production uses platform discovery; test builds share the same isolated
+/// profile as config/data/state, without mutating the process environment.
+/// Explicit isolated HOME overrides remain authoritative.
+pub fn user_home_dir() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    #[cfg(any(test, feature = "test-support"))]
+    let home = cockpit_test_support::home_isolation::finalize_test_profile_home(home);
+    Some(home)
+}
 
 /// An installation root (config, data, state, or cache) did not resolve to a
 /// fully absolute path. Such a path would be interpreted against the process
@@ -197,6 +208,33 @@ pub fn cockpit_state_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_home_isolates_the_developer_and_honors_explicit_test_home() {
+        let env = crate::test_env::lock();
+        env.remove_var(cockpit_test_support::home_isolation::COCKPIT_TEST_ALLOW_REAL_HOME_ENV);
+        // Resolve the build-time developer profile without reading its files.
+        let developer = option_env!("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dirs::home_dir().expect("developer profile"));
+        env.set_var("HOME", &developer);
+        let isolated = user_home_dir().expect("isolated profile");
+        assert!(isolated.is_absolute());
+        assert_ne!(
+            isolated, developer,
+            "default tests must not scan the developer profile"
+        );
+        assert_eq!(
+            user_home_dir(),
+            Some(isolated),
+            "the isolated profile is stable"
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        env.set_isolated_home(fixture.path());
+        assert_eq!(user_home_dir(), Some(fixture.path().join("home")));
+    }
 
     #[test]
     fn data_dir_respects_xdg() {

@@ -79,7 +79,7 @@ pub(crate) fn resolve_ssh_key_dir(
                     .into()
                 })
         }
-        None => match dirs::home_dir() {
+        None => match crate::config::resolve::user_home_dir() {
             None => Ok(None),
             Some(home) if home.is_absolute() => Ok(Some(SshKeyDir::default_dir(home.join(".ssh")))),
             Some(home) => Err(UnanchoredRedactionSourcePath {

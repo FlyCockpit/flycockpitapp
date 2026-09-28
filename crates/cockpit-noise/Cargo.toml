@@ -32,7 +32,7 @@ uniffi_build = "=0.29.4"
 uniffi_bindgen = "=0.29.4"
 
 [dev-dependencies]
-proptest = "=1.9.0"
+proptest = "=1.11.0"
 
 [lints]
 workspace = true

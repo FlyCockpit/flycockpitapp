@@ -7,10 +7,8 @@
 //! Per the tool-availability-policy memory: at startup we probe
 //! `$PATH` for `rg`/`fd` and (on macOS) `gsed`. The tool description
 //! advertises which of these are available so the model picks the
-//! right binary. On a macOS host whose effective `PATH` resolves `sed` to
-//! the system BSD sed, the description says so (and points at `gsed` when
-//! present); the note is derived from the probed environment, omitted for
-//! container targets, and the shell text itself is never rewritten.
+//! right binary. macOS builds add a static, hedged `sed` hint (see
+//! [`MACOS_SED_HINT`]); the shell text itself is never rewritten.
 //!
 //! Approval/effect identity: the command text the user or model approved is
 //! byte-for-byte the script handed to `sh -c` (host, sandboxed, and container
@@ -77,8 +75,9 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
+        let mut description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
             .to_string();
+        description.push_str(MACOS_SED_HINT);
 
         // The defensive, explicitly-steering form (the verbose steering
         // variant). Same PATH-probe hints, more guidance.
@@ -102,7 +101,8 @@ impl BashTool {
              unless the user explicitly wants a persistent workspace artifact, then inspect \
              focused slices or searches from that file. Never edit a file you intend to keep via bash — use \
              `read`+`write`/`edit`."
-                .to_string();
+                .to_string()
+                + MACOS_SED_HINT;
 
         Self {
             description,
@@ -135,83 +135,19 @@ impl BashTool {
     }
 }
 
-/// How one launcher's child shell resolves `sed`/`gsed`.
-#[derive(Debug, Clone, Copy, Default)]
-struct ChildSed<'a> {
-    sed: Option<&'a Path>,
-    gsed: bool,
-}
-
-/// macOS's system `sed` (`/usr/bin/sed`, SIP-protected) is BSD sed, whose
-/// flags (notably `-i`) differ from GNU sed. Steer the model with what each
-/// host launcher's child shell actually resolves instead of rewriting the
-/// approved shell text: an injected `sed()` prelude made the executed script
-/// differ from the approved one (#528). The sandboxed and unsandboxed
-/// launchers can see different `PATH`s (see [`bash_child_paths`]), so the
-/// note names the mode when only one of them gets BSD sed. No note when
-/// neither does (for example Homebrew's gnubin first on the child `PATH`),
-/// on other hosts, or for a container target (a Linux image).
-fn sed_flavor_note(
-    macos_host: bool,
-    target: crate::capabilities::ExecutionTarget,
-    sandboxed: ChildSed<'_>,
-    unsandboxed: ChildSed<'_>,
-) -> Option<String> {
-    if !macos_host || target != crate::capabilities::ExecutionTarget::Host {
-        return None;
-    }
-    let bsd = |child: &ChildSed<'_>| child.sed == Some(Path::new("/usr/bin/sed"));
-    let (scope, gsed) = match (bsd(&sandboxed), bsd(&unsandboxed)) {
-        (true, true) => ("", sandboxed.gsed && unsandboxed.gsed),
-        (true, false) => (" in sandboxed runs", sandboxed.gsed),
-        (false, true) => (" in unsandboxed runs", unsandboxed.gsed),
-        (false, false) => return None,
-    };
-    let advice = if gsed {
-        "use `gsed` for GNU sed syntax."
-    } else {
-        "`sed -i ''` edits in place."
-    };
-    Some(format!(" `sed` is BSD sed{scope}; {advice}"))
-}
-
-/// The `PATH` each host launcher gives the bash child, as
-/// `(sandboxed, unsandboxed)`. The sandboxed launcher keeps the daemon's
-/// `PATH` (zerobox's default env keys) with the session overlay on top; the
-/// unsandboxed
-/// launcher (`run_shell`) is `env_clear()` + overlay, so without an overlay
-/// `PATH` its `sh` falls back to the shell's compiled default.
-fn bash_child_paths(
-    overlay_path: Option<&str>,
-    process_path: Option<&str>,
-    shell_default_path: Option<&str>,
-) -> (Option<String>, Option<String>) {
-    match overlay_path {
-        Some(path) => (Some(path.to_string()), Some(path.to_string())),
-        None => (
-            process_path.map(str::to_string),
-            shell_default_path.map(str::to_string),
-        ),
-    }
-}
-
-/// The `PATH` an `env_clear()`ed `sh -c` sees, i.e. the shell's compiled
-/// default. Asked of the real `sh` once per process rather than hard-coded.
-fn shell_default_path() -> Option<&'static str> {
-    static DEFAULT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    DEFAULT
-        .get_or_init(|| {
-            let output = std::process::Command::new("sh")
-                .env_clear()
-                .args(["-c", r#"printf %s "${PATH-}""#])
-                .stdin(std::process::Stdio::null())
-                .output()
-                .ok()?;
-            let path = String::from_utf8(output.stdout).ok()?;
-            (output.status.success() && !path.is_empty()).then_some(path)
-        })
-        .as_deref()
-}
+/// macOS ships BSD `sed`, whose flags (notably `-i`) differ from GNU sed.
+/// The approved shell text is never rewritten to paper over this (#528: an
+/// injected `sed()` prelude made the executed script differ from the
+/// approved one), so the model is told instead. The hint is static and
+/// compiled only into macOS builds: it lives in the base description, which
+/// every provider sees, and stays byte-stable for prompt caching. "May be"
+/// keeps it accurate when GNU sed is first on `PATH` (Homebrew gnubin) or the
+/// shell runs in a Linux container.
+#[cfg(target_os = "macos")]
+const MACOS_SED_HINT: &str =
+    " On macOS, `sed` may be BSD sed: use `sed -i ''` for in-place edits, or `gsed` if installed.";
+#[cfg(not(target_os = "macos"))]
+const MACOS_SED_HINT: &str = "";
 
 #[async_trait]
 impl Tool for BashTool {
@@ -233,49 +169,6 @@ impl Tool for BashTool {
 
     fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
         Self::declared_binary_requirements()
-    }
-
-    fn capability_description_note(
-        &self,
-        env: &std::collections::HashMap<String, String>,
-        cwd: &Path,
-        target: crate::capabilities::ExecutionTarget,
-    ) -> Option<String> {
-        let macos_host = cfg!(target_os = "macos");
-        if !macos_host || target != crate::capabilities::ExecutionTarget::Host {
-            return None;
-        }
-        use crate::external_runtime::ProbeExecutor;
-        let executor = crate::external_runtime::SystemProbeExecutor;
-        let process_path = std::env::var("PATH").ok();
-        let (sandboxed_path, unsandboxed_path) = bash_child_paths(
-            env.get("PATH").map(String::as_str),
-            process_path.as_deref(),
-            shell_default_path(),
-        );
-        // Resolve against exactly the child's PATH; an unknown PATH resolves
-        // nothing (the probe's own process-PATH fallback must not apply).
-        let resolve = |name: &str, path: Option<&str>| {
-            path.and_then(|path| {
-                executor
-                    .resolve(name, None, Some(path), cwd)
-                    .filter(|resolved| executor.is_spawnable(resolved))
-            })
-        };
-        let sandboxed_sed = resolve("sed", sandboxed_path.as_deref());
-        let unsandboxed_sed = resolve("sed", unsandboxed_path.as_deref());
-        sed_flavor_note(
-            macos_host,
-            target,
-            ChildSed {
-                sed: sandboxed_sed.as_deref(),
-                gsed: resolve("gsed", sandboxed_path.as_deref()).is_some(),
-            },
-            ChildSed {
-                sed: unsandboxed_sed.as_deref(),
-                gsed: resolve("gsed", unsandboxed_path.as_deref()).is_some(),
-            },
-        )
     }
 
     fn completed_call_effect(&self, args: &Value, _output: &ToolOutput) -> ToolEffect {

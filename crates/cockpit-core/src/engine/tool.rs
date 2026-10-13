@@ -1109,19 +1109,6 @@ pub trait Tool: Send + Sync {
         Vec::new()
     }
 
-    /// Environment-derived steering appended to the description when the
-    /// toolbox is rebuilt for an effective `PATH` and execution target (for
-    /// example which `sed` flavor a host shell resolves). Must describe the
-    /// resolved environment, never a compile-time guess.
-    fn capability_description_note(
-        &self,
-        _env: &std::collections::HashMap<String, String>,
-        _cwd: &std::path::Path,
-        _target: crate::capabilities::ExecutionTarget,
-    ) -> Option<String> {
-        None
-    }
-
     fn presentation(&self, args: &Value) -> ToolPresentation {
         ToolPresentation::default_for(self.name(), args)
     }
@@ -2930,20 +2917,21 @@ impl ToolBox {
                 self.capability_unavailable
                     .insert(name.clone(), evaluation.unavailable);
             }
-            let mut suffixes: Vec<String> = tool
-                .capability_description_note(env, cwd, target)
-                .into_iter()
-                .collect();
-            suffixes.extend(evaluation.optional_missing.into_iter().map(|issue| {
-                format!(
-                    " Optional `{}` missing: {}",
-                    issue.requirement.name,
-                    issue.render_remedy(crate::capabilities::RemedyPlatform::current())
-                )
-            }));
-            if !suffixes.is_empty() {
-                self.capability_description_suffixes
-                    .insert(name.clone(), suffixes);
+            if !evaluation.optional_missing.is_empty() {
+                self.capability_description_suffixes.insert(
+                    name.clone(),
+                    evaluation
+                        .optional_missing
+                        .into_iter()
+                        .map(|issue| {
+                            format!(
+                                " Optional `{}` missing: {}",
+                                issue.requirement.name,
+                                issue.render_remedy(crate::capabilities::RemedyPlatform::current())
+                            )
+                        })
+                        .collect(),
+                );
             }
         }
         self.definition_cache.lock().unwrap().clear();

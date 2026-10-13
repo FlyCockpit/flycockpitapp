@@ -557,69 +557,6 @@ fn a_session_switch_chord_goes_to_the_context_menu_on_top() {
 }
 
 #[test]
-fn paste_under_a_floating_layer_reaches_nothing_below_it() {
-    // Through the production intake (`handle_observed_terminal_event`), for
-    // every floating layer: the paste reaches neither the composer nor any
-    // other sink underneath.
-    let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    for layer in Layer::ALL.into_iter().filter(|layer| layer.is_floating()) {
-        let mut app = chat_app(tmp.path());
-        open_layer(&mut app, layer);
-        assert_eq!(app.top_layer(), layer);
-        let at = std::time::Duration::from_secs(10);
-        app.event_loop_monotonic_now = at;
-        let _ = app.handle_observed_terminal_event(
-            crossterm::event::Event::Paste("pasted text".to_string()),
-            at,
-            1,
-            None,
-            None,
-        );
-        let flush = at + std::time::Duration::from_millis(50);
-        let decision = app.terminal_paste_classifier.flush_due(flush);
-        let _ = app.apply_terminal_paste_decision(decision);
-        assert_eq!(
-            app.composer.text(),
-            "",
-            "{layer:?}: the paste reached the composer"
-        );
-        assert!(
-            app.pending_paste_probes.is_empty(),
-            "{layer:?}: a paste probe started"
-        );
-    }
-}
-
-#[test]
-fn floating_layers_on_the_surface_take_their_keys() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let mut app = chat_app(tmp.path());
-    open_floating(&mut app, Layer::ContextMenu);
-    app.handle_key(key(KeyCode::Esc));
-    assert!(app.context_menu.is_none());
-
-    let mut app = chat_app(tmp.path());
-    app.pins_review = PinsReview::enter(vec![
-        cockpit_proto::PinnedMessage {
-            seq: 1,
-            is_assistant: false,
-            text: "one".to_string(),
-        },
-        cockpit_proto::PinnedMessage {
-            seq: 2,
-            is_assistant: true,
-            text: "two".to_string(),
-        },
-    ]);
-    app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.pins_review.as_ref().unwrap().cursor, 1);
-    app.handle_key(key(KeyCode::Esc));
-    assert!(app.pins_review.is_none());
-}
-
-#[test]
 fn the_base_quit_key_passes_a_floating_layer_on_either_base() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
@@ -771,31 +708,6 @@ fn a_release_swallowed_inside_the_surface_still_ends_the_drag() {
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, 0));
     assert!(!app.mouse_gesture_state.dragging);
     assert!(app.mouse_gesture_state.pending_press.is_none());
-}
-
-#[test]
-fn review_boxes_take_their_cells_for_clicks_and_wheel() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let mut app = grid_app(tmp.path());
-    app.chat_total_lines = 100;
-    app.chat_visible_lines = 1;
-    app.pins_review = PinsReview::enter(vec![cockpit_proto::PinnedMessage {
-        seq: 1,
-        is_assistant: false,
-        text: "pinned".to_string(),
-    }]);
-    app.pins_review_rect = Some(Rect::new(0, 0, 3, 1));
-    let offset = app.chat_scroll_offset;
-    // Inside the box: the chat under it neither scrolls nor selects.
-    app.handle_mouse(mouse(MouseEventKind::ScrollUp, 1, 0));
-    assert_eq!(app.chat_scroll_offset, offset, "the wheel reached the chat");
-    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
-    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 0));
-    assert!(app.selection.is_none(), "the click reached the chat");
-    // Beside the box: the chat does.
-    app.handle_mouse(mouse(MouseEventKind::ScrollUp, 8, 0));
-    assert_ne!(app.chat_scroll_offset, offset);
 }
 
 // ── Hover resolution: every store, every path ───────────────────────────
@@ -960,56 +872,6 @@ fn typed_burst(app: &mut App, keys: &[KeyCode]) -> bool {
 }
 
 #[test]
-fn a_typing_burst_reaches_the_layer_on_top_never_a_hidden_composer() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    for layer in Layer::ALL {
-        let mut app = chat_app(tmp.path());
-        open_layer(&mut app, layer);
-        assert_eq!(app.top_layer(), layer, "{layer:?} is on top");
-        assert_eq!(
-            app.structured_paste_composer_eligible(),
-            layer == Layer::Surface,
-            "{layer:?}: only the surface's composer may intake-buffer keys"
-        );
-        // Keys the layer itself handles, typed fast enough to be buffered as
-        // a rapid-paste candidate when the composer is eligible.
-        let keys: &[KeyCode] = match layer {
-            Layer::DaemonRestartPrompt => &[KeyCode::Tab, KeyCode::Enter],
-            Layer::KeysOverlay => &[KeyCode::Char('j'), KeyCode::Char('q')],
-            Layer::ContextMenu => &[KeyCode::Char('j')],
-            Layer::RulesReview | Layer::PinsReview => &[KeyCode::Char('j'), KeyCode::Enter],
-            Layer::WorkspaceTrust | Layer::Onboarding | Layer::Surface => {
-                &[KeyCode::Char('x'), KeyCode::Char('y')]
-            }
-        };
-        typed_burst(&mut app, keys);
-        if layer == Layer::Surface {
-            assert_eq!(app.composer.text(), "xy", "the surface composer types");
-            continue;
-        }
-        assert_eq!(
-            app.composer.text(),
-            "",
-            "{layer:?}: typed into the hidden composer"
-        );
-        match layer {
-            // Tab moved the focus to Quit; Enter activated it.
-            Layer::DaemonRestartPrompt => assert!(app.exit_requested, "Tab+Enter must quit"),
-            Layer::KeysOverlay => assert!(app.keys_overlay.is_none(), "`q` must close it"),
-            Layer::ContextMenu => {
-                assert_eq!(app.context_menu.as_ref().map(|menu| menu.cursor), Some(1));
-            }
-            Layer::RulesReview => assert!(app.rules_review.is_some()),
-            Layer::PinsReview => assert!(app.pins_review.is_some()),
-            Layer::WorkspaceTrust => assert_eq!(app.base_layer(), Layer::WorkspaceTrust),
-            Layer::Onboarding => assert!(app.onboarding_shell.is_some()),
-            Layer::Surface => unreachable!(),
-        }
-    }
-}
-
-#[test]
 fn the_daemon_prompt_restart_key_reaches_the_prompt_through_the_intake() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
@@ -1029,34 +891,6 @@ fn the_daemon_prompt_restart_key_reaches_the_prompt_through_the_intake() {
             .is_some_and(|toast| toast.text.contains("restart is unavailable")),
         "`r` must reach the prompt's restart"
     );
-}
-
-#[test]
-fn a_typing_burst_reaches_the_surface_owner_ahead_of_the_composer() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-
-    let mut app = chat_app(tmp.path());
-    app.pending_stop_confirm = Some(Vec::new());
-    typed_burst(&mut app, &[KeyCode::Char('n')]);
-    assert!(app.pending_stop_confirm.is_none(), "`n` must cancel /stop");
-    assert_eq!(app.composer.text(), "");
-
-    let mut app = chat_app(tmp.path());
-    app.pending_prune_confirm = true;
-    typed_burst(&mut app, &[KeyCode::Char('n')]);
-    assert!(!app.pending_prune_confirm, "`n` must cancel /prune");
-    assert_eq!(app.composer.text(), "");
-
-    let mut app = chat_app(tmp.path());
-    app.session_rail.focus();
-    typed_burst(&mut app, &[KeyCode::Char('j'), KeyCode::Char('k')]);
-    assert_eq!(app.composer.text(), "", "the focused rail takes its keys");
-
-    let mut app = chat_app(tmp.path());
-    app.overlay = super::Overlay::Help(super::help_overlay::HelpOverlay::open());
-    typed_burst(&mut app, &[KeyCode::Char('x'), KeyCode::Char('y')]);
-    assert_eq!(app.composer.text(), "", "the help overlay takes its keys");
 }
 
 #[test]
@@ -1115,27 +949,6 @@ fn a_successful_editor_round_trip_ends_captures_and_forgets_the_pointer() {
 
 // ── Surface popovers occlude what they cover ───────────────────────────
 
-fn transcript_app(tmp: &std::path::Path) -> App {
-    let mut app =
-        App::new_with_workspace_trust(Some(tmp), false, super::StartupWorkspaceTrust::Decided);
-    app.dialog = Dialog::None;
-    app.launch.banner_enabled = false;
-    app.mouse_capture = true;
-    for seq in 0..30i64 {
-        app.history.push(crate::tui::history::HistoryEntry::User {
-            text: format!("user message number {seq} with enough text to fill the row"),
-            cleaned: None,
-            expanded: false,
-            timestamp: chrono::Local::now(),
-            seq: Some(seq * 2),
-            optimistic_submission_id: None,
-            preflight_pending: false,
-            persist_failed: false,
-        });
-    }
-    app
-}
-
 fn is_transcript_control(dispatch: &crate::tui::button::ButtonDispatch) -> bool {
     use crate::tui::button::ButtonDispatch;
     matches!(
@@ -1159,85 +972,6 @@ fn transcript_control_cells(app: &App) -> Vec<Position> {
         }
     }
     cells
-}
-
-#[test]
-fn a_body_overlay_takes_the_pointer_from_the_transcript_controls_it_covers() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let mut app = transcript_app(tmp.path());
-    app.overlay = super::Overlay::Help(super::help_overlay::HelpOverlay::open());
-    draw(&mut app, 120, 50);
-    let popover = app.last_popover_rect;
-    let cells = transcript_control_cells(&app);
-    let covered: Vec<Position> = cells
-        .iter()
-        .copied()
-        .filter(|cell| popover.contains(*cell))
-        .collect();
-    assert!(
-        !covered.is_empty(),
-        "the fixture must paint transcript controls under the popover"
-    );
-    assert!(
-        app.button_registry
-            .targets()
-            .iter()
-            .all(|target| !is_transcript_control(&target.dispatch)
-                || !target.rect.intersects(popover)),
-        "a covered transcript control is still registered"
-    );
-    let history = app.history.len();
-    for cell in covered {
-        app.handle_mouse(mouse(MouseEventKind::Moved, cell.x, cell.y));
-        draw(&mut app, 120, 50);
-        assert!(
-            app.button_registry.hover().is_none(),
-            "{cell:?} hovers under help"
-        );
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            cell.x,
-            cell.y,
-        ));
-        assert!(
-            app.button_registry.pressed().is_none(),
-            "{cell:?} pressed under help"
-        );
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), cell.x, cell.y));
-        assert!(matches!(app.overlay, super::Overlay::Help(_)));
-        assert!(app.pin_pick.is_none() && app.fork_pick.is_none());
-        assert_eq!(app.history.len(), history, "{cell:?} acted under help");
-        assert!(app.toast.is_none(), "{cell:?} acted under help");
-    }
-
-    // Inverse: a transcript control the popover does not cover stays live.
-    if let Some(open) = cells.iter().copied().find(|cell| !popover.contains(*cell)) {
-        assert!(
-            app.button_registry
-                .hit(open.x, open.y)
-                .is_some_and(|target| is_transcript_control(&target.dispatch)),
-            "an uncovered control lost the pointer"
-        );
-    }
-}
-
-#[test]
-fn transcript_controls_take_the_pointer_when_no_popover_covers_them() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-    let mut app = transcript_app(tmp.path());
-    draw(&mut app, 120, 50);
-    let cells = transcript_control_cells(&app);
-    assert!(!cells.is_empty());
-    for cell in cells {
-        assert!(
-            app.button_registry
-                .hit(cell.x, cell.y)
-                .is_some_and(|target| is_transcript_control(&target.dispatch)),
-            "{cell:?} is not hit-testable without a popover"
-        );
-    }
 }
 
 #[test]
@@ -1267,4 +1001,931 @@ fn leader_actions_run_only_over_the_chat_surface() {
             );
         }
     }
+}
+
+// ── The ownership matrix ────────────────────────────────────────────────
+//
+// One table: every owner that can be on top × every input kind. Each cell
+// runs on a fresh app through the production intake
+// (`handle_observed_terminal_event`) and the production draw, and asserts
+// the input reaches the owner on top and nothing it covers. Rows are every
+// layer (`Layer::ALL`), the surface's covering parts, and every surface text
+// owner (`SurfaceTextOwner::ALL`, keys and paste only: they own no cells).
+
+use super::pointer::{PaintedPart, SurfacePart, SurfaceTextOwner};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// A layer of the stack; `Layer::Surface` is the bare transcript.
+    Layer(Layer),
+    /// A body popover over the transcript.
+    Popover(PopoverKind),
+    /// The composer picker over the transcript.
+    ComposerPicker,
+    /// Below 80 columns: the focused overlay rail, then a picker opened over
+    /// it (the picker is on top — for paint, pointer and keys).
+    PickerOverNarrowRail,
+    /// The chat header's `more` popover over the transcript.
+    HeaderMore,
+    /// The question dialog mounted over a painted settings dialog (#504):
+    /// settings is no longer painted, so the transcript owns its old cells.
+    QuestionOverSettings,
+    /// The question dialog mounted over a painted slash-suggestion list.
+    QuestionOverSuggestions,
+    /// A surface text owner: keys and paste only.
+    Text(SurfaceTextOwner),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopoverKind {
+    Help,
+    /// `/settings` without a config: `Dialog::open` (config picker/creator).
+    ConfigDialog,
+    Settings,
+    SessionSetup,
+    AgentTree,
+}
+
+const POPOVER_KINDS: [PopoverKind; 5] = [
+    PopoverKind::Help,
+    PopoverKind::ConfigDialog,
+    PopoverKind::Settings,
+    PopoverKind::SessionSetup,
+    PopoverKind::AgentTree,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Input {
+    Click,
+    Wheel,
+    RightClick,
+    Drag,
+    Hover,
+    Key,
+    Paste,
+    Osc8,
+}
+
+const INPUTS: [Input; 8] = [
+    Input::Click,
+    Input::Wheel,
+    Input::RightClick,
+    Input::Drag,
+    Input::Hover,
+    Input::Key,
+    Input::Paste,
+    Input::Osc8,
+];
+
+fn owners() -> Vec<Owner> {
+    let mut owners: Vec<Owner> = Layer::ALL.iter().copied().map(Owner::Layer).collect();
+    owners.extend(POPOVER_KINDS.map(Owner::Popover));
+    owners.extend([
+        Owner::ComposerPicker,
+        Owner::PickerOverNarrowRail,
+        Owner::HeaderMore,
+        Owner::QuestionOverSettings,
+        Owner::QuestionOverSuggestions,
+    ]);
+    owners.extend(SurfaceTextOwner::ALL.iter().copied().map(Owner::Text));
+    owners
+}
+
+/// What the owner on top is at the fixture's cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Top {
+    /// Something covers the transcript there: the transcript must not react.
+    Covering,
+    /// The transcript itself is on top there: it must react.
+    Transcript,
+    /// A focus owner: it owns keys and paste, not cells.
+    Focus,
+}
+
+struct Fixture {
+    app: App,
+    width: u16,
+    height: u16,
+    /// A cell the owner owns — a covered transcript control when one lies
+    /// under the owner.
+    cell: Position,
+    /// A cell the owner owns that holds no transcript control.
+    plain: Position,
+    top: Top,
+    /// Owner-specific state captured at mount (suggestion rects, settings
+    /// buttons).
+    old_rects: Vec<Rect>,
+}
+
+fn matrix_app(tmp: &std::path::Path) -> App {
+    let mut app =
+        App::new_with_workspace_trust(Some(tmp), false, super::StartupWorkspaceTrust::Decided);
+    app.dialog = Dialog::None;
+    app.launch.banner_enabled = false;
+    app.mouse_capture = true;
+    for seq in 0..60i64 {
+        app.history.push(crate::tui::history::HistoryEntry::User {
+            text: format!("user message number {seq} with enough text to fill the row"),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: Some(seq * 2),
+            optimistic_submission_id: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+    }
+    app
+}
+
+fn question() -> crate::tui::dialog::question::QuestionDialog {
+    use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+    let option = |id: &str| InterruptOption {
+        id: id.to_string(),
+        label: id.to_string(),
+        description: None,
+        secondary: false,
+    };
+    crate::tui::dialog::question::QuestionDialog::new(
+        uuid::Uuid::from_u128(5),
+        String::new(),
+        InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Proceed?".to_string(),
+                options: vec![option("yes"), option("no")],
+                allow_freetext: false,
+                command_detail: None,
+                permission: false,
+                approval_class: None,
+                sandbox_escalation: None,
+            }],
+        },
+        std::time::Duration::ZERO,
+    )
+}
+
+fn painted_rect(app: &App, part: PaintedPart) -> Rect {
+    app.paint_record
+        .iter()
+        .rev()
+        .find(|(painted, _)| *painted == part)
+        .map(|(_, rect)| *rect)
+        .unwrap_or_else(|| panic!("{part:?} was not painted: {:?}", app.paint_record))
+}
+
+fn surface_rect(app: &App, part: SurfacePart) -> Rect {
+    painted_rect(app, PaintedPart::Surface(part))
+}
+
+/// Put `owner` on top of a fresh transcript app and draw it.
+fn mount(tmp: &std::path::Path, owner: Owner) -> Fixture {
+    let mut app = matrix_app(tmp);
+    let (mut width, mut height) = (120, 50);
+    let mut old_rects = Vec::new();
+    let mut top = Top::Covering;
+    let rect: Rect = match owner {
+        Owner::Layer(layer) => {
+            if layer == Layer::PinsReview {
+                app.pins_review = PinsReview::enter(
+                    (1..=2)
+                        .map(|seq| cockpit_proto::PinnedMessage {
+                            seq,
+                            is_assistant: false,
+                            text: format!("pinned {seq}"),
+                        })
+                        .collect(),
+                );
+            } else {
+                open_layer(&mut app, layer);
+            }
+            draw(&mut app, width, height);
+            match layer {
+                Layer::WorkspaceTrust => surface_rect(&app, SurfacePart::Popover),
+                Layer::Onboarding => Rect::new(0, 0, width, height),
+                Layer::Surface => {
+                    top = Top::Transcript;
+                    app.chat_area.expect("transcript painted")
+                }
+                floating => painted_rect(&app, PaintedPart::Floating(floating)),
+            }
+        }
+        Owner::Popover(kind) => {
+            match kind {
+                PopoverKind::Help => {
+                    app.overlay = super::Overlay::Help(super::help_overlay::HelpOverlay::open());
+                }
+                PopoverKind::ConfigDialog => app.dialog = Dialog::open(tmp),
+                PopoverKind::Settings => {
+                    app.dialog = Dialog::Settings(Box::new(
+                        crate::tui::settings::SettingsDialog::open(tmp.join("config.json")),
+                    ));
+                }
+                PopoverKind::SessionSetup => {
+                    let mut pane = crate::tui::session_setup::SessionSetupPane::loading(false);
+                    pane.test_open_add_mcp_form();
+                    app.overlay = super::Overlay::SessionSetup(pane);
+                }
+                PopoverKind::AgentTree => {
+                    app.overlay = super::Overlay::AgentTree(
+                        crate::tui::agent_tree_pane::AgentTreePane::loading(false),
+                    );
+                }
+            }
+            draw(&mut app, width, height);
+            surface_rect(&app, SurfacePart::Popover)
+        }
+        Owner::ComposerPicker => {
+            draw(&mut app, width, height);
+            // The approval picker always has rows to move through.
+            app.open_composer_picker(crate::tui::composer_controls::ComposerControlKind::Approval);
+            draw(&mut app, width, height);
+            surface_rect(&app, SurfacePart::ComposerPicker)
+        }
+        Owner::PickerOverNarrowRail => {
+            (width, height) = (70, 30);
+            app.session_rail.focus();
+            draw(&mut app, width, height);
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+            assert!(
+                app.composer_controls.picker.is_some(),
+                "Ctrl-E opens a picker"
+            );
+            // The approval picker always has rows to move through.
+            app.open_composer_picker(crate::tui::composer_controls::ComposerControlKind::Approval);
+            draw(&mut app, width, height);
+            assert!(app.session_rail.is_focused(), "the rail keeps its focus");
+            let picker = surface_rect(&app, SurfacePart::ComposerPicker);
+            let rail = surface_rect(&app, SurfacePart::SessionRail);
+            let both = picker.intersection(rail);
+            assert!(
+                !both.is_empty(),
+                "the fixture must overlap the rail and the picker"
+            );
+            both
+        }
+        Owner::HeaderMore => {
+            (width, height) = (40, 30);
+            app.busy = true;
+            app.attention_interrupt = Some(super::AttentionInterruptState {
+                interrupt_id: uuid::Uuid::from_u128(6),
+                kind: super::AttentionInterruptKind::Question,
+                pending: true,
+                pending_count: 1,
+                next_renudge_at: std::time::Instant::now(),
+            });
+            app.history
+                .push(crate::tui::history::HistoryEntry::SkillAutoInjected {
+                    name: "firecrawl".to_string(),
+                    reason: None,
+                });
+            for (job, kind) in [("t1", "timer"), ("b1", "background")] {
+                app.active_schedules.insert(
+                    job.to_string(),
+                    super::ActiveSchedule {
+                        session_id: uuid::Uuid::from_u128(7),
+                        label: format!("{kind} job"),
+                        kind: kind.to_string(),
+                        iteration: 1,
+                        last_activity: std::time::Instant::now(),
+                    },
+                );
+            }
+            draw(&mut app, width, height);
+            app.dispatch_button(crate::tui::button::ButtonDispatch::HeaderMore);
+            draw(&mut app, width, height);
+            surface_rect(&app, SurfacePart::HeaderMore)
+        }
+        Owner::QuestionOverSettings => {
+            app.dialog = Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
+                tmp.join("config.json"),
+            )));
+            draw(&mut app, width, height);
+            old_rects = app.dialog.test_settings_buttons().0;
+            assert!(!old_rects.is_empty(), "settings registered its buttons");
+            let settings = surface_rect(&app, SurfacePart::Popover);
+            app.question_dialog = Some(question());
+            draw(&mut app, width, height);
+            top = Top::Transcript;
+            settings
+        }
+        Owner::QuestionOverSuggestions => {
+            app.composer.insert_str("/");
+            draw(&mut app, width, height);
+            old_rects = app.suggestion_row_hits.iter().map(|hit| hit.rect).collect();
+            assert!(!old_rects.is_empty(), "slash suggestions painted");
+            let area = app.suggestion_box_area.expect("suggestion box painted");
+            app.question_dialog = Some(question());
+            draw(&mut app, width, height);
+            // What the list covered is the transcript's again.
+            top = Top::Transcript;
+            area
+        }
+        Owner::Text(text) => {
+            top = Top::Focus;
+            mount_text_owner(&mut app, text, tmp);
+            Rect::new(0, 0, width, height)
+        }
+    };
+    // Cells the owner owns, over the transcript where it covers some.
+    let buffer = draw(&mut app, width, height);
+    let over = app
+        .chat_area
+        .map(|chat| chat.intersection(rect))
+        .filter(|both| !both.is_empty())
+        .unwrap_or(rect);
+    let controls = transcript_control_cells_or_none(&app);
+    let cell = controls
+        .iter()
+        .copied()
+        .find(|cell| over.contains(*cell))
+        .or_else(|| {
+            old_rects
+                .iter()
+                .map(|rect| rect.as_position())
+                .find(|cell| over.contains(*cell))
+        })
+        .unwrap_or(Position::new(
+            over.x + over.width / 2,
+            over.y + over.height / 2,
+        ));
+    let plain = (over.y..over.bottom())
+        .flat_map(|y| (over.x..over.right()).map(move |x| Position::new(x, y)))
+        .find(|pos| {
+            *pos != cell
+                && !buffer[(pos.x, pos.y)].symbol().trim().is_empty()
+                && !controls.contains(pos)
+                && !controls.contains(&Position::new(pos.x + 2, pos.y))
+                && pos.x + 2 < over.right()
+        })
+        .unwrap_or(cell);
+    Fixture {
+        app,
+        width,
+        height,
+        cell,
+        plain,
+        top,
+        old_rects,
+    }
+}
+
+fn transcript_control_cells_or_none(app: &App) -> Vec<Position> {
+    if app.chat_area.is_none() {
+        return Vec::new();
+    }
+    transcript_control_cells(app)
+}
+
+/// Put the surface text owner `owner` in charge of typing.
+fn mount_text_owner(app: &mut App, owner: SurfaceTextOwner, tmp: &std::path::Path) {
+    draw(app, 120, 50);
+    match owner {
+        SurfaceTextOwner::ComposerPicker => {
+            app.open_composer_picker(crate::tui::composer_controls::ComposerControlKind::Approval);
+        }
+        SurfaceTextOwner::Queue => {
+            let item = queued_item();
+            app.queue_focus = Some(item.id);
+            app.queue.push(item);
+        }
+        SurfaceTextOwner::Btw => {
+            let mut pane = super::btw_pane::BtwPane::new(
+                cockpit_proto::BtwForkInfo {
+                    session_id: uuid::Uuid::from_u128(8),
+                    parent_session_id: uuid::Uuid::from_u128(9),
+                    short_id: "btw001".to_string(),
+                    tangent: false,
+                    created_at: 1,
+                    message_count: 0,
+                },
+                false,
+            );
+            pane.focused = true;
+            app.btw_pane = Some(pane);
+        }
+        SurfaceTextOwner::Rail => {
+            app.session_rail.focus();
+            app.session_rail.focus_search();
+        }
+        SurfaceTextOwner::EmbeddedPane => {
+            #[cfg(unix)]
+            {
+                let pane = crate::tui::pty::PtyPane::spawn(
+                    crate::tui::pty::PaneKind::Editor,
+                    &["cat".to_string()],
+                    &std::env::temp_dir(),
+                    24,
+                    80,
+                )
+                .expect("spawn cat pty child");
+                app.pane = Some(pane);
+                app.pane_focused = true;
+            }
+        }
+        SurfaceTextOwner::Confirmation => app.pending_stop_confirm = Some(Vec::new()),
+        SurfaceTextOwner::PickMode => app.enter_pin_pick_mode(),
+        SurfaceTextOwner::ComposerPill => {
+            app.composer_controls.selection =
+                Some(crate::tui::composer_controls::ComposerControlKind::Effort);
+        }
+        SurfaceTextOwner::HeaderPill => {
+            app.header_pill_selection = Some(crate::tui::chat_header::HeaderPillKind::Task);
+        }
+        SurfaceTextOwner::Question => app.question_dialog = Some(question()),
+        SurfaceTextOwner::Dialog => {
+            app.dialog = Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
+                tmp.join("config.json"),
+            )));
+        }
+        SurfaceTextOwner::InlineSetup => {
+            let mut pane = crate::tui::session_setup::SessionSetupPane::loading_inline(false);
+            pane.test_open_add_mcp_form();
+            app.session_setup_inline = Some(pane);
+            app.session_setup_collapsed = false;
+            app.session_setup_focused = true;
+        }
+        SurfaceTextOwner::Overlay => {
+            app.overlay = super::Overlay::AgentTree(
+                crate::tui::agent_tree_pane::AgentTreePane::loading(false),
+            );
+        }
+        SurfaceTextOwner::Find => {
+            app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        }
+        SurfaceTextOwner::Composer => {}
+    }
+    draw(app, 120, 50);
+}
+
+/// One terminal event through the production intake, then the classifier's
+/// idle flush as the event loop's paste-wait arm runs it.
+fn feed(app: &mut App, events: Vec<crossterm::event::Event>) {
+    let start = std::time::Duration::from_secs(10);
+    for (index, event) in events.into_iter().enumerate() {
+        let at = start + std::time::Duration::from_millis(index as u64);
+        app.event_loop_monotonic_now = at;
+        let _ = app.handle_observed_terminal_event(event, at, 1, None, None);
+    }
+    let flush = start + std::time::Duration::from_millis(500);
+    app.event_loop_monotonic_now = flush;
+    let decision = app.terminal_paste_classifier.flush_due(flush);
+    let _ = app.apply_terminal_paste_decision(decision);
+}
+
+fn mouse_at(kind: MouseEventKind, at: Position) -> crossterm::event::Event {
+    crossterm::event::Event::Mouse(mouse(kind, at.x, at.y))
+}
+
+fn is_transcript_target(app: &App, id: Option<&crate::tui::button::ButtonId>) -> bool {
+    id.is_some_and(|id| {
+        app.button_registry
+            .targets()
+            .iter()
+            .any(|target| &target.id == id && is_transcript_control(&target.dispatch))
+    }) || matches!(
+        id,
+        Some(
+            crate::tui::button::ButtonId::TranscriptPin { .. }
+                | crate::tui::button::ButtonId::TranscriptFork { .. }
+        )
+    )
+}
+
+/// The keys the owner handles and whether it handled them.
+fn key_case(owner: Owner) -> (Vec<KeyCode>, fn(&App) -> bool) {
+    use KeyCode::{Char, Enter, Esc, Tab};
+    match owner {
+        // Tab moved the focus to Quit; Enter activated it.
+        Owner::Layer(Layer::DaemonRestartPrompt) => (vec![Tab, Enter], |app| app.exit_requested),
+        Owner::Layer(Layer::KeysOverlay) => {
+            (vec![Char('j'), Char('q')], |app| app.keys_overlay.is_none())
+        }
+        Owner::Layer(Layer::ContextMenu) => (vec![Char('j')], |app| {
+            app.context_menu.as_ref().map(|menu| menu.cursor) == Some(1)
+        }),
+        Owner::Layer(Layer::RulesReview) => {
+            (vec![Char('j'), Esc], |app| app.rules_review.is_none())
+        }
+        Owner::Layer(Layer::PinsReview) => (vec![Char('j')], |app| {
+            app.pins_review.as_ref().map(|review| review.cursor) == Some(1)
+        }),
+        Owner::Layer(Layer::WorkspaceTrust) => (vec![Char('x'), Char('y')], |app| {
+            app.base_layer() == Layer::WorkspaceTrust
+        }),
+        Owner::Layer(Layer::Onboarding) => (vec![Char('x'), Char('y')], |app| {
+            app.onboarding_shell.is_some()
+        }),
+        Owner::Layer(Layer::Surface) | Owner::Text(SurfaceTextOwner::Composer) => {
+            (vec![Char('x'), Char('y')], |app| {
+                app.composer.text() == "xy"
+            })
+        }
+        Owner::Popover(PopoverKind::Help) => (vec![Esc], |app| !app.overlay.is_open()),
+        Owner::Popover(PopoverKind::ConfigDialog | PopoverKind::Settings) => {
+            (vec![Esc], |app| !app.dialog.is_active())
+        }
+        Owner::Popover(PopoverKind::SessionSetup) => (vec![Char('x')], |app| {
+            matches!(&app.overlay, super::Overlay::SessionSetup(pane)
+                if pane.test_add_mcp_name() == Some("x"))
+        }),
+        Owner::Popover(PopoverKind::AgentTree) | Owner::Text(SurfaceTextOwner::Overlay) => {
+            (vec![Esc], |app| !app.overlay.is_open())
+        }
+        // `j` moves the picker's cursor (checked against its start in
+        // `run_cell`) and keeps it open; typed into the composer it would
+        // close the picker, and taken by the rail it would not move it.
+        Owner::ComposerPicker
+        | Owner::PickerOverNarrowRail
+        | Owner::Text(SurfaceTextOwner::ComposerPicker) => (vec![Char('j')], |app| {
+            app.composer_controls.picker.is_some()
+        }),
+        Owner::HeaderMore => (vec![Esc], |app| !app.chat_header_more_open),
+        Owner::QuestionOverSettings | Owner::Text(SurfaceTextOwner::Question) => {
+            (vec![Esc], |app| app.question_dialog.is_none())
+        }
+        Owner::QuestionOverSuggestions => (vec![Esc], |app| {
+            app.question_dialog.is_none() && app.composer.text() == "/"
+        }),
+        Owner::Text(SurfaceTextOwner::Queue) => (vec![Esc], |app| app.queue_focus.is_none()),
+        Owner::Text(SurfaceTextOwner::Btw) => (vec![Char('x'), Char('y')], |app| {
+            app.btw_pane
+                .as_ref()
+                .is_some_and(|pane| pane.test_composer_text() == "xy")
+        }),
+        Owner::Text(SurfaceTextOwner::Rail) => (vec![Char('x'), Char('y')], |app| {
+            app.session_rail.search_query() == "xy"
+        }),
+        Owner::Text(SurfaceTextOwner::EmbeddedPane) => {
+            (vec![Char('x')], |app| app.pane.is_some() || cfg!(not(unix)))
+        }
+        Owner::Text(SurfaceTextOwner::Confirmation) => {
+            (vec![Char('n')], |app| app.pending_stop_confirm.is_none())
+        }
+        Owner::Text(SurfaceTextOwner::PickMode) => (vec![Esc], |app| app.pin_pick.is_none()),
+        // A typed character dismisses the pill and types into the composer.
+        Owner::Text(SurfaceTextOwner::ComposerPill) => (vec![Char('x')], |app| {
+            app.composer_controls.selection.is_none() && app.composer.text() == "x"
+        }),
+        Owner::Text(SurfaceTextOwner::HeaderPill) => (vec![Char('x')], |app| {
+            app.header_pill_selection.is_none() && app.composer.text() == "x"
+        }),
+        Owner::Text(SurfaceTextOwner::Dialog) => (vec![Esc], |app| !app.dialog.is_active()),
+        Owner::Text(SurfaceTextOwner::InlineSetup) => (vec![Char('x')], |app| {
+            app.session_setup_inline
+                .as_ref()
+                .is_some_and(|pane| pane.test_add_mcp_name() == Some("x"))
+        }),
+        Owner::Text(SurfaceTextOwner::Find) => (vec![Char('x')], |app| {
+            app.transcript_find
+                .as_ref()
+                .is_some_and(|find| find.query == "x")
+        }),
+    }
+}
+
+/// Where a bracketed paste must land for `owner` (`Ok`), or why not.
+fn paste_landed(owner: Owner, app: &App, text: &str) -> Result<(), String> {
+    let composer_is = |want: &str| {
+        (app.composer.text() == want)
+            .then_some(())
+            .ok_or_else(|| format!("composer {:?}, want {want:?}", app.composer.text()))
+    };
+    let untouched = || {
+        composer_is(match owner {
+            Owner::QuestionOverSuggestions => "/",
+            _ => "",
+        })
+    };
+    match owner {
+        // The composer takes it — condensed into a paste block, as a
+        // multi-line paste crossing the threshold is.
+        Owner::Layer(Layer::Surface) | Owner::Text(SurfaceTextOwner::Composer) => {
+            if app.composer.text().starts_with("[Pasted text #1") {
+                Ok(())
+            } else {
+                Err(format!("composer {:?}", app.composer.text()))
+            }
+        }
+        // A typed character dismisses these and lands in the composer; so
+        // does a paste.
+        Owner::ComposerPicker
+        | Owner::HeaderMore
+        | Owner::Text(
+            SurfaceTextOwner::ComposerPicker
+            | SurfaceTextOwner::ComposerPill
+            | SurfaceTextOwner::HeaderPill,
+        ) => {
+            if app.composer_controls.picker.is_some()
+                || app.composer_controls.selection.is_some()
+                || app.header_pill_selection.is_some()
+            {
+                return Err("the dismissible owner stayed up".to_string());
+            }
+            if app.composer.text().starts_with("[Pasted text #1") {
+                Ok(())
+            } else {
+                Err(format!("composer {:?}", app.composer.text()))
+            }
+        }
+        // The picker over the rail is dismissed; the rail is next, and its
+        // list (not its search) has the focus: the paste goes nowhere.
+        Owner::PickerOverNarrowRail => {
+            if app.composer_controls.picker.is_some() {
+                return Err("the picker stayed up".to_string());
+            }
+            untouched()?;
+            (app.session_rail.search_query().is_empty())
+                .then_some(())
+                .ok_or("the rail list took text".to_string())
+        }
+        Owner::Popover(PopoverKind::SessionSetup) => {
+            untouched()?;
+            match &app.overlay {
+                super::Overlay::SessionSetup(pane)
+                    if pane.test_add_mcp_name() == Some(text.lines().next().unwrap()) =>
+                {
+                    Ok(())
+                }
+                _ => Err("the setup form's name field did not get it".to_string()),
+            }
+        }
+        Owner::Text(SurfaceTextOwner::InlineSetup) => {
+            untouched()?;
+            app.session_setup_inline
+                .as_ref()
+                .filter(|pane| pane.test_add_mcp_name() == Some(text.lines().next().unwrap()))
+                .map(|_| ())
+                .ok_or("the inline setup form did not get it".to_string())
+        }
+        Owner::Text(SurfaceTextOwner::Btw) => {
+            untouched()?;
+            app.btw_pane
+                .as_ref()
+                .filter(|pane| pane.test_composer_text() == text)
+                .map(|_| ())
+                .ok_or("the btw pane did not get it".to_string())
+        }
+        Owner::Text(SurfaceTextOwner::Rail) => {
+            untouched()?;
+            (app.session_rail.search_query() == text.lines().next().unwrap())
+                .then_some(())
+                .ok_or(format!("rail search {:?}", app.session_rail.search_query()))
+        }
+        Owner::Text(SurfaceTextOwner::Find) => {
+            untouched()?;
+            app.transcript_find
+                .as_ref()
+                .filter(|find| find.query == text.lines().next().unwrap())
+                .map(|_| ())
+                .ok_or("the find bar did not get it".to_string())
+        }
+        // A paste is not `y`: it cancels the armed confirmation.
+        Owner::Text(SurfaceTextOwner::Confirmation) => {
+            untouched()?;
+            app.pending_stop_confirm
+                .is_none()
+                .then_some(())
+                .ok_or("the confirmation stayed armed".to_string())
+        }
+        // Every other owner has no text field for it (or its own field,
+        // unobservable here): it reaches nothing underneath.
+        _ => {
+            untouched()?;
+            app.pending_paste_probes
+                .is_empty()
+                .then_some(())
+                .ok_or("a paste probe started".to_string())
+        }
+    }
+}
+
+fn run_cell(tmp: &std::path::Path, owner: Owner, input: Input) -> Result<(), String> {
+    let fx = mount(tmp, owner);
+    let Fixture {
+        mut app,
+        width,
+        height,
+        cell,
+        plain,
+        top,
+        old_rects,
+    } = fx;
+    let pointer = matches!(
+        input,
+        Input::Click | Input::Wheel | Input::RightClick | Input::Drag | Input::Hover | Input::Osc8
+    );
+    if top == Top::Focus && pointer {
+        // Focus owners own no cells: the pointer columns are the layer and
+        // covering-part rows'.
+        return Ok(());
+    }
+    let transcript_owns = top == Top::Transcript;
+    let history = app.history.len();
+    let settings_before = format!("{:?}", app.dialog.test_settings_buttons());
+    let check = |ok: bool, what: &str| -> Result<(), String> {
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("{what} (cell {cell:?}, plain {plain:?})"))
+        }
+    };
+    match input {
+        Input::Click => {
+            let control = transcript_control_cells_or_none(&app).contains(&cell);
+            feed(
+                &mut app,
+                vec![mouse_at(MouseEventKind::Down(MouseButton::Left), cell)],
+            );
+            let pressed = is_transcript_target(&app, app.button_registry.pressed().map(|p| &p.id));
+            if transcript_owns {
+                if control {
+                    check(pressed, "the visible transcript control was not pressed")?;
+                }
+            } else {
+                check(!pressed, "a covered transcript control was pressed")?;
+            }
+            feed(
+                &mut app,
+                vec![mouse_at(MouseEventKind::Up(MouseButton::Left), cell)],
+            );
+            if !transcript_owns {
+                check(
+                    app.pin_pick.is_none() && app.fork_pick.is_none(),
+                    "a covered control acted",
+                )?;
+                check(app.history.len() == history, "a covered control acted")?;
+            }
+        }
+        Input::Wheel => {
+            let offset = app.chat_scroll_offset;
+            let picker_cursor = app.composer_controls.picker.as_ref().map(|p| p.cursor);
+            feed(&mut app, vec![mouse_at(MouseEventKind::ScrollUp, plain)]);
+            // The picker on top (over the transcript, or over the narrow
+            // rail) takes the wheel itself.
+            if matches!(owner, Owner::ComposerPicker | Owner::PickerOverNarrowRail) {
+                check(
+                    app.composer_controls.picker.as_ref().map(|p| p.cursor) != picker_cursor,
+                    "the wheel did not reach the picker on top",
+                )?;
+            }
+            check(
+                (app.chat_scroll_offset != offset) == transcript_owns,
+                &format!(
+                    "the transcript scroll moved={} (want {transcript_owns})",
+                    app.chat_scroll_offset != offset
+                ),
+            )?;
+        }
+        Input::RightClick => {
+            let before = app.context_menu.is_some();
+            feed(
+                &mut app,
+                vec![mouse_at(MouseEventKind::Down(MouseButton::Right), plain)],
+            );
+            let opened = !before && app.context_menu.is_some();
+            check(
+                opened == transcript_owns,
+                &format!("a transcript context menu opened={opened} (want {transcript_owns})"),
+            )?;
+        }
+        Input::Drag => {
+            let to = Position::new(plain.x + 2, plain.y);
+            feed(
+                &mut app,
+                vec![
+                    mouse_at(MouseEventKind::Down(MouseButton::Left), plain),
+                    mouse_at(MouseEventKind::Drag(MouseButton::Left), to),
+                ],
+            );
+            let selecting = app.mouse_gesture_state.dragging || app.selection.is_some();
+            check(
+                selecting == transcript_owns,
+                &format!("a transcript selection started={selecting} (want {transcript_owns})"),
+            )?;
+        }
+        Input::Hover => {
+            feed(&mut app, vec![mouse_at(MouseEventKind::Moved, cell)]);
+            draw(&mut app, width, height);
+            let hovered = is_transcript_target(&app, app.button_registry.hover());
+            let control = transcript_control_cells_or_none(&app).contains(&cell);
+            if transcript_owns {
+                if control {
+                    check(hovered, "the visible transcript control does not hover")?;
+                }
+            } else {
+                check(!hovered, "a covered transcript control hovers")?;
+                check(
+                    app.hovered_affordance.is_none() && app.hovered_control_chip.is_none(),
+                    "a covered transcript affordance hovers",
+                )?;
+            }
+        }
+        Input::Key => {
+            let (keys, handled) = key_case(owner);
+            let before = app.composer.text().to_string();
+            let picker_cursor = app.composer_controls.picker.as_ref().map(|p| p.cursor);
+            feed(
+                &mut app,
+                keys.iter()
+                    .map(|code| crossterm::event::Event::Key(key(*code)))
+                    .collect(),
+            );
+            check(handled(&app), &format!("{keys:?} did not reach the owner"))?;
+            if picker_cursor.is_some() {
+                check(
+                    app.composer_controls.picker.as_ref().map(|p| p.cursor) != picker_cursor,
+                    "`j` did not move the picker's cursor",
+                )?;
+            }
+            let composer_owns = matches!(
+                owner,
+                Owner::Layer(Layer::Surface)
+                    | Owner::Text(
+                        SurfaceTextOwner::Composer
+                            | SurfaceTextOwner::ComposerPill
+                            | SurfaceTextOwner::HeaderPill
+                    )
+            );
+            if !composer_owns {
+                check(
+                    app.composer.text() == before,
+                    &format!("typed into the hidden composer: {:?}", app.composer.text()),
+                )?;
+            }
+        }
+        Input::Paste => {
+            let text = "pasted text\nsecond line\nthird line";
+            feed(
+                &mut app,
+                vec![crossterm::event::Event::Paste(text.to_string())],
+            );
+            paste_landed(owner, &app, text)?;
+        }
+        Input::Osc8 => {
+            // A link the transcript registers under the owner's cell.
+            let url = format!("https://probe.test/{owner:?}").replace(' ', "");
+            app.test_transcript_link = Some((Rect::new(plain.x, plain.y, 2, 1), url.clone()));
+            draw(&mut app, width, height);
+            let bytes = crate::tui::links::osc8_bytes(&app.link_registry, true, true);
+            let emitted = String::from_utf8_lossy(&bytes).contains(&url);
+            let transcript_painted = app.chat_area.is_some();
+            check(
+                emitted == (transcript_owns && transcript_painted),
+                &format!("the transcript's link was emitted={emitted} (want {transcript_owns})"),
+            )?;
+        }
+    }
+    // Owner-specific: nothing hidden by the question dialog reacted.
+    match owner {
+        Owner::QuestionOverSettings => {
+            check(
+                matches!(app.dialog, Dialog::Settings(_)),
+                "the settings dialog under the question reacted (closed)",
+            )?;
+            if input != Input::Key {
+                check(
+                    format!("{:?}", app.dialog.test_settings_buttons()) == settings_before,
+                    "a settings button under the question hovered or changed",
+                )?;
+            }
+        }
+        Owner::QuestionOverSuggestions if input == Input::Click => {
+            // Clicking a stale suggestion row would have run its command.
+            for rect in &old_rects {
+                feed(
+                    &mut app,
+                    vec![
+                        mouse_at(MouseEventKind::Down(MouseButton::Left), rect.as_position()),
+                        mouse_at(MouseEventKind::Up(MouseButton::Left), rect.as_position()),
+                    ],
+                );
+            }
+            check(
+                app.composer.text() == "/" && !app.overlay.is_open() && !app.dialog.is_active(),
+                "a hidden slash suggestion was accepted",
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[test]
+fn every_input_reaches_exactly_the_owner_on_top() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut failures = Vec::new();
+    for owner in owners() {
+        for input in INPUTS {
+            if let Err(error) = run_cell(tmp.path(), owner, input) {
+                failures.push(format!("{owner:?} × {input:?}: {error}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} cell(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

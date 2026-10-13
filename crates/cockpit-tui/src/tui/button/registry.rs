@@ -147,13 +147,24 @@ impl ButtonRegistry {
         }
     }
 
-    /// A surface was just painted over `rect`, on top of every target
-    /// registered so far this frame: any of them it touches is no longer
-    /// under the pointer, so it stops being hit-testable and hoverable.
-    /// Targets the covering surface registers afterwards are its own and
-    /// stay. (A partly covered target is dropped whole: fail-safe.)
-    pub fn occlude(&mut self, rect: Rect) {
-        self.targets.retain(|target| !target.rect.intersects(rect));
+    /// How many targets are registered so far this frame: a mark taken
+    /// before a covering surface paints, for [`Self::occlude_below`].
+    pub fn mark(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// A surface was painted over `rect` on top of every target registered
+    /// before `mark`: any of those it touches is no longer under the pointer,
+    /// so it stops being hit-testable and hoverable. Targets registered from
+    /// `mark` on are the covering surface's own and stay. (A partly covered
+    /// target is dropped whole: fail-safe.)
+    pub fn occlude_below(&mut self, mark: usize, rect: Rect) {
+        let mut index = 0;
+        self.targets.retain(|target| {
+            let keep = index >= mark || !target.rect.intersects(rect);
+            index += 1;
+            keep
+        });
     }
 
     pub fn hit(&self, column: u16, row: u16) -> Option<&RegisteredButton> {

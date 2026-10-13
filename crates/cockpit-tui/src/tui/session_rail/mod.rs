@@ -1495,6 +1495,23 @@ impl SessionRail {
         }
     }
 
+    /// A bracketed paste while the rail is focused: into the search field
+    /// when it has the focus (typed characters go there too), its first
+    /// line only; anywhere else in the rail it goes nowhere.
+    pub fn paste(&mut self, text: &str) {
+        if !self.focused
+            || self.pending_mutation.is_some()
+            || matches!(self.step, Step::Confirm { .. })
+            || self.column_focus != ColumnFocus::Search
+        {
+            return;
+        }
+        let line = text.lines().next().unwrap_or_default();
+        self.search
+            .extend(line.chars().filter(|ch| !ch.is_control()));
+        self.restore_selection_after_filter();
+    }
+
     fn handle_search_key(&mut self, key: KeyEvent) -> Option<RailOutcome> {
         match key.code {
             KeyCode::Esc => {

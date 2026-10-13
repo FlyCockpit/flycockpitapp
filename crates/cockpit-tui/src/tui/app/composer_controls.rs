@@ -453,7 +453,13 @@ impl App {
             picker_screen,
             crate::tui::chrome::PopoverSide::Above,
         );
+        let mark = self.paint_mark();
         frame.render_widget(Clear, popover);
+        self.cover(
+            super::pointer::PaintedPart::Surface(super::pointer::SurfacePart::ComposerPicker),
+            popover,
+            mark,
+        );
         let title = match picker.level {
             0 => format!(" {} ", picker.kind.as_str()),
             _ => picker

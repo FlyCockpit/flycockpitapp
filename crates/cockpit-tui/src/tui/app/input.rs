@@ -3444,6 +3444,17 @@ impl App {
         self.transcript_find = None;
     }
 
+    /// A bracketed paste into the find query: its first line, as typed
+    /// characters would add it.
+    fn paste_into_transcript_find(&mut self, data: &str) {
+        let line = data.lines().next().unwrap_or_default();
+        if let Some(find) = self.transcript_find.as_mut() {
+            find.query
+                .extend(line.chars().filter(|ch| !ch.is_control()));
+        }
+        self.recompute_transcript_find();
+    }
+
     fn handle_transcript_find_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return;
@@ -3823,90 +3834,12 @@ impl App {
                         == crate::tui::structured_paste::PasteSource::NativePaste
             });
         }
-        // Paste enters through the layer stack like keys: a floating layer
-        // on top (none of which has a text field) drops it, so nothing
-        // underneath — btw pane, embedded PTY, composer, dialogs — gets it.
-        if self.key_owner().is_floating() {
-            self.note_interaction_above_onboarding();
+        // Paste goes where a typed character would: through the layer stack,
+        // then to the surface's text owner — the same decision the rapid-key
+        // intake buffers by (`structured_paste_composer_eligible`).
+        if !self.route_paste_to_owner(&data) {
             return;
         }
-        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused) {
-            if let Some(pane) = self.btw_pane.as_mut() {
-                pane.paste(&data);
-            }
-            return;
-        }
-        // Route the paste the same way typed keys are routed (see
-        // `handle_key`): a focused embedded PTY owns terminal input and
-        // consumes paste before the composer/image clipboard path. If the
-        // pane is open but not focused, app-owned fields still receive paste.
-        if self.pane_focused && self.pane.is_some() {
-            if let Some(pane) = self.pane.as_mut() {
-                pane.forward_paste(&data);
-            }
-            return;
-        }
-        if matches!(
-            self.overlay,
-            Overlay::Stats(_)
-                | Overlay::Usage(_)
-                | Overlay::Skills(_)
-                | Overlay::Tools(_)
-                | Overlay::GoalSettings(_)
-                | Overlay::Permissions(_)
-                | Overlay::Resources(_)
-                | Overlay::Quick(_)
-                | Overlay::Context(_)
-                | Overlay::Leaks(_)
-                | Overlay::Sealed(_)
-                | Overlay::Diff(_)
-                | Overlay::GuidanceReview(_)
-                | Overlay::Help(_)
-        ) || self.pin_pick.is_some()
-            || self.fork_pick.is_some()
-            || self.copy_pick.is_some()
-            || self.transcript_find.is_some()
-        {
-            return;
-        }
-        // Text-field-owning overlays, in the same precedence as `handle_key`:
-        // answering dialog → settings dialog → model picker. Each routes the
-        // paste to whichever of its fields is focused (or drops it when none
-        // is). The "which field is focused" logic stays inside each component.
-        if let Some(dialog) = self.question_dialog.as_mut() {
-            dialog.paste(&data);
-            return;
-        }
-        if self.onboarding_shell.is_some() {
-            // Engine stages keep the dialog's field focus; native shell
-            // screens take the paste themselves.
-            if self.onboarding_shell.as_ref().is_some_and(|shell| {
-                shell.screen_kind()
-                    == crate::tui::onboarding::OnboardingScreenKind::EmbeddedSettings
-            }) && self.dialog.is_active()
-            {
-                self.dialog.paste(&data);
-            } else if let Some(shell) = self.onboarding_shell.as_mut() {
-                shell.paste(&data);
-            }
-            return;
-        }
-        if self.dialog.is_active() {
-            self.dialog.paste(&data);
-            return;
-        }
-        match &mut self.overlay {
-            Overlay::Multireview(dialog) => {
-                dialog.paste(&data);
-                return;
-            }
-            Overlay::Notes(pane) => {
-                pane.paste(&data);
-                return;
-            }
-            _ => {}
-        }
-
         if data.is_empty() {
             let native_kind =
                 crate::tui::async_action::AsyncActionKind::Internal("paste.native_image");
@@ -4100,6 +4033,120 @@ impl App {
         self.reset_slash_window();
     }
 
+    /// Deliver a bracketed paste to its owner. Returns `true` when the owner
+    /// is the composer (the caller runs the composer's paste path), `false`
+    /// when the paste was delivered elsewhere or dropped.
+    fn route_paste_to_owner(&mut self, data: &str) -> bool {
+        use super::pointer::{Layer, SurfaceTextOwner};
+        match self.key_owner() {
+            // A floating layer on top (none has a text field) drops it, so
+            // nothing underneath gets it.
+            layer if layer.is_floating() => {
+                self.note_interaction_above_onboarding();
+                return false;
+            }
+            Layer::WorkspaceTrust => {
+                if self.pending_workspace_trust.is_none() {
+                    self.dialog.paste(data);
+                }
+                return false;
+            }
+            Layer::Onboarding => {
+                // Engine stages keep the dialog's field focus; native shell
+                // screens take the paste themselves.
+                if self.onboarding_shell.as_ref().is_some_and(|shell| {
+                    shell.screen_kind()
+                        == crate::tui::onboarding::OnboardingScreenKind::EmbeddedSettings
+                }) && self.dialog.is_active()
+                {
+                    self.dialog.paste(data);
+                } else if let Some(shell) = self.onboarding_shell.as_mut() {
+                    shell.paste(data);
+                }
+                return false;
+            }
+            _ => {}
+        }
+        // Owners a typed character dismisses hand it on to the next owner;
+        // each pass dismisses one, so this ends.
+        loop {
+            match self.surface_text_owner() {
+                SurfaceTextOwner::ComposerPicker => {
+                    self.close_composer_picker();
+                    self.composer_controls.selection = None;
+                }
+                SurfaceTextOwner::ComposerPill => self.composer_controls.selection = None,
+                SurfaceTextOwner::HeaderPill => self.header_pill_selection = None,
+                // Every key is a row action / a pick-mode key: no text field.
+                SurfaceTextOwner::Queue | SurfaceTextOwner::PickMode => return false,
+                // A non-committing key cancels the armed confirmation; so
+                // does a paste, which is not a `y`.
+                SurfaceTextOwner::Confirmation => {
+                    if self.pending_prune_confirm {
+                        self.cancel_prune();
+                    } else if self.pending_resume_compaction_confirm {
+                        self.cancel_resume_compaction();
+                    } else {
+                        self.cancel_stop();
+                    }
+                    return false;
+                }
+                SurfaceTextOwner::Btw => {
+                    if let Some(pane) = self.btw_pane.as_mut() {
+                        pane.paste(data);
+                    }
+                    return false;
+                }
+                SurfaceTextOwner::Rail => {
+                    self.session_rail.paste(data);
+                    return false;
+                }
+                // A focused embedded PTY owns terminal input.
+                SurfaceTextOwner::EmbeddedPane => {
+                    if let Some(pane) = self.pane.as_mut() {
+                        pane.forward_paste(data);
+                    }
+                    return false;
+                }
+                SurfaceTextOwner::Question => {
+                    if let Some(dialog) = self.question_dialog.as_mut() {
+                        dialog.paste(data);
+                    }
+                    return false;
+                }
+                SurfaceTextOwner::Dialog => {
+                    self.dialog.paste(data);
+                    return false;
+                }
+                // The focused inline setup takes characters only while a form
+                // captures all input; otherwise they (and a paste) reach the
+                // composer.
+                SurfaceTextOwner::InlineSetup => {
+                    let captures = self
+                        .session_setup_inline
+                        .as_ref()
+                        .is_some_and(|pane| pane.captures_all_input());
+                    if !captures {
+                        return true;
+                    }
+                    if let Some(pane) = self.session_setup_inline.as_mut() {
+                        pane.paste(data);
+                    }
+                    return false;
+                }
+                SurfaceTextOwner::Overlay => {
+                    self.overlay.paste(data);
+                    return false;
+                }
+                SurfaceTextOwner::Find => {
+                    self.paste_into_transcript_find(data);
+                    return false;
+                }
+                SurfaceTextOwner::Composer => return true,
+            }
+        }
+    }
+
     /// Whether the rapid-paste intake may buffer keys for the composer.
     ///
     /// Buffered keys are later replayed straight into the composer
@@ -4114,53 +4161,11 @@ impl App {
     ///
     /// Layers come from the layer stack — the same source of truth
     /// [`Self::handle_key`] routes by — so no floating or base layer can be
-    /// forgotten here. [`Self::surface_composer_owns_typing`] covers the
-    /// surface's own key owners.
+    /// forgotten here. [`Self::surface_text_owner`] — the same decision a
+    /// bracketed paste is routed by — covers the surface's own key owners.
     pub(super) fn structured_paste_composer_eligible(&self) -> bool {
-        self.key_owner() == super::pointer::Layer::Surface && self.surface_composer_owns_typing()
-    }
-
-    /// With the surface on top: whether no surface stage ahead of the
-    /// composer in [`Self::handle_key`] takes an ordinary typing key. Listed
-    /// in `handle_key`'s stage order; keep it in step when a stage is added
-    /// there. Owners that take only Esc, arrows or modified chords (the
-    /// queued-edit Esc, the subagent-view Esc, the global chords, selection
-    /// Esc) do not compete for typing keys and are not listed.
-    fn surface_composer_owns_typing(&self) -> bool {
-        // `handle_precedence_key`: the embedded pane forwards every key to
-        // its child; queue focus, a focused btw pane and a focused session
-        // rail take their keys first.
-        !(self.pane.is_some() && self.pane_focused)
-            && self.queue_focus.is_none()
-            && !self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
-            && !self.session_rail.is_focused()
-            // The composer control deck (open picker or pill selection)
-            // owns Enter/arrows/typing while it is up (#445).
-            && self.composer_controls.picker.is_none()
-            && self.composer_controls.selection.is_none()
-            // `handle_key_inner`: the armed `/prune`, resume-compaction and
-            // `/stop` confirmations take the next key (`y` commits).
-            && !self.pending_prune_confirm
-            && !self.pending_resume_compaction_confirm
-            && self.pending_stop_confirm.is_none()
-            // The pick modes are modal.
-            && self.pin_pick.is_none()
-            && self.fork_pick.is_none()
-            && self.copy_pick.is_none()
-            // A selected header pill takes `h`/`l`/Enter.
-            && !(self.header_pill_selection.is_some() && self.header_chrome_interactive())
-            // The answering dialog and the settings dialog are modal.
-            && self.question_dialog.is_none()
-            && !self.dialog.is_active()
-            // The focused inline session-setup pane takes its keys.
-            && !(self.session_setup_focused
-                && matches!(self.overlay, Overlay::None)
-                && self.session_setup_inline_visible())
-            // Every overlay pane takes every key (each `handle_key_inner`
-            // arm returns).
-            && !self.overlay.is_open()
-            // The transcript-find bar owns every key.
-            && self.transcript_find.is_none()
+        self.key_owner() == super::pointer::Layer::Surface
+            && self.surface_text_owner() == super::pointer::SurfaceTextOwner::Composer
     }
 
     fn start_paste_token_count(&mut self, block_id: u64, full: String) {

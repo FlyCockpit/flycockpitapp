@@ -339,6 +339,41 @@ impl SessionSetupPane {
         !matches!(self.interaction, Interaction::List)
     }
 
+    /// Open the add-MCP form on its name field (test setup).
+    #[cfg(test)]
+    pub(crate) fn test_open_add_mcp_form(&mut self) {
+        self.interaction = Interaction::AddMcp(AddMcpForm::new());
+    }
+
+    /// The add-MCP form's name field, when the form is open (test probe).
+    #[cfg(test)]
+    pub(crate) fn test_add_mcp_name(&self) -> Option<&str> {
+        match &self.interaction {
+            Interaction::AddMcp(form) => Some(form.name.text()),
+            _ => None,
+        }
+    }
+
+    /// A bracketed paste: into the add-MCP form's focused text field, the
+    /// only text field the pane has. Anywhere else (the list, a popover, a
+    /// confirmation, a choice row of the form) it goes nowhere.
+    pub(crate) fn paste(&mut self, text: &str) {
+        let Interaction::AddMcp(form) = &mut self.interaction else {
+            return;
+        };
+        let field = match form.cursor {
+            0 => &mut form.name,
+            1 => &mut form.endpoint,
+            2 => &mut form.command,
+            5 => &mut form.oauth_authorize_url,
+            6 => &mut form.oauth_token_url,
+            7 => &mut form.oauth_client_id,
+            8 => &mut form.oauth_device_endpoint,
+            _ => return,
+        };
+        field.paste(text);
+    }
+
     fn selectable_indices(&self) -> impl Iterator<Item = usize> + '_ {
         self.rows
             .iter()

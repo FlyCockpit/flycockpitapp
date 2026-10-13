@@ -123,6 +123,12 @@ impl BtwPane {
         self.composer.insert_str(text);
     }
 
+    /// The pane's own composer text (test probe).
+    #[cfg(test)]
+    pub(super) fn test_composer_text(&self) -> &str {
+        self.composer.text()
+    }
+
     fn remember_folded_queue_item_ids(&mut self, ids: impl IntoIterator<Item = Uuid>) {
         for id in ids {
             if self.folded_queue_item_ids.insert(id) {

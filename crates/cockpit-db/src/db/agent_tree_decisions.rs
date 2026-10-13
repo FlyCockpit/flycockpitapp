@@ -9483,7 +9483,12 @@ fn validate_host_operation_concrete_effects(concrete_effects_json: &str) -> Resu
 /// mutation are not caller authority; the exact effect field must match
 /// structurally, so a stale approval cannot be redirected to another command,
 /// request, connection, or filesystem mutation.
-#[cfg(any(test, feature = "host-approval-composition"))]
+// Production code under `host-approval-composition`; without the feature it
+// exists only in test builds so its unit test runs in the default test job.
+// Spelled as `cfg_attr(.., cfg(test))` rather than `cfg(any(test, ..))`: the
+// db blocking-boundary gate skips any `cfg` naming `test` as test-only, and
+// this function is a production callee of the host-approval paths.
+#[cfg_attr(not(feature = "host-approval-composition"), cfg(test))]
 fn host_operation_candidate_matches_any_concrete_effect(
     candidate: &Value,
     concrete_effects: &[Value],

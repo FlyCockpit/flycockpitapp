@@ -134,7 +134,7 @@ fn sed_flavor_note_describes_only_a_resolved_system_bsd_sed_on_a_macos_host() {
 }
 
 /// G2: without a session-overlay `PATH` the unsandboxed child (`env_clear()`
-/// + overlay) sees the shell's default `PATH`, not the daemon's; the
+/// plus overlay) sees the shell's default `PATH`, not the daemon's; the
 /// sandboxed child keeps the daemon's. An overlay `PATH` wins for both.
 #[test]
 fn bash_child_paths_follow_each_launcher() {

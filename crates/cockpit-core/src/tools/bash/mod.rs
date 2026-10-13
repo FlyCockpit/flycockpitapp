@@ -3642,11 +3642,12 @@ pub(crate) mod exec_witness {
             }
         });
         if choice.is_none() {
-            assert!(
-                !cfg!(any(target_os = "macos", target_os = "linux")),
-                "exec witness unavailable on macOS/Linux: `sh` exposes neither \
-                 $BASH_EXECUTION_STRING nor /proc/$$/cmdline"
-            );
+            if cfg!(any(target_os = "macos", target_os = "linux")) {
+                panic!(
+                    "exec witness unavailable on macOS/Linux: `sh` exposes neither \
+                     $BASH_EXECUTION_STRING nor /proc/$$/cmdline"
+                );
+            }
             eprintln!(
                 "skipping exact-script check: `sh` exposes neither $BASH_EXECUTION_STRING nor /proc/$$/cmdline"
             );

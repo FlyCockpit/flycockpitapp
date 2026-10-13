@@ -7752,7 +7752,7 @@ fn public_interrupt_response_from_private_continuation(
         },
         ResolveResponse::Freetext { text } => ResolveResponse::Freetext { text: text.clone() },
         ResolveResponse::Batch { responses } => ResolveResponse::Batch {
-            responses: map_batch_option_ids(responses, &to_public)?,
+            responses: map_batch_option_ids(responses, to_public)?,
         },
         ResolveResponse::Cancel => ResolveResponse::Cancel,
     })
@@ -7840,7 +7840,7 @@ fn private_interrupt_response_for_continuation(
         },
         ResolveResponse::Freetext { text } => ResolveResponse::Freetext { text: text.clone() },
         ResolveResponse::Batch { responses } => ResolveResponse::Batch {
-            responses: map_batch_option_ids(responses, &to_private)?,
+            responses: map_batch_option_ids(responses, to_private)?,
         },
         ResolveResponse::Cancel => ResolveResponse::Cancel,
     })

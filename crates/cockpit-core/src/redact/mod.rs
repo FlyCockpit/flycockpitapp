@@ -30,7 +30,8 @@
 //! prune (forced inclusion); the §5 inline disable marker
 //! (`# COCKPIT_DISABLE_REDACT`) excludes a single value from candidacy.
 //!
-//! Replacement is single-linear-scan multi-pattern via `aho-corasick`.
+//! Replacement is one multi-pattern scan of an `aho-corasick` anchor index,
+//! with long literals confirmed byte-for-byte (see `literal_matcher`).
 //! Matches are case-sensitive and substring-aware (so a token embedded
 //! in a longer URL is still redacted).
 
@@ -38,7 +39,6 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 
@@ -106,6 +106,7 @@ mod command_output;
 pub(crate) mod coverage_authority;
 pub(crate) mod coverage_bindings;
 mod dotenv;
+mod literal_matcher;
 pub(crate) use dotenv::{
     UnanchoredRedactionSourcePath, matched_dotenv_sources, resolve_explicit_dotenv_path,
 };
@@ -1056,31 +1057,23 @@ impl PersistedEntry {
 /// rebuild; small in-memory footprint).
 #[derive(Clone)]
 pub struct RedactionTable {
-    /// Aho-Corasick search structure; `None` when there's nothing to
-    /// scrub or redaction is disabled. Keeping it `Option` lets
-    /// [`scrub`] short-circuit without allocating.
+    /// Exact multi-literal matcher over `entries`; `None` when there's
+    /// nothing to scrub. Keeping it `Option` lets [`scrub`] short-circuit
+    /// without allocating.
     ///
-    /// Built with [`MatchKind::LeftmostLongest`]: this drives the fast
-    /// `is_match` gate and the journaling primitive
-    /// [`match_sensitive_literals`] (via `find_iter`), both of which want the
-    /// leftmost-longest non-overlapping emit. It is NOT used for substitution —
-    /// see `overlap_matcher`.
-    matcher: Option<AhoCorasick>,
-    /// A second Aho-Corasick over the SAME pattern list, built with
-    /// [`MatchKind::Standard`] so [`scrub_cow`] can call `find_overlapping_iter`
-    /// and enumerate EVERY occurrence of EVERY registered literal — OVERLAPPING
-    /// and SELF-overlapping included. LeftmostLongest cannot do this (its
-    /// `replace_all`/`find_iter` emit only non-overlapping matches and resume
-    /// past each), which would leak the non-overlapping tail of an overlapping
-    /// secret. `AhoCorasick` is `Clone` over an internal `Arc<dyn Automaton>`,
-    /// so storing this second matcher costs its automaton memory once; the
-    /// `clone()`s in `union`/`enforced`/`with_sealed_replacements` only bump the
-    /// Arc. Rebuilt from `entries` like `matcher`; never serialized. `Some`
-    /// exactly when `matcher` is `Some` (both built from the same non-empty
-    /// pattern list at the same site).
-    overlap_matcher: Option<AhoCorasick>,
+    /// One index serves both uses: [`scrub_cow`] enumerates EVERY occurrence
+    /// of EVERY registered literal, OVERLAPPING and SELF-overlapping included
+    /// (a non-overlapping emit would leak the tail of an overlapping secret),
+    /// and the journaling primitive [`match_sensitive_literals`] takes the
+    /// leftmost-longest non-overlapping sequence derived from that same set
+    /// (see [`literal_matcher`]). Long literals are indexed by a bounded
+    /// anchor and confirmed against their entry, so the index stays small for
+    /// private keys and their encodings. Cheap to clone (`Arc`); the
+    /// `union`/`enforced`/`with_sealed_replacements` views share it. Rebuilt
+    /// from `entries`; never serialized.
+    matcher: Option<literal_matcher::LiteralMatcher>,
     /// The single typed entry vector used to build `matcher`, aligned 1:1 with
-    /// the matcher's pattern list by construction. There is no parallel
+    /// the matcher's index by construction. There is no parallel
     /// origins/replacements vector to drift: each entry carries its own typed
     /// classification and per-target replacement descriptor.
     entries: Vec<RedactionEntry>,
@@ -1524,7 +1517,7 @@ impl RedactionTable {
     /// The single construction funnel for a [`RedactionTable`]. Every builder
     /// (`from_entries`, `union`, `with_forced_literal`,
     /// `with_forced_sealed_literal`, `from_persisted_json`) routes here, so the
-    /// entry vector and the matcher's pattern list are 1:1 by construction and
+    /// entry vector and the matcher's index are 1:1 by construction and
     /// the length invariant cannot be violated by a caller.
     fn from_redaction_entries(
         mut entries: Vec<RedactionEntry>,
@@ -1593,7 +1586,6 @@ impl RedactionTable {
         if entries.is_empty() {
             return Ok(Self {
                 matcher: None,
-                overlap_matcher: None,
                 entries,
                 placeholder,
                 disabled,
@@ -1606,40 +1598,14 @@ impl RedactionTable {
                 fail_enforced_view: false,
             });
         }
-        let patterns: Vec<&str> = entries.iter().map(|entry| entry.value.as_str()).collect();
-        // Single-vector invariant: the matcher's pattern list is derived from
-        // the one entry vector, so their lengths are equal by construction.
-        assert_eq!(
-            patterns.len(),
-            entries.len(),
-            "redaction matcher patterns must be 1:1 with typed entries"
-        );
-        // Coverage has a fixed per-generation memory budget. The library's
-        // automatic choice favors a DFA for small pattern counts, but a few
-        // long private keys (including their encodings) can inflate its dense
-        // transition tables past that budget. Use the compact representation
-        // for BOTH match semantics without dropping any candidate or variant.
-        let mut builder = AhoCorasick::builder();
-        builder
-            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
-            .ascii_case_insensitive(false);
-        let matcher = builder
-            .match_kind(MatchKind::LeftmostLongest)
-            .build(&patterns)
-            .map_err(|e| anyhow::anyhow!("building aho-corasick: {e}"))?;
-        // The substitution matcher over the SAME patterns. `Standard` is the
-        // only match kind that supports `find_overlapping_iter`, which
-        // `scrub_cow` needs to cover overlapping/self-overlapping literals; its
-        // `PatternID`s index `entries` identically to `matcher` (same list,
-        // same order). Kept separate from `matcher` so `is_match` and the
-        // journaling `find_iter` keep their leftmost-longest semantics.
-        let overlap_matcher = builder
-            .match_kind(MatchKind::Standard)
-            .build(&patterns)
-            .map_err(|e| anyhow::anyhow!("building aho-corasick (overlap): {e}"))?;
+        // Single-vector invariant: the matcher indexes the one entry vector and
+        // reports matches by entry position, so it cannot drift from it.
+        // Coverage has a fixed per-generation memory budget; the matcher's
+        // bounded-anchor index keeps private keys and their encodings within
+        // it without dropping any candidate or variant.
+        let matcher = literal_matcher::LiteralMatcher::build(&entries)?;
         Ok(Self {
             matcher: Some(matcher),
-            overlap_matcher: Some(overlap_matcher),
             entries,
             placeholder,
             disabled,
@@ -1848,9 +1814,8 @@ impl RedactionTable {
             })
             .collect();
         Self {
+            // Arc bump only — see the field doc; the index is not re-copied.
             matcher: self.matcher.clone(),
-            // Arc bump only — see the field doc; the automaton is not re-copied.
-            overlap_matcher: self.overlap_matcher.clone(),
             entries,
             placeholder: self.placeholder.clone(),
             disabled: self.disabled,
@@ -1993,6 +1958,14 @@ impl RedactionTable {
         Ok(origins)
     }
 
+    /// Whether any entry was collected from a private SSH key. Only the
+    /// fact leaves: it selects the remediation an over-budget refusal names.
+    pub(super) fn has_ssh_key_material(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(&entry.class, EntryClass::Ordinary { origin, .. } if origin.starts_with("$ssh:")))
+    }
+
     pub fn has_origin(&self, origin: &str) -> bool {
         self.entries
             .iter()
@@ -2021,35 +1994,18 @@ impl RedactionTable {
         let Some(matcher) = self.matcher.as_ref() else {
             return Cow::Borrowed(body);
         };
-        if !matcher.is_match(body) {
-            return Cow::Borrowed(body);
-        }
         // Enumerate EVERY occurrence of EVERY registered literal, OVERLAPPING
-        // and SELF-overlapping included. The `matcher` above is
-        // `MatchKind::LeftmostLongest`, whose `replace_all`/`find_iter` emit
-        // only NON-overlapping matches and resume PAST each one: when two
-        // registered literals overlap (share a run — e.g. `abcdefghij` and
-        // `cdefghijWXYZ` in `abcdefghijWXYZ`), or a literal self-overlaps
-        // (`aaaa` at `[0,4)` then `[1,5)`), the suppressed occurrence's tail
-        // would pass through UN-redacted, leaking a partial secret. So
-        // substitution uses `overlap_matcher` (`MatchKind::Standard`) and
-        // `find_overlapping_iter`, which yields ALL occurrences — one automaton
-        // pass, O(body + matches). Its `PatternID`s index `entries` identically
-        // to `matcher` (both built from the same pattern list, same order).
-        //
-        // `is_match` already gated the no-secret common case to a borrowed
-        // return above, so this scan runs only on bodies that carry a secret.
-        let overlap_matcher = self
-            .overlap_matcher
-            .as_ref()
-            .expect("overlap_matcher is Some whenever matcher is Some (same build site)");
-        let mut spans: Vec<(usize, usize, usize)> = overlap_matcher
-            .find_overlapping_iter(body)
-            .map(|m| (m.start(), m.end(), m.pattern().as_usize()))
-            .collect();
+        // and SELF-overlapping included. A leftmost-longest non-overlapping
+        // emit resumes PAST each match: when two registered literals overlap
+        // (share a run — e.g. `abcdefghij` and `cdefghijWXYZ` in
+        // `abcdefghijWXYZ`), or a literal self-overlaps (`aaaa` at `[0,4)` then
+        // `[1,5)`), the suppressed occurrence's tail would pass through
+        // UN-redacted, leaking a partial secret. One automaton pass,
+        // O(body + anchor hits), plus a confirmation per hit; the result is
+        // sorted by `(start, end)` and each entry index points into `entries`.
+        let spans = matcher.overlapping(&self.entries, body);
         if spans.is_empty() {
-            // `is_match` was true, so this is unreachable in practice (the same
-            // patterns drive both). Stay fail-safe: nothing to cover, borrow.
+            // The no-secret common case borrows without allocating.
             return Cow::Borrowed(body);
         }
         // Merge STRICTLY-overlapping spans into maximal covered ranges, tracking
@@ -2061,19 +2017,18 @@ impl RedactionTable {
         // behavior for adjacent distinct secrets (two placeholders, and each
         // single entry's own sealed marker) exactly. Every registered-secret
         // byte still lands inside some emitted range, overlaps included.
-        spans.sort_unstable_by_key(|&(s, e, _)| (s, e));
         let mut out = String::with_capacity(body.len());
         let mut last_end = 0usize;
         let mut i = 0usize;
         while i < spans.len() {
-            let (start, mut end, first_idx) = spans[i];
+            let (start, mut end, first_idx) = (spans[i].start, spans[i].end, spans[i].entry);
             let mut single_entry = true;
             let mut j = i + 1;
-            while j < spans.len() && spans[j].0 < end {
-                if spans[j].1 > end {
-                    end = spans[j].1;
+            while j < spans.len() && spans[j].start < end {
+                if spans[j].end > end {
+                    end = spans[j].end;
                 }
-                if spans[j].2 != first_idx {
+                if spans[j].entry != first_idx {
                     single_entry = false;
                 }
                 j += 1;
@@ -2119,8 +2074,9 @@ impl RedactionTable {
     }
 
     /// Measured private heap accounting for one immutable authority artifact.
-    /// Uses the entry heap plus each automaton's library-reported
-    /// [`aho_corasick::AhoCorasick::memory_usage`]. This value never leaves the
+    /// Uses the entry heap plus the matcher index: its automaton's
+    /// library-reported [`aho_corasick::AhoCorasick::memory_usage`] and its
+    /// anchor candidate lists. This value never leaves the
     /// daemon and is not a source or candidate fingerprint.
     pub(super) fn measured_immutable_artifact_bytes(&self) -> usize {
         let entry_bytes = self
@@ -2137,13 +2093,7 @@ impl RedactionTable {
             .matcher
             .as_ref()
             .map(|matcher| matcher.memory_usage())
-            .unwrap_or(0)
-            .saturating_add(
-                self.overlap_matcher
-                    .as_ref()
-                    .map(|matcher| matcher.memory_usage())
-                    .unwrap_or(0),
-            );
+            .unwrap_or(0);
         let unsupported_path_bytes = self
             .unsupported_files
             .capacity()
@@ -2187,9 +2137,8 @@ impl RedactionTable {
     /// A table that is already enforcing is returned unchanged.
     pub fn enforced(&self) -> Self {
         Self {
+            // Arc bump only — see the field doc; the index is not re-copied.
             matcher: self.matcher.clone(),
-            // Arc bump only — see the field doc; the automaton is not re-copied.
-            overlap_matcher: self.overlap_matcher.clone(),
             entries: self.entries.clone(),
             placeholder: self.placeholder.clone(),
             disabled: false,
@@ -2277,8 +2226,8 @@ impl RedactionTable {
     /// The maximum byte length of any literal this table can match — the
     /// finite `M` a caller needs to bound a truncation-straddle margin.
     ///
-    /// Every entry is a fixed literal string matched via `aho-corasick`
-    /// (`MatchKind::LeftmostLongest`); there is no regex or otherwise-unbounded
+    /// Every entry is a fixed literal string matched exactly (an `aho-corasick`
+    /// anchor index, see `literal_matcher`); there is no regex or otherwise-unbounded
     /// matcher in this architecture, so the longest possible match is exactly the
     /// longest registered literal. Returns `0` for an empty/no-op table (nothing
     /// can match), so a caller computing an `(M - 1)` margin must guard `M <= 1`.
@@ -2457,7 +2406,6 @@ impl RedactionTable {
     pub fn empty() -> Self {
         Self {
             matcher: None,
-            overlap_matcher: None,
             entries: Vec::new(),
             placeholder: RedactConfig::default().placeholder,
             disabled: false,
@@ -2618,9 +2566,9 @@ impl std::fmt::Debug for MatchedLiteral {
 ///
 /// This is the production, table-match-only journaling primitive (decision 11):
 /// the set it returns is *exactly* what downstream layers journal — nothing is
-/// classified free-form. It uses the table's existing Aho-Corasick matcher (the
-/// same one [`RedactionTable::scrub_cow`] uses), so a match here is a literal the
-/// table would also scrub. It performs **no** encryption and **no** DB I/O.
+/// classified free-form. It uses the table's existing matcher (the same one
+/// [`RedactionTable::scrub_cow`] uses) in its leftmost-longest non-overlapping
+/// form, so a match here is a literal the table would also scrub. It performs **no** encryption and **no** DB I/O.
 ///
 /// Each matched entry appears at most once (dedup is by entry, not by
 /// occurrence): a literal that occurs many times in `haystack` yields a single
@@ -2638,13 +2586,13 @@ pub(crate) fn match_sensitive_literals(
     let Some(matcher) = table.matcher.as_ref() else {
         return Vec::new();
     };
-    // The matcher's pattern list is 1:1 with `table.entries` by construction
-    // (see `from_redaction_entries`), so a `PatternID` indexes `entries`
-    // directly. Dedup by that index to return each entry at most once.
+    // The matcher reports entry positions in `table.entries` (see
+    // `from_redaction_entries`). Dedup by that index to return each entry at
+    // most once.
     let mut seen = vec![false; table.entries.len()];
     let mut matched = Vec::new();
-    for m in matcher.find_iter(haystack) {
-        let idx = m.pattern().as_usize();
+    for m in matcher.leftmost_longest(&table.entries, haystack) {
+        let idx = m.entry;
         if std::mem::replace(&mut seen[idx], true) {
             continue;
         }

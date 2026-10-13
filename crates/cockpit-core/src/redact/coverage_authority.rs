@@ -330,6 +330,13 @@ pub(crate) enum CoverageError {
     /// daemon's fixed file cap. The category is safe to surface; the source
     /// path and all other capture details remain confined to the worker.
     SourceFileOverLimit,
+    /// The complete capture's immutable artifact exceeds the per-generation
+    /// budget. Carries only whether private SSH key material is part of it,
+    /// which decides the remediation the message names; never a path, count,
+    /// or value.
+    ArtifactOverBudget {
+        ssh_key_material: bool,
+    },
 }
 
 impl CoverageError {
@@ -340,6 +347,23 @@ impl CoverageError {
         tracing::warn!(category, "redaction coverage unavailable (fail closed)");
         Self::Unavailable
     }
+
+    /// The per-generation artifact cap refused a capture. Logged like every
+    /// unavailable category, plus the sanitized cause and its remediation.
+    fn artifact_over_budget(ssh_key_material: bool) -> Self {
+        let error = Self::ArtifactOverBudget { ssh_key_material };
+        let cause = if ssh_key_material {
+            "ssh_key_material"
+        } else {
+            "redaction_sources"
+        };
+        tracing::warn!(
+            category = "artifact_bytes_per_generation_exceeded",
+            cause,
+            "redaction coverage unavailable (fail closed): {error}"
+        );
+        error
+    }
 }
 
 impl fmt::Display for CoverageError {
@@ -349,6 +373,14 @@ impl fmt::Display for CoverageError {
             Self::Saturated => "coverage_saturated",
             Self::Invalidated => "coverage_invalidated",
             Self::SourceFileOverLimit => "redaction source exceeds the daemon file size limit",
+            Self::ArtifactOverBudget {
+                ssh_key_material: true,
+            } => {
+                "private SSH key material exceeds the redaction coverage memory budget; point `redact.ssh_key_dir` at a directory holding only the keys to protect, or set `redact.scan_ssh_keys` to false"
+            }
+            Self::ArtifactOverBudget {
+                ssh_key_material: false,
+            } => "redaction sources exceed the redaction coverage memory budget",
         })
     }
 }
@@ -953,8 +985,8 @@ impl RedactionCoverageAuthority {
         publish_revisions: super::coverage_bindings::OwnedSourceRevisions,
     ) -> std::result::Result<Arc<RedactionCoverageGeneration>, CoverageError> {
         if build.artifact_bytes > COVERAGE_ARTIFACT_BYTES_PER_GENERATION {
-            return Err(CoverageError::unavailable(
-                "artifact_bytes_per_generation_exceeded",
+            return Err(CoverageError::artifact_over_budget(
+                build.table.has_ssh_key_material(),
             ));
         }
         let mut state = lock(&self.inner.state);

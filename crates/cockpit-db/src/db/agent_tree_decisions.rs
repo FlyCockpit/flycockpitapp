@@ -9483,7 +9483,7 @@ fn validate_host_operation_concrete_effects(concrete_effects_json: &str) -> Resu
 /// mutation are not caller authority; the exact effect field must match
 /// structurally, so a stale approval cannot be redirected to another command,
 /// request, connection, or filesystem mutation.
-#[cfg(feature = "host-approval-composition")]
+#[cfg(any(test, feature = "host-approval-composition"))]
 fn host_operation_candidate_matches_any_concrete_effect(
     candidate: &Value,
     concrete_effects: &[Value],
@@ -12088,7 +12088,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "host-approval-composition")]
     #[test]
     fn concrete_effect_fence_matches_only_the_selected_candidate_effect() {
         let selected = json!({

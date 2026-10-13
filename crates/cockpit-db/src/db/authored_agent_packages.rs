@@ -347,7 +347,7 @@ impl Db {
                 )
                 .optional()?;
             match (expected_revision.as_deref(), current.as_deref()) {
-                (None, Some(_)) | (Some(_), None) => return Ok(false),
+                (None, Some(_)) | (Some(_), None) => Ok(false),
                 (None, None) => {
                     conn.execute(
                         "INSERT INTO authored_agent_package_drafts(agent_name,draft_revision,package_digest,updated_at_unix_ms) VALUES(?1,?2,?3,?4)",

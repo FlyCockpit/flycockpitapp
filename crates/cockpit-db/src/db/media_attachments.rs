@@ -412,7 +412,7 @@ impl MediaDiscardResultV1 {
         let digest_bytes = |value: &str| -> Result<[u8; 32]> {
             validate_digest(value, "discard digest")?;
             let mut decoded = [0u8; 32];
-            for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            for (index, &[high, low]) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
                 let nibble = |byte: u8| {
                     if byte.is_ascii_digit() {
                         Some(byte - b'0')
@@ -422,8 +422,8 @@ impl MediaDiscardResultV1 {
                         None
                     }
                 };
-                decoded[index] = (nibble(pair[0]).context("invalid digest")? << 4)
-                    | nibble(pair[1]).context("invalid digest")?;
+                decoded[index] = (nibble(high).context("invalid digest")? << 4)
+                    | nibble(low).context("invalid digest")?;
             }
             Ok(decoded)
         };

@@ -277,9 +277,11 @@ impl Session {
                     &literal,
                     &reason,
                     "trusted_child_acquisition",
-                    &acquisition_id,
-                    &source_tool_call_id,
-                    now_ms,
+                    crate::db::sealed_scope::SealedAcquisitionCompletion {
+                        acquisition_id: &acquisition_id,
+                        source_tool_call_id: &source_tool_call_id,
+                        completed_at_ms: now_ms,
+                    },
                 )?;
                 vault
                     .put_item_on_conn(

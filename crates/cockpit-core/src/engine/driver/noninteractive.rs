@@ -1966,10 +1966,11 @@ impl Driver {
                 self.session.live_id(),
                 task_call_id.to_string(),
                 label.to_string(),
-                outcome,
-                report.map(str::to_owned),
-                None,
-                serde_json::json!({
+                crate::db::agent_tree_decisions::TaskDelegationChildSettlement {
+                    outcome,
+                    report: report.map(str::to_owned),
+                    snapshot_json: None,
+                    receipt_json: serde_json::json!({
                     "source": "task_delegation",
                     "task_call_id": task_call_id,
                     "label": label,
@@ -1980,6 +1981,7 @@ impl Driver {
                     },
                 })
                 .to_string(),
+                },
                 crate::agent_tree::system_now_unix_ms(),
                 None,
             )
@@ -10324,10 +10326,12 @@ async fn recover_pending_recursive_continuation(
                     settlement_session.id,
                     parent_agent_instance_id,
                     child_agent_instance_id,
-                    recovered.label.clone(),
-                    recovered.child_agent.clone(),
-                    recovered.report.clone(),
-                    super::is_host_failure_sentinel(recovered.report.as_str()),
+                    crate::db::agent_tree_decisions::RecursiveChildOutcomeReport {
+                        label: recovered.label.clone(),
+                        child_agent: recovered.child_agent.clone(),
+                        report: recovered.report.clone(),
+                        failed: super::is_host_failure_sentinel(recovered.report.as_str()),
+                    },
                     crate::agent_tree::system_now_unix_ms(),
                 )
                 .await?;
@@ -13887,10 +13891,12 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                                                         session.id,
                                                         parent_agent_instance_id,
                                                         child_agent_instance_id,
-                                                        entry.label.clone(),
-                                                        entry.child_agent.clone(),
-                                                        report.clone(),
-                                                        true,
+                                                        crate::db::agent_tree_decisions::RecursiveChildOutcomeReport {
+                                                            label: entry.label.clone(),
+                                                            child_agent: entry.child_agent.clone(),
+                                                            report: report.clone(),
+                                                            failed: true,
+                                                        },
                                                         crate::agent_tree::system_now_unix_ms(),
                                                     )
                                                     .await
@@ -13931,10 +13937,12 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                                                     session.id,
                                                     parent_agent_instance_id,
                                                     child_agent_instance_id,
-                                                    entry.label.clone(),
-                                                    entry.child_agent.clone(),
-                                                    report.clone(),
-                                                    true,
+                                                    crate::db::agent_tree_decisions::RecursiveChildOutcomeReport {
+                                                        label: entry.label.clone(),
+                                                        child_agent: entry.child_agent.clone(),
+                                                        report: report.clone(),
+                                                        failed: true,
+                                                    },
                                                     crate::agent_tree::system_now_unix_ms(),
                                                 )
                                                 .await
@@ -14008,10 +14016,12 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                                     session.id,
                                     parent_agent_instance_id,
                                     child_agent_instance_id,
-                                    entry.label.clone(),
-                                    entry.child_agent.clone(),
-                                    report.clone(),
-                                    super::is_host_failure_sentinel(report.as_str()),
+                                    crate::db::agent_tree_decisions::RecursiveChildOutcomeReport {
+                                        label: entry.label.clone(),
+                                        child_agent: entry.child_agent.clone(),
+                                        report: report.clone(),
+                                        failed: super::is_host_failure_sentinel(report.as_str()),
+                                    },
                                     crate::agent_tree::system_now_unix_ms(),
                                 )
                                 .await

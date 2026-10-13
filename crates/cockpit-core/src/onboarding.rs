@@ -707,10 +707,12 @@ impl OnboardingAuthority {
             .onboarding_transition(
                 current,
                 operation_id,
-                stage,
-                state,
-                false,
-                placement,
+                crate::db::onboarding::OnboardingTransitionOutcome {
+                    next_stage: stage,
+                    bootstrap_state: state,
+                    limited_mode: false,
+                    selected_secure_placement: placement,
+                },
                 stage_entry_config_generation(),
             )
             .await?;
@@ -740,10 +742,12 @@ impl OnboardingAuthority {
             .onboarding_transition(
                 current,
                 client_operation_id,
-                DbStage::Provider,
-                DbBootstrapState::Ready,
-                false,
-                selected_secure_placement,
+                crate::db::onboarding::OnboardingTransitionOutcome {
+                    next_stage: DbStage::Provider,
+                    bootstrap_state: DbBootstrapState::Ready,
+                    limited_mode: false,
+                    selected_secure_placement,
+                },
                 stage_entry_config_generation(),
             )
             .await?;

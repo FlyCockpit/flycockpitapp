@@ -171,7 +171,7 @@ pub fn read_prefix_and_hash_from_file(
         }
         read_total = read_total
             .checked_add(n as u64)
-            .ok_or_else(|| BoundedIoError::Limit {
+            .ok_or(BoundedIoError::Limit {
                 what: "file",
                 limit: max_len,
                 actual: u64::MAX,

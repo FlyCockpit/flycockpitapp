@@ -689,6 +689,38 @@ fn validate_component(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Caller-supplied bounds for one held-package tree read.
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy)]
+struct HeldTreeLimits {
+    per_file_limit: usize,
+    total_limit: usize,
+    max_entries: usize,
+    max_depth: usize,
+}
+
+/// Bounds plus running totals shared by every level of one held-package tree
+/// read, so the entry, byte, and duplicate-path limits apply to the whole tree.
+#[cfg(any(unix, windows))]
+struct HeldTreeRead {
+    limits: HeldTreeLimits,
+    total: usize,
+    entries: usize,
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+#[cfg(any(unix, windows))]
+impl HeldTreeRead {
+    fn new(limits: HeldTreeLimits) -> Self {
+        Self {
+            limits,
+            total: 0,
+            entries: 0,
+            files: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 fn digest(parts: &[&[u8]]) -> String {
     let mut hash = Sha256::new();
     for part in parts {
@@ -701,7 +733,6 @@ fn digest(parts: &[&[u8]]) -> String {
 #[cfg(unix)]
 mod imp {
     use std::ffi::{CString, OsStr};
-    use std::io::Read as _;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
@@ -995,22 +1026,14 @@ mod imp {
                     "held package component is not a directory"
                 );
             }
-            let mut files = std::collections::BTreeMap::new();
-            let mut total = 0usize;
-            let mut entries = 0usize;
-            read_tree_from_directory(
-                &root,
-                "",
-                0,
+            let mut tree = HeldTreeRead::new(HeldTreeLimits {
                 per_file_limit,
                 total_limit,
                 max_entries,
                 max_depth,
-                &mut total,
-                &mut entries,
-                &mut files,
-            )?;
-            Ok(Some(files))
+            });
+            read_tree_from_directory(&mut tree, &root, "", 0)?;
+            Ok(Some(tree.files))
         }
 
         pub(super) fn read_regular_executable_file_bounded(
@@ -1507,7 +1530,7 @@ mod imp {
         held_fd::fstatat_nofollow(dir.as_raw_fd(), name).is_ok_and(|named| {
             named.st_mode & libc::S_IFMT == libc::S_IFREG
                 && named.st_dev as u64 == held.dev()
-                && named.st_ino as u64 == held.ino()
+                && named.st_ino == held.ino()
         })
     }
 
@@ -1591,17 +1614,17 @@ mod imp {
     }
 
     fn read_tree_from_directory(
+        tree: &mut HeldTreeRead,
         directory: &File,
         relative: &str,
         depth: usize,
-        per_file_limit: usize,
-        total_limit: usize,
-        max_entries: usize,
-        max_depth: usize,
-        total: &mut usize,
-        entries: &mut usize,
-        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
     ) -> Result<()> {
+        let HeldTreeLimits {
+            per_file_limit,
+            total_limit,
+            max_entries,
+            max_depth,
+        } = tree.limits;
         use std::ffi::CStr;
         use std::os::fd::FromRawFd as _;
 
@@ -1632,11 +1655,12 @@ mod imp {
                 if bytes == b"." || bytes == b".." {
                     continue;
                 }
-                *entries = entries
+                tree.entries = tree
+                    .entries
                     .checked_add(1)
                     .context("held package entry count overflow")?;
                 ensure!(
-                    *entries <= max_entries,
+                    tree.entries <= max_entries,
                     "held package exceeds its entry count limit"
                 );
                 ensure!(
@@ -1670,18 +1694,7 @@ mod imp {
                         depth < max_depth,
                         "held package exceeds its directory depth limit"
                     );
-                    read_tree_from_directory(
-                        &held,
-                        &key,
-                        depth + 1,
-                        per_file_limit,
-                        total_limit,
-                        max_entries,
-                        max_depth,
-                        total,
-                        entries,
-                        files,
-                    )?;
+                    read_tree_from_directory(tree, &held, &key, depth + 1)?;
                 } else {
                     ensure!(metadata.is_file(), "held package entry is not regular");
                     crate::bounded::clear_nonblock(&held)
@@ -1698,13 +1711,13 @@ mod imp {
                         bytes.len() <= per_file_limit,
                         "held package file exceeds its byte limit"
                     );
-                    *total = total.saturating_add(bytes.len());
+                    tree.total = tree.total.saturating_add(bytes.len());
                     ensure!(
-                        *total <= total_limit,
+                        tree.total <= total_limit,
                         "held package exceeds its total byte limit"
                     );
                     ensure!(
-                        files.insert(key, bytes).is_none(),
+                        tree.files.insert(key, bytes).is_none(),
                         "held package path is duplicated"
                     );
                 }
@@ -1770,7 +1783,6 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
-    use std::io::Read as _;
     use std::mem::size_of;
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
@@ -2283,22 +2295,14 @@ mod imp {
                 root = opened;
                 verify_directory_handle(&root)?;
             }
-            let mut files = std::collections::BTreeMap::new();
-            let mut total = 0usize;
-            let mut entries = 0usize;
-            read_tree_from_directory(
-                &root,
-                "",
-                0,
+            let mut tree = HeldTreeRead::new(HeldTreeLimits {
                 per_file_limit,
                 total_limit,
                 max_entries,
                 max_depth,
-                &mut total,
-                &mut entries,
-                &mut files,
-            )?;
-            Ok(Some(files))
+            });
+            read_tree_from_directory(&mut tree, &root, "", 0)?;
+            Ok(Some(tree.files))
         }
 
         pub(super) fn read_regular_executable_file_bounded(
@@ -3217,17 +3221,17 @@ mod imp {
     }
 
     fn read_tree_from_directory(
+        tree: &mut HeldTreeRead,
         directory: &File,
         relative: &str,
         depth: usize,
-        per_file_limit: usize,
-        total_limit: usize,
-        max_entries: usize,
-        max_depth: usize,
-        total: &mut usize,
-        entries: &mut usize,
-        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
     ) -> Result<()> {
+        let HeldTreeLimits {
+            per_file_limit,
+            total_limit,
+            max_entries,
+            max_depth,
+        } = tree.limits;
         const FILE_NAMES_INFORMATION_CLASS: u32 = 12;
         let mut restart = true;
         loop {
@@ -3290,11 +3294,12 @@ mod imp {
             {
                 continue;
             }
-            *entries = entries
+            tree.entries = tree
+                .entries
                 .checked_add(1)
                 .context("held Windows package entry count overflow")?;
             ensure!(
-                *entries <= max_entries,
+                tree.entries <= max_entries,
                 "held Windows package exceeds its entry count limit"
             );
             let name = os_name
@@ -3325,18 +3330,7 @@ mod imp {
                     depth < max_depth,
                     "held Windows package exceeds its directory depth limit"
                 );
-                read_tree_from_directory(
-                    &held,
-                    &key,
-                    depth + 1,
-                    per_file_limit,
-                    total_limit,
-                    max_entries,
-                    max_depth,
-                    total,
-                    entries,
-                    files,
-                )?;
+                read_tree_from_directory(tree, &held, &key, depth + 1)?;
             } else {
                 ensure!(
                     metadata.is_file(),
@@ -3355,13 +3349,13 @@ mod imp {
                     bytes.len() <= per_file_limit,
                     "held Windows package file exceeds its byte limit"
                 );
-                *total = total.saturating_add(bytes.len());
+                tree.total = tree.total.saturating_add(bytes.len());
                 ensure!(
-                    *total <= total_limit,
+                    tree.total <= total_limit,
                     "held Windows package exceeds its total byte limit"
                 );
                 ensure!(
-                    files.insert(key, bytes).is_none(),
+                    tree.files.insert(key, bytes).is_none(),
                     "held Windows package path is duplicated"
                 );
             }

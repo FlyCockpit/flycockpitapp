@@ -522,9 +522,11 @@ fn import_session_archive_graph_conn(
         conn,
         graph,
         source_ids,
-        id_map,
-        task_call_id_map,
-        inference_call_id_map,
+        ArchiveImportIdMaps {
+            id_map,
+            task_call_id_map,
+            inference_call_id_map,
+        },
         imported,
         pending_forks,
         thread_anchors,
@@ -655,17 +657,30 @@ fn restore_delegations(
     Ok(())
 }
 
+/// Source-to-destination identity remaps minted once per archive import.
+struct ArchiveImportIdMaps {
+    /// Source session id -> freshly minted destination session id.
+    id_map: BTreeMap<Uuid, Uuid>,
+    /// Source delegation task-call id -> import-scoped task-call id.
+    task_call_id_map: BTreeMap<String, String>,
+    /// Source inference-call id -> destination inference-call id.
+    inference_call_id_map: BTreeMap<String, String>,
+}
+
 fn restore_events_and_artifacts(
     conn: &Connection,
     graph: SessionArchiveImportGraph,
     source_ids: BTreeSet<Uuid>,
-    id_map: BTreeMap<Uuid, Uuid>,
-    task_call_id_map: BTreeMap<String, String>,
-    inference_call_id_map: BTreeMap<String, String>,
+    id_maps: ArchiveImportIdMaps,
     imported: Vec<Uuid>,
     pending_forks: Vec<(Uuid, Uuid, String, bool)>,
     thread_anchors: BTreeMap<Uuid, (Uuid, i64)>,
 ) -> Result<ArchiveImportResult> {
+    let ArchiveImportIdMaps {
+        id_map,
+        task_call_id_map,
+        inference_call_id_map,
+    } = id_maps;
     let provenance_ts = graph
         .events
         .iter()

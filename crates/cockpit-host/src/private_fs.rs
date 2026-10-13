@@ -276,17 +276,14 @@ fn private_runtime_root_from(
     xdg_runtime_dir: Option<&OsStr>,
     darwin_user_temp_dir: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    absolute_non_empty_path(xdg_runtime_dir).or_else(|| {
-        #[cfg(target_os = "macos")]
-        {
-            darwin_user_temp_dir
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = darwin_user_temp_dir;
-            None
-        }
-    })
+    #[cfg(target_os = "macos")]
+    let fallback = darwin_user_temp_dir;
+    #[cfg(not(target_os = "macos"))]
+    let fallback = {
+        let _ = darwin_user_temp_dir;
+        None
+    };
+    absolute_non_empty_path(xdg_runtime_dir).or(fallback)
 }
 
 fn absolute_non_empty_path(value: Option<&OsStr>) -> Option<PathBuf> {
@@ -1142,22 +1139,30 @@ pub fn read_nofollow_directory_tree(
     per_file_limit: u64,
     total_limit: u64,
 ) -> std::result::Result<std::collections::BTreeMap<String, Vec<u8>>, PrivateFsError> {
-    fn visit(
-        dir: &std::fs::File,
-        relative_dir: &Path,
-        root: &Path,
+    /// Limits and running totals shared by every level of one tree walk.
+    struct TreeWalk<'a> {
+        root: &'a Path,
         per_file_limit: u64,
         total_limit: u64,
+        total: u64,
+        entries: usize,
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+    }
+
+    fn visit(
+        walk: &mut TreeWalk<'_>,
+        dir: &std::fs::File,
+        relative_dir: &Path,
         depth: usize,
-        total: &mut u64,
-        entries: &mut usize,
-        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
     ) -> std::result::Result<(), PrivateFsError> {
         use std::ffi::{CStr, CString};
         use std::io::Read as _;
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::ffi::OsStringExt as _;
 
+        let root = walk.root;
+        let per_file_limit = walk.per_file_limit;
+        let total_limit = walk.total_limit;
         let duplicated = unsafe { libc::dup(dir.as_raw_fd()) };
         if duplicated < 0 {
             return Err(PrivateFsError::io(
@@ -1176,27 +1181,23 @@ pub fn read_nofollow_directory_tree(
         }
 
         let result = (|| {
-            loop {
-                let Some(entry) = read_directory_entry(stream).map_err(|error| {
-                    PrivateFsError::io(
-                        format!("enumerating package directory under {}", root.display()),
-                        error,
-                    )
-                })?
-                else {
-                    break;
-                };
+            while let Some(entry) = read_directory_entry(stream).map_err(|error| {
+                PrivateFsError::io(
+                    format!("enumerating package directory under {}", root.display()),
+                    error,
+                )
+            })? {
                 let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
                 if name == b"." || name == b".." {
                     continue;
                 }
-                *entries = entries.checked_add(1).ok_or_else(|| {
+                walk.entries = walk.entries.checked_add(1).ok_or_else(|| {
                     PrivateFsError::Containment(format!(
                         "{}: package entry count overflow",
                         root.display()
                     ))
                 })?;
-                if *entries > MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES {
+                if walk.entries > MAX_NOFOLLOW_DIRECTORY_TREE_ENTRIES {
                     return Err(PrivateFsError::Containment(format!(
                         "{}: package exceeds its entry count limit",
                         root.display()
@@ -1255,17 +1256,7 @@ pub fn read_nofollow_directory_tree(
                             root.display()
                         )));
                     }
-                    visit(
-                        &held,
-                        &relative,
-                        root,
-                        per_file_limit,
-                        total_limit,
-                        depth + 1,
-                        total,
-                        entries,
-                        files,
-                    )?;
+                    visit(walk, &held, &relative, depth + 1)?;
                     continue;
                 }
                 if !metadata.is_file() {
@@ -1290,8 +1281,8 @@ pub fn read_nofollow_directory_tree(
                         root.display()
                     )));
                 }
-                *total = total.saturating_add(bytes.len() as u64);
-                if *total > total_limit {
+                walk.total = walk.total.saturating_add(bytes.len() as u64);
+                if walk.total > total_limit {
                     return Err(PrivateFsError::Containment(format!(
                         "{}: package exceeds {total_limit} byte limit",
                         root.display()
@@ -1303,7 +1294,7 @@ pub fn read_nofollow_directory_tree(
                         root.display()
                     ))
                 })?;
-                if files.insert(key.to_string(), bytes).is_some() {
+                if walk.files.insert(key.to_string(), bytes).is_some() {
                     return Err(PrivateFsError::Containment(format!(
                         "{}: package entry path collides with another entry",
                         root.display()
@@ -1317,21 +1308,16 @@ pub fn read_nofollow_directory_tree(
     }
 
     let root_handle = walk_private_dir(root, false)?;
-    let mut files = std::collections::BTreeMap::new();
-    let mut total = 0;
-    let mut entries = 0;
-    visit(
-        &root_handle,
-        Path::new(""),
+    let mut walk = TreeWalk {
         root,
         per_file_limit,
         total_limit,
-        0,
-        &mut total,
-        &mut entries,
-        &mut files,
-    )?;
-    Ok(files)
+        total: 0,
+        entries: 0,
+        files: std::collections::BTreeMap::new(),
+    };
+    visit(&mut walk, &root_handle, Path::new(""), 0)?;
+    Ok(walk.files)
 }
 
 /// Windows package traversal is rooted in a retained directory handle and
@@ -1502,7 +1488,7 @@ pub fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<(
         )
         .map_err(anyhow::Error::from)
         .context("renaming directory without replacement")?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -1543,7 +1529,7 @@ pub fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<(
                 destination.display()
             ));
         }
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -2064,14 +2050,14 @@ fn write_private_file_in_held_dir(
     // Refuse a hostile pre-existing target (symlink / directory / hard-linked)
     // before writing; the rename below is non-following regardless, so a secret
     // is never disclosed through a planted link even under a race.
-    refuse_hostile_target(&dir_handle, &final_c, path)?;
+    refuse_hostile_target(dir_handle, &final_c, path)?;
 
     // Crash-safe atomic replacement, fully fd-anchored: write the payload into a
     // fresh O_EXCL temp entry (moded 0600 at create) beneath the held dir fd,
     // fsync it, renameat it over the target relative to the SAME fd, then fsync
     // the held directory fd so the rename itself is durable. A crash at any
     // point leaves either the previous file intact or the complete new file.
-    let (mut temp, temp_c) = create_temp_in(&dir_handle, path)?;
+    let (mut temp, temp_c) = create_temp_in(dir_handle, path)?;
     let staged = (|| -> Result<()> {
         temp.write_all(bytes)
             .with_context(|| format!("writing temp file for {}", path.display()))?;
@@ -2082,7 +2068,7 @@ fn write_private_file_in_held_dir(
         Ok(())
     })();
     if let Err(error) = staged {
-        unlinkat_best_effort(&dir_handle, &temp_c);
+        unlinkat_best_effort(dir_handle, &temp_c);
         return Err(error);
     }
 
@@ -2121,7 +2107,7 @@ fn write_private_file_in_held_dir(
             device_id_matches(named.st_dev, held.dev()) && named.st_ino == held.ino()
         };
         if !matches {
-            unlinkat_best_effort(&dir_handle, &temp_c);
+            unlinkat_best_effort(dir_handle, &temp_c);
             anyhow::bail!(
                 "aborting write of {}: staged temp entry was substituted before publish",
                 path.display()
@@ -2143,10 +2129,10 @@ fn write_private_file_in_held_dir(
             )
         },
         PrivateWritePublish::Exclusive => {
-            match exclusive_publish_in_dir(&dir_handle, &temp_c, &final_c) {
+            match exclusive_publish_in_dir(dir_handle, &temp_c, &final_c) {
                 Ok(()) => 0,
                 Err(error) => {
-                    unlinkat_best_effort(&dir_handle, &temp_c);
+                    unlinkat_best_effort(dir_handle, &temp_c);
                     return Err(anyhow::Error::from(error)).with_context(|| {
                         format!(
                             "exclusive create of {} lost the race or failed",
@@ -2159,7 +2145,7 @@ fn write_private_file_in_held_dir(
     };
     if renamed != 0 {
         let error = std::io::Error::last_os_error();
-        unlinkat_best_effort(&dir_handle, &temp_c);
+        unlinkat_best_effort(dir_handle, &temp_c);
         return Err(anyhow::Error::from(error))
             .with_context(|| format!("atomically replacing {}", path.display()));
     }
@@ -3118,11 +3104,11 @@ pub fn write_private_export_file(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     #[cfg(unix)]
     {
-        return write_private_file(path, bytes);
+        write_private_file(path, bytes)
     }
     #[cfg(windows)]
     {
-        return write_windows_private_export_file(path, bytes);
+        write_windows_private_export_file(path, bytes)
     }
     #[cfg(not(any(unix, windows)))]
     {

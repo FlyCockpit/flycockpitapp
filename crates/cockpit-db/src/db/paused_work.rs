@@ -62,6 +62,16 @@ pub struct PausedWorkRow {
     pub resolved_at: Option<i64>,
 }
 
+/// The descriptive columns of one `paused_session_work` row: who was running,
+/// where, why it paused, and which daemon build parked it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PausedWorkDescription {
+    pub active_agent: String,
+    pub project_root: String,
+    pub reason: String,
+    pub daemon_version: String,
+}
+
 impl Db {
     pub async fn upsert_paused_session_work(
         &self,
@@ -73,19 +83,18 @@ impl Db {
         daemon_version: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        let active_agent = active_agent.to_owned();
-        let project_root = project_root.to_owned();
-        let reason = reason.to_owned();
-        let daemon_version = daemon_version.to_owned();
+        let description = PausedWorkDescription {
+            active_agent: active_agent.to_owned(),
+            project_root: project_root.to_owned(),
+            reason: reason.to_owned(),
+            daemon_version: daemon_version.to_owned(),
+        };
         self.write(move |conn| {
             Self::upsert_paused_session_work_conn(
                 conn,
                 session_id,
-                &active_agent,
-                &project_root,
-                &reason,
+                &description,
                 pending_tool_count,
-                &daemon_version,
                 now,
             )
         })
@@ -95,13 +104,16 @@ impl Db {
     pub fn upsert_paused_session_work_conn(
         conn: &Connection,
         session_id: Uuid,
-        active_agent: &str,
-        project_root: &str,
-        reason: &str,
+        description: &PausedWorkDescription,
         pending_tool_count: i64,
-        daemon_version: &str,
         now: i64,
     ) -> Result<()> {
+        let PausedWorkDescription {
+            active_agent,
+            project_root,
+            reason,
+            daemon_version,
+        } = description;
         conn.execute(
             "INSERT INTO paused_session_work (
                     session_id, status, active_agent, project_root, reason,
@@ -138,16 +150,9 @@ impl Db {
         &self,
         owner_session_id: Uuid,
         interrupt_session_id: Uuid,
-        active_agent: &str,
-        project_root: &str,
-        reason: &str,
+        description: PausedWorkDescription,
         pending_floor: i64,
-        daemon_version: &str,
     ) -> Result<i64> {
-        let active_agent = active_agent.to_owned();
-        let project_root = project_root.to_owned();
-        let reason = reason.to_owned();
-        let daemon_version = daemon_version.to_owned();
         let now = Utc::now().timestamp();
         self.transaction(move |conn| {
             let interrupt_ids = {
@@ -189,11 +194,8 @@ impl Db {
                 Self::upsert_paused_session_work_conn(
                     conn,
                     owner_session_id,
-                    &active_agent,
-                    &project_root,
-                    &reason,
+                    &description,
                     pending,
-                    &daemon_version,
                     now,
                 )?;
             }

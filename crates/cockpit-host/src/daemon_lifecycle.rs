@@ -113,6 +113,10 @@ fn open_lifetime_lock(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .create(true)
+        // Advisory-lock anchor only: nothing reads or writes its bytes, and a
+        // release witness opens the same path while another generation may
+        // hold the lock, so opening must never mutate the file.
+        .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
@@ -1137,10 +1141,12 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = (pair[0] as char).to_digit(16)? as u8;
-            let low = (pair[1] as char).to_digit(16)? as u8;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| {
+            let high = (high as char).to_digit(16)? as u8;
+            let low = (low as char).to_digit(16)? as u8;
             Some((high << 4) | low)
         })
         .collect()

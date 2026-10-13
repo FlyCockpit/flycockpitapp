@@ -134,6 +134,19 @@ pub struct MessageReceiptStatus {
     pub attachments: Vec<MessageAttachmentReceiptIdentity>,
 }
 
+/// The exact committed-acceptance identity a replay must match field for
+/// field before it may return the durable safe outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageReplayKey {
+    pub session_id: Uuid,
+    pub operation_id: [u8; 16],
+    pub actor: MessageActor,
+    pub client_submission_id: [u8; 16],
+    pub request_hash: [u8; 32],
+    pub message_request_digest: [u8; 32],
+    pub attachment_set_digest: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedMessageQueueRow {
     pub queue_item_id: [u8; 16],
@@ -154,14 +167,17 @@ impl Db {
     /// identity is valid for both local-owner and verified remote actors.
     pub async fn exact_message_replay_outcome(
         &self,
-        session_id: Uuid,
-        operation_id: [u8; 16],
-        actor: MessageActor,
-        client_submission_id: [u8; 16],
-        request_hash: [u8; 32],
-        message_request_digest: [u8; 32],
-        attachment_set_digest: [u8; 32],
+        key: MessageReplayKey,
     ) -> Result<Option<MessageSafeOutcome>> {
+        let MessageReplayKey {
+            session_id,
+            operation_id,
+            actor,
+            client_submission_id,
+            request_hash,
+            message_request_digest,
+            attachment_set_digest,
+        } = key;
         let (actor_kind, actor_id, actor_generation) = actor_parts(actor);
         self.read(move |conn| {
             let outcome = conn
@@ -214,15 +230,15 @@ impl Db {
         message_request_digest: [u8; 32],
         attachment_set_digest: [u8; 32],
     ) -> Result<Option<MessageSafeOutcome>> {
-        self.exact_message_replay_outcome(
+        self.exact_message_replay_outcome(MessageReplayKey {
             session_id,
             operation_id,
-            MessageActor::LocalOwner,
+            actor: MessageActor::LocalOwner,
             client_submission_id,
             request_hash,
             message_request_digest,
             attachment_set_digest,
-        )
+        })
         .await
     }
 

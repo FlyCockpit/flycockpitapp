@@ -1174,7 +1174,7 @@ impl ProcessTreeGuard {
             // can return from: `process_group(0)` already placed the child in
             // a fresh group before exec. Resume is a no-op.
             let _ = child;
-            return Ok(());
+            Ok(())
         }
         #[cfg(windows)]
         {
@@ -2240,10 +2240,10 @@ pub fn terminate_group_kill_wait_status(
             }
             std::thread::yield_now();
         }
-        return GroupKillWaitOutcome::Unproven {
+        GroupKillWaitOutcome::Unproven {
             leader_status,
             failure: GroupContainmentFailure::GroupDrainDeadline(group_member_snapshot(pgid)),
-        };
+        }
     }
     #[cfg(not(unix))]
     {

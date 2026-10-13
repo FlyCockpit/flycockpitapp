@@ -1881,10 +1881,12 @@ mod tests {
                 session.session_id,
                 operation.operation_id,
                 &lease,
-                snapshot_json,
-                lease.snapshot_generation(),
-                digest(&canonical_snapshot),
-                24,
+                crate::db::agent_tree_decisions::HostCapabilityRefreshSnapshotReceipt {
+                    result_snapshot_json: snapshot_json,
+                    generation: lease.snapshot_generation(),
+                    digest: digest(&canonical_snapshot)
+                },
+                24
             )
             .await
             .unwrap()
@@ -3201,16 +3203,20 @@ mod tests {
             .await
             .unwrap();
         db.reserve_host_approval_final_operation(
-            session.session_id,
-            agent.agent_instance_id,
-            operation_id,
-            authorization_group_id,
-            tool_call_id,
-            member_index,
-            concrete_effect_digest,
-            operation_kind.clone(),
-            canonical_input_json.clone(),
-            input_digest.clone(),
+            crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                session_id: session.session_id,
+                agent_instance_id: agent.agent_instance_id,
+                operation_id,
+                operation_kind: operation_kind.clone(),
+                canonical_input_json: canonical_input_json.clone(),
+                input_digest: input_digest.clone(),
+            },
+            crate::db::agent_tree_decisions::HostAuthorizationGroupMember {
+                authorization_group_id,
+                tool_call_id,
+                member_index,
+                concrete_effect_digest,
+            },
             HostApprovalAuthority::trusted_host().into_db(),
             19,
         )
@@ -3328,13 +3334,15 @@ mod tests {
             !db.consume_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
-                session.session_id,
-                agent.agent_instance_id,
-                operation_id,
-                operation_kind.clone(),
-                different_input.canonical_input_json,
-                different_input.input_digest,
-                24,
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id,
+                    operation_kind: operation_kind.clone(),
+                    canonical_input_json: different_input.canonical_input_json,
+                    input_digest: different_input.input_digest
+                },
+                24
             )
             .await
             .unwrap(),
@@ -3344,13 +3352,15 @@ mod tests {
             db.consume_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
-                session.session_id,
-                agent.agent_instance_id,
-                operation_id,
-                operation_kind.clone(),
-                canonical_input_json.clone(),
-                input_digest.clone(),
-                25,
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id,
+                    operation_kind: operation_kind.clone(),
+                    canonical_input_json: canonical_input_json.clone(),
+                    input_digest: input_digest.clone()
+                },
+                25
             )
             .await
             .unwrap()
@@ -3377,13 +3387,15 @@ mod tests {
             db.consume_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
-                session.session_id,
-                agent.agent_instance_id,
-                operation_id,
-                operation_kind.clone(),
-                canonical_input_json.clone(),
-                input_digest.clone(),
-                26,
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id,
+                    operation_kind: operation_kind.clone(),
+                    canonical_input_json: canonical_input_json.clone(),
+                    input_digest: input_digest.clone()
+                },
+                26
             )
             .await
             .unwrap(),
@@ -3393,17 +3405,19 @@ mod tests {
             db.claim_host_approval_effect_handoff(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
-                session.session_id,
-                agent.agent_instance_id,
-                operation_id,
-                operation_kind.clone(),
-                canonical_input_json.clone(),
-                input_digest.clone(),
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id,
+                    operation_kind: operation_kind.clone(),
+                    canonical_input_json: canonical_input_json.clone(),
+                    input_digest: input_digest.clone()
+                },
                 serde_json::to_string(&[serde_json::json!({
                     "execute": {"operation": "test"},
                 })])
                 .unwrap(),
-                27,
+                27
             )
             .await
             .unwrap(),
@@ -3414,13 +3428,15 @@ mod tests {
             !db.consume_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
-                session.session_id,
-                agent.agent_instance_id,
-                operation_id,
-                operation_kind.clone(),
-                canonical_input_json.clone(),
-                input_digest.clone(),
-                28,
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id,
+                    operation_kind: operation_kind.clone(),
+                    canonical_input_json: canonical_input_json.clone(),
+                    input_digest: input_digest.clone()
+                },
+                28
             )
             .await
             .unwrap(),
@@ -3430,15 +3446,17 @@ mod tests {
             db.complete_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
-                session.session_id,
-                agent.agent_instance_id,
-                operation_id,
-                operation_kind.clone(),
-                canonical_input_json.clone(),
-                input_digest.clone(),
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id,
+                    operation_kind: operation_kind.clone(),
+                    canonical_input_json: canonical_input_json.clone(),
+                    input_digest: input_digest.clone()
+                },
                 true,
                 r#"{"outcome":"completed"}"#.into(),
-                29,
+                29
             )
             .await
             .unwrap()
@@ -3447,13 +3465,15 @@ mod tests {
             !db.consume_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
-                session.session_id,
-                agent.agent_instance_id,
-                operation_id,
-                operation_kind,
-                canonical_input_json,
-                input_digest,
-                30,
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id,
+                    operation_kind,
+                    canonical_input_json,
+                    input_digest
+                },
+                30
             )
             .await
             .unwrap(),
@@ -3501,16 +3521,20 @@ mod tests {
             .await
             .unwrap();
         db.reserve_host_approval_final_operation(
-            session.session_id,
-            agent.agent_instance_id,
-            operation.operation_id,
-            operation.authorization_group_id,
-            operation.tool_call_id.clone(),
-            operation.member_index,
-            operation.concrete_effect_digest.clone(),
-            operation.operation_kind.clone(),
-            operation.canonical_input_json.clone(),
-            operation.input_digest.clone(),
+            crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                session_id: session.session_id,
+                agent_instance_id: agent.agent_instance_id,
+                operation_id: operation.operation_id,
+                operation_kind: operation.operation_kind.clone(),
+                canonical_input_json: operation.canonical_input_json.clone(),
+                input_digest: operation.input_digest.clone(),
+            },
+            crate::db::agent_tree_decisions::HostAuthorizationGroupMember {
+                authorization_group_id: operation.authorization_group_id,
+                tool_call_id: operation.tool_call_id.clone(),
+                member_index: operation.member_index,
+                concrete_effect_digest: operation.concrete_effect_digest.clone(),
+            },
             HostApprovalAuthority::trusted_host().into_db(),
             10,
         )
@@ -3836,13 +3860,15 @@ mod tests {
             !db.consume_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
-                session.session_id,
-                agent.agent_instance_id,
-                approved_operation_id,
-                operation_kind_for_consume,
-                canonical_input_for_consume,
-                input_digest_for_consume,
-                22,
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id: approved_operation_id,
+                    operation_kind: operation_kind_for_consume,
+                    canonical_input_json: canonical_input_for_consume,
+                    input_digest: input_digest_for_consume
+                },
+                22
             )
             .await
             .unwrap(),
@@ -3852,13 +3878,15 @@ mod tests {
             db.reject_unclaimed_host_approval_final_operation(
                 HostApprovalAuthority::trusted_host().into_db(),
                 interrupt_id,
-                session.session_id,
-                agent.agent_instance_id,
-                approved_operation_id,
-                operation_kind_for_scope_cleanup,
-                canonical_input_for_scope_cleanup,
-                input_digest_for_scope_cleanup,
-                22,
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id: approved_operation_id,
+                    operation_kind: operation_kind_for_scope_cleanup,
+                    canonical_input_json: canonical_input_for_scope_cleanup,
+                    input_digest: input_digest_for_scope_cleanup
+                },
+                22
             )
             .await
             .unwrap(),
@@ -6315,9 +6343,12 @@ impl AgentTreeLifecycle {
                 self.db
                     .create_host_capability_refresh_decision_for_interrupt(
                         input,
-                        operation.operation_id,
-                        operation.request_id,
-                        operation.requires_dedicated_child_initialization(),
+                        crate::db::agent_tree_decisions::HostCapabilityRefreshDecisionBinding {
+                            operation_id: operation.operation_id,
+                            request_id: operation.request_id,
+                            requires_dedicated_child_initialization: operation
+                                .requires_dedicated_child_initialization(),
+                        },
                         interrupt_id,
                         HostCapabilityRefreshAuthority::trusted_daemon_host().into_db(),
                         now_unix_ms,
@@ -6574,9 +6605,11 @@ impl AgentTreeLifecycle {
         let outcome = self
             .db
             .resolve_decision_request_with_resume_payload_and_code_root_receipt(
-                session_id,
-                decision.decision_request_id,
-                decision.revision,
+                crate::db::agent_tree_decisions::DecisionRevisionRef {
+                    session_id,
+                    decision_request_id: decision.decision_request_id,
+                    expected_revision: decision.revision,
+                },
                 DecisionState::Answered,
                 &answer_receipt("user", &answer),
                 &answer_resume_payload("user", &private_answer),
@@ -6767,15 +6800,17 @@ impl AgentTreeLifecycle {
         match self
             .db
             .resolve_host_approval_decision(
-                session_id,
-                decision.decision_request_id,
+                crate::db::agent_tree_decisions::DecisionRevisionRef {
+                    session_id,
+                    decision_request_id: decision.decision_request_id,
+                    expected_revision: decision.revision,
+                },
                 interrupt_id,
                 authority.db_for_settlement(
                     session_id,
                     decision.agent_instance_id,
                     interrupt_id,
                 )?,
-                decision.revision,
                 &serde_json::json!({ "source": "host_approval" }).to_string(),
                 &answer_resume_payload(
                     "user",
@@ -7154,9 +7189,11 @@ impl AgentTreeLifecycle {
             Some(payload) => {
                 self.db
                     .resolve_decision_request_with_resume_payload(
-                        session_id,
-                        decision.decision_request_id,
-                        decision.revision,
+                        crate::db::agent_tree_decisions::DecisionRevisionRef {
+                            session_id,
+                            decision_request_id: decision.decision_request_id,
+                            expected_revision: decision.revision,
+                        },
                         terminal_state,
                         receipt_json,
                         &payload,

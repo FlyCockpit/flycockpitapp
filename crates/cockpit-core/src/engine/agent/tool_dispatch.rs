@@ -2972,9 +2972,11 @@ async fn execute_ordinary_call_unscoped(
             .session
             .db
             .settle_verification_dispatch(
-                env.session.id,
-                plan.operation_id,
-                plan.attempt_revision,
+                crate::db::verification_ledger::VerificationDispatchAttemptRef {
+                    session_id: env.session.id,
+                    operation_id: plan.operation_id,
+                    expected_attempt_revision: plan.attempt_revision,
+                },
                 settlement,
                 receipt,
                 projection_event_seq,

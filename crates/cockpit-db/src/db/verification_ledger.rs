@@ -641,6 +641,15 @@ pub struct VerificationCandidateRow {
     pub revision: i64,
 }
 
+/// The exact dispatch attempt a settlement is fenced against: the operation
+/// and the attempt revision the settling dispatcher claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerificationDispatchAttemptRef {
+    pub session_id: Uuid,
+    pub operation_id: Uuid,
+    pub expected_attempt_revision: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct VerificationDispatchAttemptRow {
     pub attempt_id: Uuid,
@@ -1814,14 +1823,17 @@ impl Db {
     /// outcomes are suppressed.
     pub async fn settle_verification_dispatch(
         &self,
-        session_id: Uuid,
-        operation_id: Uuid,
-        expected_attempt_revision: i64,
+        attempt: VerificationDispatchAttemptRef,
         settlement: DispatchSettlement,
         receipt: RedactedVerificationJson,
         projection_event_seq: Option<i64>,
         now_unix_ms: i64,
     ) -> Result<VerificationOperationRow> {
+        let VerificationDispatchAttemptRef {
+            session_id,
+            operation_id,
+            expected_attempt_revision,
+        } = attempt;
         ensure!(
             settlement != DispatchSettlement::CancelledNoSubmission,
             "use the no-submission proof settlement API for cancellation"
@@ -3296,9 +3308,11 @@ mod tests {
             prepared_selected_dispatch(db, session_id, agent_id, base).await;
         let settled = db
             .settle_verification_dispatch(
-                session_id,
-                operation_id,
-                attempt.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id,
+                    expected_attempt_revision: attempt.revision,
+                },
                 DispatchSettlement::Succeeded,
                 redacted(
                     VerificationRedactionClass::DispatchSuccess,
@@ -3461,9 +3475,11 @@ mod tests {
             prepared_selected_dispatch(&db, session_id, agent_id, 10).await;
         let settled = db
             .settle_verification_dispatch(
-                session_id,
-                operation_id,
-                attempt.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id,
+                    expected_attempt_revision: attempt.revision,
+                },
                 DispatchSettlement::Succeeded,
                 redacted(VerificationRedactionClass::DispatchSuccess, "clean-replay"),
                 projection_event(&db, session_id, DispatchSettlement::Succeeded, 19).await,
@@ -3482,9 +3498,11 @@ mod tests {
         // path errors or re-derives a dispatch from the surviving digests.
         let replayed = db
             .settle_verification_dispatch(
-                session_id,
-                operation_id,
-                attempt.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id,
+                    expected_attempt_revision: attempt.revision,
+                },
                 DispatchSettlement::Succeeded,
                 redacted(VerificationRedactionClass::DispatchSuccess, "clean-replay"),
                 None,
@@ -3623,9 +3641,11 @@ mod tests {
             prepared_selected_dispatch(&db, session_id, agent_id, 100).await;
         let terminal = db
             .settle_verification_dispatch(
-                session_id,
-                operation_id,
-                executing.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id,
+                    expected_attempt_revision: executing.revision,
+                },
                 DispatchSettlement::Failed,
                 redacted(
                     VerificationRedactionClass::DispatchFinalError,
@@ -3721,9 +3741,11 @@ mod tests {
             .unwrap();
         let settled = db
             .settle_verification_dispatch(
-                session_id,
-                created.operation_id,
-                executing.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id: created.operation_id,
+                    expected_attempt_revision: executing.revision,
+                },
                 DispatchSettlement::Succeeded,
                 redacted(
                     VerificationRedactionClass::DispatchSuccess,
@@ -4115,9 +4137,11 @@ mod tests {
             .unwrap();
         let settled = db
             .settle_verification_dispatch(
-                session_id,
-                collecting.operation_id,
-                executing.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id: collecting.operation_id,
+                    expected_attempt_revision: executing.revision,
+                },
                 DispatchSettlement::Succeeded,
                 redacted(VerificationRedactionClass::DispatchSuccess, "host-success"),
                 projection_event(&db, session_id, DispatchSettlement::Succeeded, 12).await,
@@ -4157,9 +4181,11 @@ mod tests {
         );
         let replay = db
             .settle_verification_dispatch(
-                session_id,
-                created.operation_id,
-                executing.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id: created.operation_id,
+                    expected_attempt_revision: executing.revision,
+                },
                 DispatchSettlement::Succeeded,
                 redacted(VerificationRedactionClass::DispatchSuccess, "different"),
                 projection_event(&db, session_id, DispatchSettlement::Succeeded, 13).await,
@@ -4206,9 +4232,11 @@ mod tests {
             .unwrap();
         let unknown = db
             .settle_verification_dispatch(
-                session_id,
-                created.operation_id,
-                reserved.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id: created.operation_id,
+                    expected_attempt_revision: reserved.revision,
+                },
                 DispatchSettlement::Unknown,
                 redacted(VerificationRedactionClass::DispatchUnknown, "unknown"),
                 None,
@@ -4254,9 +4282,11 @@ mod tests {
             let (operation_id, executing) =
                 prepared_selected_dispatch(&db, session_id, agent_id, base).await;
             db.settle_verification_dispatch(
-                session_id,
-                operation_id,
-                executing.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id,
+                    expected_attempt_revision: executing.revision,
+                },
                 settlement,
                 receipt.clone(),
                 projection_event(&db, session_id, settlement, base + 20).await,
@@ -4350,9 +4380,11 @@ mod tests {
         assert_eq!(dispatching.state, VerificationOperationState::Dispatching);
         let terminal = db
             .settle_verification_dispatch(
-                session_id,
-                operation_id,
-                executing.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id,
+                    expected_attempt_revision: executing.revision,
+                },
                 DispatchSettlement::Succeeded,
                 RedactedVerificationJson::dispatch_success(digest("close-replay-success")),
                 projection_event(&db, session_id, DispatchSettlement::Succeeded, 31).await,
@@ -5614,9 +5646,11 @@ mod tests {
             assert_eq!(replay_attempt.attempt_id, attempt.attempt_id);
             let terminal = db
                 .settle_verification_dispatch(
-                    session_id,
-                    created.operation_id,
-                    attempt.revision,
+                    VerificationDispatchAttemptRef {
+                        session_id,
+                        operation_id: created.operation_id,
+                        expected_attempt_revision: attempt.revision,
+                    },
                     settlement,
                     redacted(
                         match settlement {
@@ -5667,9 +5701,11 @@ mod tests {
         let (operation_id, executing) =
             prepared_selected_dispatch(&db, session_id, agent_id, 3).await;
         db.settle_verification_dispatch(
-            session_id,
-            operation_id,
-            executing.revision,
+            VerificationDispatchAttemptRef {
+                session_id,
+                operation_id,
+                expected_attempt_revision: executing.revision,
+            },
             DispatchSettlement::Succeeded,
             redacted(
                 VerificationRedactionClass::DispatchSuccess,
@@ -5719,16 +5755,18 @@ mod tests {
         inject_settlement_fault_once(operation_id);
         assert!(
             db.settle_verification_dispatch(
-                session_id,
-                operation_id,
-                executing.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id,
+                    expected_attempt_revision: executing.revision
+                },
                 DispatchSettlement::Failed,
                 redacted(
                     VerificationRedactionClass::DispatchFinalError,
                     "effect-before-crash"
                 ),
                 projection_event(&db, session_id, DispatchSettlement::Failed, 19).await,
-                19,
+                19
             )
             .await
             .is_err()
@@ -5839,16 +5877,18 @@ mod tests {
         inject_settlement_fault_once(success_operation);
         assert!(
             db.settle_verification_dispatch(
-                session_id,
-                success_operation,
-                success_attempt.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id: success_operation,
+                    expected_attempt_revision: success_attempt.revision
+                },
                 DispatchSettlement::Succeeded,
                 redacted(
                     VerificationRedactionClass::DispatchSuccess,
                     "success-before-crash"
                 ),
                 projection_event(&db, session_id, DispatchSettlement::Succeeded, 40).await,
-                40,
+                40
             )
             .await
             .is_err()
@@ -6006,13 +6046,15 @@ mod tests {
         .unwrap();
         assert!(
             db.settle_verification_dispatch(
-                session_id,
-                operation_id,
-                executing.revision,
+                VerificationDispatchAttemptRef {
+                    session_id,
+                    operation_id,
+                    expected_attempt_revision: executing.revision
+                },
                 DispatchSettlement::Succeeded,
                 RedactedVerificationJson::dispatch_success(digest("normal-safe-host-receipt")),
                 projection_event(&db, session_id, DispatchSettlement::Succeeded, 20).await,
-                20,
+                20
             )
             .await
             .is_err()
@@ -6054,9 +6096,11 @@ mod tests {
         let (clean_operation, clean_executing) =
             prepared_selected_dispatch(&db, session_id, agent_id, 30).await;
         db.settle_verification_dispatch(
-            session_id,
-            clean_operation,
-            clean_executing.revision,
+            VerificationDispatchAttemptRef {
+                session_id,
+                operation_id: clean_operation,
+                expected_attempt_revision: clean_executing.revision,
+            },
             DispatchSettlement::Succeeded,
             RedactedVerificationJson::dispatch_success(digest("normal-clean-host-receipt")),
             projection_event(&db, session_id, DispatchSettlement::Succeeded, 40).await,

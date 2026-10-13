@@ -1642,9 +1642,7 @@ async fn execute_host_capability_refresh_operation_while_serialized(
                             session.id,
                             operation_id,
                             &lease,
-                            receipt.result_snapshot_json,
-                            receipt.generation,
-                            receipt.digest,
+                            receipt,
                             crate::agent_tree::system_now_unix_ms(),
                         )
                         .await
@@ -2115,10 +2113,12 @@ async fn abort_unbound_host_capability_refresh_initialization(
         .db
         .abort_host_capability_refresh_initialization(
             crate::agent_tree::daemon_host_capability_refresh_authority(),
-            session.id,
-            operation.operation_id,
-            operation.request_id,
-            agent_instance_id,
+            crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationRef {
+                session_id: session.id,
+                operation_id: operation.operation_id,
+                request_id: operation.request_id,
+                agent_instance_id,
+            },
             None,
             crate::agent_tree::system_now_unix_ms(),
         )
@@ -7487,11 +7487,13 @@ pub(super) async fn run_worker(
                     .park_session_for_resume(
                         session_id,
                         session.live_id(),
-                        &root_agent_name,
-                        &project_root.display().to_string(),
-                        "daemon restart recovered interrupted work",
+                        crate::db::paused_work::PausedWorkDescription {
+                            active_agent: root_agent_name.clone(),
+                            project_root: project_root.display().to_string(),
+                            reason: "daemon restart recovered interrupted work".to_owned(),
+                            daemon_version: proto::DAEMON_VERSION.to_owned(),
+                        },
                         0,
-                        proto::DAEMON_VERSION,
                     )
                     .await
                 {
@@ -10565,13 +10567,15 @@ pub(super) async fn run_worker(
                         let exact_replay = match session
                             .db
                             .exact_message_replay_outcome(
-                                conversation_id,
-                                admission.operation_id,
-                                admission.actor,
-                                *receipt.id.as_bytes(),
-                                admission.request_hash,
-                                admission.message_request_digest,
-                                admission.attachment_set_digest,
+                                crate::db::db::message_attachments::MessageReplayKey {
+                                    session_id: conversation_id,
+                                    operation_id: admission.operation_id,
+                                    actor: admission.actor,
+                                    client_submission_id: *receipt.id.as_bytes(),
+                                    request_hash: admission.request_hash,
+                                    message_request_digest: admission.message_request_digest,
+                                    attachment_set_digest: admission.attachment_set_digest,
+                                },
                             )
                             .await
                         {
@@ -14762,11 +14766,13 @@ pub(super) async fn persist_paused_session_work(
         .park_session_for_resume(
             session_id,
             session.live_id(),
-            root_agent_name,
-            &project_root.display().to_string(),
-            "daemon shutdown paused active work",
+            crate::db::paused_work::PausedWorkDescription {
+                active_agent: root_agent_name.to_owned(),
+                project_root: project_root.display().to_string(),
+                reason: "daemon shutdown paused active work".to_owned(),
+                daemon_version: proto::DAEMON_VERSION.to_owned(),
+            },
             pending_tool_count,
-            proto::DAEMON_VERSION,
         )
         .await
         .context("persisting paused session work")

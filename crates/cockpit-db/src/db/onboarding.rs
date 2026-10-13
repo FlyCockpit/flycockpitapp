@@ -71,6 +71,27 @@ impl OnboardingOperationFingerprint {
     }
 }
 
+/// The durable run state an onboarding transition commits. These four fields
+/// are also exactly what an outcome receipt is fingerprinted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardingTransitionOutcome {
+    pub next_stage: OnboardingStage,
+    pub bootstrap_state: OnboardingBootstrapState,
+    pub limited_mode: bool,
+    pub selected_secure_placement: Option<OnboardingSecurePlacement>,
+}
+
+impl OnboardingTransitionOutcome {
+    fn fingerprint(self) -> OnboardingOperationFingerprint {
+        OnboardingOperationFingerprint::outcome(
+            self.next_stage,
+            self.bootstrap_state,
+            self.limited_mode,
+            self.selected_secure_placement,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingStage {
     Welcome,
@@ -327,19 +348,13 @@ impl Db {
         &self,
         snapshot: OnboardingSnapshotRow,
         client_operation_id: String,
-        next_stage: OnboardingStage,
-        bootstrap_state: OnboardingBootstrapState,
-        limited_mode: bool,
-        selected_secure_placement: Option<OnboardingSecurePlacement>,
+        outcome: OnboardingTransitionOutcome,
         stage_entry_config_generation: u64,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
         self.onboarding_transition_with_receipt_status(
             snapshot,
             client_operation_id,
-            next_stage,
-            bootstrap_state,
-            limited_mode,
-            selected_secure_placement,
+            outcome,
             OnboardingReceiptStatus::Committed,
             stage_entry_config_generation,
         )
@@ -525,10 +540,7 @@ impl Db {
         &self,
         snapshot: OnboardingSnapshotRow,
         client_operation_id: String,
-        next_stage: OnboardingStage,
-        bootstrap_state: OnboardingBootstrapState,
-        limited_mode: bool,
-        selected_secure_placement: Option<OnboardingSecurePlacement>,
+        outcome: OnboardingTransitionOutcome,
         receipt_status: OnboardingReceiptStatus,
         stage_entry_config_generation: u64,
     ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
@@ -537,10 +549,7 @@ impl Db {
                 conn,
                 &snapshot,
                 &client_operation_id,
-                next_stage,
-                bootstrap_state,
-                limited_mode,
-                selected_secure_placement,
+                outcome,
                 receipt_status,
                 stage_entry_config_generation,
             )
@@ -556,22 +565,10 @@ impl Db {
         run_id: Uuid,
         attempt_id: Uuid,
         client_operation_id: String,
-        next_stage: OnboardingStage,
-        bootstrap_state: OnboardingBootstrapState,
-        limited_mode: bool,
-        selected_secure_placement: Option<OnboardingSecurePlacement>,
+        outcome: OnboardingTransitionOutcome,
     ) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
         self.read(move |conn| {
-            transition_receipt_conn(
-                conn,
-                run_id,
-                attempt_id,
-                &client_operation_id,
-                next_stage,
-                bootstrap_state,
-                limited_mode,
-                selected_secure_placement,
-            )
+            transition_receipt_conn(conn, run_id, attempt_id, &client_operation_id, outcome)
         })
         .await
     }
@@ -694,30 +691,21 @@ fn transition_conn(
     conn: &rusqlite::Connection,
     current: &OnboardingSnapshotRow,
     client_operation_id: &str,
-    next_stage: OnboardingStage,
-    bootstrap_state: OnboardingBootstrapState,
-    limited_mode: bool,
-    selected_secure_placement: Option<OnboardingSecurePlacement>,
+    outcome: OnboardingTransitionOutcome,
     receipt_status: OnboardingReceiptStatus,
     stage_entry_config_generation: u64,
 ) -> Result<(OnboardingSnapshotRow, OnboardingReceiptRow)> {
-    let fingerprint = OnboardingOperationFingerprint::outcome(
-        next_stage,
-        bootstrap_state,
-        limited_mode,
-        selected_secure_placement,
-    );
     transition_conn_with_fingerprint(
         conn,
         current,
         client_operation_id,
-        next_stage,
-        bootstrap_state,
-        limited_mode,
-        selected_secure_placement,
+        outcome.next_stage,
+        outcome.bootstrap_state,
+        outcome.limited_mode,
+        outcome.selected_secure_placement,
         receipt_status,
         stage_entry_config_generation,
-        fingerprint,
+        outcome.fingerprint(),
     )
 }
 
@@ -832,22 +820,14 @@ fn transition_receipt_conn(
     run_id: Uuid,
     attempt_id: Uuid,
     client_operation_id: &str,
-    next_stage: OnboardingStage,
-    bootstrap_state: OnboardingBootstrapState,
-    limited_mode: bool,
-    selected_secure_placement: Option<OnboardingSecurePlacement>,
+    outcome: OnboardingTransitionOutcome,
 ) -> Result<Option<(OnboardingSnapshotRow, OnboardingReceiptRow)>> {
     receipt_with_fingerprint_conn(
         conn,
         run_id,
         attempt_id,
         client_operation_id,
-        OnboardingOperationFingerprint::outcome(
-            next_stage,
-            bootstrap_state,
-            limited_mode,
-            selected_secure_placement,
-        ),
+        outcome.fingerprint(),
     )
 }
 
@@ -1060,10 +1040,12 @@ mod tests {
             .onboarding_transition(
                 initial.clone(),
                 "select-keyring".into(),
-                OnboardingStage::SecureStore,
-                OnboardingBootstrapState::Materializing,
-                false,
-                Some(OnboardingSecurePlacement::Keyring),
+                OnboardingTransitionOutcome {
+                    next_stage: OnboardingStage::SecureStore,
+                    bootstrap_state: OnboardingBootstrapState::Materializing,
+                    limited_mode: false,
+                    selected_secure_placement: Some(OnboardingSecurePlacement::Keyring),
+                },
                 0,
             )
             .await
@@ -1075,10 +1057,12 @@ mod tests {
             .onboarding_transition(
                 initial.clone(),
                 "select-keyring".into(),
-                OnboardingStage::SecureStore,
-                OnboardingBootstrapState::Materializing,
-                false,
-                Some(OnboardingSecurePlacement::Keyring),
+                OnboardingTransitionOutcome {
+                    next_stage: OnboardingStage::SecureStore,
+                    bootstrap_state: OnboardingBootstrapState::Materializing,
+                    limited_mode: false,
+                    selected_secure_placement: Some(OnboardingSecurePlacement::Keyring),
+                },
                 0,
             )
             .await
@@ -1090,10 +1074,12 @@ mod tests {
             .onboarding_transition(
                 initial,
                 "different-operation".into(),
-                OnboardingStage::Provider,
-                OnboardingBootstrapState::Ready,
-                false,
-                None,
+                OnboardingTransitionOutcome {
+                    next_stage: OnboardingStage::Provider,
+                    bootstrap_state: OnboardingBootstrapState::Ready,
+                    limited_mode: false,
+                    selected_secure_placement: None,
+                },
                 0,
             )
             .await
@@ -1113,10 +1099,12 @@ mod tests {
             .onboarding_transition(
                 initial.clone(),
                 "secure".into(),
-                OnboardingStage::SecureStore,
-                OnboardingBootstrapState::Materializing,
-                false,
-                Some(OnboardingSecurePlacement::MachineBoundFile),
+                OnboardingTransitionOutcome {
+                    next_stage: OnboardingStage::SecureStore,
+                    bootstrap_state: OnboardingBootstrapState::Materializing,
+                    limited_mode: false,
+                    selected_secure_placement: Some(OnboardingSecurePlacement::MachineBoundFile),
+                },
                 0,
             )
             .await
@@ -1138,10 +1126,12 @@ mod tests {
             .onboarding_transition(
                 secured,
                 "secure".into(),
-                OnboardingStage::SecureStore,
-                OnboardingBootstrapState::Materializing,
-                false,
-                Some(OnboardingSecurePlacement::MachineBoundFile),
+                OnboardingTransitionOutcome {
+                    next_stage: OnboardingStage::SecureStore,
+                    bootstrap_state: OnboardingBootstrapState::Materializing,
+                    limited_mode: false,
+                    selected_secure_placement: Some(OnboardingSecurePlacement::MachineBoundFile),
+                },
                 0,
             )
             .await
@@ -1160,10 +1150,12 @@ mod tests {
         db.onboarding_transition(
             initial.clone(),
             "one-operation".into(),
-            OnboardingStage::SecureStore,
-            OnboardingBootstrapState::Materializing,
-            false,
-            Some(OnboardingSecurePlacement::Keyring),
+            OnboardingTransitionOutcome {
+                next_stage: OnboardingStage::SecureStore,
+                bootstrap_state: OnboardingBootstrapState::Materializing,
+                limited_mode: false,
+                selected_secure_placement: Some(OnboardingSecurePlacement::Keyring),
+            },
             0,
         )
         .await
@@ -1172,10 +1164,12 @@ mod tests {
             .onboarding_transition(
                 initial,
                 "one-operation".into(),
-                OnboardingStage::SecureStore,
-                OnboardingBootstrapState::Materializing,
-                false,
-                Some(OnboardingSecurePlacement::MachineBoundFile),
+                OnboardingTransitionOutcome {
+                    next_stage: OnboardingStage::SecureStore,
+                    bootstrap_state: OnboardingBootstrapState::Materializing,
+                    limited_mode: false,
+                    selected_secure_placement: Some(OnboardingSecurePlacement::MachineBoundFile),
+                },
                 0,
             )
             .await
@@ -1206,10 +1200,12 @@ mod tests {
             .onboarding_transition(
                 begun.clone(),
                 "advance".into(),
-                OnboardingStage::Profile,
-                OnboardingBootstrapState::AwaitingChoice,
-                false,
-                None,
+                OnboardingTransitionOutcome {
+                    next_stage: OnboardingStage::Profile,
+                    bootstrap_state: OnboardingBootstrapState::AwaitingChoice,
+                    limited_mode: false,
+                    selected_secure_placement: None,
+                },
                 0,
             )
             .await

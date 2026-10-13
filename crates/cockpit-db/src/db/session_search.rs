@@ -150,17 +150,14 @@ impl Db {
             search_candidates_inner(
                 conn,
                 &query,
-                project_id.as_deref(),
-                exclude_session,
-                since,
-                None,
                 pool,
                 caller_trust,
-                None,
-                None,
-                None,
-                false,
-                false,
+                CandidateSearchFilter {
+                    project_id: project_id.as_deref(),
+                    exclude_session,
+                    since,
+                    ..Default::default()
+                },
             )
         })
         .await
@@ -173,31 +170,30 @@ impl Db {
     pub async fn search_assistant_candidates_for_trust(
         &self,
         query: &str,
-        assistant_name: &str,
-        project_id: &str,
+        thread_scope: AssistantThreadScope<'_>,
         exclude_session: Option<Uuid>,
         since: Option<i64>,
         pool: u32,
         caller_trust: HistoryCallerTrust,
     ) -> Result<Vec<SearchHit>> {
         let query = query.to_string();
-        let assistant_name = assistant_name.to_string();
-        let project_id = project_id.to_string();
+        let assistant_name = thread_scope.assistant_name.to_string();
+        let project_id = thread_scope.project_id.to_string();
         self.read(move |conn| {
             search_candidates_inner(
                 conn,
                 &query,
-                Some(&project_id),
-                exclude_session,
-                since,
-                None,
                 pool,
                 caller_trust,
-                None,
-                None,
-                Some(&assistant_name),
-                true,
-                true,
+                CandidateSearchFilter {
+                    project_id: Some(&project_id),
+                    exclude_session,
+                    since,
+                    assistant_name: Some(&assistant_name),
+                    assistant_thread_only: true,
+                    recency_sorted: true,
+                    ..Default::default()
+                },
             )
         })
         .await
@@ -221,17 +217,14 @@ impl Db {
             search_candidates_inner(
                 conn,
                 &query,
-                None,
-                exclude_session,
-                since,
-                None,
                 pool,
                 caller_trust,
-                Some(&session_ids),
-                None,
-                None,
-                false,
-                false,
+                CandidateSearchFilter {
+                    exclude_session,
+                    since,
+                    allowed_session_ids: Some(&session_ids),
+                    ..Default::default()
+                },
             )
         })
         .await
@@ -255,17 +248,14 @@ impl Db {
             search_candidates_inner(
                 conn,
                 &query,
-                project_id.as_deref(),
-                exclude_session,
-                None,
-                Some(after_session_event_seq),
                 pool,
                 caller_trust,
-                None,
-                None,
-                None,
-                false,
-                false,
+                CandidateSearchFilter {
+                    project_id: project_id.as_deref(),
+                    exclude_session,
+                    after_session_event_seq: Some(after_session_event_seq),
+                    ..Default::default()
+                },
             )
         })
         .await
@@ -290,17 +280,14 @@ impl Db {
             search_candidates_inner(
                 conn,
                 &query,
-                None,
-                exclude_session,
-                since,
-                None,
                 pool,
                 caller_trust,
-                None,
-                Some(&reader_project),
-                None,
-                false,
-                false,
+                CandidateSearchFilter {
+                    exclude_session,
+                    since,
+                    reader_project: Some(&reader_project),
+                    ..Default::default()
+                },
             )
         })
         .await
@@ -551,21 +538,47 @@ impl Db {
     }
 }
 
-fn search_candidates_inner(
-    conn: &Connection,
-    query: &str,
-    project_id: Option<&str>,
+/// The assistant whose threads are searched, within one project.
+#[derive(Debug, Clone, Copy)]
+pub struct AssistantThreadScope<'a> {
+    pub assistant_name: &'a str,
+    pub project_id: &'a str,
+}
+
+/// Eligibility predicates and ordering for one candidate search. Every
+/// predicate is applied inside the ranked SQL query, before the bounded pool.
+/// The default is unrestricted and BM25-ordered.
+#[derive(Debug, Clone, Copy, Default)]
+struct CandidateSearchFilter<'a> {
+    project_id: Option<&'a str>,
     exclude_session: Option<Uuid>,
     since: Option<i64>,
     after_session_event_seq: Option<i64>,
-    pool: u32,
-    caller_trust: HistoryCallerTrust,
-    allowed_session_ids: Option<&[Uuid]>,
-    reader_project: Option<&str>,
-    assistant_name: Option<&str>,
+    allowed_session_ids: Option<&'a [Uuid]>,
+    reader_project: Option<&'a str>,
+    assistant_name: Option<&'a str>,
     assistant_thread_only: bool,
     recency_sorted: bool,
+}
+
+fn search_candidates_inner(
+    conn: &Connection,
+    query: &str,
+    pool: u32,
+    caller_trust: HistoryCallerTrust,
+    filter: CandidateSearchFilter<'_>,
 ) -> Result<Vec<SearchHit>> {
+    let CandidateSearchFilter {
+        project_id,
+        exclude_session,
+        since,
+        after_session_event_seq,
+        allowed_session_ids,
+        reader_project,
+        assistant_name,
+        assistant_thread_only,
+        recency_sorted,
+    } = filter;
     let Some(match_query) = literal_fts_match_query(query) else {
         return Ok(Vec::new());
     };

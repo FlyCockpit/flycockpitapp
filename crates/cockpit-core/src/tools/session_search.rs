@@ -216,8 +216,10 @@ impl Tool for HistorySearchTool {
                         .db
                         .search_assistant_candidates_for_trust(
                             query,
-                            &assistant_name,
-                            &ctx.session.project_id,
+                            crate::db::session_search::AssistantThreadScope {
+                                assistant_name: &assistant_name,
+                                project_id: &ctx.session.project_id,
+                            },
                             None,
                             since,
                             limit,

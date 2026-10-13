@@ -103,7 +103,7 @@ fn peer_pid_from_unix_socket(fd: std::os::fd::RawFd) -> Result<u32> {
             return Err(std::io::Error::last_os_error())
                 .context("reading unix socket LOCAL_PEERPID");
         }
-        return u32::try_from(pid).context("unix socket peer pid out of range");
+        u32::try_from(pid).context("unix socket peer pid out of range")
     }
     #[cfg(target_os = "freebsd")]
     {
@@ -127,8 +127,8 @@ fn peer_pid_from_unix_socket(fd: std::os::fd::RawFd) -> Result<u32> {
         }
         // SAFETY: `getsockopt` succeeded and initialized the `xucred` struct.
         let cred = unsafe { cred.assume_init() };
-        return u32::try_from(unsafe { cred.cr_pid__c_anonymous_union.cr_pid })
-            .context("unix socket peer pid out of range");
+        u32::try_from(unsafe { cred.cr_pid__c_anonymous_union.cr_pid })
+            .context("unix socket peer pid out of range")
     }
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     {

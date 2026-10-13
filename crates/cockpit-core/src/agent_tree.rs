@@ -3542,16 +3542,20 @@ mod tests {
                 .await
                 .unwrap();
             db.reserve_host_approval_final_operation(
-                session.session_id,
-                agent.agent_instance_id,
-                operation_id,
-                operation.authorization_group_id,
-                operation.tool_call_id.clone(),
-                operation.member_index,
-                operation.concrete_effect_digest.clone(),
-                operation.operation_kind.clone(),
-                operation.canonical_input_json.clone(),
-                operation.input_digest.clone(),
+                crate::db::agent_tree_decisions::HostApprovalFinalOperation {
+                    session_id: session.session_id,
+                    agent_instance_id: agent.agent_instance_id,
+                    operation_id,
+                    operation_kind: operation.operation_kind.clone(),
+                    canonical_input_json: operation.canonical_input_json.clone(),
+                    input_digest: operation.input_digest.clone(),
+                },
+                crate::db::agent_tree_decisions::HostAuthorizationGroupMember {
+                    authorization_group_id: operation.authorization_group_id,
+                    tool_call_id: operation.tool_call_id.clone(),
+                    member_index: operation.member_index,
+                    concrete_effect_digest: operation.concrete_effect_digest.clone(),
+                },
                 HostApprovalAuthority::trusted_host().into_db(),
                 19,
             )

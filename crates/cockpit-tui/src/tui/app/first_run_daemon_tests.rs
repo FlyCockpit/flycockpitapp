@@ -357,10 +357,10 @@ fn settle_agent_via_real_daemon_rpc(app: &mut App) {
         Err(error) => panic!("agent projection unavailable: {error}"),
     };
     if let Some(shell) = app.onboarding_shell.as_mut() {
-        shell.present_agent_authoring(projection.clone(), operation_id.clone());
+        shell.present_agent_authoring(projection.clone(), operation_id.clone(), Default::default());
     }
 
-    let draft = AgentAuthoringDraft::from_projection(&projection);
+    let draft = AgentAuthoringDraft::from_projection(&projection, None);
     for (index, _) in draft
         .pending_trust_route_indices(&projection)
         .into_iter()

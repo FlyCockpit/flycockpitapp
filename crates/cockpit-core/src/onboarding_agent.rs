@@ -157,6 +157,75 @@ pub fn policy_snapshot(
     }
 }
 
+/// Names a client gives the wire routes of an [`AgentPolicySnapshot`].
+///
+/// A route's `provider_id` is the portable token an authored definition
+/// stores: the provider's template id, or `configured-provider-N` for a
+/// custom provider. It is not the configured provider id the user chose
+/// (`openrouter` configured from the `openai-compatible` template is the
+/// route `openai-compatible/…`). A client holding the redacted provider
+/// config maps each route back to that provider id for display, and finds
+/// the route of the active default model so a fresh draft starts from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfiguredRouteNames {
+    /// `(route provider token, model id, configured provider id)` per offering.
+    offerings: Vec<(String, String, String)>,
+    /// The active default model as `(configured provider id, model id)`.
+    active: Option<(String, String)>,
+}
+
+impl ConfiguredRouteNames {
+    pub fn from_providers(providers: &ProvidersConfig) -> Self {
+        Self {
+            offerings: crate::daemon::agent_installation::setup_offerings(providers)
+                .into_iter()
+                .map(|offering| {
+                    (
+                        offering.provider_id,
+                        offering.model_id,
+                        offering.provider_profile_handle,
+                    )
+                })
+                .collect(),
+            active: providers
+                .active_model
+                .as_ref()
+                .map(|active| (active.provider.clone(), active.model.clone())),
+        }
+    }
+
+    /// The configured provider id behind a route, when exactly one
+    /// configured offering carries it.
+    fn configured_provider(&self, route_provider: &str, model_id: &str) -> Option<&str> {
+        let mut matches = self
+            .offerings
+            .iter()
+            .filter(|(token, model, _)| token == route_provider && model == model_id);
+        let (_, _, configured) = matches.next()?;
+        matches.next().is_none().then_some(configured.as_str())
+    }
+
+    /// `provider/model` as the user configured it, for a route token and
+    /// model, falling back to the token when the route is not (uniquely)
+    /// configured here.
+    pub fn label(&self, route_provider: &str, model_id: &str) -> String {
+        let provider = self
+            .configured_provider(route_provider, model_id)
+            .unwrap_or(route_provider);
+        format!("{provider}/{model_id}")
+    }
+
+    /// The index in `routes` of the active default model's route.
+    pub fn default_route_index(&self, routes: &[AgentPolicyRoute]) -> Option<usize> {
+        let (provider, model) = self.active.as_ref()?;
+        routes.iter().position(|route| {
+            route.model_id == *model
+                && self.configured_provider(&route.provider_id, &route.model_id)
+                    == Some(provider.as_str())
+        })
+    }
+}
+
 pub fn authoring_projection(
     providers: &ProvidersConfig,
     catalog: &AgentCatalogIndex,
@@ -1473,7 +1542,7 @@ mod tests {
             review_trust_disclosure: REVIEW_TRUST_DISCLOSURE.into(),
         };
         let mut authored =
-            crate::authoring_draft::AgentAuthoringDraft::from_projection(&projection);
+            crate::authoring_draft::AgentAuthoringDraft::from_projection(&projection, None);
         authored.name = "optimizer".into();
         authored.route_grants[1].enabled = true;
         authored.default_route_index = 1;
@@ -1486,7 +1555,10 @@ mod tests {
         authored.self_verification[1].copies = vec![0, 3];
         authored.self_verification[2].copies = vec![1, 0];
         authored.sidecar_route_index = None;
-        authored.children = vec![crate::authoring_draft::default_child_draft(&projection)];
+        authored.children = vec![crate::authoring_draft::default_child_draft(
+            &projection,
+            None,
+        )];
 
         let package = crate::authoring_draft::build_package_draft(&projection, &authored).unwrap();
         let canonical = canonicalize(&package, &snapshot, &providers).unwrap();
@@ -1899,6 +1971,58 @@ mod tests {
             err.reason == AuthoredAgentRejectReason::IncompletePackage
                 || err.reason == AuthoredAgentRejectReason::UnpinnedThirdPartySource
                 || err.reason == AuthoredAgentRejectReason::MissingThirdPartyTrustConfirmation
+        );
+    }
+
+    #[test]
+    fn configured_route_names_label_by_provider_and_find_the_active_default() {
+        use cockpit_config::config::providers::ActiveModelRef;
+        let entry = |models: &[&str]| ProviderEntry {
+            template: Some("openai-compatible".into()),
+            models: models
+                .iter()
+                .map(|id| ModelEntry {
+                    id: (*id).to_string(),
+                    ..ModelEntry::default()
+                })
+                .collect(),
+            ..ProviderEntry::default()
+        };
+        let mut providers = ProvidersConfig::default();
+        providers
+            .providers
+            .insert("openrouter".into(), entry(&["a/one", "b/two"]));
+        providers
+            .providers
+            .insert("orcompat".into(), entry(&["b/two"]));
+        providers.active_model = Some(ActiveModelRef {
+            provider: "openrouter".into(),
+            model: "a/one".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        });
+        let snapshot = snapshot_for(&providers);
+        let names = ConfiguredRouteNames::from_providers(&providers);
+        let one = snapshot
+            .routes
+            .iter()
+            .find(|route| route.model_id == "a/one")
+            .unwrap();
+        assert_eq!(one.provider_id, "openai-compatible", "the wire token");
+        assert_eq!(
+            names.label(&one.provider_id, &one.model_id),
+            "openrouter/a/one"
+        );
+        assert_eq!(
+            names.default_route_index(&snapshot.routes),
+            snapshot.routes.iter().position(|route| route == one)
+        );
+        // Two providers behind one template offer `b/two`: the route cannot
+        // name either, so it keeps the token rather than guess.
+        assert_eq!(
+            names.label("openai-compatible", "b/two"),
+            "openai-compatible/b/two"
         );
     }
 

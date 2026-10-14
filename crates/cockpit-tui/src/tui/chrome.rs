@@ -199,6 +199,20 @@ pub(crate) fn radio_mark(on: bool, focused: bool) -> Span<'static> {
     Span::styled(mark, Style::new().fg(resolve_color(color, index)))
 }
 
+/// The mark of a two-step confirmation row: `✓` once confirmed, otherwise a
+/// radio that fills while the first click is armed.
+pub(crate) fn confirm_mark(confirmed: bool, armed: bool, focused: bool) -> Span<'static> {
+    if !confirmed {
+        return radio_mark(armed, focused);
+    }
+    let (color, index) = if focused {
+        (BRASS, BRASS_INDEX)
+    } else {
+        (GOOD, GOOD_INDEX)
+    };
+    Span::styled("✓ ", Style::new().fg(resolve_color(color, index)))
+}
+
 /// One clickable action in an [`ActionBar`].
 pub(crate) struct ActionButton<'a> {
     pub(crate) label: &'a str,

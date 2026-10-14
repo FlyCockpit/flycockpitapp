@@ -393,3 +393,128 @@ async fn secure_store_screen_shows_and_clears_the_submission_progress() {
             .is_none()
     );
 }
+
+fn resolving_workspace(app: &App) -> bool {
+    app.async_actions
+        .has_pending_kind(&crate::tui::async_action::AsyncActionKind::DaemonRpc(
+            "startup.workspace",
+        ))
+}
+
+/// #548: every way out of an unfinished run past the secure store leaves the
+/// chat usable, so it must resolve the workspace; the old deferral kept every
+/// command fenced behind "startup accepts the workspace" forever.
+#[test]
+fn leaving_onboarding_after_the_vault_resolves_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    use crate::tui::onboarding::OnboardingShellAction;
+    use cockpit_proto::OnboardingStage;
+
+    for stage in [
+        OnboardingStage::Provider,
+        OnboardingStage::Model,
+        OnboardingStage::Agent,
+        OnboardingStage::Lifetime,
+    ] {
+        // Cancel from the escape menu.
+        let mut app = App::new(Some(tmp.path()), false);
+        app.apply_onboarding_bootstrap_snapshot(Some(snapshot(stage)));
+        assert!(app.onboarding_shell.is_some(), "{stage:?}");
+        assert!(
+            !resolving_workspace(&app),
+            "{stage:?}: an open shell defers the workspace"
+        );
+        app.apply_onboarding_shell_action(Some(OnboardingShellAction::Close));
+        assert!(app.onboarding_shell.is_none(), "{stage:?}");
+        assert!(!app.exit_requested, "{stage:?}: cancel lands on the chat");
+        assert!(resolving_workspace(&app), "{stage:?}: cancel");
+
+        // `--skip-setup` with the run unfinished.
+        let mut app = App::new(Some(tmp.path()), false);
+        app.configure_onboarding_launch(true, false);
+        app.apply_onboarding_bootstrap_snapshot(Some(snapshot(stage)));
+        assert!(app.onboarding_shell.is_none(), "{stage:?}");
+        assert!(!app.exit_requested, "{stage:?}");
+        assert!(resolving_workspace(&app), "{stage:?}: --skip-setup");
+    }
+
+    // Deferring provider setup (limited mode) also lands on the chat.
+    let mut app = App::new(Some(tmp.path()), false);
+    let mut deferred = snapshot(OnboardingStage::Provider);
+    deferred.limited_mode = true;
+    app.apply_onboarding_bootstrap_snapshot(Some(deferred));
+    assert!(app.onboarding_shell.is_none());
+    assert!(resolving_workspace(&app), "limited mode");
+}
+
+/// Before the secure store is chosen the daemon is locked and nothing outside
+/// onboarding can open, so leaving quits (with a reason for `--skip-setup`)
+/// instead of presenting a chat stuck on "Loading session setup…".
+#[test]
+fn leaving_onboarding_before_the_vault_quits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    use crate::tui::onboarding::OnboardingShellAction;
+    use cockpit_proto::{OnboardingBootstrapState, OnboardingStage};
+
+    for stage in [
+        OnboardingStage::Welcome,
+        OnboardingStage::Profile,
+        OnboardingStage::SecureStore,
+    ] {
+        let mut locked = snapshot(stage);
+        locked.bootstrap_state = OnboardingBootstrapState::AwaitingChoice;
+
+        let mut app = App::new(Some(tmp.path()), false);
+        app.apply_onboarding_bootstrap_snapshot(Some(locked.clone()));
+        app.apply_onboarding_shell_action(Some(OnboardingShellAction::Close));
+        assert!(app.exit_requested, "{stage:?}: cancel quits");
+        assert!(!resolving_workspace(&app), "{stage:?}");
+
+        let mut app = App::new(Some(tmp.path()), false);
+        app.configure_onboarding_launch(true, false);
+        app.apply_onboarding_bootstrap_snapshot(Some(locked));
+        assert!(app.exit_requested, "{stage:?}: --skip-setup quits");
+        assert!(
+            app.exit_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("without `--skip-setup`")),
+            "{stage:?}: {:?}",
+            app.exit_notice
+        );
+        assert!(!resolving_workspace(&app), "{stage:?}");
+    }
+
+    // Ctrl-C (the shell's Quit) quits at any stage.
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(OnboardingStage::Model)));
+    app.apply_onboarding_shell_action(Some(OnboardingShellAction::Quit));
+    assert!(app.exit_requested);
+}
+
+/// #548: with setup unfinished and no model, no session can attach, so a send
+/// must reopen setup at its stage rather than wait forever for an attach.
+#[test]
+fn send_with_unfinished_setup_and_no_model_reopens_setup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    use crate::tui::onboarding::OnboardingShellAction;
+    let mut app = App::new(Some(tmp.path()), false);
+    app.apply_onboarding_bootstrap_snapshot(Some(snapshot(cockpit_proto::OnboardingStage::Model)));
+    app.apply_onboarding_shell_action(Some(OnboardingShellAction::Close));
+    assert!(app.onboarding_shell.is_none());
+    app.first_paint_completed = true;
+    app.startup_background.workspace_ready = true;
+    app.composer.insert_str("hello");
+    assert!(!app.submit_input());
+    assert!(
+        app.onboarding_shell.is_some(),
+        "the send must reopen setup, not retain the message for an attach that cannot land"
+    );
+    assert_eq!(
+        app.composer.text(),
+        "hello",
+        "the draft stays in the composer"
+    );
+}

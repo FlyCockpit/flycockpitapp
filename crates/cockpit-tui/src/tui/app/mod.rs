@@ -834,6 +834,7 @@ impl App {
                 tracing::info!(target: cockpit_core::startup::TARGET, event = "trust-ready", "startup");
             }
             self.apply_onboarding_bootstrap_snapshot(startup.snapshot);
+            self.announce_unfinished_onboarding();
             self.start_post_trust_cleanup();
         } else if pending.mode == cockpit_config::WorkspaceTrustMode::Trust {
             self.resync_config_after_local_write();

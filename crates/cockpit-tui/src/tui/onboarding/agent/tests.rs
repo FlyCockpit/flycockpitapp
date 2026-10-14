@@ -158,7 +158,11 @@ fn advance_to_create(screen: &mut AgentAuthoringScreen) {
 
 #[test]
 fn model_grant_toggle_replaces_disabled_default() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-1".into(),
+        Default::default(),
+    );
     screen.handle_key(key(KeyCode::Enter));
     assert!(matches!(screen.phase, Phase::ModelGrants));
     screen.cursor = 1;
@@ -174,7 +178,11 @@ fn model_grant_toggle_replaces_disabled_default() {
 
 #[test]
 fn model_grant_toggle_refuses_disabling_sole_enabled_default() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-1".into(),
+        Default::default(),
+    );
     screen.handle_key(key(KeyCode::Enter));
     assert!(matches!(screen.phase, Phase::ModelGrants));
     screen.cursor = 0;
@@ -185,7 +193,11 @@ fn model_grant_toggle_refuses_disabling_sole_enabled_default() {
 
 #[test]
 fn default_replacement_toggle_on_create_screen() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-1".into(),
+        Default::default(),
+    );
     advance_to_create(&mut screen);
     assert!(screen.draft.make_default);
     screen.cursor = 0;
@@ -204,7 +216,11 @@ fn default_replacement_toggle_on_create_screen() {
 
 #[test]
 fn hyphen_is_preserved_in_identity_and_locator_text_fields() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "hyphen-root".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "hyphen-root".into(),
+        Default::default(),
+    );
     screen.name_field.set("my");
     screen.handle_key(key(KeyCode::Char('-')));
     screen.handle_key(key(KeyCode::Char('p')));
@@ -224,7 +240,11 @@ fn hyphen_is_preserved_in_identity_and_locator_text_fields() {
 
 #[test]
 fn child_optimization_back_restores_pending_model_trust() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "child-trust".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "child-trust".into(),
+        Default::default(),
+    );
     screen.begin_edit_subagent(0);
     screen
         .editing_child
@@ -240,7 +260,11 @@ fn child_optimization_back_restores_pending_model_trust() {
 
 #[test]
 fn self_verify_and_panel_done_restore_the_opening_rows() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "restore-focus".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "restore-focus".into(),
+        Default::default(),
+    );
     screen.phase = Phase::SelfVerify;
     screen.cursor = 2;
     screen.handle_key(key(KeyCode::Esc));
@@ -258,7 +282,11 @@ fn self_verify_and_panel_done_restore_the_opening_rows() {
 
 #[test]
 fn child_self_verify_edits_the_child_draft_only() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "child-verify".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "child-verify".into(),
+        Default::default(),
+    );
     let root = screen.draft.self_verification[1].copies.clone();
     screen.begin_edit_subagent(0);
     screen.phase = Phase::SubagentEdit(SubagentPhase::Optimizations);
@@ -283,7 +311,11 @@ fn child_self_verify_edits_the_child_draft_only() {
 
 #[test]
 fn back_restores_parent_after_canceling_nested_subagent() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-1".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     let before = screen.draft.children.len();
     screen.cursor = 0;
@@ -296,7 +328,11 @@ fn back_restores_parent_after_canceling_nested_subagent() {
 
 #[test]
 fn canceling_nested_subagent_restores_its_parent_editor_without_the_new_child() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "nested-cancel".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "nested-cancel".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     screen.begin_edit_subagent(0);
     screen.phase = Phase::SubagentEdit(SubagentPhase::SubagentsList);
@@ -358,7 +394,11 @@ fn advance_subagent_to_helpers(screen: &mut AgentAuthoringScreen) {
 
 #[test]
 fn saving_added_subagent_appends_it_to_the_root_draft() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "root-add".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "root-add".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     let initial_children = screen.draft.children.len();
 
@@ -384,7 +424,11 @@ fn saving_added_subagent_appends_it_to_the_root_draft() {
 
 #[test]
 fn saving_added_nested_subagent_preserves_the_parent_editor() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "nested-add".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "nested-add".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     screen.begin_edit_subagent(0);
     for _ in "runner".chars() {
@@ -419,7 +463,11 @@ fn saving_added_nested_subagent_preserves_the_parent_editor() {
 
 #[test]
 fn tool_model_selection_is_scoped_to_the_draft_being_edited() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "tool-scope".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "tool-scope".into(),
+        Default::default(),
+    );
     let tool_index = screen
         .tool_catalog
         .iter()
@@ -460,7 +508,11 @@ fn tool_model_selection_is_scoped_to_the_draft_being_edited() {
 
 #[test]
 fn stale_review_refresh_after_projection_revision_change() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-1".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     screen.apply_outcome(ApplyAuthoredAgentPackageOutcome::Review(sample_review()));
     assert!(screen.review.is_some());
@@ -488,7 +540,11 @@ fn stale_review_refresh_after_projection_revision_change() {
 
 #[test]
 fn trust_gate_blocks_advance_until_confirmed() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-1".into(),
+        Default::default(),
+    );
     screen.handle_key(key(KeyCode::Enter));
     assert!(matches!(screen.phase, Phase::ModelGrants));
     screen.handle_key(key(KeyCode::Enter));
@@ -508,7 +564,11 @@ fn trust_gate_blocks_advance_until_confirmed() {
 
 #[test]
 fn review_render_matches_canonical_projection_without_secrets() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-1".into(),
+        Default::default(),
+    );
     let review = sample_review();
     screen.apply_outcome(ApplyAuthoredAgentPackageOutcome::Review(review.clone()));
     let rendered = render_string(&mut screen, 100, 30);
@@ -536,7 +596,11 @@ fn review_render_matches_canonical_projection_without_secrets() {
 
 #[test]
 fn preview_action_is_emitted_from_review() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-1".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-1".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     screen.draft.trust_confirmations[0] = true;
     screen.apply_outcome(ApplyAuthoredAgentPackageOutcome::Review(sample_review()));
@@ -549,7 +613,11 @@ fn preview_action_is_emitted_from_review() {
 
 #[test]
 fn apply_uses_stable_client_operation_id() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "stable-op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "stable-op".into(),
+        Default::default(),
+    );
     advance_to_create(&mut screen);
     let action = screen.handle_key(key(KeyCode::Enter));
     assert!(matches!(
@@ -576,9 +644,10 @@ fn invalid_nested_depth_surfaces_canonical_failure() {
         sidecar_eligible: false,
         remote_sidecar_egress_required: false,
     }];
-    let mut screen = AgentAuthoringScreen::new(projection, "op-depth".into());
+    let mut screen = AgentAuthoringScreen::new(projection, "op-depth".into(), Default::default());
     advance_to_subagents(&mut screen);
-    let mut duplicate = cockpit_core::authoring_draft::default_child_draft(&screen.projection);
+    let mut duplicate =
+        cockpit_core::authoring_draft::default_child_draft(&screen.projection, None);
     duplicate.name = "child-a".into();
     screen.draft.children = vec![duplicate.clone(), duplicate];
     let error = build_package_draft(&screen.projection, &screen.draft)
@@ -591,7 +660,11 @@ fn invalid_nested_depth_surfaces_canonical_failure() {
 
 #[test]
 fn model_gated_tool_stays_off_until_its_inline_model_is_chosen() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-tools".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-tools".into(),
+        Default::default(),
+    );
     screen.phase = Phase::ToolTiers;
     let catalog = &screen.tool_catalog;
     let tool_index = catalog
@@ -643,7 +716,11 @@ fn tools_are_grouped_and_required_tools_cannot_be_disabled() {
         "tool sections must be required, suggested, then not suggested: {sections:?}"
     );
 
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "op-tools".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "op-tools".into(),
+        Default::default(),
+    );
     screen.phase = Phase::ToolTiers;
     let read_index = catalog
         .iter()
@@ -664,7 +741,11 @@ fn tools_are_grouped_and_required_tools_cannot_be_disabled() {
 
 #[test]
 fn model_tool_optimization_and_subagent_rows_activate_on_first_click() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "click-op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "click-op".into(),
+        Default::default(),
+    );
 
     screen.phase = Phase::ModelGrants;
     render_buffer(&mut screen, 120, 40);
@@ -705,7 +786,11 @@ fn model_tool_optimization_and_subagent_rows_activate_on_first_click() {
 
 #[test]
 fn verifier_panel_keeps_default_model_first_and_labels_cache_reuse() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-order".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "panel-order".into(),
+        Default::default(),
+    );
     screen.draft.default_route_index = 1;
     screen.phase = Phase::VerifierPanel(0);
     assert_eq!(screen.verifier_route_index(0), Some(1));
@@ -719,7 +804,11 @@ fn verifier_panel_keeps_default_model_first_and_labels_cache_reuse() {
 
 #[test]
 fn changing_the_default_model_moves_same_model_verification_copies() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-default".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "panel-default".into(),
+        Default::default(),
+    );
     screen.phase = Phase::ModelGrants;
     screen.cursor = 1;
     screen.handle_key(key(KeyCode::Char(' ')));
@@ -737,7 +826,11 @@ fn changing_the_default_model_moves_same_model_verification_copies() {
 
 #[test]
 fn verifier_minus_at_zero_is_a_no_op_and_surface_off_requires_all_zero() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-zero".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "panel-zero".into(),
+        Default::default(),
+    );
     screen.draft.self_verification[1].copies.fill(0);
     assert!(screen.draft.self_verification[1].is_off());
     screen.phase = Phase::VerifierPanel(1);
@@ -753,7 +846,11 @@ fn verifier_minus_at_zero_is_a_no_op_and_surface_off_requires_all_zero() {
 
 #[test]
 fn verifier_space_wraps_from_the_copy_cap_to_zero() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "panel-wrap".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "panel-wrap".into(),
+        Default::default(),
+    );
     screen.phase = Phase::VerifierPanel(0);
     screen.draft.self_verification[0].copies[0] = 9;
     screen.handle_key(key(KeyCode::Char(' ')));
@@ -762,7 +859,11 @@ fn verifier_space_wraps_from_the_copy_cap_to_zero() {
 
 #[test]
 fn review_row_click_stashes_preview_package() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "preview-click".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "preview-click".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     screen.cursor = screen.draft.children.len();
     render_buffer(&mut screen, 120, 40);
@@ -776,7 +877,11 @@ fn review_row_click_stashes_preview_package() {
 
 #[test]
 fn space_on_review_row_returns_preview_package_immediately() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "preview-space".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "preview-space".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     screen.cursor = screen.draft.children.len();
     let action = screen
@@ -788,7 +893,11 @@ fn space_on_review_row_returns_preview_package_immediately() {
 
 #[test]
 fn nested_subagent_required_tool_lock_does_not_cycle_tier() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "nested-tools".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "nested-tools".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     screen.cursor = 0;
     screen.handle_key(key(KeyCode::Char('e')));
@@ -840,7 +949,11 @@ fn nested_subagent_required_tool_lock_does_not_cycle_tier() {
 
 #[test]
 fn tool_model_picker_click_uses_picker_row_index_after_tools_scroll() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "picker-scroll".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "picker-scroll".into(),
+        Default::default(),
+    );
     screen.phase = Phase::ToolTiers;
     let catalog = &screen.tool_catalog;
     let tool_index = catalog
@@ -873,7 +986,11 @@ fn tool_model_picker_click_uses_picker_row_index_after_tools_scroll() {
 
 #[test]
 fn trust_first_mouse_click_renders_selected_radio() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "trust-radio".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "trust-radio".into(),
+        Default::default(),
+    );
     screen.handle_key(key(KeyCode::Enter));
     screen.handle_key(key(KeyCode::Enter));
     assert!(matches!(screen.phase, Phase::ModelTrust));
@@ -890,7 +1007,11 @@ fn trust_first_mouse_click_renders_selected_radio() {
 
 #[test]
 fn settlement_trust_first_mouse_click_renders_selected_radio() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("settlement-radio"), "op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("settlement-radio"),
+        "op".into(),
+        Default::default(),
+    );
 
     screen.phase = Phase::ThirdPartyTrust;
     render_buffer(&mut screen, 120, 40);
@@ -922,7 +1043,11 @@ fn settlement_trust_first_mouse_click_renders_selected_radio() {
 
 #[test]
 fn runner_keeps_the_safe_default_route_and_lists_its_actual_trust() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("runner-route"), "op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("runner-route"),
+        "op".into(),
+        Default::default(),
+    );
     let runner = &screen.draft.children[0];
     assert!(runner.route_grants[0].enabled);
     assert!(!runner.route_grants[1].enabled);
@@ -930,12 +1055,19 @@ fn runner_keeps_the_safe_default_route_and_lists_its_actual_trust() {
 
     screen.phase = Phase::SubagentsList;
     let rendered = render_string(&mut screen, 120, 40);
-    assert!(rendered.contains("runner  ·  unset"), "{rendered}");
+    assert!(
+        rendered.contains("runner  ·  untrusted by default"),
+        "{rendered}"
+    );
 }
 
 #[test]
 fn enter_on_subagents_list_requests_preview_even_with_runner_focused() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "enter-op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "enter-op".into(),
+        Default::default(),
+    );
     advance_to_subagents(&mut screen);
     assert_eq!(screen.cursor, 0);
     let action = screen
@@ -947,7 +1079,11 @@ fn enter_on_subagents_list_requests_preview_even_with_runner_focused() {
 
 #[test]
 fn mouse_only_authoring_keeps_runner_and_submits_it() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("rev-a"), "mouse-op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("rev-a"),
+        "mouse-op".into(),
+        Default::default(),
+    );
     assert_eq!(screen.draft.children.len(), 1);
     assert_eq!(screen.draft.children[0].name, "runner");
 
@@ -1012,7 +1148,11 @@ fn mouse_only_authoring_keeps_runner_and_submits_it() {
 }
 
 fn golden_screen(phase: Phase) -> AgentAuthoringScreen {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("golden-rev"), "golden-op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("golden-rev"),
+        "golden-op".into(),
+        Default::default(),
+    );
     screen.tool_catalog = golden_tool_catalog();
     if let Phase::SubagentEdit(subphase) = phase {
         screen.begin_edit_subagent(0);
@@ -1171,7 +1311,8 @@ fn golden_agent_authoring_screens() {
         if phase == Phase::SubagentEdit(SubagentPhase::ModelTrust) {
             let rendered = render_string(&mut screen, 120, 40);
             assert!(
-                rendered.contains("Confirm vendor/exact-a as unset") && rendered.contains('○'),
+                rendered.contains("vendor/exact-a · untrusted by default")
+                    && rendered.contains('○'),
                 "nested trust golden must include a confirmable runner route: {rendered}"
             );
         }
@@ -1322,7 +1463,8 @@ fn two_pending_trust_screen() -> AgentAuthoringScreen {
     let mut projection = sample_projection("two-pending");
     projection.policy.routes[1].confirmation_required = true;
     projection.policy.routes[1].trust = AgentPolicyTrustClassification::Unset;
-    let mut screen = AgentAuthoringScreen::new(projection, "two-pending".into());
+    let mut screen =
+        AgentAuthoringScreen::new(projection, "two-pending".into(), Default::default());
     screen.draft.route_grants[1].enabled = true;
     screen.phase = Phase::ModelTrust;
     assert_eq!(
@@ -1343,9 +1485,10 @@ fn a_keyboard_confirm_consumes_the_armed_row_so_the_next_model_needs_two_clicks(
     screen.handle_key(key(KeyCode::Char(' ')));
     assert!(screen.draft.trust_confirmations[0]);
 
-    // Route 1 now occupies row 0. Its first click must only arm it.
+    // Route 0 stays listed (confirmed); route 1 is on row 1. Its first
+    // click must only arm it.
     render_buffer(&mut screen, 120, 40);
-    let row = screen.list_row_rects[0];
+    let row = screen.list_row_rects[1];
     screen.handle_mouse(click_at(Position::new(row.x, row.y)));
     assert!(
         !screen.draft.trust_confirmations[1],
@@ -1417,7 +1560,11 @@ fn child_route_zero_confirmed(screen: &AgentAuthoringScreen) -> bool {
 
 #[test]
 fn an_arm_in_a_cancelled_child_does_not_pass_to_the_next_added_child() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("recycle-add"), "op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("recycle-add"),
+        "op".into(),
+        Default::default(),
+    );
     screen.begin_add_subagent();
     child_trust_phase(&mut screen);
     click_first_list_row(&mut screen);
@@ -1435,7 +1582,11 @@ fn an_arm_in_a_cancelled_child_does_not_pass_to_the_next_added_child() {
 
 #[test]
 fn an_arm_does_not_pass_to_the_child_that_shifts_into_its_slot() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("recycle-delete"), "op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("recycle-delete"),
+        "op".into(),
+        Default::default(),
+    );
     screen.begin_add_subagent();
     screen.commit_subagent_edit();
     assert_eq!(screen.draft.children.len(), 2);
@@ -1465,7 +1616,7 @@ fn a_projection_replacement_with_identical_content_still_drops_the_arm() {
         projection.policy.routes[1].trust = AgentPolicyTrustClassification::Unset;
         projection
     };
-    let mut screen = AgentAuthoringScreen::new(projection.clone(), "op".into());
+    let mut screen = AgentAuthoringScreen::new(projection.clone(), "op".into(), Default::default());
     screen.draft.route_grants[1].enabled = true;
     screen.phase = Phase::ModelTrust;
     render_buffer(&mut screen, 120, 40);
@@ -1487,7 +1638,11 @@ fn a_projection_replacement_with_identical_content_still_drops_the_arm() {
 fn publisher_trust_follows_the_concrete_locator() {
     // Content keying alone: the locator changes with no key, click or
     // navigation in between that would disarm on its own.
-    let mut screen = AgentAuthoringScreen::new(sample_projection("locator"), "op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("locator"),
+        "op".into(),
+        Default::default(),
+    );
     screen.draft.third_party_locator = "registry/a@1".into();
     screen.phase = Phase::ThirdPartyTrust;
     render_buffer(&mut screen, 120, 40);
@@ -1511,7 +1666,11 @@ fn publisher_trust_follows_the_concrete_locator() {
 
 #[test]
 fn a_keyboard_confirm_clears_the_pending_arm_on_the_same_target() {
-    let mut screen = AgentAuthoringScreen::new(sample_projection("arm-clear"), "op".into());
+    let mut screen = AgentAuthoringScreen::new(
+        sample_projection("arm-clear"),
+        "op".into(),
+        Default::default(),
+    );
     screen.phase = Phase::ThirdPartyTrust;
     render_buffer(&mut screen, 120, 40);
     let row = screen.list_row_rects[0];
@@ -1682,4 +1841,117 @@ fn a_shell_chrome_click_or_a_resize_between_the_two_clicks_disarms() {
     shell_full_click(&mut shell, row.x, row.y);
     shell_full_click(&mut shell, row.x, row.y);
     assert!(shell_trust_confirmed(&shell));
+}
+
+/// Three routes behind one configured provider `openrouter`, built from the
+/// `openai-compatible` template, so every route carries that template token.
+fn template_routes_projection() -> (AgentAuthoringProjection, ConfiguredRouteNames) {
+    use cockpit_config::config::providers::{
+        ActiveModelRef, ModelEntry, ProviderEntry, ProvidersConfig,
+    };
+    let mut projection = sample_projection("template-routes");
+    let route = projection.policy.routes[0].clone();
+    projection.policy.routes = ["anthropic/haiku", "deepseek/flash", "openai/mini"]
+        .into_iter()
+        .map(|model| AgentPolicyRoute {
+            provider_id: "openai-compatible".into(),
+            model_id: model.into(),
+            ..route.clone()
+        })
+        .collect();
+    let mut providers = ProvidersConfig::default();
+    providers.providers.insert(
+        "openrouter".into(),
+        ProviderEntry {
+            template: Some("openai-compatible".into()),
+            models: projection
+                .policy
+                .routes
+                .iter()
+                .map(|route| ModelEntry {
+                    id: route.model_id.clone(),
+                    ..ModelEntry::default()
+                })
+                .collect(),
+            ..ProviderEntry::default()
+        },
+    );
+    providers.active_model = Some(ActiveModelRef {
+        provider: "openrouter".into(),
+        model: "deepseek/flash".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    let names = ConfiguredRouteNames::from_providers(&providers);
+    (projection, names)
+}
+
+/// #553 (B11): rows name the configured provider, not the template token, and
+/// the default model chosen on the model step is the starred, granted
+/// default of the agent and of its runner subagent.
+#[test]
+fn agent_models_default_to_the_chosen_model_under_the_configured_provider() {
+    let (projection, names) = template_routes_projection();
+    let mut screen = AgentAuthoringScreen::new(projection, "b11".into(), names);
+    assert_eq!(screen.draft.default_route_index, 1);
+    let granted: Vec<bool> = screen
+        .draft
+        .route_grants
+        .iter()
+        .map(|grant| grant.enabled)
+        .collect();
+    assert_eq!(granted, [false, true, false]);
+    let runner = &screen.draft.children[0];
+    assert_eq!(runner.default_route_index, 1, "runner default");
+    assert!(runner.route_grants[1].enabled && !runner.route_grants[0].enabled);
+
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelGrants));
+    let rendered = render_string(&mut screen, 100, 24);
+    assert!(rendered.contains("openrouter/deepseek/flash"), "{rendered}");
+    assert!(!rendered.contains("openai-compatible/"), "{rendered}");
+    assert!(
+        rendered.contains("★ openrouter/deepseek/flash"),
+        "{rendered}"
+    );
+}
+
+/// #553 (B12): confirming trust rows keeps them listed (marked ✓) with the
+/// cursor on a real row, so every row can be confirmed with Space alone.
+#[test]
+fn confirmed_trust_rows_stay_listed_and_space_confirms_each() {
+    let (projection, names) = template_routes_projection();
+    let mut screen = AgentAuthoringScreen::new(projection, "b12".into(), names);
+    for grant in &mut screen.draft.route_grants {
+        grant.enabled = true;
+    }
+    screen.handle_key(key(KeyCode::Enter));
+    screen.cursor = 2;
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelTrust));
+    assert_eq!(screen.cursor, 0, "a trust list opens at its first row");
+    for row in 0..3 {
+        screen.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            screen.visible_row_count(),
+            3,
+            "row {row}: confirmed rows stay"
+        );
+        assert!(screen.cursor < 3);
+        screen.handle_key(key(KeyCode::Down));
+    }
+    assert!(screen.draft.trust_confirmations.iter().all(|done| *done));
+    assert_eq!(screen.cursor, 2, "the cursor stays on the last row");
+    let rendered = render_string(&mut screen, 100, 24);
+    assert_eq!(rendered.matches("✓ openrouter/").count(), 3, "{rendered}");
+    assert!(
+        rendered.contains("openrouter/anthropic/haiku · untrusted by default"),
+        "{rendered}"
+    );
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(
+        !matches!(screen.phase, Phase::ModelTrust),
+        "every row confirmed"
+    );
 }

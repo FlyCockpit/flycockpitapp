@@ -1230,6 +1230,24 @@ impl App {
         // here the moment the authoritative snapshot reaches `Complete`
         // (the vault exists by then, the daemon is ready, and the trust
         // modal can actually be answered), so no path stays unfenced.
+        if self.onboarding_skip
+            && snapshot.as_ref().is_none_or(|current| {
+                current.stage != cockpit_proto::OnboardingStage::Complete
+                    && !Self::onboarding_vault_ready(current)
+            })
+        {
+            // `--skip-setup` before setup chose a secure store: the daemon
+            // stays locked without a vault, so no workspace can open. Say
+            // so and leave instead of presenting a chat that cannot load.
+            self.exit_notice = Some(
+                "Cockpit isn't set up yet: `--skip-setup` can't open a workspace before \
+                 setup has chosen where to keep secrets. Run `cockpit` without \
+                 `--skip-setup` to finish setup."
+                    .to_string(),
+            );
+            self.exit_requested = true;
+            return;
+        }
         let onboarding_resolvable = snapshot
             .as_ref()
             .is_none_or(|current| current.stage == cockpit_proto::OnboardingStage::Complete);
@@ -1270,6 +1288,110 @@ impl App {
             self.start_onboarding_capability_probe_wait();
         }
         self.maybe_open_pending_setup_wizard();
+        self.resolve_workspace_outside_onboarding();
+    }
+
+    /// Whether the run has a vault behind it: its secure store committed and
+    /// the daemon can leave the locked bootstrap. Before that the daemon
+    /// denies every workspace read, so nothing outside onboarding can open.
+    fn onboarding_vault_ready(snapshot: &cockpit_proto::OnboardingBootstrapSnapshot) -> bool {
+        use cockpit_proto::OnboardingStage;
+        snapshot.bootstrap_state == cockpit_proto::OnboardingBootstrapState::Ready
+            && !matches!(
+                snapshot.stage,
+                OnboardingStage::Welcome | OnboardingStage::Profile | OnboardingStage::SecureStore
+            )
+    }
+
+    /// Resolve the workspace for an unfinished run whose shell is not on
+    /// screen: cancelled, deferred to limited mode, or skipped with
+    /// `--skip-setup`. The ordinary chat is then the surface, so it needs a
+    /// workspace exactly like a finished run; otherwise every command stays
+    /// fenced behind "startup accepts the workspace" forever (#548). A run
+    /// with its shell up keeps the deferral (the trust modal would compete
+    /// with the shell for the dialog), and a run before its vault exists
+    /// has nothing to open.
+    pub(super) fn resolve_workspace_outside_onboarding(&mut self) {
+        if self.startup_background.workspace_ready
+            || self.startup_pending_trust.is_some()
+            || self.onboarding_shell.is_some()
+        {
+            return;
+        }
+        let Some(snapshot) = self.onboarding_snapshot.clone() else {
+            return;
+        };
+        if snapshot.stage == cockpit_proto::OnboardingStage::Complete
+            || !Self::onboarding_vault_ready(&snapshot)
+        {
+            return;
+        }
+        self.start_workspace_resolution(Some(snapshot));
+    }
+
+    /// Once the workspace is accepted with onboarding unfinished, say how to
+    /// finish it: the chat is usable, but a send without a provider is
+    /// refused.
+    pub(super) fn announce_unfinished_onboarding(&mut self) {
+        let Some(limited_mode) = self
+            .onboarding_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.stage != cockpit_proto::OnboardingStage::Complete)
+            .map(|snapshot| snapshot.limited_mode)
+        else {
+            return;
+        };
+        if !matches!(self.agent_runner, Some(Ok(_))) {
+            // Detached, nothing pushes config: read the providers and
+            // default model that onboarding has written so far, so the
+            // chat, `/model`, and the hint below see them.
+            self.refresh_bootstrap_config_snapshot();
+        }
+        let resume = if self.onboarding_skip {
+            "Setup isn't finished (skipped with `--skip-setup`). Relaunch without \
+             `--skip-setup` to finish it."
+        } else if limited_mode {
+            "Provider setup is deferred. Run /setup to add a provider and finish setup."
+        } else {
+            "Setup isn't finished. Run /setup to continue where you left off."
+        };
+        let message = if self.config_snapshot.providers.providers.is_empty() {
+            format!("{resume} Messages can't be sent until a provider is added.")
+        } else if self.config_snapshot.providers.active_model.is_none() {
+            format!("{resume} Messages can't be sent until a default model is chosen.")
+        } else {
+            resume.to_string()
+        };
+        if self.unfinished_onboarding_blocks_session() {
+            // No session can attach yet; the setup pane says why instead of
+            // "Loading session setup…".
+            let pane_message = match (
+                self.onboarding_skip,
+                self.config_snapshot.providers.providers.is_empty(),
+            ) {
+                (true, _) => "No session yet: setup was skipped before a default model was chosen.",
+                (false, true) => "No session yet: run /setup to add a provider.",
+                (false, false) => "No session yet: run /setup to choose a default model.",
+            };
+            if let Some(pane) = self.session_setup_inline.as_mut() {
+                pane.set_error(pane_message);
+            }
+            self.launch.provider_line = "Setup not finished".to_string();
+        }
+        self.push_plain(message);
+    }
+
+    /// Leave onboarding for good: Ctrl-C, or cancelling before the vault
+    /// exists (nothing outside onboarding can open then). The main loop
+    /// exits once in-flight setup authority settles; say so if it must wait.
+    pub(super) fn quit_from_onboarding(&mut self) {
+        if self.has_unsettled_local_authority() {
+            self.show_toast(
+                "Quitting once the current setup step settles…",
+                super::ToastKind::Info,
+            );
+        }
+        self.exit_requested = true;
     }
 
     /// The locked daemon answers onboarding before its host probes settle,
@@ -1715,6 +1837,7 @@ impl App {
             tracing::info!(target: cockpit_core::startup::TARGET, event = "trust-ready", "startup");
         }
         self.apply_onboarding_bootstrap_snapshot(completion.snapshot);
+        self.announce_unfinished_onboarding();
         self.start_post_trust_cleanup();
     }
 
@@ -2054,6 +2177,7 @@ impl App {
                 }
                 self.dialog = crate::tui::settings::Dialog::None;
             }
+            Some(OnboardingShellAction::Quit) => self.quit_from_onboarding(),
             Some(OnboardingShellAction::Close) => {
                 // Cancel/exit preserves committed daemon progress and drops
                 // only the local engine state; a later reopen resumes from
@@ -2061,9 +2185,19 @@ impl App {
                 // late authority results (an in-flight transition, a
                 // concurrent client's broadcast) from reopening the shell;
                 // only explicit re-entry clears it.
+                if self.onboarding_snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.stage != cockpit_proto::OnboardingStage::Complete
+                        && !Self::onboarding_vault_ready(snapshot)
+                }) {
+                    // Before the vault exists there is no chat to land on.
+                    self.quit_from_onboarding();
+                    return;
+                }
                 self.onboarding_dismissed = true;
                 self.onboarding_shell = None;
                 self.dialog = crate::tui::settings::Dialog::None;
+                // The chat is the surface now: resolve its workspace.
+                self.resolve_workspace_outside_onboarding();
             }
             Some(OnboardingShellAction::AgentAuthoring(action)) => {
                 self.dispatch_onboarding_agent_authoring(action);

@@ -86,7 +86,7 @@ fn package_from_projection(
 ) -> cockpit_proto::AuthoredAgentPackageDraft {
     use crate::authoring_draft::{AgentAuthoringDraft, build_package_draft};
 
-    let mut draft = AgentAuthoringDraft::from_projection(projection);
+    let mut draft = AgentAuthoringDraft::from_projection(projection, None);
     for index in draft.pending_trust_route_indices(projection) {
         draft.trust_confirmations[index] = true;
     }

@@ -2745,6 +2745,22 @@ impl App {
             self.handle_empty_composer_enter();
             return false;
         }
+        if self.startup_background.workspace_ready
+            && !matches!(self.agent_runner, Some(Ok(_)))
+            && self.unfinished_onboarding_blocks_session()
+        {
+            // A session needs a model, so with setup unfinished the attach
+            // can never land and a retained message would wait forever.
+            // Route the send to the missing setup instead (it reopens the
+            // onboarding shell at its stage); the draft stays put.
+            let reason = if self.config_snapshot.providers.providers.is_empty() {
+                MissingModelReason::NoProviders
+            } else {
+                MissingModelReason::NoActiveModel
+            };
+            self.open_missing_model_setup(reason);
+            return false;
+        }
         if (self.first_paint_completed || self.startup_background.started)
             && (!self.startup_background.workspace_ready
                 || !matches!(self.agent_runner, Some(Ok(_))))
@@ -3333,6 +3349,18 @@ impl App {
         ModelReadiness::Ready((provider.clone(), _model.clone()))
     }
 
+    /// With onboarding unfinished and no configured default model, no
+    /// session can be created: the daemon refuses a new session without
+    /// one. The configured `active_model` is the authority here, not the
+    /// launch header's display fallback (the first listed model).
+    pub(super) fn unfinished_onboarding_blocks_session(&self) -> bool {
+        let providers = &self.config_snapshot.providers;
+        self.onboarding_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.stage != cockpit_proto::OnboardingStage::Complete)
+            && (providers.providers.is_empty() || providers.active_model.is_none())
+    }
+
     fn open_missing_model_setup(&mut self, reason: MissingModelReason) {
         let status = reason.status();
         let cfg = self.config_snapshot.providers.clone();
@@ -3363,6 +3391,17 @@ impl App {
                         Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
                 }
             }
+            return;
+        }
+        // An unfinished run picks its model in the onboarding shell.
+        if !self.onboarding_skip
+            && let Some(snapshot) = self
+                .onboarding_snapshot
+                .clone()
+                .filter(|snapshot| snapshot.stage != cockpit_proto::OnboardingStage::Complete)
+        {
+            self.push_plain(status);
+            self.reopen_onboarding_shell(&snapshot);
             return;
         }
         // Missing selection/configuration is recovered through `/model`, not

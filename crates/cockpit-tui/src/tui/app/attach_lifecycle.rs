@@ -23,6 +23,13 @@ impl App {
         if !self.first_paint_completed || !self.startup_background.workspace_ready {
             return;
         }
+        // Setup left unfinished without a model (cancelled, deferred, or
+        // `--skip-setup`): the daemon refuses a session without a model, so
+        // an attach would only fail and retry, holding the exit fence. A
+        // send reopens setup instead (#548).
+        if self.unfinished_onboarding_blocks_session() {
+            return;
+        }
         if let Some(name) = self.startup_assistant_name.clone()
             && self.launch.session_id.is_none()
         {

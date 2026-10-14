@@ -488,6 +488,15 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
     }
     let inherited_trust = effective.provider_trust_default(&provider_id);
     let current_trust = effective.resolve_trust(&provider_id, &model_id);
+    let explicit_provider_trust = effective
+        .providers
+        .get(&provider_id)
+        .is_some_and(|provider| provider.trust.is_some());
+    let explicit_model_trust = effective
+        .providers
+        .get(&provider_id)
+        .and_then(|provider| provider.models.iter().find(|model| model.id == model_id))
+        .and_then(|model| model.trust);
     let inherited_thinking = effective.provider_default_thinking_mode_default(&provider_id);
     let current_thinking = effective.resolve_default_thinking_mode(&provider_id, &model_id);
     let inherited_subagent = effective.provider_subagent_invokable_default(&provider_id);
@@ -518,9 +527,18 @@ pub fn apply_model_answers(_cwd: &Path, run: &WizardRun) -> Result<ModelAnswersO
     let mut model_changed = model_inserted;
 
     if let Some(selected) = model_trust_answer(run) {
-        let next = if selected == current_trust {
+        // Onboarding is where an unclassified model gets its first custody
+        // class. With neither the model nor its provider classified, the
+        // resolved `untrusted` is only the unset fallback, which agent
+        // authoring (the next onboarding step) treats as "never chosen" and
+        // asks to confirm again (#553), so onboarding writes the answer
+        // explicitly. Elsewhere, re-accepting the resolved value is no
+        // change.
+        let keeps_fallback =
+            !onboarding || explicit_model_trust.is_some() || explicit_provider_trust;
+        let next = if selected == current_trust && keeps_fallback {
             model.trust
-        } else if selected == inherited_trust {
+        } else if selected == inherited_trust && keeps_fallback {
             None
         } else {
             Some(selected)
@@ -941,6 +959,48 @@ mod tests {
                 .unwrap()
                 .is_complete()
         );
+    }
+
+    /// #553: the onboarding model step is the first custody choice for an
+    /// unclassified model. Choosing `untrusted` (equal to the unset
+    /// fallback) is written explicitly, so the agent step does not ask for
+    /// the model's trust again.
+    #[test]
+    fn onboarding_model_trust_answer_classifies_an_unclassified_model() {
+        use crate::config::providers::ModelTrust;
+        for (trust_id, expected) in [
+            ("untrusted", ModelTrust::Untrusted),
+            ("trusted", ModelTrust::Trusted),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = CockpitConfigEnvGuard::set(&tmp.path().join("global-config.json"));
+            write_model_wizard_provider(tmp.path());
+            let providers = ConfigDoc::load_effective(tmp.path());
+            let descriptor =
+                crate::wizard::onboarding_model_descriptor_with_selection(&providers, None);
+            let submission = OnboardingModelSubmission {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                trust: trust_id.into(),
+                capabilities: Vec::new(),
+                context_tokens: String::new(),
+                max_output_tokens: String::new(),
+                thinking: "inherit".into(),
+                subagent_flags: Vec::new(),
+            };
+            let json = onboarding_model_client_answers_json(descriptor.clone(), &submission)
+                .unwrap_or_else(|e| panic!("{trust_id}: {e:#}"));
+            let run = WizardRun::from_answers_json(descriptor, &json).unwrap();
+            apply_model_answers(tmp.path(), &run)
+                .unwrap_or_else(|e| panic!("{trust_id}: save rejected: {e:#}"));
+            let cfg = ConfigDoc::load_effective(tmp.path());
+            let model = cfg.providers["p"]
+                .models
+                .iter()
+                .find(|model| model.id == "m")
+                .unwrap();
+            assert_eq!(model.trust, Some(expected), "{trust_id}");
+        }
     }
 
     fn submit_security_wizard_prefills_until_save(run: &mut WizardRun) {

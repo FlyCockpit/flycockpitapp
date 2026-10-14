@@ -1587,8 +1587,18 @@ impl App {
                         projection,
                     }) if pending_request_id.as_deref() == Some(&request_id) => {
                         self.onboarding_agent_operation_id = Some(client_operation_id.clone());
+                        // Route labels and the starred default come from
+                        // the provider config the model step just wrote.
+                        let route_names =
+                            cockpit_core::onboarding_agent::ConfiguredRouteNames::from_providers(
+                                &self.config_snapshot.providers,
+                            );
                         if let Some(shell) = self.onboarding_shell.as_mut() {
-                            shell.present_agent_authoring(projection, client_operation_id.clone());
+                            shell.present_agent_authoring(
+                                projection,
+                                client_operation_id.clone(),
+                                route_names,
+                            );
                             if let Some((pending_operation_id, receipt)) =
                                 self.pending_startup_agent_authoring_receipt.take()
                                 && pending_operation_id == client_operation_id

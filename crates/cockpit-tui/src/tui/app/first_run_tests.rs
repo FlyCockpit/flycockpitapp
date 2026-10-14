@@ -402,7 +402,7 @@ fn settle_onboarding_agent_stage(app: &mut App) {
         trust_disclosure: "Trust classification is shared global provider/model policy.".into(),
     };
     if let Some(shell) = app.onboarding_shell.as_mut() {
-        shell.present_agent_authoring(projection, operation_id.clone());
+        shell.present_agent_authoring(projection, operation_id.clone(), Default::default());
         shell.apply_agent_authoring_outcome(ApplyAuthoredAgentPackageOutcome::Receipt(
             ApplyAuthoredAgentPackageReceipt {
                 client_operation_id: operation_id,

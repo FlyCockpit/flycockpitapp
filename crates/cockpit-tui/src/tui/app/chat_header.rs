@@ -408,7 +408,13 @@ impl App {
             height,
         };
 
+        let mark = self.paint_mark();
         frame.render_widget(Clear, popover);
+        self.cover(
+            super::pointer::PaintedPart::Surface(super::pointer::SurfacePart::HeaderMore),
+            popover,
+            mark,
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(crate::tui::chrome::rounded_border_type())

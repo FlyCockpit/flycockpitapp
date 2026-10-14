@@ -36,8 +36,8 @@ use crate::tui::theme::{
 
 use super::{
     AUTOCOMPLETE_ROWS, AffordanceTarget, App, DirtyScan, HistoryEntryId, HistoryRenderCacheEntry,
-    PaneSide, PrewrappedEntry, ScrollAnchor, Selection, SelectionSpan, StartupModal,
-    SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind,
+    PaneSide, PrewrappedEntry, ScrollAnchor, Selection, SelectionSpan, SuggestionBoxKind,
+    SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind,
 };
 const IDLE_COMPOSER_PLACEHOLDER: &str = "Ask anything, ⇧↵ for a newline, or / for commands…";
 const WORKING_COMPOSER_PLACEHOLDER: &str = "The agent is working — type to queue a message…";
@@ -1248,10 +1248,21 @@ impl App {
         self.button_registry
             .begin_frame(self.mouse_capture, self.button_surface_generation);
         self.row_registry.begin_frame(self.mouse_capture);
-        // The queue's row hits are this frame's too: a frame that does not
-        // paint the queue (an overlay is up, the queue emptied) leaves none.
+        // The queue's and the suggestion box's row hits are this frame's
+        // too: a frame that does not paint them (an overlay or the question
+        // dialog is up, the queue emptied) leaves none to hit-test.
         self.queue_row_hits.clear();
-        self.surface_occluder = None;
+        self.suggestion_box_area = None;
+        self.suggestion_row_hits.clear();
+        // The paint record is rebuilt as this frame paints its covering parts.
+        self.paint_record.clear();
+        self.last_frame_area = frame.area();
+        // Pane geometry is this frame's too: a mode that does not paint the
+        // panes (a popover, the question dialog) leaves none to hit-test.
+        self.pane_rect = None;
+        self.divider = None;
+        self.pane_body = None;
+        self.find_bar_rect = None;
         self.session_rail.set_pointer_capture(self.mouse_capture);
         self.session_rail.begin_frame();
         let rects = geom.layout(frame.area());
@@ -1286,16 +1297,8 @@ impl App {
         {
             self.last_popover_rect = popover_body;
         }
-        let popover_stack_active = self.onboarding_shell.is_none()
-            && self.question_dialog.is_none()
-            && (self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust)
-                || self.overlay.is_open()
-                || self.dialog.is_active());
-        let paint_transcript_under_popover = popover_stack_active
-            && (self.overlay.is_open()
-                || self.dialog.is_active()
-                || self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust));
-        if paint_transcript_under_popover {
+        let popover_stack_active = self.surface_popover_up();
+        if popover_stack_active {
             // excoc paints the main transcript before Clear+overlay; keep the
             // chat column visible around popovers and dialog surfaces.
             let history_body = self.render_chat_header(frame, chat_body);
@@ -1303,8 +1306,13 @@ impl App {
             self.paint_transcript_control_buttons(frame);
         }
         if popover_stack_active {
+            let mark = self.paint_mark();
             frame.render_widget(ratatui::widgets::Clear, popover_body);
-            self.occlude_surface(popover_body);
+            self.cover(
+                super::pointer::PaintedPart::Surface(super::pointer::SurfacePart::Popover),
+                popover_body,
+                mark,
+            );
         }
 
         let base = self.base_layer();
@@ -1455,7 +1463,6 @@ impl App {
                     } else {
                         self.clear_suggestion_box_hits();
                     }
-                    self.paint_composer_picker(frame, chat_body);
                     // Park the real cursor: in the focused pane (when the child
                     // shows one), otherwise in the composer.
                     if self.pane.is_some() && self.pane_focused {
@@ -1475,7 +1482,11 @@ impl App {
                 }
             }
         }
+        // The surface's covering parts, in paint order. Each records itself
+        // in the paint record as it paints, and the record is the surface's
+        // pointer z-order, so what paints on top here takes the pointer.
         if render_session_rail {
+            let mark = self.paint_mark();
             self.session_rail.set_pointer_capture(self.mouse_capture);
             self.session_rail.render(
                 frame,
@@ -1484,7 +1495,17 @@ impl App {
                 Some(&mut self.button_registry),
                 frame_width,
             );
+            if let Some(area) = self.session_rail.rail_area() {
+                self.cover(
+                    super::pointer::PaintedPart::Surface(super::pointer::SurfacePart::SessionRail),
+                    area,
+                    mark,
+                );
+            }
         }
+        // The composer picker opens over the chat body — and over the narrow
+        // focused rail, which it also outranks for keys.
+        self.paint_composer_picker(frame, chat_body);
         // The collapsed-pill `more` popover floats over the transcript.
         self.paint_chat_header_more_popover(frame);
 
@@ -1497,7 +1518,13 @@ impl App {
                 rects.body.width,
                 u16::from(rects.body.height > 0),
             );
+            let mark = self.paint_mark();
             render_toast(frame, toast_row, &toast);
+            self.cover(
+                super::pointer::PaintedPart::Surface(super::pointer::SurfacePart::Toast),
+                toast_row,
+                mark,
+            );
         }
 
         // Floating layers, painted bottom-up in the order of the layer stack
@@ -1506,23 +1533,25 @@ impl App {
         self.pins_review_rect = None;
         self.rules_review_rect = None;
         for layer in self.layer_stack().into_iter().rev() {
-            match layer {
+            let mark = self.paint_mark();
+            let painted = match layer {
                 // `/pins` review checklist (`pinned-messages`): a compact
                 // bottom-anchored box listing the session's pinned messages.
                 // The transcript jumps to the highlighted pin underneath.
                 super::pointer::Layer::PinsReview => {
                     self.pins_review_rect = self.render_pins_review(frame, rects.body);
+                    self.pins_review_rect
                 }
                 super::pointer::Layer::RulesReview => {
                     self.rules_review_rect = self.render_rules_review(frame, rects.body);
+                    self.rules_review_rect
                 }
                 // The context menu's renderer clears the cells under it so
                 // the chat and status line don't bleed through.
-                super::pointer::Layer::ContextMenu => {
-                    if let Some(menu) = self.context_menu.as_ref() {
-                        crate::tui::context_menu::render_context_menu(frame, frame.area(), menu);
-                    }
-                }
+                super::pointer::Layer::ContextMenu => self.context_menu.as_ref().map(|menu| {
+                    crate::tui::context_menu::render_context_menu(frame, frame.area(), menu);
+                    menu.placement(frame.area())
+                }),
                 // Which-key overlay (`which-key-overlay.md`): a centred,
                 // scrollable, informational popover over the chat body,
                 // clear of the session rail.
@@ -1535,26 +1564,34 @@ impl App {
                         crate::tui::chrome::PopoverSide::Center,
                     );
                     let mut overlay = self.keys_overlay.take();
-                    if let Some(o) = overlay.as_mut() {
+                    let painted = overlay.as_mut().map(|o| {
                         o.render(frame, keys_rect);
-                    }
+                        keys_rect
+                    });
                     self.keys_overlay = overlay;
+                    painted
                 }
                 super::pointer::Layer::DaemonRestartPrompt => {
-                    self.render_daemon_restart_prompt(frame);
+                    self.render_daemon_restart_prompt(frame)
                 }
                 super::pointer::Layer::WorkspaceTrust
                 | super::pointer::Layer::Onboarding
-                | super::pointer::Layer::Surface => {}
+                | super::pointer::Layer::Surface => None,
+            };
+            // A floating layer covers what the base painted: covered buttons
+            // and links (and so their OSC 8 re-emission) are gone.
+            if let Some(rect) = painted {
+                self.cover(super::pointer::PaintedPart::Floating(layer), rect, mark);
             }
         }
         self.button_registry.end_frame();
+        // The targets just registered belong to this ownership state.
+        self.painted_ownership = Some(self.frame_ownership());
+        self.frame_layout_stale = false;
     }
 
-    fn render_daemon_restart_prompt(&mut self, frame: &mut ratatui::Frame) {
-        let Some(prompt) = self.daemon_restart_prompt.as_mut() else {
-            return;
-        };
+    fn render_daemon_restart_prompt(&mut self, frame: &mut ratatui::Frame) -> Option<Rect> {
+        let prompt = self.daemon_restart_prompt.as_mut()?;
         let screen = frame.area();
         let width = 52u16.min(screen.width.saturating_sub(2)).max(24);
         let height = 7u16.min(screen.height);
@@ -1622,6 +1659,7 @@ impl App {
             )),
             prompt.quit_rect,
         );
+        Some(rect)
     }
 
     fn paint_transcript_control_buttons(&mut self, frame: &mut ratatui::Frame) {
@@ -1629,9 +1667,21 @@ impl App {
         let Some(area) = self.chat_area else {
             return;
         };
+        // The find bar, painted over the transcript's last row, covers what
+        // the transcript would register there.
+        let covered_row = self.find_bar_rect.map(|rect| rect.y);
+        #[cfg(test)]
+        if let Some((rect, url)) = self.test_transcript_link.clone()
+            && Some(rect.y) != covered_row
+        {
+            self.link_registry.register(rect, url, "probe");
+        }
         let mut chips = Vec::new();
         for (row, meta) in self.chat_row_meta.iter().enumerate() {
             let y = area.y.saturating_add(row as u16);
+            if Some(y) == covered_row {
+                continue;
+            }
             if let Some(hit) = meta.fork_hit {
                 chips.push((
                     area.x.saturating_add(hit.col_start),
@@ -3261,6 +3311,18 @@ impl App {
         }
 
         if self.find_owns_bottom_row() {
+            // The bar covers the transcript's last row: what the transcript
+            // registered there is gone, and it owns that row's pointer.
+            let mark = self.paint_mark();
+            if area.width > 0 && area.height > 0 {
+                let row = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+                self.find_bar_rect = Some(row);
+                self.cover(
+                    super::pointer::PaintedPart::Surface(super::pointer::SurfacePart::FindBar),
+                    row,
+                    mark,
+                );
+            }
             render_transcript_find_bar(
                 frame.buffer_mut(),
                 area,

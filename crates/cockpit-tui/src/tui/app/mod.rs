@@ -1525,6 +1525,33 @@ impl Overlay {
         !matches!(self, Self::None)
     }
 
+    /// A bracketed paste the open overlay owns (it is the surface's text
+    /// owner). Exhaustive, so a new overlay must say where a paste goes: the
+    /// focused text field of a pane that has one, otherwise nowhere.
+    pub(super) fn paste(&mut self, data: &str) {
+        match self {
+            Self::Multireview(dialog) => dialog.paste(data),
+            Self::Notes(pane) => pane.paste(data),
+            Self::SessionSetup(pane) => pane.paste(data),
+            Self::None
+            | Self::Stats(_)
+            | Self::Usage(_)
+            | Self::Skills(_)
+            | Self::Tools(_)
+            | Self::GoalSettings(_)
+            | Self::Permissions(_)
+            | Self::Resources(_)
+            | Self::Quick(_)
+            | Self::Context(_)
+            | Self::Leaks(_)
+            | Self::Sealed(_)
+            | Self::Diff(_)
+            | Self::AgentTree(_)
+            | Self::GuidanceReview(_)
+            | Self::Help(_) => {}
+        }
+    }
+
     pub(super) fn dialog_height(&self) -> u16 {
         match self {
             Self::None => 0,
@@ -2790,10 +2817,26 @@ pub struct App {
     /// Popover body rect from the latest [`Self::render`] (for acceptance tests).
     #[cfg(any(test, feature = "test-support"))]
     pub(super) last_popover_rect: ratatui::layout::Rect,
-    /// This frame's surface popover (a body overlay, the settings dialog or
-    /// the workspace-trust dialog), painted over the transcript: nothing
-    /// painted under it takes the pointer there (`App::occlude_surface`).
-    pub(super) surface_occluder: Option<ratatui::layout::Rect>,
+    /// The covering paints of the frame just drawn, in paint order
+    /// (`App::cover`): the surface's pointer z-order and the occlusion
+    /// record for buttons, links and OSC 8 output.
+    pub(super) paint_record: Vec<(pointer::PaintedPart, ratatui::layout::Rect)>,
+    /// The ownership state the last frame was drawn for
+    /// (`App::painted_frame_is_stale`). `None` before the first frame.
+    pub(super) painted_ownership: Option<pointer::FrameOwnership>,
+    /// A resize arrived since the last frame was drawn: its geometry is void.
+    pub(super) frame_layout_stale: bool,
+    /// This frame's transcript-find bar row, if painted: transcript targets
+    /// on it are covered.
+    pub(super) find_bar_rect: Option<ratatui::layout::Rect>,
+    /// The frame area of the last draw (the bounds floating layers were
+    /// placed in).
+    pub(super) last_frame_area: ratatui::layout::Rect,
+    /// A link the transcript registers when it paints (test probe): the
+    /// transcript itself registers none in production, and the ownership
+    /// matrix needs one under every covering part to observe OSC 8 output.
+    #[cfg(test)]
+    pub(super) test_transcript_link: Option<(ratatui::layout::Rect, String)>,
 
     /// Mutable confirmation row for rapid agent switching before the next turn.
     pub(super) pending_agent_switch_log: Option<PendingAgentSwitchLog>,
@@ -4380,7 +4423,13 @@ impl App {
             last_button_frame_key: None,
             #[cfg(any(test, feature = "test-support"))]
             last_popover_rect: ratatui::layout::Rect::default(),
-            surface_occluder: None,
+            paint_record: Vec::new(),
+            painted_ownership: None,
+            frame_layout_stale: false,
+            find_bar_rect: None,
+            last_frame_area: ratatui::layout::Rect::default(),
+            #[cfg(test)]
+            test_transcript_link: None,
 
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),

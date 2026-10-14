@@ -49,13 +49,24 @@ impl LinkRegistry {
         }
     }
 
-    /// A surface was just painted over `rect`, on top of every link
-    /// registered so far this frame: any link it touches is gone from the
-    /// screen, so it is neither clickable, hoverable nor re-emitted as an
-    /// OSC 8 hyperlink over the covering surface. Links the covering surface
-    /// registers afterwards are its own and stay.
-    pub fn occlude(&mut self, rect: Rect) {
-        self.regions.retain(|link| !link.rect.intersects(rect));
+    /// How many links are registered so far this frame: a mark taken before
+    /// a covering surface paints, for [`Self::occlude_below`].
+    pub fn mark(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// A surface was painted over `rect` on top of every link registered
+    /// before `mark`: any of those it touches is gone from the screen, so it
+    /// is neither clickable, hoverable nor re-emitted as an OSC 8 hyperlink
+    /// over the covering surface. Links registered from `mark` on are the
+    /// covering surface's own and stay.
+    pub fn occlude_below(&mut self, mark: usize, rect: Rect) {
+        let mut index = 0;
+        self.regions.retain(|link| {
+            let keep = index >= mark || !link.rect.intersects(rect);
+            index += 1;
+            keep
+        });
         self.hovered = self
             .hovered_url
             .as_deref()

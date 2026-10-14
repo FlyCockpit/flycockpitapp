@@ -1,4 +1,4 @@
-use super::pointer::Layer;
+use super::pointer::{Layer, SurfacePart};
 use super::*;
 use ratatui::layout::Position;
 
@@ -24,21 +24,6 @@ pub(super) fn point_in(rect: Rect, col: u16, row: u16) -> bool {
 }
 
 impl App {
-    pub(super) fn pointer_over_session_rail(&self, col: u16, row: u16) -> bool {
-        self.session_rail
-            .rail_area()
-            .or(self.session_rail.compact_area())
-            .is_some_and(|area| point_in(area, col, row))
-    }
-
-    /// Rail hits are frame-scoped. Dialogs and overlays are rendered in the
-    /// body remaining after the rail split, so neither surface overlaps it.
-    pub(super) fn session_rail_owns_pointer(&self, col: u16, row: u16) -> bool {
-        self.pointer_over_session_rail(col, row)
-    }
-}
-
-impl App {
     /// - left-down on a chat thinking-chip → toggle reasoning expansion;
     /// - left-down on a non-chip chat row → start drag-select (T8.f);
     /// - left-drag → extend the active drag-select;
@@ -50,6 +35,15 @@ impl App {
         // old owner can no longer release before routing this event.
         self.sync_pointer_owner();
         self.observe_pointer(mouse.column, mouse.row);
+        // Hit targets belong to the frame the user saw. A modal opened, a
+        // part closed or a resize since then (in the same input drain, before
+        // a redraw) voids them: drop the event and end every capture rather
+        // than hit-test a frame the state no longer matches. The next draw
+        // resolves hover for the recorded pointer.
+        if self.painted_frame_is_stale() {
+            self.end_pointer_captures();
+            return;
+        }
         let owner = self.pointer_owner_at(Position::new(mouse.column, mouse.row));
         // A capture belongs to the layer that received its press: an event
         // routed to a different owner (a drag that crossed into a review
@@ -157,8 +151,14 @@ impl App {
                                 MouseGestureInvalidation::Cancel,
                                 self.event_loop_monotonic_now,
                             );
-                            let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
-                            if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
+                            // Hit-test the menu where it was painted: placed
+                            // in the last frame's area (clamped at its edges).
+                            let area = if self.last_frame_area.is_empty() {
+                                ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX)
+                            } else {
+                                self.last_frame_area
+                            };
+                            if let Some(action) = menu.hit_test(mouse.column, mouse.row, area) {
                                 self.context_menu = None;
                                 self.execute_context_menu_action(action, menu.clicked_chat_row);
                             } else {
@@ -222,6 +222,8 @@ impl App {
                 return;
             }
         }
+        // A live picker-scrollbar drag is a capture: it keeps the pointer
+        // until its release, wherever the pointer goes.
         if self.composer_controls.picker_scroll_drag {
             match mouse.kind {
                 MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
@@ -234,59 +236,83 @@ impl App {
             }
             return;
         }
-        let pointer_in_composer_picker = self
-            .composer_controls
-            .picker_rect
-            .is_some_and(|rect| point_in(rect, mouse.column, mouse.row));
-        if pointer_in_composer_picker {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.move_open_composer_picker(-1);
-                    return;
-                }
-                MouseEventKind::ScrollDown => {
-                    self.move_open_composer_picker(1);
-                    return;
-                }
-                MouseEventKind::Down(MouseButton::Left)
-                    if self.begin_composer_picker_scroll_drag(mouse.column, mouse.row) =>
-                {
-                    return;
-                }
-                _ => {}
-            }
-        }
+        let pos = Position::new(mouse.column, mouse.row);
         if matches!(mouse.kind, MouseEventKind::Moved) {
             // Hover follows the pointer through the one surface resolver the
             // redraw-time pass uses too.
-            self.resolve_surface_hover(Some(Position::new(mouse.column, mouse.row)), true);
+            self.resolve_surface_hover(Some(pos), true);
             return;
         }
         if !self.mouse_capture {
             self.link_pointer_gesture.cancel();
             self.pending_link_activation = None;
         }
-        // Overlay/compact rails paint over the transcript. Hits in that rect
-        // belong to the rail, not to hidden links or pin/fork chips. Persistent
-        // rails are disjoint from the dialog/overlay body by construction.
-        if !pointer_in_composer_picker && self.session_rail_owns_pointer(mouse.column, mouse.row) {
-            self.link_registry.clear_hover();
-            self.link_pointer_gesture.cancel();
-            self.pending_link_activation = None;
-            let pointer = matches!(
-                mouse.kind,
-                MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Moved
-            );
-            let wheel = matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            );
-            if wheel || (self.mouse_capture && pointer) {
-                let outcome = self.session_rail.handle_mouse(mouse);
-                self.apply_session_rail_outcome(outcome);
+        // Inside the surface, the covering part painted on top at the
+        // pointer in the frame just drawn owns it (the paint record: paint
+        // order is pointer precedence). Each part takes every event in its
+        // rect, so nothing it covers reacts.
+        match self.surface_part_at(pos) {
+            Some(SurfacePart::SessionRail) => {
+                self.link_registry.clear_hover();
+                self.link_pointer_gesture.cancel();
+                self.pending_link_activation = None;
+                let pointer = matches!(
+                    mouse.kind,
+                    MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Moved
+                );
+                let wheel = matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                );
+                if wheel || (self.mouse_capture && pointer) {
+                    let outcome = self.session_rail.handle_mouse(mouse);
+                    self.apply_session_rail_outcome(outcome);
+                }
+                return;
             }
+            Some(SurfacePart::ComposerPicker) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        let _ = self.move_open_composer_picker(-1);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let _ = self.move_open_composer_picker(1);
+                    }
+                    MouseEventKind::Down(MouseButton::Left)
+                        if self.begin_composer_picker_scroll_drag(mouse.column, mouse.row) => {}
+                    // Its rows are registered buttons.
+                    _ => {
+                        let _ = self.route_registered_button(mouse);
+                    }
+                }
+                return;
+            }
+            // Its rows are registered buttons.
+            Some(SurfacePart::HeaderMore) => {
+                let _ = self.route_registered_button(mouse);
+                return;
+            }
+            // The find bar and a toast own their row: a press or wheel on
+            // the toast already dismissed it above, and goes no further.
+            Some(SurfacePart::FindBar | SurfacePart::Toast) => return,
+            Some(SurfacePart::Popover) | None => {}
+        }
+        // A settings dialog takes the pointer inside what it painted — only
+        // when it was painted this frame (under the question dialog it is
+        // not, and its last geometry is stale).
+        let popover_up = self.surface_popover_up();
+        if popover_up
+            && self.mouse_capture
+            && self
+                .dialog
+                .settings_pointer_contains(mouse.column, mouse.row)
+            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
+        {
+            self.apply_settings_pointer_outcome(outcome);
             return;
         }
+        // Registered links and buttons are the visible ones: `App::cover`
+        // removed every target a covering part painted over.
         let hit_url = self
             .link_registry
             .at(mouse.column, mouse.row)
@@ -347,125 +373,18 @@ impl App {
             }
             return;
         }
-        if self.mouse_capture
-            && self
-                .dialog
-                .settings_pointer_contains(mouse.column, mouse.row)
-            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
-        {
-            self.apply_settings_pointer_outcome(outcome);
+        if self.route_registered_button(mouse) {
             return;
-        }
-        if self.mouse_capture
-            && let Some(outcome) = self.button_registry.handle_mouse(mouse)
-        {
-            let consumed = matches!(
-                &outcome,
-                crate::tui::button::ButtonPointerOutcome::Activated(_)
-                    | crate::tui::button::ButtonPointerOutcome::Pressed(_)
-                    | crate::tui::button::ButtonPointerOutcome::Cancelled
-            ) || self.button_registry.hit(mouse.column, mouse.row).is_some();
-            if let crate::tui::button::ButtonPointerOutcome::Activated(dispatch) = outcome {
-                self.dispatch_button(dispatch);
-            }
-            self.update_queue_pointer(mouse);
-            if consumed {
-                return;
-            }
         }
         if self.mouse_capture {
             self.update_queue_pointer(mouse);
         }
-        if self.mouse_capture
-            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
-        {
-            self.apply_settings_pointer_outcome(outcome);
+        // A painted body popover holds the surface: every event no visible
+        // registered target took is its, inside it or not — the transcript
+        // it floats over never sees a click, wheel, right-click or drag.
+        if popover_up {
+            self.route_popover_mouse(mouse);
             return;
-        }
-        // The `/sealed` no-echo overlay is modal: a left-click dismisses it,
-        // which cancels the pending write and drops the minted capability (or
-        // hides a recover reveal). Handled before the `&mut self.overlay` match
-        // so the dismiss can call back into `self` to send the cancel RPC.
-        if matches!(self.overlay, Overlay::Sealed(_)) {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.dismiss_sealed_overlay_via_pointer();
-            }
-            return;
-        }
-
-        match &mut self.overlay {
-            Overlay::Stats(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
-                return;
-            }
-            Overlay::Tools(_) => return,
-            Overlay::GoalSettings(_) => return,
-            Overlay::Skills(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
-                return;
-            }
-            Overlay::Permissions(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
-                return;
-            }
-            Overlay::Context(_) => return,
-            Overlay::Notes(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
-                return;
-            }
-            Overlay::Diff(pane) => {
-                pane.handle_mouse(mouse);
-                return;
-            }
-            Overlay::Help(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
-                return;
-            }
-            Overlay::Leaks(_) => return,
-            // Handled by the modal guard above; unreachable here.
-            Overlay::Sealed(_) => return,
-            Overlay::Resources(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
-                return;
-            }
-            Overlay::Usage(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
-                return;
-            }
-            Overlay::Multireview(_)
-            | Overlay::Quick(_)
-            | Overlay::SessionSetup(_)
-            | Overlay::AgentTree(_)
-            | Overlay::GuidanceReview(_) => return,
-            Overlay::None => {}
         }
         if self.mouse_capture && self.handle_suggestion_box_mouse(&mouse) {
             return;
@@ -749,6 +668,107 @@ impl App {
         self.dispatch_chat_gesture(mouse);
     }
 
+    /// Offer `mouse` to the registered buttons. Returns whether a button
+    /// consumed it (activated, pressed, cancelled a press, or is under the
+    /// pointer).
+    fn route_registered_button(&mut self, mouse: MouseEvent) -> bool {
+        if !self.mouse_capture {
+            return false;
+        }
+        let Some(outcome) = self.button_registry.handle_mouse(mouse) else {
+            return false;
+        };
+        let consumed = matches!(
+            &outcome,
+            crate::tui::button::ButtonPointerOutcome::Activated(_)
+                | crate::tui::button::ButtonPointerOutcome::Pressed(_)
+                | crate::tui::button::ButtonPointerOutcome::Cancelled
+        ) || self.button_registry.hit(mouse.column, mouse.row).is_some();
+        if let crate::tui::button::ButtonPointerOutcome::Activated(dispatch) = outcome {
+            self.dispatch_button(dispatch);
+        }
+        self.update_queue_pointer(mouse);
+        consumed
+    }
+
+    /// A surface event the painted body popover owns: the settings dialog,
+    /// the `/sealed` overlay or the open overlay pane handles what it can;
+    /// the rest (any other dialog, an event a pane ignores) is swallowed.
+    fn route_popover_mouse(&mut self, mouse: MouseEvent) {
+        if self.mouse_capture
+            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
+        {
+            self.apply_settings_pointer_outcome(outcome);
+            return;
+        }
+        if self.dialog.is_active() {
+            // A dialog without a pointer surface (the config picker/creator,
+            // wizards): keyboard-driven, and nothing underneath reacts.
+            return;
+        }
+        // The `/sealed` no-echo overlay is modal: a left-click dismisses it,
+        // which cancels the pending write and drops the minted capability (or
+        // hides a recover reveal). Handled before the `&mut self.overlay` match
+        // so the dismiss can call back into `self` to send the cancel RPC.
+        if matches!(self.overlay, Overlay::Sealed(_)) {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.dismiss_sealed_overlay_via_pointer();
+            }
+            return;
+        }
+        match &mut self.overlay {
+            Overlay::Stats(pane) => match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            },
+            Overlay::Skills(pane) => match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            },
+            Overlay::Permissions(pane) => match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            },
+            Overlay::Notes(pane) => match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            },
+            Overlay::Diff(pane) => pane.handle_mouse(mouse),
+            Overlay::Help(pane) => match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            },
+            Overlay::Resources(pane) => match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            },
+            Overlay::Usage(pane) => match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            },
+            // Keyboard-driven panes; `Sealed` was handled above.
+            Overlay::Tools(_)
+            | Overlay::GoalSettings(_)
+            | Overlay::Context(_)
+            | Overlay::Leaks(_)
+            | Overlay::Sealed(_)
+            | Overlay::Multireview(_)
+            | Overlay::Quick(_)
+            | Overlay::SessionSetup(_)
+            | Overlay::AgentTree(_)
+            | Overlay::GuidanceReview(_)
+            // The workspace-trust popover is its own layer, routed above.
+            | Overlay::None => {}
+        }
+    }
+
     fn apply_settings_pointer_outcome(
         &mut self,
         outcome: crate::tui::settings::SettingsPointerOutcome,
@@ -977,31 +997,13 @@ impl App {
         (clamped_col, clamped_row)
     }
 
-    /// Whether the transcript is not what the pointer is over: a layer above
-    /// the base owns the pointer (the layer stack), or a panel inside the
-    /// surface layer occludes the transcript (the surface's own z-order:
-    /// dialogs, the question dialog, the composer picker, body overlays, an
-    /// embedded pane).
+    /// Whether the transcript is not what the pointer is over: the one
+    /// ownership lookup the click path uses (a layer above the base, a
+    /// covering surface part at the pointer, or a painted body popover that
+    /// holds the surface), so hover never shows on what a click would not
+    /// reach.
     fn transcript_hover_suppressed(&self, mouse: &MouseEvent) -> bool {
-        self.pointer_owner_at(Position::new(mouse.column, mouse.row)) != Layer::Surface
-            || self.pointer_occluded(Position::new(mouse.column, mouse.row))
-            || self.dialog.is_active()
-            || self.question_dialog.is_some()
-            || self.composer_controls.picker.is_some()
-            || matches!(
-                self.overlay,
-                Overlay::Stats(_)
-                    | Overlay::Skills(_)
-                    | Overlay::Tools(_)
-                    | Overlay::GoalSettings(_)
-                    | Overlay::Permissions(_)
-                    | Overlay::Context(_)
-                    | Overlay::Notes(_)
-                    | Overlay::Leaks(_)
-                    | Overlay::Sealed(_)
-                    | Overlay::Diff(_)
-            )
-            || self.pane.is_some()
+        !self.surface_tiles_own_pointer_at(Position::new(mouse.column, mouse.row))
     }
 
     fn performance_chip_hit_at(
@@ -1091,7 +1093,9 @@ impl App {
     }
 
     fn suggestion_target_at_mouse(&self, mouse: &MouseEvent) -> Option<super::SuggestionBoxTarget> {
-        if !self.mouse_capture || !matches!(self.overlay, Overlay::None) {
+        if !self.mouse_capture
+            || !self.surface_tiles_own_pointer_at(Position::new(mouse.column, mouse.row))
+        {
             return None;
         }
         self.suggestion_row_hits

@@ -1,10 +1,31 @@
-//! The app's pointer model, in one place.
+//! The app's input-ownership model, in one place. Paint order, key routing,
+//! paste routing, pointer routing (click, wheel, right-click, drag, hover)
+//! and OSC 8 link emission all consult it.
 //!
 //! - **Layer stack** ([`App::layer_stack`]): the painted layers, topmost
-//!   first, in exactly the order [`App::render`] paints them. Pointer
-//!   ownership ([`App::pointer_owner_at`]), key ownership
-//!   ([`App::key_owner`]) and the floating-layer paint order all derive from
-//!   it, so the layer the user sees on top is the layer that gets the input.
+//!   first, derived from state. [`App::render`] paints the floating layers
+//!   in exactly its order, and pointer ownership ([`App::pointer_owner_at`])
+//!   and key ownership ([`App::key_owner`]) derive from it, so the layer the
+//!   user sees on top is the layer that gets the input. [`Layer`] and
+//!   [`Layer::ALL`] come from one declaration, so every matrix over `ALL`
+//!   covers every layer.
+//! - **Paint record** (`App::paint_record`, written by [`App::cover`]): every
+//!   covering paint of the frame just drawn — the surface's body popover,
+//!   session rail, composer picker and header `more` popover, and each
+//!   floating layer — in paint order. Recording a part removes every button
+//!   and link it covers from the registries, so a covered target is neither
+//!   clicked, hovered nor re-emitted as an OSC 8 hyperlink. Inside the
+//!   surface, the topmost recorded part at a position owns the pointer there
+//!   ([`App::surface_part_at`]): paint order *is* pointer precedence. A
+//!   painted body popover owns every surface event no visible registered
+//!   target took; with no covering part, the surface's tiles (transcript,
+//!   composer, queue, suggestions, question dialog, embedded pane) own it
+//!   ([`App::surface_tiles_own_pointer_at`]).
+//! - **Surface text owner** ([`App::surface_text_owner`]): with the surface
+//!   on top, the stage that takes an ordinary typing key. The rapid-key
+//!   intake buffers only for the composer
+//!   (`App::structured_paste_composer_eligible`), and a bracketed paste goes
+//!   to the same owner (`App::route_paste_to_owner`).
 //! - **Pointer position** (`App::pointer`): the last position the terminal
 //!   reported, recorded for every mouse event before routing
 //!   ([`App::observe_pointer`]) and forgotten when it becomes meaningless
@@ -13,9 +34,10 @@
 //!   terminal stays at its last reported cell until one of those.
 //! - **Hover** is never an independent fact: every hover store is resolved
 //!   from the owned pointer against the frame just drawn
-//!   ([`App::resolve_pointer_hover`]), and the frame is redrawn when that
-//!   changed anything, so the presented frame hovers exactly what the owned
-//!   pointer is over.
+//!   ([`App::resolve_pointer_hover`]), through the same paint-record lookup
+//!   the click path uses, and the frame is redrawn when that changed
+//!   anything, so the presented frame hovers exactly what the owned pointer
+//!   is over.
 //! - **Captures** (a held press or drag whose release is still to come)
 //!   belong to the layer that received the press. They end
 //!   ([`App::end_pointer_captures`]) when a pointer event is routed to a
@@ -27,63 +49,57 @@
 //!   cancelled here.
 //! - **Keys and paste** enter through the layer stack before any other
 //!   stage: a floating layer on top takes them all, except the base's global
-//!   quit/interrupt keys (see `App::is_base_global_key`). The rapid-paste
-//!   intake, which replays buffered keys straight into the composer, buffers
-//!   only while the surface is on top and its composer owns typing
-//!   (`App::structured_paste_composer_eligible`, derived from this stack).
+//!   quit/interrupt keys (see `App::is_base_global_key`).
 
 use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use super::{App, PointerInteractionEnd, StartupModal};
 
-/// A painted layer, topmost first in [`App::layer_stack`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Layer {
-    DaemonRestartPrompt,
-    KeysOverlay,
-    ContextMenu,
-    RulesReview,
-    PinsReview,
-    WorkspaceTrust,
-    Onboarding,
-    /// The base surface: the chat and whatever dialog, overlay, pane or
-    /// question it shows.
-    Surface,
+/// Declares an enum and its `ALL` inventory from one variant list, so a
+/// variant cannot exist without being in `ALL` — and so in every test
+/// matrix that iterates it. `ALL` is in declaration order and exists only in
+/// test builds (it is test inventory; production never enumerates).
+macro_rules! enum_with_all {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $( $(#[$attr:meta])* $variant:ident ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis enum $name {
+            $( $(#[$attr])* $variant, )+
+        }
+
+        impl $name {
+            /// Every variant, in declaration order. Generated from the same
+            /// list as the enum, so it is complete by construction.
+            #[cfg(test)]
+            $vis const ALL: &'static [$name] = &[$( $name::$variant, )+];
+        }
+    };
+}
+
+enum_with_all! {
+    /// A painted layer, topmost first in [`App::layer_stack`]. Declaration
+    /// order is stack order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Layer {
+        DaemonRestartPrompt,
+        KeysOverlay,
+        ContextMenu,
+        RulesReview,
+        PinsReview,
+        WorkspaceTrust,
+        Onboarding,
+        /// The base surface: the chat and whatever dialog, overlay, pane or
+        /// question it shows.
+        Surface,
+    }
 }
 
 impl Layer {
-    /// Every layer, in stack order (topmost first). A new variant does not
-    /// compile until [`Layer::ordinal`]'s exhaustive match gives it an
-    /// ordinal, which is its index here (the const check below rejects a
-    /// mismatch), so every test that iterates this array (the key-intake
-    /// matrix among them) covers it.
-    pub(super) const ALL: [Layer; 8] = [
-        Layer::DaemonRestartPrompt,
-        Layer::KeysOverlay,
-        Layer::ContextMenu,
-        Layer::RulesReview,
-        Layer::PinsReview,
-        Layer::WorkspaceTrust,
-        Layer::Onboarding,
-        Layer::Surface,
-    ];
-
-    /// This layer's index in [`Layer::ALL`]. A new variant gets the index it
-    /// is listed at there.
-    pub(super) const fn ordinal(self) -> usize {
-        match self {
-            Layer::DaemonRestartPrompt => 0,
-            Layer::KeysOverlay => 1,
-            Layer::ContextMenu => 2,
-            Layer::RulesReview => 3,
-            Layer::PinsReview => 4,
-            Layer::WorkspaceTrust => 5,
-            Layer::Onboarding => 6,
-            Layer::Surface => 7,
-        }
-    }
-
     /// Floating layers paint over the base; exactly one base layer is last
     /// in the stack.
     pub(super) fn is_floating(self) -> bool {
@@ -98,15 +114,108 @@ impl Layer {
     }
 }
 
-// `Layer::ALL[i]` has ordinal `i`: each listed variant sits at its own
-// ordinal, so none is listed twice and the list is in stack order.
-const _: () = {
-    let mut index = 0;
-    while index < Layer::ALL.len() {
-        assert!(Layer::ALL[index].ordinal() == index);
-        index += 1;
+/// A part of the surface layer that paints **over** other surface content.
+/// The transcript, composer, queue, suggestion box, question dialog and
+/// embedded pane are tiles (disjoint by layout) and are not listed: they own
+/// whatever no covering part took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SurfacePart {
+    /// The body popover: an overlay pane, the settings/wizard dialog or the
+    /// workspace-trust dialog, over the transcript. While painted it owns
+    /// every surface event not taken by a visible registered target.
+    Popover,
+    /// The session rail (persistent column, compact affordance, the narrow
+    /// focused overlay rail or the `[Show]` toggle).
+    SessionRail,
+    /// The composer's model/effort picker.
+    ComposerPicker,
+    /// The chat header's collapsed-pill `more` popover.
+    HeaderMore,
+    /// The transcript-find bar, painted over the transcript's last row.
+    FindBar,
+    /// A transient toast, painted over the body's last row. A press or wheel
+    /// on it dismisses it and goes no further.
+    Toast,
+}
+
+/// The ownership state a frame was painted for. Frame-owned hit targets
+/// (the registries, the paint record, tile geometry) are valid only while
+/// the current state still matches the frame the user saw: a modal opened,
+/// a part closed or a resize between draws (one input drain) voids them,
+/// and pointer events are dropped until the next frame is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FrameOwnership {
+    top: Layer,
+    popover_up: bool,
+    question: bool,
+    overlay: std::mem::Discriminant<super::Overlay>,
+    dialog_active: bool,
+    picker: bool,
+    header_more: bool,
+    pane_focused: bool,
+    pane_open: bool,
+    btw_focused: bool,
+    find: bool,
+    toast: bool,
+}
+
+/// One covering paint of the frame just drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaintedPart {
+    Surface(SurfacePart),
+    Floating(Layer),
+}
+
+enum_with_all! {
+    /// With the surface on top of the layer stack: the first stage of
+    /// [`App::handle_key`] that takes an ordinary typing key (a character,
+    /// Enter, Tab). One decision for typed keys and pasted text: the rapid-key
+    /// intake buffers only for [`SurfaceTextOwner::Composer`], and a bracketed
+    /// paste goes to the owner's text field, or nowhere when it has none.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum SurfaceTextOwner {
+        /// The open composer picker (Enter/j/k); other characters dismiss it and
+        /// go on to the next owner.
+        ComposerPicker,
+        /// A focused queue row: every key is a row action.
+        Queue,
+        /// The focused btw pane's input.
+        Btw,
+        /// The focused session rail (its search field takes characters).
+        Rail,
+        /// The focused embedded PTY pane: every key goes to the child.
+        EmbeddedPane,
+        /// An armed `/prune`, resume-compaction or `/stop` confirmation: the
+        /// next key commits (`y`) or cancels it.
+        Confirmation,
+        /// The `/pin`, `/fork` or `/copy-pick` pick mode: modal, no text field.
+        PickMode,
+        /// A selected composer pill (h/l/Enter); other characters dismiss it.
+        ComposerPill,
+        /// A selected header pill (h/l/Enter); other characters dismiss it.
+        HeaderPill,
+        /// The answering (question/approval) dialog.
+        Question,
+        /// The settings/wizard dialog.
+        Dialog,
+        /// The focused inline session-setup pane.
+        InlineSetup,
+        /// An open overlay pane.
+        Overlay,
+        /// The transcript-find bar.
+        Find,
+        /// The composer.
+        Composer,
     }
-};
+}
+
+/// Registry lengths taken before a covering part paints: everything
+/// registered before it is what the part covers.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PaintMark {
+    buttons: usize,
+    links: usize,
+}
 
 impl App {
     /// The painted layers, topmost first — the reverse of paint order.
@@ -145,6 +254,51 @@ impl App {
     /// The topmost layer.
     pub(super) fn top_layer(&self) -> Layer {
         self.layer_stack()[0]
+    }
+
+    /// The surface's text owner (see [`SurfaceTextOwner`]), in the stage
+    /// order of `handle_precedence_key` and `handle_key_inner`. Owners that
+    /// take only Esc, arrows or modified chords (the queued-edit Esc, the
+    /// subagent-view Esc, the global chords, selection Esc) do not compete
+    /// for typing and are not owners.
+    pub(super) fn surface_text_owner(&self) -> SurfaceTextOwner {
+        if self.composer_controls.picker.is_some() && self.composer_chrome_interactive() {
+            SurfaceTextOwner::ComposerPicker
+        } else if self.queue_focus.is_some() && self.surface_chat_tiles_painted() {
+            SurfaceTextOwner::Queue
+        } else if self.btw_focus_owns_input() {
+            SurfaceTextOwner::Btw
+        } else if self.session_rail.is_focused() {
+            SurfaceTextOwner::Rail
+        } else if self.embedded_pane_owns_input() {
+            SurfaceTextOwner::EmbeddedPane
+        } else if self.pending_prune_confirm
+            || self.pending_resume_compaction_confirm
+            || self.pending_stop_confirm.is_some()
+        {
+            SurfaceTextOwner::Confirmation
+        } else if self.pin_pick.is_some() || self.fork_pick.is_some() || self.copy_pick.is_some() {
+            SurfaceTextOwner::PickMode
+        } else if self.composer_controls.selection.is_some() && self.composer_chrome_interactive() {
+            SurfaceTextOwner::ComposerPill
+        } else if self.header_pill_selection.is_some() && self.header_chrome_interactive() {
+            SurfaceTextOwner::HeaderPill
+        } else if self.question_dialog.is_some() {
+            SurfaceTextOwner::Question
+        } else if self.dialog.is_active() {
+            SurfaceTextOwner::Dialog
+        } else if self.session_setup_focused
+            && matches!(self.overlay, super::Overlay::None)
+            && self.session_setup_inline_visible()
+        {
+            SurfaceTextOwner::InlineSetup
+        } else if self.overlay.is_open() {
+            SurfaceTextOwner::Overlay
+        } else if self.transcript_find.is_some() {
+            SurfaceTextOwner::Find
+        } else {
+            SurfaceTextOwner::Composer
+        }
     }
 
     /// The layer that receives keys: the topmost one. Every layer in the
@@ -263,6 +417,11 @@ impl App {
     /// pointer position is forgotten. A resize also voids the selection's
     /// coordinates.
     pub(super) fn end_pointer_interactions(&mut self, end: PointerInteractionEnd) {
+        if end == PointerInteractionEnd::Resize {
+            // The frame on screen no longer has the geometry its targets
+            // were registered at: nothing hit-tests until the next draw.
+            self.frame_layout_stale = true;
+        }
         self.end_pointer_captures_clearing_selection(end == PointerInteractionEnd::Resize);
         self.dialog.cancel_settings_pointer_confirmations();
         self.forget_pointer();
@@ -314,22 +473,120 @@ impl App {
         }
     }
 
-    /// A surface popover was just painted over `rect` on top of the
-    /// transcript. Everything painted under it so far this frame — the
-    /// transcript's registered buttons and links — is covered there, so it
-    /// stops taking the pointer (click and hover) at once; the popover's own
-    /// targets, registered after this, are unaffected. Pointer paths that hit
-    /// other transcript geometry check [`Self::pointer_occluded`].
-    pub(super) fn occlude_surface(&mut self, rect: Rect) {
-        self.button_registry.occlude(rect);
-        self.link_registry.occlude(rect);
-        self.surface_occluder = Some(rect);
+    /// The registries' lengths before a covering part paints; pass it to
+    /// [`Self::cover`] once the part has painted.
+    pub(super) fn paint_mark(&self) -> PaintMark {
+        PaintMark {
+            buttons: self.button_registry.mark(),
+            links: self.link_registry.mark(),
+        }
     }
 
-    /// Whether `pos` lies under this frame's surface popover, where the
-    /// transcript underneath does not take the pointer.
-    pub(super) fn pointer_occluded(&self, pos: Position) -> bool {
-        self.surface_occluder.is_some_and(|rect| rect.contains(pos))
+    /// A covering part was just painted over `rect`. Every button and link
+    /// registered before `mark` that it touches is gone from the screen, so
+    /// it stops taking the pointer (click and hover) and is not re-emitted as
+    /// an OSC 8 hyperlink; the part's own targets, registered after `mark`,
+    /// stay. The part is appended to this frame's paint record, which is the
+    /// surface's pointer z-order ([`Self::surface_part_at`]): what paints
+    /// later is on top and takes the pointer first.
+    pub(super) fn cover(&mut self, part: PaintedPart, rect: Rect, mark: PaintMark) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        self.button_registry.occlude_below(mark.buttons, rect);
+        self.link_registry.occlude_below(mark.links, rect);
+        self.paint_record.push((part, rect));
+    }
+
+    /// The covering surface part on top at `pos` in the frame just drawn, if
+    /// any. `None` means the surface's tiles (transcript, composer, queue,
+    /// suggestions, question dialog, embedded pane) own `pos`.
+    pub(super) fn surface_part_at(&self, pos: Position) -> Option<SurfacePart> {
+        self.paint_record
+            .iter()
+            .rev()
+            .find_map(|(part, rect)| match part {
+                PaintedPart::Surface(part) if rect.contains(pos) => Some(*part),
+                _ => None,
+            })
+    }
+
+    /// Whether the surface's chat tiles — the embedded/btw panes, the
+    /// queue, the composer and its suggestions — are what the surface paints
+    /// this frame. The body popover, the question dialog, the workspace-trust
+    /// dialog and the onboarding shell replace them; a focus held by a tile
+    /// that is not painted owns no input (its focus is kept for when the tile
+    /// returns).
+    pub(super) fn surface_chat_tiles_painted(&self) -> bool {
+        self.base_layer() == Layer::Surface
+            && !self.surface_popover_up()
+            && self.question_dialog.is_none()
+    }
+
+    /// A focused btw pane owns the keyboard only while it is painted.
+    pub(super) fn btw_focus_owns_input(&self) -> bool {
+        self.btw_pane.as_ref().is_some_and(|pane| pane.focused) && self.surface_chat_tiles_painted()
+    }
+
+    /// A focused embedded PTY owns the keyboard only while it is painted.
+    pub(super) fn embedded_pane_owns_input(&self) -> bool {
+        self.pane.is_some() && self.pane_focused && self.surface_chat_tiles_painted()
+    }
+
+    /// The ownership state of the current App state, compared against the
+    /// one recorded when the last frame was drawn.
+    pub(super) fn frame_ownership(&self) -> FrameOwnership {
+        FrameOwnership {
+            top: self.top_layer(),
+            popover_up: self.surface_popover_up(),
+            question: self.question_dialog.is_some(),
+            overlay: std::mem::discriminant(&self.overlay),
+            dialog_active: self.dialog.is_active(),
+            picker: self.composer_controls.picker.is_some(),
+            header_more: self.chat_header_more_open,
+            pane_focused: self.pane_focused,
+            pane_open: self.pane.is_some(),
+            btw_focused: self.btw_pane.as_ref().is_some_and(|pane| pane.focused),
+            find: self.transcript_find.is_some(),
+            toast: self.toast.is_some(),
+        }
+    }
+
+    /// Whether the frame on screen is stale for pointer input: a resize, or
+    /// an ownership change (a modal opened, a part closed) since it was
+    /// drawn. Its registered targets and geometry belong to a frame the
+    /// state no longer matches, so the pointer event is dropped. Before the
+    /// first frame there is nothing to compare with.
+    pub(super) fn painted_frame_is_stale(&self) -> bool {
+        self.frame_layout_stale
+            || self
+                .painted_ownership
+                .is_some_and(|painted| painted != self.frame_ownership())
+    }
+
+    /// Whether the body popover (an overlay pane, the settings/wizard
+    /// dialog or the workspace-trust dialog) is up on the surface. The one
+    /// predicate both paint ([`App::render`] paints the popover exactly when
+    /// this holds) and pointer routing use: while it holds the popover owns
+    /// every surface event no visible registered target took. The question
+    /// dialog replaces it, so a settings dialog under a question is not up,
+    /// and its last-painted geometry takes nothing (#504).
+    pub(super) fn surface_popover_up(&self) -> bool {
+        self.onboarding_shell.is_none()
+            && self.question_dialog.is_none()
+            && (self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust)
+                || self.overlay.is_open()
+                || self.dialog.is_active())
+    }
+
+    /// Whether the surface's tiles take the pointer at `pos`: the surface is
+    /// the pointer owner there, no covering part is on top at `pos`, and no
+    /// body popover holds the surface (a popover owns every surface event
+    /// that no visible registered target takes, inside it or not).
+    pub(super) fn surface_tiles_own_pointer_at(&self, pos: Position) -> bool {
+        self.pointer_owner_at(pos) == Layer::Surface
+            && self.surface_part_at(pos).is_none()
+            && !self.surface_popover_up()
     }
 
     /// Show the daemon restart prompt. It takes the pointer, so the
@@ -382,18 +639,32 @@ impl App {
             row: pos.y,
             modifiers: KeyModifiers::NONE,
         };
-        let pointer_in_composer_picker = self
-            .composer_controls
-            .picker_rect
-            .is_some_and(|rect: Rect| rect.contains(pos));
-        if !pointer_in_composer_picker && self.session_rail_owns_pointer(pos.x, pos.y) {
+        let part = self.surface_part_at(pos);
+        // The rail, the picker and the header popover own their rects
+        // outright; a painted body popover is resolved below with the rest
+        // of the surface (its links, buttons and settings hover).
+        let covering_chrome = matches!(
+            part,
+            Some(
+                SurfacePart::SessionRail
+                    | SurfacePart::ComposerPicker
+                    | SurfacePart::HeaderMore
+                    | SurfacePart::FindBar
+                    | SurfacePart::Toast
+            )
+        );
+        if covering_chrome {
+            // A covering part owns the pointer here: nothing it covers
+            // hovers. (Its own registered rows hover through the buttons.)
             self.link_registry.clear_hover();
-            self.button_registry.resolve_hover(None);
             self.queue_hover = None;
             let _ = self.dialog.resolve_settings_hover(None);
             self.hovered_suggestion = None;
             self.hovered_control_chip = None;
             self.hovered_affordance = None;
+        }
+        if part == Some(SurfacePart::SessionRail) {
+            self.button_registry.resolve_hover(None);
             if motion {
                 let _ = self.session_rail.handle_mouse(mouse);
             }
@@ -418,6 +689,9 @@ impl App {
         } else {
             self.button_registry.resolve_hover(Some(pos));
         }
+        if covering_chrome {
+            return;
+        }
         self.update_queue_pointer(mouse);
         let _ = self.link_registry.update_hover(pos.x, pos.y);
         if self.link_registry.hovered().is_some() {
@@ -427,7 +701,9 @@ impl App {
             self.hovered_affordance = None;
             return;
         }
-        if self.dialog.resolve_settings_hover(Some(pos)) {
+        // Settings hovers only while its popover is up.
+        let settings_pointer = self.surface_popover_up().then_some(pos);
+        if self.dialog.resolve_settings_hover(settings_pointer) && settings_pointer.is_some() {
             self.hovered_suggestion = None;
             self.hovered_control_chip = None;
             self.hovered_affordance = None;

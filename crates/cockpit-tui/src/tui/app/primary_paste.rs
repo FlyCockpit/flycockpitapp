@@ -23,7 +23,7 @@ impl App {
     pub(super) fn primary_paste_layer_at(&self, mouse: &MouseEvent) -> PrimaryPasteLayer {
         // The layer that owns the pointer there, from the layer stack; only
         // the surface is resolved further.
-        use super::pointer::Layer;
+        use super::pointer::{Layer, SurfacePart};
         match self.pointer_owner_at(ratatui::layout::Position::new(mouse.column, mouse.row)) {
             Layer::KeysOverlay => return PrimaryPasteLayer::KeysOverlay,
             Layer::ContextMenu => return PrimaryPasteLayer::ContextMenu,
@@ -34,19 +34,37 @@ impl App {
             | Layer::Onboarding => return PrimaryPasteLayer::Other,
             Layer::Surface => {}
         }
-        if self.dialog.is_active() {
-            return PrimaryPasteLayer::Settings;
+        // Inside the surface: the covering part on top there (the paint
+        // record), else the tiles.
+        let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+        match self.surface_part_at(pos) {
+            Some(SurfacePart::ComposerPicker) => return PrimaryPasteLayer::Footer,
+            Some(
+                SurfacePart::SessionRail
+                | SurfacePart::HeaderMore
+                | SurfacePart::FindBar
+                | SurfacePart::Toast,
+            ) => {
+                return PrimaryPasteLayer::Other;
+            }
+            Some(SurfacePart::Popover) | None => {}
+        }
+        if self.surface_popover_up() {
+            return if self.dialog.is_active() {
+                PrimaryPasteLayer::Settings
+            } else {
+                PrimaryPasteLayer::Overlay
+            };
         }
         if self.question_dialog.is_some() {
             return PrimaryPasteLayer::Dialog;
         }
-        if self.overlay.is_open() {
-            return PrimaryPasteLayer::Overlay;
-        }
-        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused) {
+        if self.btw_focus_owns_input() {
             return PrimaryPasteLayer::BtwPane;
         }
-        if self.pane_focused
+        // A focused pane keeps the middle-click away from the composer only
+        // while the panes are what the surface paints.
+        if (self.pane_focused && self.surface_chat_tiles_painted())
             || self
                 .pane_rect
                 .is_some_and(|rect| super::mouse::point_in(rect, mouse.column, mouse.row))
@@ -68,13 +86,6 @@ impl App {
         }
         if self.mouse_in_chat_area(mouse) {
             return PrimaryPasteLayer::Chat;
-        }
-        if self
-            .composer_controls
-            .picker_rect
-            .is_some_and(|rect| super::mouse::point_in(rect, mouse.column, mouse.row))
-        {
-            return PrimaryPasteLayer::Footer;
         }
         PrimaryPasteLayer::Other
     }

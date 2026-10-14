@@ -51,6 +51,23 @@ fn seed_read_args_schema() -> Value {
     })
 }
 
+/// Verbose steering about structured model selectors; removed together with
+/// the selector fields by [`TaskTool::without_model_selection`].
+const MODEL_SELECTION_STEER: &str = "Use `intent=models` to discover allowed structured model selectors. Model selectors choose capability, category, and cost only: data custody is host policy, so you cannot request a capture-capable child, and delegated routing always applies the redacted untrusted filter. ";
+const MODELS_INTENT_EXAMPLE: &str = "- models: { \"intent\": \"models\" } ";
+
+/// Remove one field from the delegate payload and every batch entry.
+fn remove_payload_field(schema: &mut Value, field: &str) {
+    for pointer in [
+        "/properties/payload/properties",
+        "/properties/payload/items/properties",
+    ] {
+        if let Some(object) = schema.pointer_mut(pointer).and_then(Value::as_object_mut) {
+            object.remove(field);
+        }
+    }
+}
+
 pub struct TaskTool {
     description: String,
     /// The explicit, steering verbose description, built
@@ -81,7 +98,44 @@ impl TaskTool {
         remaining_depth: u32,
         same_model_only: bool,
     ) -> Self {
-        Self::with_subagents_inner(agents, Some(remaining_depth), same_model_only)
+        let tool = Self::with_subagents_inner(agents, Some(remaining_depth), same_model_only);
+        // A same-model recursive child refuses any `model`
+        // (`recursive delegation must omit model`), so do not offer one.
+        if same_model_only {
+            tool.without_model_selection()
+        } else {
+            tool
+        }
+    }
+
+    /// Advertise only what the host will accept when the parent may not name
+    /// a child model (`agent_chooses_subagent_model` off, or a same-model
+    /// recursive child): drop every `model` selector and the `models`
+    /// discovery intent. Strict function-calling wires make every advertised
+    /// optional field a decision the model must take, so a field the host
+    /// would refuse cannot stay in the schema.
+    pub fn without_model_selection(mut self) -> Self {
+        for schema in [&mut self.parameters, &mut self.verbose_parameters] {
+            remove_payload_field(schema, "model");
+            if let Some(intents) = schema["properties"]["intent"]["enum"].as_array_mut() {
+                intents.retain(|intent| intent != "models");
+            }
+        }
+        self.verbose_description = self
+            .verbose_description
+            .replace(MODEL_SELECTION_STEER, "")
+            .replace(MODELS_INTENT_EXAMPLE, "");
+        self
+    }
+
+    /// Drop the `mode` override when the agent's grant forbids interactive
+    /// subagents: the host forces every child noninteractive there, so an
+    /// advertised `subagent_interactive` would be silently overridden.
+    pub fn without_interactive_mode(mut self) -> Self {
+        for schema in [&mut self.parameters, &mut self.verbose_parameters] {
+            remove_payload_field(schema, "mode");
+        }
+        self
     }
 
     fn with_subagents_inner(
@@ -122,14 +176,11 @@ impl TaskTool {
              subagent does NOT see your \
              conversation. An interactive subagent (e.g. the writer or the planning interviewer) \
              takes over the conversation with the user; the others run on their own and report \
-             back. Only `builder` may write files, in either case. Use `intent=models` to discover \
-             allowed structured model selectors. Model selectors choose capability, category, and \
-             cost only: data custody is host policy, so you cannot request a capture-capable \
-             child, and delegated routing always applies the redacted untrusted filter. \
+             back. Only `builder` may write files, in either case. {MODEL_SELECTION_STEER}\
              Use exactly one task intent: \
              - delegate: {{ \"intent\": \"delegate\", \"payload\": {{ \"agent\": \"builder\", \"prompt\": \"...\" }} }} \
              - batch: {{ \"intent\": \"batch\", \"payload\": [{{ \"label\": \"x\", \"agent\": \"explore\", \"prompt\": \"...\" }}] }} \
-             - models: {{ \"intent\": \"models\" }} \
+             {MODELS_INTENT_EXAMPLE}\
              - query: {{ \"intent\": \"query\", \"payload\": {{ \"task_call_id\": \"...\", \"message\": \"...\" }} }} \
              If a noninteractive task returns a backgrounded task_delegation JSON envelope, the original tool call is closed and the child is still running detached with result_pending=true. Do not treat it as the report or redelegate solely because it backgrounded; continue the current conversation and use the async task_delegation result or task status/query/list with task_call_id. Read each child status and optional error; backgrounded children can later complete, fail, be cancelled, or be lost. task steer applies at the next child turn boundary only if still running/actionable. resume_handle is not a universal background-task control channel. \
              When explore returns host-authored seed_reads and seed_reads_receipt fields, copy both unchanged to the promptly-following builder delegate payload; the builder executes those read-only calls before its first inference. Multiple independent delegate calls may be emitted separately; each keeps its own call/task lifecycle and the host may run proven read-only children concurrently. Use batch only for one grouped result or explicit depends_on edges. Do not add legacy delegate/batch/control siblings. Query/steer require message."

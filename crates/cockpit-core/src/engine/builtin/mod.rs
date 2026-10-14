@@ -643,6 +643,18 @@ fn with_tiered_recall_tools(
 }
 
 fn with_task_for_targets(tb: ToolBox, args: &SpawnArgs, targets: &[&str]) -> ToolBox {
+    with_task_for_targets_granted(tb, args, targets, args.vnext_grant.as_ref())
+}
+
+/// `grant` is the effective vNext grant of the agent being built (it can be
+/// narrower than `args.vnext_grant`); it decides whether interactive
+/// subagents are offered at all.
+fn with_task_for_targets_granted(
+    tb: ToolBox,
+    args: &SpawnArgs,
+    targets: &[&str],
+    grant: Option<&crate::agents::EffectiveVnextGrant>,
+) -> ToolBox {
     let allowed: Vec<&str> = if args.delegated && args.vnext_grant.is_none() {
         targets
             .iter()
@@ -655,19 +667,29 @@ fn with_task_for_targets(tb: ToolBox, args: &SpawnArgs, targets: &[&str]) -> Too
     if allowed.is_empty() {
         return tb;
     }
-    if args.delegated && args.vnext_grant.is_none() {
-        tb.with(Arc::new(
-            crate::tools::task::TaskTool::with_recursive_subagents(
-                &allowed,
-                args.delegation_recursion.remaining_depth,
-                args.delegation_recursion.same_model_only,
-            ),
-        ))
-    } else {
-        tb.with(Arc::new(crate::tools::task::TaskTool::with_subagents(
+    let task = if args.delegated && args.vnext_grant.is_none() {
+        crate::tools::task::TaskTool::with_recursive_subagents(
             &allowed,
-        )))
-    }
+            args.delegation_recursion.remaining_depth,
+            args.delegation_recursion.same_model_only,
+        )
+    } else {
+        crate::tools::task::TaskTool::with_subagents(&allowed)
+    };
+    // Every delegation path refuses a parent-named child model while
+    // `agent_chooses_subagent_model` is off; advertise only what it accepts.
+    let (extended, _) = crate::engine::model_roles::load_model_role_config(&args.config);
+    let task = if extended.agent_chooses_subagent_model {
+        task
+    } else {
+        task.without_model_selection()
+    };
+    let task = if grant.is_none_or(|grant| grant.interactive_subagents_permitted()) {
+        task
+    } else {
+        task.without_interactive_mode()
+    };
+    tb.with(Arc::new(task))
 }
 
 /// Every native tool name that an agent definition may mention in `tools:`.
@@ -3044,7 +3066,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             &args.vnext_local_installation_resolver,
         )?;
         let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
-        tb = with_task_for_targets(tb, tool_args, &target_refs);
+        tb = with_task_for_targets_granted(tb, tool_args, &target_refs, Some(grant));
     }
     tb = with_audio_video_tools(tb, def, tool_args)?;
     tb = with_read_image_tools(tb, def, tool_args)?;
@@ -5201,6 +5223,63 @@ pub(crate) mod tests {
             violations.is_empty(),
             "agent tool schemas outside the wire subsets:\n{}",
             violations.join("\n")
+        );
+    }
+
+    /// #549 follow-up: strict wires make every advertised optional field a
+    /// decision the model must take. With `agent_chooses_subagent_model` off
+    /// (the default) the host refuses any parent-named child model, so the
+    /// `task` schema must not offer the selector (nor `models` discovery).
+    #[test]
+    fn task_schema_omits_model_selector_the_host_would_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let (extended, _) = crate::engine::model_roles::load_model_role_config(&args.config);
+        assert!(
+            !extended.agent_chooses_subagent_model,
+            "test premise: model selection is off by default"
+        );
+        for steering in [
+            crate::agents::ToolSteering::Terse,
+            crate::agents::ToolSteering::Verbose,
+        ] {
+            let task = task_definition(&build(&args), steering);
+            let payload = &task.parameters["properties"]["payload"];
+            assert!(
+                payload["properties"].get("model").is_none(),
+                "{steering:?}: {payload}"
+            );
+            assert!(
+                payload["items"]["properties"].get("model").is_none(),
+                "{steering:?}"
+            );
+            assert!(
+                !task.parameters["properties"]["intent"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|intent| intent == "models"),
+                "{steering:?}: models discovery offered without model selection"
+            );
+            assert!(!task.description.contains("intent=models"), "{steering:?}");
+        }
+
+        // A same-model recursive child refuses `model` regardless of config.
+        let recursive =
+            crate::tools::task::TaskTool::with_recursive_subagents(&["explore"], 1, true);
+        let schema = crate::engine::tool::Tool::parameters(&recursive);
+        assert!(
+            schema["properties"]["payload"]["properties"]
+                .get("model")
+                .is_none()
+        );
+        // The unrestricted tool still offers it.
+        let open = crate::tools::task::TaskTool::with_subagents(&["explore"]);
+        let schema = crate::engine::tool::Tool::parameters(&open);
+        assert!(
+            schema["properties"]["payload"]["properties"]
+                .get("model")
+                .is_some()
         );
     }
 
@@ -8145,7 +8224,10 @@ pub(crate) mod tests {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        );
+        )
+        // Test config leaves `agent_chooses_subagent_model` off, so the host
+        // advertises the selector-free schema (#549).
+        .without_model_selection();
         let base_def =
             crate::engine::tool::definition_of(&base, crate::agents::ToolSteering::Terse, None);
         assert_eq!(task_terse.name, base_def.name);

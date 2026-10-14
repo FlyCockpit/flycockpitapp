@@ -332,19 +332,25 @@ async fn run_verification(
             }
         });
     let author_slot = author_slot_for_agent(input.agent);
-    let generators = rule
-        .generators
-        .iter()
-        .map(|generator| {
-            EffectiveGeneratorContext::new(generator, &author_slot, input.agent, input.history)
-        })
-        .collect::<Vec<_>>();
     let candidate_schema = input
         .agent
         .tools
         .get(input.resolved_name)
         .map(|tool| tool.parameters())
         .unwrap_or(Value::Null);
+    let generators = rule
+        .generators
+        .iter()
+        .map(|generator| {
+            EffectiveGeneratorContext::new(
+                generator,
+                &author_slot,
+                input.agent,
+                input.history,
+                &candidate_schema,
+            )
+        })
+        .collect::<Vec<_>>();
     let generator_audit_name = format!("{}:verification-generator", input.agent.name);
     for effective in &generators {
         let model = if profile_snapshot_id.is_nil() {
@@ -1430,6 +1436,7 @@ mod tests {
             "author",
             &agent,
             &history,
+            &serde_json::Value::Null,
         );
         let author_request = author.request("candidate prompt");
         let author_reservation = generator_budget_text(&agent.model, &author_request).unwrap();
@@ -1453,6 +1460,7 @@ mod tests {
             "author",
             &agent,
             &history,
+            &serde_json::Value::Null,
         );
         assert!(matches!(
             foreign.recipe(),

@@ -2179,7 +2179,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
     // fork-only `note` tool: present only inside a loop fork.
     if resolved_name == "schedule" && agent.tools.get("note").is_none() {
         let original_args = tc.function.arguments.clone();
-        let mut args = tc.function.arguments.clone();
         // Validate + repair the loose outer object against the `schedule`
         // tool's own minimal `{action, args}` schema; per-action
         // validation runs in the driver through the same repair
@@ -2190,6 +2189,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
             .get("schedule")
             .map(|t| t.parameters())
             .unwrap_or(Value::Null);
+        // Structural tools bypass ordinary dispatch, so they drop strict-wire
+        // placeholder nulls here: an optional field sent as `null` is absent.
+        let mut args = crate::engine::model::wire_schema::strip_wire_nulls(
+            &schedule_schema,
+            tc.function.arguments.clone(),
+        );
         let recovery = repair(&mut args, &schedule_schema, "schedule").recovery;
         return_structural!(TurnOutcome::ScheduleAction {
             original_args,
@@ -2217,7 +2222,10 @@ pub(crate) async fn phase_10_dispatch_one_call(
             .get("spawn")
             .map(|t| t.parameters())
             .unwrap_or(Value::Null);
-        let mut args = tc.function.arguments.clone();
+        let mut args = crate::engine::model::wire_schema::strip_wire_nulls(
+            &schema,
+            tc.function.arguments.clone(),
+        );
         let _ = repair(&mut args, &schema, "spawn");
         let prompt = args
             .get("prompt")
@@ -2264,7 +2272,10 @@ pub(crate) async fn phase_10_dispatch_one_call(
             .get("return")
             .map(|t| t.parameters())
             .unwrap_or(Value::Null);
-        let mut fields = tc.function.arguments.clone();
+        let mut fields = crate::engine::model::wire_schema::strip_wire_nulls(
+            &schema,
+            tc.function.arguments.clone(),
+        );
         let _ = repair(&mut fields, &schema, "return");
         return_structural!(TurnOutcome::Return { fields });
     }

@@ -21,7 +21,7 @@ use crate::session::Session;
 
 use super::inference::{VerificationInferenceRuntime, effective_verification_route};
 use super::intercept::generator_context::{
-    EffectiveGeneratorContext, EffectiveGeneratorRequest, candidate_tool_definition,
+    CANDIDATE_TOOL_NAME, EffectiveGeneratorContext, EffectiveGeneratorRequest,
 };
 use super::recipe::{RecipeAssemblyInput, assemble_recipe};
 
@@ -1022,7 +1022,6 @@ async fn generate_one_shot(
     request: EffectiveGeneratorRequest<'_>,
     provider_handoff: Option<&AtomicBool>,
 ) -> GeneratedTurn {
-    let tool = candidate_tool_definition();
     let choice = super::inference::journaled_generator_inference(
         VerificationInferenceRuntime {
             session: input.ctx.session.clone(),
@@ -1037,7 +1036,7 @@ async fn generate_one_shot(
         request,
     )
     .await;
-    generated_turn_from_provider_result(choice, &tool.name)
+    generated_turn_from_provider_result(choice, CANDIDATE_TOOL_NAME)
 }
 
 fn generated_turn_from_provider_result(
@@ -1406,7 +1405,11 @@ mod tests {
             },
         ];
         let mut verification_tools = author_tools.clone();
-        verification_tools.push(candidate_tool_definition());
+        verification_tools.push(
+            crate::engine::verification::intercept::generator_context::candidate_tool_definition(
+                &serde_json::Value::Null,
+            ),
+        );
         for (actual, expected) in verification_tools.iter().zip(&author_tools) {
             assert_eq!(actual.name, expected.name);
             assert_eq!(actual.description, expected.description);

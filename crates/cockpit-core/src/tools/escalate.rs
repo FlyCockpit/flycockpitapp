@@ -331,6 +331,15 @@ mod tests {
     use uuid::Uuid;
 
     async fn record_bash_call(ctx: &ToolCtx, call_id: &str, exit_code: Option<i32>) {
+        record_bash_command(ctx, call_id, "printf escalated", exit_code).await;
+    }
+
+    async fn record_bash_command(
+        ctx: &ToolCtx,
+        call_id: &str,
+        command: &str,
+        exit_code: Option<i32>,
+    ) {
         ctx.session
             .record_tool_call(ToolCallRow {
                 event_id: Uuid::new_v4(),
@@ -343,8 +352,8 @@ mod tests {
                 tool: "bash".to_string(),
                 path: None,
                 mcp_server: None,
-                original_input_json: json!({ "command": "printf escalated" }),
-                wire_input_json: json!({ "command": "printf escalated" }),
+                original_input_json: json!({ "command": command }),
+                wire_input_json: json!({ "command": command }),
                 recovery: crate::db::tool_calls::Recovery::Clean,
                 hard_fail: false,
                 exit_code,
@@ -436,6 +445,68 @@ mod tests {
             .await
             .unwrap();
         })
+    }
+
+    /// #528: an approved `escalate` rerun crosses the real spawn-boundary
+    /// recheck (no scripted outcome) and `sh -c` receives exactly the command
+    /// the escalation prompt bound. `None` when the host `sh` has no witness.
+    #[cfg(unix)]
+    async fn escalate_rerun_with_exec_witness(
+        selected: &'static str,
+        args: Value,
+    ) -> Option<ToolOutput> {
+        let command = crate::tools::bash::exec_witness::command()?;
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, _approver, db, session_id, hub) = ctx_with_approver(tmp.path()).await;
+        ctx.session.set_sandbox_escalation_enabled(true);
+        ctx.session.set_sandbox_enabled(true);
+        ctx.session.set_approval_mode(ApprovalMode::Manual);
+        record_bash_command(&ctx, "call-528", command, Some(1)).await;
+        let resolver = resolve_next_interrupt(db, session_id, hub, selected);
+        let out = crate::engine::interrupt::with_host_approval_effect_scope(
+            "escalate_test_dispatch",
+            tokio_util::sync::CancellationToken::new(),
+            EscalateTool.call(args, &ctx),
+            |output| Some(output.exit_code == Some(0)),
+        )
+        .await
+        .expect("escalate returns");
+        resolver.await.unwrap();
+        assert_eq!(out.exit_code, Some(0), "{}", out.content);
+        crate::tools::bash::exec_witness::assert_executed_exactly(&out.content, command);
+        Some(out)
+    }
+
+    /// Grant-and-retry binds `{"execute":{command,"sandbox":"confined"}}`;
+    /// the confined respawn must present that effect and run the exact text.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escalate_grant_retry_confined_runs_exactly_the_approved_command() {
+        let Some(out) = escalate_rerun_with_exec_witness(
+            crate::approval::ID_ESCALATE_GRANT_SESSION,
+            json!({ "call_id": "call-528", "suggested_paths": ["cache"] }),
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(out.sandbox.expect("bash records sandbox metadata").confined);
+    }
+
+    /// Run-unconfined-once binds `{"execute":{command,"sandbox":"unconfined"}}`
+    /// through the `escalate` prompt (distinct from bash's in-call escalation).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escalate_run_unconfined_once_runs_exactly_the_approved_command() {
+        let Some(out) = escalate_rerun_with_exec_witness(
+            crate::approval::ID_ESCALATE_RUN_UNCONFINED_ONCE,
+            json!({ "call_id": "call-528" }),
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(!out.sandbox.expect("bash records sandbox metadata").confined);
     }
 
     #[tokio::test]

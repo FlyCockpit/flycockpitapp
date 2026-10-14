@@ -7,10 +7,15 @@
 //! Per the tool-availability-policy memory: at startup we probe
 //! `$PATH` for `rg`/`fd` and (on macOS) `gsed`. The tool description
 //! advertises which of these are available so the model picks the
-//! right binary, and on macOS-with-gsed we prepend a small `sed()`
-//! shell function so `sed` invocations use the GNU implementation —
-//! BSD `sed` differs enough that scripts written for Linux fail
-//! silently on macOS.
+//! right binary. macOS builds add a static, hedged `sed` hint (see
+//! [`MACOS_SED_HINT`]); the shell text itself is never rewritten.
+//!
+//! Approval/effect identity: the command text the user or model approved is
+//! byte-for-byte the script handed to `sh -c` (host, sandboxed, and container
+//! runs alike) and the `execute.command` effect rechecked at the spawn
+//! boundary. Cockpit adds no shell prelude, wrapper, or platform prefix to
+//! that text; confinement, cwd, and environment plumbing live in the
+//! process launcher, never in the approved script.
 //!
 //! Safety:
 //!   - Output is capped at [`crate::tools::common::OUTPUT_BYTE_CAP`], and every
@@ -60,7 +65,6 @@ pub struct BashTool {
     /// The explicit, steering verbose (formerly defensive) description
     /// (implementation note).
     verbose_description: String,
-    prelude: String,
 }
 
 impl Default for BashTool {
@@ -71,8 +75,9 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
+        let mut description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
             .to_string();
+        description.push_str(MACOS_SED_HINT);
 
         // The defensive, explicitly-steering form (the verbose steering
         // variant). Same PATH-probe hints, more guidance.
@@ -96,12 +101,12 @@ impl BashTool {
              unless the user explicitly wants a persistent workspace artifact, then inspect \
              focused slices or searches from that file. Never edit a file you intend to keep via bash — use \
              `read`+`write`/`edit`."
-                .to_string();
+                .to_string()
+                + MACOS_SED_HINT;
 
         Self {
             description,
             verbose_description,
-            prelude: macos_sed_prelude(),
         }
     }
 
@@ -130,13 +135,19 @@ impl BashTool {
     }
 }
 
-fn macos_sed_prelude() -> String {
-    if cfg!(target_os = "macos") {
-        "sed() { if command -v gsed >/dev/null 2>&1; then command gsed \"$@\"; else command sed \"$@\"; fi; }; ".to_string()
-    } else {
-        String::new()
-    }
-}
+/// macOS ships BSD `sed`, whose flags (notably `-i`) differ from GNU sed.
+/// The approved shell text is never rewritten to paper over this (#528: an
+/// injected `sed()` prelude made the executed script differ from the
+/// approved one), so the model is told instead. The hint is static and
+/// compiled only into macOS builds: it lives in the base description, which
+/// every provider sees, and stays byte-stable for prompt caching. "May be"
+/// keeps it accurate when GNU sed is first on `PATH` (Homebrew gnubin) or the
+/// shell runs in a Linux container.
+#[cfg(target_os = "macos")]
+const MACOS_SED_HINT: &str =
+    " On macOS, `sed` may be BSD sed: use `sed -i ''` for in-place edits, or `gsed` if installed.";
+#[cfg(not(target_os = "macos"))]
+const MACOS_SED_HINT: &str = "";
 
 #[async_trait]
 impl Tool for BashTool {
@@ -217,7 +228,7 @@ impl Tool for BashTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        call_bash_inner(&self.prelude, args, ctx, BashRunOptions::default()).await
+        call_bash_inner(args, ctx, BashRunOptions::default()).await
     }
 }
 
@@ -368,9 +379,7 @@ pub(crate) async fn rerun_escalated_bash(
     ctx: &ToolCtx,
     approval_scope_recorded: Option<String>,
 ) -> Result<ToolOutput> {
-    let tool = BashTool::new();
     call_bash_inner(
-        &tool.prelude,
         args,
         ctx,
         BashRunOptions {
@@ -395,9 +404,7 @@ pub(crate) async fn rerun_escalated_bash_confined(
                 "workspace lease is unavailable before escalated bash: {error:#}"
             ))
         })?;
-    let tool = BashTool::new();
     call_bash_inner(
-        &tool.prelude,
         args,
         ctx,
         BashRunOptions {
@@ -410,7 +417,6 @@ pub(crate) async fn rerun_escalated_bash_confined(
 }
 
 async fn call_bash_inner(
-    prelude: &str,
     args: Value,
     ctx: &ToolCtx,
     options: BashRunOptions,
@@ -536,12 +542,6 @@ async fn call_bash_inner(
 
     tracing::debug!(command, timeout_ms, "bash: spawning");
 
-    let prefixed = if prelude.is_empty() {
-        command.to_string()
-    } else {
-        format!("{prelude}{command}")
-    };
-
     // Resolve whether to confine this run (sandboxing part 2):
     //
     //   - Windows: never (no zerobox backend) — run unconfined and
@@ -653,7 +653,6 @@ async fn call_bash_inner(
     if is_container_run {
         return run_container_bash(
             command,
-            &prefixed,
             &cwd,
             timeout_ms,
             &session_env,
@@ -843,7 +842,7 @@ async fn call_bash_inner(
 
     // First attempt: sandboxed (confined) or broadened/unconfined.
     let attempt = run_shell(
-        &prefixed,
+        command,
         &cwd,
         confine,
         tmp_dir.as_deref(),
@@ -883,7 +882,7 @@ async fn call_bash_inner(
             .with_bash_meta(meta, &resource_meta));
         }
         RunOutcome::SpawnError(e) => {
-            let mut message = render_spawn_error(&prefixed, &cwd, &e, Some(confine));
+            let mut message = render_spawn_error(command, &cwd, &e, Some(confine));
             message.push_str(
                 &crate::tools::command_resource_profiles::resource_profile_context(
                     &command_resource_plan,
@@ -990,7 +989,7 @@ async fn call_bash_inner(
             }
             meta.approval_scope_recorded = Some(scope.as_str().to_string());
             let rerun = run_shell(
-                &prefixed,
+                command,
                 &cwd,
                 false, // broadened — no confinement
                 tmp_dir.as_deref(),
@@ -1030,7 +1029,7 @@ async fn call_bash_inner(
                     .with_bash_meta(meta, &resource_meta));
                 }
                 RunOutcome::SpawnError(e) => {
-                    let mut message = render_spawn_error(&prefixed, &cwd, &e, Some(false));
+                    let mut message = render_spawn_error(command, &cwd, &e, Some(false));
                     message.push_str(
                         &crate::tools::command_resource_profiles::resource_profile_context(
                             &command_resource_plan,
@@ -2616,7 +2615,6 @@ fn looks_like_build_test_check(command: &str) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_container_bash(
-    display_command: &str,
     command: &str,
     cwd: &std::path::Path,
     timeout_ms: u64,
@@ -2704,7 +2702,7 @@ async fn run_container_bash(
         RunOutcome::Done(o) => o,
     };
     Ok(render_bash_outcome(
-        display_command,
+        command,
         cwd,
         final_outcome,
         ctx,
@@ -3504,3 +3502,58 @@ mod schema_tests;
 
 #[cfg(all(test, unix))]
 mod tests;
+
+/// Test-only witness for the #528 invariant: the script `sh -c` receives is
+/// byte-for-byte the approved command. The witness command prints its own
+/// script from inside the shell, so it works under seatbelt/bwrap (where
+/// `ps` may be denied) and needs no procps.
+#[cfg(all(test, unix))]
+pub(crate) mod exec_witness {
+    /// A command that prints the exact `sh -c` script it runs on its own
+    /// line: `$BASH_EXECUTION_STRING` when `sh` is bash (macOS), otherwise
+    /// the script argument from `/proc/$$/cmdline` (Linux dash).
+    ///
+    /// Guaranteed on macOS and Linux: there an unavailable witness is a test
+    /// environment defect and panics, so the exact-script tests can never
+    /// pass vacuously. Only on other unix hosts (for example FreeBSD with a
+    /// non-bash `sh` and no procfs) does this return `None`, and callers
+    /// skip with the reason printed to stderr.
+    pub(crate) fn command() -> Option<&'static str> {
+        static CHOICE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+        let choice = *CHOICE.get_or_init(|| {
+            let bash_string = std::process::Command::new("sh")
+                .args(["-c", r#"printf %s "${BASH_EXECUTION_STRING-}""#])
+                .output()
+                .map(|output| !output.stdout.is_empty())
+                .unwrap_or(false);
+            if bash_string {
+                Some(r#"printf '%s\n' "$BASH_EXECUTION_STRING"; :"#)
+            } else if std::path::Path::new("/proc/self/cmdline").exists() {
+                Some(r#"tr '\000' '\n' < /proc/$$/cmdline; :"#)
+            } else {
+                None
+            }
+        });
+        if choice.is_none() {
+            if cfg!(any(target_os = "macos", target_os = "linux")) {
+                panic!(
+                    "exec witness unavailable on macOS/Linux: `sh` exposes neither \
+                     $BASH_EXECUTION_STRING nor /proc/$$/cmdline"
+                );
+            }
+            eprintln!(
+                "skipping exact-script check: `sh` exposes neither $BASH_EXECUTION_STRING nor /proc/$$/cmdline"
+            );
+        }
+        choice
+    }
+
+    /// Assert the witness output shows exactly `command` as the executed
+    /// script (any prelude, wrapper, or prefix makes the line differ).
+    pub(crate) fn assert_executed_exactly(content: &str, command: &str) {
+        assert!(
+            content.lines().any(|line| line.trim_end() == command),
+            "executed script must be exactly `{command}`; got:\n{content}"
+        );
+    }
+}

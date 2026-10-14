@@ -2032,6 +2032,139 @@ async fn approved_outside_cwd_executes() {
     assert_eq!(out.exit_code, Some(0));
 }
 
+/// Approve every host approval prompt the call raises (a compound command
+/// raises one per constituent) until the caller aborts the task.
+fn approve_every_host_prompt(ctx: &ToolCtx) -> tokio::task::JoinHandle<()> {
+    let db = ctx.session.db.clone();
+    let sid = ctx.session.id;
+    let hub = ctx.interrupts.clone();
+    let mut raised = hub.subscribe_raised();
+    tokio::spawn(async move {
+        loop {
+            crate::engine::interrupt::test_support::settle_published_host_approval(
+                &db,
+                sid,
+                &hub,
+                &mut raised,
+                ResolveResponse::Single {
+                    selected_id: ID_APPROVE_ONCE.into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    })
+}
+
+/// #528: an interactively approved unconfined command must cross the real
+/// spawn-boundary effect recheck and run. No scripted `run_shell` outcome is
+/// installed, so the approval's `execute.command` candidate is compared with
+/// the concrete effect built for the actual `sh -c` spawn. A platform shell
+/// prelude folded into that effect (the macOS `sed()` shim) made every such
+/// command fail with "no live host approval capability authorizes this
+/// effect boundary".
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_unconfined_command_runs_at_real_spawn_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path()).await;
+    ctx.session.set_sandbox_enabled(false);
+    let resolver = resolve_next_interrupt(
+        ctx.session.db.clone(),
+        ctx.session.id,
+        ctx.interrupts.clone(),
+        ID_APPROVE_ONCE,
+        None,
+    );
+    let out = call_bash_host_effect_for_test(
+        serde_json::json!({ "command": "printf '%s-%s' approved ran" }),
+        &ctx,
+    )
+    .await
+    .expect("approved bash call returns");
+    resolver.await.unwrap();
+    assert_eq!(out.exit_code, Some(0), "{}", out.content);
+    assert!(out.content.contains("approved-ran"), "{}", out.content);
+    let meta = out.sandbox.expect("bash records sandbox metadata");
+    assert!(!meta.confined);
+    assert_eq!(meta.approval_scope_recorded.as_deref(), Some("once"));
+}
+
+/// #528: the script handed to the unconfined `sh -c` is byte-for-byte the
+/// approved command. Any prelude, wrapper, or platform prefix added between
+/// approval and exec shows up in the witness even if the effect binding were
+/// kept on the raw text.
+#[tokio::test]
+async fn executed_shell_script_is_exactly_the_approved_command() {
+    let Some(command) = super::exec_witness::command() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path()).await;
+    ctx.session.set_sandbox_enabled(false);
+    let resolver = approve_every_host_prompt(&ctx);
+    let out = call_bash_host_effect_for_test(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("approved bash call returns");
+    resolver.abort();
+    assert_eq!(out.exit_code, Some(0), "{}", out.content);
+    assert!(!out.sandbox.expect("bash records sandbox metadata").confined);
+    super::exec_witness::assert_executed_exactly(&out.content, command);
+}
+
+/// #528: the confined first attempt (real seatbelt/bwrap spawn, no scripted
+/// outcome) hands the sandboxed `sh -c` exactly the approved text.
+#[tokio::test]
+async fn confined_shell_script_is_exactly_the_approved_command() {
+    let Some(command) = super::exec_witness::command() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path()).await;
+    ctx.session.set_sandbox_enabled(true);
+    let out = call_bash_host_effect_for_test(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("confined bash call returns");
+    assert!(
+        out.sandbox
+            .clone()
+            .expect("bash records sandbox metadata")
+            .confined,
+        "must run confined: {}",
+        out.content
+    );
+    assert_eq!(out.exit_code, Some(0), "{}", out.content);
+    super::exec_witness::assert_executed_exactly(&out.content, command);
+}
+
+/// #528: the approved run-fail-escalate rerun binds
+/// `{"execute":{"command":<approved>,"sandbox":"unconfined"}}`; the real
+/// unconfined respawn must present that exact effect and hand `sh -c` exactly
+/// the approved text. Only the confined first attempt is scripted.
+#[tokio::test]
+async fn approved_escalation_rerun_runs_exactly_the_approved_command() {
+    let Some(command) = super::exec_witness::command() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path()).await;
+    let resolver = approve_every_host_prompt(&ctx);
+    let _guard = set_bash_test_overrides(
+        Some(crate::tools::shell_sandbox::SandboxAvailability::Available),
+        Some((13, "sandbox denied".to_string())),
+        [(true, shell_out("", "sandbox denied", 13))],
+    );
+    let out = call_bash_host_effect_for_test(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .expect("bash call returns");
+    resolver.abort();
+    assert_eq!(out.exit_code, Some(0), "{}", out.content);
+    super::exec_witness::assert_executed_exactly(&out.content, command);
+    let meta = out.sandbox.expect("bash records sandbox metadata");
+    assert!(meta.escalated);
+    assert_eq!(meta.approval_scope_recorded.as_deref(), Some("once"));
+}
+
 #[tokio::test]
 async fn cd_inside_root_is_allowed() {
     let tmp = tempfile::tempdir().unwrap();

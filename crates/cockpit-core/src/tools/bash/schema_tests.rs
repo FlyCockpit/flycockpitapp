@@ -91,3 +91,28 @@ fn bash_timeout_schema_declares_default_and_bounds_in_both_tiers() {
         serde_json::json!(MIN_QUEUE_TIMEOUT_MS)
     );
 }
+
+/// #528: on macOS the hedged `sed` hint is part of the description the
+/// provider actually receives (`advertised_definitions`, not a capability
+/// suffix that inference never sends), in both steering tiers; other build
+/// targets carry no hint.
+#[test]
+fn macos_sed_hint_is_in_the_provider_visible_definition_only_on_macos() {
+    let toolbox = crate::engine::tool::ToolBox::new().with(std::sync::Arc::new(BashTool::new()));
+    for steering in [
+        crate::agents::ToolSteering::Terse,
+        crate::agents::ToolSteering::Verbose,
+    ] {
+        let definitions = toolbox.advertised_definitions(steering);
+        let bash = definitions
+            .iter()
+            .find(|definition| definition.name == "bash")
+            .expect("bash is advertised");
+        assert_eq!(
+            bash.description.contains("`sed` may be BSD sed"),
+            cfg!(target_os = "macos"),
+            "{steering:?}: {}",
+            bash.description
+        );
+    }
+}

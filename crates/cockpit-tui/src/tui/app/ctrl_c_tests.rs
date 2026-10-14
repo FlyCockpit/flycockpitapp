@@ -516,11 +516,11 @@ fn note_without_session_shows_send_first_error() {
 }
 
 /// Issue #546: quitting never depends on daemon authority. When the daemon
-/// refuses the exit check (for example after this connection lost owner
-/// authority), the user is told how to leave and the next exit request quits
-/// without asking the daemon again.
+/// refuses the exit check with a typed authorization error (this connection
+/// lost owner authority), the user is told how to leave and the next exit
+/// request quits without asking the daemon again.
 #[test]
-fn rejected_exit_check_lets_the_next_exit_quit_without_the_daemon() {
+fn unauthorized_exit_check_lets_the_next_exit_quit_without_the_daemon() {
     use super::App;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -540,8 +540,9 @@ fn rejected_exit_check_lets_the_next_exit_quit_without_the_daemon() {
         .expect("exit check is pending");
     app.apply_control_request_outcome(
         request_id,
-        cockpit_client::presentation::ControlRequestOutcome::Rejected(
-            "authorization: request requires the local owner".to_string(),
+        cockpit_client::presentation::ControlRequestOutcome::Unauthorized(
+            "daemon request: daemon error: authorization: request requires the local owner"
+                .to_string(),
         ),
     );
     assert!(
@@ -562,5 +563,184 @@ fn rejected_exit_check_lets_the_next_exit_quit_without_the_daemon() {
     assert!(
         control_rx.try_recv().is_err(),
         "no second exit check is sent"
+    );
+}
+
+/// Run one exit attempt that the daemon answers with `outcome`.
+fn exit_check_answered(
+    app: &mut super::App,
+    control_rx: &mut tokio::sync::mpsc::Receiver<crate::tui::agent_runner::ControlRequest>,
+    outcome: cockpit_client::presentation::ControlRequestOutcome,
+) {
+    assert!(!app.request_guarded_exit(), "exit asks the daemon");
+    let _sent = control_rx.try_recv().expect("exit check is sent");
+    let request_id = *app
+        .pending_control_requests
+        .keys()
+        .next()
+        .expect("exit check is pending");
+    app.apply_control_request_outcome(request_id, outcome);
+}
+
+/// C4 (issue #546 r2): a delivered non-authorization refusal (for example a
+/// concurrent detach decision) never disables the daemon's exit check.
+#[test]
+fn unrelated_exit_check_refusal_keeps_the_guard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+    exit_check_answered(
+        &mut app,
+        &mut control_rx,
+        cockpit_client::presentation::ControlRequestOutcome::Rejected(
+            "daemon request: daemon error: internal: another client is deciding how to detach live ephemeral work"
+                .to_string(),
+        ),
+    );
+    assert!(app.exit_check_escape.is_none());
+    assert!(
+        !app.request_guarded_exit(),
+        "the next exit still asks the daemon"
+    );
+    assert!(control_rx.try_recv().is_ok(), "a fresh exit check is sent");
+}
+
+/// C4: a fenced (stale) receipt never arms the escape.
+#[test]
+fn fenced_exit_check_refusal_does_not_arm_the_escape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+    assert!(!app.request_guarded_exit());
+    let _request = control_rx.try_recv().unwrap();
+    let id = *app.pending_control_requests.keys().next().unwrap();
+    app.fence_pending_control_request(id);
+    app.apply_control_request_outcome(
+        id,
+        cockpit_client::presentation::ControlRequestOutcome::Unauthorized(
+            "authorization: request requires the local owner".into(),
+        ),
+    );
+    assert!(app.exit_check_escape.is_none());
+}
+
+/// C4: the escape is one-shot and bound to its attachment: a session reset
+/// voids it, and a successful exit check clears it.
+#[test]
+fn exit_check_escape_is_one_shot_and_bound_to_its_attachment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+    let unauthorized = || {
+        cockpit_client::presentation::ControlRequestOutcome::Unauthorized(
+            "authorization: request requires the local owner".into(),
+        )
+    };
+    exit_check_answered(&mut app, &mut control_rx, unauthorized());
+    assert!(app.exit_check_escape.is_some());
+    app.reset_session_live_state();
+    assert!(
+        app.exit_check_escape.is_none(),
+        "exit recovery from an old session must not bypass a new session's work check"
+    );
+
+    // The reset session's successor attaches a new runner.
+    control_rx = install_ephemeral_runner(&mut app);
+    exit_check_answered(&mut app, &mut control_rx, unauthorized());
+    assert!(app.exit_check_escape.is_some());
+    // The very next exit attempt uses it ...
+    assert!(
+        app.request_guarded_exit(),
+        "the armed attempt quits locally"
+    );
+    assert!(control_rx.try_recv().is_err(), "without asking the daemon");
+    // ... and only that one: it is not sticky.
+    app.exit_requested = false;
+    assert!(app.exit_check_escape.is_none());
+    assert!(
+        !app.request_guarded_exit(),
+        "a later exit asks the daemon again"
+    );
+    assert!(control_rx.try_recv().is_ok());
+    // A successful daemon answer to that check voids an escape armed
+    // meanwhile (for example by a parallel undelivered check).
+    let id = *app.pending_control_requests.keys().next().unwrap();
+    app.exit_check_escape = app.current_exit_check_binding();
+    assert!(app.exit_check_escape.is_some());
+    app.apply_control_request_outcome(
+        id,
+        cockpit_client::presentation::ControlRequestOutcome::ExitGuardStatus {
+            ephemeral_owner: true,
+            has_live_work: true,
+        },
+    );
+    assert!(app.exit_check_escape.is_none());
+
+    // An escape armed for another attachment is consumed without effect.
+    app.exit_check_escape = Some(super::ExitCheckBinding {
+        session_id: uuid::Uuid::new_v4(),
+        attachment_epoch: 99,
+    });
+    app.question_dialog = None;
+    app.pending_local_choice = None;
+    assert!(
+        !app.request_guarded_exit(),
+        "a foreign binding never skips the check"
+    );
+    assert!(
+        app.exit_check_escape.is_none(),
+        "the escape is consumed by one attempt"
+    );
+}
+
+/// C2 (issue #546 r2): an exit check that cannot even be queued (the
+/// runner's control receiver is gone) never strands quit: the next exit
+/// leaves without the daemon.
+#[test]
+fn immediately_undelivered_exit_check_can_quit_on_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let control_rx = install_ephemeral_runner(&mut app);
+    drop(control_rx);
+    assert!(!app.request_guarded_exit());
+    assert!(app.pending_control_requests.is_empty());
+    assert!(
+        app.request_guarded_exit(),
+        "an immediately undelivered check must allow the local exit on retry"
+    );
+}
+
+/// C2: the same when the control channel is full.
+#[test]
+fn exit_check_rejected_by_a_full_control_channel_can_quit_on_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = super::App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let _control_rx = install_ephemeral_runner(&mut app);
+    let control_tx = app
+        .agent_runner
+        .as_ref()
+        .and_then(|runner| runner.as_ref().ok())
+        .map(|runner| runner.control_tx.clone())
+        .expect("runner");
+    // Fill the one-slot channel with an unrelated request.
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    control_tx
+        .try_send(crate::tui::agent_runner::ControlRequest {
+            request: cockpit_proto::Request::Prune,
+            intended_session_id: uuid::Uuid::new_v4(),
+            intended_attachment_epoch: 0,
+            response_tx,
+        })
+        .expect("fill the control channel");
+    assert!(!app.request_guarded_exit());
+    assert!(app.pending_control_requests.is_empty());
+    assert!(
+        app.request_guarded_exit(),
+        "a full control channel never strands quit"
     );
 }

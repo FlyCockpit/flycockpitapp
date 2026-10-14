@@ -724,10 +724,13 @@ impl App {
         let attachment_epoch = runner.attachment_epoch();
         self.next_control_request_seq = self.next_control_request_seq.saturating_add(1);
         let request_id = ControlRequestId(self.next_control_request_seq);
-        self.pending_control_requests.insert(
-            request_id,
-            PendingControlRequest::new(label.to_string(), applied),
-        );
+        let binding = super::ExitCheckBinding {
+            session_id,
+            attachment_epoch,
+        };
+        let mut pending = PendingControlRequest::new(label.to_string(), applied);
+        pending.binding = Some(binding);
+        self.pending_control_requests.insert(request_id, pending);
         self.bind_composer_control_request(request_id);
         let result = agent_runner::send_control_request(
             &control_tx,
@@ -743,11 +746,19 @@ impl App {
             let tool_surface_override = removed.as_ref().is_some_and(|pending| {
                 matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. })
             });
+            let exit_check = removed
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.applied, ControlApplied::ExitGuardStatus));
             let selection_id = removed.and_then(|pending| match pending.applied {
                 ControlApplied::ModelSelection { selection_id } => Some(selection_id),
                 _ => None,
             });
-            let message = Self::control_not_delivered_message(label, reason);
+            let mut message = Self::control_not_delivered_message(label, reason);
+            if exit_check {
+                // Nothing was sent, so no outcome will ever arrive: an
+                // undelivered exit check must never strand quit (C2).
+                message = self.arm_exit_check_escape(Some(binding), message);
+            }
             if tool_surface_override {
                 self.refuse_tool_surface_override(message.clone());
             }
@@ -940,6 +951,7 @@ impl App {
         };
         let refresh_tool_surface_on_failure =
             matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. });
+        let unauthorized = matches!(outcome, ControlRequestOutcome::Unauthorized(_));
         match outcome {
             ControlRequestOutcome::ConfigRefreshed {
                 applied_generation,
@@ -984,7 +996,7 @@ impl App {
                     ));
                 }
             }
-            ControlRequestOutcome::Rejected(error) => {
+            ControlRequestOutcome::Rejected(error) | ControlRequestOutcome::Unauthorized(error) => {
                 if refresh_tool_surface_on_failure {
                     self.refuse_tool_surface_override(format!(
                         "Tool surface update was refused: {error}"
@@ -1007,8 +1019,14 @@ impl App {
                 } else {
                     let mut message =
                         format!("{}: daemon rejected request: {error}", pending.label);
-                    if pending.applied.is_exit_step() {
-                        message = self.note_exit_check_failure(message);
+                    // Only the exit check itself, only for a typed
+                    // authorization refusal, and never from a fenced or
+                    // stale receipt (C4).
+                    if unauthorized
+                        && !skip_confirmation
+                        && matches!(pending.applied, ControlApplied::ExitGuardStatus)
+                    {
+                        message = self.arm_exit_check_escape(pending.binding, message);
                     }
                     self.finish_control_failure(
                         skip_confirmation,
@@ -1033,8 +1051,10 @@ impl App {
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
                     let mut message = Self::control_not_delivered_message(&pending.label, reason);
-                    if pending.applied.is_exit_step() {
-                        message = self.note_exit_check_failure(message);
+                    if !skip_confirmation
+                        && matches!(pending.applied, ControlApplied::ExitGuardStatus)
+                    {
+                        message = self.arm_exit_check_escape(pending.binding, message);
                     }
                     self.finish_control_failure(
                         skip_confirmation,

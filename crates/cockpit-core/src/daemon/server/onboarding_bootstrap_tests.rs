@@ -2305,3 +2305,254 @@ fn classify_accept_error_by_errno() {
         AcceptFailure::Fatal
     ));
 }
+
+/// Open a raw locked control connection to the production locked handler and
+/// read its hello.
+#[cfg(unix)]
+async fn raw_locked_connection(
+    locked: &std::sync::Arc<LockedServices>,
+) -> (
+    cockpit_proto::ProtoStream<tokio::net::UnixStream>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let listener =
+        tokio::net::UnixListener::bind(&locked.paths.socket).expect("bind locked socket");
+    let stream = tokio::net::UnixStream::connect(&locked.paths.socket)
+        .await
+        .expect("connect locked socket");
+    let (accepted, _) = listener.accept().await.expect("accept locked client");
+    let task = tokio::spawn(super::handle_locked_client(accepted, locked.clone()));
+    let mut client = cockpit_proto::ProtoStream::new(stream);
+    assert!(client.recv().await.unwrap().is_some(), "locked hello");
+    (client, task)
+}
+
+/// C1 (issue #546 r2): a refused locked-socket request has no effect. A
+/// `StopDaemon` without a valid owner credential, or with a revoked one, is
+/// denied and the locked owner keeps running: it is neither stopping nor
+/// closing, and it keeps answering on the same connection.
+#[cfg(unix)]
+#[tokio::test]
+async fn refused_locked_stop_daemon_has_no_effect() {
+    let (_tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let peer = test_process_peer();
+    let revoked_connection = uuid::Uuid::new_v4();
+    let revoked = locked.peer_credential_registry.mint(
+        peer,
+        revoked_connection,
+        crate::daemon::principal::LocalClientRole::Tui,
+        Vec::new(),
+    );
+    locked.peer_credential_registry.revoke_for_connection(
+        revoked_connection,
+        crate::daemon::peer_authority::PeerCredentialRevocation::Unrecognized,
+    );
+    let (mut client, task) = raw_locked_connection(&locked).await;
+    for credential in [None, Some(revoked.0.clone())] {
+        let id = uuid::Uuid::new_v4();
+        client
+            .send(&cockpit_proto::Envelope::request_with_owner_capability(
+                id,
+                Request::StopDaemon { grace_secs: None },
+                credential.map(cockpit_proto::OwnerCapabilityToken::new),
+            ))
+            .await
+            .unwrap();
+        let reply = loop {
+            let Some(cockpit_proto::RecvFrame::Envelope(reply)) = client.recv().await.unwrap()
+            else {
+                panic!("expected a reply");
+            };
+            match &reply.body {
+                cockpit_proto::Body::Error {
+                    id: Some(reply_id), ..
+                }
+                | cockpit_proto::Body::Response { id: reply_id, .. }
+                    if *reply_id == id =>
+                {
+                    break reply;
+                }
+                _ => continue,
+            }
+        };
+        let cockpit_proto::Body::Error { error, .. } = reply.body else {
+            panic!("an unauthenticated StopDaemon must be refused");
+        };
+        assert!(
+            error
+                .message
+                .contains("bootstrap peer is not authenticated"),
+            "refusal: {error:?}"
+        );
+        assert!(
+            !locked
+                .stop_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+                && !locked.closing.load(std::sync::atomic::Ordering::Acquire),
+            "a refused StopDaemon must not stop or close the locked owner"
+        );
+    }
+    // The connection is still served after both refusals.
+    let id = uuid::Uuid::new_v4();
+    client
+        .send(&cockpit_proto::Envelope::request(id, Request::DaemonStatus))
+        .await
+        .unwrap();
+    assert!(
+        client.recv().await.unwrap().is_some(),
+        "connection still served"
+    );
+    assert!(!task.is_finished(), "the locked connection keeps running");
+    task.abort();
+    let _ = task.await;
+}
+
+/// C1 positive control: an authenticated StopDaemon still retires the owner.
+#[cfg(unix)]
+#[tokio::test]
+async fn authenticated_locked_stop_daemon_stops_the_owner() {
+    let (_tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let peer = test_process_peer();
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    locked
+        .peer_credential_registry
+        .install_launch_provenance_for_test(&ticket, peer);
+    let (mut client, task) = raw_locked_connection(&locked).await;
+    let id = uuid::Uuid::new_v4();
+    client
+        .send(&cockpit_proto::Envelope::request_with_owner_capability(
+            id,
+            Request::ExchangeLocalPeerCredential,
+            Some(cockpit_proto::OwnerCapabilityToken::new(ticket)),
+        ))
+        .await
+        .unwrap();
+    let Some(cockpit_proto::RecvFrame::Envelope(reply)) = client.recv().await.unwrap() else {
+        panic!("exchange reply");
+    };
+    let cockpit_proto::Body::Response { response, .. } = reply.body else {
+        panic!("exchange must succeed: {:?}", reply.body);
+    };
+    let Response::LocalPeerCredential { token, .. } = *response else {
+        panic!("credential response");
+    };
+    client
+        .send(&cockpit_proto::Envelope::request_with_owner_capability(
+            uuid::Uuid::new_v4(),
+            Request::StopDaemon { grace_secs: None },
+            Some(token),
+        ))
+        .await
+        .unwrap();
+    let _ = client.recv().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    assert!(
+        locked
+            .stop_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+}
+
+/// Reviewer probe (#546 r1): the locked connection renews past its TTL,
+/// re-derives owner authority from every envelope (a revoked credential is
+/// refused on the very next one), and an I/O error releases the credential.
+#[cfg(unix)]
+#[tokio::test]
+async fn locked_connection_renews_rechecks_each_envelope_and_releases_on_io_error() {
+    let (_tmp, mut locked) = fresh_locked_services().await;
+    locked.peer_credential_registry = std::sync::Arc::new(
+        crate::daemon::peer_authority::PeerCredentialRegistry::with_ttl_for_test(
+            std::time::Duration::from_millis(300),
+        ),
+    );
+    let locked = std::sync::Arc::new(locked);
+    let peer = test_process_peer();
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    locked
+        .peer_credential_registry
+        .install_launch_provenance_for_test(&ticket, peer);
+    let (mut client, task) = raw_locked_connection(&locked).await;
+    let exchange = cockpit_proto::Envelope::request_with_owner_capability(
+        uuid::Uuid::new_v4(),
+        Request::ExchangeLocalPeerCredential,
+        Some(cockpit_proto::OwnerCapabilityToken::new(ticket)),
+    );
+    client.send(&exchange).await.unwrap();
+    let Some(cockpit_proto::RecvFrame::Envelope(reply)) = client.recv().await.unwrap() else {
+        panic!("exchange response");
+    };
+    let cockpit_proto::Body::Response { response, .. } = reply.body else {
+        panic!("credential exchange must succeed");
+    };
+    let Response::LocalPeerCredential { token, .. } = *response else {
+        panic!("credential response");
+    };
+    assert_eq!(
+        locked
+            .peer_credential_registry
+            .connection_records_for_test()
+            .len(),
+        1
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let query = |token: &cockpit_proto::OwnerCapabilityToken| {
+        cockpit_proto::Envelope::request_with_owner_capability(
+            uuid::Uuid::new_v4(),
+            Request::GetOnboardingBootstrapSnapshot,
+            Some(token.clone()),
+        )
+    };
+    client.send(&query(&token)).await.unwrap();
+    let Some(cockpit_proto::RecvFrame::Envelope(reply)) = client.recv().await.unwrap() else {
+        panic!("query response");
+    };
+    assert!(
+        matches!(reply.body, cockpit_proto::Body::Response { .. }),
+        "the locked connection renews past its TTL"
+    );
+    let (id, _) = locked
+        .peer_credential_registry
+        .connection_records_for_test()
+        .pop()
+        .unwrap();
+    locked.peer_credential_registry.revoke_for_connection(
+        id,
+        crate::daemon::peer_authority::PeerCredentialRevocation::Unrecognized,
+    );
+    client.send(&query(&token)).await.unwrap();
+    let Some(cockpit_proto::RecvFrame::Envelope(reply)) = client.recv().await.unwrap() else {
+        panic!("query response");
+    };
+    assert!(
+        matches!(reply.body, cockpit_proto::Body::Error { .. }),
+        "a revoked credential is refused on the very next envelope"
+    );
+    assert!(
+        locked
+            .peer_credential_registry
+            .verify_sensitive_peer(peer, token.as_str())
+            .is_none()
+    );
+    client.send(&exchange).await.unwrap();
+    client.recv().await.unwrap().unwrap();
+    assert_eq!(
+        locked
+            .peer_credential_registry
+            .connection_records_for_test()
+            .len(),
+        1
+    );
+    client.send_raw_line("{malformed".into()).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+        .await
+        .expect("the handler ends on a protocol error");
+    assert!(
+        locked
+            .peer_credential_registry
+            .connection_records_for_test()
+            .is_empty(),
+        "every exit path releases the connection's credential"
+    );
+}

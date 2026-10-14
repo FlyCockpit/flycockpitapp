@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use rand::RngExt as _;
@@ -57,8 +57,9 @@ pub fn principal_local_role(role: cockpit_proto::LocalClientRole) -> LocalClient
 /// exact live process. A live owner connection therefore never loses owner
 /// authority to the clock (issue #546), while a record orphaned by a
 /// cancelled or leaked connection handler, or whose peer process is gone,
-/// lapses within one TTL. The deadline is monotonic, so wall-clock steps and
-/// host sleep never revoke a live connection.
+/// lapses within one TTL. Deadlines are on the [`CredentialClock`], which
+/// counts only time the host is awake, so wall-clock steps and host suspend
+/// never revoke a live connection on any supported platform.
 const PEER_CREDENTIAL_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Renewal cadence as a fraction of the TTL: a live record is renewed at
@@ -257,35 +258,120 @@ struct PeerCredentialRecord {
     connection_id: Uuid,
     role: LocalClientRole,
     grants: Vec<PrincipalGrant>,
-    expires_at: Instant,
+    expires_at: CredentialInstant,
 }
 
-type InvalidationHook = Box<dyn Fn(PeerCredentialRevocation) + Send + Sync>;
+/// A point on the credential clock: time the host has been *awake* since an
+/// arbitrary process-local origin. See [`CredentialClock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CredentialInstant(Duration);
+
+impl CredentialInstant {
+    fn after(self, duration: Duration) -> Self {
+        Self(self.0.saturating_add(duration))
+    }
+
+    /// Awake time left until `self`, measured from `now`; zero once due.
+    pub fn remaining_since(self, now: Self) -> Duration {
+        self.0.saturating_sub(now.0)
+    }
+}
+
+/// Source of credential deadlines. Credential lifetime is measured in time
+/// the host is awake, never in time it spends suspended: nothing can run,
+/// renew, or exit while the host sleeps, so suspend must not consume a live
+/// connection's TTL (issue #546). Production uses [`SuspendExcludingClock`].
+pub trait CredentialClock: Send + Sync {
+    fn now(&self) -> CredentialInstant;
+}
+
+/// Platform clock that stops while the host is suspended:
+/// - macOS: Rust's `Instant` is `CLOCK_UPTIME_RAW` (mach absolute time),
+///   which does not advance during sleep.
+/// - Linux: Rust's `Instant` is `CLOCK_MONOTONIC`, which excludes suspend
+///   (`CLOCK_BOOTTIME` is the variant that includes it).
+/// - Windows: Rust's `Instant` is `QueryPerformanceCounter`, which *includes*
+///   standby and hibernation, so it is not used. `QueryUnbiasedInterruptTime`
+///   excludes time spent in sleep or hibernation.
+pub struct SuspendExcludingClock;
+
+impl CredentialClock for SuspendExcludingClock {
+    #[cfg(not(windows))]
+    fn now(&self) -> CredentialInstant {
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let origin = *ORIGIN.get_or_init(std::time::Instant::now);
+        CredentialInstant(std::time::Instant::now().saturating_duration_since(origin))
+    }
+
+    #[cfg(windows)]
+    fn now(&self) -> CredentialInstant {
+        let mut unbiased_100ns = 0_u64;
+        // SAFETY: the out-pointer is a valid, writable u64 for the call.
+        let ok = unsafe {
+            windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime(
+                &mut unbiased_100ns,
+            )
+        };
+        // The call only fails for an invalid pointer; never treat a failure
+        // as "time stopped" (that would extend credentials).
+        assert!(ok != 0, "QueryUnbiasedInterruptTime failed");
+        CredentialInstant(Duration::from_nanos(unbiased_100ns.saturating_mul(100)))
+    }
+}
+
+/// The connection is told which credential was withdrawn and why. The token
+/// binds the notice to that exact credential, so a delayed notice can never
+/// downgrade a fresh re-exchange on the same connection.
+type InvalidationHook = Box<dyn Fn(&str, PeerCredentialRevocation) + Send + Sync>;
+
+/// Why a credential was withdrawn, kept until its connection ends so a
+/// connection that learns of the loss late (a queued frame, a dropped notice)
+/// reports the real cause.
+#[derive(Debug, Clone)]
+struct RevocationRecord {
+    token: String,
+    reason: PeerCredentialRevocation,
+}
+
+/// A record removed from the registry for a reason its connection must hear.
+type Withdrawn = (Uuid, String, PeerCredentialRevocation);
+
+/// Why `try_mint` refused to issue a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerCredentialCapacity {
+    /// The registry is full of credentials at least as privileged as the
+    /// requested one; minting would evict an owner for a non-owner.
+    Full,
+}
 
 pub struct PeerCredentialRegistry {
     records: Mutex<HashMap<String, PeerCredentialRecord>>,
     invalidation_hooks: Mutex<HashMap<Uuid, InvalidationHook>>,
+    revocations: Mutex<HashMap<Uuid, RevocationRecord>>,
     /// Trusted launch provenance recorded once at daemon boot. `None` means
     /// this daemon was not spawned with a launch ticket (human foreground
     /// start, in-process boot) and no socket peer can ever exchange for an
     /// owner-class credential.
     launch_provenance: Mutex<Option<DaemonLaunchProvenance>>,
     ttl: Duration,
+    clock: Arc<dyn CredentialClock>,
 }
 
 impl Default for PeerCredentialRegistry {
     fn default() -> Self {
-        Self::with_ttl(PEER_CREDENTIAL_TTL)
+        Self::with_ttl_and_clock(PEER_CREDENTIAL_TTL, Arc::new(SuspendExcludingClock))
     }
 }
 
 impl PeerCredentialRegistry {
-    fn with_ttl(ttl: Duration) -> Self {
+    fn with_ttl_and_clock(ttl: Duration, clock: Arc<dyn CredentialClock>) -> Self {
         Self {
             records: Mutex::new(HashMap::new()),
             invalidation_hooks: Mutex::new(HashMap::new()),
+            revocations: Mutex::new(HashMap::new()),
             launch_provenance: Mutex::new(None),
             ttl,
+            clock,
         }
     }
 
@@ -293,7 +379,19 @@ impl PeerCredentialRegistry {
     /// and renewal are exercised without waiting for the production TTL.
     #[cfg(test)]
     pub(crate) fn with_ttl_for_test(ttl: Duration) -> Self {
-        Self::with_ttl(ttl)
+        Self::with_ttl_and_clock(ttl, Arc::new(SuspendExcludingClock))
+    }
+
+    /// Test seam: a registry on an explicit credential clock (for example
+    /// one that models host suspend).
+    #[cfg(test)]
+    pub(crate) fn with_clock_for_test(ttl: Duration, clock: Arc<dyn CredentialClock>) -> Self {
+        Self::with_ttl_and_clock(ttl, clock)
+    }
+
+    /// Now, on this registry's credential clock.
+    pub fn now(&self) -> CredentialInstant {
+        self.clock.now()
     }
 
     /// How often a live connection's [`PeerCredentialLease`] renews.
@@ -383,10 +481,10 @@ impl PeerCredentialRegistry {
         self.record_launch_provenance(ticket.to_string(), Some(launcher));
     }
 
-    pub fn register_invalidation_hook(
+    fn register_invalidation_hook(
         &self,
         connection_id: Uuid,
-        hook: impl Fn(PeerCredentialRevocation) + Send + Sync + 'static,
+        hook: impl Fn(&str, PeerCredentialRevocation) + Send + Sync + 'static,
     ) {
         self.invalidation_hooks
             .lock()
@@ -394,30 +492,61 @@ impl PeerCredentialRegistry {
             .insert(connection_id, Box::new(hook));
     }
 
-    pub fn unregister_invalidation_hook(&self, connection_id: Uuid) {
+    fn unregister_invalidation_hook(&self, connection_id: Uuid) {
         self.invalidation_hooks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&connection_id);
     }
 
-    fn notify_invalidated(
-        &self,
-        connection_ids: impl IntoIterator<Item = Uuid>,
-        reason: PeerCredentialRevocation,
-    ) {
+    /// Record why each credential was withdrawn, then tell its connection.
+    /// Runs after the records lock is released.
+    fn withdraw(&self, withdrawn: Vec<Withdrawn>) {
+        if withdrawn.is_empty() {
+            return;
+        }
+        {
+            let mut revocations = self
+                .revocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (connection_id, token, reason) in &withdrawn {
+                revocations.insert(
+                    *connection_id,
+                    RevocationRecord {
+                        token: token.clone(),
+                        reason: *reason,
+                    },
+                );
+            }
+        }
         let hooks = self
             .invalidation_hooks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for connection_id in connection_ids {
+        for (connection_id, token, reason) in withdrawn {
             if let Some(hook) = hooks.get(&connection_id) {
-                hook(reason);
+                hook(&token, reason);
             }
         }
     }
 
-    fn remove_records<F>(&self, mut keep: F) -> Vec<Uuid>
+    /// Why `presented` was withdrawn from `connection_id`, if the registry
+    /// withdrew it (rather than the connection ending or re-exchanging).
+    pub fn revocation_cause(
+        &self,
+        connection_id: Uuid,
+        presented: &str,
+    ) -> Option<PeerCredentialRevocation> {
+        self.revocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&connection_id)
+            .filter(|record| record.token == presented)
+            .map(|record| record.reason)
+    }
+
+    fn remove_records<F>(&self, mut keep: F) -> Vec<(Uuid, String)>
     where
         F: FnMut(&PeerCredentialRecord) -> bool,
     {
@@ -425,35 +554,110 @@ impl PeerCredentialRegistry {
             .records
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut invalidated = Vec::new();
-        records.retain(|_, record| {
+        let mut removed = Vec::new();
+        records.retain(|token, record| {
             if keep(record) {
                 true
             } else {
-                invalidated.push(record.connection_id);
+                removed.push((record.connection_id, token.clone()));
                 false
             }
         });
-        invalidated
+        removed
     }
 
     fn prune_expired_records(
         &self,
         records: &mut HashMap<String, PeerCredentialRecord>,
-    ) -> Vec<Uuid> {
-        let now = Instant::now();
-        let mut invalidated = Vec::new();
-        records.retain(|_, record| {
+    ) -> Vec<Withdrawn> {
+        let now = self.now();
+        let mut lapsed = Vec::new();
+        records.retain(|token, record| {
             if record.expires_at > now {
                 true
             } else {
-                invalidated.push(record.connection_id);
+                lapsed.push((
+                    record.connection_id,
+                    token.clone(),
+                    PeerCredentialRevocation::Lapsed,
+                ));
                 false
             }
         });
-        invalidated
+        lapsed
     }
 
+    /// Issue a credential for `peer` on `connection_id`, replacing that
+    /// connection's previous credential.
+    ///
+    /// At the record cap only actually lapsed records are pruned; then the
+    /// least privileged, nearest-to-lapse record that is *no more privileged
+    /// than the new one* is evicted. A non-owner exchange therefore never
+    /// evicts an owner credential: when only owners remain it is refused.
+    pub fn try_mint(
+        &self,
+        peer: PeerIdentity,
+        connection_id: Uuid,
+        role: LocalClientRole,
+        grants: Vec<PrincipalGrant>,
+    ) -> Result<PeerCredentialToken, PeerCredentialCapacity> {
+        let mut bytes = [0_u8; 32];
+        rand::rng().fill(&mut bytes);
+        let token = PeerCredentialToken(crate::intel::hex_lower(&bytes));
+        let withdrawn = {
+            let mut records = self
+                .records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut withdrawn = self.prune_expired_records(&mut records);
+            // Re-exchange on the same connection must replace its prior token
+            // without evicting unrelated live credentials.
+            records.retain(|_, existing| existing.connection_id != connection_id);
+            let incoming_owner = role.is_owner_class();
+            while records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
+                let Some(victim_key) = records
+                    .iter()
+                    .filter(|(_, existing)| incoming_owner || !existing.role.is_owner_class())
+                    .min_by_key(|(_, existing)| {
+                        (existing.role.is_owner_class(), existing.expires_at)
+                    })
+                    .map(|(key, _)| key.clone())
+                else {
+                    drop(records);
+                    self.withdraw(withdrawn);
+                    return Err(PeerCredentialCapacity::Full);
+                };
+                if let Some(record) = records.remove(&victim_key) {
+                    withdrawn.push((
+                        record.connection_id,
+                        victim_key,
+                        PeerCredentialRevocation::Evicted,
+                    ));
+                }
+            }
+            records.insert(
+                token.0.clone(),
+                PeerCredentialRecord {
+                    peer,
+                    connection_id,
+                    role,
+                    grants,
+                    expires_at: self.now().after(self.ttl),
+                },
+            );
+            withdrawn
+        };
+        // A fresh credential supersedes any recorded revocation cause.
+        self.revocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&connection_id);
+        self.withdraw(withdrawn);
+        Ok(token)
+    }
+
+    /// [`Self::try_mint`] for tests that never fill the registry.
+    #[cfg(test)]
     pub fn mint(
         &self,
         peer: PeerIdentity,
@@ -461,62 +665,8 @@ impl PeerCredentialRegistry {
         role: LocalClientRole,
         grants: Vec<PrincipalGrant>,
     ) -> PeerCredentialToken {
-        let mut bytes = [0_u8; 32];
-        rand::rng().fill(&mut bytes);
-        let token = PeerCredentialToken(crate::intel::hex_lower(&bytes));
-        let record = PeerCredentialRecord {
-            peer,
-            connection_id,
-            role,
-            grants,
-            expires_at: Instant::now() + self.ttl,
-        };
-        let (lapsed, evicted) = {
-            let mut records = self
-                .records
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let lapsed = self.prune_expired_records(&mut records);
-            let mut evicted = Vec::new();
-            // Re-exchange on the same connection must replace its prior token
-            // without evicting unrelated live credentials.
-            records.retain(|_, existing| existing.connection_id != connection_id);
-            if records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
-                // Live connections renew well before half the TTL is left,
-                // so a record this close to lapsing was orphaned.
-                let near_expiry_cutoff = Instant::now() + self.ttl / 2;
-                records.retain(|_, existing| {
-                    if existing.expires_at > near_expiry_cutoff {
-                        true
-                    } else {
-                        evicted.push(existing.connection_id);
-                        false
-                    }
-                });
-                // Then the least-privileged, nearest-to-lapsing record: a
-                // flood of non-owner exchanges (an agent child opening
-                // connections) never evicts the local owner's credential.
-                while records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
-                    let Some(victim_key) = records
-                        .iter()
-                        .min_by_key(|(_, existing)| {
-                            (existing.role.is_owner_class(), existing.expires_at)
-                        })
-                        .map(|(key, _)| key.clone())
-                    else {
-                        break;
-                    };
-                    if let Some(record) = records.remove(&victim_key) {
-                        evicted.push(record.connection_id);
-                    }
-                }
-            }
-            records.insert(token.0.clone(), record);
-            (lapsed, evicted)
-        };
-        self.notify_invalidated(lapsed, PeerCredentialRevocation::Lapsed);
-        self.notify_invalidated(evicted, PeerCredentialRevocation::Evicted);
-        token
+        self.try_mint(peer, connection_id, role, grants)
+            .expect("test registry has capacity")
     }
 
     /// Daemon-side renewal of the credential held by `connection_id`. Only a
@@ -537,7 +687,7 @@ impl PeerCredentialRegistry {
         let Some((token, peer, expires_at)) = held else {
             return PeerCredentialRenewal::NoCredential;
         };
-        let refusal = if expires_at <= Instant::now() {
+        let refusal = if expires_at <= self.now() {
             Some(PeerCredentialRevocation::Lapsed)
         } else if !peer_identity_matches_live_process(peer) {
             Some(PeerCredentialRevocation::PeerChanged)
@@ -555,18 +705,18 @@ impl PeerCredentialRegistry {
             // Replaced by a re-exchange or revoked while the peer was probed.
             return PeerCredentialRenewal::NoCredential;
         };
-        let now = Instant::now();
+        let now = self.now();
         let refusal =
             refusal.or((record.expires_at <= now).then_some(PeerCredentialRevocation::Lapsed));
         match refusal {
             None => {
-                record.expires_at = now + self.ttl;
+                record.expires_at = now.after(self.ttl);
                 PeerCredentialRenewal::Renewed
             }
             Some(reason) => {
                 records.remove(&token);
                 drop(records);
-                self.notify_invalidated([connection_id], reason);
+                self.withdraw(vec![(connection_id, token, reason)]);
                 PeerCredentialRenewal::Revoked(reason)
             }
         }
@@ -581,21 +731,21 @@ impl PeerCredentialRegistry {
         if !peer_identity_matches_live_process(peer) {
             return None;
         }
-        let (invalidated, verified) = {
+        let (lapsed, verified) = {
             let mut records = self
                 .records
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let invalidated = self.prune_expired_records(&mut records);
+            let lapsed = self.prune_expired_records(&mut records);
             let verified = records.get(presented).and_then(|record| {
                 if record.peer != peer || record.connection_id != connection_id {
                     return None;
                 }
                 Some((record.role, record.grants.clone()))
             });
-            (invalidated, verified)
+            (lapsed, verified)
         };
-        self.notify_invalidated(invalidated, PeerCredentialRevocation::Lapsed);
+        self.withdraw(lapsed);
         verified
     }
 
@@ -613,7 +763,7 @@ impl PeerCredentialRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let record = records.get(presented)?;
-        if record.expires_at <= Instant::now() {
+        if record.expires_at <= self.now() {
             return None;
         }
         if record.peer != peer || record.connection_id != connection_id {
@@ -638,15 +788,15 @@ impl PeerCredentialRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let record = records.get(presented)?;
-        if record.expires_at <= Instant::now() || record.peer != peer {
+        if record.expires_at <= self.now() || record.peer != peer {
             return None;
         }
         Some((record.role, record.grants.clone()))
     }
 
-    /// Current (monotonic) deadline of `presented` on `connection_id`; it
-    /// moves forward each time the connection's lease renews it.
-    pub fn expires_at(&self, connection_id: Uuid, presented: &str) -> Option<Instant> {
+    /// Current deadline of `presented` on `connection_id`, on the credential
+    /// clock; it moves forward each time the connection's lease renews it.
+    pub fn expires_at(&self, connection_id: Uuid, presented: &str) -> Option<CredentialInstant> {
         let records = self
             .records
             .lock()
@@ -660,22 +810,53 @@ impl PeerCredentialRegistry {
     /// Withdraw the connection's credential. The connection is told why
     /// through its invalidation hook, when one is still registered.
     pub fn revoke_for_connection(&self, connection_id: Uuid, reason: PeerCredentialRevocation) {
-        let invalidated = self.remove_records(|record| record.connection_id != connection_id);
-        self.notify_invalidated(invalidated, reason);
+        let removed = self.remove_records(|record| record.connection_id != connection_id);
+        self.withdraw(
+            removed
+                .into_iter()
+                .map(|(connection_id, token)| (connection_id, token, reason))
+                .collect(),
+        );
     }
 
-    /// Teardown of the connection itself: drop its credential silently.
+    /// Teardown of the connection itself: drop its credential, hook, and
+    /// recorded revocation cause silently.
     pub fn release_connection(&self, connection_id: Uuid) {
+        self.unregister_invalidation_hook(connection_id);
         let _ = self.remove_records(|record| record.connection_id != connection_id);
+        self.revocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&connection_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidation_hook_count(&self) -> usize {
+        self.invalidation_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_records_for_test(&self) -> Vec<(Uuid, String)> {
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(token, record)| (record.connection_id, token.clone()))
+            .collect()
     }
 }
 
-/// Binds a connection's peer credential to the lifetime of the connection
-/// handler that owns it. While held, the lease renews the connection's
-/// credential every [`PeerCredentialRegistry::renewal_interval`] (each renewal
+/// Binds a connection's peer credential, and the hook that tells the
+/// connection about revocation, to the lifetime of the connection handler
+/// that owns them. While held, the lease renews the connection's credential
+/// every [`PeerCredentialRegistry::renewal_interval`] (each renewal
 /// re-verifies the peer process); dropping it, on every teardown path
-/// including task cancellation and early returns, stops renewal and
-/// releases the credential. Must be created inside a Tokio runtime.
+/// including task cancellation, unwinding and early returns, stops renewal
+/// and releases the credential, its hook, and its recorded revocation cause.
+/// Must be created inside a Tokio runtime.
 pub struct PeerCredentialLease {
     registry: Arc<PeerCredentialRegistry>,
     connection_id: Uuid,
@@ -708,6 +889,17 @@ impl PeerCredentialLease {
             connection_id,
             renewal,
         }
+    }
+
+    /// [`Self::hold`] plus the connection's revocation hook, owned by the
+    /// same guard so cancellation can never leave the hook registered.
+    pub fn hold_with_invalidation_hook(
+        registry: Arc<PeerCredentialRegistry>,
+        connection_id: Uuid,
+        hook: impl Fn(&str, PeerCredentialRevocation) + Send + Sync + 'static,
+    ) -> Self {
+        registry.register_invalidation_hook(connection_id, hook);
+        Self::hold(registry, connection_id)
     }
 }
 
@@ -1044,7 +1236,7 @@ mod tests {
         let connection_id = Uuid::new_v4();
         let reasons = Arc::new(Mutex::new(Vec::new()));
         let hook_reasons = reasons.clone();
-        registry.register_invalidation_hook(connection_id, move |reason| {
+        registry.register_invalidation_hook(connection_id, move |_token, reason| {
             hook_reasons.lock().unwrap().push(reason);
         });
         let token = registry.mint(peer, connection_id, LocalClientRole::Tui, Vec::new());
@@ -1084,7 +1276,7 @@ mod tests {
         let connection_id = Uuid::new_v4();
         let reasons = Arc::new(Mutex::new(Vec::new()));
         let hook_reasons = reasons.clone();
-        registry.register_invalidation_hook(connection_id, move |reason| {
+        registry.register_invalidation_hook(connection_id, move |_token, reason| {
             hook_reasons.lock().unwrap().push(reason);
         });
         let token = registry.mint(recycled, connection_id, LocalClientRole::Tui, Vec::new());
@@ -1121,6 +1313,254 @@ mod tests {
                 .is_some_and(|(role, _)| role.is_owner_class()),
             "the owner credential must survive non-owner churn at the cap"
         );
+    }
+
+    /// C6: an owner whose renewal is late, but whose credential has not
+    /// lapsed, is never evicted while non-owner records exist (no
+    /// role-blind "near expiry" sweep).
+    #[test]
+    fn unexpired_near_deadline_owner_outranks_non_owners_at_the_cap() {
+        let registry = PeerCredentialRegistry::with_ttl_for_test(Duration::from_secs(3));
+        let peer = current_process_peer_identity();
+        let owner = Uuid::new_v4();
+        let token = registry.mint(peer, owner, LocalClientRole::Tui, vec![]);
+        for _ in 0..MAX_PEER_CREDENTIAL_RECORDS - 1 {
+            registry.mint(peer, Uuid::new_v4(), LocalClientRole::AgentChild, vec![]);
+        }
+        // One delayed renewal: past half the TTL, still well before it.
+        std::thread::sleep(Duration::from_millis(1700));
+        assert!(registry.verify(peer, owner, token.as_str()).is_some());
+        registry.mint(peer, Uuid::new_v4(), LocalClientRole::AgentChild, vec![]);
+        assert!(
+            registry.verify(peer, owner, token.as_str()).is_some(),
+            "an unexpired owner must be evicted only after every non-owner record"
+        );
+    }
+
+    /// C6: the cap never evicts an owner for a non-owner. A non-owner
+    /// exchange into a registry holding only owners is refused, while an
+    /// owner can always mint into a registry of non-owners.
+    #[test]
+    fn non_owner_exchange_never_evicts_an_owner_to_fit() {
+        let registry = PeerCredentialRegistry::default();
+        let peer = current_process_peer_identity();
+        let owners: Vec<_> = (0..MAX_PEER_CREDENTIAL_RECORDS)
+            .map(|_| {
+                let id = Uuid::new_v4();
+                (id, registry.mint(peer, id, LocalClientRole::Cli, vec![]))
+            })
+            .collect();
+        assert_eq!(
+            registry.try_mint(peer, Uuid::new_v4(), LocalClientRole::AgentChild, vec![]),
+            Err(PeerCredentialCapacity::Full)
+        );
+        for (id, token) in &owners {
+            assert!(registry.verify(peer, *id, token.as_str()).is_some());
+        }
+
+        let registry = PeerCredentialRegistry::default();
+        for _ in 0..MAX_PEER_CREDENTIAL_RECORDS {
+            registry.mint(peer, Uuid::new_v4(), LocalClientRole::AgentChild, vec![]);
+        }
+        let owner = Uuid::new_v4();
+        let token = registry
+            .try_mint(peer, owner, LocalClientRole::Tui, vec![])
+            .expect("an owner may displace a non-owner at the cap");
+        assert!(registry.verify(peer, owner, token.as_str()).is_some());
+        assert_eq!(
+            registry.connection_records_for_test().len(),
+            MAX_PEER_CREDENTIAL_RECORDS
+        );
+    }
+
+    /// Clock that models a host which sleeps: tests advance only the awake
+    /// time the credential clock counts.
+    struct ManualClock(Mutex<Duration>);
+
+    impl CredentialClock for ManualClock {
+        fn now(&self) -> CredentialInstant {
+            CredentialInstant(*self.0.lock().unwrap())
+        }
+    }
+
+    /// C3: host suspend does not consume a live credential's TTL. The
+    /// registry measures lifetime on its credential clock (awake time only),
+    /// never on a clock that keeps running across suspend, so after a
+    /// "suspend" longer than the TTL the next renewal still succeeds; awake
+    /// time beyond the TTL still lapses it.
+    #[test]
+    fn host_suspend_longer_than_the_ttl_does_not_lapse_a_live_credential() {
+        let clock = Arc::new(ManualClock(Mutex::new(Duration::ZERO)));
+        let registry =
+            PeerCredentialRegistry::with_clock_for_test(Duration::from_millis(200), clock.clone());
+        let peer = current_process_peer_identity();
+        let id = Uuid::new_v4();
+        let token = registry.mint(peer, id, LocalClientRole::Tui, vec![]);
+        // Host suspended: real (and Windows QPC) time passes, awake time does not.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(registry.verify(peer, id, token.as_str()).is_some());
+        assert_eq!(
+            registry.renew_connection(id),
+            PeerCredentialRenewal::Renewed
+        );
+        *clock.0.lock().unwrap() += Duration::from_millis(150);
+        assert_eq!(
+            registry.renew_connection(id),
+            PeerCredentialRenewal::Renewed
+        );
+        // Awake past the TTL without renewal: lapsed, never revived.
+        *clock.0.lock().unwrap() += Duration::from_millis(250);
+        assert!(registry.verify(peer, id, token.as_str()).is_none());
+        assert_eq!(
+            registry.renew_connection(id),
+            PeerCredentialRenewal::NoCredential
+        );
+    }
+
+    /// C7: the registry remembers why it withdrew a token until the
+    /// connection ends, so late readers report the real cause; a fresh
+    /// exchange or connection teardown clears it.
+    #[test]
+    fn revocation_cause_is_recorded_until_reexchange_or_release() {
+        let registry = PeerCredentialRegistry::default();
+        let peer = current_process_peer_identity();
+        let id = Uuid::new_v4();
+        let token = registry.mint(peer, id, LocalClientRole::Tui, vec![]);
+        registry.revoke_for_connection(id, PeerCredentialRevocation::PeerChanged);
+        assert_eq!(
+            registry.revocation_cause(id, token.as_str()),
+            Some(PeerCredentialRevocation::PeerChanged)
+        );
+        assert_eq!(registry.revocation_cause(id, "other-token"), None);
+        let fresh = registry.mint(peer, id, LocalClientRole::Tui, vec![]);
+        assert_eq!(registry.revocation_cause(id, token.as_str()), None);
+        registry.revoke_for_connection(id, PeerCredentialRevocation::Evicted);
+        registry.release_connection(id);
+        assert_eq!(registry.revocation_cause(id, fresh.as_str()), None);
+    }
+
+    /// Reviewer probe (#546 r1): renewal racing revocation never revives.
+    #[test]
+    fn renewal_racing_revoke_does_not_revive() {
+        let registry = Arc::new(PeerCredentialRegistry::default());
+        let peer = current_process_peer_identity();
+        for _ in 0..100 {
+            let id = Uuid::new_v4();
+            let token = registry.mint(peer, id, LocalClientRole::Tui, vec![]);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let renewer = {
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.renew_connection(id)
+                })
+            };
+            barrier.wait();
+            registry.revoke_for_connection(id, PeerCredentialRevocation::Unrecognized);
+            let _ = renewer.join().unwrap();
+            assert!(
+                registry
+                    .verify_sensitive_peer(peer, token.as_str())
+                    .is_none(),
+                "revoked authority must not survive a concurrent renewal"
+            );
+            assert_eq!(
+                registry.renew_connection(id),
+                PeerCredentialRenewal::NoCredential
+            );
+        }
+    }
+
+    /// Reviewer probe (#546 r1) + C5: cancelling the task that holds a lease
+    /// removes the credential, the hook, and the renewal task's registry
+    /// reference.
+    #[tokio::test]
+    async fn lease_cancellation_releases_token_hook_and_renewal_task() {
+        let registry = Arc::new(PeerCredentialRegistry::with_ttl_for_test(SHORT_TTL));
+        let peer = current_process_peer_identity();
+        let id = Uuid::new_v4();
+        let token = registry.mint(peer, id, LocalClientRole::Tui, vec![]);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let _lease =
+                    PeerCredentialLease::hold_with_invalidation_hook(registry, id, |_, _| {});
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+        };
+        ready_rx.await.unwrap();
+        assert_eq!(registry.invalidation_hook_count(), 1);
+        tokio::time::sleep(SHORT_TTL * 2).await;
+        assert!(
+            registry
+                .verify_sensitive_peer(peer, token.as_str())
+                .is_some()
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            registry
+                .verify_sensitive_peer(peer, token.as_str())
+                .is_none()
+        );
+        assert_eq!(
+            registry.invalidation_hook_count(),
+            0,
+            "cancellation must unregister the connection's hook"
+        );
+        tokio::time::sleep(SHORT_TTL * 2).await;
+        assert_eq!(
+            Arc::strong_count(&registry),
+            1,
+            "the renewal task must release its registry clone after cancellation"
+        );
+        assert!(registry.connection_records_for_test().is_empty());
+    }
+
+    /// Reviewer probe (#546 r1): a killed peer can neither renew nor use the
+    /// sensitive sibling.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killed_peer_cannot_renew_or_use_sensitive_authority() {
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("10")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let (uid, gid) = cockpit_host::daemon_lifecycle::read_process_credentials(pid).unwrap();
+        let peer = PeerIdentity {
+            pid,
+            uid,
+            gid,
+            process_start: cockpit_host::daemon_lifecycle::process_start_identity(pid).unwrap(),
+        };
+        let registry = PeerCredentialRegistry::default();
+        let id = Uuid::new_v4();
+        let token = registry.mint(peer, id, LocalClientRole::Tui, vec![]);
+        assert!(
+            registry
+                .verify_sensitive_peer(peer, token.as_str())
+                .is_some()
+        );
+        assert_eq!(
+            registry.renew_connection(id),
+            PeerCredentialRenewal::Renewed
+        );
+        child.kill().await.unwrap();
+        assert_eq!(
+            registry.renew_connection(id),
+            PeerCredentialRenewal::Revoked(PeerCredentialRevocation::PeerChanged)
+        );
+        assert!(
+            registry
+                .verify_sensitive_peer(peer, token.as_str())
+                .is_none()
+        );
+        assert!(registry.expires_at(id, token.as_str()).is_none());
     }
 
     /// The lease renews while held and releases the credential when the

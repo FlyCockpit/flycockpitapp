@@ -189,6 +189,8 @@ impl App {
             None,
             present_model_cancel_notice,
         );
+        // An exit escape belongs to the attachment it was armed for.
+        self.exit_check_escape = None;
         self.queue.clear();
         self.folded_queue_item_ids.clear();
         self.folded_queue_item_order.clear();

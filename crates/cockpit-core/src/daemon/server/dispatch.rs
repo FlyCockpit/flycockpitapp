@@ -18838,12 +18838,14 @@ async fn handle_serialized_request_impl(
                 Vec::new()
             };
             let connection_id = state.terminal_context.client_instance_id;
-            let token =
-                ctx.peer_credential_registry
-                    .mint(peer, connection_id, role, grants.clone());
+            let token = ctx
+                .peer_credential_registry
+                .try_mint(peer, connection_id, role, grants.clone())
+                .map_err(|_| authorization_error(super::PEER_CREDENTIAL_CAPACITY_MESSAGE))?;
             state.has_owner_capability = role.is_owner_class();
             if state.has_owner_capability {
                 state.owner_credential_revoked = None;
+                state.owner_revoked_token = None;
             }
             state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
             state.active_peer_credential = Some(token.as_str().to_string());

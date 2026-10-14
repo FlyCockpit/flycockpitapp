@@ -180,7 +180,24 @@ pub struct ControlRequest {
     pub request: Request,
     pub intended_session_id: Uuid,
     pub intended_attachment_epoch: u64,
-    pub response_tx: oneshot::Sender<Result<Response, String>>,
+    pub response_tx: oneshot::Sender<Result<Response, ControlRequestError>>,
+}
+
+/// A control request's failure, keeping whether the daemon refused it with
+/// a typed authorization error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlRequestError {
+    pub message: String,
+    pub authorization: bool,
+}
+
+impl From<String> for ControlRequestError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            authorization: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1078,7 +1095,7 @@ async fn dispatch_control_request_for_current_attachment<F, Fut>(
     send: F,
 ) where
     F: FnOnce(Request) -> Fut,
-    Fut: std::future::Future<Output = Result<Response, String>>,
+    Fut: std::future::Future<Output = Result<Response, ControlRequestError>>,
 {
     let _transition_guard = transition_gate.lock_owned().await;
     let current_session_id = *session_id_state
@@ -1089,7 +1106,9 @@ async fn dispatch_control_request_for_current_attachment<F, Fut>(
         || control_request.intended_attachment_epoch != current_epoch
     {
         let _ = control_request.response_tx.send(Err(
-            "request belongs to a session attachment that has been replaced; retry".to_string(),
+            "request belongs to a session attachment that has been replaced; retry"
+                .to_string()
+                .into(),
         ));
         return;
     }
@@ -3218,10 +3237,14 @@ async fn try_spawn_inner(
                         let current_client = current_client.clone();
                         async move {
                             let client = current_client.read().await.clone();
-                            client
-                                .request_ok(request)
-                                .await
-                                .map_err(|e| format!("daemon request: {e}"))
+                            match client.request(request).await {
+                                Ok(Ok(response)) => Ok(response),
+                                Ok(Err(payload)) => Err(ControlRequestError {
+                                    authorization: payload.code == proto::ErrorCode::Authorization,
+                                    message: format!("daemon request: daemon error: {payload}"),
+                                }),
+                                Err(error) => Err(format!("daemon request: {error}").into()),
+                            }
                         }
                     },
                 )
@@ -3686,7 +3709,9 @@ pub(crate) fn send_control_request(
     }
 }
 
-pub(crate) fn control_response_outcome(result: Result<Response, String>) -> ControlRequestOutcome {
+pub(crate) fn control_response_outcome(
+    result: Result<Response, ControlRequestError>,
+) -> ControlRequestOutcome {
     match result {
         Ok(Response::Unknown) => {
             ControlRequestOutcome::Rejected("unexpected daemon response: Unknown".to_string())
@@ -3709,7 +3734,8 @@ pub(crate) fn control_response_outcome(result: Result<Response, String>) -> Cont
             has_live_work,
         },
         Ok(_) => ControlRequestOutcome::Applied,
-        Err(error) => ControlRequestOutcome::Rejected(error),
+        Err(error) if error.authorization => ControlRequestOutcome::Unauthorized(error.message),
+        Err(error) => ControlRequestOutcome::Rejected(error.message),
     }
 }
 
@@ -5945,8 +5971,8 @@ mod tests {
         assert!(!sent.load(Ordering::Acquire));
         let error = response_rx.await.unwrap().unwrap_err();
         assert!(
-            error.contains("attachment that has been replaced"),
-            "{error}"
+            error.message.contains("attachment that has been replaced"),
+            "{error:?}"
         );
     }
 

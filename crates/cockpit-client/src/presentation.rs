@@ -45,6 +45,10 @@ pub enum ControlRequestNotDelivered {
 pub enum ControlRequestOutcome {
     NotDelivered(ControlRequestNotDelivered),
     Rejected(String),
+    /// The daemon refused the request with a typed authorization error
+    /// (`ErrorCode::Authorization`). Presented like [`Self::Rejected`];
+    /// kept distinct so callers never infer authorization from text.
+    Unauthorized(String),
     Applied,
     ConfigRefreshed {
         applied_generation: u64,

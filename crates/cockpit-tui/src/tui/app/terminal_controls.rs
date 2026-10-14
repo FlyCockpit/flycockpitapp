@@ -41,8 +41,9 @@ impl App {
                 ToastKind::Info,
             );
             false
-        } else if self.exit_check_failed {
-            // The daemon already refused the exit check; quitting is a local
+        } else if self.take_exit_check_escape() {
+            // The daemon could not answer this attachment's exit check, or
+            // refused it for lack of owner authority: quitting is a local
             // decision and never waits on daemon authority.
             self.exit_notice = Some(format!(
                 "Exited without the daemon's background-work check; if work was still running, reattach with {}",
@@ -69,11 +70,37 @@ impl App {
         }
     }
 
-    /// The exit check (or the stop/background choice after it) failed: let
-    /// the very next exit request quit without the daemon, and tell the user
-    /// how. Returns `message` with that recovery hint appended.
-    pub(super) fn note_exit_check_failure(&mut self, message: String) -> String {
-        self.exit_check_failed = true;
+    /// The current attachment, as exit checks are bound to it.
+    pub(super) fn current_exit_check_binding(&self) -> Option<super::ExitCheckBinding> {
+        self.agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(|runner| super::ExitCheckBinding {
+                session_id: runner.session_id(),
+                attachment_epoch: runner.attachment_epoch(),
+            })
+    }
+
+    /// Consume the one-shot escape; it counts only for the attachment it
+    /// was armed against.
+    fn take_exit_check_escape(&mut self) -> bool {
+        self.exit_check_escape
+            .take()
+            .is_some_and(|armed| Some(armed) == self.current_exit_check_binding())
+    }
+
+    /// The exit check bound to `binding` was refused for authorization or
+    /// never delivered: let the next exit attempt on that attachment quit
+    /// without it, and tell the user how. Returns `message` with that hint.
+    pub(super) fn arm_exit_check_escape(
+        &mut self,
+        binding: Option<super::ExitCheckBinding>,
+        message: String,
+    ) -> String {
+        let Some(binding) = binding else {
+            return message;
+        };
+        self.exit_check_escape = Some(binding);
         let message = format!(
             "{message}. Press Ctrl+C twice or run /exit again to quit without the daemon check."
         );
@@ -82,6 +109,8 @@ impl App {
     }
 
     pub(super) fn apply_exit_guard_status(&mut self, ephemeral_owner: bool, has_live_work: bool) {
+        // The daemon answered: no escape survives a successful check.
+        self.exit_check_escape = None;
         if !has_live_work {
             self.exit_requested = true;
         } else if ephemeral_owner {

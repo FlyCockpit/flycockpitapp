@@ -259,6 +259,8 @@ pub(crate) struct PendingControlRequest {
     /// release uniquely-owned slots (`pending_model_selection`, tokenizer
     /// confirm) without driving picker confirmation side-effects.
     fenced: bool,
+    /// The attachment the request was sent for.
+    binding: Option<ExitCheckBinding>,
 }
 
 impl PendingControlRequest {
@@ -267,8 +269,16 @@ impl PendingControlRequest {
             label: label.into(),
             applied,
             fenced: false,
+            binding: None,
         }
     }
+}
+
+/// The session attachment a daemon exit check was issued against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExitCheckBinding {
+    pub(crate) session_id: uuid::Uuid,
+    pub(crate) attachment_epoch: u64,
 }
 
 pub(crate) struct PendingModelSelection {
@@ -491,16 +501,6 @@ pub(crate) enum ControlEpochAbandonAction {
 }
 
 impl ControlApplied {
-    /// The exit check and the stop/background choices that complete it.
-    pub(crate) fn is_exit_step(&self) -> bool {
-        matches!(
-            self,
-            Self::ExitGuardStatus
-                | Self::ExitAfterStoppingWork
-                | Self::ExitAfterBackgroundPromotion
-        )
-    }
-
     /// Completeness bound for epoch abandonment. A new variant that does not
     /// appear here is a compile error; do not add a wildcard arm.
     pub(crate) fn epoch_abandon_action(
@@ -2176,11 +2176,12 @@ pub struct App {
     pub(super) daemon_restart_prompt: Option<DaemonRestartPrompt>,
     exit_requested: bool,
     exit_notice: Option<String>,
-    /// The daemon refused or never answered this TUI's last exit check (or
-    /// the stop/background choice that follows it). Quitting must never
-    /// depend on daemon authority, so the next exit request leaves without
-    /// asking again (issue #546).
-    exit_check_failed: bool,
+    /// One-shot permission for the *next* exit attempt to leave without the
+    /// daemon's exit check. Armed only when that check itself was refused
+    /// with a typed authorization error or could not be delivered, and bound
+    /// to the attachment it was issued against: a successful check, a
+    /// session reset, or any other attachment voids it (issue #546).
+    exit_check_escape: Option<ExitCheckBinding>,
     pub(super) active_model_state_generation: u64,
     /// Security disclosures must be fetched from the daemon before a session
     /// attachment can be created. Failures leave this false and user actions
@@ -4218,7 +4219,7 @@ impl App {
             daemon_restart_prompt: None,
             exit_requested: false,
             exit_notice: None,
-            exit_check_failed: false,
+            exit_check_escape: None,
             active_model_state_generation: 0,
             // Existing unit harnesses construct App without an event loop or
             // daemon fake; gate-focused tests explicitly set this false.

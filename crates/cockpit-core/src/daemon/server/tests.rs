@@ -8699,6 +8699,7 @@ fn remote_state_with_grants(
         has_owner_capability: false,
         active_peer_credential: None,
         owner_credential_revoked: None,
+        owner_revoked_token: None,
         presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "flycockpit:user-1".into(),
@@ -8747,6 +8748,7 @@ fn owner_state() -> MutableClientState {
         has_owner_capability: true,
         active_peer_credential: None,
         owner_credential_revoked: None,
+        owner_revoked_token: None,
         presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
@@ -9252,7 +9254,137 @@ async fn live_owner_connection_keeps_owner_authority_past_the_credential_ttl() {
     }
 
     drop(client);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("the handler ends when the client disconnects")
+        .expect("handler task joins")
+        .expect("handler completes cleanly");
+    assert_eq!(ctx.peer_credential_registry.invalidation_hook_count(), 0);
+    assert!(
+        ctx.peer_credential_registry
+            .connection_records_for_test()
+            .is_empty()
+    );
+}
+
+/// C5 (issue #546 r2): aborting a real ready-socket handler (listener
+/// handover, cancellation) removes its invalidation hook as well as its
+/// credential; no per-connection registry state outlives the handler.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn aborted_socket_handler_leaves_no_registry_hook_or_credential() {
+    let ctx = test_ctx();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("abort.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let (accepted, _) = listener.accept().await.unwrap();
+    let task = tokio::spawn(handle_client(accepted, ctx.clone()));
+    let mut client = ProtoStream::new(stream);
+    assert!(matches!(
+        client.recv().await.unwrap(),
+        Some(RecvFrame::Envelope(_))
+    ));
+    assert_eq!(
+        ctx.peer_credential_registry.invalidation_hook_count(),
+        1,
+        "the production handler registered its hook"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        ctx.peer_credential_registry.invalidation_hook_count(),
+        0,
+        "aborting a real socket handler must unregister its invalidation hook"
+    );
+    assert!(
+        ctx.peer_credential_registry
+            .connection_records_for_test()
+            .is_empty()
+    );
+}
+
+/// C7 (issue #546 r2): a frame queued ahead of the revocation notice
+/// reports the registry's real cause, not a guessed "lapsed"; the matching
+/// notice keeps it; a notice for a credential the connection has since
+/// replaced never downgrades the fresh one.
+#[cfg(unix)]
+#[tokio::test]
+async fn revocation_cause_survives_frame_ordering_and_stale_notices() {
+    use crate::daemon::peer_authority::PeerCredentialRevocation;
+    let ctx = test_ctx();
+    let registry = &ctx.peer_credential_registry;
+    let peer = child_peer_identity(std::process::id());
+    let mut state = owner_state();
+    let id = state.terminal_context.client_instance_id;
+    let token = registry.mint(
+        peer,
+        id,
+        crate::daemon::principal::LocalClientRole::Tui,
+        vec![],
+    );
+    state.socket_peer = Some(peer);
+    state.active_peer_credential = Some(token.0.clone());
+    let mut shared = state.shared_snapshot();
+    let (principal_tx, _principal_rx) = tokio::sync::watch::channel(state.principal.clone());
+
+    registry.revoke_for_connection(id, PeerCredentialRevocation::PeerChanged);
+    // A frame queued before the hook's notice reaches reconciliation first.
+    reconcile_socket_peer_owner_authority(&mut state, &mut shared, &ctx, &principal_tx);
+    assert_eq!(
+        state.owner_credential_revoked,
+        Some(PeerCredentialRevocation::PeerChanged),
+        "reconciliation must report the registry's recorded cause"
+    );
+    // The accurate notice for that same token arrives afterwards.
+    apply_peer_credential_invalidation(
+        &mut state,
+        &mut shared,
+        &principal_tx,
+        &token.0,
+        PeerCredentialRevocation::PeerChanged,
+    );
+    assert_eq!(
+        shared.owner_credential_revoked,
+        Some(PeerCredentialRevocation::PeerChanged)
+    );
+
+    // Re-exchange; then a delayed notice for the old token arrives.
+    let fresh = registry.mint(
+        peer,
+        id,
+        crate::daemon::principal::LocalClientRole::Tui,
+        vec![],
+    );
+    state.has_owner_capability = true;
+    state.owner_credential_revoked = None;
+    state.owner_revoked_token = None;
+    state.principal = ClientPrincipal::local_authenticated(
+        peer,
+        crate::daemon::principal::LocalClientRole::Tui,
+        vec![],
+    );
+    state.active_peer_credential = Some(fresh.0.clone());
+    apply_peer_credential_invalidation(
+        &mut state,
+        &mut shared,
+        &principal_tx,
+        &token.0,
+        PeerCredentialRevocation::Lapsed,
+    );
+    assert_eq!(
+        state.active_peer_credential.as_deref(),
+        Some(fresh.0.as_str())
+    );
+    assert!(
+        state.has_owner_capability,
+        "a stale notice must not downgrade a fresh credential"
+    );
+    assert_eq!(
+        *principal_tx.borrow(),
+        state.principal,
+        "the event principal is restored"
+    );
 }
 
 /// Issue #546: when the daemon does withdraw an owner connection's
@@ -17946,6 +18078,7 @@ async fn attached_state_with_worker_receiver(
             has_owner_capability: true,
             active_peer_credential: None,
             owner_credential_revoked: None,
+            owner_revoked_token: None,
             presented_owner_capability: None,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id: "local-owner".into(),
@@ -38605,6 +38738,7 @@ async fn btw_concurrent_with_parent_turn() {
         has_owner_capability: true,
         active_peer_credential: None,
         owner_credential_revoked: None,
+        owner_revoked_token: None,
         presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
@@ -38693,6 +38827,7 @@ async fn btw_concurrent_with_parent_turn() {
         has_owner_capability: true,
         active_peer_credential: None,
         owner_credential_revoked: None,
+        owner_revoked_token: None,
         presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),

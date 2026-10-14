@@ -315,47 +315,17 @@ fn generate_image_schema() -> Value {
                         "height": { "type": "integer", "minimum": 1, "maximum": MAX_GENERATE_IMAGE_DIMENSION, "description": "Optional requested height in pixels." },
                         "format": { "type": "string", "enum": ["png", "jpeg", "webp", "svg"], "description": "Optional output format." },
                         "parameters": {
-                            "type": "object",
-                            "description": "Optional typed target parameters, keyed by parameter name.",
-                            "maxProperties": MAX_GENERATE_IMAGE_TYPED_PARAMETERS,
-                            "propertyNames": {
-                                "type": "string",
-                                "minLength": 1,
-                                "maxLength": MAX_GENERATE_IMAGE_STRING_BYTES
-                            },
-                            "additionalProperties": {
-                                "oneOf": [
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "type": { "const": "boolean" },
-                                            "value": { "type": "boolean" }
-                                        },
-                                        "required": ["type", "value"],
-                                        "additionalProperties": false
-                                    },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "type": { "const": "integer" },
-                                            "value": {
-                                                "type": "integer",
-                                                "minimum": i64::MIN,
-                                                "maximum": i64::MAX
-                                            }
-                                        },
-                                        "required": ["type", "value"],
-                                        "additionalProperties": false
-                                    },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "type": { "const": "text" },
-                                            "value": { "type": "string", "maxLength": MAX_GENERATE_IMAGE_STRING_BYTES }
-                                        },
-                                        "required": ["type", "value"],
-                                        "additionalProperties": false
-                                    }
+                            "type": "array",
+                            "description": "Optional typed target parameters as {name, type, value} entries; names are unique.",
+                            "maxItems": MAX_GENERATE_IMAGE_TYPED_PARAMETERS,
+                            "items": {
+                                "anyOf": [
+                                    typed_parameter_entry_schema("boolean", serde_json::json!({ "type": "boolean" })),
+                                    typed_parameter_entry_schema("integer", serde_json::json!({ "type": "integer" })),
+                                    typed_parameter_entry_schema(
+                                        "text",
+                                        serde_json::json!({ "type": "string", "maxLength": MAX_GENERATE_IMAGE_STRING_BYTES })
+                                    )
                                 ]
                             }
                         }
@@ -384,6 +354,23 @@ fn generate_image_schema() -> Value {
             "base_stem": { "type": "string", "description": "Required output base stem for published artifact names." }
         },
         "required": ["prompt", "directory", "base_stem"],
+        "additionalProperties": false
+    })
+}
+
+/// One `generate_image` typed-parameter entry. Strict function-calling wires
+/// cannot express an open-keyed map (they decode `{}`), so parameters travel
+/// as `{name, type, value}` entries and [`typed_parameters_from_wire`] folds
+/// them into the dispatch map, enforcing the name bounds and uniqueness.
+fn typed_parameter_entry_schema(kind: &str, value: Value) -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "minLength": 1, "maxLength": MAX_GENERATE_IMAGE_STRING_BYTES },
+            "type": { "type": "string", "const": kind },
+            "value": value
+        },
+        "required": ["name", "type", "value"],
         "additionalProperties": false
     })
 }
@@ -636,23 +623,50 @@ fn validate_optional_dimension(obj: &Map<String, Value>, key: &str, label: &str)
     Ok(())
 }
 
+/// Fold the `{name, type, value}` wire entries into the `name -> {type,
+/// value}` map the dispatch boundary deserializes, rejecting a non-array, an
+/// entry without a bounded non-empty string `name`, and a repeated name.
+fn typed_parameters_from_wire(parameters: &Value, target_id: &str) -> Result<Map<String, Value>> {
+    let entries = parameters.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "generate_image target `{target_id}` parameters must be an array of {{name, type, value}} entries"
+        )
+    })?;
+    ensure!(
+        entries.len() <= MAX_GENERATE_IMAGE_TYPED_PARAMETERS,
+        "generate_image target `{target_id}` parameters exceed the {} cap",
+        MAX_GENERATE_IMAGE_TYPED_PARAMETERS
+    );
+    let mut params = Map::with_capacity(entries.len());
+    for entry in entries {
+        let mut entry = entry.as_object().cloned().ok_or_else(|| {
+            anyhow::anyhow!("generate_image target `{target_id}` parameter entries must be objects")
+        })?;
+        let name = match entry.remove("name") {
+            Some(Value::String(name)) => name,
+            _ => anyhow::bail!(
+                "generate_image target `{target_id}` parameter entries require a string `name`"
+            ),
+        };
+        ensure!(
+            !name.is_empty() && name.len() <= MAX_GENERATE_IMAGE_STRING_BYTES,
+            "generate_image target `{target_id}` parameter key is outside its bound"
+        );
+        ensure!(
+            !params.contains_key(&name),
+            "generate_image target `{target_id}` repeats parameter `{name}`"
+        );
+        params.insert(name, Value::Object(entry));
+    }
+    Ok(params)
+}
+
 fn validate_typed_parameters(parameters: Option<&Value>, target_id: &str) -> Result<()> {
     let Some(parameters) = parameters else {
         return Ok(());
     };
-    let params = parameters.as_object().ok_or_else(|| {
-        anyhow::anyhow!("generate_image target `{target_id}` parameters must be an object")
-    })?;
-    ensure!(
-        params.len() <= MAX_GENERATE_IMAGE_TYPED_PARAMETERS,
-        "generate_image target `{target_id}` parameters exceed the {} cap",
-        MAX_GENERATE_IMAGE_TYPED_PARAMETERS
-    );
-    for (key, parameter) in params {
-        ensure!(
-            !key.is_empty() && key.len() <= MAX_GENERATE_IMAGE_STRING_BYTES,
-            "generate_image target `{target_id}` parameter key is outside its bound"
-        );
+    let params = typed_parameters_from_wire(parameters, target_id)?;
+    for (key, parameter) in &params {
         let parameter = parameter.as_object().ok_or_else(|| {
             anyhow::anyhow!(
                 "generate_image target `{target_id}` parameter `{key}` must be an object"
@@ -1261,8 +1275,12 @@ fn parse_generate_image_dispatch_target(
         .unwrap_or("png")
         .to_string();
     let parameters: BTreeMap<String, TypedParameter> = match entry.get("parameters") {
-        Some(parameters) => serde_json::from_value(parameters.clone())
-            .map_err(|err| invalid_input(format!("invalid target `parameters`: {err}")))?,
+        Some(parameters) => typed_parameters_from_wire(parameters, &target_id)
+            .map_err(|err| invalid_input(err.to_string()))
+            .and_then(|parameters| {
+                serde_json::from_value(Value::Object(parameters))
+                    .map_err(|err| invalid_input(format!("invalid target `parameters`: {err}")))
+            })?,
         None => BTreeMap::new(),
     };
     Ok(crate::image_generation_job::GenerateImageDispatchTarget {
@@ -1898,22 +1916,21 @@ mod tests {
     }
 
     #[test]
-    fn generate_image_schema_parameters_match_the_typed_map_wire_contract() {
+    fn generate_image_schema_parameters_use_the_typed_entry_wire_contract() {
         let schema = image_generation_tool_schema("generate_image");
         let parameters = &schema["properties"]["targets"]["items"]["properties"]["parameters"];
-        assert_eq!(parameters["type"], "object");
-        assert_eq!(
-            parameters["maxProperties"],
-            MAX_GENERATE_IMAGE_TYPED_PARAMETERS
-        );
-        assert_eq!(parameters["propertyNames"]["minLength"], 1);
-        assert_eq!(
-            parameters["additionalProperties"]["oneOf"]
-                .as_array()
-                .unwrap()
-                .len(),
-            3
-        );
+        assert_eq!(parameters["type"], "array");
+        assert_eq!(parameters["maxItems"], MAX_GENERATE_IMAGE_TYPED_PARAMETERS);
+        let variants = parameters["items"]["anyOf"].as_array().unwrap();
+        let kinds: Vec<_> = variants
+            .iter()
+            .map(|variant| {
+                assert_eq!(variant["additionalProperties"], false);
+                assert_eq!(variant["properties"]["name"]["minLength"], 1);
+                variant["properties"]["type"]["const"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(kinds, ["boolean", "integer", "text"]);
     }
 
     #[test]
@@ -2252,14 +2269,25 @@ mod tests {
             "base_stem": "image",
             "targets": [{
                 "target_id": "t1",
-                "parameters": {
-                    "seed": { "type": "integer", "value": 7 },
-                    "transparent": { "type": "boolean", "value": true },
-                    "style": { "type": "text", "value": "illustration" }
-                }
+                "parameters": [
+                    { "name": "seed", "type": "integer", "value": 7 },
+                    { "name": "transparent", "type": "boolean", "value": true },
+                    { "name": "style", "type": "text", "value": "illustration" }
+                ]
             }]
         });
         validate_generate_image_args(&args).unwrap();
+        let target =
+            parse_generate_image_dispatch_target(&args["targets"][0], None, None, None, &[])
+                .expect("typed entries parse into the dispatch map");
+        assert_eq!(
+            target
+                .parameters
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["seed", "style", "transparent"]
+        );
     }
 
     #[test]
@@ -2272,20 +2300,43 @@ mod tests {
         });
 
         let mut wrong_container = base.clone();
-        wrong_container["targets"][0]["parameters"] = serde_json::json!([]);
+        wrong_container["targets"][0]["parameters"] = serde_json::json!({
+            "seed": { "type": "integer", "value": 7 }
+        });
         assert!(validate_generate_image_args(&wrong_container).is_err());
 
         let mut unknown_field = base.clone();
-        unknown_field["targets"][0]["parameters"] = serde_json::json!({
-            "seed": { "type": "integer", "value": 7, "provider": "ignored" }
-        });
+        unknown_field["targets"][0]["parameters"] = serde_json::json!([
+            { "name": "seed", "type": "integer", "value": 7, "provider": "ignored" }
+        ]);
         assert!(validate_generate_image_args(&unknown_field).is_err());
 
-        let mut wrong_type = base;
-        wrong_type["targets"][0]["parameters"] = serde_json::json!({
-            "seed": { "type": "integer", "value": "7" }
-        });
+        let mut wrong_type = base.clone();
+        wrong_type["targets"][0]["parameters"] = serde_json::json!([
+            { "name": "seed", "type": "integer", "value": "7" }
+        ]);
         assert!(validate_generate_image_args(&wrong_type).is_err());
+
+        // The bounds the schema used to carry in `propertyNames` are enforced
+        // here, because strict wires cannot carry them.
+        let mut empty_name = base.clone();
+        empty_name["targets"][0]["parameters"] = serde_json::json!([
+            { "name": "", "type": "integer", "value": 7 }
+        ]);
+        let err = validate_generate_image_args(&empty_name)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parameter key is outside its bound"), "{err}");
+
+        let mut repeated = base;
+        repeated["targets"][0]["parameters"] = serde_json::json!([
+            { "name": "seed", "type": "integer", "value": 7 },
+            { "name": "seed", "type": "integer", "value": 8 }
+        ]);
+        let err = validate_generate_image_args(&repeated)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repeats parameter `seed`"), "{err}");
     }
 
     #[test]

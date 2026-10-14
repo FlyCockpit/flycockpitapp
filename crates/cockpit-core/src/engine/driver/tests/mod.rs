@@ -168,7 +168,13 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
                     "agent": "builder",
                     "prompt": "durable interactive handoff",
                     "mode": "subagent_interactive",
-                    "seed_reads": &seed_reads,
+                    "seed_reads": seed_reads
+                        .iter()
+                        .map(|seed| serde_json::json!({
+                            "tool": seed.tool,
+                            "args": crate::engine::seed_reads::args_to_wire(&seed.args),
+                        }))
+                        .collect::<Vec<_>>(),
                     "seed_reads_receipt": &receipt,
                 },
             }),

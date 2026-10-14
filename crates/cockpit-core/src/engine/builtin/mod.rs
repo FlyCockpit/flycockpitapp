@@ -5144,6 +5144,66 @@ pub(crate) mod tests {
         }
     }
 
+    /// Issue #549: every tool a built-in agent advertises — its own tools,
+    /// `task` with its real subagent enum, spawn and delegation tools, in both
+    /// steerings — must fit the subset of every wire it can be sent on.
+    #[test]
+    fn every_builtin_agent_tool_schema_fits_every_wire_subset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        let mut agents = vec![build(&args)];
+        for &name in crate::agents::BUILTIN_AGENT_NAMES {
+            agents.push(load(name, &args).unwrap());
+        }
+        // Feature primaries (Dream's governed knowledge writers, Computer)
+        // join when they materialize without host-specific policy.
+        for name in ["Computer", "Dream", "Multireview"] {
+            if !crate::agents::BUILTIN_AGENT_NAMES.contains(&name)
+                && let Ok(agent) = load(name, &args)
+            {
+                agents.push(agent);
+            }
+        }
+        let mut definitions = Vec::new();
+        for agent in &agents {
+            for steering in [
+                crate::agents::ToolSteering::Terse,
+                crate::agents::ToolSteering::Verbose,
+            ] {
+                definitions.extend(
+                    agent
+                        .tools
+                        .advertised_definitions(steering)
+                        .into_iter()
+                        .chain(agent.tools.definitions(steering))
+                        .map(|mut definition| {
+                            definition.name = format!("{}/{}", agent.name, definition.name);
+                            definition
+                        }),
+                );
+            }
+        }
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.name.ends_with("/task")),
+            "no built-in agent advertised `task`"
+        );
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.name.ends_with("/structured_search")),
+            "knowledge search tools are sent on the wire and must be linted"
+        );
+        let violations =
+            crate::engine::model::wire_schema::tests::wire_subset_violations(&definitions);
+        assert!(
+            violations.is_empty(),
+            "agent tool schemas outside the wire subsets:\n{}",
+            violations.join("\n")
+        );
+    }
+
     #[test]
     fn loaded_builder_has_defer_to_orchestrator() {
         let tmp = tempfile::tempdir().unwrap();

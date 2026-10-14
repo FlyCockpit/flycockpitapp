@@ -31,17 +31,22 @@ fn per_delegation_budget_schema() -> Value {
     })
 }
 
+/// `seed_reads[].args` on the wire: an array of `{name, value}` entries.
+/// Strict function-calling wires cannot express an open-keyed map (they
+/// accept the schema but decode `{}`), so the host renders and parses seed
+/// arguments in this entry form; see [`crate::engine::seed_reads`].
 fn seed_read_args_schema() -> Value {
     serde_json::json!({
-        "type": "object",
-        "maxProperties": 12,
-        "propertyNames": { "type": "string", "minLength": 1 },
-        "additionalProperties": {
-            "oneOf": [
-                { "type": "string", "additionalProperties": false },
-                { "type": "integer", "additionalProperties": false },
-                { "type": "boolean", "additionalProperties": false }
-            ]
+        "type": "array",
+        "maxItems": crate::engine::seed_reads::MAX_SEED_READ_ARGS,
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "value": { "type": ["string", "integer", "boolean"] }
+            },
+            "required": ["name", "value"],
+            "additionalProperties": false
         }
     })
 }
@@ -163,10 +168,10 @@ impl TaskTool {
         });
         // A seed carries the exact arguments for one bounded read-only tool.
         // The item stays a single closed object with the full read-only
-        // allowlist enum: `args` use a compact typed map so the task schema
-        // stays strict-wire compatible without embedding every read-only tool
-        // schema here; they are replayed by the implementation child against
-        // the named tool's real schema.
+        // allowlist enum: `args` use compact `{name, value}` entries so the
+        // task schema stays strict-wire compatible without embedding every
+        // read-only tool schema here; they are replayed by the implementation
+        // child against the named tool's real schema.
         // Terse steering keeps the parameter schema inside the task-definition
         // byte budget (`task_definition_shrinks_after_seed_removal`): only the
         // descriptions a test or the terse contract pins stay inline; the rest

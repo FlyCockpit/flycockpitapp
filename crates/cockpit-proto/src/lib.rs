@@ -51,8 +51,9 @@ pub use acp::{
 };
 pub use agent_authoring::{
     AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
-    AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
-    AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
+    AgentAuthoringDefaultRoute, AgentAuthoringProjection, AgentAuthoringSource,
+    AgentAuthoringSourceKind, AgentPolicyRoute, AgentPolicySnapshot,
+    AgentPolicyTrustClassification, ApplyAuthoredAgentPackageOutcome,
     ApplyAuthoredAgentPackageReceipt, ApplyAuthoredAgentPackageRequest, AuthoredAgentChild,
     AuthoredAgentOnboardingCorrelation, AuthoredAgentPackageDraft,
     AuthoredAgentPackageReceiptQuery, AuthoredAgentReceiptStatus, AuthoredAgentRejectReason,

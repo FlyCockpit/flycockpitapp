@@ -1998,11 +1998,7 @@ fn every_step_label_names_the_step_its_screen_title_names() {
         let mut shell = shell_at(stage);
         if stage == OnboardingStage::Agent {
             // The app mounts the authoring entry screen asynchronously.
-            shell.present_agent_authoring(
-                agent::golden_sample_projection(),
-                "label".into(),
-                Default::default(),
-            );
+            shell.present_agent_authoring(agent::golden_sample_projection(), "label".into());
         }
         let label = PROGRESS_STEPS[index + 1];
         let rows = render_rows(&mut shell, 120, 40);
@@ -2258,11 +2254,7 @@ fn agent_authoring_back_stays_inside_the_editor_until_the_root_name_phase() {
     const WIDTH: u16 = 100;
     const HEIGHT: u16 = 30;
     let mut shell = shell_at(OnboardingStage::Agent);
-    shell.present_agent_authoring(
-        agent::golden_sample_projection(),
-        "agent-back".into(),
-        Default::default(),
-    );
+    shell.present_agent_authoring(agent::golden_sample_projection(), "agent-back".into());
     let mut engine = Dialog::None;
 
     shell.handle_key(key(KeyCode::Enter), &mut engine);

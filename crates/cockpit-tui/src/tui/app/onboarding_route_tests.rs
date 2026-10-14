@@ -518,3 +518,37 @@ fn send_with_unfinished_setup_and_no_model_reopens_setup() {
         "the draft stays in the composer"
     );
 }
+
+/// Codex C2: choosing a model before any session exists buffers a best-effort
+/// `RecordUsage`; when the session attach then fails, that unsent record must
+/// not fence quit forever.
+#[test]
+fn unsent_usage_after_a_failed_pre_session_attach_never_fences_quit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = App::new(Some(tmp.path()), false);
+    assert!(app.agent_runner.is_none());
+    app.notify_active_model_selected(
+        cockpit_config::providers::ActiveModelRef {
+            provider: "openrouter".into(),
+            model: "deepseek/flash".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        false,
+        cockpit_proto::ActiveModelSwitchTrigger::Picker,
+    );
+    // The attach is refused (no daemon in this test): nothing is pending
+    // except the buffered usage record.
+    app.pending_runner_attach = None;
+    assert!(
+        !app.pending_usage.is_empty(),
+        "the usage record is buffered"
+    );
+    assert!(!app.has_unsettled_local_authority());
+    assert!(
+        app.request_guarded_exit(),
+        "quit must not wait on unsent usage"
+    );
+}

@@ -609,17 +609,6 @@ pub struct ExtendedConfig {
     #[serde(rename = "defaultPrimaryAgent", default)]
     pub default_primary_agent: DefaultPrimaryAgent,
 
-    /// Installed launch-v1 agent selected during onboarding. When present it
-    /// supersedes the legacy built-in-only `defaultPrimaryAgent` switch for
-    /// new code sessions. The stored value is the agent's final ID segment,
-    /// never a source path or repository locator.
-    #[serde(
-        rename = "defaultAgent",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub default_agent: Option<String>,
-
     /// Host-owned per-agent onboarding overrides. These are separate from the
     /// portable definition's author preferences and therefore cannot be
     /// supplied by an agent repository.
@@ -1919,12 +1908,12 @@ impl ExtendedConfig {
             .filter(|s| !s.is_empty())
     }
 
+    /// The configured builtin default primary (`defaultPrimaryAgent`). The
+    /// default *installed* agent is daemon state, not config: the
+    /// `agent_default_installation` row onboarding writes, which new
+    /// sessions prefer when it is set.
     pub fn default_agent_name(&self) -> &str {
-        self.default_agent
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| self.default_primary_agent.agent_name())
+        self.default_primary_agent.agent_name()
     }
 
     /// Resolve the hierarchical spend budget for `agent_name`.
@@ -2013,7 +2002,6 @@ impl Default for ExtendedConfig {
             dialog: DialogConfig::default(),
             skills: SkillsConfig::default(),
             default_primary_agent: DefaultPrimaryAgent::default(),
-            default_agent: None,
             agent_runtime_defaults: BTreeMap::new(),
             translation: TranslationConfig::default(),
             sandbox_escalation_enabled: true,
@@ -3373,10 +3361,9 @@ pub(crate) fn strip_remote_image_sidecar(raw: &mut Value) {
 }
 
 /// Per-agent runtime defaults are host authority: a remote layer may not
-/// change native/Monty tool placement, packages, or the machine default agent.
+/// change native/Monty tool placement or packages.
 pub(crate) fn strip_remote_agent_runtime_defaults(raw: &mut Value) {
     if let Some(obj) = raw.as_object_mut() {
-        obj.remove("defaultAgent");
         obj.remove("agentRuntimeDefaults");
     }
 }

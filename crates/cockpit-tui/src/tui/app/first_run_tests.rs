@@ -374,6 +374,8 @@ fn settle_onboarding_agent_stage(app: &mut App) {
             }],
             definition_frontmatter_yaml: None,
         }],
+        route_provider_labels: Vec::new(),
+        default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
         review_trust_disclosure: "Trust classification is shared global provider/model policy."
             .into(),
     };
@@ -402,7 +404,7 @@ fn settle_onboarding_agent_stage(app: &mut App) {
         trust_disclosure: "Trust classification is shared global provider/model policy.".into(),
     };
     if let Some(shell) = app.onboarding_shell.as_mut() {
-        shell.present_agent_authoring(projection, operation_id.clone(), Default::default());
+        shell.present_agent_authoring(projection, operation_id.clone());
         shell.apply_agent_authoring_outcome(ApplyAuthoredAgentPackageOutcome::Receipt(
             ApplyAuthoredAgentPackageReceipt {
                 client_operation_id: operation_id,

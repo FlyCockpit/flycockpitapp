@@ -80,12 +80,22 @@ export const agentAuthoringSourceSchema = z
   })
   .strict();
 
+export const agentAuthoringDefaultRouteSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("route"), index: z.number().int().nonnegative() }).strict(),
+  z.object({ kind: z.literal("unresolved"), model_id: z.string() }).strict(),
+]);
+export type AgentAuthoringDefaultRoute = z.infer<typeof agentAuthoringDefaultRouteSchema>;
+
 export const agentAuthoringProjectionSchema = z
   .object({
     dto_version: agentAuthoringDtoVersionSchema,
     policy: agentPolicySnapshotSchema,
     sources: z.array(agentAuthoringSourceSchema),
     review_trust_disclosure: z.string(),
+    /** Configured provider id per `policy.routes` entry (index-aligned), when unique. */
+    route_provider_labels: z.array(z.string().nullable()).optional(),
+    /** Where the configured default model sits among `policy.routes`. */
+    default_route: agentAuthoringDefaultRouteSchema.optional(),
   })
   .strict();
 export type AgentAuthoringProjection = z.infer<typeof agentAuthoringProjectionSchema>;

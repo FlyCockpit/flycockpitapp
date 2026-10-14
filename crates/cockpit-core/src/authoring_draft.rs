@@ -124,16 +124,13 @@ pub struct AgentAuthoringDraft {
 }
 
 impl AgentAuthoringDraft {
-    /// Construct defaults from the authoritative projection. `default_route`
-    /// is the policy route of the user's default model (see
-    /// [`crate::onboarding_agent::ConfiguredRouteNames::default_route_index`]);
-    /// the draft grants and stars it, falling back to the first route.
-    pub fn from_projection(
-        projection: &AgentAuthoringProjection,
-        default_route: Option<usize>,
-    ) -> Self {
+    /// Construct defaults from the authoritative projection. The route of
+    /// the configured default model (`projection.default_route`) is granted
+    /// and starred; when the projection cannot name it, nothing is granted
+    /// and the user picks.
+    pub fn from_projection(projection: &AgentAuthoringProjection) -> Self {
         let route_count = projection.policy.routes.len();
-        let (route_grants, default_route_index) = initial_route_grants(route_count, default_route);
+        let (route_grants, default_route_index) = initial_route_grants(projection);
         let source_index = projection
             .sources
             .iter()
@@ -204,22 +201,28 @@ impl AgentAuthoringDraft {
     }
 }
 
-/// The initial grants of a fresh draft: only the default route is enabled,
-/// and it is the default. An absent or out-of-range hint selects the first
-/// route.
-fn initial_route_grants(
-    route_count: usize,
-    default_route: Option<usize>,
-) -> (Vec<RouteGrantDraft>, usize) {
-    let default_route_index = default_route
-        .filter(|index| *index < route_count)
-        .unwrap_or(0);
-    let grants = (0..route_count)
+/// The route of the configured default model, when the projection names one.
+pub fn projection_default_route(projection: &AgentAuthoringProjection) -> Option<usize> {
+    match projection.default_route.as_ref()? {
+        cockpit_proto::AgentAuthoringDefaultRoute::Route { index } => usize::try_from(*index)
+            .ok()
+            .filter(|index| *index < projection.policy.routes.len()),
+        cockpit_proto::AgentAuthoringDefaultRoute::Unresolved { .. } => None,
+    }
+}
+
+/// The initial grants of a fresh draft: only the default model's route is
+/// enabled, and it is the default. Without a resolved default nothing is
+/// granted — never an unrelated first route (#553, Codex C5) — and the
+/// default index is a placeholder that the first enabled grant replaces.
+fn initial_route_grants(projection: &AgentAuthoringProjection) -> (Vec<RouteGrantDraft>, usize) {
+    let default_route = projection_default_route(projection);
+    let grants = (0..projection.policy.routes.len())
         .map(|index| RouteGrantDraft {
-            enabled: index == default_route_index,
+            enabled: Some(index) == default_route,
         })
         .collect();
-    (grants, default_route_index)
+    (grants, default_route.unwrap_or(0))
 }
 
 /// Keep `default_route_index` aligned with an enabled grant when any exist.
@@ -994,13 +997,11 @@ fn child_slug(child: &ChildAuthoringDraft) -> String {
 }
 
 /// Construct a fresh nested subagent draft with runner-like defaults.
-/// `default_route` is as for [`AgentAuthoringDraft::from_projection`].
-pub fn default_child_draft(
-    projection: &AgentAuthoringProjection,
-    default_route: Option<usize>,
-) -> ChildAuthoringDraft {
+/// Grants and stars the default model's route as
+/// [`AgentAuthoringDraft::from_projection`] does.
+pub fn default_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthoringDraft {
     let route_count = projection.policy.routes.len();
-    let (route_grants, default_route_index) = initial_route_grants(route_count, default_route);
+    let (route_grants, default_route_index) = initial_route_grants(projection);
     ChildAuthoringDraft {
         name: "runner".to_string(),
         route_grants,
@@ -1083,6 +1084,8 @@ mod tests {
                 }],
                 definition_frontmatter_yaml: None,
             }],
+            route_provider_labels: Vec::new(),
+            default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
             review_trust_disclosure: "shared trust".into(),
         }
     }
@@ -1090,7 +1093,7 @@ mod tests {
     #[test]
     fn prepared_runner_child_markdown_loads_as_workspace_package() {
         let projection = sample_projection();
-        let mut child = default_child_draft(&projection, None);
+        let mut child = default_child_draft(&projection);
         child.trust_confirmations[0] = true;
         let mut diagnostics = Vec::new();
         let (_path, markdown) =
@@ -1109,7 +1112,7 @@ mod tests {
     #[test]
     fn build_package_draft_requires_trust_confirmation() {
         let projection = sample_projection();
-        let draft = AgentAuthoringDraft::from_projection(&projection, None);
+        let draft = AgentAuthoringDraft::from_projection(&projection);
         let err = build_package_draft(&projection, &draft).unwrap_err();
         assert!(err.to_string().contains("trust confirmation"));
     }
@@ -1117,7 +1120,7 @@ mod tests {
     #[test]
     fn build_package_draft_omits_host_placement_tool_tier_preferences() {
         let projection = sample_projection();
-        let mut draft = AgentAuthoringDraft::from_projection(&projection, None);
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
         draft.trust_confirmations[0] = true;
         let package = build_package_draft(&projection, &draft).unwrap();
         assert!(
@@ -1139,7 +1142,7 @@ mod tests {
     #[test]
     fn unknown_user_tool_preference_warns_and_is_dropped() {
         let projection = sample_projection();
-        let mut draft = AgentAuthoringDraft::from_projection(&projection, None);
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
         draft.trust_confirmations[0] = true;
         draft.children.clear();
         draft
@@ -1161,9 +1164,9 @@ mod tests {
     #[test]
     fn default_tool_preferences_need_no_diagnostics() {
         let projection = sample_projection();
-        let mut draft = AgentAuthoringDraft::from_projection(&projection, None);
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
         draft.trust_confirmations[0] = true;
-        let mut child = default_child_draft(&projection, None);
+        let mut child = default_child_draft(&projection);
         child.trust_confirmations[0] = true;
         draft.children = vec![child];
 
@@ -1177,7 +1180,7 @@ mod tests {
     #[test]
     fn build_package_draft_emits_enabled_grants_and_default() {
         let projection = sample_projection();
-        let mut draft = AgentAuthoringDraft::from_projection(&projection, None);
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
         draft.trust_confirmations[0] = true;
         draft.route_grants[1].enabled = true;
         draft.default_route_index = 1;
@@ -1190,7 +1193,7 @@ mod tests {
     #[test]
     fn authoring_draft_emits_seven_optimization_values_and_surface_copies() {
         let projection = sample_projection();
-        let mut draft = AgentAuthoringDraft::from_projection(&projection, None);
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
         draft.trust_confirmations[0] = true;
         draft.route_grants[1].enabled = true;
         draft.default_route_index = 1;
@@ -1202,7 +1205,7 @@ mod tests {
         draft.self_verification[0].copies = vec![2, 1];
         draft.self_verification[1].copies = vec![0, 3];
         draft.self_verification[2].copies = vec![1, 0];
-        let mut child = default_child_draft(&projection, None);
+        let mut child = default_child_draft(&projection);
         child.trust_confirmations[0] = true;
         draft.children = vec![child];
         draft.make_default = false;
@@ -1259,7 +1262,7 @@ mod tests {
     #[test]
     fn all_zero_surface_emits_no_verification_rule() {
         let projection = sample_projection();
-        let mut draft = AgentAuthoringDraft::from_projection(&projection, None);
+        let mut draft = AgentAuthoringDraft::from_projection(&projection);
         draft.trust_confirmations[0] = true;
         draft.self_verification[1].copies.fill(0);
         let package = build_package_draft(&projection, &draft).unwrap();

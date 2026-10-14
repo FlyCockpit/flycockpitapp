@@ -734,7 +734,6 @@ impl OnboardingShell {
         let mut screen = agent::AgentAuthoringScreen::new(
             agent::golden_sample_projection(),
             "test-trust".into(),
-            Default::default(),
         );
         screen.test_enter_model_trust();
         self.screen = OnboardingScreen::AgentAuthoring(Box::new(screen));
@@ -910,12 +909,10 @@ impl OnboardingShell {
         &mut self,
         projection: cockpit_proto::AgentAuthoringProjection,
         client_operation_id: String,
-        route_names: cockpit_core::onboarding_agent::ConfiguredRouteNames,
     ) {
         self.screen = OnboardingScreen::AgentAuthoring(Box::new(agent::AgentAuthoringScreen::new(
             projection,
             client_operation_id,
-            route_names,
         )));
         self.escape = None;
     }

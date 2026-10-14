@@ -231,8 +231,16 @@ pub struct InventorySourceSnapshot {
     pub trust_policy: WorkspaceTrustPolicy,
     pub providers: ProvidersConfig,
     pub skills_config: crate::config::extended::SkillsConfig,
-    /// Pre-resolved chat-ownable primary names under the snapshot trust policy.
+    /// Pre-resolved chat-ownable primary names under the snapshot trust
+    /// policy, including `installed_agents`.
     pub ownable_agents: Vec<String>,
+    /// Installed roots' launch targets (authored or installed agents), which
+    /// have no workspace definition file to resolve.
+    pub installed_agents: Vec<String>,
+    /// The attached session's live tool surface. An installed selected agent
+    /// has no workspace definition to read its tools from, so its skill
+    /// activation uses the tools the session actually runs.
+    pub selected_agent_tool_names: Vec<String>,
 }
 
 /// Pure projection of one source snapshot into a wire inventory bundle.
@@ -353,6 +361,22 @@ fn project_agents(snapshot: &InventorySourceSnapshot) -> Result<Vec<AgentSummary
     let mut agents = Vec::with_capacity(snapshot.ownable_agents.len());
     for name in &snapshot.ownable_agents {
         validate_ownable(name, &snapshot.ownable_agents)?;
+        if snapshot.installed_agents.contains(name)
+            && !crate::config::trust::with_workspace_trust_policy(
+                snapshot.trust_policy.clone(),
+                || crate::agents::resolve(&snapshot.project_root, name),
+            )
+            .is_ok_and(|def| def.is_some())
+        {
+            agents.push(AgentSummary {
+                builtin: false,
+                name: name.clone(),
+                description: "Installed agent".to_string(),
+                mode: "primary".to_string(),
+                source: "installed".to_string(),
+            });
+            continue;
+        }
         let def = crate::config::trust::with_workspace_trust_policy(
             snapshot.trust_policy.clone(),
             || crate::agents::resolve(&snapshot.project_root, name),
@@ -460,16 +484,26 @@ fn project_skills(snapshot: &InventorySourceSnapshot) -> Result<Vec<SkillSummary
         .map_err(|err| ErrorPayload {
             code: ErrorCode::Internal,
             message: format!("{err:#}"),
-        })?
-        .ok_or_else(|| ErrorPayload {
-            code: ErrorCode::UnknownAgent,
-            message: format!(
-                "agent `{}` did not resolve in the inventory snapshot",
-                snapshot.selected_agent
-            ),
         })?;
-
-    let tool_names: Vec<String> = def.tools.clone().unwrap_or_default();
+    let tool_names: Vec<String> = match def {
+        Some(def) => def.tools.clone().unwrap_or_default(),
+        None if snapshot
+            .installed_agents
+            .iter()
+            .any(|name| name == &snapshot.selected_agent) =>
+        {
+            snapshot.selected_agent_tool_names.clone()
+        }
+        None => {
+            return Err(ErrorPayload {
+                code: ErrorCode::UnknownAgent,
+                message: format!(
+                    "agent `{}` did not resolve in the inventory snapshot",
+                    snapshot.selected_agent
+                ),
+            });
+        }
+    };
     let activation =
         crate::skills::ActivationContext::from_tool_names(tool_names.iter().map(String::as_str));
     let skills = crate::skills::discover_for_session(

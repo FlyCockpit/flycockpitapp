@@ -811,7 +811,7 @@ pub(super) fn require_attached(
     })
 }
 
-pub(super) fn validate_set_agent(
+pub(super) async fn validate_set_agent(
     ctx: &DaemonContext,
     att: &AttachedSession,
     name: &str,
@@ -821,10 +821,26 @@ pub(super) fn validate_set_agent(
         .config_source()
         .load_effective_for_daemon(&att.handle.project_root, &trust_policy)
         .map_err(super::dispatch::daemon_config_error)?;
-    let ownable = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+    let mut ownable = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
         crate::agents::chat_ownable_primaries(&att.handle.project_root)
     });
+    ownable.extend(installed_primary_agents(ctx, &att.handle.project_root).await?);
     validate_set_agent_name(name, &ownable)
+}
+
+/// Installed agents (authored or installed roots) a session in `project_root`
+/// may run as its primary, alongside [`crate::agents::chat_ownable_primaries`].
+pub(super) async fn installed_primary_agents(
+    ctx: &DaemonContext,
+    project_root: &std::path::Path,
+) -> std::result::Result<Vec<String>, ErrorPayload> {
+    let workspace_id = crate::daemon::agent_installation::canonical_workspace_id(project_root);
+    crate::daemon::agent_installation::installed_root_launch_targets(&ctx.db, &workspace_id)
+        .await
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::Internal,
+            message: format!("listing installed agents: {error:#}"),
+        })
 }
 
 pub(super) fn validate_set_agent_name(

@@ -454,7 +454,7 @@ fn set_agent_admits_durably_then_applies_or_closes_for_recovery() {
         .find("lookup_committed_remote_operation")
         .expect("remote SetAgent resolves its committed receipt before mutable validation");
     let fresh_remote_validation = set_agent
-        .rfind("validate_set_agent(ctx, att, &name)?")
+        .rfind("validate_set_agent(ctx, att, &name).await?")
         .expect("fresh remote SetAgent validates current availability");
     let replay_return = set_agent
         .find("TransactionalRemoteOperationOutcome::Replay(bytes) => return")

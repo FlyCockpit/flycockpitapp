@@ -28,6 +28,7 @@ pub fn model_override_from_state(
 pub fn enrich_session_setup_snapshot(
     mut snapshot: SessionSetupSnapshotV1,
     project_root: &std::path::Path,
+    installed_agents: &[String],
     active_agent: &str,
     last_used_agent: Option<String>,
     tool_surface_override_json: Option<&str>,
@@ -36,7 +37,12 @@ pub fn enrich_session_setup_snapshot(
     override_revision: u64,
     model_override: Option<StoredModelBinding>,
 ) -> anyhow::Result<SessionSetupSnapshotV1> {
-    let available = agents::chat_ownable_primaries(project_root);
+    let mut available = agents::chat_ownable_primaries(project_root);
+    for name in installed_agents {
+        if !available.contains(name) {
+            available.push(name.clone());
+        }
+    }
     snapshot.available_agents = available.clone();
     snapshot.last_used_agent = last_used_agent;
     snapshot.resolved_agent = Some(active_agent.to_string());

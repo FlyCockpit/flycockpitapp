@@ -1077,11 +1077,14 @@ pub fn chat_ownable_primaries(cwd: &Path) -> Vec<String> {
     chat_ownable_primaries_with(cwd)
 }
 
-/// Default agent for a new session: last used in this workspace if it is
-/// still a chat-ownable primary, else `defaultPrimaryAgent`, else `Build`.
-/// Private package subagents never appear in `available` (they are absent
-/// from [`chat_ownable_primaries`] / inventory listings).
+/// Default agent for a new session. The default installed agent (the one
+/// onboarding or an authored apply made the default) wins when it is still
+/// available; then the agent last used in this workspace if it is still a
+/// chat-ownable primary; then `defaultPrimaryAgent`; then `Build`. Private
+/// package subagents never appear in `available` (they are absent from
+/// [`chat_ownable_primaries`] / inventory listings).
 pub fn resolve_setup_default_agent(
+    default_installed: Option<&str>,
     last_used: Option<&str>,
     available: &[String],
     configured_default: &str,
@@ -1089,6 +1092,9 @@ pub fn resolve_setup_default_agent(
     let listed = |name: &str| {
         !name.is_empty() && !is_hidden_primary(name) && available.iter().any(|item| item == name)
     };
+    if let Some(name) = default_installed.filter(|name| listed(name)) {
+        return name.to_string();
+    }
     if let Some(name) = last_used.filter(|name| listed(name)) {
         return resolve_primary(Some(name), configured_default);
     }

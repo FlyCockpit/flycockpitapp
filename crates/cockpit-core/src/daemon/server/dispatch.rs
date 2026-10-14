@@ -14467,10 +14467,10 @@ async fn handle_serialized_request_impl(
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
             #[cfg(not(feature = "remote"))]
-            validate_set_agent(ctx, att, &name)?;
+            validate_set_agent(ctx, att, &name).await?;
             #[cfg(feature = "remote")]
             if remote_operation.is_none() {
-                validate_set_agent(ctx, att, &name)?;
+                validate_set_agent(ctx, att, &name).await?;
             }
             // Remote SetAgent is an idempotent adapter: the sessions row is
             // its authoritative desired state and worker dispatch is only live
@@ -14567,7 +14567,7 @@ async fn handle_serialized_request_impl(
                         });
                     }
                 } else {
-                    validate_set_agent(ctx, att, &name)?;
+                    validate_set_agent(ctx, att, &name).await?;
                 }
                 let desired = name.clone();
                 // Installation rows are keyed by the canonical workspace
@@ -29107,10 +29107,18 @@ pub(super) async fn get_inventory_bundle(
     // Session generation is the attached worker config epoch (attach identity).
     let session_generation = held.generation.max(config_generation);
     let inventory_generation = super::inventory::current_inventory_generation();
-    let ownable_agents =
+    let mut ownable_agents =
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             crate::agents::chat_ownable_primaries(cwd)
         });
+    let installed_agents = super::sessions::installed_primary_agents(ctx, cwd).await?;
+    ownable_agents.extend(
+        installed_agents
+            .iter()
+            .filter(|name| !ownable_agents.contains(name))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
 
     let snapshot = super::inventory::InventorySourceSnapshot {
         project_root: cwd.to_path_buf(),
@@ -29123,6 +29131,8 @@ pub(super) async fn get_inventory_bundle(
         providers,
         skills_config,
         ownable_agents,
+        selected_agent_tool_names: att.handle.active_tool_names(),
+        installed_agents,
     };
     super::inventory::project_inventory_bundle(&snapshot)
 }
@@ -29511,9 +29521,11 @@ async fn finish_session_setup_snapshot(
         .flatten();
     let (override_revision, model_override) =
         crate::daemon::session_setup_projection::model_override_from_state(override_state);
+    let installed_agents = super::sessions::installed_primary_agents(ctx, project_root).await?;
     crate::daemon::session_setup_projection::enrich_session_setup_snapshot(
         snapshot,
         project_root,
+        &installed_agents,
         &handle.live_active_agent(),
         last_used,
         handle.tool_surface_override_json().as_deref(),
@@ -29801,10 +29813,18 @@ pub(super) async fn get_inventory_bundle_shared(
         };
     let session_generation = held.generation;
     let inventory_generation = super::inventory::current_inventory_generation();
-    let ownable_agents =
+    let mut ownable_agents =
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             crate::agents::chat_ownable_primaries(cwd)
         });
+    let installed_agents = super::sessions::installed_primary_agents(ctx, cwd).await?;
+    ownable_agents.extend(
+        installed_agents
+            .iter()
+            .filter(|name| !ownable_agents.contains(name))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
 
     let snapshot = super::inventory::InventorySourceSnapshot {
         project_root: cwd.to_path_buf(),
@@ -29817,6 +29837,8 @@ pub(super) async fn get_inventory_bundle_shared(
         providers,
         skills_config,
         ownable_agents,
+        selected_agent_tool_names: att.handle().active_tool_names(),
+        installed_agents,
     };
     super::inventory::project_inventory_bundle(&snapshot)
 }

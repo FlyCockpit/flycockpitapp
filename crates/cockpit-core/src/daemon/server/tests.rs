@@ -34195,6 +34195,7 @@ async fn list_agents_agrees_with_validate_set_agent() {
             state.attached.as_ref().expect("attached"),
             &agent.name,
         )
+        .await
         .expect("listed agent is accepted by SetAgent validation");
     }
     let omitted = ["builder", "explore", "bee", "Multireview"];
@@ -34204,6 +34205,7 @@ async fn list_agents_agrees_with_validate_set_agent() {
             "{name} must not be listed as chat-ownable"
         );
         validate_set_agent(&ctx, state.attached.as_ref().expect("attached"), name)
+            .await
             .expect_err("omitted agent is rejected by SetAgent validation");
     }
 }
@@ -36549,9 +36551,51 @@ async fn daemon_inventory_bundle_bounds() {
         providers,
         skills_config: Default::default(),
         ownable_agents: vec!["Build".into()],
+        installed_agents: Vec::new(),
+        selected_agent_tool_names: Vec::new(),
     };
     let err = project_inventory_bundle(&snapshot).expect_err("model cap");
     assert_eq!(err.code, ErrorCode::InventoryTooLarge);
+}
+
+/// #561: an installed agent (no workspace definition file) is listed as a
+/// chat-ownable primary and, when it is the session's agent, projects the
+/// inventory from the session's live tool surface instead of failing with
+/// `unknown_agent` (which left `/agent` with an empty list).
+#[test]
+fn inventory_projects_an_installed_selected_agent() {
+    use crate::daemon::server::inventory::{InventorySourceSnapshot, project_inventory_bundle};
+    use cockpit_config::config::{
+        providers::ProvidersConfig,
+        trust::{WorkspaceTrustPolicy, resolve_trust_root},
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = resolve_trust_root(tmp.path()).unwrap();
+    let snapshot = InventorySourceSnapshot {
+        project_root: tmp.path().to_path_buf(),
+        session_id: Uuid::nil(),
+        selected_agent: "pilot".into(),
+        session_generation: 0,
+        config_generation: 0,
+        inventory_generation: 0,
+        trust_policy: WorkspaceTrustPolicy {
+            root,
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        },
+        providers: ProvidersConfig::default(),
+        skills_config: Default::default(),
+        ownable_agents: vec!["Build".into(), "pilot".into()],
+        installed_agents: vec!["pilot".into()],
+        selected_agent_tool_names: vec!["read".into()],
+    };
+    let Response::InventoryBundle { agents, .. } =
+        project_inventory_bundle(&snapshot).expect("installed selected agent projects")
+    else {
+        panic!("expected inventory bundle");
+    };
+    let names: Vec<_> = agents.iter().map(|agent| agent.name.as_str()).collect();
+    assert_eq!(names, ["Build", "pilot"]);
+    assert!(!agents[1].builtin);
 }
 
 #[tokio::test]

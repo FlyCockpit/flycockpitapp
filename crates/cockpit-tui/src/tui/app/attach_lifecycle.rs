@@ -20,7 +20,10 @@ impl App {
         // setup is explicitly skipped).  The ordering fence is the accepted
         // startup workspace/trust result, not the presence of an onboarding
         // card in the renderer.
-        if !self.first_paint_completed || !self.startup_background.workspace_ready {
+        if !self.first_paint_completed
+            || !self.startup_background.workspace_ready
+            || self.exit_requested
+        {
             return;
         }
         // Setup left unfinished without a model (cancelled, deferred, or

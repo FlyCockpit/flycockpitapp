@@ -1864,29 +1864,19 @@ impl SessionRegistry {
                 .context("no model selected for the new session")?,
         };
         let project_id = crate::session::project_id_for(&project_root)?;
-        let last_used = self
-            .inner
-            .db
-            .last_used_root_agent_for_project(&project_id)
-            .await
-            .ok()
-            .flatten();
-        let available = crate::agents::chat_ownable_primaries(&project_root);
-        let initial_agent =
-            if session_entry_mode == crate::daemon::proto::SessionEntryMode::Assistant {
-                // Assistant mode owns an explicit first-class primary. Do not let
-                // the Code session's last-used/default selection silently boot
-                // Build here.
-                "Assistant".to_string()
-            } else if session_entry_mode == crate::daemon::proto::SessionEntryMode::Computer {
-                "Computer".to_string()
-            } else {
-                crate::agents::resolve_setup_default_agent(
-                    last_used.as_deref(),
-                    &available,
-                    session_worker::initial_active_agent(&extended_cfg),
-                )
-            };
+        let initial_agent = if session_entry_mode
+            == crate::daemon::proto::SessionEntryMode::Assistant
+        {
+            // Assistant mode owns an explicit first-class primary. Do not let
+            // the Code session's last-used/default selection silently boot
+            // Build here.
+            "Assistant".to_string()
+        } else if session_entry_mode == crate::daemon::proto::SessionEntryMode::Computer {
+            "Computer".to_string()
+        } else {
+            initial_code_session_agent(&self.inner.db, &project_root, &project_id, &extended_cfg)
+                .await?
+        };
         let assistant_identity_name =
             if session_entry_mode == crate::daemon::proto::SessionEntryMode::Assistant {
                 crate::assistants::ensure_primary_assistant(&self.inner.db)
@@ -3956,6 +3946,37 @@ impl SessionRegistry {
             },
         );
     }
+}
+
+/// The primary agent a new code session runs: the default installed agent
+/// (`agent_default_installation`, which onboarding's "make default agent"
+/// writes) while it is available, else the agent last used in this project,
+/// else the configured builtin default (`defaultPrimaryAgent`), else Build.
+/// Installed roots are selectable primaries alongside the disk agents.
+pub(crate) async fn initial_code_session_agent(
+    db: &Db,
+    project_root: &std::path::Path,
+    project_id: &str,
+    extended_cfg: &ExtendedConfig,
+) -> Result<String> {
+    let last_used = db
+        .last_used_root_agent_for_project(project_id)
+        .await
+        .ok()
+        .flatten();
+    let workspace_id = crate::daemon::agent_installation::canonical_workspace_id(project_root);
+    let mut available = crate::agents::chat_ownable_primaries(project_root);
+    available.extend(
+        crate::daemon::agent_installation::installed_root_launch_targets(db, &workspace_id).await?,
+    );
+    let default_installed =
+        crate::daemon::agent_installation::default_installed_root_launch_target(db).await?;
+    Ok(crate::agents::resolve_setup_default_agent(
+        default_installed.as_deref(),
+        last_used.as_deref(),
+        &available,
+        session_worker::initial_active_agent(extended_cfg),
+    ))
 }
 
 #[cfg(test)]

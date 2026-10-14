@@ -24,7 +24,6 @@ use cockpit_core::authoring_draft::{
     AgentAuthoringDraft, ChildAuthoringDraft, RouteGrantDraft, SourceSelection,
     SurfaceVerificationDraft, build_package_draft_with_diagnostics, default_child_draft,
 };
-use cockpit_core::onboarding_agent::ConfiguredRouteNames;
 use cockpit_proto::{
     AgentAuthoringProjection, ApplyAuthoredAgentPackageOutcome, ApplyAuthoredAgentPackageReceipt,
     AuthoredAgentPackageDraft, AuthoredAgentReceiptStatus, AuthoredAgentReview,
@@ -129,9 +128,6 @@ struct SubagentStackFrame {
 /// The nested agent authoring reducer.
 pub struct AgentAuthoringScreen {
     projection: AgentAuthoringProjection,
-    /// Names the user configured for the projection's wire routes, and
-    /// where their default model sits (see [`ConfiguredRouteNames`]).
-    route_names: ConfiguredRouteNames,
     draft: AgentAuthoringDraft,
     phase: Phase,
     subagent_stack: Vec<SubagentStackFrame>,
@@ -177,19 +173,11 @@ impl std::fmt::Debug for AgentAuthoringScreen {
 }
 
 impl AgentAuthoringScreen {
-    pub fn new(
-        projection: AgentAuthoringProjection,
-        client_operation_id: String,
-        route_names: ConfiguredRouteNames,
-    ) -> Self {
-        let draft = fresh_authoring_draft(
-            &projection,
-            route_names.default_route_index(&projection.policy.routes),
-        );
+    pub fn new(projection: AgentAuthoringProjection, client_operation_id: String) -> Self {
+        let draft = fresh_authoring_draft(&projection);
         let name = draft.name.clone();
         Self {
             projection,
-            route_names,
             draft,
             phase: Phase::SourceIdentity,
             subagent_stack: Vec::new(),
@@ -260,8 +248,9 @@ impl AgentAuthoringScreen {
             .review_policy_revision
             .as_deref()
             .is_some_and(|revision| revision != projection.policy.policy_revision);
+        let phase = self.phase;
         self.projection = projection;
-        self.draft = fresh_authoring_draft(&self.projection, self.default_route());
+        self.draft = fresh_authoring_draft(&self.projection);
         self.enter_draft_context();
         self.draft_diagnostics.clear();
         if stale_review {
@@ -319,15 +308,27 @@ impl AgentAuthoringScreen {
         }
     }
 
-    /// The policy route of the user's default model, if it is offered.
-    fn default_route(&self) -> Option<usize> {
-        self.route_names
-            .default_route_index(&self.projection.policy.routes)
-    }
-
-    /// `provider/model` as the user configured the route.
+    /// `provider/model` as the user configured the route, from the label the
+    /// daemon computed with this exact projection; the portable route token
+    /// when the projection names no single configured provider for it.
     fn route_label(&self, provider_id: &str, model_id: &str) -> String {
-        self.route_names.label(provider_id, model_id)
+        let mut matches = self
+            .projection
+            .policy
+            .routes
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| route.provider_id == provider_id && route.model_id == model_id);
+        let label = match (matches.next(), matches.next()) {
+            (Some((index, _)), None) => self
+                .projection
+                .route_provider_labels
+                .get(index)
+                .cloned()
+                .flatten(),
+            _ => None,
+        };
+        format!("{}/{model_id}", label.as_deref().unwrap_or(provider_id))
     }
 
     fn resize_route_state(&mut self) {
@@ -680,17 +681,23 @@ impl AgentAuthoringScreen {
         }
         let phase = self.phase;
         let action = self.handle_list_key(key);
-        if self.trust_phase() {
-            if self.phase != phase {
-                // A trust list opens at its first row, whatever row the
-                // previous list was on.
-                self.cursor = 0;
-                self.scroll_offset = 0;
-            }
-            // Keep the cursor on a listed row.
-            self.cursor = self.cursor.min(self.trust_rows().len().saturating_sub(1));
-        }
+        self.settle_trust_cursor(phase);
         action
+    }
+
+    /// Phase-entry normalization shared by every input path (keys, the
+    /// action bar, pointer rows, projection replacement): a trust list
+    /// opens at its first row, whatever row the previous list was on, and
+    /// its cursor always stays on a listed row.
+    fn settle_trust_cursor(&mut self, previous_phase: Phase) {
+        if !self.trust_phase() {
+            return;
+        }
+        if self.phase != previous_phase {
+            self.cursor = 0;
+            self.scroll_offset = 0;
+        }
+        self.cursor = self.cursor.min(self.trust_rows().len().saturating_sub(1));
     }
 
     fn trust_phase(&self) -> bool {
@@ -853,6 +860,13 @@ impl AgentAuthoringScreen {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let phase = self.phase;
+        let handled = self.route_mouse(mouse);
+        self.settle_trust_cursor(phase);
+        handled
+    }
+
+    fn route_mouse(&mut self, mouse: MouseEvent) -> bool {
         self.note_pointer_event(&mouse);
         let pos = Position::new(mouse.column, mouse.row);
         if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
@@ -1151,12 +1165,29 @@ impl AgentAuthoringScreen {
             }
             Phase::ModelGrants => {
                 let cursor = self.cursor;
+                let first_grant = self.draft.enabled_route_count() == 0;
                 cockpit_core::authoring_draft::toggle_route_grant_draft(
                     &mut self.draft.route_grants,
                     cursor,
                     &mut self.draft.default_route_index,
                     &mut self.draft.self_verification,
                 );
+                if first_grant {
+                    // The default model could not be resolved, so nothing
+                    // was granted up front; the user's first pick is the
+                    // agent's default, and the prepared runner (still
+                    // without a model) follows that explicit choice.
+                    for child in &mut self.draft.children {
+                        if child.route_grants.iter().all(|grant| !grant.enabled) {
+                            cockpit_core::authoring_draft::toggle_route_grant_draft(
+                                &mut child.route_grants,
+                                cursor,
+                                &mut child.default_route_index,
+                                &mut child.self_verification,
+                            );
+                        }
+                    }
+                }
             }
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
                 let cursor = self.cursor;
@@ -1890,7 +1921,7 @@ impl AgentAuthoringScreen {
             phase: SubagentPhase::Identity,
         });
         self.draft = parent_snapshot;
-        let child = prepared_child_draft(&self.projection, self.default_route());
+        let child = prepared_child_draft(&self.projection);
         if let Some(parent) = Self::child_slot_at_path(&mut self.draft, &parent_path) {
             parent.children.push(child);
         }
@@ -1935,7 +1966,7 @@ impl AgentAuthoringScreen {
     }
 
     fn begin_add_subagent(&mut self) {
-        let child = prepared_child_draft(&self.projection, self.default_route());
+        let child = prepared_child_draft(&self.projection);
         let child_path = vec![self.draft.children.len()];
         self.subagent_stack.push(SubagentStackFrame {
             parent: self.draft.clone(),
@@ -2191,6 +2222,13 @@ impl AgentAuthoringScreen {
     }
 
     pub(crate) fn action_bar_click(&mut self, button: usize) -> Option<AgentAuthoringAction> {
+        let phase = self.phase;
+        let action = self.action_bar_activate(button);
+        self.settle_trust_cursor(phase);
+        action
+    }
+
+    fn action_bar_activate(&mut self, button: usize) -> Option<AgentAuthoringAction> {
         self.disarm();
         match self.phase {
             Phase::SubagentsList if button == 0 => {
@@ -2493,6 +2531,26 @@ impl AgentAuthoringScreen {
                     ));
                 }
                 lines.push((None, Line::default()));
+                if !grants.iter().any(|grant| grant.enabled) {
+                    // The projection could not name the default model's
+                    // route, so nothing was granted for the user (#553,
+                    // Codex C5): say why and what to do.
+                    let why = match self.projection.default_route.as_ref() {
+                        Some(cockpit_proto::AgentAuthoringDefaultRoute::Unresolved {
+                            model_id,
+                        }) => {
+                            vec![
+                                format!("Your default model {model_id}"),
+                                "is offered by more than one provider.".to_string(),
+                                "Tick the model to use; the first tick is starred.".to_string(),
+                            ]
+                        }
+                        _ => vec!["Tick the models to use; the first tick is starred.".to_string()],
+                    };
+                    for line in why {
+                        lines.push((None, Line::from(Span::styled(line, selected))));
+                    }
+                }
                 lines.push((None, Line::from(Span::styled(
                     "Space toggles grants; disabling the default selects another enabled route.",
                     muted,
@@ -2896,7 +2954,9 @@ impl AgentAuthoringScreen {
                         ));
                     }
                     for child in &review.children {
-                        for line in review_child_lines(child, 1, &self.route_names) {
+                        for line in review_child_lines(child, 1, &|provider: &str, model: &str| {
+                            self.route_label(provider, model)
+                        }) {
                             lines.push((None, line));
                         }
                     }
@@ -3238,21 +3298,18 @@ pub(crate) fn golden_sample_projection() -> AgentAuthoringProjection {
             }],
             definition_frontmatter_yaml: None,
         }],
+        route_provider_labels: Vec::new(),
+        default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
         review_trust_disclosure: "Trust classification is shared global provider/model policy."
             .into(),
     }
 }
 
-fn fresh_authoring_draft(
-    projection: &AgentAuthoringProjection,
-    default_route: Option<usize>,
-) -> AgentAuthoringDraft {
-    let mut draft = AgentAuthoringDraft::from_projection(projection, default_route);
+fn fresh_authoring_draft(projection: &AgentAuthoringProjection) -> AgentAuthoringDraft {
+    let mut draft = AgentAuthoringDraft::from_projection(projection);
     initialize_tool_tiers(&mut draft.tool_tiers);
     if draft.children.is_empty() {
-        draft
-            .children
-            .push(prepared_child_draft(projection, default_route));
+        draft.children.push(prepared_child_draft(projection));
     } else {
         for child in &mut draft.children {
             initialize_child_tool_tiers(child);
@@ -3271,11 +3328,8 @@ fn initialize_tool_tiers(tiers: &mut std::collections::BTreeMap<String, ToolTier
     }
 }
 
-fn prepared_child_draft(
-    projection: &AgentAuthoringProjection,
-    default_route: Option<usize>,
-) -> ChildAuthoringDraft {
-    let mut child = default_child_draft(projection, default_route);
+fn prepared_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthoringDraft {
+    let mut child = default_child_draft(projection);
     initialize_tool_tiers(&mut child.tool_tiers);
     let default_route_is_safe = child
         .route_grants
@@ -3347,7 +3401,7 @@ fn cycle_tool_tier_at(
 fn review_child_lines(
     child: &AuthoredAgentReviewChild,
     indent: usize,
-    names: &ConfiguredRouteNames,
+    label: &dyn Fn(&str, &str) -> String,
 ) -> Vec<Line<'static>> {
     let prefix = "  ".repeat(indent);
     let mut lines = vec![Line::from(format!("{prefix}{}", child.path))];
@@ -3355,7 +3409,7 @@ fn review_child_lines(
         let mark = if grant.is_default { "*" } else { " " };
         lines.push(Line::from(format!(
             "{prefix}  {mark} {} · {}",
-            names.label(&grant.provider_id, &grant.model_id),
+            label(&grant.provider_id, &grant.model_id),
             trust_label(grant.trust)
         )));
     }
@@ -3405,7 +3459,7 @@ fn review_child_lines(
     if !child.children.is_empty() {
         lines.push(Line::from(format!("{prefix}  delegation children:")));
         for nested in &child.children {
-            lines.extend(review_child_lines(nested, indent + 1, names));
+            lines.extend(review_child_lines(nested, indent + 1, label));
         }
     }
     lines

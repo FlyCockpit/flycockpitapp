@@ -571,13 +571,13 @@ fn the_base_quit_key_passes_a_floating_layer_on_either_base() {
         "Ctrl-C must reach the surface"
     );
 
-    // Onboarding base: its quit chord closes onboarding.
+    // Onboarding base: its quit chord quits Cockpit (#548).
     let mut app = chat_app(tmp.path());
     mount_onboarding(&mut app, cockpit_proto::OnboardingStage::Profile);
     open_floating(&mut app, Layer::KeysOverlay);
     app.handle_key(ctrl_c);
     assert!(
-        app.onboarding_shell.is_none(),
+        app.exit_requested,
         "Ctrl-C must reach the onboarding shell under the overlay"
     );
 }

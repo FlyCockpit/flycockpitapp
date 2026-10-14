@@ -3764,10 +3764,10 @@ fn redaction_selected_ids(
     result: &crate::tui::dialog::question::QuestionResult,
 ) -> Option<Vec<String>> {
     use crate::tui::dialog::question::QuestionResult;
-    use cockpit_proto::ResolveResponse;
+    use cockpit_proto::QuestionAnswer;
     match result {
         QuestionResult::Submit { responses, .. } => match responses.first() {
-            Some(ResolveResponse::Multi { selected_ids }) => Some(selected_ids.clone()),
+            Some(QuestionAnswer::Multi { selected_ids }) => Some(selected_ids.clone()),
             _ => Some(Vec::new()),
         },
         QuestionResult::Cancel { .. } => None,
@@ -3778,10 +3778,10 @@ fn redaction_selected_ids(
 /// `None` for cancel / a malformed response.
 fn init_selected_id(result: &crate::tui::dialog::question::QuestionResult) -> Option<String> {
     use crate::tui::dialog::question::QuestionResult;
-    use cockpit_proto::ResolveResponse;
+    use cockpit_proto::QuestionAnswer;
     match result {
         QuestionResult::Submit { responses, .. } => match responses.first() {
-            Some(ResolveResponse::Single { selected_id }) => Some(selected_id.clone()),
+            Some(QuestionAnswer::Single { selected_id }) => Some(selected_id.clone()),
             _ => None,
         },
         QuestionResult::Cancel { .. } => None,

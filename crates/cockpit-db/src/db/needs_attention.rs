@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::db::Db;
 use crate::db::wire::{
     InterruptDecision, InterruptDecisionLine, InterruptQuestion, InterruptQuestionSet,
-    ResolveResponse,
+    QuestionAnswer, ResolveResponse,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -959,10 +959,7 @@ pub fn summarize_interrupt_decision(
         .map(|set| set.questions.iter().collect())
         .or_else(|| row.question.as_ref().map(|question| vec![question]))
         .unwrap_or_default();
-    let responses: Vec<&ResolveResponse> = match response {
-        ResolveResponse::Batch { responses } => responses.iter().collect(),
-        other => vec![other],
-    };
+    let responses = response.clone().into_batch(questions.len());
     let cancelled = matches!(response, ResolveResponse::Cancel);
     let permission = questions.iter().any(|question| {
         matches!(
@@ -1004,16 +1001,16 @@ fn interrupt_prompt(question: &InterruptQuestion) -> &str {
     }
 }
 
-fn answer_label(question: &InterruptQuestion, response: &ResolveResponse) -> String {
+fn answer_label(question: &InterruptQuestion, response: &QuestionAnswer) -> String {
     match (question, response) {
-        (InterruptQuestion::Single { options, .. }, ResolveResponse::Single { selected_id }) => {
+        (InterruptQuestion::Single { options, .. }, QuestionAnswer::Single { selected_id }) => {
             options
                 .iter()
                 .find(|option| option.id == *selected_id)
                 .map(|option| option.label.clone())
                 .unwrap_or_else(|| selected_id.clone())
         }
-        (InterruptQuestion::Multi { options, .. }, ResolveResponse::Multi { selected_ids }) => {
+        (InterruptQuestion::Multi { options, .. }, QuestionAnswer::Multi { selected_ids }) => {
             selected_ids
                 .iter()
                 .map(|id| {
@@ -1026,13 +1023,13 @@ fn answer_label(question: &InterruptQuestion, response: &ResolveResponse) -> Str
                 .collect::<Vec<_>>()
                 .join(", ")
         }
-        (InterruptQuestion::Freetext { masked: true, .. }, ResolveResponse::Freetext { .. }) => {
+        (InterruptQuestion::Freetext { masked: true, .. }, QuestionAnswer::Freetext { .. }) => {
             "••••••••".to_string()
         }
-        (InterruptQuestion::Freetext { masked: false, .. }, ResolveResponse::Freetext { text }) => {
+        (InterruptQuestion::Freetext { masked: false, .. }, QuestionAnswer::Freetext { text }) => {
             text.clone()
         }
-        (_, ResolveResponse::Cancel) => "dismissed".to_string(),
+        (_, QuestionAnswer::Cancel) => "dismissed".to_string(),
         _ => "dismissed".to_string(),
     }
 }
@@ -1365,16 +1362,15 @@ mod tests {
         };
         let decision = summarize_interrupt_decision(
             &row,
-            &ResolveResponse::Batch {
-                responses: vec![
-                    ResolveResponse::Single {
-                        selected_id: "yes".into(),
-                    },
-                    ResolveResponse::Freetext {
-                        text: "super-secret".into(),
-                    },
-                ],
-            },
+            &ResolveResponse::from_answers(vec![
+                QuestionAnswer::Single {
+                    selected_id: "yes".into(),
+                },
+                QuestionAnswer::Freetext {
+                    text: "super-secret".into(),
+                },
+            ])
+            .unwrap(),
         );
         assert!(decision.permission);
         assert_eq!(decision.lines[0].answer, "Approve for this project");
@@ -1422,14 +1418,13 @@ mod tests {
 
         db.resolve_interrupt(
             iid,
-            &ResolveResponse::Batch {
-                responses: vec![
-                    ResolveResponse::Single {
-                        selected_id: "a".into(),
-                    },
-                    ResolveResponse::Freetext { text: "Ada".into() },
-                ],
-            },
+            &ResolveResponse::from_answers(vec![
+                QuestionAnswer::Single {
+                    selected_id: "a".into(),
+                },
+                QuestionAnswer::Freetext { text: "Ada".into() },
+            ])
+            .unwrap(),
         )
         .await
         .unwrap();

@@ -417,22 +417,169 @@ pub struct InterruptDecision {
     pub lines: Vec<InterruptDecisionLine>,
 }
 
+/// The answer to an interrupt.
+///
+/// Canonical shape (one representation per meaning, enforced by type): an
+/// interrupt with exactly one question is answered by a bare `Single`,
+/// `Multi`, `Freetext`, or `Cancel`; only an interrupt with two or more
+/// questions is answered by a `Batch`, whose [`BatchAnswers`] cannot hold
+/// fewer than two entries and whose entries are non-recursive
+/// [`QuestionAnswer`]s. A one-element (or nested) batch is therefore not a
+/// representable value, so a host approval — always exactly one
+/// single-select question — can only ever be answered by a bare `Single`
+/// (or `Cancel`). Build per-question answers with
+/// [`ResolveResponse::from_answers`] rather than choosing a variant by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", content = "data")]
 pub enum ResolveResponse {
     Single { selected_id: String },
     Multi { selected_ids: Vec<String> },
     Freetext { text: String },
-    Batch { responses: Vec<ResolveResponse> },
+    Batch { responses: BatchAnswers },
     Cancel,
 }
 
+/// One question's answer inside a multi-question [`ResolveResponse::Batch`].
+/// Same serde envelope as the matching top-level `ResolveResponse` variant,
+/// but deliberately without a `Batch` arm: batches never nest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", content = "data")]
+pub enum QuestionAnswer {
+    Single {
+        selected_id: String,
+    },
+    Multi {
+        selected_ids: Vec<String>,
+    },
+    Freetext {
+        text: String,
+    },
+    /// This one question was dismissed.
+    Cancel,
+}
+
+/// Minimum number of entries in a [`BatchAnswers`]. A single question is
+/// answered by a bare response, never by a one-element batch.
+pub const MIN_BATCH_ANSWERS: usize = 2;
+
+/// The per-question answers of a multi-question interrupt: at least
+/// [`MIN_BATCH_ANSWERS`] entries. The only constructors ([`BatchAnswers::new`]
+/// and deserialization) enforce the bound, so a one-element or empty batch
+/// cannot exist in memory or on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct BatchAnswers(Vec<QuestionAnswer>);
+
+/// A batch was built with fewer than [`MIN_BATCH_ANSWERS`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchTooShort {
+    pub len: usize,
+}
+
+impl std::fmt::Display for BatchTooShort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a batch answer needs at least {MIN_BATCH_ANSWERS} per-question answers, got {}; \
+             answer a single question with a bare response",
+            self.len
+        )
+    }
+}
+
+impl std::error::Error for BatchTooShort {}
+
+impl BatchAnswers {
+    pub fn new(answers: Vec<QuestionAnswer>) -> Result<Self, BatchTooShort> {
+        if answers.len() < MIN_BATCH_ANSWERS {
+            return Err(BatchTooShort { len: answers.len() });
+        }
+        Ok(Self(answers))
+    }
+
+    pub fn as_slice(&self) -> &[QuestionAnswer] {
+        &self.0
+    }
+
+    pub fn into_vec(self) -> Vec<QuestionAnswer> {
+        self.0
+    }
+}
+
+impl std::ops::Deref for BatchAnswers {
+    type Target = [QuestionAnswer];
+
+    fn deref(&self) -> &[QuestionAnswer] {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a BatchAnswers {
+    type Item = &'a QuestionAnswer;
+    type IntoIter = std::slice::Iter<'a, QuestionAnswer>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'de> Deserialize<'de> for BatchAnswers {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let answers = Vec::<QuestionAnswer>::deserialize(deserializer)?;
+        Self::new(answers).map_err(serde::de::Error::custom)
+    }
+}
+
+/// [`ResolveResponse::from_answers`] was given no answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoAnswers;
+
+impl std::fmt::Display for NoAnswers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an interrupt answer needs at least one per-question answer")
+    }
+}
+
+impl std::error::Error for NoAnswers {}
+
+impl From<QuestionAnswer> for ResolveResponse {
+    fn from(answer: QuestionAnswer) -> Self {
+        match answer {
+            QuestionAnswer::Single { selected_id } => Self::Single { selected_id },
+            QuestionAnswer::Multi { selected_ids } => Self::Multi { selected_ids },
+            QuestionAnswer::Freetext { text } => Self::Freetext { text },
+            QuestionAnswer::Cancel => Self::Cancel,
+        }
+    }
+}
+
 impl ResolveResponse {
-    pub fn into_batch(self, n: usize) -> Vec<ResolveResponse> {
+    /// The one canonical builder for an interrupt answer from its
+    /// per-question answers (in question order): one answer becomes the bare
+    /// response, two or more become a [`ResolveResponse::Batch`].
+    pub fn from_answers(answers: Vec<QuestionAnswer>) -> Result<Self, NoAnswers> {
+        match answers.len() {
+            0 => Err(NoAnswers),
+            1 => Ok(answers.into_iter().next().expect("length checked").into()),
+            _ => Ok(Self::Batch {
+                responses: BatchAnswers::new(answers).expect("length checked"),
+            }),
+        }
+    }
+
+    /// Per-question answers for an interrupt with `n` questions. A whole
+    /// `Cancel` dismisses every question; a bare answer is the sole
+    /// question's answer.
+    pub fn into_batch(self, n: usize) -> Vec<QuestionAnswer> {
         match self {
-            ResolveResponse::Batch { responses } => responses,
-            ResolveResponse::Cancel => std::iter::repeat_n(ResolveResponse::Cancel, n).collect(),
-            other => vec![other],
+            Self::Batch { responses } => responses.into_vec(),
+            Self::Cancel => std::iter::repeat_n(QuestionAnswer::Cancel, n).collect(),
+            Self::Single { selected_id } => vec![QuestionAnswer::Single { selected_id }],
+            Self::Multi { selected_ids } => vec![QuestionAnswer::Multi { selected_ids }],
+            Self::Freetext { text } => vec![QuestionAnswer::Freetext { text }],
         }
     }
 }

@@ -5,7 +5,7 @@
 //! [`Page`]s, drives the shared state machine for input, renders the
 //! dialog as a compact bottom-anchored overlay above the status row
 //! (codex bottom-pane style), and maps the resulting [`Answer`]s back to
-//! the proto [`ResolveResponse`]s the `question` tool expects. The
+//! the per-question proto [`QuestionAnswer`]s the `question` tool expects. The
 //! approval prompt reuses [`DialogState`] unchanged via its own thin
 //! wrapper.
 
@@ -32,7 +32,7 @@ use crate::tui::theme::{
     YELLOW_INDEX, resolve_color,
 };
 use cockpit_proto::{
-    CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
+    CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet, QuestionAnswer,
     SandboxEscalation,
 };
 
@@ -76,10 +76,40 @@ pub enum QuestionResult {
     /// Send these resolutions back to the daemon for `interrupt_id`.
     Submit {
         interrupt_id: Uuid,
-        responses: Vec<ResolveResponse>,
+        /// One answer per question, in question order. The host turns these
+        /// into the canonical wire answer with
+        /// [`cockpit_proto::ResolveResponse::from_answers`].
+        responses: Vec<QuestionAnswer>,
     },
     /// User dismissed: resolve as a cancel.
     Cancel { interrupt_id: Uuid },
+}
+
+impl QuestionResult {
+    /// The daemon request for this closed dialog — the TUI's one interrupt
+    /// answer builder. Per-question answers go through the canonical
+    /// [`cockpit_proto::ResolveResponse::from_answers`], so a one-question
+    /// interrupt (every approval prompt) is answered by a bare response and
+    /// only a multi-question interrupt gets a `Batch`. A dialog that somehow
+    /// produced no answers resolves as a cancel (fail closed: a cancel never
+    /// approves).
+    pub fn into_resolve_request(self) -> cockpit_proto::Request {
+        use cockpit_proto::{Request, ResolveResponse};
+        let (interrupt_id, response) = match self {
+            QuestionResult::Submit {
+                interrupt_id,
+                responses,
+            } => (
+                interrupt_id,
+                ResolveResponse::from_answers(responses).unwrap_or(ResolveResponse::Cancel),
+            ),
+            QuestionResult::Cancel { interrupt_id } => (interrupt_id, ResolveResponse::Cancel),
+        };
+        Request::ResolveInterrupt {
+            interrupt_id,
+            response,
+        }
+    }
 }
 
 /// The App-facing question dialog overlay. Owns a [`DialogState`] plus
@@ -1651,13 +1681,13 @@ impl Pane for QuestionDialog {
     }
 }
 
-/// Map a dialog [`Answer`] back to the proto [`ResolveResponse`] for its
+/// Map a dialog [`Answer`] back to the proto [`QuestionAnswer`] for its
 /// question. The additive multiselect free-text rides as an extra
 /// selected id (the option ids are stable; a typed value can't collide
 /// with a proposed id, and the tool renders unknown ids verbatim).
-fn answer_to_response(answer: &Answer, _q: &InterruptQuestion) -> ResolveResponse {
+fn answer_to_response(answer: &Answer, _q: &InterruptQuestion) -> QuestionAnswer {
     match answer {
-        Answer::Single { id } => ResolveResponse::Single {
+        Answer::Single { id } => QuestionAnswer::Single {
             selected_id: id.clone(),
         },
         Answer::Multi { ids, custom } => {
@@ -1665,9 +1695,9 @@ fn answer_to_response(answer: &Answer, _q: &InterruptQuestion) -> ResolveRespons
             if let Some(text) = custom {
                 selected_ids.push(text.clone());
             }
-            ResolveResponse::Multi { selected_ids }
+            QuestionAnswer::Multi { selected_ids }
         }
-        Answer::Text { text } => ResolveResponse::Freetext { text: text.clone() },
+        Answer::Text { text } => QuestionAnswer::Freetext { text: text.clone() },
     }
 }
 
@@ -1770,7 +1800,7 @@ mod tests {
                 assert_eq!(interrupt_id, iid);
                 assert!(matches!(
                     responses.as_slice(),
-                    [ResolveResponse::Single { selected_id }] if selected_id == "pg"
+                    [QuestionAnswer::Single { selected_id }] if selected_id == "pg"
                 ));
             }
             other => panic!("expected Submit, got {other:?}"),
@@ -1788,7 +1818,7 @@ mod tests {
             Some(QuestionResult::Submit { responses, .. }) => {
                 assert!(matches!(
                     responses.as_slice(),
-                    [ResolveResponse::Single { selected_id }] if selected_id == "sqlite"
+                    [QuestionAnswer::Single { selected_id }] if selected_id == "sqlite"
                 ));
             }
             other => panic!("expected Submit, got {other:?}"),
@@ -1819,7 +1849,7 @@ mod tests {
             Some(QuestionResult::Submit { responses, .. }) => {
                 assert!(matches!(
                     responses.as_slice(),
-                    [ResolveResponse::Single { selected_id }] if selected_id == "pg"
+                    [QuestionAnswer::Single { selected_id }] if selected_id == "pg"
                 ));
             }
             other => panic!("expected Submit, got {other:?}"),
@@ -1843,7 +1873,7 @@ mod tests {
             Some(QuestionResult::Submit { responses, .. }) => {
                 assert!(matches!(
                     responses.as_slice(),
-                    [ResolveResponse::Freetext { text }] if text == "my"
+                    [QuestionAnswer::Freetext { text }] if text == "my"
                 ));
             }
             other => panic!("expected Submit, got {other:?}"),
@@ -1895,7 +1925,7 @@ mod tests {
         };
         let resp = answer_to_response(&answer, &q);
         match resp {
-            ResolveResponse::Multi { selected_ids } => {
+            QuestionAnswer::Multi { selected_ids } => {
                 assert_eq!(selected_ids, vec!["a".to_string(), "custom".to_string()]);
             }
             other => panic!("expected Multi, got {other:?}"),
@@ -1921,7 +1951,7 @@ mod tests {
             Some(QuestionResult::Submit { responses, .. }) => {
                 assert!(matches!(
                     responses.as_slice(),
-                    [ResolveResponse::Freetext { text }] if text == "hi"
+                    [QuestionAnswer::Freetext { text }] if text == "hi"
                 ));
             }
             other => panic!("expected Submit, got {other:?}"),
@@ -3554,9 +3584,94 @@ mod tests {
         match d.take_result() {
             Some(QuestionResult::Submit { responses, .. }) => assert!(matches!(
                 responses.as_slice(),
-                [ResolveResponse::Single { selected_id }] if selected_id == ID_APPROVE_SESSION
+                [QuestionAnswer::Single { selected_id }] if selected_id == ID_APPROVE_SESSION
             )),
             other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    fn ls_detail() -> CommandDetail {
+        CommandDetail {
+            full_command: "ls".into(),
+            highlight: None,
+            step: 1,
+            step_count: 1,
+            cwd: None,
+            remembered_key: None,
+            write_content: None,
+            risk_tier: None,
+            risk_reasons: Vec::new(),
+            affected_targets: Vec::new(),
+            native_tool_hints: Vec::new(),
+            offered_scopes: Vec::new(),
+            policy_cap: None,
+            image_plan_review: None,
+        }
+    }
+
+    fn resolve_response_of(request: cockpit_proto::Request) -> cockpit_proto::ResolveResponse {
+        match request {
+            cockpit_proto::Request::ResolveInterrupt { response, .. } => response,
+            other => panic!("expected ResolveInterrupt, got {other:?}"),
+        }
+    }
+
+    /// #532: the TUI's answer builder must send a one-question approval as a
+    /// bare `Single` — the only shape host-approval settlement accepts. Before
+    /// the fix it always wrapped answers in a (one-element) `Batch`.
+    #[test]
+    fn approval_submit_sends_a_bare_single_answer() {
+        let mut d = approval_dialog(ls_detail());
+        assert!(!d.handle_key(press(KeyCode::Char('1'))));
+        assert!(d.handle_key(press(KeyCode::Enter)));
+        let response = resolve_response_of(d.take_result().unwrap().into_resolve_request());
+        assert_eq!(
+            response,
+            cockpit_proto::ResolveResponse::Single {
+                selected_id: ID_APPROVE_ONCE.into()
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            serde_json::json!({ "kind": "single", "data": { "selected_id": ID_APPROVE_ONCE } }),
+            "the wire envelope is the bare single answer"
+        );
+
+        let mut d = approval_dialog(ls_detail());
+        assert!(d.handle_key(press(KeyCode::Esc)));
+        assert_eq!(
+            resolve_response_of(d.take_result().unwrap().into_resolve_request()),
+            cockpit_proto::ResolveResponse::Cancel,
+            "Esc declines the approval with a whole-interrupt cancel"
+        );
+    }
+
+    #[test]
+    fn multi_question_submit_sends_one_batch_entry_per_question() {
+        let questions = ["First?", "Second?"]
+            .into_iter()
+            .map(|prompt| InterruptQuestion::Freetext {
+                prompt: prompt.into(),
+                masked: false,
+            })
+            .collect();
+        let mut d = dialog(InterruptQuestionSet { questions });
+        for answer in ['x', 'y'] {
+            d.handle_key(press(KeyCode::Char(answer)));
+            d.handle_key(press(KeyCode::Right));
+        }
+        assert!(d.state.on_confirm_page());
+        assert!(d.handle_key(press(KeyCode::Enter)));
+        let response = resolve_response_of(d.take_result().unwrap().into_resolve_request());
+        match response {
+            cockpit_proto::ResolveResponse::Batch { responses } => assert_eq!(
+                responses.as_slice(),
+                [
+                    QuestionAnswer::Freetext { text: "x".into() },
+                    QuestionAnswer::Freetext { text: "y".into() },
+                ]
+            ),
+            other => panic!("two questions must be answered by a batch, got {other:?}"),
         }
     }
 

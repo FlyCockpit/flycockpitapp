@@ -382,34 +382,15 @@ pub enum AgentDecisionAnswer {
     FreeText {
         text: String,
     },
-    /// Exact wire continuation for a linked QuestionTool interrupt.  It has
-    /// the same serde envelope as `ResolveResponse`, but lives in the
-    /// protocol crate so clients never depend on the daemon storage crate.
+    /// Exact wire continuation for a linked QuestionTool interrupt: the same
+    /// typed [`ResolveResponse`] every other interrupt answer uses, so the
+    /// canonical one-question/batch shape is enforced once, by type, for
+    /// every client. Keeping this typed rather than accepting JSON means the
+    /// session worker can validate the durable redacted question contract
+    /// before it releases the parked continuation.
     InterruptResponse {
-        response: AgentInterruptResponse,
+        response: ResolveResponse,
     },
-}
-
-/// A QuestionTool continuation supplied through `ResolveAgentDecision`.
-/// Keeping this typed rather than accepting JSON means the session worker can
-/// validate the durable redacted question contract before it releases the
-/// parked continuation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", content = "data")]
-pub enum AgentInterruptResponse {
-    Single {
-        selected_id: String,
-    },
-    Multi {
-        selected_ids: Vec<String>,
-    },
-    Freetext {
-        text: String,
-    },
-    Batch {
-        responses: Vec<AgentInterruptResponse>,
-    },
-    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2687,8 +2668,9 @@ pub use cockpit_config::{
 pub use cockpit_db::wire::{
     CharSpan, CommandDetail, GrantKind, ImageBudgetDisposition, ImagePlanReview, InterruptDecision,
     InterruptDecisionLine, InterruptOption, InterruptQuestion, InterruptQuestionSet, MessageRole,
-    ResolveResponse, SandboxDenialConfidence, SandboxDenialEvidence, SandboxDenialReport,
-    SandboxEscalation, SessionActivityState, SessionMessage, SessionSummary, WriteContentPreview,
+    QuestionAnswer, ResolveResponse, SandboxDenialConfidence, SandboxDenialEvidence,
+    SandboxDenialReport, SandboxEscalation, SessionActivityState, SessionMessage, SessionSummary,
+    WriteContentPreview,
 };
 
 pub use cockpit_db::db::conversation_rules::{
@@ -4899,12 +4881,19 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
                 "{key} must cover ResolveResponse::{expected_kind}"
             );
         }
-        assert_eq!(
-            resolve_response(fixtures, "request_resolve_batch")
-                .pointer("/data/responses/0/kind")
-                .and_then(Value::as_str),
-            Some("single"),
-            "ResolveResponse::Batch must nest at least one non-batch response"
+        let batch = resolve_response(fixtures, "request_resolve_batch")
+            .pointer("/data/responses")
+            .and_then(Value::as_array)
+            .expect("batch fixture carries its per-question answers");
+        assert!(
+            batch.len() >= 2,
+            "ResolveResponse::Batch answers two or more questions; one question is a bare answer"
+        );
+        assert!(
+            batch
+                .iter()
+                .all(|answer| answer.get("kind").and_then(Value::as_str) != Some("batch")),
+            "ResolveResponse::Batch entries never nest a batch"
         );
         assert_checked_in("interrupts.json", generated);
     }
@@ -5299,11 +5288,15 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
             ),
             (
                 "request_resolve_batch",
-                ResolveResponse::Batch {
-                    responses: vec![ResolveResponse::Single {
-                        selected_id: "approve_once".into(),
-                    }],
-                },
+                ResolveResponse::from_answers(vec![
+                    QuestionAnswer::Single {
+                        selected_id: "pg".into(),
+                    },
+                    QuestionAnswer::Freetext {
+                        text: "Use the existing design".into(),
+                    },
+                ])
+                .expect("two answers form a batch"),
             ),
             ("request_resolve_cancel", ResolveResponse::Cancel),
         ] {

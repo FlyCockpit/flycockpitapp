@@ -1410,18 +1410,18 @@ fn resolve_run_interrupt(
                 .filter(|class| approved_classes.contains(class))
                 .and_then(|_| safe_once_option(question));
             if let Some(selected_id) = selected {
-                proto::ResolveResponse::Single { selected_id }
+                proto::QuestionAnswer::Single { selected_id }
             } else {
                 approved = false;
-                noninteractive_denial_response()
+                proto::QuestionAnswer::Freetext {
+                    text: crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+                }
             }
         })
         .collect::<Vec<_>>();
-    let response = match responses.as_slice() {
-        [] => noninteractive_denial_response(),
-        [one] => one.clone(),
-        _ => proto::ResolveResponse::Batch { responses },
-    };
+    // Canonical shape: one question → bare answer, several → batch.
+    let response = proto::ResolveResponse::from_answers(responses)
+        .unwrap_or_else(|_| noninteractive_denial_response());
     InterruptResolution {
         response,
         approved,

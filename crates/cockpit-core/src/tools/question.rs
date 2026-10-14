@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::daemon::proto::{
-    InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
+    InterruptOption, InterruptQuestion, InterruptQuestionSet, QuestionAnswer,
 };
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
 
@@ -299,7 +299,7 @@ fn question_prompt(q: &InterruptQuestion) -> &str {
 /// turn. One line per question; the option label is preferred over the
 /// raw id when it can be resolved, and a free-text answer is shown
 /// verbatim. A dismissed batch reads as `[cancelled]` per question.
-fn render_answers(set: &InterruptQuestionSet, answers: &[ResolveResponse]) -> String {
+fn render_answers(set: &InterruptQuestionSet, answers: &[QuestionAnswer]) -> String {
     let mut out = String::new();
     for (i, q) in set.questions.iter().enumerate() {
         if !out.is_empty() {
@@ -308,10 +308,10 @@ fn render_answers(set: &InterruptQuestionSet, answers: &[ResolveResponse]) -> St
         out.push_str(question_prompt(q));
         out.push_str(" → ");
         match answers.get(i) {
-            Some(ResolveResponse::Single { selected_id }) => {
+            Some(QuestionAnswer::Single { selected_id }) => {
                 out.push_str(&label_for(q, selected_id));
             }
-            Some(ResolveResponse::Multi { selected_ids }) => {
+            Some(QuestionAnswer::Multi { selected_ids }) => {
                 if selected_ids.is_empty() {
                     out.push_str("[none]");
                 } else {
@@ -320,9 +320,9 @@ fn render_answers(set: &InterruptQuestionSet, answers: &[ResolveResponse]) -> St
                     out.push_str(&labels.join(", "));
                 }
             }
-            Some(ResolveResponse::Freetext { text }) => out.push_str(text),
-            Some(ResolveResponse::Batch { .. }) | None => out.push_str("[no answer]"),
-            Some(ResolveResponse::Cancel) => out.push_str("[cancelled]"),
+            Some(QuestionAnswer::Freetext { text }) => out.push_str(text),
+            None => out.push_str("[no answer]"),
+            Some(QuestionAnswer::Cancel) => out.push_str("[cancelled]"),
         }
     }
     out
@@ -432,10 +432,10 @@ mod tests {
             ],
         };
         let answers = vec![
-            ResolveResponse::Single {
+            QuestionAnswer::Single {
                 selected_id: "pg".into(),
             },
-            ResolveResponse::Freetext { text: "Ada".into() },
+            QuestionAnswer::Freetext { text: "Ada".into() },
         ];
         let rendered = render_answers(&set, &answers);
         assert!(rendered.contains("DB? → Postgres"));
@@ -450,7 +450,7 @@ mod tests {
                 masked: false,
             }],
         };
-        let answers = ResolveResponse::Cancel.into_batch(1);
+        let answers = crate::daemon::proto::ResolveResponse::Cancel.into_batch(1);
         assert!(render_answers(&set, &answers).contains("[cancelled]"));
     }
 
@@ -637,7 +637,7 @@ mod tests {
         let q = parse_question(&two_option_question("DB?"), 0).unwrap();
         let rendered = render_answers(
             &InterruptQuestionSet { questions: vec![q] },
-            &[ResolveResponse::Single {
+            &[QuestionAnswer::Single {
                 selected_id: "custom".into(),
             }],
         );
@@ -682,7 +682,7 @@ mod tests {
             }
             tokio::task::yield_now().await;
         };
-        let response = ResolveResponse::Single {
+        let response = crate::daemon::proto::ResolveResponse::Single {
             selected_id: "pg".into(),
         };
         // Wake the registered continuation before projecting the terminal row.

@@ -949,15 +949,13 @@ enum GitignorePersistence {
     NoninteractiveReject,
 }
 
-/// Extract the selected option id from a `Single` (or single-element `Batch`)
-/// response; `None` for a cancel/other shape. Shared by the gitignore stages.
+/// Extract the selected option id from a bare `Single` response; `None` for a
+/// cancel/other shape. Approval prompts are exactly one single-select
+/// question, whose canonical answer is a bare `Single` — a `Batch` always
+/// answers two or more questions (by type), so it is never unwrapped here.
 fn response_single_id(response: &ResolveResponse) -> Option<&str> {
     match response {
         ResolveResponse::Single { selected_id } => Some(selected_id.as_str()),
-        ResolveResponse::Batch { responses } => match responses.first() {
-            Some(ResolveResponse::Single { selected_id }) => Some(selected_id.as_str()),
-            _ => None,
-        },
         _ => None,
     }
 }
@@ -1721,6 +1719,7 @@ mod tests {
     use super::*;
     use crate::approval::classify::ApprovalKey;
     use crate::config::extended::{ApprovalPolicyScope, DangerousFlagRule};
+    use crate::daemon::proto::QuestionAnswer;
     use crate::daemon::session_worker::SessionConfigSnapshot;
     use std::io;
     use std::sync::Mutex as StdMutex;
@@ -2315,15 +2314,31 @@ mod tests {
         );
         assert_eq!(
             response_to_approval_choice(
-                &ResolveResponse::Batch {
-                    responses: vec![ResolveResponse::Single {
-                        selected_id: ID_REJECT_SESSION.to_string(),
-                    }],
+                &ResolveResponse::Single {
+                    selected_id: ID_REJECT_SESSION.to_string(),
                 },
                 &command_set,
             )
             .unwrap(),
             ApprovalChoice::Reject(Scope::Session)
+        );
+        // A batch answers two or more questions; its first entry is never
+        // borrowed as the answer to a one-question approval prompt.
+        assert_eq!(
+            response_to_approval_choice(
+                &ResolveResponse::from_answers(vec![
+                    QuestionAnswer::Single {
+                        selected_id: ID_APPROVE_PROJECT.to_string(),
+                    },
+                    QuestionAnswer::Single {
+                        selected_id: ID_APPROVE_PROJECT.to_string(),
+                    },
+                ])
+                .unwrap(),
+                &command_set,
+            )
+            .unwrap(),
+            ApprovalChoice::Deny
         );
         assert!(
             response_to_approval_choice(
@@ -2370,16 +2385,28 @@ mod tests {
             }
         );
         assert_eq!(
-            response_to_repeat_choice(&ResolveResponse::Batch {
-                responses: vec![ResolveResponse::Single {
-                    selected_id: ID_LOOP_ACCEPT_SESSION.to_string(),
-                }],
+            response_to_repeat_choice(&ResolveResponse::Single {
+                selected_id: ID_LOOP_ACCEPT_SESSION.to_string(),
             })
             .unwrap(),
             RepeatChoice::Always {
                 verdict: LoopVerdict::Accept,
                 scope: Scope::Session,
             }
+        );
+        assert_eq!(
+            response_to_repeat_choice(
+                &ResolveResponse::from_answers(vec![
+                    QuestionAnswer::Single {
+                        selected_id: ID_LOOP_ACCEPT_SESSION.to_string(),
+                    },
+                    QuestionAnswer::Cancel,
+                ])
+                .unwrap()
+            )
+            .unwrap(),
+            RepeatChoice::RejectOnce,
+            "a multi-question batch never selects a loop-guard rule"
         );
         assert_eq!(
             response_to_repeat_choice(&ResolveResponse::Cancel).unwrap(),
@@ -6295,9 +6322,8 @@ mod tests {
             ResolveResponse::Freetext {
                 text: "deny".into(),
             },
-            ResolveResponse::Batch {
-                responses: vec![ResolveResponse::Cancel],
-            },
+            ResolveResponse::from_answers(vec![QuestionAnswer::Cancel, QuestionAnswer::Cancel])
+                .unwrap(),
         ] {
             assert!(
                 !host_approval_response_declines(&invalid, &offered),

@@ -4,7 +4,7 @@
 
 use super::*;
 
-use cockpit_proto::{AgentDecisionAnswer, AgentInterruptResponse};
+use cockpit_proto::{AgentDecisionAnswer, ResolveResponse};
 use uuid::Uuid;
 
 /// Combined tree + attention fetch. `Replace` policy coalesces bursts of
@@ -112,7 +112,7 @@ impl App {
                         session_id,
                         decision_request_id,
                         answer: AgentDecisionAnswer::InterruptResponse {
-                            response: AgentInterruptResponse::Cancel,
+                            response: ResolveResponse::Cancel,
                         },
                     })
                     .await

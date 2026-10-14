@@ -33515,35 +33515,8 @@ fn agent_decision_answer_from_wire(
             crate::agent_tree::PublicDecisionAnswer::FreeText { text }
         }
         proto::AgentDecisionAnswer::InterruptResponse { response } => {
-            crate::agent_tree::PublicDecisionAnswer::InterruptResponse {
-                response: agent_interrupt_response_from_wire(response),
-            }
+            crate::agent_tree::PublicDecisionAnswer::InterruptResponse { response }
         }
-    }
-}
-
-fn agent_interrupt_response_from_wire(
-    response: proto::AgentInterruptResponse,
-) -> crate::db::wire::ResolveResponse {
-    match response {
-        proto::AgentInterruptResponse::Single { selected_id } => {
-            crate::db::wire::ResolveResponse::Single { selected_id }
-        }
-        proto::AgentInterruptResponse::Multi { selected_ids } => {
-            crate::db::wire::ResolveResponse::Multi { selected_ids }
-        }
-        proto::AgentInterruptResponse::Freetext { text } => {
-            crate::db::wire::ResolveResponse::Freetext { text }
-        }
-        proto::AgentInterruptResponse::Batch { responses } => {
-            crate::db::wire::ResolveResponse::Batch {
-                responses: responses
-                    .into_iter()
-                    .map(agent_interrupt_response_from_wire)
-                    .collect(),
-            }
-        }
-        proto::AgentInterruptResponse::Cancel => crate::db::wire::ResolveResponse::Cancel,
     }
 }
 

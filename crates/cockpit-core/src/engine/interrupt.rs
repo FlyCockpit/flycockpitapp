@@ -2395,28 +2395,22 @@ impl Drop for PendingInterrupt<'_> {
     }
 }
 
-/// The selected option id from a resolved single-select interrupt
-/// (unwrapping a one-question `Batch`); `Cancel` / other shapes → `None`.
+/// The selected option id from a resolved single-select, one-question
+/// interrupt; `Cancel` / other shapes → `None`. A one-question interrupt is
+/// always answered by a bare response (a `Batch` has at least two answers by
+/// type), so a batch is never "the" answer to a single-select prompt.
 pub fn selected_id_of(resp: &ResolveResponse) -> Option<String> {
     match resp {
         ResolveResponse::Single { selected_id } => Some(selected_id.clone()),
-        ResolveResponse::Batch { responses } => match responses.first() {
-            Some(ResolveResponse::Single { selected_id }) => Some(selected_id.clone()),
-            _ => None,
-        },
         _ => None,
     }
 }
 
-/// The free-text answer from a resolved free-text interrupt (unwrapping a
-/// one-question `Batch`); `Cancel` / other shapes → `None`.
+/// The free-text answer from a resolved one-question free-text interrupt;
+/// `Cancel` / other shapes (including any `Batch`) → `None`.
 pub fn freetext_of(resp: &ResolveResponse) -> Option<String> {
     match resp {
         ResolveResponse::Freetext { text } => Some(text.clone()),
-        ResolveResponse::Batch { responses } => match responses.first() {
-            Some(ResolveResponse::Freetext { text }) => Some(text.clone()),
-            _ => None,
-        },
         _ => None,
     }
 }

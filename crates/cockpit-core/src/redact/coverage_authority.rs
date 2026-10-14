@@ -30,8 +30,14 @@ pub(crate) const COVERAGE_WAITERS_PER_KEY: usize = 16;
 pub(crate) const COVERAGE_WAITERS: usize = 256;
 pub(crate) const COVERAGE_ADMISSIONS: usize = 256;
 pub(crate) const COVERAGE_RESIDENT_GENERATIONS: usize = 64;
-pub(crate) const COVERAGE_ARTIFACT_BYTES_PER_GENERATION: usize = 4 * 1024 * 1024;
-pub(crate) const COVERAGE_ARTIFACT_BYTES_TOTAL: usize = 32 * 1024 * 1024;
+/// One generation's immutable artifact (entries plus both automata). 16 MiB
+/// admits a realistic developer `~/.ssh`: 10 RSA-4096 + 2 ed25519 keys + 40
+/// env values measure about 12.5 MiB with ContiguousNFA (#527).
+pub(crate) const COVERAGE_ARTIFACT_BYTES_PER_GENERATION: usize = 16 * 1024 * 1024;
+/// All resident generations together. Installed tables do not pin their
+/// generation (#542), so the total must hold the daemon-global table plus
+/// several sessions at the per-generation size: 64 MiB keeps 4 at the cap.
+pub(crate) const COVERAGE_ARTIFACT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CoverageOwnerMode {

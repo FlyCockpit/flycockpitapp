@@ -81,6 +81,9 @@ async fn ssh_private_key_coverage_admits_and_scrubs_every_encoding() {
     let cfg = crate::config::extended::RedactConfig {
         scan_environment: false,
         scan_dotenv: false,
+        // Explicit: the default profile is platform-resolved (Windows uses
+        // the Known Folder, not HOME); see the default-profile test below.
+        ssh_key_dir: Some(ssh.clone()),
         ..Default::default()
     };
     let table = RedactionTable::build_scoped(
@@ -91,6 +94,12 @@ async fn ssh_private_key_coverage_admits_and_scrubs_every_encoding() {
     )
     .expect("complete private-key capture");
     let artifact_bytes = table.measured_immutable_artifact_bytes();
+    // The compact automaton representation keeps one key far below the cap;
+    // the dense DFA the library would auto-select measures over 5 MiB.
+    assert!(
+        artifact_bytes <= 1024 * 1024,
+        "one private key must use the compact matcher: artifact_bytes={artifact_bytes}"
+    );
     let parts = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
     let authority = RedactionCoverageAuthority::default();
     let admission = authority
@@ -152,7 +161,7 @@ async fn ssh_private_key_coverage_admits_and_scrubs_every_encoding() {
 }
 
 /// Several large keys in one profile (work, personal, deploy, ...) plus a
-/// typical environment must admit within the unchanged per-generation budget,
+/// typical environment must admit within the per-generation budget,
 /// and every representation of every key must still scrub to the placeholder
 /// (issue #527).
 #[tokio::test]
@@ -188,6 +197,7 @@ async fn ssh_coverage_admits_ten_rsa_4096_keys_with_an_environment() {
     let cfg = crate::config::extended::RedactConfig {
         scan_environment: true,
         scan_dotenv: false,
+        ssh_key_dir: Some(ssh.clone()),
         ..Default::default()
     };
     let table = RedactionTable::build_scoped(
@@ -248,6 +258,78 @@ async fn ssh_coverage_admits_ten_rsa_4096_keys_with_an_environment() {
         .expect("admitted SSH coverage is usable at the sink");
 }
 
+/// The unconfigured default (`~/.ssh` of the platform profile) is scanned.
+/// Unix resolves the profile from `HOME`, which the isolated test home sets;
+/// Windows resolves the Known Folder profile, which a test cannot redirect,
+/// so the explicit-directory tests above carry the cross-platform coverage.
+#[cfg(unix)]
+#[tokio::test]
+async fn default_profile_ssh_directory_is_scanned() {
+    let env = crate::test_env::lock_async().await;
+    let home = tempfile::tempdir().unwrap();
+    env.set_isolated_home(home.path());
+    let ssh = home.path().join("home/.ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    let secret = test_only_private_key(ED25519_TEST_KEY_BODIES[1]);
+    std::fs::write(ssh.join("id_ed25519"), &secret).unwrap();
+    let cfg = crate::config::extended::RedactConfig {
+        scan_environment: false,
+        scan_dotenv: false,
+        ssh_key_dir: None,
+        ..Default::default()
+    };
+    let table = RedactionTable::build_scoped(
+        &cfg,
+        super::super::RedactionSourceScope::DaemonGlobal,
+        &HashMap::new(),
+        std::iter::empty(),
+    )
+    .expect("complete default-profile capture");
+    assert!(table.has_ssh_key_material());
+    for variant in private_key_representations(secret.trim()) {
+        assert_eq!(table.scrub(&variant), REDACTED);
+    }
+}
+
+/// The total budget keeps the daemon-global generation and several
+/// concurrent session generations resident at the size a ten-RSA-4096-key
+/// profile measures (about 12 MiB each). An evicted generation's installed
+/// table turns stale and scrubs every body to the placeholder, so these
+/// installed tables must all stay current.
+#[tokio::test]
+async fn total_budget_keeps_global_and_session_generations_of_a_many_key_profile() {
+    const MANY_KEY_GENERATION_BYTES: usize = 12 * 1024 * 1024;
+    let authority = RedactionCoverageAuthority::default();
+    let mut installed = Vec::new();
+    // Daemon-global plus four sessions, each installed for its lifetime.
+    for index in 0..5u8 {
+        let parts = [90 + index; 10];
+        let admission = authority
+            .acquire(key(parts), CoverageScope::SessionStart, move || {
+                let table = RedactionTable::empty().with_forced_literal(
+                    "coverage-canary-secret".to_string(),
+                    "$test:coverage".to_string(),
+                )?;
+                Ok(CoverageBuild::from_complete_table_and_artifact_bytes(
+                    table,
+                    MANY_KEY_GENERATION_BYTES,
+                    boundary_for(parts),
+                ))
+            })
+            .await
+            .unwrap_or_else(|error| panic!("generation {index} must admit: {error}"));
+        installed.push(admission.install_table().expect("installed table"));
+    }
+    for (index, table) in installed.iter().enumerate() {
+        assert_eq!(
+            table.scrub("ordinary public text"),
+            "ordinary public text",
+            "installed generation {index} was evicted"
+        );
+        assert_eq!(table.scrub("coverage-canary-secret"), REDACTED);
+    }
+}
+
 /// A capture over the per-generation budget still fails closed, and the
 /// refusal names private SSH key material and the settings that bound it
 /// when keys are part of the artifact.
@@ -266,6 +348,9 @@ async fn over_budget_coverage_names_ssh_key_remediation() {
     let cfg = crate::config::extended::RedactConfig {
         scan_environment: false,
         scan_dotenv: false,
+        // Explicit: the default profile is platform-resolved (Windows uses
+        // the Known Folder, not HOME); see the default-profile test below.
+        ssh_key_dir: Some(ssh.clone()),
         ..Default::default()
     };
     let with_keys = RedactionTable::build_scoped(
@@ -508,8 +593,8 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
         256,
         256,
         64,
-        4 * 1024 * 1024,
-        32 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64 * 1024 * 1024,
     );
     for mode in [
         CoverageOwnerMode::Persistent,

@@ -813,6 +813,131 @@ fn build_redacted_policy_model(
     Ok((model, custody))
 }
 
+/// One route of a finite vNext child slot (its prepared routes, or the
+/// authored `models` list of an unprepared slot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FiniteSlotRoute {
+    pub provider: String,
+    pub model: String,
+    pub is_default: bool,
+}
+
+/// Choose the route a parent-named selector names inside a finite child slot.
+///
+/// The slot's list is the authority on *which* models the child may run, and
+/// the selector narrows within it: an exact selector must name an allowed
+/// route, and every requirement the selector carries (capabilities, minimum
+/// context, category) is enforced against the chosen route instead of being
+/// discarded. A category selector picks the best allowed route that admits
+/// the category, ordered like category discovery (routes that list the
+/// category first, then `optimize`), with the slot default winning ties.
+pub(crate) fn select_finite_slot_route(
+    selector: &DelegationModelSelector,
+    agent_name: &str,
+    routes: &[FiniteSlotRoute],
+    providers: &ProvidersConfig,
+    allowed_label: &str,
+) -> Result<FiniteSlotRoute, String> {
+    match selector {
+        DelegationModelSelector::Exact {
+            selector,
+            required_capabilities,
+            min_context_tokens,
+        } => {
+            let not_allowed = || {
+                format!(
+                    "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
+                )
+            };
+            let (provider, model) = split_selector(selector).ok_or_else(not_allowed)?;
+            let route = routes
+                .iter()
+                .find(|route| route.provider == provider && route.model == model)
+                .ok_or_else(not_allowed)?;
+            providers
+                .check_route_capability_requirements(
+                    &route.provider,
+                    &route.model,
+                    required_capabilities,
+                    *min_context_tokens,
+                )
+                .map_err(|error| {
+                    format!(
+                        "parent-named model `{selector}` does not meet the selector's requirements: {}",
+                        policy_error_message(error)
+                    )
+                })?;
+            Ok(route.clone())
+        }
+        DelegationModelSelector::Category {
+            category,
+            optimize,
+            required_capabilities,
+            min_context_tokens,
+        } => {
+            let default_category = default_role_for_agent(agent_name).map(CodingModelRole::as_str);
+            let category = category.as_deref().or(default_category).ok_or_else(|| {
+                "category model selector needs `category` for agents without a default model role"
+                    .to_string()
+            })?;
+            let mut eligible: Vec<&FiniteSlotRoute> = routes
+                .iter()
+                .filter(|route| {
+                    providers.route_permits_category(
+                        &route.provider,
+                        &route.model,
+                        category,
+                        Some(agent_name),
+                    ) && providers
+                        .check_route_capability_requirements(
+                            &route.provider,
+                            &route.model,
+                            required_capabilities,
+                            *min_context_tokens,
+                        )
+                        .is_ok()
+                })
+                .collect();
+            let quality = |route: &FiniteSlotRoute| {
+                providers.resolve_quality_rank(&route.provider, &route.model)
+            };
+            let cost = |route: &FiniteSlotRoute| {
+                providers.resolve_cost_rank(&route.provider, &route.model)
+            };
+            // Like category discovery: a route that explicitly lists the
+            // category outranks one that is merely unrestricted.
+            let explicit = |route: &FiniteSlotRoute| {
+                providers
+                    .providers
+                    .get(&route.provider)
+                    .and_then(|entry| entry.models.iter().find(|m| m.id == route.model))
+                    .is_some_and(|model| {
+                        model.availability.categories.iter().any(|c| c == category)
+                    })
+            };
+            eligible.sort_by(|a, b| {
+                let rank = match optimize {
+                    ModelOptimization::Quality | ModelOptimization::Balanced => quality(b)
+                        .cmp(&quality(a))
+                        .then_with(|| cost(a).cmp(&cost(b))),
+                    ModelOptimization::Cost => cost(a)
+                        .cmp(&cost(b))
+                        .then_with(|| quality(b).cmp(&quality(a))),
+                };
+                explicit(b)
+                    .cmp(&explicit(a))
+                    .then(rank)
+                    .then_with(|| b.is_default.cmp(&a.is_default))
+            });
+            eligible.first().map(|route| (*route).clone()).ok_or_else(|| {
+                format!(
+                    "no route in the child slot admits category `{category}` with the selector's requirements; allowed routes: {allowed_label}"
+                )
+            })
+        }
+    }
+}
+
 pub(crate) fn split_selector(selector: &str) -> Option<(String, String)> {
     let selector = selector.trim();
     if let Some((provider, model)) = selector.split_once(':') {
@@ -1326,7 +1451,7 @@ fn capability_summary(caps: &EffectiveModelCapabilities) -> String {
     }
 }
 
-fn policy_error_message(error: ModelPolicyError) -> String {
+pub(crate) fn policy_error_message(error: ModelPolicyError) -> String {
     match error {
         ModelPolicyError::MalformedSelector(selector) => {
             format!("model selector `{selector}` must be provider:model or provider/model")

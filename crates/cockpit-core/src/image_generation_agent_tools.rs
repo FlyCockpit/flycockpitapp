@@ -2290,6 +2290,43 @@ mod tests {
         );
     }
 
+    /// #549 C1: a legal strict-wire `generate_image` call fills every
+    /// optional target and reference field with null. After normalization it
+    /// must satisfy the canonical schema and the image validator, including
+    /// the exclusive attachment/local-path reference tag.
+    #[test]
+    fn strict_wire_generate_image_with_placeholder_nulls_is_accepted() {
+        let canonical = image_generation_tool_schema("generate_image");
+        let normalized = crate::engine::model::wire_schema::tests::assert_strict_call_normalizes(
+            &canonical,
+            serde_json::json!({
+                "prompt": "a cat",
+                "directory": "/tmp/out",
+                "base_stem": "image",
+                "width": null,
+                "height": null,
+                "format": null,
+                "targets": [{
+                    "target_id": "t1",
+                    "samples": null,
+                    "width": null,
+                    "height": null,
+                    "format": null,
+                    "parameters": null
+                }],
+                "references": [
+                    { "attachment_id": "a1", "local_path": null },
+                    { "attachment_id": null, "local_path": "ref.png" }
+                ]
+            }),
+        );
+        validate_generate_image_args(&normalized).unwrap();
+        assert_eq!(
+            normalized["targets"][0],
+            serde_json::json!({ "target_id": "t1" })
+        );
+    }
+
     #[test]
     fn validate_generate_image_rejects_parameter_shape_or_type_mismatch() {
         let base = serde_json::json!({

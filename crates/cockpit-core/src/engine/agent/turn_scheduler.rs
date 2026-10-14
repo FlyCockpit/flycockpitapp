@@ -307,8 +307,12 @@ fn classify_call(
     force_noninteractive_delegates: bool,
 ) -> CallClassification {
     // Structural tools are always serial barriers unless they are a
-    // noninteractive delegate that proves parallel_read_only_eligible.
+    // noninteractive delegate that proves parallel_read_only_eligible. A
+    // structural name the agent does not hold is classified as an ordinary
+    // (unknown) call, so it can never reach a structural interceptor (#549).
+    let granted = active_tools.get(resolved_name).is_some();
     match resolved_name {
+        "task" | "schedule" | "spawn" | "return" if !granted => {}
         "task" => {
             return classify_task_call(tc, active_tools, force_noninteractive_delegates);
         }
@@ -461,6 +465,43 @@ fn classify_delegate_call(delegate_args: &Value, force_noninteractive: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A toolbox granting every structural tool: the scheduler classifies a
+    /// structural name as structure only when the agent holds it (#549).
+    fn structural_toolbox() -> ToolBox {
+        ToolBox::new()
+            .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
+                "builder", "explore", "docs",
+            ])))
+            .with(Arc::new(crate::tools::schedule::ScheduleTool))
+            .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(0, 1)))
+            .with(Arc::new(crate::tools::return_tool::ReturnTool))
+    }
+
+    /// #549 C4: an ungranted structural name is an ordinary unknown call,
+    /// never a structural barrier or delegate candidate.
+    #[test]
+    fn ungranted_structural_names_are_not_classified_as_structure() {
+        let calls = vec![
+            tool_call("schedule", serde_json::json!({})),
+            tool_call(
+                "task",
+                serde_json::json!({ "intent": "delegate", "payload": { "agent": "explore", "prompt": "p" } }),
+            ),
+        ];
+        let names = resolved_names(&calls);
+        let plan = build_plan(&calls, &names, &ToolBox::new(), 4);
+        for call in &plan.calls {
+            assert_eq!(
+                call.classification,
+                CallClassification::SerialBarrier {
+                    reason: SerialBarrierReason::UnknownTool,
+                },
+                "{}",
+                call.resolved_name
+            );
+        }
+    }
     use std::sync::Arc;
 
     struct MutatingStub;
@@ -518,7 +559,7 @@ mod tests {
     /// barriers. Source-order IDs are preserved.
     #[test]
     fn capability_aware_turn_scheduler_preserves_ids_and_serial_barriers() {
-        let toolbox = ToolBox::new()
+        let toolbox = structural_toolbox()
             .with(Arc::new(crate::tools::read::ReadTool))
             .with(Arc::new(crate::tools::bash::BashTool::new()))
             .with(Arc::new(crate::tools::glob::GlobTool))
@@ -604,7 +645,7 @@ mod tests {
     /// AC1: Structural tools are serial barriers.
     #[test]
     fn structural_tools_are_serial_barriers() {
-        let toolbox = ToolBox::new();
+        let toolbox = structural_toolbox();
 
         let calls = vec![
             tool_call("schedule", serde_json::json!({})),
@@ -648,7 +689,7 @@ mod tests {
     /// AC1: Task control and task batch are serial barriers.
     #[test]
     fn task_control_and_batch_are_serial_barriers() {
-        let toolbox = ToolBox::new();
+        let toolbox = structural_toolbox();
 
         let calls = vec![
             tool_call("task", serde_json::json!({ "intent": "list" })),
@@ -687,7 +728,7 @@ mod tests {
     /// can pin the live grant after the preceding barrier.
     #[test]
     fn interactive_delegates_are_serial_barriers_and_write_scope_stays_a_candidate() {
-        let toolbox = ToolBox::new();
+        let toolbox = structural_toolbox();
 
         // Interactive delegate (builder is interactive by default).
         let calls = vec![
@@ -720,7 +761,7 @@ mod tests {
 
     #[test]
     fn padded_explicit_modes_match_dispatch_precedence_in_canonical_envelopes() {
-        let toolbox = ToolBox::new();
+        let toolbox = structural_toolbox();
         let calls = vec![
             tool_call(
                 "task",
@@ -768,7 +809,7 @@ mod tests {
     /// plan entries (not coalesced).
     #[test]
     fn plan_keeps_batch_and_distinct_delegates_separate() {
-        let toolbox = ToolBox::new();
+        let toolbox = structural_toolbox();
 
         // An explicit batch followed by two distinct delegates.
         let calls = vec![
@@ -820,7 +861,7 @@ mod tests {
     /// calls are not rewritten into the explicit-batch lifecycle.
     #[test]
     fn ordinary_plus_two_distinct_delegates_form_one_bounded_candidate_run() {
-        let toolbox = ToolBox::new().with(Arc::new(crate::tools::read::ReadTool));
+        let toolbox = structural_toolbox().with(Arc::new(crate::tools::read::ReadTool));
         let calls = vec![
             tool_call("read", serde_json::json!({ "path": "Cargo.toml" })),
             tool_call(
@@ -1448,7 +1489,7 @@ mod tests {
     /// The event payload never contains tool arguments or provider bodies.
     #[test]
     fn event_payload_omits_args_and_bodies() {
-        let toolbox = ToolBox::new();
+        let toolbox = structural_toolbox();
         let calls = vec![
             tool_call("read", serde_json::json!({ "path": "/secret/key" })),
             tool_call("bash", serde_json::json!({ "command": "cat /etc/passwd" })),

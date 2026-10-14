@@ -803,6 +803,18 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
     // resolve a secret owned by (provider, this workspace), never a foreign one.
     // See `named-secret-ownership-boundary`.
     let scoped_store = ctx.session.provider_credential_store(&providers).ok();
+    // Every spawn (root, nested, queued) is built here, so this is the one
+    // enforcement point for the host's model-selection policy: with
+    // `agent_chooses_subagent_model` off, a model may not pick a child model.
+    // Host-configured selectors (`HostConfig`) remain host authority.
+    if let Some(selector) = spec.model.as_deref()
+        && spec.model_origin == SpawnModelOrigin::ModelDirected
+        && !extended.agent_chooses_subagent_model
+    {
+        anyhow::bail!(
+            "spawn model selector `{selector}` is refused because agent_chooses_subagent_model is off; omit `model` to use the host default"
+        );
+    }
     // `spawn.model` is a model-authored selector exactly like
     // `task.payload.model`, so it takes the same custody-typed, forced
     // redacted-untrusted route with subagent-invokable and capability checks.
@@ -1897,6 +1909,147 @@ mod tests {
             1,
             "a non-goal worker fires exactly one subagentStop through the same funnel"
         );
+    }
+
+    /// #549 C3: with `agent_chooses_subagent_model` off (the default) a
+    /// model-authored `spawn.model` must be refused where every spawn is
+    /// built, while a host-configured selector and the no-selector default
+    /// still build; with the setting on, the model-authored selector builds.
+    #[tokio::test]
+    async fn model_directed_spawn_selector_obeys_the_selection_policy() {
+        async fn build(enabled: bool, spec: &SpawnSpec) -> Result<(), String> {
+            let tmp = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+            let config_path = tmp.path().join(".cockpit/config.json");
+            std::fs::write(
+                &config_path,
+                format!(r#"{{"agent_chooses_subagent_model": {enabled}}}"#),
+            )
+            .unwrap();
+            let mut providers = crate::config::providers::ProvidersConfig::default();
+            let model = |id: &str| crate::config::providers::ModelEntry {
+                id: id.into(),
+                subagent_invokable: Some(true),
+                can_delegate: Some(true),
+                ..crate::config::providers::ModelEntry::default()
+            };
+            providers.providers.insert(
+                "cloud".into(),
+                crate::config::providers::ProviderEntry {
+                    url: "http://127.0.0.1:1/v1".into(),
+                    trust: Some(crate::config::providers::ModelTrust::Untrusted),
+                    models: vec![model("worker"), model("other")],
+                    ..crate::config::providers::ProviderEntry::default()
+                },
+            );
+            let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
+            crate::config::trust::with_workspace_trust_policy(
+                crate::config::trust::WorkspaceTrustPolicy {
+                    root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                    mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                },
+                || doc.write(&providers),
+            )
+            .unwrap();
+            let table = Arc::new(crate::redact::RedactionTable::empty());
+            let config =
+                crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+            let (extended, effective_providers) =
+                crate::engine::model_roles::load_model_role_config(&config);
+            assert_eq!(
+                extended.agent_chooses_subagent_model, enabled,
+                "fixture config"
+            );
+            let parent_model = Arc::new(
+                crate::engine::model::Model::for_provider(
+                    &effective_providers,
+                    "cloud",
+                    "worker",
+                    table.clone(),
+                )
+                .unwrap(),
+            );
+            let session = Arc::new(
+                crate::session::Session::create_for_test(
+                    crate::db::Db::open_in_memory().unwrap(),
+                    tmp.path().to_path_buf(),
+                    "Swarm",
+                    crate::session::test_redaction_key_resolver(),
+                )
+                .unwrap(),
+            );
+            let parent = Agent {
+                name: "Swarm".to_string(),
+                system: "s".to_string(),
+                role_prompt: "s".to_string(),
+                tools: crate::engine::tool::ToolBox::new(),
+                model: parent_model,
+                params: crate::engine::model::ModelParams::default(),
+                scan_tool_results: true,
+                tool_steering: crate::agents::ToolSteering::Terse,
+                posture: crate::agents::PostureResolution::standard(),
+                context_policy: None,
+                lock_identity: "Swarm".to_string(),
+                write_scope: None,
+                workspace_lease: None,
+                delegated: false,
+                delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+                vnext_grant: None,
+                env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                definition: None,
+                assistant_identity_prefix: None,
+                mcp_resolver: crate::mcp::resolver::EffectiveCatalogResolver::empty(),
+            };
+            let ctx = ScheduleContext {
+                dream_read_scope: session.dream_read_scope(),
+                session,
+                locks: Arc::new(crate::locks::LockManager::in_memory(
+                    crate::db::Db::open_in_memory().unwrap(),
+                )),
+                redact: table,
+                cwd: tmp.path().to_path_buf(),
+                config,
+                guidance_compiler: None,
+                local_installations: crate::agents::LocalInstallationResolver::no_installations(),
+                agent: Arc::new(parent),
+                write_scope: None,
+                budget: crate::engine::delegation_budget::BudgetPool::defaults(),
+            };
+            build_swarm_child(spec, &ctx)
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"))
+        }
+
+        let mut model_directed = spec(1, 3);
+        model_directed.worker = SpawnWorkerKind::Scout;
+        model_directed.model = Some("cloud:other".into());
+        model_directed.model_origin = SpawnModelOrigin::ModelDirected;
+        let error = build(false, &model_directed)
+            .await
+            .expect_err("a model-chosen spawn model must be refused while selection is off");
+        assert!(
+            error.contains("agent_chooses_subagent_model is off"),
+            "{error}"
+        );
+
+        build(true, &model_directed)
+            .await
+            .expect("with selection on, the model-chosen allowed model builds");
+
+        let mut host_named = model_directed.clone();
+        host_named.model_origin = SpawnModelOrigin::HostConfig;
+        if let Err(error) = build(false, &host_named).await {
+            assert!(
+                !error.contains("agent_chooses_subagent_model"),
+                "host-configured selectors are host authority: {error}"
+            );
+        }
+
+        let mut no_selector = model_directed.clone();
+        no_selector.model = None;
+        build(false, &no_selector)
+            .await
+            .expect("no selector inherits the parent model");
     }
 
     /// A spawn spec defaults to model-directed provenance: anything that forgets

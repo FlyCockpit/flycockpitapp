@@ -1362,6 +1362,11 @@ fn prompt_has_redundant_seed_tag(prompt: &str) -> bool {
         .any(|token| token.starts_with('@') || token.starts_with("/skill"))
 }
 
+/// Tool names [`phase_10_dispatch_one_call`] intercepts as host structure.
+pub(crate) fn is_structural_tool_name(name: &str) -> bool {
+    matches!(name, "task" | "schedule" | "spawn" | "return")
+}
+
 pub(crate) async fn phase_10_dispatch_one_call(
     agent: &Agent,
     session: &Arc<Session>,
@@ -1374,6 +1379,14 @@ pub(crate) async fn phase_10_dispatch_one_call(
         ($outcome:expr) => {
             return Ok(ControlFlow::Break($outcome));
         };
+    }
+    // Structural tools are intercepted here, before ordinary dispatch's
+    // unknown-tool and capability checks, so the agent's tool grant must be
+    // enforced at this point: a name the agent does not hold is not a
+    // structural operation. It continues to ordinary dispatch, which refuses
+    // it as an unknown tool (#549 C4).
+    if is_structural_tool_name(resolved_name) && agent.tools.get(resolved_name).is_none() {
+        return Ok(ControlFlow::Continue(()));
     }
     // `task` is special — it's a structural tool the driver
     // handles. For interactive subagents (builder) the driver
@@ -4037,6 +4050,81 @@ mod tests {
         )
     }
 
+    /// `test_agent` holding every structural tool, so phase 10 intercepts
+    /// them (an ungranted structural name is an ordinary unknown call).
+    fn structural_test_agent() -> Agent {
+        let mut agent = test_agent();
+        agent.tools = ToolBox::new()
+            .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
+                "builder", "explore",
+            ])))
+            .with(Arc::new(crate::tools::schedule::ScheduleTool))
+            .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(0, 1)))
+            .with(Arc::new(crate::tools::return_tool::ReturnTool));
+        agent
+    }
+
+    /// #549 C4: a structural name the agent was not granted must not be
+    /// intercepted as host structure (bypassing unknown-tool refusal); it
+    /// continues to ordinary dispatch. A granted one is still intercepted.
+    #[tokio::test]
+    async fn phase_10_refuses_to_intercept_ungranted_structural_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        let (tx, _rx) = mpsc::channel(4);
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
+        let calls = [
+            (
+                "schedule",
+                serde_json::json!({ "action": "loop.start", "args": { "interval": 5, "prompt": "Do work", "limit": 1 } }),
+            ),
+            (
+                "spawn",
+                serde_json::json!({ "prompt": "p", "write_scope": "slice" }),
+            ),
+            (
+                "return",
+                serde_json::json!({ "summary": "done", "result": "ok" }),
+            ),
+            (
+                "task",
+                serde_json::json!({ "intent": "delegate", "payload": { "agent": "explore", "prompt": "p" } }),
+            ),
+        ];
+        let narrow = test_agent();
+        for (name, args) in &calls {
+            let flow = phase_10_dispatch_one_call(
+                &narrow,
+                &session,
+                &config,
+                &tx,
+                &tool_call(name, args.clone()),
+                name,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(flow, ControlFlow::Continue(())),
+                "ungranted `{name}` was intercepted: {flow:?}"
+            );
+        }
+        let granted = structural_test_agent();
+        let flow = phase_10_dispatch_one_call(
+            &granted,
+            &session,
+            &config,
+            &tx,
+            &tool_call("schedule", calls[0].1.clone()),
+            "schedule",
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(flow, ControlFlow::Break(TurnOutcome::ScheduleAction { .. })),
+            "granted schedule must stay structural: {flow:?}"
+        );
+    }
+
     fn test_agent() -> Agent {
         Agent {
             name: "Build".to_string(),
@@ -4645,7 +4733,7 @@ mod tests {
     #[tokio::test]
     async fn phase_10_structural_return_breaks() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent = test_agent();
+        let agent = structural_test_agent();
         let session = test_session(tmp.path());
         let (tx, _rx) = mpsc::channel(1);
         let call = tool_call(
@@ -4700,7 +4788,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
         let host = crate::agents::VnextHostPolicy::for_session_config(&config.extended());
-        let mut agent = test_agent();
+        let mut agent = structural_test_agent();
         agent.vnext_grant = Some(
             crate::agents::embedded_default("Build")
                 .and_then(|definition| definition.vnext)
@@ -5036,7 +5124,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_batch_and_distinct_delegates_keep_separate_lifecycles() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent = test_agent();
+        let agent = structural_test_agent();
         let session = test_session(tmp.path());
         let config = crate::daemon::session_worker::SessionConfigHandle::detached_default();
         let (tx, _rx) = mpsc::channel(8);
@@ -6189,7 +6277,7 @@ mod tests {
     #[tokio::test]
     async fn phase_10_spawn_retains_responses_dual_identity() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut agent = test_agent();
+        let mut agent = structural_test_agent();
         agent.name = "Swarm".to_string();
         agent.tools =
             ToolBox::new().with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(0, 3)));

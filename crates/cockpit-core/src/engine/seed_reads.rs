@@ -710,6 +710,54 @@ mod tests {
         );
     }
 
+    /// #549 C2: the production path, not just the decoder. The explore
+    /// report is copied into a `task` call, and `parse_task_args` runs its
+    /// default-pruning repair before the seed decoder. Receipt-bound data —
+    /// whitespace-only string values and an empty argument list — must
+    /// survive that unchanged.
+    #[test]
+    fn task_repair_preserves_receipt_bound_seed_data() {
+        let selection = SeedReadSelection {
+            calls: vec![
+                SeedRead {
+                    tool: "search".to_string(),
+                    args: serde_json::json!({"pattern": "  "}),
+                },
+                SeedRead {
+                    tool: "code".to_string(),
+                    args: serde_json::json!({}),
+                },
+                SeedRead {
+                    tool: "read".to_string(),
+                    args: serde_json::json!({"path": "src/lib.rs", "offset": 0}),
+                },
+            ],
+            receipt: Some("receipt".to_string()),
+        };
+        let report = append_to_report("report".to_string(), &selection);
+        let rendered: Value =
+            serde_json::from_str(report.rsplit("## Seed reads\n").next().unwrap().trim()).unwrap();
+        let task_args = serde_json::json!({
+            "intent": "delegate",
+            "payload": {
+                "agent": "builder",
+                "prompt": "implement it",
+                "seed_reads": rendered["seed_reads"],
+                "seed_reads_receipt": rendered["seed_reads_receipt"],
+            }
+        });
+        let parsed =
+            crate::tools::task_repair::parse_task_args(&task_args, &Default::default()).unwrap();
+        let crate::tools::task_repair::ParsedTaskArgs::Delegate { args, .. } = parsed else {
+            panic!("expected a delegate");
+        };
+        assert_eq!(
+            parse_task_seed_reads(args.get("seed_reads")).unwrap(),
+            selection.calls
+        );
+        assert_eq!(args["seed_reads_receipt"], "receipt");
+    }
+
     /// The task schema once enforced non-empty argument names with
     /// `propertyNames` and a 12-argument cap with `maxProperties`; strict wires
     /// reject both keywords, so the parser is the authority for them.

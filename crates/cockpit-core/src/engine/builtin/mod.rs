@@ -642,6 +642,18 @@ fn with_tiered_recall_tools(
     Ok(tb)
 }
 
+/// The `spawn` tool for this agent's swarm depth, advertising the child
+/// `model` selector only when the host would accept a model-chosen model.
+fn spawn_tool_for(args: &SpawnArgs) -> crate::tools::spawn::SpawnTool {
+    let tool = crate::tools::spawn::SpawnTool::for_depth(args.swarm_depth, args.swarm_max_depth);
+    let (extended, _) = crate::engine::model_roles::load_model_role_config(&args.config);
+    if extended.agent_chooses_subagent_model {
+        tool
+    } else {
+        tool.without_model_selection()
+    }
+}
+
 fn with_task_for_targets(tb: ToolBox, args: &SpawnArgs, targets: &[&str]) -> ToolBox {
     with_task_for_targets_granted(tb, args, targets, args.vnext_grant.as_ref())
 }
@@ -1392,10 +1404,7 @@ pub(crate) fn materialize_tool_by_name(
             def.and_then(crate::agents::AgentDef::allowed_knowledge_bases)
                 .cloned(),
         ))),
-        "spawn" => tb.with(Arc::new(tools::spawn::SpawnTool::for_depth(
-            args.swarm_depth,
-            args.swarm_max_depth,
-        ))),
+        "spawn" => tb.with(Arc::new(spawn_tool_for(args))),
         "worktree_orchestrate" => tb.with(Arc::new(
             tools::worktree_orchestrate::WorktreeOrchestrateTool,
         )),
@@ -3670,27 +3679,32 @@ fn resolve_vnext_slot_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> 
                 "parent-named model selector is refused because agent_chooses_subagent_model is off; allowed routes: {allowed_label}"
             );
         }
-        let crate::engine::model_roles::DelegationModelSelector::Exact { selector, .. } = selector
-        else {
-            bail!(
-                "parent-named category selector is refused; child slot allowed routes: {allowed_label}"
-            );
-        };
-        let (provider, model) = crate::engine::model_roles::split_selector(selector).ok_or_else(|| {
-            anyhow::anyhow!(
-                "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
-            )
-        })?;
-        let Some(route) = routes
+        let candidates: Vec<_> = routes
             .iter()
-            .find(|route| route.provider_id == provider && route.model_id == model)
-        else {
-            bail!(
-                "parent-named model `{selector}` is not in the child slot allowed route set: {allowed_label}"
-            );
-        };
-        return model_from_prepared_route(route, args)
-            .with_context(|| format!("loading prepared vNext child route `{selector}`"));
+            .map(|route| crate::engine::model_roles::FiniteSlotRoute {
+                provider: route.provider_id.clone(),
+                model: route.model_id.clone(),
+                is_default: route.is_default,
+            })
+            .collect();
+        let chosen = crate::engine::model_roles::select_finite_slot_route(
+            selector,
+            &def.name,
+            &candidates,
+            &providers,
+            &allowed_label,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let route = routes
+            .iter()
+            .find(|route| route.provider_id == chosen.provider && route.model_id == chosen.model)
+            .context("selected prepared vNext route vanished")?;
+        return model_from_prepared_route(route, args).with_context(|| {
+            format!(
+                "loading prepared vNext child route `{}:{}`",
+                chosen.provider, chosen.model
+            )
+        });
     }
 
     let default = routes
@@ -3815,32 +3829,32 @@ fn resolve_unprepared_vnext_delegation_selector(
             }
         });
     }
-    let crate::engine::model_roles::DelegationModelSelector::Exact { selector, .. } = selector
-    else {
-        bail!(
-            "subagent model selector category is refused; child slot allowed routes: {allowed_label}"
-        );
-    };
-    let (provider, model) = crate::engine::model_roles::split_selector(selector).ok_or_else(|| {
-        anyhow::anyhow!(
-            "subagent model selector `{selector}` is not in the child slot allowed route set: {allowed_label}"
-        )
-    })?;
-    if !slot
+    let default = slot.default_model();
+    let candidates: Vec<_> = slot
         .models
         .iter()
-        .any(|allowed| allowed.provider_id == provider && allowed.model_id == model)
-    {
-        bail!(
-            "subagent model selector `{selector}` is not in the child slot allowed route set: {allowed_label}"
-        );
-    }
+        .map(|allowed| crate::engine::model_roles::FiniteSlotRoute {
+            provider: allowed.provider_id.clone(),
+            model: allowed.model_id.clone(),
+            is_default: default.is_some_and(|default| {
+                default.provider_id == allowed.provider_id && default.model_id == allowed.model_id
+            }),
+        })
+        .collect();
+    let chosen = crate::engine::model_roles::select_finite_slot_route(
+        selector,
+        &def.name,
+        &candidates,
+        &args.config.providers(),
+        &allowed_label,
+    )
+    .map_err(anyhow::Error::msg)?;
     model_from_unprepared_slot_ids(
         def,
         args,
-        &provider,
-        &model,
-        &format!("parent-named route `{selector}`"),
+        &chosen.provider,
+        &chosen.model,
+        &format!("parent-named route `{}:{}`", chosen.provider, chosen.model),
     )
 }
 
@@ -4267,10 +4281,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
                     .with(Arc::new(crate::tools::read::ReadTool))
                     .with(Arc::new(crate::tools::bash::BashTool::new())),
             )
-            .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(
-                args.swarm_depth,
-                args.swarm_max_depth,
-            )))
+            .with(Arc::new(spawn_tool_for(args)))
             .with(Arc::new(crate::tools::mcp_tool::McpTool::default())),
             &args.config,
             &args.cwd,
@@ -4457,10 +4468,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
                     .with(Arc::new(crate::tools::read::ReadTool))
                     .with(Arc::new(crate::tools::bash::BashTool::new())),
             )
-            .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(
-                args.swarm_depth,
-                args.swarm_max_depth,
-            )))
+            .with(Arc::new(spawn_tool_for(args)))
             .with(Arc::new(crate::tools::harness::HarnessListTool))
             .with(Arc::new(crate::tools::harness::HarnessInvokeTool))
             .with(Arc::new(crate::tools::schedule::ScheduleTool))
@@ -4535,10 +4543,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
                 // The recursive fan-out tool (GOALS §24): a `bee` may fan out
                 // deeper `bee` workers, routed back to the single async-job
                 // authority.
-                .with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(
-                    args.swarm_depth,
-                    args.swarm_max_depth,
-                )))
+                .with(Arc::new(spawn_tool_for(args)))
                 .with(Arc::new(crate::tools::mcp_tool::McpTool::default())),
             &args.config,
             &args.cwd,
@@ -8915,6 +8920,102 @@ pub(crate) mod tests {
             message.contains("lmstudio/local")
                 && message.contains("not in the child slot allowed route set"),
             "parent-named model outside the authored list must be a structured refusal, got: {message}"
+        );
+    }
+
+    /// Two allowed slot routes with known context windows; only `slot-big`
+    /// is scoped to the `review` category.
+    fn finite_slot_args_with_catalog(cwd: &Path) -> SpawnArgs {
+        let mut args = unprepared_spawn_args_with_slot_providers(cwd, true);
+        let mut providers = args.config.providers();
+        let extended = args.config.extended();
+        let entry = providers.providers.get_mut("lmstudio").unwrap();
+        entry.models = vec![
+            crate::config::providers::ModelEntry {
+                id: "slot-default".into(),
+                context_length: Some(8_000),
+                ..Default::default()
+            },
+            crate::config::providers::ModelEntry {
+                id: "slot-big".into(),
+                context_length: Some(1_000_000),
+                availability: crate::config::providers::ModelAvailability {
+                    categories: vec!["review".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ];
+        args.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(0, providers, extended),
+        );
+        args
+    }
+
+    /// #549 C5: in a finite (authored) child slot, an exact selector's
+    /// requirements are enforced instead of discarded, and a category
+    /// selector picks the allowed route that admits it instead of being
+    /// refused outright.
+    #[test]
+    fn finite_vnext_slot_honors_parent_selector_requirements_and_categories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let def = vnext_def_with_primary_models(vec![
+            slot_model("lmstudio", "slot-default", true),
+            slot_model("lmstudio", "slot-big", false),
+        ]);
+
+        let mut args = finite_slot_args_with_catalog(tmp.path());
+        args.delegation_model = Some(crate::engine::model_roles::DelegationModelSelector::Exact {
+            selector: "lmstudio/slot-default".into(),
+            required_capabilities: Vec::new(),
+            min_context_tokens: Some(1_000_000),
+        });
+        let Err(err) = resolve_agent_model(&def, &args) else {
+            panic!("an allowed route that misses the selector's minimum context must be refused");
+        };
+        assert!(
+            format!("{err:#}").contains("does not meet the selector's requirements"),
+            "{err:#}"
+        );
+
+        args.delegation_model = Some(crate::engine::model_roles::DelegationModelSelector::Exact {
+            selector: "lmstudio/slot-big".into(),
+            required_capabilities: Vec::new(),
+            min_context_tokens: Some(1_000_000),
+        });
+        assert_eq!(
+            resolve_agent_model(&def, &args).unwrap().model_id_ref(),
+            "slot-big"
+        );
+
+        args.delegation_model = Some(
+            crate::engine::model_roles::DelegationModelSelector::Category {
+                category: Some("review".into()),
+                optimize: crate::config::providers::ModelOptimization::Balanced,
+                required_capabilities: Vec::new(),
+                min_context_tokens: None,
+            },
+        );
+        assert_eq!(
+            resolve_agent_model(&def, &args).unwrap().model_id_ref(),
+            "slot-big",
+            "a category selector picks the allowed route scoped to that category"
+        );
+
+        args.delegation_model = Some(
+            crate::engine::model_roles::DelegationModelSelector::Category {
+                category: Some("review".into()),
+                optimize: crate::config::providers::ModelOptimization::Balanced,
+                required_capabilities: Vec::new(),
+                min_context_tokens: Some(2_000_000),
+            },
+        );
+        let Err(err) = resolve_agent_model(&def, &args) else {
+            panic!("no allowed route meets the category selector's minimum context");
+        };
+        assert!(
+            format!("{err:#}").contains("admits category `review`"),
+            "{err:#}"
         );
     }
 

@@ -545,8 +545,12 @@ fn explicitly_allows_null(schema: &Value) -> bool {
 }
 
 /// Remove object-property nulls introduced only for strict-wire optionality.
-/// Arrays are intentionally opaque: their elements are model data, not the
-/// object-property omission encoding owned by this boundary.
+///
+/// Strict lowering adds the null arm to optional properties at every depth,
+/// including objects inside schema-described arrays (`targets[]`,
+/// `questions[]`), so normalization descends the same way. Array elements are
+/// otherwise model data: a null element, and any element whose `items` schema
+/// does not describe an object, are left untouched.
 pub(crate) fn strip_wire_nulls(canonical_schema: &Value, mut args: Value) -> Value {
     strip_object_nulls(canonical_schema, canonical_schema, &mut args);
     args
@@ -570,12 +574,89 @@ fn strip_object_nulls(root: &Value, schema: &Value, value: &mut Value) {
         let Some(property_schema) = property_schema else {
             continue;
         };
-        if let Some(child) = arguments.get_mut(&key)
-            && child.is_object()
-        {
-            strip_object_nulls(root, property_schema, child);
+        if let Some(child) = arguments.get_mut(&key) {
+            strip_nested_nulls(root, property_schema, child, 0);
         }
     }
+}
+
+fn strip_nested_nulls(root: &Value, schema: &Value, value: &mut Value, depth: usize) {
+    if depth > 64 {
+        return;
+    }
+    match value {
+        Value::Object(_) => strip_object_nulls(root, schema, value),
+        Value::Array(elements) => {
+            let Some(items) = find_items_schema(root, schema, 0) else {
+                return;
+            };
+            if !describes_object(root, items, 0) {
+                return;
+            }
+            for element in elements {
+                strip_nested_nulls(root, items, element, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `items` schema governing an array position, through `$ref` and
+/// combinators.
+fn find_items_schema<'a>(root: &'a Value, schema: &'a Value, depth: usize) -> Option<&'a Value> {
+    if depth > 64 {
+        return None;
+    }
+    let object = schema.as_object()?;
+    if let Some(items) = object.get("items").filter(|items| items.is_object()) {
+        return Some(items);
+    }
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str)
+        && let Some(target) = resolve_local_ref(root, reference)
+    {
+        return find_items_schema(root, target, depth + 1);
+    }
+    ["anyOf", "oneOf", "allOf"]
+        .into_iter()
+        .find_map(|combinator| {
+            object
+                .get(combinator)
+                .and_then(Value::as_array)
+                .and_then(|variants| {
+                    variants
+                        .iter()
+                        .find_map(|variant| find_items_schema(root, variant, depth + 1))
+                })
+        })
+}
+
+/// Whether a schema (or one of its variants) describes object properties, so
+/// the strict lowering would have made its optional fields nullable.
+fn describes_object(root: &Value, schema: &Value, depth: usize) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    if object.contains_key("properties") {
+        return true;
+    }
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str)
+        && let Some(target) = resolve_local_ref(root, reference)
+    {
+        return describes_object(root, target, depth + 1);
+    }
+    ["anyOf", "oneOf", "allOf"].into_iter().any(|combinator| {
+        object
+            .get(combinator)
+            .and_then(Value::as_array)
+            .is_some_and(|variants| {
+                variants
+                    .iter()
+                    .any(|variant| describes_object(root, variant, depth + 1))
+            })
+    })
 }
 
 fn find_property_schema<'a>(
@@ -1592,6 +1673,77 @@ pub(crate) mod tests {
             foreign.parameters["properties"]["wide"]["minimum"],
             i64::MIN,
             "canonical mutated"
+        );
+    }
+
+    /// The strict request body for `schema`, as rig serializes it.
+    pub(crate) fn strict_parameters(schema: &Value) -> Value {
+        rig::providers::openai::responses_api::ResponsesToolDefinition::strict_function(
+            "probe",
+            "probe",
+            for_responses(schema),
+        )
+        .parameters
+    }
+
+    /// Assert `args` is a legal strict-wire call and that, once normalized,
+    /// it satisfies the canonical schema.
+    pub(crate) fn assert_strict_call_normalizes(canonical: &Value, args: Value) -> Value {
+        let strict = jsonschema::validator_for(&strict_parameters(canonical)).unwrap();
+        assert!(
+            strict.is_valid(&args),
+            "fixture is not a legal strict-wire call: {:?}",
+            strict
+                .iter_errors(&args)
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+        let normalized = strip_wire_nulls(canonical, args);
+        let canonical_validator = jsonschema::validator_for(canonical).unwrap();
+        assert!(
+            canonical_validator.is_valid(&normalized),
+            "normalized strict call violates the canonical schema: {normalized} {:?}",
+            canonical_validator
+                .iter_errors(&normalized)
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+        normalized
+    }
+
+    /// #549 C1: strict lowering makes optional fields nullable inside array
+    /// items too (`questions[].options`, `options[].description`), so the
+    /// normalizer must remove those placeholders there, or a free-text
+    /// question is rejected before the user sees it.
+    #[test]
+    fn strict_placeholder_nulls_inside_array_items_are_normalized() {
+        let canonical =
+            crate::engine::tool::Tool::parameters(&crate::tools::question::QuestionTool);
+        let normalized = assert_strict_call_normalizes(
+            &canonical,
+            json!({
+                "questions": [
+                    { "type": "text", "prompt": "Choose a name", "options": null },
+                    {
+                        "type": "select",
+                        "prompt": "Pick one",
+                        "options": [
+                            { "id": "a", "label": "A", "description": null },
+                            { "id": "b", "label": "B", "description": "second" }
+                        ]
+                    }
+                ]
+            }),
+        );
+        assert!(normalized["questions"][0].get("options").is_none());
+        assert!(
+            normalized["questions"][1]["options"][0]
+                .get("description")
+                .is_none()
+        );
+        assert_eq!(
+            normalized["questions"][1]["options"][1]["description"],
+            "second"
         );
     }
 }

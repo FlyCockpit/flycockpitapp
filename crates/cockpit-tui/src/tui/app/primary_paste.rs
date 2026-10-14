@@ -62,7 +62,9 @@ impl App {
         if self.btw_focus_owns_input() {
             return PrimaryPasteLayer::BtwPane;
         }
-        if self.embedded_pane_owns_input()
+        // A focused pane keeps the middle-click away from the composer only
+        // while the panes are what the surface paints.
+        if (self.pane_focused && self.surface_chat_tiles_painted())
             || self
                 .pane_rect
                 .is_some_and(|rect| super::mouse::point_in(rect, mouse.column, mouse.row))

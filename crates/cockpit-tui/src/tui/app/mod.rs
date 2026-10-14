@@ -2821,6 +2821,17 @@ pub struct App {
     /// (`App::cover`): the surface's pointer z-order and the occlusion
     /// record for buttons, links and OSC 8 output.
     pub(super) paint_record: Vec<(pointer::PaintedPart, ratatui::layout::Rect)>,
+    /// The ownership state the last frame was drawn for
+    /// (`App::painted_frame_is_stale`). `None` before the first frame.
+    pub(super) painted_ownership: Option<pointer::FrameOwnership>,
+    /// A resize arrived since the last frame was drawn: its geometry is void.
+    pub(super) frame_layout_stale: bool,
+    /// This frame's transcript-find bar row, if painted: transcript targets
+    /// on it are covered.
+    pub(super) find_bar_rect: Option<ratatui::layout::Rect>,
+    /// The frame area of the last draw (the bounds floating layers were
+    /// placed in).
+    pub(super) last_frame_area: ratatui::layout::Rect,
     /// A link the transcript registers when it paints (test probe): the
     /// transcript itself registers none in production, and the ownership
     /// matrix needs one under every covering part to observe OSC 8 output.
@@ -4413,6 +4424,10 @@ impl App {
             #[cfg(any(test, feature = "test-support"))]
             last_popover_rect: ratatui::layout::Rect::default(),
             paint_record: Vec::new(),
+            painted_ownership: None,
+            frame_layout_stale: false,
+            find_bar_rect: None,
+            last_frame_area: ratatui::layout::Rect::default(),
             #[cfg(test)]
             test_transcript_link: None,
 

@@ -39,7 +39,12 @@ impl App {
         let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
         match self.surface_part_at(pos) {
             Some(SurfacePart::ComposerPicker) => return PrimaryPasteLayer::Footer,
-            Some(SurfacePart::SessionRail | SurfacePart::HeaderMore) => {
+            Some(
+                SurfacePart::SessionRail
+                | SurfacePart::HeaderMore
+                | SurfacePart::FindBar
+                | SurfacePart::Toast,
+            ) => {
                 return PrimaryPasteLayer::Other;
             }
             Some(SurfacePart::Popover) | None => {}
@@ -54,10 +59,10 @@ impl App {
         if self.question_dialog.is_some() {
             return PrimaryPasteLayer::Dialog;
         }
-        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused) {
+        if self.btw_focus_owns_input() {
             return PrimaryPasteLayer::BtwPane;
         }
-        if self.pane_focused
+        if self.embedded_pane_owns_input()
             || self
                 .pane_rect
                 .is_some_and(|rect| super::mouse::point_in(rect, mouse.column, mouse.row))

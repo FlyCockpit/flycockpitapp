@@ -131,6 +131,32 @@ pub(super) enum SurfacePart {
     ComposerPicker,
     /// The chat header's collapsed-pill `more` popover.
     HeaderMore,
+    /// The transcript-find bar, painted over the transcript's last row.
+    FindBar,
+    /// A transient toast, painted over the body's last row. A press or wheel
+    /// on it dismisses it and goes no further.
+    Toast,
+}
+
+/// The ownership state a frame was painted for. Frame-owned hit targets
+/// (the registries, the paint record, tile geometry) are valid only while
+/// the current state still matches the frame the user saw: a modal opened,
+/// a part closed or a resize between draws (one input drain) voids them,
+/// and pointer events are dropped until the next frame is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FrameOwnership {
+    top: Layer,
+    popover_up: bool,
+    question: bool,
+    overlay: std::mem::Discriminant<super::Overlay>,
+    dialog_active: bool,
+    picker: bool,
+    header_more: bool,
+    pane_focused: bool,
+    pane_open: bool,
+    btw_focused: bool,
+    find: bool,
+    toast: bool,
 }
 
 /// One covering paint of the frame just drawn.
@@ -238,13 +264,13 @@ impl App {
     pub(super) fn surface_text_owner(&self) -> SurfaceTextOwner {
         if self.composer_controls.picker.is_some() && self.composer_chrome_interactive() {
             SurfaceTextOwner::ComposerPicker
-        } else if self.queue_focus.is_some() {
+        } else if self.queue_focus.is_some() && self.surface_chat_tiles_painted() {
             SurfaceTextOwner::Queue
-        } else if self.btw_pane.as_ref().is_some_and(|pane| pane.focused) {
+        } else if self.btw_focus_owns_input() {
             SurfaceTextOwner::Btw
         } else if self.session_rail.is_focused() {
             SurfaceTextOwner::Rail
-        } else if self.pane.is_some() && self.pane_focused {
+        } else if self.embedded_pane_owns_input() {
             SurfaceTextOwner::EmbeddedPane
         } else if self.pending_prune_confirm
             || self.pending_resume_compaction_confirm
@@ -391,6 +417,11 @@ impl App {
     /// pointer position is forgotten. A resize also voids the selection's
     /// coordinates.
     pub(super) fn end_pointer_interactions(&mut self, end: PointerInteractionEnd) {
+        if end == PointerInteractionEnd::Resize {
+            // The frame on screen no longer has the geometry its targets
+            // were registered at: nothing hit-tests until the next draw.
+            self.frame_layout_stale = true;
+        }
         self.end_pointer_captures_clearing_selection(end == PointerInteractionEnd::Resize);
         self.dialog.cancel_settings_pointer_confirmations();
         self.forget_pointer();
@@ -480,6 +511,59 @@ impl App {
             })
     }
 
+    /// Whether the surface's chat tiles — the embedded/btw panes, the
+    /// queue, the composer and its suggestions — are what the surface paints
+    /// this frame. The body popover, the question dialog, the workspace-trust
+    /// dialog and the onboarding shell replace them; a focus held by a tile
+    /// that is not painted owns no input (its focus is kept for when the tile
+    /// returns).
+    pub(super) fn surface_chat_tiles_painted(&self) -> bool {
+        self.base_layer() == Layer::Surface
+            && !self.surface_popover_up()
+            && self.question_dialog.is_none()
+    }
+
+    /// A focused btw pane owns the keyboard only while it is painted.
+    pub(super) fn btw_focus_owns_input(&self) -> bool {
+        self.btw_pane.as_ref().is_some_and(|pane| pane.focused) && self.surface_chat_tiles_painted()
+    }
+
+    /// A focused embedded PTY owns the keyboard only while it is painted.
+    pub(super) fn embedded_pane_owns_input(&self) -> bool {
+        self.pane.is_some() && self.pane_focused && self.surface_chat_tiles_painted()
+    }
+
+    /// The ownership state of the current App state, compared against the
+    /// one recorded when the last frame was drawn.
+    pub(super) fn frame_ownership(&self) -> FrameOwnership {
+        FrameOwnership {
+            top: self.top_layer(),
+            popover_up: self.surface_popover_up(),
+            question: self.question_dialog.is_some(),
+            overlay: std::mem::discriminant(&self.overlay),
+            dialog_active: self.dialog.is_active(),
+            picker: self.composer_controls.picker.is_some(),
+            header_more: self.chat_header_more_open,
+            pane_focused: self.pane_focused,
+            pane_open: self.pane.is_some(),
+            btw_focused: self.btw_pane.as_ref().is_some_and(|pane| pane.focused),
+            find: self.transcript_find.is_some(),
+            toast: self.toast.is_some(),
+        }
+    }
+
+    /// Whether the frame on screen is stale for pointer input: a resize, or
+    /// an ownership change (a modal opened, a part closed) since it was
+    /// drawn. Its registered targets and geometry belong to a frame the
+    /// state no longer matches, so the pointer event is dropped. Before the
+    /// first frame there is nothing to compare with.
+    pub(super) fn painted_frame_is_stale(&self) -> bool {
+        self.frame_layout_stale
+            || self
+                .painted_ownership
+                .is_some_and(|painted| painted != self.frame_ownership())
+    }
+
     /// Whether the body popover (an overlay pane, the settings/wizard
     /// dialog or the workspace-trust dialog) is up on the surface. The one
     /// predicate both paint ([`App::render`] paints the popover exactly when
@@ -561,7 +645,13 @@ impl App {
         // of the surface (its links, buttons and settings hover).
         let covering_chrome = matches!(
             part,
-            Some(SurfacePart::SessionRail | SurfacePart::ComposerPicker | SurfacePart::HeaderMore)
+            Some(
+                SurfacePart::SessionRail
+                    | SurfacePart::ComposerPicker
+                    | SurfacePart::HeaderMore
+                    | SurfacePart::FindBar
+                    | SurfacePart::Toast
+            )
         );
         if covering_chrome {
             // A covering part owns the pointer here: nothing it covers

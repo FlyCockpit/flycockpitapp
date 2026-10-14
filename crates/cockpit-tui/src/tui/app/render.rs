@@ -1256,6 +1256,13 @@ impl App {
         self.suggestion_row_hits.clear();
         // The paint record is rebuilt as this frame paints its covering parts.
         self.paint_record.clear();
+        self.last_frame_area = frame.area();
+        // Pane geometry is this frame's too: a mode that does not paint the
+        // panes (a popover, the question dialog) leaves none to hit-test.
+        self.pane_rect = None;
+        self.divider = None;
+        self.pane_body = None;
+        self.find_bar_rect = None;
         self.session_rail.set_pointer_capture(self.mouse_capture);
         self.session_rail.begin_frame();
         let rects = geom.layout(frame.area());
@@ -1511,7 +1518,13 @@ impl App {
                 rects.body.width,
                 u16::from(rects.body.height > 0),
             );
+            let mark = self.paint_mark();
             render_toast(frame, toast_row, &toast);
+            self.cover(
+                super::pointer::PaintedPart::Surface(super::pointer::SurfacePart::Toast),
+                toast_row,
+                mark,
+            );
         }
 
         // Floating layers, painted bottom-up in the order of the layer stack
@@ -1572,6 +1585,9 @@ impl App {
             }
         }
         self.button_registry.end_frame();
+        // The targets just registered belong to this ownership state.
+        self.painted_ownership = Some(self.frame_ownership());
+        self.frame_layout_stale = false;
     }
 
     fn render_daemon_restart_prompt(&mut self, frame: &mut ratatui::Frame) -> Option<Rect> {
@@ -1651,13 +1667,21 @@ impl App {
         let Some(area) = self.chat_area else {
             return;
         };
+        // The find bar, painted over the transcript's last row, covers what
+        // the transcript would register there.
+        let covered_row = self.find_bar_rect.map(|rect| rect.y);
         #[cfg(test)]
-        if let Some((rect, url)) = self.test_transcript_link.clone() {
+        if let Some((rect, url)) = self.test_transcript_link.clone()
+            && Some(rect.y) != covered_row
+        {
             self.link_registry.register(rect, url, "probe");
         }
         let mut chips = Vec::new();
         for (row, meta) in self.chat_row_meta.iter().enumerate() {
             let y = area.y.saturating_add(row as u16);
+            if Some(y) == covered_row {
+                continue;
+            }
             if let Some(hit) = meta.fork_hit {
                 chips.push((
                     area.x.saturating_add(hit.col_start),
@@ -3287,6 +3311,18 @@ impl App {
         }
 
         if self.find_owns_bottom_row() {
+            // The bar covers the transcript's last row: what the transcript
+            // registered there is gone, and it owns that row's pointer.
+            let mark = self.paint_mark();
+            if area.width > 0 && area.height > 0 {
+                let row = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+                self.find_bar_rect = Some(row);
+                self.cover(
+                    super::pointer::PaintedPart::Surface(super::pointer::SurfacePart::FindBar),
+                    row,
+                    mark,
+                );
+            }
             render_transcript_find_bar(
                 frame.buffer_mut(),
                 area,

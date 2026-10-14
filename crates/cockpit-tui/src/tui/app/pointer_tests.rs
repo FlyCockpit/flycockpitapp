@@ -1032,8 +1032,25 @@ enum Owner {
     QuestionOverSettings,
     /// The question dialog mounted over a painted slash-suggestion list.
     QuestionOverSuggestions,
+    /// The question dialog mounted over a focused btw pane: the pane is no
+    /// longer painted, so neither its focus nor its old cells take input.
+    QuestionOverBtw,
+    /// The question dialog mounted over a focused embedded PTY.
+    QuestionOverPane,
+    /// The transcript-find bar's row over the transcript's last row.
+    FindBar,
+    /// A transient toast over the body's last row.
+    Toast,
     /// A surface text owner: keys and paste only.
     Text(SurfaceTextOwner),
+    /// The other armed confirmations (`Text(Confirmation)` arms `/stop`).
+    Confirm(ConfirmKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmKind {
+    Prune,
+    ResumeCompaction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1086,8 +1103,16 @@ fn owners() -> Vec<Owner> {
         Owner::HeaderMore,
         Owner::QuestionOverSettings,
         Owner::QuestionOverSuggestions,
+        Owner::QuestionOverBtw,
+        Owner::QuestionOverPane,
+        Owner::FindBar,
+        Owner::Toast,
     ]);
     owners.extend(SurfaceTextOwner::ALL.iter().copied().map(Owner::Text));
+    owners.extend([
+        Owner::Confirm(ConfirmKind::Prune),
+        Owner::Confirm(ConfirmKind::ResumeCompaction),
+    ]);
     owners
 }
 
@@ -1115,6 +1140,8 @@ struct Fixture {
     /// Owner-specific state captured at mount (suggestion rects, settings
     /// buttons).
     old_rects: Vec<Rect>,
+    /// Bytes written to the embedded PTY, when the fixture mounts one.
+    pane_input: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
 }
 
 fn matrix_app(tmp: &std::path::Path) -> App {
@@ -1182,10 +1209,22 @@ fn mount(tmp: &std::path::Path, owner: Owner) -> Fixture {
     let mut app = matrix_app(tmp);
     let (mut width, mut height) = (120, 50);
     let mut old_rects = Vec::new();
+    let mut pane_input = None;
     let mut top = Top::Covering;
     let rect: Rect = match owner {
         Owner::Layer(layer) => {
-            if layer == Layer::PinsReview {
+            if layer == Layer::RulesReview {
+                let rule = |text: &str| cockpit_proto::ConversationRule {
+                    rule_id: uuid::Uuid::new_v4(),
+                    lineage_id: uuid::Uuid::new_v4(),
+                    text: text.to_string(),
+                    created_by: cockpit_proto::ConversationRuleCreatedBy::User,
+                    source_trust: cockpit_proto::ConversationRuleSourceTrust::Trusted,
+                    created_at_unix_ms: 0,
+                };
+                app.rules_review =
+                    RulesReview::enter(vec![rule("cite the spec"), rule("keep it short")]);
+            } else if layer == Layer::PinsReview {
                 app.pins_review = PinsReview::enter(
                     (1..=2)
                         .map(|seq| cockpit_proto::PinnedMessage {
@@ -1320,9 +1359,49 @@ fn mount(tmp: &std::path::Path, owner: Owner) -> Fixture {
             top = Top::Transcript;
             area
         }
+        Owner::QuestionOverBtw => {
+            mount_text_owner(&mut app, SurfaceTextOwner::Btw, tmp);
+            let pane = app.btw_pane.as_ref().expect("btw pane");
+            let painted = pane.body_rect.expect("btw pane painted");
+            old_rects.push(painted);
+            app.question_dialog = Some(question());
+            draw(&mut app, width, height);
+            top = Top::Transcript;
+            painted
+        }
+        Owner::QuestionOverPane => {
+            pane_input = mount_text_owner(&mut app, SurfaceTextOwner::EmbeddedPane, tmp);
+            let painted = app.pane_rect.expect("embedded pane painted");
+            old_rects.push(painted);
+            app.question_dialog = Some(question());
+            draw(&mut app, width, height);
+            top = Top::Transcript;
+            painted
+        }
+        Owner::FindBar => {
+            draw(&mut app, width, height);
+            app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            draw(&mut app, width, height);
+            surface_rect(&app, SurfacePart::FindBar)
+        }
+        Owner::Toast => {
+            draw(&mut app, width, height);
+            app.show_toast("a notice over the last row", super::ToastKind::Info);
+            draw(&mut app, width, height);
+            surface_rect(&app, SurfacePart::Toast)
+        }
         Owner::Text(text) => {
             top = Top::Focus;
-            mount_text_owner(&mut app, text, tmp);
+            pane_input = mount_text_owner(&mut app, text, tmp);
+            Rect::new(0, 0, width, height)
+        }
+        Owner::Confirm(kind) => {
+            top = Top::Focus;
+            match kind {
+                ConfirmKind::Prune => app.pending_prune_confirm = true,
+                ConfirmKind::ResumeCompaction => app.pending_resume_compaction_confirm = true,
+            }
+            draw(&mut app, width, height);
             Rect::new(0, 0, width, height)
         }
     };
@@ -1348,13 +1427,31 @@ fn mount(tmp: &std::path::Path, owner: Owner) -> Fixture {
             over.x + over.width / 2,
             over.y + over.height / 2,
         ));
+    // The click/hover columns discriminate only where a transcript control
+    // really lies under the owner (or, bare, is visible there).
+    if matches!(owner, Owner::Popover(_) | Owner::Layer(Layer::Surface)) {
+        assert!(
+            controls.contains(&cell),
+            "{owner:?}: the fixture must put a transcript control under the owner"
+        );
+    }
+    // Not on (or dragging onto) a registered button, so a press there is
+    // the transcript's own gesture when the transcript owns it.
+    let on_button = |pos: Position| {
+        controls.contains(&pos)
+            || app
+                .button_registry
+                .targets()
+                .iter()
+                .any(|target| target.rect.contains(pos))
+    };
     let plain = (over.y..over.bottom())
         .flat_map(|y| (over.x..over.right()).map(move |x| Position::new(x, y)))
         .find(|pos| {
             *pos != cell
                 && !buffer[(pos.x, pos.y)].symbol().trim().is_empty()
-                && !controls.contains(pos)
-                && !controls.contains(&Position::new(pos.x + 2, pos.y))
+                && !on_button(*pos)
+                && !on_button(Position::new(pos.x + 2, pos.y))
                 && pos.x + 2 < over.right()
         })
         .unwrap_or(cell);
@@ -1366,6 +1463,7 @@ fn mount(tmp: &std::path::Path, owner: Owner) -> Fixture {
         plain,
         top,
         old_rects,
+        pane_input,
     }
 }
 
@@ -1377,8 +1475,13 @@ fn transcript_control_cells_or_none(app: &App) -> Vec<Position> {
 }
 
 /// Put the surface text owner `owner` in charge of typing.
-fn mount_text_owner(app: &mut App, owner: SurfaceTextOwner, tmp: &std::path::Path) {
+fn mount_text_owner(
+    app: &mut App,
+    owner: SurfaceTextOwner,
+    tmp: &std::path::Path,
+) -> Option<std::sync::mpsc::Receiver<Vec<u8>>> {
     draw(app, 120, 50);
+    let mut pane_input = None;
     match owner {
         SurfaceTextOwner::ComposerPicker => {
             app.open_composer_picker(crate::tui::composer_controls::ComposerControlKind::Approval);
@@ -1408,19 +1511,26 @@ fn mount_text_owner(app: &mut App, owner: SurfaceTextOwner, tmp: &std::path::Pat
             app.session_rail.focus_search();
         }
         SurfaceTextOwner::EmbeddedPane => {
-            #[cfg(unix)]
-            {
-                let pane = crate::tui::pty::PtyPane::spawn(
-                    crate::tui::pty::PaneKind::Editor,
-                    &["cat".to_string()],
-                    &std::env::temp_dir(),
-                    24,
-                    80,
-                )
-                .expect("spawn cat pty child");
-                app.pane = Some(pane);
-                app.pane_focused = true;
-            }
+            // A child that keeps reading its terminal on every supported
+            // platform; the input observer sees exactly what the app writes.
+            let argv = if cfg!(windows) {
+                vec!["cmd.exe".to_string()]
+            } else {
+                vec!["cat".to_string()]
+            };
+            let mut pane = crate::tui::pty::PtyPane::spawn(
+                crate::tui::pty::PaneKind::Editor,
+                &argv,
+                &std::env::temp_dir(),
+                24,
+                80,
+            )
+            .expect("spawn a pty child");
+            let (tx, rx) = std::sync::mpsc::channel();
+            pane.install_input_observer(tx);
+            app.pane = Some(pane);
+            app.pane_focused = true;
+            pane_input = Some(rx);
         }
         SurfaceTextOwner::Confirmation => app.pending_stop_confirm = Some(Vec::new()),
         SurfaceTextOwner::PickMode => app.enter_pin_pick_mode(),
@@ -1455,6 +1565,7 @@ fn mount_text_owner(app: &mut App, owner: SurfaceTextOwner, tmp: &std::path::Pat
         SurfaceTextOwner::Composer => {}
     }
     draw(app, 120, 50);
+    pane_input
 }
 
 /// One terminal event through the production intake, then the classifier's
@@ -1503,15 +1614,17 @@ fn key_case(owner: Owner) -> (Vec<KeyCode>, fn(&App) -> bool) {
         Owner::Layer(Layer::ContextMenu) => (vec![Char('j')], |app| {
             app.context_menu.as_ref().map(|menu| menu.cursor) == Some(1)
         }),
-        Owner::Layer(Layer::RulesReview) => {
-            (vec![Char('j'), Esc], |app| app.rules_review.is_none())
-        }
+        Owner::Layer(Layer::RulesReview) => (vec![Char('j')], |app| {
+            app.rules_review.as_ref().map(|review| review.cursor) == Some(1)
+        }),
         Owner::Layer(Layer::PinsReview) => (vec![Char('j')], |app| {
             app.pins_review.as_ref().map(|review| review.cursor) == Some(1)
         }),
         Owner::Layer(Layer::WorkspaceTrust) => (vec![Char('x'), Char('y')], |app| {
             app.base_layer() == Layer::WorkspaceTrust
         }),
+        // The shell keeps the keys (its screens advance through daemon
+        // RPCs, absent here); the composer check below is the discriminator.
         Owner::Layer(Layer::Onboarding) => (vec![Char('x'), Char('y')], |app| {
             app.onboarding_shell.is_some()
         }),
@@ -1555,9 +1668,29 @@ fn key_case(owner: Owner) -> (Vec<KeyCode>, fn(&App) -> bool) {
         Owner::Text(SurfaceTextOwner::Rail) => (vec![Char('x'), Char('y')], |app| {
             app.session_rail.search_query() == "xy"
         }),
-        Owner::Text(SurfaceTextOwner::EmbeddedPane) => {
-            (vec![Char('x')], |app| app.pane.is_some() || cfg!(not(unix)))
-        }
+        // The pane's own delivery is checked in `run_cell` (its observer).
+        Owner::QuestionOverPane => (vec![Char('x')], |app| app.question_dialog.is_some()),
+        Owner::QuestionOverBtw => (vec![Char('x')], |app| {
+            app.question_dialog.is_some()
+                && app
+                    .btw_pane
+                    .as_ref()
+                    .is_some_and(|pane| pane.test_composer_text().is_empty())
+        }),
+        Owner::FindBar => (vec![Char('x')], |app| {
+            app.transcript_find
+                .as_ref()
+                .is_some_and(|find| find.query == "x")
+        }),
+        // Non-modal: typing goes on into the composer under it.
+        Owner::Toast => (vec![Char('x'), Char('y')], |app| {
+            app.composer.text() == "xy"
+        }),
+        Owner::Confirm(ConfirmKind::Prune) => (vec![Char('n')], |app| !app.pending_prune_confirm),
+        Owner::Confirm(ConfirmKind::ResumeCompaction) => (vec![Char('n')], |app| {
+            !app.pending_resume_compaction_confirm
+        }),
+        Owner::Text(SurfaceTextOwner::EmbeddedPane) => (vec![Char('x')], |app| app.pane.is_some()),
         Owner::Text(SurfaceTextOwner::Confirmation) => {
             (vec![Char('n')], |app| app.pending_stop_confirm.is_none())
         }
@@ -1599,7 +1732,8 @@ fn paste_landed(owner: Owner, app: &App, text: &str) -> Result<(), String> {
     match owner {
         // The composer takes it — condensed into a paste block, as a
         // multi-line paste crossing the threshold is.
-        Owner::Layer(Layer::Surface) | Owner::Text(SurfaceTextOwner::Composer) => {
+        // A toast is non-modal: the composer under it takes the paste.
+        Owner::Layer(Layer::Surface) | Owner::Text(SurfaceTextOwner::Composer) | Owner::Toast => {
             if app.composer.text().starts_with("[Pasted text #1") {
                 Ok(())
             } else {
@@ -1671,7 +1805,21 @@ fn paste_landed(owner: Owner, app: &App, text: &str) -> Result<(), String> {
                 .then_some(())
                 .ok_or(format!("rail search {:?}", app.session_rail.search_query()))
         }
-        Owner::Text(SurfaceTextOwner::Find) => {
+        Owner::QuestionOverBtw => {
+            untouched()?;
+            app.btw_pane
+                .as_ref()
+                .filter(|pane| pane.test_composer_text().is_empty())
+                .map(|_| ())
+                .ok_or("the hidden btw pane took the paste".to_string())
+        }
+        Owner::Confirm(_) => {
+            untouched()?;
+            (!app.pending_prune_confirm && !app.pending_resume_compaction_confirm)
+                .then_some(())
+                .ok_or("the confirmation stayed armed".to_string())
+        }
+        Owner::Text(SurfaceTextOwner::Find) | Owner::FindBar => {
             untouched()?;
             app.transcript_find
                 .as_ref()
@@ -1699,6 +1847,32 @@ fn paste_landed(owner: Owner, app: &App, text: &str) -> Result<(), String> {
     }
 }
 
+/// What the embedded PTY received: the focused, painted pane gets the input;
+/// a pane the question dialog replaced gets nothing.
+fn pane_delivery(
+    owner: Owner,
+    input: Option<&std::sync::mpsc::Receiver<Vec<u8>>>,
+    want: &[u8],
+) -> Result<(), String> {
+    let Some(input) = input else {
+        return Ok(());
+    };
+    let written: Vec<u8> = input.try_iter().flatten().collect();
+    let delivered = written.windows(want.len()).any(|bytes| bytes == want);
+    match owner {
+        Owner::Text(SurfaceTextOwner::EmbeddedPane) if !delivered => Err(format!(
+            "the focused pane did not receive {:?} (got {:?})",
+            String::from_utf8_lossy(want),
+            String::from_utf8_lossy(&written)
+        )),
+        Owner::QuestionOverPane if !written.is_empty() => Err(format!(
+            "the hidden pane received {:?}",
+            String::from_utf8_lossy(&written)
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn run_cell(tmp: &std::path::Path, owner: Owner, input: Input) -> Result<(), String> {
     let fx = mount(tmp, owner);
     let Fixture {
@@ -1709,6 +1883,7 @@ fn run_cell(tmp: &std::path::Path, owner: Owner, input: Input) -> Result<(), Str
         plain,
         top,
         old_rects,
+        pane_input,
     } = fx;
     let pointer = matches!(
         input,
@@ -1831,6 +2006,7 @@ fn run_cell(tmp: &std::path::Path, owner: Owner, input: Input) -> Result<(), Str
                     .collect(),
             );
             check(handled(&app), &format!("{keys:?} did not reach the owner"))?;
+            pane_delivery(owner, pane_input.as_ref(), b"x")?;
             if picker_cursor.is_some() {
                 check(
                     app.composer_controls.picker.as_ref().map(|p| p.cursor) != picker_cursor,
@@ -1840,6 +2016,7 @@ fn run_cell(tmp: &std::path::Path, owner: Owner, input: Input) -> Result<(), Str
             let composer_owns = matches!(
                 owner,
                 Owner::Layer(Layer::Surface)
+                    | Owner::Toast
                     | Owner::Text(
                         SurfaceTextOwner::Composer
                             | SurfaceTextOwner::ComposerPill
@@ -1860,6 +2037,7 @@ fn run_cell(tmp: &std::path::Path, owner: Owner, input: Input) -> Result<(), Str
                 vec![crossterm::event::Event::Paste(text.to_string())],
             );
             paste_landed(owner, &app, text)?;
+            pane_delivery(owner, pane_input.as_ref(), b"pasted text")?;
         }
         Input::Osc8 => {
             // A link the transcript registers under the owner's cell.
@@ -1927,5 +2105,283 @@ fn every_input_reaches_exactly_the_owner_on_top() {
         "{} cell(s) failed:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+// ── Frame-owned targets across transitions (r2) ─────────────────────────
+
+/// The registered targets of a transcript control, by cell.
+fn pressed_transcript_control(app: &App) -> bool {
+    is_transcript_target(app, app.button_registry.pressed().map(|press| &press.id))
+}
+
+#[test]
+fn a_popover_opened_before_the_next_draw_takes_the_old_frames_clicks() {
+    // `/help` + Enter and a click on a transcript control the help box will
+    // cover arrive in one input drain: no redraw between them.
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut probe = matrix_app(tmp.path());
+    probe.overlay = super::Overlay::Help(super::help_overlay::HelpOverlay::open());
+    draw(&mut probe, 120, 50);
+    let popover = probe.last_popover_rect;
+
+    let mut app = matrix_app(tmp.path());
+    draw(&mut app, 120, 50);
+    let covered = transcript_control_cells(&app)
+        .into_iter()
+        .find(|cell| popover.contains(*cell))
+        .expect("a transcript control the help box will cover");
+    for ch in "/help".chars() {
+        app.handle_key(key(KeyCode::Char(ch)));
+    }
+    app.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(app.overlay, super::Overlay::Help(_)),
+        "/help opened"
+    );
+    let history = app.history.len();
+    feed(
+        &mut app,
+        vec![
+            mouse_at(MouseEventKind::Down(MouseButton::Left), covered),
+            mouse_at(MouseEventKind::Up(MouseButton::Left), covered),
+        ],
+    );
+    assert!(
+        !pressed_transcript_control(&app),
+        "the old frame's control was pressed"
+    );
+    assert!(app.pin_pick.is_none() && app.fork_pick.is_none());
+    assert_eq!(app.history.len(), history, "the old frame's control acted");
+
+    // Inverse: once the help frame is drawn, a transcript control it does
+    // not cover takes the pointer.
+    draw(&mut app, 120, 50);
+    let open = transcript_control_cells(&app)
+        .into_iter()
+        .find(|cell| !app.last_popover_rect.contains(*cell))
+        .expect("an uncovered transcript control beside the help box");
+    feed(
+        &mut app,
+        vec![mouse_at(MouseEventKind::Down(MouseButton::Left), open)],
+    );
+    assert!(
+        pressed_transcript_control(&app),
+        "the visible control lost the pointer"
+    );
+}
+
+#[test]
+fn a_resize_voids_the_old_frames_targets_until_the_next_draw() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = matrix_app(tmp.path());
+    draw(&mut app, 120, 50);
+    let control = transcript_control_cells(&app)
+        .into_iter()
+        .find(|cell| cell.y < 30)
+        .expect("a transcript control inside the resized terminal too");
+    feed(
+        &mut app,
+        vec![
+            crossterm::event::Event::Resize(120, 30),
+            mouse_at(MouseEventKind::Down(MouseButton::Left), control),
+        ],
+    );
+    assert!(
+        !pressed_transcript_control(&app),
+        "a press hit the pre-resize geometry"
+    );
+    // Inverse: the resized frame's own controls take the pointer.
+    draw(&mut app, 120, 30);
+    let control = transcript_control_cells(&app)
+        .into_iter()
+        .next()
+        .expect("a transcript control at the new size");
+    feed(
+        &mut app,
+        vec![mouse_at(MouseEventKind::Down(MouseButton::Left), control)],
+    );
+    assert!(
+        pressed_transcript_control(&app),
+        "the new frame's control lost the pointer"
+    );
+}
+
+#[test]
+fn a_toast_press_dismisses_it_and_reaches_nothing_under_its_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = matrix_app(tmp.path());
+    draw(&mut app, 120, 50);
+    app.show_toast("a notice over the last row", super::ToastKind::Info);
+    draw(&mut app, 120, 50);
+    let row = surface_rect(&app, SurfacePart::Toast);
+    let chat = app.chat_area.expect("transcript painted");
+    let cell = Position::new(row.x + chat.width / 2, row.y);
+    feed(
+        &mut app,
+        vec![mouse_at(MouseEventKind::Down(MouseButton::Right), cell)],
+    );
+    assert!(app.toast.is_none(), "the press dismissed the toast");
+    assert!(
+        app.context_menu.is_none(),
+        "the press reached the row under it"
+    );
+    // Inverse: once redrawn without the toast, that row is the transcript's.
+    draw(&mut app, 120, 50);
+    if chat.contains(cell) {
+        feed(
+            &mut app,
+            vec![mouse_at(MouseEventKind::Down(MouseButton::Right), cell)],
+        );
+        assert!(
+            app.context_menu.is_some(),
+            "the uncovered row lost the pointer"
+        );
+    }
+}
+
+// ── Live covering parts keep their uncovered neighbours live (r2) ───────
+
+#[test]
+fn transcript_cells_beside_a_live_covering_part_keep_the_pointer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for owner in [
+        Owner::Layer(Layer::PinsReview),
+        Owner::Layer(Layer::RulesReview),
+        Owner::ComposerPicker,
+        Owner::HeaderMore,
+        Owner::FindBar,
+        Owner::Toast,
+    ] {
+        let Fixture {
+            mut app,
+            width,
+            height,
+            ..
+        } = mount(tmp.path(), owner);
+        let covering = app
+            .paint_record
+            .iter()
+            .filter(|(part, _)| *part != PaintedPart::Surface(SurfacePart::SessionRail))
+            .map(|(_, rect)| *rect)
+            .collect::<Vec<_>>();
+        let chat = app.chat_area.expect("transcript painted");
+        let buffer = draw(&mut app, width, height);
+        let beside = (chat.y..chat.bottom())
+            .flat_map(|y| (chat.x..chat.right()).map(move |x| Position::new(x, y)))
+            .find(|pos| {
+                !buffer[(pos.x, pos.y)].symbol().trim().is_empty()
+                    && covering.iter().all(|rect| !rect.contains(*pos))
+                    && !transcript_control_cells(&app).contains(pos)
+            })
+            .unwrap_or_else(|| panic!("{owner:?}: a transcript cell beside the part"));
+        let offset = app.chat_scroll_offset;
+        feed(&mut app, vec![mouse_at(MouseEventKind::ScrollUp, beside)]);
+        assert_ne!(
+            app.chat_scroll_offset, offset,
+            "{owner:?}: the wheel beside the live part did not reach the transcript"
+        );
+    }
+}
+
+#[test]
+fn a_popover_unregisters_every_control_it_covers_and_keeps_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    for kind in POPOVER_KINDS {
+        let Fixture { app, .. } = mount(tmp.path(), Owner::Popover(kind));
+        let popover = surface_rect(&app, SurfacePart::Popover);
+        let cells = transcript_control_cells(&app);
+        let (covered, open): (Vec<_>, Vec<_>) = cells
+            .iter()
+            .copied()
+            .partition(|cell| popover.contains(*cell));
+        assert!(!covered.is_empty(), "{kind:?}: controls under the popover");
+        assert!(
+            app.button_registry
+                .targets()
+                .iter()
+                .all(|target| !is_transcript_control(&target.dispatch)
+                    || !target.rect.intersects(popover)),
+            "{kind:?}: a covered transcript control is still registered"
+        );
+        for cell in open {
+            assert!(
+                app.button_registry
+                    .hit(cell.x, cell.y)
+                    .is_some_and(|target| is_transcript_control(&target.dispatch)),
+                "{kind:?}: the uncovered control at {cell:?} lost the pointer"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_visible_transcript_control_takes_the_pointer_without_a_cover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = matrix_app(tmp.path());
+    draw(&mut app, 120, 50);
+    let cells = transcript_control_cells(&app);
+    assert!(!cells.is_empty());
+    for cell in cells {
+        assert!(
+            app.button_registry
+                .hit(cell.x, cell.y)
+                .is_some_and(|target| is_transcript_control(&target.dispatch)),
+            "{cell:?} is not hit-testable without a cover"
+        );
+    }
+}
+
+// ── The context menu hit-tests where it was painted (r2, C6) ────────────
+
+#[test]
+fn an_edge_clamped_context_menu_hit_tests_where_it_was_painted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = matrix_app(tmp.path());
+    draw(&mut app, 40, 30);
+    app.context_menu = Some(ContextMenu {
+        preferred_origin: (38, 26),
+        // No message under this row: running an item only toasts (no
+        // clipboard is touched by the test).
+        clicked_chat_row: 9_999,
+        cursor: 0,
+        items: ContextMenu::build_items(false, false),
+    });
+    draw(&mut app, 40, 30);
+    let painted = painted_rect(&app, PaintedPart::Floating(Layer::ContextMenu));
+    assert_ne!(
+        (painted.x, painted.y),
+        (38, 26),
+        "the fixture must clamp the menu at the edge"
+    );
+    let menu = app.context_menu.clone().expect("menu open");
+    let first_item = Position::new(painted.x + 2, painted.y + 1);
+    assert_eq!(
+        menu.hit_test(first_item.x, first_item.y, app.last_frame_area),
+        menu.items.first().copied(),
+        "the painted first row is the first item"
+    );
+    // Through the app: the click lands on the item (closing the menu by
+    // executing it), not on "outside" geometry computed for another area.
+    let executed_before = app.toast.clone();
+    feed(
+        &mut app,
+        vec![mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            first_item,
+        )],
+    );
+    assert!(app.context_menu.is_none());
+    assert_ne!(
+        format!("{:?}", app.toast),
+        format!("{executed_before:?}"),
+        "the visible item did not run (the click was treated as outside)"
     );
 }

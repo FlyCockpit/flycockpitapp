@@ -686,7 +686,7 @@ impl App {
             return None;
         }
 
-        let embedded_pane_owns_input = self.pane.is_some() && self.pane_focused;
+        let embedded_pane_owns_input = self.embedded_pane_owns_input();
         if !embedded_pane_owns_input {
             if self.composer_chords_available()
                 && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -770,10 +770,13 @@ impl App {
         if self.composer_controls.picker.is_some() && self.handle_composer_control_key(key) {
             return Some(KeyRouterStage::ComposerPicker);
         }
-        if self.handle_queue_key(key) {
+        // The queue, btw and embedded panes own keys only while they are
+        // painted (`surface_chat_tiles_painted`): under the question dialog
+        // or a body popover their focus waits, and the visible owner types.
+        if self.surface_chat_tiles_painted() && self.handle_queue_key(key) {
             return Some(KeyRouterStage::Queue);
         }
-        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
+        if self.btw_focus_owns_input()
             && let Some(pane) = self.btw_pane.as_mut()
         {
             match pane.handle_focused_key(key) {
@@ -825,8 +828,10 @@ impl App {
         // focused, every other key (incl. Ctrl+C) is forwarded to the
         // child PTY rather than handled by the TUI. The adopted Alt+arrow
         // session chords are the deliberate exception, claimed by the
-        // precedence funnel above.
-        if self.pane.is_some() {
+        // precedence funnel above. A pane that is not painted (the question
+        // dialog, a popover, onboarding or workspace trust replaced it)
+        // takes nothing.
+        if self.pane.is_some() && self.surface_chat_tiles_painted() {
             if is_pane_force_close(&key) {
                 self.close_pane(true);
                 return false;

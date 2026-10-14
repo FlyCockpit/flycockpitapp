@@ -35,6 +35,15 @@ impl App {
         // old owner can no longer release before routing this event.
         self.sync_pointer_owner();
         self.observe_pointer(mouse.column, mouse.row);
+        // Hit targets belong to the frame the user saw. A modal opened, a
+        // part closed or a resize since then (in the same input drain, before
+        // a redraw) voids them: drop the event and end every capture rather
+        // than hit-test a frame the state no longer matches. The next draw
+        // resolves hover for the recorded pointer.
+        if self.painted_frame_is_stale() {
+            self.end_pointer_captures();
+            return;
+        }
         let owner = self.pointer_owner_at(Position::new(mouse.column, mouse.row));
         // A capture belongs to the layer that received its press: an event
         // routed to a different owner (a drag that crossed into a review
@@ -142,8 +151,14 @@ impl App {
                                 MouseGestureInvalidation::Cancel,
                                 self.event_loop_monotonic_now,
                             );
-                            let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
-                            if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
+                            // Hit-test the menu where it was painted: placed
+                            // in the last frame's area (clamped at its edges).
+                            let area = if self.last_frame_area.is_empty() {
+                                ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX)
+                            } else {
+                                self.last_frame_area
+                            };
+                            if let Some(action) = menu.hit_test(mouse.column, mouse.row, area) {
                                 self.context_menu = None;
                                 self.execute_context_menu_action(action, menu.clicked_chat_row);
                             } else {
@@ -277,6 +292,9 @@ impl App {
                 let _ = self.route_registered_button(mouse);
                 return;
             }
+            // The find bar and a toast own their row: a press or wheel on
+            // the toast already dismissed it above, and goes no further.
+            Some(SurfacePart::FindBar | SurfacePart::Toast) => return,
             Some(SurfacePart::Popover) | None => {}
         }
         // A settings dialog takes the pointer inside what it painted — only

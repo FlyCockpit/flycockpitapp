@@ -514,3 +514,53 @@ fn note_without_session_shows_send_first_error() {
         "no note row is added without a session"
     );
 }
+
+/// Issue #546: quitting never depends on daemon authority. When the daemon
+/// refuses the exit check (for example after this connection lost owner
+/// authority), the user is told how to leave and the next exit request quits
+/// without asking the daemon again.
+#[test]
+fn rejected_exit_check_lets_the_next_exit_quit_without_the_daemon() {
+    use super::App;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.dialog = crate::tui::settings::Dialog::None;
+    let mut control_rx = install_ephemeral_runner(&mut app);
+
+    assert!(!app.request_guarded_exit(), "first exit asks the daemon");
+    let sent = control_rx.try_recv().expect("exit check is sent");
+    assert!(matches!(
+        sent.request,
+        cockpit_proto::Request::ExitGuardStatus
+    ));
+    let request_id = *app
+        .pending_control_requests
+        .keys()
+        .next()
+        .expect("exit check is pending");
+    app.apply_control_request_outcome(
+        request_id,
+        cockpit_client::presentation::ControlRequestOutcome::Rejected(
+            "authorization: request requires the local owner".to_string(),
+        ),
+    );
+    assert!(
+        !app.exit_requested,
+        "a refused check does not exit by itself"
+    );
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("quit without the daemon check")),
+        "the refusal tells the user how to quit"
+    );
+
+    assert!(
+        app.request_guarded_exit(),
+        "the next exit request quits without daemon authority"
+    );
+    assert!(
+        control_rx.try_recv().is_err(),
+        "no second exit check is sent"
+    );
+}

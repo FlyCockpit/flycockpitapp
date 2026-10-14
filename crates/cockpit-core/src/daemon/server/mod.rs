@@ -7609,7 +7609,12 @@ async fn locked_bootstrap_hello(locked: &LockedServices) -> Result<Response> {
 async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>) -> Result<()> {
     let peer = socket_peer_identity(&stream)?;
     let connection_id = Uuid::new_v4();
-    let mut authenticated_owner = false;
+    // Renews this connection's credential while it is served and releases
+    // it on every exit path (issue #546).
+    let _credential_lease = crate::daemon::peer_authority::PeerCredentialLease::hold(
+        locked.peer_credential_registry.clone(),
+        connection_id,
+    );
     let mut lifetime_guard = None;
     let mut proto_stream = ProtoStream::new(stream);
     proto_stream
@@ -7637,14 +7642,14 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
         if locked.locked_connection_retired() {
             break;
         }
-        if let Some(token) = owner_capability.as_ref()
-            && locked
+        // Owner authority is re-established from the credential this
+        // envelope presents, so a revoked credential never keeps it.
+        let authenticated_owner = owner_capability.as_ref().is_some_and(|token| {
+            locked
                 .peer_credential_registry
                 .verify(peer, connection_id, token.as_str())
                 .is_some_and(|(role, _)| role.is_owner_class())
-        {
-            authenticated_owner = true;
-        }
+        });
         if matches!(&request, Request::DaemonStatus) && lifetime_guard.is_none() {
             lifetime_guard = Some(locked.track_client());
         }
@@ -7722,7 +7727,6 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                 let token = locked
                     .peer_credential_registry
                     .mint(peer, connection_id, role, grants);
-                authenticated_owner = role.is_owner_class();
                 Ok(Response::LocalPeerCredential {
                     token: cockpit_proto::OwnerCapabilityToken::new(token.0),
                     role: proto_local_role(role),
@@ -7745,9 +7749,6 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
             break;
         }
     }
-    locked
-        .peer_credential_registry
-        .revoke_for_connection(connection_id);
     Ok(())
 }
 
@@ -8328,8 +8329,10 @@ struct MutableClientState {
     has_owner_capability: bool,
     /// Active peer-bound credential presented by this connection, if any.
     active_peer_credential: Option<String>,
-    /// Wall-clock expiry for [`active_peer_credential`], when installed.
-    peer_credential_expires_at_unix_ms: Option<i64>,
+    /// Set when this connection held owner authority and the daemon withdrew
+    /// its credential; authorization refusals then say why and how to
+    /// recover (issue #546). Cleared by a fresh owner credential.
+    owner_credential_revoked: Option<crate::daemon::peer_authority::PeerCredentialRevocation>,
     /// Raw capability token carried by the current request envelope, before
     /// any verification. Only the peer-credential exchange consumes it (as
     /// its launch-ticket presentation); every envelope overwrites it.
@@ -8362,6 +8365,7 @@ pub(super) struct SharedClientState {
     socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
     client_instance_id: Uuid,
     active_peer_credential: Option<String>,
+    owner_credential_revoked: Option<crate::daemon::peer_authority::PeerCredentialRevocation>,
     capability_owner: String,
     #[allow(dead_code)]
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
@@ -8448,7 +8452,7 @@ impl MutableClientState {
             socket_peer,
             has_owner_capability: false,
             active_peer_credential: None,
-            peer_credential_expires_at_unix_ms: None,
+            owner_credential_revoked: None,
             presented_owner_capability: None,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id,
@@ -8490,6 +8494,7 @@ impl MutableClientState {
             socket_peer: self.socket_peer,
             client_instance_id: self.terminal_context.client_instance_id,
             active_peer_credential: self.active_peer_credential.clone(),
+            owner_credential_revoked: self.owner_credential_revoked,
             // Capabilities survive the settings client's short transport
             // reconnects. Root, layer, identity and revision remain bound in
             // the capability itself; the owner is the stable authenticated
@@ -8924,7 +8929,7 @@ async fn run_in_process_client(
         );
     }
     ctx.peer_credential_registry
-        .revoke_for_connection(client_instance_id);
+        .release_connection(client_instance_id);
 }
 
 #[derive(Default)]
@@ -9079,16 +9084,27 @@ where
     let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (principal_tx, principal_rx) = watch::channel(principal.clone());
+    // The credential this connection exchanges lives exactly as long as this
+    // handler: renewed while it serves the peer, released when it ends or is
+    // cancelled (issue #546).
+    let _credential_lease = socket_peer.map(|_| {
+        crate::daemon::peer_authority::PeerCredentialLease::hold(
+            ctx.peer_credential_registry.clone(),
+            client_instance_id,
+        )
+    });
     if let Some(peer) = socket_peer {
         let invalidation_principal_tx = principal_tx.clone();
         let invalidation_executor_tx = executor_tx.clone();
-        ctx.peer_credential_registry
-            .register_invalidation_hook(client_instance_id, move || {
+        ctx.peer_credential_registry.register_invalidation_hook(
+            client_instance_id,
+            move |reason| {
                 let _ =
                     invalidation_principal_tx.send(ClientPrincipal::local_unauthenticated(peer));
                 let _ = invalidation_executor_tx
-                    .try_send(ClientExecutorInput::PeerCredentialInvalidated);
-            });
+                    .try_send(ClientExecutorInput::PeerCredentialInvalidated(reason));
+            },
+        );
     }
 
     // Emit a "hello" envelope immediately so cheap probes
@@ -9227,7 +9243,7 @@ where
     ctx.peer_credential_registry
         .unregister_invalidation_hook(client_instance_id);
     ctx.peer_credential_registry
-        .revoke_for_connection(client_instance_id);
+        .release_connection(client_instance_id);
     completed.result?;
     Ok(())
 }
@@ -9296,7 +9312,7 @@ fn flatten_client_task(
 enum ClientExecutorInput {
     Frame(RecvFrame),
     SessionEventsClosed,
-    PeerCredentialInvalidated,
+    PeerCredentialInvalidated(crate::daemon::peer_authority::PeerCredentialRevocation),
 }
 
 enum ClientWriterMessage {
@@ -9619,8 +9635,7 @@ async fn run_client_executor(
     state.has_owner_capability = has_owner_capability;
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();
-    let mut credential_expiry =
-        peer_credential_expiry_deadline(state.peer_credential_expires_at_unix_ms);
+    let mut credential_expiry = peer_credential_deadline(&state, &ctx);
     loop {
         tokio::select! {
             biased;
@@ -9631,9 +9646,23 @@ async fn run_client_executor(
                     std::future::pending::<()>().await;
                 }
             }, if credential_expiry.is_some() => {
-                ctx.peer_credential_registry.revoke_for_connection(client_instance_id);
-                downgrade_revoked_peer_authority(&mut state, &mut shared, &principal_tx);
-                credential_expiry = None;
+                // The connection's lease normally renews the credential long
+                // before this deadline; only a credential that really lapsed
+                // is revoked here.
+                credential_expiry = peer_credential_deadline(&state, &ctx);
+                if credential_expiry.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                    ctx.peer_credential_registry.revoke_for_connection(
+                        client_instance_id,
+                        crate::daemon::peer_authority::PeerCredentialRevocation::Lapsed,
+                    );
+                    downgrade_revoked_peer_authority(
+                        &mut state,
+                        &mut shared,
+                        &principal_tx,
+                        crate::daemon::peer_authority::PeerCredentialRevocation::Lapsed,
+                    );
+                    credential_expiry = None;
+                }
             }
             Some(joined) = concurrent.join_next(), if !concurrent.is_empty() => {
                 if let Err(error) = joined {
@@ -9663,16 +9692,19 @@ async fn run_client_executor(
                         {
                             return Ok(());
                         }
-                        credential_expiry = peer_credential_expiry_deadline(
-                            state.peer_credential_expires_at_unix_ms,
-                        );
+                        credential_expiry = peer_credential_deadline(&state, &ctx);
                     }
                     ClientExecutorInput::SessionEventsClosed => {
                         state.attached = None;
                         shared = state.shared_snapshot();
                     }
-                    ClientExecutorInput::PeerCredentialInvalidated => {
-                        downgrade_revoked_peer_authority(&mut state, &mut shared, &principal_tx);
+                    ClientExecutorInput::PeerCredentialInvalidated(reason) => {
+                        downgrade_revoked_peer_authority(
+                            &mut state,
+                            &mut shared,
+                            &principal_tx,
+                            reason,
+                        );
                         credential_expiry = None;
                     }
                 }
@@ -9681,29 +9713,34 @@ async fn run_client_executor(
     }
 }
 
-fn peer_credential_expiry_deadline(
-    expires_at_unix_ms: Option<i64>,
+/// When the connection's active credential lapses, read from the registry
+/// (the lease moves it forward). A credential the registry no longer holds is
+/// due now, so the executor downgrades at once.
+fn peer_credential_deadline(
+    state: &MutableClientState,
+    ctx: &DaemonContext,
 ) -> Option<tokio::time::Instant> {
-    expires_at_unix_ms.and_then(|expires_at_unix_ms| {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
-            .unwrap_or(0);
-        let delay_ms = expires_at_unix_ms.saturating_sub(now_ms);
-        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms.max(0) as u64))
-    })
+    let token = state.active_peer_credential.as_deref()?;
+    let deadline = ctx
+        .peer_credential_registry
+        .expires_at(state.terminal_context.client_instance_id, token)
+        .unwrap_or_else(std::time::Instant::now);
+    Some(tokio::time::Instant::from_std(deadline))
 }
 
 fn downgrade_revoked_peer_authority(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
     principal_tx: &watch::Sender<ClientPrincipal>,
+    reason: crate::daemon::peer_authority::PeerCredentialRevocation,
 ) {
     if state.active_peer_credential.is_none() {
         return;
     }
+    if state.has_owner_capability {
+        state.owner_credential_revoked = Some(reason);
+    }
     state.active_peer_credential = None;
-    state.peer_credential_expires_at_unix_ms = None;
     state.has_owner_capability = false;
     if let Some(peer) = state.socket_peer {
         state.principal = ClientPrincipal::local_unauthenticated(peer);
@@ -9736,7 +9773,16 @@ fn reconcile_socket_peer_owner_authority(
     ) {
         return;
     }
-    downgrade_revoked_peer_authority(state, shared, principal_tx);
+    let reason = if ctx
+        .peer_credential_registry
+        .expires_at(connection_id, token)
+        .is_some_and(|deadline| deadline > std::time::Instant::now())
+    {
+        crate::daemon::peer_authority::PeerCredentialRevocation::PeerChanged
+    } else {
+        crate::daemon::peer_authority::PeerCredentialRevocation::Lapsed
+    };
+    downgrade_revoked_peer_authority(state, shared, principal_tx, reason);
 }
 
 async fn handle_client_frame(
@@ -9840,17 +9886,21 @@ async fn handle_envelope(
                             .verify(peer, connection_id, token.as_str())
                     {
                         state.has_owner_capability = role.is_owner_class();
+                        if state.has_owner_capability {
+                            state.owner_credential_revoked = None;
+                        }
                         state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
                         state.active_peer_credential = Some(token.as_str().to_string());
-                        state.peer_credential_expires_at_unix_ms = ctx
-                            .peer_credential_registry
-                            .expires_at_unix_ms(connection_id, token.as_str());
                         *shared = state.shared_snapshot();
                         let _ = principal_tx.send(state.principal.clone());
                     } else {
+                        if state.has_owner_capability {
+                            state
+                                .owner_credential_revoked
+                                .get_or_insert(crate::daemon::peer_authority::PeerCredentialRevocation::Unrecognized);
+                        }
                         state.has_owner_capability = false;
                         state.active_peer_credential = None;
-                        state.peer_credential_expires_at_unix_ms = None;
                         state.principal = ClientPrincipal::local_unauthenticated(peer);
                         *shared = state.shared_snapshot();
                         let _ = principal_tx.send(state.principal.clone());
@@ -10330,8 +10380,32 @@ fn response_envelope_for_shared(
                 ),
             }
         }
-        Err(err) => bounded_error_envelope(Some(id), normalize_database_storage_error(err)),
+        Err(err) => bounded_error_envelope(
+            Some(id),
+            explain_revoked_owner_authority(normalize_database_storage_error(err), shared),
+        ),
     }
+}
+
+/// A connection that lost its owner credential is downgraded to an
+/// unauthenticated local peer, so its refusals ("remote principal cannot
+/// access this session", "requires the local owner") would otherwise not say
+/// what happened. Name the cause and the recovery (issue #546).
+fn explain_revoked_owner_authority(
+    mut error: ErrorPayload,
+    shared: &SharedClientState,
+) -> ErrorPayload {
+    if error.code == ErrorCode::Authorization
+        && let Some(reason) = shared.owner_credential_revoked
+    {
+        error.message = format!(
+            "this Cockpit connection lost local owner authority because {}; quit and restart \
+             cockpit to reconnect as the owner ({})",
+            reason.describe(),
+            error.message
+        );
+    }
+    error
 }
 
 fn bounded_response_envelope(id: Uuid, response: proto::Response) -> Envelope {

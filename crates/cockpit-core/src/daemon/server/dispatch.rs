@@ -18842,11 +18842,11 @@ async fn handle_serialized_request_impl(
                 ctx.peer_credential_registry
                     .mint(peer, connection_id, role, grants.clone());
             state.has_owner_capability = role.is_owner_class();
+            if state.has_owner_capability {
+                state.owner_credential_revoked = None;
+            }
             state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
             state.active_peer_credential = Some(token.as_str().to_string());
-            state.peer_credential_expires_at_unix_ms = ctx
-                .peer_credential_registry
-                .expires_at_unix_ms(connection_id, token.as_str());
             Ok(Response::LocalPeerCredential {
                 token: proto::OwnerCapabilityToken::new(token.0),
                 role: proto_local_role(role),

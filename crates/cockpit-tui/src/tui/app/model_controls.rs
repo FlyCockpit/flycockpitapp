@@ -1005,7 +1005,11 @@ impl App {
                     let outcome = tok.on_response(confirm_id, 0, false, code);
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
-                    let message = format!("{}: daemon rejected request: {error}", pending.label);
+                    let mut message =
+                        format!("{}: daemon rejected request: {error}", pending.label);
+                    if pending.applied.is_exit_step() {
+                        message = self.note_exit_check_failure(message);
+                    }
                     self.finish_control_failure(
                         skip_confirmation,
                         selection_id,
@@ -1028,7 +1032,10 @@ impl App {
                     let outcome = tok.on_response(confirm_id, 0, false, Some("refresh_failed"));
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
-                    let message = Self::control_not_delivered_message(&pending.label, reason);
+                    let mut message = Self::control_not_delivered_message(&pending.label, reason);
+                    if pending.applied.is_exit_step() {
+                        message = self.note_exit_check_failure(message);
+                    }
                     self.finish_control_failure(
                         skip_confirmation,
                         selection_id,

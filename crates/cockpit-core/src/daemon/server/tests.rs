@@ -8698,7 +8698,7 @@ fn remote_state_with_grants(
         socket_peer: None,
         has_owner_capability: false,
         active_peer_credential: None,
-        peer_credential_expires_at_unix_ms: None,
+        owner_credential_revoked: None,
         presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "flycockpit:user-1".into(),
@@ -8746,7 +8746,7 @@ fn owner_state() -> MutableClientState {
         socket_peer: None,
         has_owner_capability: true,
         active_peer_credential: None,
-        peer_credential_expires_at_unix_ms: None,
+        owner_credential_revoked: None,
         presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
@@ -9181,6 +9181,137 @@ async fn run_legitimate_peer_auth_admission_test(role: &str, child_args: &[&str]
     );
 
     let _ = server.await;
+}
+
+/// Issue #546: a live local owner connection keeps owner authority past the
+/// peer-credential TTL. The daemon's connection lease renews the credential
+/// while the connection is served, so an idle owner (a TUI waiting for the
+/// user) is never silently downgraded to an unauthenticated peer. The TTL is
+/// shortened through the test-only registry seam; the production accept
+/// path and the production client connect/exchange run unchanged.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn live_owner_connection_keeps_owner_authority_past_the_credential_ttl() {
+    const TTL: std::time::Duration = std::time::Duration::from_millis(1_500);
+    let db = Db::open_in_memory().expect("in-memory db");
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    let mut ctx = DaemonContext::new(
+        db,
+        locks,
+        unique_test_paths(true),
+        crate::daemon::terminal::test_host_factory(),
+        stub_config_source(),
+    );
+    // Not this test binary: the test process is admitted only as a
+    // same-uid follower presenting the persisted launch ticket.
+    ctx.approved_client_executable = std::path::PathBuf::from("/nonexistent/cockpit");
+    ctx.peer_credential_registry =
+        Arc::new(crate::daemon::peer_authority::PeerCredentialRegistry::with_ttl_for_test(TTL));
+    let ctx = Arc::new(ctx);
+    let socket_dir = tempfile::tempdir().expect("socket tempdir");
+    let socket_path = socket_dir.path().join("owner-renewal.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind owner socket");
+    let ticket = crate::daemon::peer_authority::mint_launch_ticket();
+    ctx.peer_credential_registry.record_launch_provenance(
+        ticket.clone(),
+        Some(child_peer_identity(std::process::id())),
+    );
+    crate::daemon::peer_authority::persist_launch_ticket(&socket_path, &ticket)
+        .expect("persist follower launch ticket");
+    let server_ctx = ctx.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept owner client");
+        handle_client(stream, server_ctx).await
+    });
+
+    let client = cockpit_client::DaemonClient::connect(&socket_path)
+        .await
+        .expect("production connect and exchange");
+    assert!(
+        client.has_owner_capability(),
+        "the exchange minted an owner credential"
+    );
+    let owner_only = || Request::GetUsageCounts { project_id: None };
+    client
+        .request_ok(owner_only())
+        .await
+        .expect("owner-only RPC right after the exchange");
+
+    // Idle for three TTLs, then use the connection again exactly as a TUI
+    // does after the user comes back to it.
+    tokio::time::sleep(TTL * 3).await;
+    match client
+        .request(owner_only())
+        .await
+        .expect("transport stays up")
+    {
+        Ok(_) => {}
+        Err(payload) => panic!(
+            "live owner connection lost owner authority after the credential TTL: {payload:?}"
+        ),
+    }
+
+    drop(client);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;
+}
+
+/// Issue #546: when the daemon does withdraw an owner connection's
+/// credential, its refusals name the cause and the recovery instead of the
+/// bare unauthenticated-peer wording. Other errors pass through unchanged.
+#[tokio::test]
+async fn revoked_owner_connection_refusals_explain_the_recovery() {
+    let ctx = test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+    state.owner_credential_revoked =
+        Some(crate::daemon::peer_authority::PeerCredentialRevocation::PeerChanged);
+    let shared = state.shared_snapshot();
+    let envelope = response_envelope_for_shared(
+        Uuid::new_v4(),
+        Err(authorization_error(
+            "remote principal cannot access this session",
+        )),
+        &shared,
+        &ctx,
+    );
+    let Body::Error { error, .. } = envelope.body else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.code, ErrorCode::Authorization);
+    assert!(
+        error.message.contains("lost local owner authority")
+            && error.message.contains("quit and restart cockpit")
+            && error
+                .message
+                .contains("remote principal cannot access this session"),
+        "refusal must explain the revocation and recovery: {}",
+        error.message
+    );
+
+    let envelope = response_envelope_for_shared(
+        Uuid::new_v4(),
+        Err(ErrorPayload {
+            code: ErrorCode::NotFound,
+            message: "no such session".into(),
+        }),
+        &shared,
+        &ctx,
+    );
+    let Body::Error { error, .. } = envelope.body else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.message, "no such session");
+
+    state.owner_credential_revoked = None;
+    let envelope = response_envelope_for_shared(
+        Uuid::new_v4(),
+        Err(authorization_error("request requires the local owner")),
+        &state.shared_snapshot(),
+        &ctx,
+    );
+    let Body::Error { error, .. } = envelope.body else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.message, "request requires the local owner");
 }
 
 #[cfg(unix)]
@@ -17814,7 +17945,7 @@ async fn attached_state_with_worker_receiver(
             socket_peer: None,
             has_owner_capability: true,
             active_peer_credential: None,
-            peer_credential_expires_at_unix_ms: None,
+            owner_credential_revoked: None,
             presented_owner_capability: None,
             terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
                 principal_id: "local-owner".into(),
@@ -38473,7 +38604,7 @@ async fn btw_concurrent_with_parent_turn() {
         socket_peer: None,
         has_owner_capability: true,
         active_peer_credential: None,
-        peer_credential_expires_at_unix_ms: None,
+        owner_credential_revoked: None,
         presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),
@@ -38561,7 +38692,7 @@ async fn btw_concurrent_with_parent_turn() {
         socket_peer: None,
         has_owner_capability: true,
         active_peer_credential: None,
-        peer_credential_expires_at_unix_ms: None,
+        owner_credential_revoked: None,
         presented_owner_capability: None,
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "local-owner".into(),

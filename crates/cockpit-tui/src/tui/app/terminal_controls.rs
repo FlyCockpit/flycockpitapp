@@ -41,6 +41,14 @@ impl App {
                 ToastKind::Info,
             );
             false
+        } else if self.exit_check_failed {
+            // The daemon already refused the exit check; quitting is a local
+            // decision and never waits on daemon authority.
+            self.exit_notice = Some(format!(
+                "Exited without the daemon's background-work check; if work was still running, reattach with {}",
+                self.exit_reattach_command()
+            ));
+            true
         } else {
             // This response is the detach-time authority: local `busy` and
             // schedule projections can lag the worker that owns the work.
@@ -59,6 +67,18 @@ impl App {
             );
             false
         }
+    }
+
+    /// The exit check (or the stop/background choice after it) failed: let
+    /// the very next exit request quit without the daemon, and tell the user
+    /// how. Returns `message` with that recovery hint appended.
+    pub(super) fn note_exit_check_failure(&mut self, message: String) -> String {
+        self.exit_check_failed = true;
+        let message = format!(
+            "{message}. Press Ctrl+C twice or run /exit again to quit without the daemon check."
+        );
+        self.show_toast(message.clone(), ToastKind::Error);
+        message
     }
 
     pub(super) fn apply_exit_guard_status(&mut self, ephemeral_owner: bool, has_live_work: bool) {

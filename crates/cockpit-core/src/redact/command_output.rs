@@ -1049,10 +1049,7 @@ impl NovelScrubStream {
             return None;
         }
         let (value_end, quoted) = match rest.chars().next() {
-            Some(q @ ('"' | '\'')) => match closing_quote(&rest[1..], q) {
-                Some(close) => (close + 2, Some(q)),
-                None => return None,
-            },
+            Some(q @ ('"' | '\'')) => (closing_quote(&rest[1..], q)? + 2, Some(q)),
             _ => {
                 let end = rest.find(',').unwrap_or(rest.len());
                 (end, None)

@@ -2077,6 +2077,7 @@ impl RedactionTable {
     /// value — including base64 / hex / URL encodings — are then scrubbed by
     /// the ordinary table pass everywhere, not only where the original shape
     /// survives.
+    #[cfg(test)]
     pub(crate) fn with_observed_output_secrets(
         &self,
         cfg: &RedactConfig,

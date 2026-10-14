@@ -287,7 +287,7 @@ fn candidates(source: &str) -> Vec<(String, Vec<String>)> {
     let mut found = Vec::new();
     let bytes = source.as_bytes();
     let mut search = 0;
-    while let Some(rel) = source[search..].find(|c: char| c == 's' || c == 'e') {
+    while let Some(rel) = source[search..].find(['s', 'e']) {
         let at = search + rel;
         search = at + 1;
         let keyword = if source[at..].starts_with("struct ") {

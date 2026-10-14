@@ -602,7 +602,7 @@ async fn refresh_redaction_for_turn(
         {
             Ok(new_table) => {
                 match interrupts
-                    .refresh_owned_redaction(&accumulated_redact, session, &new_table)
+                    .refresh_owned_redaction(accumulated_redact, session, &new_table)
                     .await
                 {
                     Ok(unioned) => {

@@ -815,6 +815,7 @@ impl ConfigDoc {
             deep_merge_value(&mut merged, &layer);
         }
         serde_json::from_value(merged)
+            .map_err(|error| crate::config::value_free::json_error(&error))
             .context("projecting merged retained workspace provider layers")
     }
 
@@ -1147,6 +1148,8 @@ impl ConfigDoc {
                         cfg.providers.insert(id.clone(), entry);
                     }
                     Err(error) => {
+                        let error =
+                            crate::config::value_free::value_free_message(&error.to_string());
                         tracing::warn!(
                             path = %self.path.display(),
                             provider = %id,
@@ -1823,6 +1826,7 @@ where
     match serde_json::from_value::<T>(value.clone()) {
         Ok(parsed) => Some(parsed),
         Err(error) => {
+            let error = crate::config::value_free::value_free_message(&error.to_string());
             tracing::warn!(
                 path = %path.display(),
                 key,
@@ -2013,6 +2017,7 @@ fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig
                     cfg.providers.insert(id.clone(), entry);
                 }
                 Err(e) => {
+                    let e = crate::config::value_free::value_free_message(&e.to_string());
                     tracing::warn!(provider = %id, error = %e, "skipping malformed provider entry");
                 }
             }

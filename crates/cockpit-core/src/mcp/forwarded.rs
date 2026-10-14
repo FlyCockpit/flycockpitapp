@@ -55,7 +55,7 @@ impl fmt::Debug for AcpForwardedRemoteV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AcpForwardedRemoteV1")
-            .field("url", &self.url)
+            .field("url", &crate::config::value_free::redacted_url(&self.url))
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .finish()
     }

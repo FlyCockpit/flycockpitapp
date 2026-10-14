@@ -48,7 +48,7 @@ pub(crate) enum SessionAdmissionDto {
     Load(SessionLoadDto),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SessionNewDto {
     pub cwd: String,
     pub mcp_servers: Vec<McpServerDto>,
@@ -56,7 +56,7 @@ pub(crate) struct SessionNewDto {
     pub raw_params: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SessionLoadDto {
     pub cwd: String,
     pub session_id: String,
@@ -65,7 +65,7 @@ pub(crate) struct SessionLoadDto {
     pub raw_params: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum McpServerDto {
     Stdio {
         name: String,
@@ -83,6 +83,67 @@ pub(crate) enum McpServerDto {
         url: String,
         headers: Vec<NameValueDto>,
     },
+}
+
+// The raw admission JSON carries the editor's MCP env/header values verbatim:
+// diagnostics get its length only.
+impl std::fmt::Debug for SessionNewDto {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionNewDto")
+            .field("cwd", &self.cwd)
+            .field("mcp_servers", &self.mcp_servers)
+            .field("additional_directories", &self.additional_directories)
+            .field("raw_params_len", &self.raw_params.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SessionLoadDto {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionLoadDto")
+            .field("cwd", &self.cwd)
+            .field("session_id", &self.session_id)
+            .field("mcp_servers", &self.mcp_servers)
+            .field("additional_directories", &self.additional_directories)
+            .field("raw_params_len", &self.raw_params.len())
+            .finish()
+    }
+}
+
+// Stdio argv can carry `--token=…` and URLs can carry userinfo or query
+// tokens: argument counts and redacted URLs only.
+impl std::fmt::Debug for McpServerDto {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => formatter
+                .debug_struct("Stdio")
+                .field("name", name)
+                .field("command", command)
+                .field("argument_count", &args.len())
+                .field("env", env)
+                .finish(),
+            Self::Http { name, url, headers } | Self::Sse { name, url, headers } => formatter
+                .debug_struct(if matches!(self, Self::Http { .. }) {
+                    "Http"
+                } else {
+                    "Sse"
+                })
+                .field("name", name)
+                .field(
+                    "url",
+                    &cockpit_config::config::value_free::redacted_url(url),
+                )
+                .field("headers", headers)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -310,5 +371,31 @@ mod debug_hygiene_tests {
             assert!(!rendered.contains(SENTINEL), "{rendered}");
             assert!(rendered.contains("API_TOKEN"), "{rendered}");
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_params_debug_tests {
+    use super::*;
+
+    /// Secrets r2 C1: the raw ACP admission JSON (which carries the editor's
+    /// MCP env/header values verbatim) and stdio argv never print.
+    #[test]
+    fn admission_dto_debug_hides_raw_params_and_argv() {
+        let secret = ["NovelDebug515", "Secret78529"].concat();
+        let dto = SessionNewDto {
+            cwd: "/workspace".into(),
+            mcp_servers: vec![McpServerDto::Stdio {
+                name: "demo".into(),
+                command: "/usr/bin/server".into(),
+                args: vec![format!("--token={secret}")],
+                env: vec![],
+            }],
+            additional_directories: vec![],
+            raw_params: format!(r#"{{"env":[{{"name":"API_KEY","value":"{secret}"}}]}}"#),
+        };
+        let rendered = format!("{dto:?}");
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(rendered.contains("raw_params_len"), "{rendered}");
     }
 }

@@ -1052,3 +1052,28 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod value_free_error_tests {
+    use super::*;
+
+    /// Secrets r2 C8: a header value with an invalid reference default
+    /// (`Bearer ${X:-<literal>}`) never reaches `header_errors` or Debug.
+    #[test]
+    fn resolved_auth_errors_never_carry_the_literal() {
+        let secret = ["NovelErrorDebug515", "Secret78529"].concat();
+        let config = super::super::config::McpConfig::parse(&format!(
+            r#"{{"servers":{{"demo":{{"transport":"streamable","endpoint":"https://mcp.example.test","auth":{{"kind":"header","value":"Bearer ${{X:-{secret}}}"}}}}}}}}"#
+        ))
+        .unwrap();
+        let resolved = resolve_static_for_server("demo", &config.servers["demo"]);
+        assert!(
+            !resolved.header_errors.is_empty(),
+            "precondition: the reference is invalid"
+        );
+        for error in &resolved.header_errors {
+            assert!(!error.contains(&secret), "{error}");
+        }
+        assert!(!format!("{resolved:?}").contains(&secret));
+    }
+}

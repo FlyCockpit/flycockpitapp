@@ -1032,6 +1032,14 @@ impl ScheduleAuthority {
         // when the model-facing result is built.
         let live_ctx = self.ctx.clone();
         let live_ctx_for_guard = self.ctx.clone();
+        let observed_sink = {
+            let ctx = self.ctx.snapshot();
+            background::ObservedOutputSink {
+                interrupts: ctx.interrupts.clone(),
+                session: ctx.session.clone(),
+                cfg: ctx.config.extended().redact,
+            }
+        };
         let (handle, task) = background::spawn(background::BackgroundSpawn {
             job_id: job_id.clone(),
             label: label.clone(),
@@ -1051,6 +1059,7 @@ impl ScheduleAuthority {
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             cancel: cancel.clone(),
+            observed_sink: Some(observed_sink),
         });
         let abort = task.abort_handle();
         let entry = ScheduleEntry {

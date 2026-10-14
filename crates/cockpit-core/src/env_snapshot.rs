@@ -29,6 +29,56 @@ impl std::fmt::Debug for EnvSnapshot {
     }
 }
 
+/// The process environment as `String`s, captured with `vars_os` and an
+/// explicit conversion. `std::env::vars()` PANICS on a non-Unicode name or
+/// value, and the panic message renders the offending `OsString`. An
+/// inherited credential with one stray `0xff` byte would be printed into the
+/// panic hook's output. Unrepresentable variables are excluded (no `String`
+/// table, overlay or child env built from this snapshot could carry them),
+/// and the exclusion is reported, never silent: a warning names each
+/// excluded variable, by name only (lossily sanitized), never by value.
+pub fn process_env_vars() -> HashMap<String, String> {
+    env_vars_from_os(std::env::vars_os())
+}
+
+fn env_vars_from_os(
+    vars_os: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    let mut excluded: Vec<String> = Vec::new();
+    for (name, value) in vars_os {
+        match (name.into_string(), value.into_string()) {
+            (Ok(name), Ok(value)) => {
+                vars.insert(name, value);
+            }
+            (Ok(name), Err(_)) => excluded.push(sanitized_env_name(&name)),
+            (Err(name), _) => excluded.push(sanitized_env_name(&name.to_string_lossy())),
+        }
+    }
+    if !excluded.is_empty() {
+        tracing::warn!(
+            excluded = ?excluded,
+            "environment variables with non-Unicode names or values were excluded from the environment snapshot"
+        );
+    }
+    vars
+}
+
+/// An environment variable NAME reduced to identifier characters for a
+/// diagnostic (values are never rendered).
+fn sanitized_env_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(128)
+        .collect();
+    if sanitized.is_empty() {
+        "<non-unicode name>".to_string()
+    } else {
+        sanitized
+    }
+}
+
 impl EnvSnapshot {
     pub fn new(source: EnvSnapshotSource, vars: HashMap<String, String>) -> Self {
         let digest = digest_env(&vars);
@@ -39,8 +89,10 @@ impl EnvSnapshot {
         }
     }
 
+    /// Snapshot the process environment. Never panics on a non-Unicode
+    /// variable (see [`process_env_vars`]).
     pub fn from_process(source: EnvSnapshotSource) -> Self {
-        Self::new(source, std::env::vars().collect())
+        Self::new(source, process_env_vars())
     }
 
     pub fn from_wire(wire: EnvSnapshotWire) -> Self {
@@ -327,6 +379,29 @@ fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Secrets r2 C11: a non-Unicode environment value never panics the
+    /// capture (whose panic would render the offending OsString, i.e. the
+    /// credential bytes); it is excluded, and the rest of the env survives.
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_env_value_is_excluded_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bad = b"FakeCredential515Sentinel".to_vec();
+        bad.push(0xff);
+        let vars = env_vars_from_os([
+            (
+                std::ffi::OsString::from("API_TOKEN"),
+                std::ffi::OsString::from_vec(bad),
+            ),
+            (
+                std::ffi::OsString::from("PATH"),
+                std::ffi::OsString::from("/usr/bin"),
+            ),
+        ]);
+        assert!(!vars.contains_key("API_TOKEN"));
+        assert_eq!(vars.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
 
     #[test]
     fn debug_never_prints_env_values() {

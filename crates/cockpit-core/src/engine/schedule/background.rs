@@ -563,6 +563,7 @@ pub fn spawn(
         turn_tx,
         event_tx,
         cancel,
+        observed_sink,
     }: BackgroundSpawn,
 ) -> (BackgroundHandle, tokio::task::JoinHandle<()>) {
     let ring: Arc<Mutex<BoundedOutputRing>> =
@@ -595,6 +596,7 @@ pub fn spawn(
             kill_rx,
             cancel,
             pgid,
+            observed_sink,
         ),
         event_tx,
         job_id,
@@ -632,6 +634,54 @@ pub struct BackgroundSpawn {
     /// kills the subprocess; [`BackgroundHandle::kill`] group-kills even if
     /// the runner is aborted first.
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Where the job's novel-secret observations are registered: the owning
+    /// session's redaction owner (`None` registers nothing, e.g. tests).
+    pub observed_sink: Option<ObservedOutputSink>,
+}
+
+/// Registration target for the novel-secret backstop run on background
+/// output as it arrives (see [`run_background`]).
+#[derive(Clone)]
+pub struct ObservedOutputSink {
+    pub interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    pub session: Arc<crate::session::Session>,
+    pub cfg: crate::config::extended::RedactConfig,
+}
+
+/// Scrub one arriving background line with the stream's novel-secret
+/// state, register what it replaced, and return the line to store (`None`:
+/// the line is dropped, inside a collapsed PEM block or multiline secret).
+/// A registration failure is latched in `failed` (the completion is then
+/// withheld); the line itself is still stored scrubbed.
+async fn ingest_background_line(
+    stream: &mut crate::redact::NovelScrubStream,
+    line: &str,
+    sink: Option<&ObservedOutputSink>,
+    failed: &mut bool,
+) -> Option<String> {
+    let scrubbed = stream.push_line(line);
+    register_background_observations(stream, sink, failed).await;
+    scrubbed
+}
+
+async fn register_background_observations(
+    stream: &mut crate::redact::NovelScrubStream,
+    sink: Option<&ObservedOutputSink>,
+    failed: &mut bool,
+) {
+    let found = stream.take_found();
+    if found.is_empty() {
+        return;
+    }
+    if let Some(sink) = sink
+        && sink
+            .interrupts
+            .register_observed_output_secrets(&sink.session, &sink.cfg, &found)
+            .await
+            .is_err()
+    {
+        *failed = true;
+    }
 }
 
 fn spawn_guarded_background<F>(
@@ -799,6 +849,7 @@ async fn run_background(
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
     cancel: tokio_util::sync::CancellationToken,
     pgid: Arc<Mutex<Option<u32>>>,
+    observed_sink: Option<ObservedOutputSink>,
 ) {
     if cancel.is_cancelled() {
         let _ = event_tx
@@ -871,6 +922,24 @@ async fn run_background(
     let push = |ring: &Arc<Mutex<BoundedOutputRing>>, line: String| {
         ring.lock().unwrap().push(line);
     };
+    // Narrow novel-secret backstop (secrets I2) AT INTAKE: every line passes
+    // a per-stream scrubber before it enters the ring, so tail slicing, ring
+    // eviction and the completion token cap only ever cut already-scrubbed
+    // text. A tail of PEM body lines whose BEGIN fence fell outside the
+    // window, or YAML block-scalar lines whose key line was evicted, can no
+    // longer reach the model raw. What the scrubber replaces is registered in
+    // the owning session's table as it is found.
+    let intake_table = redact_probe();
+    let scrub_intake = !intake_table.disabled();
+    let mut out_scrub = crate::redact::NovelScrubStream::new(
+        intake_table.placeholder(),
+        crate::redact::NovelScrubMode::KeyedNarrow,
+    );
+    let mut err_scrub = crate::redact::NovelScrubStream::new(
+        intake_table.placeholder(),
+        crate::redact::NovelScrubMode::KeyedNarrow,
+    );
+    let mut registration_failed = false;
 
     let mut stdout_done = false;
     let mut stderr_done = false;
@@ -919,7 +988,20 @@ async fn run_background(
             line = out_lines.next_line(), if !stdout_done => {
                 match line {
                     Ok(Some(l)) => {
-                        push(&ring, l);
+                        let l = if scrub_intake {
+                            ingest_background_line(
+                                &mut out_scrub,
+                                &l,
+                                observed_sink.as_ref(),
+                                &mut registration_failed,
+                            )
+                            .await
+                        } else {
+                            Some(l)
+                        };
+                        if let Some(l) = l {
+                            push(&ring, l);
+                        }
                         let _ = turn_tx.try_send(TurnEvent::ScheduleProgress {
                             job_id: job_id.clone(),
                         });
@@ -930,7 +1012,20 @@ async fn run_background(
             line = err_lines.next_line(), if !stderr_done => {
                 match line {
                     Ok(Some(l)) => {
-                        push(&ring, l);
+                        let l = if scrub_intake {
+                            ingest_background_line(
+                                &mut err_scrub,
+                                &l,
+                                observed_sink.as_ref(),
+                                &mut registration_failed,
+                            )
+                            .await
+                        } else {
+                            Some(l)
+                        };
+                        if let Some(l) = l {
+                            push(&ring, l);
+                        }
                         let _ = turn_tx.try_send(TurnEvent::ScheduleProgress {
                             job_id: job_id.clone(),
                         });
@@ -943,6 +1038,12 @@ async fn run_background(
         if stdout_done && stderr_done {
             break;
         }
+    }
+
+    for stream in [&mut out_scrub, &mut err_scrub] {
+        stream.finish();
+        register_background_observations(stream, observed_sink.as_ref(), &mut registration_failed)
+            .await;
     }
 
     let status = child.wait().await;
@@ -977,6 +1078,13 @@ async fn run_background(
 
     let (result, failed) = if killed {
         (format!("background `{label}` was cancelled"), false)
+    } else if registration_failed {
+        (
+            format!(
+                "background `{label}` finished; its output was withheld because registering a secret found in it failed"
+            ),
+            true,
+        )
     } else {
         let header = match exit {
             Some(0) => format!("background `{label}` finished (exit 0)\n"),
@@ -1221,6 +1329,7 @@ mod tests {
             turn_tx,
             event_tx,
             cancel,
+            observed_sink: None,
         })
     }
 

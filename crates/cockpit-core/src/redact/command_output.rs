@@ -193,11 +193,15 @@ impl std::fmt::Debug for ObservedSecret {
 }
 
 impl ObservedSecret {
+    /// A value under a secret-shaped key. The key is the secrecy evidence, so
+    /// the value is registered down to the hard [`MIN_REDACTION_ENTRY_LENGTH`]
+    /// floor regardless of `min_secret_length`. The backstop registers what it
+    /// replaces; a short `password: hunter2` is not silently left unregistered.
     fn keyed(key: &str, value: &str) -> Self {
         let credential = credential_shaped_key(key);
         Self {
             value: strip_matching_quotes(value).to_string(),
-            length_exempt: credential,
+            length_exempt: true,
             encoded_variants: true,
             case_variants: credential,
         }
@@ -283,6 +287,233 @@ fn is_interpolation_reference(value: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Record a replaced keyed value: the raw spelling the output carried, its
+/// DECODED form (JSON string escapes for a double-quoted value, doubled
+/// `''` for a single-quoted YAML value), and the literal default of any
+/// `${NAME:-default}`-style reference. A later plaintext or encoded echo of
+/// the decoded value would otherwise survive a table that registered only the
+/// escaped spelling.
+fn observe_keyed(found: &mut Vec<ObservedSecret>, key: &str, raw: &str, quote: Option<char>) {
+    let bare = strip_matching_quotes(raw);
+    let quote = quote.or_else(|| {
+        let first = raw.chars().next()?;
+        (raw.len() >= 2 && matches!(first, '"' | '\'') && raw.ends_with(first)).then_some(first)
+    });
+    found.push(ObservedSecret::keyed(key, bare));
+    let decoded = match quote {
+        Some('"') if bare.contains('\\') => json_unescape(bare),
+        Some('\'') if bare.contains("''") => Some(bare.replace("''", "'")),
+        _ => None,
+    };
+    if let Some(decoded) = decoded.filter(|decoded| decoded != bare) {
+        found.push(ObservedSecret::keyed(key, &decoded));
+    }
+    for default in reference_default_literals(bare) {
+        found.push(ObservedSecret::keyed(key, &default));
+    }
+}
+
+/// Decode JSON string escapes (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`,
+/// `\t`, `\uXXXX` including surrogate pairs). `None` for an invalid escape.
+pub(super) fn json_unescape(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                let unit = u16::from_str_radix(&hex, 16).ok()?;
+                if (0xD800..0xDC00).contains(&unit) {
+                    if chars.next()? != '\\' || chars.next()? != 'u' {
+                        return None;
+                    }
+                    let low_hex: String = chars.by_ref().take(4).collect();
+                    let low = u16::from_str_radix(&low_hex, 16).ok()?;
+                    out.push(char::decode_utf16([unit, low]).next()?.ok()?);
+                } else {
+                    out.push(char::from_u32(u32::from(unit))?);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Literal defaults inside shell-style references: `${NAME:-default}` (and
+/// `-`, `:=`, `=`, `:+`, `+`, `:?`, `?`), recursively through nested
+/// references. The whole reference expression is replaced in the output;
+/// its literal default component is registered on its own as well, since a
+/// later echo prints only the default.
+fn reference_default_literals(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(inner) = value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return out;
+    };
+    let name_end = inner
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(inner.len());
+    let rest = &inner[name_end..];
+    let default = [":-", ":=", ":+", ":?", "-", "=", "+", "?"]
+        .iter()
+        .find_map(|op| rest.strip_prefix(op));
+    if let Some(default) = default.filter(|default| !default.is_empty()) {
+        if default.starts_with("${") {
+            out.extend(reference_default_literals(default));
+        } else {
+            out.push(default.to_string());
+        }
+    }
+    out
+}
+
+/// `true` when a keyed value is a source-code TYPE annotation, not a value:
+/// `password: String,` in a Rust struct, `token: string;` in TypeScript,
+/// `api_key: Option<SecretString>`. Reading source files through the shell
+/// is the core of a coding agent's work; scrubbing and registering `String`
+/// as a session-wide secret would rewrite every later file it reads. Only a
+/// closed vocabulary of primitive and wrapper type names qualifies (an
+/// arbitrary CamelCase word could be a real password), with generic
+/// arguments drawn from the same vocabulary or other CamelCase names.
+fn is_code_type_expression(value: &str) -> bool {
+    const PRIMITIVES: &[&str] = &[
+        "String",
+        "str",
+        "bool",
+        "char",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "usize",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
+        "isize",
+        "f32",
+        "f64",
+        "string",
+        "number",
+        "boolean",
+        "any",
+        "unknown",
+        "Bytes",
+        "PathBuf",
+        "Path",
+        "Uuid",
+        "Value",
+        "SecretString",
+    ];
+    const WRAPPERS: &[&str] = &[
+        "Option",
+        "Vec",
+        "Box",
+        "Arc",
+        "Rc",
+        "Cow",
+        "HashMap",
+        "BTreeMap",
+        "Result",
+        "Zeroizing",
+        "SecretBox",
+        "Mutex",
+        "RwLock",
+        "Cell",
+        "RefCell",
+        "Array",
+        "Promise",
+        "Record",
+    ];
+    let value = strip_matching_quotes(value.trim().trim_end_matches([',', ';']).trim());
+    let value = value.strip_prefix('&').unwrap_or(value);
+    let value = value
+        .strip_prefix("'static ")
+        .or_else(|| value.strip_prefix("'a "))
+        .unwrap_or(value)
+        .trim_start_matches("mut ")
+        .trim();
+    if PRIMITIVES.contains(&value) {
+        return true;
+    }
+    let Some(open) = value.find('<') else {
+        return false;
+    };
+    let (outer, rest) = value.split_at(open);
+    let Some(inner) = rest
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+    else {
+        return false;
+    };
+    WRAPPERS.contains(&outer)
+        && !inner.is_empty()
+        && inner.split(',').all(|arg| {
+            let arg = arg.trim();
+            is_code_type_expression(arg)
+                || (arg.starts_with(|c: char| c.is_ascii_uppercase())
+                    && arg
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_'))
+        })
+}
+
+/// Keys whose short all-digit values are counts or limits (`max_tokens`,
+/// `token_count`, `timeout`), never credentials. The secret-shaped key
+/// predicate deliberately matches the `tokens` segment, so this narrower
+/// list, not the absence of a `_PASSWORD`/`_PIN` suffix, decides the
+/// [`NovelScrubMode::KeyedNarrow`] count exemption. A key that also names
+/// a password, PIN, secret or key segment is never count-like.
+fn is_count_like_key(key: &str) -> bool {
+    let segments = super::key_name_segments(key);
+    let counting = segments.iter().any(|segment| {
+        matches!(
+            segment.as_str(),
+            "tokens"
+                | "count"
+                | "counts"
+                | "limit"
+                | "limits"
+                | "max"
+                | "min"
+                | "size"
+                | "length"
+                | "ttl"
+                | "timeout"
+                | "budget"
+                | "usage"
+                | "total"
+                | "expiry"
+                | "expires"
+                | "lifetime"
+        )
+    });
+    let credential = segments.iter().any(|segment| {
+        matches!(
+            segment.as_str(),
+            "password" | "passwd" | "pin" | "secret" | "passphrase" | "key" | "apikey"
+        )
+    });
+    counting && !credential
+}
+
 /// Keyed-value visibility under `mode`: the shared plausibility floor, plus
 /// the [`NovelScrubMode::KeyedNarrow`] exemptions — braced interpolation
 /// references ([`is_interpolation_reference`]) and short counts.
@@ -293,7 +524,10 @@ fn keyed_value_is_visible(mode: NovelScrubMode, key: &str, value: &str) -> bool 
     if mode == NovelScrubMode::KeyedNarrow && is_interpolation_reference(value) {
         return true;
     }
-    if mode == NovelScrubMode::KeyedNarrow && !credential_shaped_key(key) {
+    if mode == NovelScrubMode::KeyedNarrow && is_code_type_expression(value) {
+        return true;
+    }
+    if mode == NovelScrubMode::KeyedNarrow && is_count_like_key(key) {
         let bare = strip_matching_quotes(value);
         return !bare.is_empty()
             && bare.len() < NARROW_NUMERIC_VALUE_MIN_LEN
@@ -330,88 +564,276 @@ impl RedactionTable {
         body: &str,
         mode: NovelScrubMode,
     ) -> NovelScrubOutput {
-        let mut found = Vec::new();
         if self.disabled {
             return NovelScrubOutput {
                 text: body.to_string(),
-                found,
+                found: Vec::new(),
             };
         }
-        let mut out = String::with_capacity(body.len());
-        let mut in_private_key_block = false;
-        // The raw lines of the private-key block being dropped, fences
-        // included, so the block (and each body line) can be registered.
-        let mut private_key_lines: Vec<&str> = Vec::new();
-        // YAML block scalar opened by a secret-shaped key: the key line's
-        // indent. The value is the run of following lines indented deeper
-        // than the key line.
-        let mut block_scalar: Option<usize> = None;
+        let mut stream = NovelScrubStream::new(&self.placeholder, mode);
+        let mut lines: Vec<(Option<String>, &str)> = Vec::new();
         for line in body.split_inclusive('\n') {
             let (content, newline) = match line.strip_suffix('\n') {
                 Some(content) => (content, "\n"),
                 None => (line, ""),
             };
-            if in_private_key_block {
-                // The whole block collapsed to one placeholder at its BEGIN
-                // fence; keep dropping lines (the END fence included) until
-                // the block closes.
-                private_key_lines.push(content);
-                if is_private_key_fence(content, "-----END") {
-                    in_private_key_block = false;
-                    observe_private_key_block(&mut private_key_lines, &mut found);
-                }
-                continue;
-            }
-            if is_private_key_fence(content, "-----BEGIN") {
-                out.push_str(&self.placeholder);
+            lines.push((stream.push_line(content), newline));
+        }
+        stream.finish();
+        // A bounded capture (head + tail around an omission) or a tail slice
+        // can start inside a PEM private-key block whose BEGIN fence was
+        // dropped. An END fence with no open block is the evidence: the
+        // base64 run immediately before it is key material too.
+        if stream.mode_scrubs_orphan_pem() {
+            redact_orphan_private_key_bodies(&mut lines, &self.placeholder, &mut stream.found);
+        }
+        let mut out = String::with_capacity(body.len());
+        for (text, newline) in &lines {
+            // A dropped line (inside a collapsed PEM block or a multiline
+            // secret value) disappears together with its newline.
+            if let Some(text) = text {
+                out.push_str(text);
                 out.push_str(newline);
-                in_private_key_block = true;
-                private_key_lines.push(content);
-                continue;
-            }
-            if let Some(key_indent) = block_scalar {
-                let indent = content.len() - content.trim_start().len();
-                let trimmed = content.trim();
-                if trimmed.is_empty() {
-                    // Blank lines do not close a YAML block scalar.
-                    out.push_str(content);
-                    out.push_str(newline);
-                    continue;
-                }
-                if indent > key_indent {
-                    if trimmed != self.placeholder && !keyed_novel_value_is_visible(trimmed) {
-                        out.push_str(&content[..indent]);
-                        out.push_str(&self.placeholder);
-                        found.push(ObservedSecret::literal(trimmed.to_string(), false));
-                    } else {
-                        out.push_str(content);
-                    }
-                    out.push_str(newline);
-                    continue;
-                }
-                // Dedent closes the block; this line is normal output.
-                block_scalar = None;
-            }
-            let intro = secret_shaped_block_scalar_intro(content);
-            let scrubbed = scrub_line(content, &self.placeholder, mode, &mut found);
-            out.push_str(&scrubbed);
-            out.push_str(newline);
-            if let Some(intro) = intro {
-                block_scalar = Some(intro);
             }
         }
-        if !private_key_lines.is_empty() {
-            // Output ended inside the block (truncated key): register what
-            // was captured.
-            observe_private_key_block(&mut private_key_lines, &mut found);
+        NovelScrubOutput {
+            text: out,
+            found: stream.take_found(),
         }
+    }
+}
+
+/// The open quoted value of a secret-keyed assignment / colon pair that did
+/// not close on its own line (a multiline dotenv or YAML quoted value).
+#[derive(Clone)]
+struct OpenQuote {
+    quote: char,
+    key: String,
+    parts: Vec<String>,
+}
+
+/// Line-at-a-time novel-secret scrubber. It carries every multi-line shape's
+/// state (PEM private-key blocks, YAML block scalars under secret keys,
+/// multiline quoted secret values) across lines, so a caller can scrub output
+/// AS IT ARRIVES (background jobs) and slice/window/evict only already
+/// scrubbed lines afterwards. A later tail slice can then never strip the
+/// context (the BEGIN fence, the keyed scalar intro) that made a line secret.
+pub(crate) struct NovelScrubStream {
+    placeholder: String,
+    mode: NovelScrubMode,
+    in_private_key_block: bool,
+    private_key_lines: Vec<String>,
+    block_scalar: Option<usize>,
+    open_quote: Option<OpenQuote>,
+    found: Vec<ObservedSecret>,
+}
+
+impl NovelScrubStream {
+    pub(crate) fn new(placeholder: &str, mode: NovelScrubMode) -> Self {
+        Self {
+            placeholder: placeholder.to_string(),
+            mode,
+            in_private_key_block: false,
+            private_key_lines: Vec::new(),
+            block_scalar: None,
+            open_quote: None,
+            found: Vec::new(),
+        }
+    }
+
+    fn mode_scrubs_orphan_pem(&self) -> bool {
+        true
+    }
+
+    /// Scrub one line (without its newline); returns the replacement line,
+    /// or `None` when the line is dropped entirely (it lies inside a
+    /// collapsed PEM block or a multiline secret value).
+    pub(crate) fn push_line(&mut self, content: &str) -> Option<String> {
+        let placeholder = self.placeholder.clone();
+        if self.in_private_key_block {
+            // The whole block collapsed to one placeholder at its BEGIN
+            // fence; keep dropping lines (the END fence included) until the
+            // block closes.
+            self.private_key_lines.push(content.to_string());
+            if is_private_key_fence(content, "-----END") {
+                self.in_private_key_block = false;
+                observe_private_key_block(&mut self.private_key_lines, &mut self.found);
+            }
+            return None;
+        }
+        if let Some(open) = self.open_quote.as_mut() {
+            // Continuation of a multiline quoted secret value: drop the value
+            // text up to its closing quote; the rest of the line is ordinary.
+            match closing_quote(content, open.quote) {
+                Some(close) => {
+                    open.parts.push(content[..close].to_string());
+                    let open = self.open_quote.take().expect("open quote");
+                    observe_multiline_value(&mut self.found, &open);
+                    let rest = &content[close..];
+                    return Some(scrub_line(
+                        rest,
+                        &placeholder,
+                        self.mode,
+                        &mut self.found,
+                        &mut self.open_quote,
+                    ));
+                }
+                None => {
+                    open.parts.push(content.to_string());
+                    return None;
+                }
+            }
+        }
+        if is_private_key_fence(content, "-----BEGIN") {
+            self.in_private_key_block = true;
+            self.private_key_lines.push(content.to_string());
+            return Some(placeholder);
+        }
+        if let Some(key_indent) = self.block_scalar {
+            let indent = content.len() - content.trim_start().len();
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                // Blank lines do not close a YAML block scalar.
+                return Some(content.to_string());
+            }
+            if indent > key_indent {
+                if trimmed != placeholder && !keyed_novel_value_is_visible(trimmed) {
+                    self.found
+                        .push(ObservedSecret::literal(trimmed.to_string(), true));
+                    return Some(format!("{}{placeholder}", &content[..indent]));
+                }
+                return Some(content.to_string());
+            }
+            // Dedent closes the block; this line is normal output.
+            self.block_scalar = None;
+        }
+        let intro = secret_shaped_block_scalar_intro(content);
+        let scrubbed = scrub_line(
+            content,
+            &placeholder,
+            self.mode,
+            &mut self.found,
+            &mut self.open_quote,
+        );
+        if let Some(intro) = intro {
+            self.block_scalar = Some(intro);
+        }
+        Some(scrubbed)
+    }
+
+    /// Flush state at end of output: a truncated PEM block or an unclosed
+    /// multiline value is registered from what was captured.
+    pub(crate) fn finish(&mut self) {
+        if !self.private_key_lines.is_empty() {
+            observe_private_key_block(&mut self.private_key_lines, &mut self.found);
+        }
+        self.in_private_key_block = false;
+        if let Some(open) = self.open_quote.take() {
+            observe_multiline_value(&mut self.found, &open);
+        }
+    }
+
+    /// Everything replaced so far, deduplicated in first-seen order.
+    pub(crate) fn take_found(&mut self) -> Vec<ObservedSecret> {
         let mut seen = std::collections::HashSet::new();
+        let placeholder = self.placeholder.clone();
+        let mut found = std::mem::take(&mut self.found);
         found.retain(|secret| {
             !secret.value.is_empty()
-                && secret.value != self.placeholder
+                && secret.value != placeholder
                 && seen.insert(secret.value.clone())
         });
-        NovelScrubOutput { text: out, found }
+        found
+    }
+}
+
+/// Byte offset of the first unescaped closing `quote` on a continuation line
+/// (`\"` escapes a double quote; `''` escapes a single quote).
+fn closing_quote(content: &str, quote: char) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    let mut backslashes = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            backslashes += 1;
+            i += 1;
+            continue;
+        }
+        if b == quote as u8 {
+            if quote == '"' && backslashes % 2 == 1 {
+                backslashes = 0;
+                i += 1;
+                continue;
+            }
+            if quote == '\'' && bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                backslashes = 0;
+                continue;
+            }
+            return Some(i);
+        }
+        backslashes = 0;
+        i += 1;
+    }
+    None
+}
+
+/// Register a multiline quoted secret value: the joined value and each
+/// distinctive line.
+fn observe_multiline_value(found: &mut Vec<ObservedSecret>, open: &OpenQuote) {
+    let joined = open.parts.join("\n");
+    let raw = format!("{q}{joined}{q}", q = open.quote);
+    observe_keyed(found, &open.key, &raw, Some(open.quote));
+    for part in &open.parts {
+        let trimmed = part.trim();
+        if trimmed.len() >= MIN_REDACTION_ENTRY_LENGTH {
+            found.push(ObservedSecret::literal(trimmed.to_string(), false));
+        }
+    }
+}
+
+/// Replace the base64 run immediately preceding an orphan PEM private-key
+/// END fence (one with no open block — its BEGIN fence was cut off), and the
+/// fence itself, with the placeholder; register the run's lines.
+fn redact_orphan_private_key_bodies(
+    lines: &mut [(Option<String>, &str)],
+    placeholder: &str,
+    found: &mut Vec<ObservedSecret>,
+) {
+    for end in 0..lines.len() {
+        if !lines[end]
+            .0
+            .as_deref()
+            .is_some_and(|line| is_private_key_fence(line, "-----END"))
+        {
+            continue;
+        }
+        let mut start = end;
+        while start > 0 {
+            let Some(candidate) = lines[start - 1].0.as_deref() else {
+                break;
+            };
+            let candidate = candidate.trim();
+            let pem_body = !candidate.is_empty()
+                && candidate
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='));
+            let pem_header =
+                candidate.starts_with("Proc-Type:") || candidate.starts_with("DEK-Info:");
+            if !(pem_body || pem_header) {
+                break;
+            }
+            start -= 1;
+        }
+        let mut block: Vec<String> = lines[start..=end]
+            .iter()
+            .filter_map(|line| line.0.clone())
+            .collect();
+        observe_private_key_block(&mut block, found);
+        for (index, line) in lines[start..=end].iter_mut().enumerate() {
+            line.0 = (index == 0).then(|| placeholder.to_string());
+        }
     }
 }
 
@@ -421,7 +843,7 @@ const PRIVATE_KEY_LINE_MIN_LEN: usize = 20;
 
 /// Register a dropped private-key block: the whole block verbatim plus each
 /// distinctive body line.
-fn observe_private_key_block(lines: &mut Vec<&str>, found: &mut Vec<ObservedSecret>) {
+fn observe_private_key_block(lines: &mut Vec<String>, found: &mut Vec<ObservedSecret>) {
     if lines.is_empty() {
         return;
     }
@@ -444,11 +866,13 @@ fn scrub_line(
     placeholder: &str,
     mode: NovelScrubMode,
     found: &mut Vec<ObservedSecret>,
+    open_quote: &mut Option<OpenQuote>,
 ) -> String {
     let xml = scrub_secret_shaped_xml(content, placeholder, mode, found);
-    let assignments = scrub_secret_shaped_assignments(&xml, placeholder, mode, found);
+    let assignments = scrub_secret_shaped_assignments(&xml, placeholder, mode, found, open_quote);
     let members = scrub_secret_shaped_quoted_members(&assignments, placeholder, mode, found);
-    let pairs = scrub_secret_shaped_colon_pairs(&members, placeholder, mode, found);
+    let flow = scrub_secret_shaped_flow_pairs(&members, placeholder, mode, found);
+    let pairs = scrub_secret_shaped_colon_pairs(&flow, placeholder, mode, found, open_quote);
     match mode {
         NovelScrubMode::Full => scrub_keyless_credential_tokens(&pairs, placeholder, found),
         NovelScrubMode::KeyedNarrow => {
@@ -516,10 +940,68 @@ fn scrub_url_userinfo_passwords(
         out.push_str(placeholder);
         copied = password_end;
         search = authority_end;
-        found.push(ObservedSecret::literal(userinfo.to_string(), false));
+        observe_url_password(found, &userinfo[..colon], password, userinfo);
     }
     out.push_str(&content[copied..]);
     out
+}
+
+/// Register a replaced URL-userinfo password: the password as replaced, its
+/// percent-DECODED form (what a later bare echo prints), with encoded
+/// variants, plus the whole `user:password` pair. Stated policy exception:
+/// a password equal to its user name or to a well-known default
+/// (`postgres`, `root`, …) is not installed on its own — as a session-wide
+/// pattern it would rewrite every mention of that word — and only the pair
+/// is registered; it is still replaced here.
+fn observe_url_password(
+    found: &mut Vec<ObservedSecret>,
+    user: &str,
+    password: &str,
+    userinfo: &str,
+) {
+    const WELL_KNOWN_DEFAULTS: &[&str] = &[
+        "password", "postgres", "root", "admin", "guest", "changeme", "example", "test", "user",
+        "pass", "mysql", "redis", "secret", "default",
+    ];
+    found.push(ObservedSecret::literal(userinfo.to_string(), false));
+    let decoded = percent_decode(password).unwrap_or_else(|| password.to_string());
+    let well_known = decoded == user
+        || WELL_KNOWN_DEFAULTS
+            .iter()
+            .any(|default| decoded.eq_ignore_ascii_case(default));
+    if well_known {
+        return;
+    }
+    for value in [password.to_string(), decoded] {
+        found.push(ObservedSecret {
+            value,
+            length_exempt: true,
+            encoded_variants: true,
+            case_variants: false,
+        });
+    }
+}
+
+/// Percent-decode `%XX` escapes; `None` for a malformed escape or a
+/// non-UTF-8 result.
+fn percent_decode(raw: &str) -> Option<String> {
+    if !raw.contains('%') {
+        return Some(raw.to_string());
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = raw.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// `true` when `line` is a PEM `-----BEGIN`/`-----END` fence for a private
@@ -585,7 +1067,7 @@ fn scrub_secret_shaped_xml(
                 let close_end = close_start + tag.len() + 3;
                 let value = &line[value_start..close_start];
                 if value != placeholder && !keyed_value_is_visible(mode, tag, value) {
-                    found.push(ObservedSecret::keyed(tag, value));
+                    observe_keyed(found, tag, value, None);
                     out.push_str(&line[copied..value_start]);
                     out.push_str(placeholder);
                     // Only the inner text is secret: the close tag is
@@ -635,6 +1117,7 @@ fn scrub_secret_shaped_assignments(
     placeholder: &str,
     mode: NovelScrubMode,
     found: &mut Vec<ObservedSecret>,
+    open_quote: &mut Option<OpenQuote>,
 ) -> String {
     if !content.contains('=') {
         return content.to_string();
@@ -686,15 +1169,33 @@ fn scrub_secret_shaped_assignments(
             _ => None,
         };
         let mut redacted: Option<(usize, usize)> = None;
-        if at_boundary
-            && command_output_key_qualifies(key)
-            && let Some((value_start, value_end)) =
-                assignment_value_span(content, eq + 1, opening_quote, query_context, &quotes)
-        {
-            let value = &content[value_start..value_end];
-            if value != placeholder && !keyed_value_is_visible(mode, key, value) {
-                found.push(ObservedSecret::keyed(key, value));
-                redacted = Some((value_start, value_end));
+        if at_boundary && command_output_key_qualifies(key) {
+            match assignment_value_span(content, eq + 1, opening_quote, query_context, &quotes) {
+                Some((value_start, value_end)) => {
+                    let value = &content[value_start..value_end];
+                    if value != placeholder && !keyed_value_is_visible(mode, key, value) {
+                        observe_keyed(found, key, value, None);
+                        redacted = Some((value_start, value_end));
+                    }
+                }
+                None => {
+                    // A value that OPENS a quote it does not close on this
+                    // line is a multiline quoted value (dotenv `KEY="a` /
+                    // `b"`): fail closed — replace the rest of the line and
+                    // carry the open quote to the following lines.
+                    if let Some((value_start, quote)) = unclosed_quoted_value(content, eq + 1)
+                        && open_quote.is_none()
+                    {
+                        *open_quote = Some(OpenQuote {
+                            quote,
+                            key: key.to_string(),
+                            parts: vec![content[value_start + 1..].to_string()],
+                        });
+                        out.push_str(&content[i..value_start]);
+                        out.push_str(placeholder);
+                        return out;
+                    }
+                }
             }
         }
         if let Some((value_start, value_end)) = redacted {
@@ -736,6 +1237,11 @@ fn assignment_value_span(
     } else if let Some(quote) = opening_quote {
         let close = quotes.next_of(quote, start)?;
         Some((start, close))
+    } else if content[start..].starts_with("${") {
+        // A shell reference with an operand (`${X:-default value}`) spans to
+        // its MATCHING brace, whitespace included; an unclosed one runs to the
+        // end of the line (fail closed, never a literal suffix left behind).
+        Some((start, matching_reference_end(content, start)))
     } else {
         let end = if query_context {
             content[start..]
@@ -748,6 +1254,44 @@ fn assignment_value_span(
         };
         Some((start, end))
     }
+}
+
+/// End (exclusive) of the `${…}` reference starting at `start`, matching
+/// nested `${` openers; the end of the line when it never closes.
+fn matching_reference_end(content: &str, start: usize) -> usize {
+    let bytes = content.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return i + 1;
+            }
+        }
+        i += 1;
+    }
+    content.len()
+}
+
+/// `(value_start, quote)` when the assignment value at `after_eq` opens a
+/// quote with no unescaped closing quote on the rest of the line.
+fn unclosed_quoted_value(content: &str, after_eq: usize) -> Option<(usize, char)> {
+    let rest = content.get(after_eq..)?;
+    let start = after_eq + (rest.len() - rest.trim_start().len());
+    let quote = match content.as_bytes().get(start)? {
+        b'"' => '"',
+        b'\'' => '\'',
+        _ => return None,
+    };
+    closing_quote(&content[start + 1..], quote)
+        .is_none()
+        .then_some((start, quote))
 }
 
 /// Scrub every `"KEY": "VALUE"` / `'KEY': 'VALUE'` member whose key is
@@ -791,28 +1335,132 @@ fn scrub_quoted_members_of_kind(
     let mut out = String::with_capacity(content.len());
     let mut copied = 0;
     let mut k = 0;
-    while k + 3 < positions.len() {
+    while k + 1 < positions.len() {
         let key_open = positions[k];
         let key_close = positions[k + 1];
+        if key_open < copied {
+            k += 2;
+            continue;
+        }
         let key = &content[key_open + 1..key_close];
         if command_output_key_qualifies(key) {
-            let val_open = positions[k + 2];
-            let val_close = positions[k + 3];
-            let separator = &content[key_close + 1..val_open];
-            let mut parts = separator.split_whitespace();
-            if parts.next() == Some(":") && parts.next().is_none() {
-                let value = &content[val_open + 1..val_close];
-                if value != placeholder && !keyed_value_is_visible(mode, key, value) {
-                    found.push(ObservedSecret::keyed(key, value));
-                    out.push_str(&content[copied..val_open + 1]);
-                    out.push_str(placeholder);
-                    copied = val_close;
-                    k += 4;
-                    continue;
+            let after_key = &content[key_close + 1..];
+            let sep_ws = after_key.len() - after_key.trim_start().len();
+            let after_colon = after_key[sep_ws..].strip_prefix(':');
+            if let Some(after_colon) = after_colon {
+                let value_ws = after_colon.len() - after_colon.trim_start().len();
+                let value_start = key_close + 1 + sep_ws + 1 + value_ws;
+                if content[value_start..].starts_with(kind) && k + 3 < positions.len() {
+                    // Quoted value: the next quote pair.
+                    let val_open = positions[k + 2];
+                    let val_close = positions[k + 3];
+                    if val_open == value_start {
+                        let value = &content[val_open + 1..val_close];
+                        if value != placeholder && !keyed_value_is_visible(mode, key, value) {
+                            observe_keyed(found, key, &content[val_open..=val_close], Some(kind));
+                            out.push_str(&content[copied..val_open + 1]);
+                            out.push_str(placeholder);
+                            copied = val_close;
+                            k += 4;
+                            continue;
+                        }
+                    }
+                } else if !content[value_start..].starts_with(['"', '\'', '{', '[']) {
+                    // Unquoted scalar member value (`"api_key": 1234567890`):
+                    // runs to the next `,` / `}` / `]` / whitespace.
+                    let value_end = content[value_start..]
+                        .find(|c: char| matches!(c, ',' | '}' | ']') || c.is_whitespace())
+                        .map_or(content.len(), |rel| value_start + rel);
+                    let value = &content[value_start..value_end];
+                    if !value.is_empty()
+                        && value != placeholder
+                        && !keyed_value_is_visible(mode, key, value)
+                    {
+                        observe_keyed(found, key, value, None);
+                        out.push_str(&content[copied..value_start]);
+                        out.push_str(placeholder);
+                        copied = value_end;
+                    }
                 }
             }
         }
         k += 2;
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
+/// Scrub `KEY: VALUE` members of YAML flow mappings (`{API_KEY: v, x: y}`)
+/// whose bare key is secret-shaped. A member starts after `{` or `,`; its
+/// value runs to the next `,` / `}` (or its closing quote when quoted).
+/// Quoted keys are covered by [`scrub_secret_shaped_quoted_members`].
+fn scrub_secret_shaped_flow_pairs(
+    content: &str,
+    placeholder: &str,
+    mode: NovelScrubMode,
+    found: &mut Vec<ObservedSecret>,
+) -> String {
+    if !content.contains('{') || !content.contains(':') {
+        return content.to_string();
+    }
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !matches!(bytes[i], b'{' | b',') {
+            i += 1;
+            continue;
+        }
+        let mut key_start = i + 1;
+        while key_start < bytes.len() && matches!(bytes[key_start], b' ' | b'\t') {
+            key_start += 1;
+        }
+        let mut key_end = key_start;
+        while key_end < bytes.len() && is_bare_key_char(bytes[key_end]) {
+            key_end += 1;
+        }
+        let key = &content[key_start..key_end];
+        if key.is_empty()
+            || bytes.get(key_end) != Some(&b':')
+            || !matches!(bytes.get(key_end + 1), Some(b' ' | b'\t' | b'"' | b'\''))
+            || !command_output_key_qualifies(key)
+        {
+            i += 1;
+            continue;
+        }
+        let mut value_start = key_end + 1;
+        while value_start < bytes.len() && matches!(bytes[value_start], b' ' | b'\t') {
+            value_start += 1;
+        }
+        let quote = bytes
+            .get(value_start)
+            .copied()
+            .filter(|b| matches!(b, b'"' | b'\''));
+        let value_end = match quote {
+            Some(q) => match closing_quote(&content[value_start + 1..], q as char) {
+                Some(close) => value_start + 1 + close + 1,
+                None => content.len(),
+            },
+            None => content[value_start..]
+                .find([',', '}'])
+                .map_or(content.len(), |rel| value_start + rel),
+        };
+        let raw = content[value_start..value_end].trim_end();
+        let value_end = value_start + raw.len();
+        if !raw.is_empty()
+            && raw != placeholder
+            && !keyed_value_is_visible(mode, key, strip_matching_quotes(raw))
+            && strip_matching_quotes(raw) != placeholder
+        {
+            observe_keyed(found, key, raw, quote.map(|q| q as char));
+            out.push_str(&content[copied..value_start]);
+            out.push_str(placeholder);
+            copied = value_end;
+            i = value_end;
+            continue;
+        }
+        i += 1;
     }
     out.push_str(&content[copied..]);
     out
@@ -834,6 +1482,7 @@ fn scrub_secret_shaped_colon_pairs(
     placeholder: &str,
     mode: NovelScrubMode,
     found: &mut Vec<ObservedSecret>,
+    open_quote: &mut Option<OpenQuote>,
 ) -> String {
     if !content.contains(':') {
         return content.to_string();
@@ -902,19 +1551,35 @@ fn scrub_secret_shaped_colon_pairs(
         .next()
         .filter(|c| *c == '"' || *c == '\'');
     let value = match quote {
-        Some(q) if value_and_close.len() >= 2 => {
-            if !value_and_close.ends_with(q) {
-                // Unbalanced quote: don't guess what belongs to the value.
-                return content.to_string();
-            }
+        Some(q) if value_and_close.len() >= 2 && value_and_close.ends_with(q) => {
             &value_and_close[1..value_and_close.len() - 1]
         }
-        _ => value_and_close,
+        Some(q) => {
+            // The quoted value opens but does not close on this line: a
+            // multiline quoted secret. Fail closed — replace the rest of the
+            // line and carry the open quote to the following lines.
+            if open_quote.is_none() {
+                *open_quote = Some(OpenQuote {
+                    quote: q,
+                    key: key.to_string(),
+                    parts: vec![content[value_start + 1..].to_string()],
+                });
+            }
+            let mut out = String::with_capacity(content.len());
+            out.push_str(&content[..value_start]);
+            out.push_str(placeholder);
+            return out;
+        }
+        None => value_and_close,
     };
+    if is_block_scalar_indicator(value) {
+        // `password: |` opens a block scalar; its value is on the next lines.
+        return content.to_string();
+    }
     if keyed_value_is_visible(mode, key, value) || value == placeholder {
         return content.to_string();
     }
-    found.push(ObservedSecret::keyed(key, value));
+    observe_keyed(found, key, value, quote);
     let mut out = String::with_capacity(content.len());
     out.push_str(&content[..value_start]);
     if let Some(q) = quote {
@@ -955,16 +1620,22 @@ fn secret_shaped_block_scalar_intro(content: &str) -> Option<usize> {
     if !command_output_key_qualifies(key) {
         return None;
     }
-    let indicator = trimmed[colon + 1..].trim();
-    let mut chars = indicator.chars();
-    let first = chars.next()?;
-    if first != '|' && first != '>' {
-        return None;
-    }
-    if !chars.all(|c| matches!(c, '+' | '-' | '0'..='9')) {
-        return None;
-    }
-    Some(indent)
+    is_block_scalar_indicator(trimmed[colon + 1..].trim()).then_some(indent)
+}
+
+/// `|` / `>` with optional chomping/indent indicators and an optional
+/// trailing YAML comment (`| # credential`).
+fn is_block_scalar_indicator(value: &str) -> bool {
+    let value = value.trim();
+    let without_comment = match value.find(" #").or_else(|| value.find("\t#")) {
+        Some(at) => value[..at].trim_end(),
+        None => value,
+    };
+    let mut chars = without_comment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '|' || first == '>') && chars.all(|c| matches!(c, '+' | '-' | '0'..='9'))
 }
 
 /// Charset of an opaque credential token: base64 / base64url / hex /
@@ -1311,6 +1982,13 @@ fn scrub_jwt_tokens<'a>(
 /// secret-shaped. Whitespace is rejected on purpose so prose like
 /// `the token: see the docs` never matches.
 fn command_output_key_qualifies(key: &str) -> bool {
+    // A JSON key spelled with escapes (`"API_\u004bEY"`) is classified by
+    // what a JSON consumer reads, not by its raw spelling.
+    if key.contains('\\') {
+        return json_unescape(key).is_some_and(|decoded| {
+            !decoded.contains('\\') && command_output_key_qualifies(&decoded)
+        });
+    }
     !key.is_empty()
         && key.starts_with(|c: char| c.is_ascii_alphanumeric())
         && !key
@@ -2180,8 +2858,9 @@ mod tests {
         // `DB_PASSWORD` is credential-shaped: length-exempt with case variants.
         let password = &out.found[1];
         assert!(password.length_exempt && password.case_variants);
+        // Every keyed value is registered down to the hard floor (r2 C5).
         let stripe_secret = &out.found[0];
-        assert!(!stripe_secret.length_exempt && stripe_secret.encoded_variants);
+        assert!(stripe_secret.length_exempt && stripe_secret.encoded_variants);
     }
 
     #[test]
@@ -2267,8 +2946,12 @@ mod tests {
             out.text,
             "DATABASE_URL=postgres://app:[ph]@db.example:5432/app\nsee https://example.com/a:b@c and https://docs.rs/x\n"
         );
+        // The pair AND the replaced password itself are registered (r2 C6).
         let registered = format!("app:{password}");
-        assert_eq!(found_values(&out), vec![registered.as_str()]);
+        assert_eq!(
+            found_values(&out),
+            vec![registered.as_str(), password.as_str()]
+        );
     }
 
     /// Braced interpolation references name a secret's source; the narrow
@@ -2337,16 +3020,161 @@ mod tests {
         assert!(!restored.scrub(&later).contains(&stripe));
     }
 
+    /// Secrets r2 C5: a detected keyed value is registered down to the hard
+    /// four-byte floor, whatever `min_secret_length` says — the backstop
+    /// registers what it replaces. Below the hard floor and never-scrub
+    /// literals stay visible and unregistered.
     #[test]
-    fn observed_values_below_the_floor_are_not_registered() {
+    fn detected_keyed_values_register_down_to_the_hard_floor() {
         let table = table_with_placeholder(PH);
-        // `API_TOKEN` is secret-shaped but not credential-shaped: a 5-byte
-        // value is redacted in place but never installed as a session-wide
-        // pattern (it would match unrelated output).
-        let out = narrow(&table, "API_TOKEN=abcde\n");
-        assert_eq!(out.text, "API_TOKEN=[ph]\n");
         let cfg = RedactConfig::default();
+        let out = narrow(&table, "API_TOKEN=abcde\npassword: hunter2\n");
+        assert_eq!(out.text, "API_TOKEN=[ph]\npassword: [ph]\n");
         let addition = table.observed_output_addition(&cfg, &out.found).unwrap();
-        assert!(addition.is_empty());
+        for value in ["abcde", "hunter2"] {
+            assert!(
+                !addition.scrub(value).contains(value),
+                "{value} unregistered"
+            );
+        }
+        let short = narrow(&table, "API_TOKEN=abc\nDB_PASSWORD=null\n");
+        assert_eq!(short.text, "API_TOKEN=abc\nDB_PASSWORD=null\n");
+        assert!(
+            table
+                .observed_output_addition(&cfg, &short.found)
+                .unwrap()
+                .is_empty()
+        );
+        // A short all-digit `password` is a credential, not a count.
+        assert_eq!(narrow(&table, "password: 4096\n").text, "password: [ph]\n");
+        assert_eq!(
+            narrow(&table, "max_tokens: 4096\n").text,
+            "max_tokens: 4096\n"
+        );
+    }
+
+    /// Secrets r2 C4: standard keyed spellings a consumer interprets — JSON
+    /// escaped keys, numeric members, YAML flow mappings, commented block
+    /// scalars, doubled single quotes, multiline quoted dotenv values and
+    /// spaced reference defaults — are all scrubbed in narrow mode.
+    #[test]
+    fn standard_keyed_formats_are_scrubbed_in_narrow_mode() {
+        let table = RedactionTable::empty();
+        let literal = ["NovelActual515", "Secret78529"].concat();
+        let cases = [
+            ("dotenv_export", format!("export API_KEY='{literal}'")),
+            ("json", format!(r#"{{"API_KEY":"{literal}"}}"#)),
+            (
+                "json_escaped_key",
+                format!(r#"{{"API_\u004bEY":"{literal}"}}"#),
+            ),
+            (
+                "json_numeric_token",
+                "{\"api_key\":1234567890123456}".to_string(),
+            ),
+            ("yaml_flow", format!("{{API_KEY: {literal}}}")),
+            (
+                "yaml_block_comment",
+                format!("API_KEY: | # credential\n  {literal}\n"),
+            ),
+            (
+                "yaml_doubled_quote",
+                format!("DB_PASSWORD: 'prefix''{literal}'"),
+            ),
+            (
+                "dotenv_multiline",
+                format!("DB_PASSWORD=\"firstline\n{literal}\"\n"),
+            ),
+            (
+                "yaml_multiline",
+                format!("password: \"firstline\n  {literal}\"\n"),
+            ),
+            (
+                "reference_default",
+                format!("DB_PASSWORD=${{X:-{literal}}}"),
+            ),
+            (
+                "reference_nested",
+                format!("DB_PASSWORD=${{X:-${{Y:-{literal}}}}}"),
+            ),
+            (
+                "reference_default_space",
+                format!("DB_PASSWORD=${{X:-prefix {literal}}}"),
+            ),
+            ("url_password", format!("postgres://app:{literal}@db/x")),
+            (
+                "pem",
+                format!("-----BEGIN PRIVATE KEY-----\n{literal}\n-----END PRIVATE KEY-----\n"),
+            ),
+        ];
+        let mut leaks = Vec::new();
+        for (name, input) in cases {
+            let out = table
+                .scrub_novel_command_output_secrets_with_mode(&input, NovelScrubMode::KeyedNarrow);
+            if out.text.contains(&literal) || out.text.contains("1234567890123456") {
+                leaks.push((name, out.text));
+            }
+        }
+        assert!(leaks.is_empty(), "secret-shape misses: {leaks:?}");
+    }
+
+    /// Secrets r2 C4: the multiline value's continuation lines are dropped and
+    /// the text after the closing quote is ordinary output again.
+    #[test]
+    fn multiline_quoted_secret_closes_and_output_resumes() {
+        let table = table_with_placeholder(PH);
+        let out = narrow(
+            &table,
+            "DB_PASSWORD=\"line-one-secret\nline-two-secret\" trailing\nNODE_ENV=production\n",
+        );
+        assert_eq!(
+            out.text,
+            "DB_PASSWORD=[ph]\n\" trailing\nNODE_ENV=production\n"
+        );
+        let values = found_values(&out);
+        assert!(
+            values.contains(&"line-one-secret\nline-two-secret"),
+            "{values:?}"
+        );
+    }
+
+    /// Secrets r2 C7: a capture that lost a PEM block's BEGIN fence (a bounded
+    /// head+tail join, a tail slice) still redacts the base64 body that
+    /// precedes the orphan END fence.
+    #[test]
+    fn orphan_private_key_end_fence_redacts_the_preceding_body() {
+        let table = table_with_placeholder(PH);
+        let body_line = ["b3BlbnNzaC1rZXktdjEAAAAA", "OrphanBody515Line78529"].concat();
+        let input = format!(
+            "[... 4096 bytes omitted ...]\n{body_line}\n{body_line}xyz\n-----END OPENSSH PRIVATE KEY-----\nafter\n" // pragma: allowlist secret
+        );
+        let out = narrow(&table, &input);
+        assert!(!out.text.contains(&body_line), "{}", out.text);
+        assert!(
+            out.text.contains("[... 4096 bytes omitted ...]"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.ends_with("[ph]\nafter\n"), "{}", out.text);
+        assert!(found_values(&out).contains(&body_line.as_str()));
+    }
+
+    /// Secrets r2 C7: the line-at-a-time stream carries PEM state across
+    /// lines, so a scrubbed-at-intake consumer never stores a body line raw.
+    #[test]
+    fn novel_scrub_stream_carries_private_key_state_across_lines() {
+        let mut stream = NovelScrubStream::new(PH, NovelScrubMode::KeyedNarrow);
+        let body_line = ["b3BlbnNzaC1rZXktdjEAAAAA", "StreamBody515Line78529"].concat();
+        assert_eq!(
+            stream
+                .push_line("-----BEGIN OPENSSH PRIVATE KEY-----")
+                .as_deref(), // pragma: allowlist secret
+            Some(PH)
+        );
+        assert_eq!(stream.push_line(&body_line), None);
+        assert_eq!(stream.push_line("-----END OPENSSH PRIVATE KEY-----"), None);
+        assert_eq!(stream.push_line("after").as_deref(), Some("after"));
+        let found = stream.take_found();
+        assert!(found.iter().any(|secret| secret.value == body_line));
     }
 }

@@ -81,8 +81,9 @@ fn command_spec_payload(command: &[String]) -> Result<Vec<u8>> {
 /// CLOSED: a malformed payload or an empty argv is an error, never a silent
 /// fallback to a usable secret value.
 fn parse_command_spec_payload(bytes: &[u8]) -> Result<Vec<String>> {
-    let argv: Vec<String> =
-        serde_json::from_slice(bytes).context("parsing command-backed secret spec")?;
+    let argv: Vec<String> = serde_json::from_slice(bytes)
+        .map_err(|error| crate::config::value_free::json_error(&error))
+        .context("parsing command-backed secret spec")?;
     if argv.is_empty() {
         anyhow::bail!("command-backed secret spec has an empty argv");
     }
@@ -1146,7 +1147,9 @@ fn read_credential_file_readonly(path: &Path) -> Result<CredentialFile> {
     if raw.trim().is_empty() {
         return Ok(CredentialFile::default());
     }
-    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    serde_json::from_str(&raw)
+        .map_err(|error| crate::config::value_free::json_error(&error))
+        .with_context(|| format!("parsing {}", path.display()))
 }
 
 #[cfg(any(test, feature = "test-support"))]

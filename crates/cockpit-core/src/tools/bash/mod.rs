@@ -540,7 +540,14 @@ async fn call_bash_inner(
         }
     };
 
-    tracing::debug!(command, timeout_ms, "bash: spawning");
+    // Never log the command text: inline `API_KEY=… cmd` assignments and
+    // `--token=…` arguments are credentials the table may not know yet.
+    tracing::debug!(
+        program = %shell_command_log_identity(command),
+        command_bytes = command.len(),
+        timeout_ms,
+        "bash: spawning"
+    );
 
     // Resolve whether to confine this run (sandboxing part 2):
     //
@@ -1196,6 +1203,40 @@ async fn call_bash_inner(
             .await;
     }
     Ok(out)
+}
+
+/// A value-free identity of a shell command for diagnostics: the program
+/// name of its first simple command (environment assignments skipped, path
+/// reduced to its file name, restricted to name characters) plus the number
+/// of further words. Arguments and assignment values are never included.
+pub(crate) fn shell_command_log_identity(command: &str) -> String {
+    let mut words = command.split_whitespace();
+    let mut program = None;
+    let mut rest = 0usize;
+    for word in words.by_ref() {
+        if program.is_none() && word.contains('=') {
+            continue;
+        }
+        if program.is_none() {
+            let name = word.rsplit('/').next().unwrap_or(word);
+            let name: String = name
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+                .take(64)
+                .collect();
+            program = Some(if name.is_empty() {
+                "?".to_string()
+            } else {
+                name
+            });
+        } else {
+            rest += 1;
+        }
+    }
+    format!(
+        "{} (+{rest} words)",
+        program.unwrap_or_else(|| "?".to_string())
+    )
 }
 
 async fn approve_outside_working_directory(
@@ -2836,17 +2877,14 @@ async fn scrub_shell_outcome_novel_secrets(
     if crate::tools::trusted_child_acquisition::acquisition_quarantines_shell_output() {
         return Ok(());
     }
-    for stream in [&mut outcome.stdout, &mut outcome.stderr] {
-        crate::tools::output_backstop::scrub_command_output_bytes(
-            &ctx.interrupts,
-            &ctx.session,
-            &ctx.redact,
-            cfg,
-            stream,
-        )
-        .await?;
-    }
-    Ok(())
+    crate::tools::output_backstop::scrub_command_byte_streams(
+        &ctx.interrupts,
+        &ctx.session,
+        &ctx.redact,
+        cfg,
+        &mut [&mut outcome.stdout, &mut outcome.stderr],
+    )
+    .await
 }
 
 fn render_bash_outcome(
@@ -3266,22 +3304,29 @@ struct AdoptedOutputBackstop {
 }
 
 impl AdoptedOutputBackstop {
-    /// Scrub one captured stream. Fail-closed: when registration fails the
-    /// stream is withheld rather than delivered with an unregistered secret.
-    async fn apply(&self, redact: &crate::redact::RedactionTable, text: String) -> String {
-        match crate::tools::output_backstop::scrub_command_output(
+    /// Scrub both captured streams together. Fail-closed: when registration
+    /// fails both streams are withheld rather than delivered with an
+    /// unregistered secret.
+    async fn apply(
+        &self,
+        redact: &crate::redact::RedactionTable,
+        mut stdout: String,
+        mut stderr: String,
+    ) -> (String, String) {
+        match crate::tools::output_backstop::scrub_command_streams(
             &self.interrupts,
             &self.session,
             redact,
             &self.redact_config,
-            &text,
+            &mut [&mut stdout, &mut stderr],
         )
         .await
         {
-            Ok(scrubbed) => scrubbed,
-            Err(error) => {
-                format!("[output withheld: registering a secret found in it failed: {error:#}]")
-            }
+            Ok(()) => (stdout, stderr),
+            Err(_) => (
+                "[output withheld: registering a secret found in it failed]".to_string(),
+                String::new(),
+            ),
         }
     }
 }
@@ -3344,8 +3389,7 @@ async fn spawn_adopted_shell_completion(
                         let stderr = boundary_safe_join(&redact, stderr_task.join().await);
                         // Narrow novel-secret backstop (secrets I2): this
                         // result lands as model-facing steering text.
-                        let stdout = backstop.apply(&redact, stdout).await;
-                        let stderr = backstop.apply(&redact, stderr).await;
+                        let (stdout, stderr) = backstop.apply(&redact, stdout, stderr).await;
                         let exit = status.code().unwrap_or(-1);
                         let signaled = !status.success() && status.code().is_none();
                         format_combined(&stdout, &stderr, exit, signaled)

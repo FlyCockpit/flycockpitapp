@@ -327,13 +327,25 @@ pub struct PoolsFile {
 }
 
 /// One secret entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretEntry {
     pub secret_ref: String,
     pub secret_version: String,
     pub secret_base64url: String,
     pub state: SecretLifecycle,
+}
+
+// The encoded TURN shared secret never prints: reference, version and state.
+impl std::fmt::Debug for SecretEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretEntry")
+            .field("secret_ref", &self.secret_ref)
+            .field("secret_version", &self.secret_version)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Secrets file root.
@@ -1127,10 +1139,20 @@ pub fn coturn_password(username: &str, secret: &[u8]) -> Result<String, IcePolic
 /// A derived coturn REST credential pair (username, password). The password
 /// is wrapped in `Zeroizing` so it is cleared on drop; the secret input is
 /// never retained.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CoturnCredential {
     pub username: String,
     pub password: Zeroizing<String>,
+}
+
+// `Zeroizing` does not redact `Debug`: the derived password never prints.
+impl std::fmt::Debug for CoturnCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoturnCredential")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Derive a coturn REST credential from the given expiry, random ID, and
@@ -1169,7 +1191,7 @@ impl IceRouteClass {
 }
 
 /// Inputs to the ICE policy response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IcePolicyResponseInput<'a> {
     pub ordered_turn_urls: &'a [String],
     pub ordered_stun_urls: &'a [String],
@@ -1178,6 +1200,20 @@ pub struct IcePolicyResponseInput<'a> {
     pub password: &'a str,
     pub authorization_jws: &'a str,
     pub expires_at: u64,
+}
+
+// The TURN password and the authorization JWS are credentials.
+impl std::fmt::Debug for IcePolicyResponseInput<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IcePolicyResponseInput")
+            .field("ordered_turn_urls", &self.ordered_turn_urls)
+            .field("ordered_stun_urls", &self.ordered_stun_urls)
+            .field("route_class", &self.route_class)
+            .field("username", &self.username)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Serialize the exact ICE policy response:
@@ -1882,5 +1918,43 @@ mod tests {
         assert!(validate_generation("0").is_err());
         assert!(validate_generation("").is_err());
         assert!(validate_generation("01").is_err());
+    }
+}
+
+#[cfg(test)]
+mod value_free_debug_tests {
+    use super::*;
+
+    /// Secrets r2 C1: TURN shared secrets, derived coturn passwords and the
+    /// ICE authorization JWS never print (`Zeroizing` does not redact Debug).
+    #[test]
+    fn turn_secret_carriers_debug_is_value_free() {
+        let secret = ["NovelTurn515", "Secret78529"].concat();
+        let entry = SecretEntry {
+            secret_ref: "turn-a".into(),
+            secret_version: "1".into(),
+            secret_base64url: secret.clone(),
+            state: SecretLifecycle::Current,
+        };
+        let credential = CoturnCredential {
+            username: "1700000000:abc".into(),
+            password: Zeroizing::new(secret.clone()),
+        };
+        let input = IcePolicyResponseInput {
+            ordered_turn_urls: &[],
+            ordered_stun_urls: &[],
+            route_class: IceRouteClass::RelayOnly,
+            username: "user",
+            password: &secret,
+            authorization_jws: &secret,
+            expires_at: 1,
+        };
+        for rendered in [
+            format!("{entry:?}"),
+            format!("{credential:?}"),
+            format!("{input:?}"),
+        ] {
+            assert!(!rendered.contains(&secret), "{rendered}");
+        }
     }
 }

@@ -20,30 +20,97 @@
 //! it is gone. This is best-effort defense in depth, not a boundary: the
 //! background secret-source index (increments I6+) is the primary control.
 
+use std::sync::Arc;
+
 use crate::config::extended::RedactConfig;
 use crate::engine::interrupt::InterruptHub;
 use crate::redact::{NovelScrubMode, NovelScrubOutput, RedactionTable};
 use crate::session::Session;
 
-/// Scrub novel secret-shaped values out of freshly captured command output
-/// and register them in the session redaction table.
+/// Scrub novel secret-shaped values out of the freshly captured streams of
+/// ONE command (stdout and stderr together) and register them in the
+/// session redaction table.
 ///
-/// `redact` is the table the tool call holds; it supplies the placeholder,
-/// the config opt-out and the protected paths. The returned text has every
-/// observed value (and its registered variants) replaced; the rest of the
-/// session table is NOT applied here, so trusted-model custody and the
-/// downstream egress chokepoint keep their existing behaviour.
+/// - `redact` is the table the tool call holds. It supplies the
+///   placeholder, the config opt-out and the protected paths.
+/// - The observations of every stream are registered together. Their union,
+///   together with every value this session's owner has observed before
+///   (the owner's accumulated observed additions), is then applied to EVERY
+///   stream. So a keyed `DB_SECRET=v` on stdout also hides a keyless `v` on
+///   stderr, and a later same-turn command that prints only `v`, or its
+///   base64, is scrubbed even though its tool table snapshot predates the
+///   registration.
+/// - The rest of the session table is NOT applied here, so trusted-model
+///   custody and the downstream egress chokepoint keep their existing
+///   behaviour.
 ///
-/// Registration goes ONLY to the live table `interrupts` owns — the owning
-/// session worker's table, which a scheduled fork reaches through
-/// [`InterruptHub::leaf_sharing_redaction`] — never to the daemon-global
-/// table or another session's. It is fail-closed like the read tool's
-/// approved-secret registration: a persist failure is an error, never a
-/// silently unregistered value. A hub that owns no live table (tests, a
-/// standalone shim) registers nothing: persisting a union of the tool's
-/// table snapshot outside the owner's write lock could overwrite
-/// concurrently committed entries in the durable table (H1), so there the
-/// values are scrubbed from this output only.
+/// Registration goes ONLY to the table `interrupts`' redaction owner holds:
+/// the owning session worker's table, which a scheduled fork reaches through
+/// [`InterruptHub::leaf_sharing_redaction`]. It never goes to the
+/// daemon-global table or another session's. Persistence targets the owner's
+/// durable session, not a fork's execution session.
+///
+/// Registration fails closed, like the read tool's approved-secret
+/// registration: a persist failure is an error, never a silently
+/// unregistered value.
+///
+/// A hub with no owner (tests, a standalone shim) registers nothing.
+/// Persisting a union of the tool's table snapshot outside the owner's write
+/// lock could overwrite concurrently committed durable entries (H1), so
+/// there the values are scrubbed from this output only.
+pub(crate) async fn scrub_command_streams(
+    interrupts: &InterruptHub,
+    session: &Session,
+    redact: &RedactionTable,
+    cfg: &RedactConfig,
+    streams: &mut [&mut String],
+) -> anyhow::Result<()> {
+    if redact.disabled() {
+        return Ok(());
+    }
+    let mut found = Vec::new();
+    for stream in streams.iter_mut() {
+        if stream.is_empty() {
+            continue;
+        }
+        let NovelScrubOutput {
+            text,
+            found: stream_found,
+        } = redact
+            .scrub_novel_command_output_secrets_with_mode(stream, NovelScrubMode::KeyedNarrow);
+        **stream = text;
+        found.extend(stream_found);
+    }
+    let observed = if found.is_empty() {
+        interrupts
+            .redaction_owner()
+            .and_then(|owner| owner.observed_additions())
+    } else {
+        match interrupts
+            .register_observed_output_secrets(session, cfg, &found)
+            .await?
+        {
+            Some(observed) => Some(observed),
+            None => {
+                tracing::debug!(
+                    observed = found.len(),
+                    "no session redaction owner to register observed output secrets into"
+                );
+                Some(Arc::new(redact.observed_output_addition(cfg, &found)?))
+            }
+        }
+    };
+    if let Some(observed) = observed.filter(|observed| !observed.is_empty()) {
+        for stream in streams.iter_mut() {
+            if let std::borrow::Cow::Owned(scrubbed) = observed.scrub_cow(stream) {
+                **stream = scrubbed;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Single-stream form of [`scrub_command_streams`].
 pub(crate) async fn scrub_command_output(
     interrupts: &InterruptHub,
     session: &Session,
@@ -51,44 +118,34 @@ pub(crate) async fn scrub_command_output(
     cfg: &RedactConfig,
     text: &str,
 ) -> anyhow::Result<String> {
-    let NovelScrubOutput { text, found } =
-        redact.scrub_novel_command_output_secrets_with_mode(text, NovelScrubMode::KeyedNarrow);
-    if found.is_empty() {
-        return Ok(text);
-    }
-    if interrupts
-        .register_observed_output_secrets(session, cfg, &found)
-        .await?
-        .is_none()
-    {
-        tracing::debug!(
-            observed = found.len(),
-            "no live session redaction table to register observed output secrets into"
-        );
-    }
-    // Encoded / case variants of an observed value that appear elsewhere in
-    // this same output are caught now, not only from the next turn on.
-    let addition = redact.observed_output_addition(cfg, &found)?;
-    Ok(addition.scrub(&text))
+    let mut text = text.to_string();
+    scrub_command_streams(interrupts, session, redact, cfg, &mut [&mut text]).await?;
+    Ok(text)
 }
 
-/// Byte-stream form of [`scrub_command_output`] for raw captured stdout /
-/// stderr. Invalid UTF-8 is only rewritten (lossily) when the stream
-/// actually carried a secret; clean output keeps its exact bytes.
-pub(crate) async fn scrub_command_output_bytes(
+/// Byte-stream form of [`scrub_command_streams`] for raw captured stdout /
+/// stderr. Invalid UTF-8 is only rewritten (lossily) when a stream actually
+/// changed; clean output keeps its exact bytes.
+pub(crate) async fn scrub_command_byte_streams(
     interrupts: &InterruptHub,
     session: &Session,
     redact: &RedactionTable,
     cfg: &RedactConfig,
-    bytes: &mut Vec<u8>,
+    streams: &mut [&mut Vec<u8>],
 ) -> anyhow::Result<()> {
-    if bytes.is_empty() {
-        return Ok(());
+    let originals: Vec<String> = streams
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .collect();
+    let mut texts = originals.clone();
+    {
+        let mut refs: Vec<&mut String> = texts.iter_mut().collect();
+        scrub_command_streams(interrupts, session, redact, cfg, &mut refs).await?;
     }
-    let text = String::from_utf8_lossy(bytes);
-    let scrubbed = scrub_command_output(interrupts, session, redact, cfg, &text).await?;
-    if scrubbed != text {
-        *bytes = scrubbed.into_bytes();
+    for ((bytes, original), text) in streams.iter_mut().zip(&originals).zip(texts) {
+        if &text != original {
+            **bytes = text.into_bytes();
+        }
     }
     Ok(())
 }
@@ -97,7 +154,6 @@ pub(crate) async fn scrub_command_output_bytes(
 mod tests {
     use super::*;
     use base64::Engine as _;
-    use std::sync::Arc;
 
     fn stripe_key() -> String {
         // Assembled from fragments so the source never carries a contiguous
@@ -303,12 +359,12 @@ mod tests {
         .unwrap();
         assert_eq!(scrubbed, output);
         let mut bytes = vec![0xff, b'\n'];
-        scrub_command_output_bytes(
+        scrub_command_byte_streams(
             &hub,
             &session,
             &RedactionTable::empty(),
             &RedactConfig::default(),
-            &mut bytes,
+            &mut [&mut bytes],
         )
         .await
         .unwrap();
@@ -317,5 +373,235 @@ mod tests {
             vec![0xff, b'\n'],
             "clean invalid UTF-8 keeps its bytes"
         );
+    }
+
+    /// Secrets r2 C4/C5/C6: what the backstop registers is the plaintext it
+    /// replaced — the URL password itself (not only the user:password pair),
+    /// the DECODED JSON value, a short password under a bare `password` key,
+    /// and the literal default of a `${X:-default}` reference — in both the
+    /// live and the durable table.
+    #[tokio::test]
+    async fn registered_values_are_the_replaced_plaintext() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = test_session(&db, &tmp);
+        let (hub, live) = live_hub(&db, &session, 0);
+        let cfg = RedactConfig::default();
+        let url_password = ["NovelPw78529", "UrlSecret"].concat();
+        let decoded = ["novelPw78529", "JsonSecret"].concat();
+        let default_literal = ["actualNovel78529", "DefaultSecret"].concat();
+        let cases = [
+            (
+                "url",
+                format!("DATABASE_URL=postgres://app:{url_password}@db/x"),
+                url_password.clone(),
+            ),
+            (
+                "json_escape",
+                r#"{"DB_PASSWORD":"novel\u0050w78529JsonSecret"}"#.to_string(),
+                decoded.clone(),
+            ),
+            (
+                "short_password",
+                "password: hunter2".to_string(),
+                "hunter2".to_string(),
+            ),
+            (
+                "reference_default",
+                format!("DB_PASSWORD=${{X:-{default_literal}}}"),
+                default_literal.clone(),
+            ),
+        ];
+        let mut leaks = Vec::new();
+        for (name, input, value) in cases {
+            let out = scrub_command_output(&hub, &session, &RedactionTable::empty(), &cfg, &input)
+                .await
+                .unwrap();
+            assert!(!out.contains(&value), "{name}: immediate output {out}");
+            let echo = format!("later echo {value} end");
+            let live_echo = live.read().unwrap().scrub(&echo);
+            let durable_echo = session
+                .persisted_redaction_table()
+                .unwrap()
+                .unwrap()
+                .scrub(&echo);
+            if live_echo.contains(&value) || durable_echo.contains(&value) {
+                leaks.push(name);
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "replaced plaintext remains unregistered: {leaks:?}"
+        );
+        // The URL password is registered with its encoded variants too.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(url_password.as_bytes());
+        assert!(!live.read().unwrap().scrub(&encoded).contains(&encoded));
+    }
+
+    /// Secrets r2 C6: a password that equals its user name or a well-known
+    /// default is replaced, but only the user:password pair is installed —
+    /// the stated policy exception, so `postgres` is not rewritten everywhere.
+    #[tokio::test]
+    async fn well_known_url_passwords_register_only_the_pair() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = test_session(&db, &tmp);
+        let (hub, live) = live_hub(&db, &session, 0);
+        let out = scrub_command_output(
+            &hub,
+            &session,
+            &RedactionTable::empty(),
+            &RedactConfig::default(),
+            "DATABASE_URL=postgres://postgres:postgres@localhost:5432/app\n",
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("postgres://postgres:"), "{out}");
+        assert!(!out.contains("postgres@localhost"), "{out}");
+        let live = live.read().unwrap().clone();
+        assert!(live.scrub("image postgres:16").contains("postgres:16"));
+        assert!(
+            !live
+                .scrub("postgres:postgres")
+                .contains("postgres:postgres")
+        );
+    }
+
+    /// Two registrations racing through leaves of one owner both survive in
+    /// the live and durable table; a registration cancelled while waiting for
+    /// the owner's lock writes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leaf_registrations_serialize_and_cancellation_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = test_session(&db, &tmp);
+        let (hub, table) = live_hub(&db, &session, 0);
+        let hub = Arc::new(hub);
+        let guard = hub.redaction_owner().unwrap().lock().await;
+        let cancelled_hub = Arc::new(hub.leaf_sharing_redaction());
+        let cancelled_session = session.clone();
+        let pending = tokio::spawn(async move {
+            scrub_command_output(
+                &cancelled_hub,
+                &cancelled_session,
+                &RedactionTable::empty(),
+                &RedactConfig::default(),
+                "DB_SECRET=Cancelled515Novel4567",
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(
+            table
+                .read()
+                .unwrap()
+                .scrub("Cancelled515Novel4567")
+                .contains("Cancelled515Novel4567")
+        );
+        drop(guard);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for secret in ["Concurrent515NovelA78529", "Concurrent515NovelB78529"] {
+            let session = session.clone();
+            let leaf = Arc::new(hub.leaf_sharing_redaction());
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                scrub_command_output(
+                    &leaf,
+                    &session,
+                    &RedactionTable::empty(),
+                    &RedactConfig::default(),
+                    &format!("DB_SECRET={secret}"),
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let durable = session.persisted_redaction_table().unwrap().unwrap();
+        for secret in ["Concurrent515NovelA78529", "Concurrent515NovelB78529"] {
+            assert!(!table.read().unwrap().scrub(secret).contains(secret));
+            assert!(!durable.scrub(secret).contains(secret));
+        }
+    }
+
+    /// A persist failure withholds the output (an error), leaves both tables
+    /// unchanged, and a retry installs the value.
+    #[tokio::test]
+    async fn registration_persist_failure_withholds_and_keeps_tables() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = test_session(&db, &tmp);
+        let (hub, live) = live_hub(&db, &session, 0);
+        session
+            .persist_redaction_table(&RedactionTable::empty())
+            .unwrap();
+        crate::session::lifecycle::fail_next_redaction_vault_write_for_test();
+        let secret = ["NovelPersist515", "Secret78529"].concat();
+        let input = format!("DB_SECRET={secret}");
+        let result = scrub_command_output(
+            &hub,
+            &session,
+            &RedactionTable::empty(),
+            &RedactConfig::default(),
+            &input,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "output must be withheld on persist failure"
+        );
+        assert!(live.read().unwrap().scrub(&secret).contains(&secret));
+        assert!(
+            session
+                .persisted_redaction_table()
+                .unwrap()
+                .unwrap()
+                .scrub(&secret)
+                .contains(&secret)
+        );
+        let out = scrub_command_output(
+            &hub,
+            &session,
+            &RedactionTable::empty(),
+            &RedactConfig::default(),
+            &input,
+        )
+        .await
+        .unwrap();
+        assert!(!out.contains(&secret));
+        assert!(!live.read().unwrap().scrub(&secret).contains(&secret));
+    }
+
+    /// Secrets r2: source-code type annotations under secret-shaped keys are
+    /// not secrets — they stay visible and are never registered, so reading a
+    /// Rust/TypeScript file through the shell is not rewritten afterwards.
+    #[tokio::test]
+    async fn code_type_annotations_under_secret_keys_stay_visible() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = test_session(&db, &tmp);
+        let (hub, live) = live_hub(&db, &session, 0);
+        let source = "pub struct Creds {\n    password: String,\n    api_key: Option<SecretString>,\n}\ninterface X { token: string; }\n";
+        let out = scrub_command_output(
+            &hub,
+            &session,
+            &RedactionTable::empty(),
+            &RedactConfig::default(),
+            source,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, source);
+        assert!(live.read().unwrap().is_empty());
     }
 }

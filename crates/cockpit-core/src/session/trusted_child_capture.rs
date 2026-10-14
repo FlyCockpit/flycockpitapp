@@ -232,6 +232,20 @@ pub struct TrustedChildCaptureRegistry {
     pending: Mutex<HashMap<String, PendingCapture>>,
 }
 
+/// The capture base for a session no live owner writes: its latest durable
+/// table (so a capture never rewrites the vault item from an older turn
+/// snapshot), unioned with the caller's snapshot.
+fn own_durable_base(
+    session: &Session,
+    snapshot: &RedactionTable,
+) -> anyhow::Result<std::sync::Arc<RedactionTable>> {
+    let base = match session.persisted_redaction_table()? {
+        Some(durable) => durable.union(snapshot)?,
+        None => snapshot.clone(),
+    };
+    Ok(std::sync::Arc::new(base))
+}
+
 impl TrustedChildCaptureRegistry {
     /// A fresh, empty registry.
     pub fn new() -> Self {
@@ -415,6 +429,7 @@ impl TrustedChildCaptureRegistry {
         &self,
         session: &Session,
         redaction: &RedactionTable,
+        owner: Option<&crate::engine::redaction_owner::SessionRedactionOwner>,
         claimed: &ProtectedSensitiveIngress,
         value: SealedCaptureValue,
         now_ms: i64,
@@ -438,20 +453,63 @@ impl TrustedChildCaptureRegistry {
         // transaction. It is the ONLY consumer of the literal — no generic
         // MCP/Tool/event/transcript path sees it. A write failure fails closed
         // (the record is already consumed; the host must begin a new capture).
-        match session
-            .create_agent_acquired_sealed_value(
-                redaction,
-                &proceed.acquisition_id,
-                &proceed.record_id,
-                &proceed.value_id,
-                &proceed.reason,
-                value.as_str(),
-                &proceed.source_tool_call_id,
-                now_ms,
-            )
-            .await
-        {
-            Ok(_) => TrustedChildCaptureOutcome::Captured {
+        //
+        // The table write goes through the session's single redaction writer:
+        // under the owner's lock, the base is the owner's LATEST committed
+        // table (never the caller's turn snapshot, which could predate an
+        // observed-output registration), and the committed union is swapped
+        // live after the transaction. Lock order: table lock, then journal
+        // preparation, then the DB transaction; the lock is never taken inside
+        // the transaction.
+        let capture = |base: std::sync::Arc<RedactionTable>| {
+            let proceed = &proceed;
+            let value = &value;
+            async move {
+                session
+                    .create_agent_acquired_sealed_value(
+                        &base,
+                        &proceed.acquisition_id,
+                        &proceed.record_id,
+                        &proceed.value_id,
+                        &proceed.reason,
+                        value.as_str(),
+                        &proceed.source_tool_call_id,
+                        now_ms,
+                    )
+                    .await
+            }
+        };
+        let result = match owner {
+            Some(owner) => {
+                let guard = owner.lock().await;
+                let owns_session = guard
+                    .durable(session)
+                    .is_ok_and(|durable| durable.live_id() == session.live_id());
+                if owns_session {
+                    match capture(guard.current()).await {
+                        Ok(table) => {
+                            guard.publish_persisted(table);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    // A fork's child session owns its own durable table (the
+                    // shared owner persists to the parent): capture onto that
+                    // table's latest durable state.
+                    match own_durable_base(session, redaction) {
+                        Ok(base) => capture(base).await.map(|_| ()),
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+            None => match own_durable_base(session, redaction) {
+                Ok(base) => capture(base).await.map(|_| ()),
+                Err(error) => Err(error),
+            },
+        };
+        match result {
+            Ok(()) => TrustedChildCaptureOutcome::Captured {
                 record_id: proceed.record_id,
             },
             Err(_) => TrustedChildCaptureOutcome::Denied,

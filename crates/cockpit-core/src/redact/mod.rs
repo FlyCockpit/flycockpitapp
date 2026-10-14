@@ -103,7 +103,9 @@ impl std::fmt::Display for RedactionTableUnavailable {
 impl std::error::Error for RedactionTableUnavailable {}
 
 mod command_output;
-pub(crate) use command_output::{NovelScrubMode, NovelScrubOutput, ObservedSecret};
+pub(crate) use command_output::{
+    NovelScrubMode, NovelScrubOutput, NovelScrubStream, ObservedSecret,
+};
 pub(crate) mod coverage_authority;
 pub(crate) mod coverage_bindings;
 
@@ -640,7 +642,7 @@ pub(crate) fn is_secret_shaped_key(name: &str) -> bool {
     })
 }
 
-fn key_name_segments(name: &str) -> Vec<String> {
+pub(super) fn key_name_segments(name: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let chars: Vec<char> = name.chars().collect();

@@ -330,7 +330,7 @@ async fn run_swarm_loop(
         pinned,
     } = build_swarm_child(spec, ctx)?;
     agent.bind_retry_budget(&ctx.budget);
-    let agent = Arc::new(agent);
+    let mut agent = Arc::new(agent);
     let mut history: Vec<Message> = Vec::new();
     let brief = swarm_child_brief(spec, &custody);
     tracing::debug!(
@@ -397,7 +397,15 @@ async fn run_swarm_loop(
     scheduled_lane_driver.bind_active_retry_budget();
 
     let mut pending_scheduled_turn: Option<Box<crate::engine::agent::DeferredTurnPlan>> = None;
+    let mut round_redact = ctx.redact.clone();
     for _ in 0..SWARM_MAX_TURNS {
+        // Same-turn redaction: adopt what an earlier round's tools registered.
+        crate::engine::redaction_owner::adopt_live_redaction_for_round(
+            &interrupts,
+            &pinned.providers(),
+            &mut round_redact,
+            &mut agent,
+        );
         // Round reservation before dispatch: same gate as the interactive
         // driver (`admit_provider_round`) and the schedule/noninteractive loops.
         if let Err(exhaustion) = ctx.budget.charge_round() {
@@ -459,7 +467,7 @@ async fn run_swarm_loop(
                         next_prompt,
                         ctx.session.clone(),
                         ctx.locks.clone(),
-                        ctx.redact.clone(),
+                        round_redact.clone(),
                         ctx.cwd.clone(),
                         pinned.clone(),
                         interrupts.clone(),

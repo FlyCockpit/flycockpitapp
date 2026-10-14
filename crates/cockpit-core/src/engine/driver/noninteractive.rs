@@ -12301,6 +12301,10 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                 }
                 let pending = std::mem::take(&mut pending_computer_continuations);
                 scheduled_lane_driver.repin_config_for_turn();
+                // Same-turn redaction: adopt what an earlier round's tools
+                // registered (the model rebuild below reads the driver's table).
+                scheduled_lane_driver.adopt_live_redaction();
+                let round_redact = scheduled_lane_driver.redact.clone();
                 match scheduled_lane_driver.build_live_model_for_running(
                     &agent.model,
                     agent.model.provider_id(),
@@ -12339,7 +12343,7 @@ pub(in crate::engine::driver) async fn run_noninteractive_resumable(
                                 next_prompt.clone(),
                                 session.clone(),
                                 locks.clone(),
-                                redact.clone(),
+                                round_redact.clone(),
                                 cwd.clone(),
                                 config.clone(),
                                 interrupts.clone(),

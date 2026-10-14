@@ -122,7 +122,7 @@ pub async fn effective_policy(host: &HostContext) -> Result<EffectiveNetworkPoli
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GovernedRequest {
     pub method: String,
     pub url: String,
@@ -130,7 +130,23 @@ pub struct GovernedRequest {
     pub body: Option<String>,
 }
 
-#[derive(Debug)]
+// Model-built requests can carry credentials in header values, the URL's
+// query/userinfo and the body: method, redacted URL, header names and the
+// body length only.
+impl std::fmt::Debug for GovernedRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GovernedRequest")
+            .field("method", &self.method)
+            .field("url", &crate::config::value_free::redacted_url(&self.url))
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("body_len", &self.body.as_ref().map(String::len))
+            .finish()
+    }
+}
+
+// Test assertions format the visited request; its fields are table-scrubbed
+// copies of a governed request, so Debug prints shapes only.
 struct VisitedRequest {
     method: String,
     url: String,
@@ -138,6 +154,19 @@ struct VisitedRequest {
     body: Option<String>,
     visited_fields: usize,
     expected_fields: usize,
+}
+
+impl std::fmt::Debug for VisitedRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VisitedRequest")
+            .field("method", &self.method)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("body_len", &self.body.as_ref().map(String::len))
+            .field("visited_fields", &self.visited_fields)
+            .field("expected_fields", &self.expected_fields)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GovernedRequest {
@@ -481,5 +510,26 @@ mod tests {
         assert!(CanonicalNetworkHost::parse("https://api.example.test").is_err());
         assert!(CanonicalNetworkHost::parse("API.example.test").is_err());
         assert!(CanonicalNetworkHost::parse("api.example.test:443").is_err());
+    }
+}
+
+#[cfg(test)]
+mod value_free_debug_tests {
+    use super::*;
+
+    /// Secrets r2 C1: model-built request headers, URL credentials and the
+    /// body never print through Debug.
+    #[test]
+    fn governed_request_debug_is_value_free() {
+        let secret = ["NovelGoverned515", "Secret78529"].concat();
+        let request = GovernedRequest {
+            method: "POST".into(),
+            url: format!("https://api.example.test/v1?key={secret}"),
+            headers: BTreeMap::from([("Authorization".to_string(), format!("Bearer {secret}"))]),
+            body: Some(format!("{{\"token\":\"{secret}\"}}")),
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(rendered.contains("Authorization"), "{rendered}");
     }
 }

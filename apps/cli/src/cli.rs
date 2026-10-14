@@ -1803,7 +1803,7 @@ pub enum McpCommand {
     Test(McpTestArgs),
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(clap::Args)]
 pub struct McpAddArgs {
     /// Server name (the catalog/`mcp.invoke` identifier).
     pub name: String,
@@ -1837,6 +1837,33 @@ pub struct McpAddArgs {
     /// Credential profile name (implicit `default` when omitted).
     #[arg(long, value_name = "PROFILE")]
     pub profile: Option<String>,
+}
+
+// `--header-value` is a literal credential and stdio `--arg`s can be too:
+// the top-level CLI `Debug` chain shows presence and counts only.
+impl std::fmt::Debug for McpAddArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpAddArgs")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field(
+                "endpoint",
+                &self
+                    .endpoint
+                    .as_deref()
+                    .map(cockpit_config::config::value_free::redacted_url),
+            )
+            .field("command", &self.command)
+            .field("argument_count", &self.args.len())
+            .field("auth", &self.auth)
+            .field("header_value_present", &self.header_value.is_some())
+            .field("header_name", &self.header_name)
+            .field("disabled", &self.disabled)
+            .field("scope", &self.scope)
+            .field("profile", &self.profile)
+            .finish()
+    }
 }
 
 #[derive(Debug, clap::Args)]

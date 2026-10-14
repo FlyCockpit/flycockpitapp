@@ -144,6 +144,7 @@ async fn exact_live_authority_captures_installs_redaction_and_consumes_single_us
         .verify_and_capture(
             &session,
             &table,
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -199,6 +200,7 @@ async fn exact_live_authority_captures_installs_redaction_and_consumes_single_us
         .verify_and_capture(
             &session,
             &installed,
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -345,6 +347,7 @@ async fn agent_capture_cannot_replace_an_owner_authored_slot() {
         .verify_and_capture(
             &session,
             &table,
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -546,6 +549,7 @@ async fn replay_after_consume_is_denied() {
         .verify_and_capture(
             &session,
             &RedactionTable::empty(),
+            None,
             &claim,
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -574,6 +578,7 @@ async fn expired_authority_is_denied_before_store() {
         .verify_and_capture(
             &session,
             &RedactionTable::empty(),
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             past_expiry,
@@ -594,6 +599,7 @@ async fn cancelled_authority_is_denied_before_store() {
         .verify_and_capture(
             &session,
             &RedactionTable::empty(),
+            None,
             &authority.to_ingress(),
             SealedCaptureValue::new(SECRET.to_owned()),
             NOW_MS,
@@ -652,9 +658,73 @@ async fn verify(
     reg.verify_and_capture(
         session,
         &RedactionTable::empty(),
+        None,
         claim,
         SealedCaptureValue::new(SECRET.to_owned()),
         NOW_MS,
     )
     .await
+}
+
+/// Secrets r2 C9: trusted capture serializes on the session's redaction
+/// owner and unions onto its LATEST table, so an observed-output value the
+/// backstop registered after the caller's turn snapshot survives in the
+/// durable table (and the captured literal also reaches the live table).
+#[tokio::test]
+async fn trusted_capture_preserves_a_later_observed_registration() {
+    let session = new_session();
+    let registry = TrustedChildCaptureRegistry::new();
+    let authority = begin(&registry, &session);
+    publish_audit(&session).await;
+    let stale = std::sync::Arc::new(RedactionTable::empty());
+    let live = std::sync::Arc::new(std::sync::RwLock::new(stale.clone()));
+    let (events, _rx) = tokio::sync::broadcast::channel(16);
+    let hub = crate::engine::interrupt::InterruptHub::new(
+        events,
+        live.clone(),
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        session.db.clone(),
+        session.id,
+    );
+    let observed = ["NovelObserved515", "Registration78529"].concat();
+    crate::tools::output_backstop::scrub_command_output(
+        &hub,
+        &session,
+        &stale,
+        &crate::config::extended::RedactConfig::default(),
+        &format!("DB_SECRET={observed}"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !session
+            .persisted_redaction_table()
+            .unwrap()
+            .unwrap()
+            .scrub(&observed)
+            .contains(&observed),
+        "precondition: the observed value is durable before the capture"
+    );
+    let outcome = registry
+        .verify_and_capture(
+            &session,
+            &stale,
+            hub.redaction_owner().map(|owner| owner.as_ref()),
+            &authority.to_ingress(),
+            SealedCaptureValue::new(SECRET.to_owned()),
+            NOW_MS,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        TrustedChildCaptureOutcome::Captured {
+            record_id: RECORD_ID.to_owned()
+        }
+    );
+    let durable = session.persisted_redaction_table().unwrap().unwrap();
+    assert!(
+        !durable.scrub(&observed).contains(&observed),
+        "trusted capture overwrote the durable observed entry from its stale snapshot"
+    );
+    assert!(!live.read().unwrap().scrub(SECRET).contains(SECRET));
 }

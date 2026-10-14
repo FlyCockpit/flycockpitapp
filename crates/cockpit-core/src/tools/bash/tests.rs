@@ -255,6 +255,109 @@ async fn bash_cat_of_unregistered_dotenv_secret_is_scrubbed_and_registered() {
     assert!(!persisted.scrub(&later).contains(&stripe));
 }
 
+/// Secrets r2 C3: after one bash call registers a novel value, a LATER
+/// bash call in the same turn whose output carries only the bare value (no
+/// key, no recognizable shape) is still scrubbed, although the tool's table
+/// snapshot predates the registration.
+#[tokio::test]
+async fn later_same_turn_bash_output_echoing_a_registered_value_is_scrubbed() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("other")).unwrap();
+    let command = "cat other/.env";
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let live = install_live_redaction_hub(&mut ctx);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+    let secret = ["NovelRealBash515", "Secret78529"].concat();
+    let path = tmp.path().join("other/.env");
+    std::fs::write(&path, format!("DB_SECRET={secret}\n")).unwrap();
+    assert!(ctx.redact.scrub(&secret).contains(&secret));
+    let first = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .unwrap();
+    assert!(!first.content.contains(&secret), "{}", first.content);
+    assert!(!live.read().unwrap().scrub(&secret).contains(&secret));
+    std::fs::write(&path, format!("{secret}\n")).unwrap();
+    let second = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .unwrap();
+    let model_bound = ctx.redact.scrub(&second.content);
+    assert!(
+        !model_bound.contains(&secret),
+        "registered value leaked through a later same-turn bash call: {model_bound}"
+    );
+}
+
+/// Secrets r2 C3: stdout and stderr of one command are scrubbed together —
+/// a keyed value on stdout also hides its keyless echo on stderr.
+#[tokio::test]
+async fn keyed_stdout_value_hides_its_keyless_stderr_echo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let secret = ["NovelSplitStream515", "Secret78529"].concat();
+    let command = format!("echo DB_SECRET={secret}; echo {secret} 1>&2");
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), &command).await;
+    let _live = install_live_redaction_hub(&mut ctx);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+    let output = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .unwrap();
+    assert!(output.content.contains("DB_SECRET="), "{}", output.content);
+    assert!(!output.content.contains(&secret), "{}", output.content);
+}
+
+/// Secrets r2 C9: a hub without a redaction owner (the shape a detached
+/// leaf had) never rewrites the session's durable table from the tool's
+/// stale snapshot on an approved secret-file read: an earlier observed
+/// registration survives in the durable table.
+#[tokio::test]
+async fn ownerless_approved_read_does_not_drop_an_earlier_durable_registration() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("other")).unwrap();
+    let command = "cat other/.env";
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let live = install_live_redaction_hub(&mut ctx);
+    let observed = ["NovelBeforeRead515", "Secret78529"].concat();
+    let path = tmp.path().join("other/.env");
+    std::fs::write(&path, format!("DB_SECRET={observed}\n")).unwrap();
+    let first = BashTool::new()
+        .call(serde_json::json!({ "command": command }), &ctx)
+        .await
+        .unwrap();
+    assert!(!first.content.contains(&observed));
+    assert!(
+        !ctx.session
+            .persisted_redaction_table()
+            .unwrap()
+            .unwrap()
+            .scrub(&observed)
+            .contains(&observed)
+    );
+    ctx.interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+    let file_secret = ["NovelFileRead515", "Secret78529"].concat();
+    std::fs::write(&path, format!("DB_SECRET={file_secret}\n")).unwrap();
+    ctx.session.add_gitignore_session_allow("other/.env");
+    let read = crate::tools::read::ReadTool
+        .call(serde_json::json!({ "path": "other/.env" }), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        read.content.contains("DB_SECRET=") && read.content.contains(ctx.redact.placeholder()),
+        "precondition: the approved secret read returns scrubbed file content: {}",
+        read.content
+    );
+    assert!(!read.content.contains(&file_secret));
+    assert!(!live.read().unwrap().scrub(&observed).contains(&observed));
+    let durable = ctx.session.persisted_redaction_table().unwrap().unwrap();
+    assert!(
+        !durable.scrub(&observed).contains(&observed),
+        "an ownerless read rewrote the durable table from a stale snapshot"
+    );
+}
+
 #[tokio::test]
 async fn bash_untruncated_output_carries_no_text_artifact_capture() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4297,4 +4400,16 @@ async fn capability_refuse_covers_missing_and_unpublished_snapshots() {
         );
         assert!(!out.content.contains("UNCONFINED_RAN"));
     }
+}
+
+/// Secrets r2 C10: the bash spawn diagnostic never carries argument or
+/// assignment values — the program name and a word count only.
+#[test]
+fn shell_command_log_identity_is_value_free() {
+    let secret = ["NovelArgv515", "Secret78529"].concat();
+    let identity = shell_command_log_identity(&format!(
+        "API_KEY={secret} /usr/local/bin/deploy --token={secret} now"
+    ));
+    assert_eq!(identity, "deploy (+2 words)");
+    assert!(!identity.contains(&secret));
 }

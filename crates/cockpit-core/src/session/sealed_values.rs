@@ -211,7 +211,7 @@ impl Session {
         value: &str,
         source_tool_call_id: &str,
         now_ms: i64,
-    ) -> Result<()> {
+    ) -> Result<std::sync::Arc<crate::redact::RedactionTable>> {
         validate_agent_acquired_sealed_value(name, value).map_err(anyhow::Error::from)?;
         let identity = crate::sealed::identity::SealedRedactionIdentity {
             scope: crate::sealed::identity::SealedScopeKind::Session,
@@ -306,7 +306,7 @@ impl Session {
         // Persist-before-swap: advertise the union as persisted only after the
         // vault write commits, matching [`Session::persist_redaction_table`].
         *self.redaction_table_json.lock().unwrap() = Some(cache_json);
-        Ok(())
+        Ok(std::sync::Arc::new(unioned))
     }
 
     /// Build the enforced redaction union for text recalled from `target`.

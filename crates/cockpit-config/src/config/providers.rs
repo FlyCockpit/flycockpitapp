@@ -1123,10 +1123,22 @@ impl CacheRetentionProfile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeaderSpec {
     pub name: String,
     pub value: String,
+}
+
+// Header values are literal credentials (`Authorization: Bearer …`):
+// diagnostics get the header name only. `ProviderEntry`, `ProvidersConfig`
+// and every config document derive `Debug` through this.
+impl std::fmt::Debug for HeaderSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HeaderSpec")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A provider usage endpoint that can be fetched without vendor-specific
@@ -1196,10 +1208,20 @@ pub struct OAuthDescriptor {
     pub headers: Vec<OAuthHeaderMapping>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OAuthHeaderMapping {
     pub name: String,
     pub value: String,
+}
+
+// The value is a template that may embed a literal credential: name only.
+impl std::fmt::Debug for OAuthHeaderMapping {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthHeaderMapping")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OAuthDescriptor {
@@ -4415,3 +4437,27 @@ impl ProvidersConfig {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod value_free_debug_tests {
+    use super::*;
+
+    /// Secrets r2 C1: literal header and OAuth header-template values never
+    /// print through provider config Debug.
+    #[test]
+    fn header_debug_does_not_print_values() {
+        let secret = ["NovelDebug515", "Secret78529"].concat();
+        let header = HeaderSpec {
+            name: "Authorization".into(),
+            value: format!("Bearer {secret}"),
+        };
+        let mapping = OAuthHeaderMapping {
+            name: "X-Api-Key".into(),
+            value: secret.clone(),
+        };
+        for rendered in [format!("{header:?}"), format!("{mapping:#?}")] {
+            assert!(!rendered.contains(&secret), "{rendered}");
+        }
+        assert!(format!("{header:?}").contains("Authorization"));
+    }
+}

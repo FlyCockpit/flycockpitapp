@@ -43,6 +43,7 @@ pub mod resolve;
 pub mod sandbox_mode;
 pub mod trust;
 pub mod update_channel;
+pub mod value_free;
 
 /// Maximum bytes accepted from one workspace configuration leaf, whether
 /// read through a retained directory handle or an ambient path loader

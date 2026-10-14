@@ -218,7 +218,13 @@ impl std::fmt::Debug for ServerConfig {
         formatter
             .debug_struct("ServerConfig")
             .field("transport", &self.transport)
-            .field("endpoint", &self.endpoint)
+            .field(
+                "endpoint",
+                &self
+                    .endpoint
+                    .as_deref()
+                    .map(crate::config::value_free::redacted_url),
+            )
             .field("command", &self.command)
             .field("argument_count", &self.args.len())
             .field("env_names", &self.env.keys().collect::<Vec<_>>())
@@ -451,10 +457,16 @@ impl McpConfig {
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
-        let value: serde_json::Value = serde_json::from_str(raw).context("parsing mcp.json")?;
+        // Errors are value-free: a malformed credential field must not echo its
+        // bytes (`invalid type: string "<secret>"`) into the error chain.
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| crate::config::value_free::json_error(&error))
+            .context("parsing mcp.json")?;
         reject_sealed_env_keys_in_mcp_value(&value)?;
         reject_reserved_builtin_server(&value)?;
-        serde_json::from_value(value).context("parsing mcp.json")
+        serde_json::from_value(value)
+            .map_err(|error| crate::config::value_free::json_error(&error))
+            .context("parsing mcp.json")
     }
 
     /// Load and merge every parseable `mcp.json` layer for `cwd`, or defaults
@@ -1321,5 +1333,50 @@ mod tests {
             !cfg.servers.contains_key("override"),
             "COCKPIT_CONFIG points at config.json only, not sibling mcp.json"
         );
+    }
+}
+
+#[cfg(test)]
+mod value_free_tests {
+    use super::*;
+
+    /// Secrets r2 C8: a malformed credential-bearing field never echoes its
+    /// value through the parse error chain.
+    #[test]
+    fn malformed_env_parse_error_does_not_print_the_value() {
+        let secret = ["NovelConfigError515", "Secret78529"].concat();
+        let error = McpConfig::parse(&format!(
+            r#"{{"servers":{{"demo":{{"transport":"stdio","command":"server","env":"{secret}"}}}}}}"#
+        ))
+        .unwrap_err();
+        let diagnostic = format!("{error:#} / {error:?}");
+        assert!(!diagnostic.contains(&secret), "{diagnostic}");
+        assert!(diagnostic.contains("parsing mcp.json"), "{diagnostic}");
+    }
+
+    /// Secrets r2 C1: a credential-bearing endpoint (userinfo, query token)
+    /// prints redacted.
+    #[test]
+    fn server_endpoint_debug_is_redacted() {
+        let secret = ["NovelEndpoint515", "Secret78529"].concat();
+        let server = ServerConfig {
+            transport: Transport::Streamable,
+            endpoint: Some(format!(
+                "https://u:{secret}@mcp.example.test/sse?key={secret}"
+            )),
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            env_credential_refs: BTreeMap::new(),
+            auth: Auth::None,
+            enabled: true,
+            cache_ttl_secs: 3600,
+            connect_timeout_secs: None,
+            timeout_secs: None,
+            profiles: BTreeMap::new(),
+        };
+        let rendered = format!("{server:?}");
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(rendered.contains("mcp.example.test/sse"), "{rendered}");
     }
 }

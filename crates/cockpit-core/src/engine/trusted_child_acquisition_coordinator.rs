@@ -515,6 +515,10 @@ pub async fn run_trusted_child_acquisition(
                 .verify_and_capture(
                     &execution.session,
                     &execution.redaction,
+                    execution
+                        .interrupts
+                        .redaction_owner()
+                        .map(|owner| owner.as_ref()),
                     &authority.to_ingress(),
                     value,
                     completed_at_ms,

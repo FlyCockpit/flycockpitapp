@@ -646,9 +646,21 @@ async fn run_iteration(
     let run_budget = ctx.budget.allot(per_run);
     scheduled_lane_driver.budget = run_budget.clone();
     scheduled_lane_driver.bind_active_retry_budget();
+    let mut round_agent = agent.clone();
+    let mut round_redact = ctx.redact.clone();
     let mut turn_agent = (**agent).clone();
     turn_agent.bind_retry_budget(&run_budget);
     for _ in 0..MAX_ITERATION_TURNS {
+        // Same-turn redaction: adopt what an earlier round's tools registered.
+        if crate::engine::redaction_owner::adopt_live_redaction_for_round(
+            &interrupts,
+            &ctx.config.providers(),
+            &mut round_redact,
+            &mut round_agent,
+        ) {
+            turn_agent = (*round_agent).clone();
+            turn_agent.bind_retry_budget(&run_budget);
+        }
         // Round reservation before dispatch: same gate as the interactive
         // driver (`admit_provider_round`) and the swarm/noninteractive loops.
         if let Err(exhaustion) = run_budget.charge_round() {
@@ -663,12 +675,12 @@ async fn run_iteration(
             // outside the per-turn backup-fallback scope (interactive turns +
             // delegated subagents; implementation note), so
             // it dispatches on its primary model and emits its own failure UI.
-            &agent.model,
+            &turn_agent.model,
             history,
             next_prompt,
             session.clone(),
             ctx.locks.clone(),
-            ctx.redact.clone(),
+            round_redact.clone(),
             ctx.cwd.clone(),
             ctx.config.clone(),
             interrupts.clone(),
@@ -1442,6 +1454,51 @@ mod tests {
         assert!(
             second_text.contains("check successor history"),
             "the successor wake must retain the earlier user prompt too: {second_text}"
+        );
+    }
+
+    /// Secrets r2 C2: a loop/timer fork runs on a real child session (a
+    /// distinct durable id) with a leaf of the owning session's hub. What its
+    /// shell output backstop registers lands in the OWNER's live AND durable
+    /// table; the child's vault item is never the owner's custody.
+    #[tokio::test]
+    async fn loop_fork_registration_persists_to_the_owning_session() {
+        let (live_ctx, owner, _tmp) = loop_test_context("http://127.0.0.1:9".to_string());
+        let mut ctx = live_ctx.snapshot();
+        owner
+            .persist_redaction_table(&crate::redact::RedactionTable::empty())
+            .unwrap();
+        let live = Arc::new(std::sync::RwLock::new(ctx.redact.clone()));
+        let (events, _rx) = tokio::sync::broadcast::channel(16);
+        ctx.interrupts = Arc::new(
+            crate::engine::interrupt::InterruptHub::new(
+                events,
+                live.clone(),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                owner.db.clone(),
+                owner.id,
+            )
+            .with_live_session(owner.clone()),
+        );
+        let child = fork_from_live_context(&ctx).unwrap();
+        assert_ne!(child.id, owner.id, "precondition: a distinct child session");
+        let secret = ["NovelLoopFork515", "Secret78529"].concat();
+        let leaf = ctx.fork_interrupts();
+        let out = crate::tools::output_backstop::scrub_command_output(
+            &leaf,
+            &child,
+            &ctx.redact,
+            &ctx.config.extended().redact,
+            &format!("DB_SECRET={secret}"),
+        )
+        .await
+        .unwrap();
+        assert!(!out.contains(&secret), "{out}");
+        assert!(!live.read().unwrap().scrub(&secret).contains(&secret));
+        let owner_durable = owner.persisted_redaction_table().unwrap().unwrap();
+        assert!(
+            !owner_durable.scrub(&secret).contains(&secret),
+            "the owner's live table advanced without its durable custody"
         );
     }
 }

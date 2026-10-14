@@ -75,7 +75,7 @@ struct DeviceCodeResponse {
     interval: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct DeviceTokenResponse {
     #[serde(default, alias = "accessToken")]
     access_token: Option<String>,
@@ -83,13 +83,35 @@ struct DeviceTokenResponse {
     token_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+// Access, instance and connector tokens are bearer credentials: their Debug
+// shows presence only.
+impl std::fmt::Debug for DeviceTokenResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceTokenResponse")
+            .field("access_token_present", &self.access_token.is_some())
+            .field("token_type", &self.token_type)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
 struct RegisterResponse {
     #[serde(alias = "instanceId")]
     instance_id: String,
     #[serde(alias = "instanceToken")]
     instance_token: String,
     account: AccountResponse,
+}
+
+impl std::fmt::Debug for RegisterResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegisterResponse")
+            .field("instance_id", &self.instance_id)
+            .field("account", &self.account)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,13 +121,23 @@ struct AccountResponse {
     email: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ConnectorTokenResponse {
     token: String,
     #[serde(default, alias = "expiresAt")]
     expires_at: Option<String>,
     #[serde(default, alias = "relayUrl")]
     relay_url: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectorTokenResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorTokenResponse")
+            .field("expires_at", &self.expires_at)
+            .field("relay_url", &self.relay_url)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,11 +156,21 @@ struct RelayCandidateResponse {
     ws_url: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectorToken {
     pub token: String,
     pub expires_at: Option<String>,
     pub relay_url: String,
+}
+
+impl std::fmt::Debug for ConnectorToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorToken")
+            .field("expires_at", &self.expires_at)
+            .field("relay_url", &self.relay_url)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1081,5 +1123,28 @@ mod tests {
 
     fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
+    }
+}
+
+#[cfg(test)]
+mod value_free_debug_tests {
+    use super::*;
+
+    /// Secrets r2 C1: device, instance and connector tokens never print.
+    #[test]
+    fn token_carriers_debug_is_value_free() {
+        let secret = ["NovelToken515", "Secret78529"].concat();
+        let connector = ConnectorToken {
+            token: secret.clone(),
+            expires_at: None,
+            relay_url: "wss://relay.example.test".into(),
+        };
+        let device = DeviceTokenResponse {
+            access_token: Some(secret.clone()),
+            token_type: Some("bearer".into()),
+        };
+        for rendered in [format!("{connector:?}"), format!("{device:?}")] {
+            assert!(!rendered.contains(&secret), "{rendered}");
+        }
     }
 }

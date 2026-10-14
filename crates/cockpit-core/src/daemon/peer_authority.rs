@@ -322,7 +322,7 @@ impl CredentialClock for SuspendExcludingClock {
 /// The connection is told which credential was withdrawn and why. The token
 /// binds the notice to that exact credential, so a delayed notice can never
 /// downgrade a fresh re-exchange on the same connection.
-type InvalidationHook = Box<dyn Fn(&str, PeerCredentialRevocation) + Send + Sync>;
+type InvalidationHook = Arc<dyn Fn(&str, PeerCredentialRevocation) + Send + Sync>;
 
 /// Why a credential was withdrawn, kept until its connection ends so a
 /// connection that learns of the loss late (a queued frame, a dropped notice)
@@ -334,7 +334,40 @@ struct RevocationRecord {
 }
 
 /// A record removed from the registry for a reason its connection must hear.
-type Withdrawn = (Uuid, String, PeerCredentialRevocation);
+struct Withdrawn {
+    connection_id: Uuid,
+    token: String,
+    reason: PeerCredentialRevocation,
+    hook: Option<InvalidationHook>,
+}
+
+/// Record removal, cause publication and connection teardown share this lock.
+/// Notifications only carry snapshots; they never mutate registry state.
+#[derive(Default)]
+struct RegistryState {
+    records: HashMap<String, PeerCredentialRecord>,
+    invalidation_hooks: HashMap<Uuid, InvalidationHook>,
+    revocations: HashMap<Uuid, RevocationRecord>,
+}
+
+impl RegistryState {
+    fn withdraw(&mut self, token: &str, reason: PeerCredentialRevocation) -> Option<Withdrawn> {
+        let record = self.records.remove(token)?;
+        self.revocations.insert(
+            record.connection_id,
+            RevocationRecord {
+                token: token.to_string(),
+                reason,
+            },
+        );
+        Some(Withdrawn {
+            connection_id: record.connection_id,
+            token: token.to_string(),
+            reason,
+            hook: self.invalidation_hooks.get(&record.connection_id).cloned(),
+        })
+    }
+}
 
 /// Why `try_mint` refused to issue a credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,9 +378,9 @@ pub enum PeerCredentialCapacity {
 }
 
 pub struct PeerCredentialRegistry {
-    records: Mutex<HashMap<String, PeerCredentialRecord>>,
-    invalidation_hooks: Mutex<HashMap<Uuid, InvalidationHook>>,
-    revocations: Mutex<HashMap<Uuid, RevocationRecord>>,
+    state: Mutex<RegistryState>,
+    #[cfg(test)]
+    before_notifications: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Trusted launch provenance recorded once at daemon boot. `None` means
     /// this daemon was not spawned with a launch ticket (human foreground
     /// start, in-process boot) and no socket peer can ever exchange for an
@@ -366,9 +399,9 @@ impl Default for PeerCredentialRegistry {
 impl PeerCredentialRegistry {
     fn with_ttl_and_clock(ttl: Duration, clock: Arc<dyn CredentialClock>) -> Self {
         Self {
-            records: Mutex::new(HashMap::new()),
-            invalidation_hooks: Mutex::new(HashMap::new()),
-            revocations: Mutex::new(HashMap::new()),
+            state: Mutex::new(RegistryState::default()),
+            #[cfg(test)]
+            before_notifications: Mutex::new(None),
             launch_provenance: Mutex::new(None),
             ttl,
             clock,
@@ -486,105 +519,71 @@ impl PeerCredentialRegistry {
         connection_id: Uuid,
         hook: impl Fn(&str, PeerCredentialRevocation) + Send + Sync + 'static,
     ) {
-        self.invalidation_hooks
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(connection_id, Box::new(hook));
+            .unwrap_or_else(|p| p.into_inner())
+            .invalidation_hooks
+            .insert(connection_id, Arc::new(hook));
     }
 
-    fn unregister_invalidation_hook(&self, connection_id: Uuid) {
-        self.invalidation_hooks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&connection_id);
-    }
-
-    /// Record why each credential was withdrawn, then tell its connection.
-    /// Runs after the records lock is released.
-    fn withdraw(&self, withdrawn: Vec<Withdrawn>) {
+    /// Called only after the registry-state lock is released. A callback may
+    /// re-enter the registry or race connection release; neither can recreate
+    /// a record or a cause through this notification snapshot.
+    fn notify_withdrawn(&self, withdrawn: Vec<Withdrawn>) {
         if withdrawn.is_empty() {
             return;
         }
+        #[cfg(test)]
         {
-            let mut revocations = self
-                .revocations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (connection_id, token, reason) in &withdrawn {
-                revocations.insert(
-                    *connection_id,
-                    RevocationRecord {
-                        token: token.clone(),
-                        reason: *reason,
-                    },
-                );
+            let boundary = self.before_notifications.lock().unwrap().clone();
+            if let Some(boundary) = boundary {
+                boundary();
             }
         }
-        let hooks = self
-            .invalidation_hooks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (connection_id, token, reason) in withdrawn {
-            if let Some(hook) = hooks.get(&connection_id) {
-                hook(&token, reason);
+        for notice in withdrawn {
+            if let Some(hook) = notice.hook {
+                hook(&notice.token, notice.reason);
             }
+            tracing::debug!(connection_id = %notice.connection_id, "peer credential withdrawn");
         }
     }
 
-    /// Why `presented` was withdrawn from `connection_id`, if the registry
-    /// withdrew it (rather than the connection ending or re-exchanging).
+    /// Why the exact token was withdrawn. Its cause is visible in the same
+    /// state transition that makes verification fail.
     pub fn revocation_cause(
         &self,
         connection_id: Uuid,
         presented: &str,
     ) -> Option<PeerCredentialRevocation> {
-        self.revocations
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|p| p.into_inner())
+            .revocations
             .get(&connection_id)
             .filter(|record| record.token == presented)
             .map(|record| record.reason)
     }
 
-    fn remove_records<F>(&self, mut keep: F) -> Vec<(Uuid, String)>
-    where
-        F: FnMut(&PeerCredentialRecord) -> bool,
-    {
-        let mut records = self
+    fn prune_expired_records(&self, state: &mut RegistryState) -> Vec<Withdrawn> {
+        let now = self.now();
+        let tokens: Vec<_> = state
             .records
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut removed = Vec::new();
-        records.retain(|token, record| {
-            if keep(record) {
-                true
-            } else {
-                removed.push((record.connection_id, token.clone()));
-                false
-            }
-        });
-        removed
+            .iter()
+            .filter(|(_, record)| record.expires_at <= now)
+            .map(|(token, _)| token.clone())
+            .collect();
+        tokens
+            .into_iter()
+            .filter_map(|token| state.withdraw(&token, PeerCredentialRevocation::Lapsed))
+            .collect()
     }
 
-    fn prune_expired_records(
+    #[cfg(test)]
+    pub(crate) fn before_notifications_for_test(
         &self,
-        records: &mut HashMap<String, PeerCredentialRecord>,
-    ) -> Vec<Withdrawn> {
-        let now = self.now();
-        let mut lapsed = Vec::new();
-        records.retain(|token, record| {
-            if record.expires_at > now {
-                true
-            } else {
-                lapsed.push((
-                    record.connection_id,
-                    token.clone(),
-                    PeerCredentialRevocation::Lapsed,
-                ));
-                false
-            }
-        });
-        lapsed
+        boundary: impl Fn() + Send + Sync + 'static,
+    ) {
+        *self.before_notifications.lock().unwrap() = Some(Arc::new(boundary));
     }
 
     /// Issue a credential for `peer` on `connection_id`, replacing that
@@ -605,17 +604,16 @@ impl PeerCredentialRegistry {
         rand::rng().fill(&mut bytes);
         let token = PeerCredentialToken(crate::intel::hex_lower(&bytes));
         let withdrawn = {
-            let mut records = self
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut withdrawn = self.prune_expired_records(&mut state);
+            // Re-exchange replaces only this connection's prior credential.
+            state
                 .records
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut withdrawn = self.prune_expired_records(&mut records);
-            // Re-exchange on the same connection must replace its prior token
-            // without evicting unrelated live credentials.
-            records.retain(|_, existing| existing.connection_id != connection_id);
+                .retain(|_, existing| existing.connection_id != connection_id);
             let incoming_owner = role.is_owner_class();
-            while records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
-                let Some(victim_key) = records
+            while state.records.len() >= MAX_PEER_CREDENTIAL_RECORDS {
+                let Some(victim_key) = state
+                    .records
                     .iter()
                     .filter(|(_, existing)| incoming_owner || !existing.role.is_owner_class())
                     .min_by_key(|(_, existing)| {
@@ -623,19 +621,16 @@ impl PeerCredentialRegistry {
                     })
                     .map(|(key, _)| key.clone())
                 else {
-                    drop(records);
-                    self.withdraw(withdrawn);
+                    drop(state);
+                    self.notify_withdrawn(withdrawn);
                     return Err(PeerCredentialCapacity::Full);
                 };
-                if let Some(record) = records.remove(&victim_key) {
-                    withdrawn.push((
-                        record.connection_id,
-                        victim_key,
-                        PeerCredentialRevocation::Evicted,
-                    ));
+                if let Some(notice) = state.withdraw(&victim_key, PeerCredentialRevocation::Evicted)
+                {
+                    withdrawn.push(notice);
                 }
             }
-            records.insert(
+            state.records.insert(
                 token.0.clone(),
                 PeerCredentialRecord {
                     peer,
@@ -645,14 +640,10 @@ impl PeerCredentialRegistry {
                     expires_at: self.now().after(self.ttl),
                 },
             );
+            state.revocations.remove(&connection_id);
             withdrawn
         };
-        // A fresh credential supersedes any recorded revocation cause.
-        self.revocations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&connection_id);
-        self.withdraw(withdrawn);
+        self.notify_withdrawn(withdrawn);
         Ok(token)
     }
 
@@ -675,11 +666,12 @@ impl PeerCredentialRegistry {
     /// before the deadline moves; an already lapsed record is never revived.
     pub fn renew_connection(&self, connection_id: Uuid) -> PeerCredentialRenewal {
         let held = {
-            let records = self
-                .records
+            let state = self
+                .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            records
+            state
+                .records
                 .iter()
                 .find(|(_, record)| record.connection_id == connection_id)
                 .map(|(token, record)| (token.clone(), record.peer, record.expires_at))
@@ -694,11 +686,12 @@ impl PeerCredentialRegistry {
         } else {
             None
         };
-        let mut records = self
-            .records
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(record) = records
+        let Some(record) = state
+            .records
             .get_mut(&token)
             .filter(|record| record.connection_id == connection_id)
         else {
@@ -714,9 +707,11 @@ impl PeerCredentialRegistry {
                 PeerCredentialRenewal::Renewed
             }
             Some(reason) => {
-                records.remove(&token);
-                drop(records);
-                self.withdraw(vec![(connection_id, token, reason)]);
+                let notice = state
+                    .withdraw(&token, reason)
+                    .expect("record checked above");
+                drop(state);
+                self.notify_withdrawn(vec![notice]);
                 PeerCredentialRenewal::Revoked(reason)
             }
         }
@@ -732,12 +727,12 @@ impl PeerCredentialRegistry {
             return None;
         }
         let (lapsed, verified) = {
-            let mut records = self
-                .records
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let lapsed = self.prune_expired_records(&mut records);
-            let verified = records.get(presented).and_then(|record| {
+            let lapsed = self.prune_expired_records(&mut state);
+            let verified = state.records.get(presented).and_then(|record| {
                 if record.peer != peer || record.connection_id != connection_id {
                     return None;
                 }
@@ -745,7 +740,7 @@ impl PeerCredentialRegistry {
             });
             (lapsed, verified)
         };
-        self.withdraw(lapsed);
+        self.notify_withdrawn(lapsed);
         verified
     }
 
@@ -758,11 +753,11 @@ impl PeerCredentialRegistry {
         if !peer_identity_matches_live_process(peer) {
             return None;
         }
-        let records = self
-            .records
+        let state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let record = records.get(presented)?;
+        let record = state.records.get(presented)?;
         if record.expires_at <= self.now() {
             return None;
         }
@@ -783,11 +778,11 @@ impl PeerCredentialRegistry {
         if !peer_identity_matches_live_process(peer) {
             return None;
         }
-        let records = self
-            .records
+        let state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let record = records.get(presented)?;
+        let record = state.records.get(presented)?;
         if record.expires_at <= self.now() || record.peer != peer {
             return None;
         }
@@ -797,11 +792,12 @@ impl PeerCredentialRegistry {
     /// Current deadline of `presented` on `connection_id`, on the credential
     /// clock; it moves forward each time the connection's lease renews it.
     pub fn expires_at(&self, connection_id: Uuid, presented: &str) -> Option<CredentialInstant> {
-        let records = self
-            .records
+        let state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        records
+        state
+            .records
             .get(presented)
             .filter(|record| record.connection_id == connection_id)
             .map(|record| record.expires_at)
@@ -810,39 +806,48 @@ impl PeerCredentialRegistry {
     /// Withdraw the connection's credential. The connection is told why
     /// through its invalidation hook, when one is still registered.
     pub fn revoke_for_connection(&self, connection_id: Uuid, reason: PeerCredentialRevocation) {
-        let removed = self.remove_records(|record| record.connection_id != connection_id);
-        self.withdraw(
-            removed
+        let withdrawn = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let tokens: Vec<_> = state
+                .records
+                .iter()
+                .filter(|(_, record)| record.connection_id == connection_id)
+                .map(|(token, _)| token.clone())
+                .collect();
+            tokens
                 .into_iter()
-                .map(|(connection_id, token)| (connection_id, token, reason))
-                .collect(),
-        );
+                .filter_map(|token| state.withdraw(&token, reason))
+                .collect()
+        };
+        self.notify_withdrawn(withdrawn);
     }
 
-    /// Teardown of the connection itself: drop its credential, hook, and
-    /// recorded revocation cause silently.
+    /// Teardown is serialized with removal and cause publication. Notifications
+    /// already in flight cannot recreate the released connection's state.
     pub fn release_connection(&self, connection_id: Uuid) {
-        self.unregister_invalidation_hook(connection_id);
-        let _ = self.remove_records(|record| record.connection_id != connection_id);
-        self.revocations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&connection_id);
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.invalidation_hooks.remove(&connection_id);
+        state
+            .records
+            .retain(|_, record| record.connection_id != connection_id);
+        state.revocations.remove(&connection_id);
     }
 
     #[cfg(test)]
     pub(crate) fn invalidation_hook_count(&self) -> usize {
-        self.invalidation_hooks
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|p| p.into_inner())
+            .invalidation_hooks
             .len()
     }
 
     #[cfg(test)]
     pub(crate) fn connection_records_for_test(&self) -> Vec<(Uuid, String)> {
-        self.records
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|p| p.into_inner())
+            .records
             .iter()
             .map(|(token, record)| (record.connection_id, token.clone()))
             .collect()
@@ -1193,6 +1198,60 @@ mod tests {
             process_start: cockpit_host::daemon_lifecycle::process_start_identity(pid)
                 .expect("process start"),
         }
+    }
+
+    /// N1: release occurs after removal, before its deferred notification.
+    /// The callback then re-enters the real registry, proving that external
+    /// callbacks do not retain its state lock or recreate released state.
+    #[test]
+    fn r3_withdrawal_racing_release_leaves_no_dead_cause() {
+        let registry = Arc::new(PeerCredentialRegistry::default());
+        let connection_id = Uuid::new_v4();
+        let token = registry.mint(
+            current_process_peer_identity(),
+            connection_id,
+            LocalClientRole::Tui,
+            vec![],
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let hook_registry = Arc::downgrade(&registry);
+        let boundary_entered = entered.clone();
+        let boundary_resume = resume.clone();
+        registry.before_notifications_for_test(move || {
+            boundary_entered.wait();
+            boundary_resume.wait();
+        });
+        registry.register_invalidation_hook(connection_id, move |token, _| {
+            assert!(
+                hook_registry
+                    .upgrade()
+                    .unwrap()
+                    .expires_at(connection_id, token)
+                    .is_none()
+            );
+        });
+        let worker_registry = registry.clone();
+        let withdrawal = std::thread::spawn(move || {
+            worker_registry
+                .revoke_for_connection(connection_id, PeerCredentialRevocation::PeerChanged)
+        });
+        entered.wait();
+        registry.release_connection(connection_id);
+        resume.wait();
+        withdrawal.join().unwrap();
+        assert_eq!(
+            registry.revocation_cause(connection_id, token.as_str()),
+            None,
+            "a deferred withdrawal must not recreate the released connection's cause"
+        );
+        let state = registry.state.lock().unwrap();
+        assert!(state.records.is_empty());
+        assert!(state.invalidation_hooks.is_empty());
+        assert!(
+            state.revocations.is_empty(),
+            "no dead connection state survives"
+        );
     }
 
     const SHORT_TTL: Duration = Duration::from_millis(300);

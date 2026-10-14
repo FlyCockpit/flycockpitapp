@@ -28,13 +28,13 @@ use std::{io::Write as _, sync::Mutex as StdMutex};
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
-fn test_principal_tx_sender() -> &'static tokio::sync::watch::Sender<ClientPrincipal> {
+fn test_principal_tx_sender() -> &'static tokio::sync::watch::Sender<ClientEventAuthority> {
     static HOLDER: std::sync::OnceLock<(
-        tokio::sync::watch::Sender<ClientPrincipal>,
-        tokio::sync::watch::Receiver<ClientPrincipal>,
+        tokio::sync::watch::Sender<ClientEventAuthority>,
+        tokio::sync::watch::Receiver<ClientEventAuthority>,
     )> = std::sync::OnceLock::new();
     &HOLDER
-        .get_or_init(|| tokio::sync::watch::channel(ClientPrincipal::owner()))
+        .get_or_init(|| tokio::sync::watch::channel(ClientPrincipal::owner().into()))
         .0
 }
 
@@ -9326,7 +9326,8 @@ async fn revocation_cause_survives_frame_ordering_and_stale_notices() {
     state.socket_peer = Some(peer);
     state.active_peer_credential = Some(token.0.clone());
     let mut shared = state.shared_snapshot();
-    let (principal_tx, _principal_rx) = tokio::sync::watch::channel(state.principal.clone());
+    let (principal_tx, _principal_rx) =
+        tokio::sync::watch::channel(ClientEventAuthority::from_state(&state));
 
     registry.revoke_for_connection(id, PeerCredentialRevocation::PeerChanged);
     // A frame queued before the hook's notice reaches reconciliation first.
@@ -9381,10 +9382,191 @@ async fn revocation_cause_survives_frame_ordering_and_stale_notices() {
         "a stale notice must not downgrade a fresh credential"
     );
     assert_eq!(
-        *principal_tx.borrow(),
+        principal_tx.borrow().principal_for_event(registry),
         state.principal,
-        "the event principal is restored"
+        "the event principal is revalidated"
     );
+}
+
+/// N2: queue A's notice, exchange B, withdraw B while the queue is full,
+/// then process A. Drive the actual independent event forwarder for both
+/// global and attached-session protected events, with positive owner controls.
+#[cfg(unix)]
+#[tokio::test]
+async fn r3_stale_a_notice_never_forwards_protected_events_after_b_withdrawal() {
+    use crate::daemon::peer_authority::{PeerCredentialLease, PeerCredentialRevocation};
+    let ctx = test_ctx();
+    let peer = child_peer_identity(std::process::id());
+    let mut state = owner_state();
+    let id = state.terminal_context.client_instance_id;
+    state.socket_peer = Some(peer);
+    let a = ctx.peer_credential_registry.mint(
+        peer,
+        id,
+        crate::daemon::principal::LocalClientRole::Tui,
+        vec![],
+    );
+    state.active_peer_credential = Some(a.0.clone());
+    let mut shared = state.shared_snapshot();
+    let (principal_tx, principal_rx) = watch::channel(ClientEventAuthority::from_state(&state));
+    let (executor_tx, mut executor_rx) = mpsc::channel(1);
+    let lease = PeerCredentialLease::hold_with_invalidation_hook(
+        ctx.peer_credential_registry.clone(),
+        id,
+        peer_credential_invalidation_hook(principal_tx.clone(), executor_tx.clone(), peer, id),
+    );
+    ctx.peer_credential_registry
+        .revoke_for_connection(id, PeerCredentialRevocation::Evicted);
+    let b = ctx.peer_credential_registry.mint(
+        peer,
+        id,
+        crate::daemon::principal::LocalClientRole::Tui,
+        vec![],
+    );
+    state.active_peer_credential = Some(b.0.clone());
+    principal_tx
+        .send(ClientEventAuthority::from_state(&state))
+        .unwrap();
+    let (global_tx, global_rx) = broadcast::channel(8);
+    let (session_tx, session_rx) = broadcast::channel(8);
+    let (event_cmd_tx, event_cmd_rx) = mpsc::channel(8);
+    let (writer_tx, mut writer_rx) = mpsc::channel(8);
+    let event_task = tokio::spawn(run_client_event_forwarder(
+        ctx.clone(),
+        principal_rx,
+        global_rx,
+        event_cmd_rx,
+        executor_tx,
+        writer_tx,
+    ));
+    event_cmd_tx
+        .send(ClientEventCommand::Attach {
+            session_id: Uuid::new_v4(),
+            rx: session_rx,
+            rendered_interrupts: Arc::new(StdMutex::new(HashSet::new())),
+        })
+        .await
+        .unwrap();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    event_cmd_tx
+        .send(ClientEventCommand::Barrier(ready_tx))
+        .await
+        .unwrap();
+    ready_rx.await.unwrap();
+    const SECRET: &str = "r3-protected-event-canary";
+    let event = || EventEnvelope {
+        event: proto::Event::LspNotice {
+            text: SECRET.into(),
+        },
+        redact: table_for(SECRET).into(),
+    };
+    for bus in [&global_tx, &session_tx] {
+        bus.send(event()).unwrap();
+        assert!(
+            matches!(recv_writer_body(&mut writer_rx, "owner control event").await,
+            Body::Event { event: proto::Event::LspNotice { text } } if text == SECRET),
+            "live B receives the owner event"
+        );
+    }
+    // A still fills the executor queue: B's accurate notice cannot be delivered.
+    ctx.peer_credential_registry
+        .revoke_for_connection(id, PeerCredentialRevocation::PeerChanged);
+    let ClientExecutorInput::PeerCredentialInvalidated { token, reason } =
+        executor_rx.recv().await.unwrap()
+    else {
+        panic!("expected A notice")
+    };
+    assert_eq!(token, a.0);
+    apply_peer_credential_invalidation(&mut state, &mut shared, &principal_tx, &token, reason);
+    assert!(
+        executor_rx.try_recv().is_err(),
+        "B notice was dropped by the full queue"
+    );
+    for bus in [&global_tx, &session_tx] {
+        bus.send(event()).unwrap();
+        assert!(
+            matches!(recv_writer_body(&mut writer_rx, "event after B withdrawal").await,
+            Body::Event { event: proto::Event::LspNotice { text } } if text == "[redacted]"),
+            "no protected event may be forwarded after B's withdrawal, even after processing A"
+        );
+    }
+    drop(lease);
+    event_task.abort();
+    assert!(event_task.await.unwrap_err().is_cancelled());
+}
+
+/// C7: pause at the removal/notification boundary, reconcile a queued frame
+/// while the notice queue is full, then let the callback lose its notice.
+/// The cause must already be visible when verification first fails.
+#[cfg(unix)]
+#[tokio::test]
+async fn r3_removal_and_cause_are_atomic_with_a_full_notice_queue() {
+    use crate::daemon::peer_authority::{PeerCredentialLease, PeerCredentialRevocation};
+    let ctx = test_ctx();
+    let registry = ctx.peer_credential_registry.clone();
+    let peer = child_peer_identity(std::process::id());
+    let mut state = owner_state();
+    let id = state.terminal_context.client_instance_id;
+    state.socket_peer = Some(peer);
+    let token = registry.mint(
+        peer,
+        id,
+        crate::daemon::principal::LocalClientRole::Tui,
+        vec![],
+    );
+    state.active_peer_credential = Some(token.0.clone());
+    let mut shared = state.shared_snapshot();
+    let (principal_tx, _principal_rx) = watch::channel(ClientEventAuthority::from_state(&state));
+    let (executor_tx, mut executor_rx) = mpsc::channel(1);
+    executor_tx
+        .try_send(ClientExecutorInput::SessionEventsClosed)
+        .unwrap();
+    let lease = PeerCredentialLease::hold_with_invalidation_hook(
+        registry.clone(),
+        id,
+        peer_credential_invalidation_hook(principal_tx.clone(), executor_tx, peer, id),
+    );
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let boundary_entered = entered.clone();
+    let boundary_resume = resume.clone();
+    registry.before_notifications_for_test(move || {
+        boundary_entered.wait();
+        boundary_resume.wait();
+    });
+    let worker_registry = registry.clone();
+    let withdrawal = std::thread::spawn(move || {
+        worker_registry.revoke_for_connection(id, PeerCredentialRevocation::PeerChanged)
+    });
+    entered.wait();
+    reconcile_socket_peer_owner_authority(&mut state, &mut shared, &ctx, &principal_tx);
+    let observed = state.owner_credential_revoked;
+    resume.wait();
+    withdrawal.join().unwrap();
+    assert!(matches!(
+        executor_rx.try_recv().unwrap(),
+        ClientExecutorInput::SessionEventsClosed
+    ));
+    assert!(
+        executor_rx.try_recv().is_err(),
+        "the full queue discarded the revocation notice"
+    );
+    reconcile_socket_peer_owner_authority(&mut state, &mut shared, &ctx, &principal_tx);
+    assert_eq!(
+        observed,
+        Some(PeerCredentialRevocation::PeerChanged),
+        "the true cause must be published atomically with token removal"
+    );
+    assert_eq!(
+        shared.owner_credential_revoked,
+        Some(PeerCredentialRevocation::PeerChanged),
+        "no guessed cause survives a lost notice"
+    );
+    assert_eq!(
+        registry.revocation_cause(id, token.as_str()),
+        Some(PeerCredentialRevocation::PeerChanged)
+    );
+    drop(lease);
 }
 
 /// Issue #546: when the daemon does withdraw an owner connection's
@@ -36994,7 +37176,7 @@ async fn serialized_requests_apply_in_receipt_order() {
         None,
         executor_rx,
         {
-            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner());
+            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner().into());
             principal_tx
         },
         event_cmd_tx,
@@ -37199,7 +37381,7 @@ async fn concurrent_requests_may_complete_out_of_order() {
         None,
         executor_rx,
         {
-            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner());
+            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner().into());
             principal_tx
         },
         event_cmd_tx,
@@ -37258,7 +37440,7 @@ async fn slow_request_does_not_block_event_forwarding() {
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
-    let (principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    let (principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner().into());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx.clone(),
         principal_rx,
@@ -37331,7 +37513,7 @@ async fn concurrent_request_panic_yields_internal_error_and_keeps_connection() {
         None,
         executor_rx,
         {
-            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner());
+            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner().into());
             principal_tx
         },
         event_cmd_tx,
@@ -37394,7 +37576,7 @@ async fn blocking_fs_handler_panic_keeps_client_connection() {
         None,
         executor_rx,
         {
-            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner());
+            let (principal_tx, _) = tokio::sync::watch::channel(ClientPrincipal::owner().into());
             principal_tx
         },
         event_cmd_tx,
@@ -37491,7 +37673,8 @@ async fn client_io_split_slow_request_does_not_block_event_forwarding() {
     // Keep the watch sender alive: `run_client_event_forwarder` exits when it
     // closes (the executor owns it in production), so a wildcard drop here
     // would tear the forwarder down before any event is forwarded.
-    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    let (_principal_tx, principal_rx) =
+        tokio::sync::watch::channel(ClientPrincipal::owner().into());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx,
         principal_rx,
@@ -37837,7 +38020,8 @@ async fn client_io_split_detach_silences_session_events() {
     // Keep the watch sender alive: `run_client_event_forwarder` exits when it
     // closes (the executor owns it in production), so a wildcard drop here
     // would tear the forwarder down before any event is forwarded.
-    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    let (_principal_tx, principal_rx) =
+        tokio::sync::watch::channel(ClientPrincipal::owner().into());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx,
         principal_rx,
@@ -37912,7 +38096,8 @@ async fn broadcast_lag_emits_typed_event_not_internal_error() {
     // Keep the watch sender alive: `run_client_event_forwarder` exits when it
     // closes (the executor owns it in production), so a wildcard drop here
     // would tear the forwarder down before any event is forwarded.
-    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    let (_principal_tx, principal_rx) =
+        tokio::sync::watch::channel(ClientPrincipal::owner().into());
     let event_task = tokio::spawn(run_client_event_forwarder(
         ctx,
         principal_rx,
@@ -42993,7 +43178,8 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
     // Keep the watch sender alive: `run_client_event_forwarder` exits when it
     // closes (the executor owns it in production), so a wildcard drop here
     // would tear the forwarder down before any event is forwarded.
-    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    let (_principal_tx, principal_rx) =
+        tokio::sync::watch::channel(ClientPrincipal::owner().into());
     let task = tokio::spawn(run_client_event_forwarder(
         ctx.clone(),
         principal_rx,
@@ -43115,7 +43301,8 @@ async fn socket_live_interrupt_provenance_tracks_the_attachment_that_received_th
     // Keep the watch sender alive: `run_client_event_forwarder` exits when it
     // closes (the executor owns it in production), so a wildcard drop here
     // would tear the forwarder down before any event is forwarded.
-    let (_principal_tx, principal_rx) = tokio::sync::watch::channel(ClientPrincipal::owner());
+    let (_principal_tx, principal_rx) =
+        tokio::sync::watch::channel(ClientPrincipal::owner().into());
     let failed_task = tokio::spawn(run_client_event_forwarder(
         ctx.clone(),
         principal_rx,

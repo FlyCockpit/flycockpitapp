@@ -342,6 +342,54 @@ fn scrub_json_strings(value: &mut serde_json::Value, redact: &RedactionTable) {
     }
 }
 
+/// Executor publications are candidates, never event-delivery authority.
+/// Socket events revalidate this exact token at the authorization boundary;
+/// even a delayed notice or exchange publication cannot restore a revoked peer.
+#[derive(Clone)]
+struct ClientEventAuthority {
+    principal: ClientPrincipal,
+    socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
+    connection_id: Uuid,
+    token: Option<String>,
+}
+
+#[cfg(test)]
+impl From<ClientPrincipal> for ClientEventAuthority {
+    fn from(principal: ClientPrincipal) -> Self {
+        Self {
+            principal,
+            socket_peer: None,
+            connection_id: Uuid::nil(),
+            token: None,
+        }
+    }
+}
+
+impl ClientEventAuthority {
+    fn from_state(state: &MutableClientState) -> Self {
+        Self {
+            principal: state.principal.clone(),
+            socket_peer: state.socket_peer,
+            connection_id: state.terminal_context.client_instance_id,
+            token: state.active_peer_credential.clone(),
+        }
+    }
+
+    fn principal_for_event(
+        &self,
+        registry: &crate::daemon::peer_authority::PeerCredentialRegistry,
+    ) -> ClientPrincipal {
+        let Some(peer) = self.socket_peer else {
+            return self.principal.clone();
+        };
+        self.token
+            .as_deref()
+            .and_then(|token| registry.verify_without_prune(peer, self.connection_id, token))
+            .map(|(role, grants)| ClientPrincipal::local_authenticated(peer, role, grants))
+            .unwrap_or_else(|| ClientPrincipal::local_unauthenticated(peer))
+    }
+}
+
 fn scrub_event_for_principal(
     principal: &ClientPrincipal,
     envelope: EventEnvelope,
@@ -9128,7 +9176,12 @@ where
     let (writer_tx, writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (executor_tx, executor_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
-    let (principal_tx, principal_rx) = watch::channel(principal.clone());
+    let (principal_tx, principal_rx) = watch::channel(ClientEventAuthority {
+        principal: principal.clone(),
+        socket_peer,
+        connection_id: client_instance_id,
+        token: None,
+    });
     // The credential this connection exchanges, and the hook that reports its
     // revocation, live exactly as long as this handler: renewed while it
     // serves the peer, released when it ends, unwinds or is cancelled
@@ -9139,19 +9192,12 @@ where
         crate::daemon::peer_authority::PeerCredentialLease::hold_with_invalidation_hook(
             ctx.peer_credential_registry.clone(),
             client_instance_id,
-            move |token, reason| {
-                // Fail closed for event delivery at once; the executor
-                // re-publishes its principal if this notice turns out to be
-                // for a credential the connection no longer uses.
-                let _ =
-                    invalidation_principal_tx.send(ClientPrincipal::local_unauthenticated(peer));
-                let _ = invalidation_executor_tx.try_send(
-                    ClientExecutorInput::PeerCredentialInvalidated {
-                        token: token.to_string(),
-                        reason,
-                    },
-                );
-            },
+            peer_credential_invalidation_hook(
+                invalidation_principal_tx,
+                invalidation_executor_tx,
+                peer,
+                client_instance_id,
+            ),
         )
     });
 
@@ -9520,9 +9566,31 @@ async fn run_client_writer<W>(
     }
 }
 
+/// Notice delivery is best effort; event authorization and cause recovery
+/// remain registry-backed even when this queue is full.
+fn peer_credential_invalidation_hook(
+    principal_tx: watch::Sender<ClientEventAuthority>,
+    executor_tx: mpsc::Sender<ClientExecutorInput>,
+    peer: cockpit_host::peer_cred::PeerIdentity,
+    connection_id: Uuid,
+) -> impl Fn(&str, crate::daemon::peer_authority::PeerCredentialRevocation) + Send + Sync {
+    move |token, reason| {
+        let _ = principal_tx.send(ClientEventAuthority {
+            principal: ClientPrincipal::local_unauthenticated(peer),
+            socket_peer: Some(peer),
+            connection_id,
+            token: None,
+        });
+        let _ = executor_tx.try_send(ClientExecutorInput::PeerCredentialInvalidated {
+            token: token.to_string(),
+            reason,
+        });
+    }
+}
+
 async fn run_client_event_forwarder(
     ctx: Arc<DaemonContext>,
-    mut principal_rx: watch::Receiver<ClientPrincipal>,
+    mut principal_rx: watch::Receiver<ClientEventAuthority>,
     mut global_rx: EventReceiver,
     mut event_cmd_rx: mpsc::Receiver<ClientEventCommand>,
     executor_tx: mpsc::Sender<ClientExecutorInput>,
@@ -9565,7 +9633,7 @@ async fn run_client_event_forwarder(
                 }
             }
             global = global_rx.recv() => {
-                let principal = principal_rx.borrow().clone();
+                let principal = principal_rx.borrow().principal_for_event(&ctx.peer_credential_registry);
                 match global {
                     Ok(envelope) => {
                         let Some(event) = scrub_event_for_principal(&principal, envelope) else {
@@ -9614,7 +9682,7 @@ async fn run_client_event_forwarder(
                 }
             }
             event = session_branch => {
-                let principal = principal_rx.borrow().clone();
+                let principal = principal_rx.borrow().principal_for_event(&ctx.peer_credential_registry);
                 match event {
                     Some(Ok(envelope)) => {
                         let Some(event) = scrub_event_for_principal(&principal, envelope) else {
@@ -9667,7 +9735,7 @@ async fn run_client_executor(
     has_owner_capability: bool,
     socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
     mut executor_rx: mpsc::Receiver<ClientExecutorInput>,
-    principal_tx: watch::Sender<ClientPrincipal>,
+    principal_tx: watch::Sender<ClientEventAuthority>,
     event_cmd_tx: mpsc::Sender<ClientEventCommand>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
 ) -> Result<()> {
@@ -9802,12 +9870,12 @@ fn lapsed_peer_credential(
 /// the connection's active credential downgrades it; a notice for the
 /// credential this connection already lost corrects the recorded cause; a
 /// notice for any older credential (superseded by a re-exchange) is stale
-/// and only restores the principal the invalidation hook pre-emptively
-/// withdrew from event delivery.
+/// and only republishes the active token candidate. Event delivery always
+/// revalidates that token; cached client state never restores authority.
 fn apply_peer_credential_invalidation(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
-    principal_tx: &watch::Sender<ClientPrincipal>,
+    principal_tx: &watch::Sender<ClientEventAuthority>,
     token: &str,
     reason: crate::daemon::peer_authority::PeerCredentialRevocation,
 ) {
@@ -9819,13 +9887,13 @@ fn apply_peer_credential_invalidation(
         state.owner_credential_revoked = Some(reason);
         *shared = state.shared_snapshot();
     }
-    let _ = principal_tx.send(state.principal.clone());
+    let _ = principal_tx.send(ClientEventAuthority::from_state(state));
 }
 
 fn downgrade_revoked_peer_authority(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
-    principal_tx: &watch::Sender<ClientPrincipal>,
+    principal_tx: &watch::Sender<ClientEventAuthority>,
     reason: crate::daemon::peer_authority::PeerCredentialRevocation,
 ) {
     if state.active_peer_credential.is_none() {
@@ -9841,14 +9909,14 @@ fn downgrade_revoked_peer_authority(
         state.principal = ClientPrincipal::local_unauthenticated(peer);
     }
     *shared = state.shared_snapshot();
-    let _ = principal_tx.send(state.principal.clone());
+    let _ = principal_tx.send(ClientEventAuthority::from_state(state));
 }
 
 fn reconcile_socket_peer_owner_authority(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
-    principal_tx: &watch::Sender<ClientPrincipal>,
+    principal_tx: &watch::Sender<ClientEventAuthority>,
 ) {
     if state.socket_peer.is_none() || state.active_peer_credential.is_none() {
         return;
@@ -9890,7 +9958,7 @@ async fn handle_client_frame(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
-    principal_tx: &watch::Sender<ClientPrincipal>,
+    principal_tx: &watch::Sender<ClientEventAuthority>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
@@ -9958,7 +10026,7 @@ async fn handle_envelope(
     state: &mut MutableClientState,
     shared: &mut Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
-    principal_tx: &watch::Sender<ClientPrincipal>,
+    principal_tx: &watch::Sender<ClientEventAuthority>,
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
@@ -9993,7 +10061,7 @@ async fn handle_envelope(
                         state.principal = ClientPrincipal::local_authenticated(peer, role, grants);
                         state.active_peer_credential = Some(token.as_str().to_string());
                         *shared = state.shared_snapshot();
-                        let _ = principal_tx.send(state.principal.clone());
+                        let _ = principal_tx.send(ClientEventAuthority::from_state(state));
                     } else {
                         if state.has_owner_capability {
                             state.owner_credential_revoked = Some(
@@ -10007,7 +10075,7 @@ async fn handle_envelope(
                         state.active_peer_credential = None;
                         state.principal = ClientPrincipal::local_unauthenticated(peer);
                         *shared = state.shared_snapshot();
-                        let _ = principal_tx.send(state.principal.clone());
+                        let _ = principal_tx.send(ClientEventAuthority::from_state(state));
                     }
                 } else if ctx.owner_capability.verify(token.as_str()) {
                     state.has_owner_capability = true;
@@ -10105,7 +10173,7 @@ async fn handle_envelope(
             let principal_changed = matches!(&result, Ok(Response::LocalPeerCredential { .. }));
             if principal_changed {
                 *shared = state.shared_snapshot();
-                let _ = principal_tx.send(state.principal.clone());
+                let _ = principal_tx.send(ClientEventAuthority::from_state(state));
             }
             let envelope = response_envelope_for_shared(id, result, shared, ctx);
             let envelope_kind = envelope_kind(&envelope);

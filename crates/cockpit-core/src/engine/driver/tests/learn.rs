@@ -103,9 +103,9 @@ fn learn_respects_write_gate() {
             .await
         });
 
-        let interrupt_id = raised
-            .recv()
+        let interrupt_id = tokio::time::timeout(Duration::from_secs(5), raised.recv())
             .await
+            .expect("timed out waiting for the learn interrupt")
             .expect("learn interrupt is published after lifecycle binding");
         assert!(hub.park(interrupt_id).await);
         task.await.unwrap().unwrap();

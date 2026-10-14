@@ -3362,7 +3362,10 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
     .await;
 
     let crate::engine::driver::DriverControl::SetRedaction { table, .. } =
-        driver_rx.recv().await.unwrap()
+        tokio::time::timeout(std::time::Duration::from_secs(5), driver_rx.recv())
+            .await
+            .expect("timed out waiting for refreshed driver redaction")
+            .expect("driver control channel closed")
     else {
         panic!("unexpected driver control");
     };

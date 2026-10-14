@@ -77,6 +77,9 @@ impl Session {
     fn with_test_redaction_coverage(self) -> Result<Self> {
         let command_cache = crate::secret_command::CommandSecretCache::with_subprocess_executor();
         self.set_command_secret_cache(Some(command_cache.clone()));
+        // Real acquisitions retain SSH scanning. The shared profile resolver
+        // isolates its default directory in test builds, including driver
+        // refreshes that construct their own default RedactConfig.
         let config = crate::config::extended::RedactConfig::default();
         let policy_digest = crate::redact::coverage_bindings::redact_config_digest(&config);
         let environment = crate::env_snapshot::EnvSnapshot::new(

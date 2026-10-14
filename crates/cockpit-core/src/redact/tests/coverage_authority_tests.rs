@@ -18,6 +18,402 @@ use super::super::{
 
 const REDACTED: &str = "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**";
 
+/// Throwaway OpenSSH private keys generated once with `ssh-keygen` for these
+/// tests only (key comments `cockpit-test-only-*`); they protect nothing.
+/// Only the base64 bodies are checked in, so no file carries a PEM armor line
+/// for repository secret scanners; [`test_only_private_key`] restores it.
+/// Fixed fixtures keep the regressions platform-independent (no
+/// `ssh-keygen`) and their artifact sizes deterministic.
+const RSA_4096_TEST_KEY_BODIES: [&str; 10] = [
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_01.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_02.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_03.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_04.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_05.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_06.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_07.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_08.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_09.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_rsa4096_10.body"),
+];
+const ED25519_TEST_KEY_BODIES: [&str; 2] = [
+    include_str!("fixtures/ssh_test_keys/test_only_ed25519_01.body"),
+    include_str!("fixtures/ssh_test_keys/test_only_ed25519_02.body"),
+];
+
+/// Reassemble a fixture body into the OpenSSH private-key file `ssh-keygen`
+/// wrote (LF line endings regardless of checkout).
+fn test_only_private_key(body: &str) -> String {
+    let mut key = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n"); // pragma: allowlist secret
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        key.push_str(line);
+        key.push('\n');
+    }
+    key.push_str("-----END OPENSSH PRIVATE KEY-----\n");
+    key
+}
+
+/// Every representation the table registers for one private key: the whole
+/// key, each line, and the encoded variants of each.
+fn private_key_representations(secret: &str) -> Vec<String> {
+    let mut variants = super::super::encoded_secret_variants(secret);
+    assert_eq!(variants.len(), 4);
+    for line in secret.lines() {
+        variants.push(line.to_owned());
+        variants.extend(super::super::encoded_secret_variants(line));
+    }
+    variants.push(secret.to_owned());
+    variants
+}
+
+#[tokio::test]
+async fn ssh_private_key_coverage_admits_and_scrubs_every_encoding() {
+    let env = crate::test_env::lock_async().await;
+    let home = tempfile::tempdir().unwrap();
+    env.set_isolated_home(home.path());
+    let ssh = home.path().join("home/.ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    let key_path = ssh.join("id_ed25519");
+    // Disposable fixture material; never depend on a developer's SSH keys.
+    std::fs::write(&key_path, test_only_private_key(ED25519_TEST_KEY_BODIES[0])).unwrap();
+    let secret = std::fs::read_to_string(key_path).unwrap();
+    let secret = secret.trim().to_owned();
+    let cfg = crate::config::extended::RedactConfig {
+        scan_environment: false,
+        scan_dotenv: false,
+        // Explicit: the default profile is platform-resolved (Windows uses
+        // the Known Folder, not HOME); see the default-profile test below.
+        ssh_key_dir: Some(ssh.clone()),
+        ..Default::default()
+    };
+    let table = RedactionTable::build_scoped(
+        &cfg,
+        super::super::RedactionSourceScope::DaemonGlobal,
+        &HashMap::new(),
+        std::iter::empty(),
+    )
+    .expect("complete private-key capture");
+    let artifact_bytes = table.measured_immutable_artifact_bytes();
+    // The compact automaton representation keeps one key far below the cap;
+    // the dense DFA the library would auto-select measures over 5 MiB.
+    assert!(
+        artifact_bytes <= 1024 * 1024,
+        "one private key must use the compact matcher: artifact_bytes={artifact_bytes}"
+    );
+    let parts = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let authority = RedactionCoverageAuthority::default();
+    let admission = authority
+        .acquire(
+            key(parts),
+            CoverageScope::DaemonGlobalBootstrap,
+            move || {
+                Ok(CoverageBuild::from_complete_table(
+                    table,
+                    boundary_for(parts),
+                ))
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "private-key coverage must be admitted: {error}; artifact_bytes={artifact_bytes}"
+            )
+        });
+    admission
+        .use_at_sink(|table| {
+            let variants = private_key_representations(&secret);
+            for (index, variant) in variants.iter().enumerate() {
+                assert!(
+                    table.scrub(variant) == REDACTED,
+                    "private-key variant {index} must be fully redacted"
+                );
+            }
+            assert_eq!(table.scrub("ordinary public text"), "ordinary public text");
+            Ok(())
+        })
+        .expect("admitted SSH coverage is usable at the sink");
+
+    // An unavailable configured source must still refuse a fresh admission.
+    authority.invalidate();
+    let missing = crate::config::extended::RedactConfig {
+        ssh_key_dir: Some(ssh.join("missing")),
+        ..cfg
+    };
+    let refused = authority
+        .acquire(
+            key(parts),
+            CoverageScope::DaemonGlobalBootstrap,
+            move || {
+                let table = RedactionTable::build_scoped(
+                    &missing,
+                    super::super::RedactionSourceScope::DaemonGlobal,
+                    &HashMap::new(),
+                    std::iter::empty(),
+                )?;
+                Ok(CoverageBuild::from_complete_table(
+                    table,
+                    boundary_for(parts),
+                ))
+            },
+        )
+        .await;
+    assert!(matches!(refused, Err(CoverageError::Unavailable)));
+}
+
+/// Several large keys in one profile (work, personal, deploy, ...) plus a
+/// typical environment must admit within the per-generation budget,
+/// and every representation of every key must still scrub to the placeholder
+/// (issue #527).
+#[tokio::test]
+async fn ssh_coverage_admits_ten_rsa_4096_keys_with_an_environment() {
+    let env = crate::test_env::lock_async().await;
+    let home = tempfile::tempdir().unwrap();
+    env.set_isolated_home(home.path());
+    let ssh = home.path().join("home/.ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    let mut secrets = Vec::new();
+    for (index, body) in RSA_4096_TEST_KEY_BODIES.iter().enumerate() {
+        let key = test_only_private_key(body);
+        std::fs::write(ssh.join(format!("id_rsa_{index}")), &key).unwrap();
+        secrets.push(key.trim().to_owned());
+    }
+    for (index, body) in ED25519_TEST_KEY_BODIES.iter().enumerate() {
+        let key = test_only_private_key(body);
+        std::fs::write(ssh.join(format!("id_ed25519_{index}")), &key).unwrap();
+        secrets.push(key.trim().to_owned());
+    }
+    // A developer environment: credential-shaped values (registered with
+    // their encodings and case variants) beside ordinary settings.
+    let mut environment: HashMap<String, String> = (0..40)
+        .map(|index| {
+            (
+                format!("SERVICE_{index:02}_API_TOKEN"),
+                format!("tok-{index:02}-test-only-9f8e7d6c5b4a3210fedcba98"),
+            )
+        })
+        .collect();
+    environment.insert("EDITOR".into(), "nvim".into());
+    environment.insert("GIT_AUTHOR_NAME".into(), "Test Only".into());
+    let cfg = crate::config::extended::RedactConfig {
+        scan_environment: true,
+        scan_dotenv: false,
+        ssh_key_dir: Some(ssh.clone()),
+        ..Default::default()
+    };
+    let table = RedactionTable::build_scoped(
+        &cfg,
+        super::super::RedactionSourceScope::DaemonGlobal,
+        &environment,
+        std::iter::empty(),
+    )
+    .expect("complete private-key capture");
+    let artifact_bytes = table.measured_immutable_artifact_bytes();
+    eprintln!("ten_rsa_4096_two_ed25519_forty_env artifact_bytes={artifact_bytes}");
+    assert!(
+        artifact_bytes <= COVERAGE_LIMITS.artifact_bytes_per_generation,
+        "artifact_bytes={artifact_bytes} exceeds the per-generation budget"
+    );
+    let parts = [7, 2, 7, 2, 7, 2, 7, 2, 7, 2];
+    let authority = RedactionCoverageAuthority::default();
+    let admission = authority
+        .acquire(
+            key(parts),
+            CoverageScope::DaemonGlobalBootstrap,
+            move || {
+                Ok(CoverageBuild::from_complete_table(
+                    table,
+                    boundary_for(parts),
+                ))
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("multi-key coverage must be admitted: {error}; artifact_bytes={artifact_bytes}")
+        });
+    admission
+        .use_at_sink(|table| {
+            for (key_index, secret) in secrets.iter().enumerate() {
+                for (index, variant) in private_key_representations(secret).iter().enumerate() {
+                    assert!(
+                        table.scrub(variant) == REDACTED,
+                        "key {key_index} representation {index} must be fully redacted"
+                    );
+                }
+            }
+            for value in environment
+                .values()
+                .filter(|value| value.starts_with("tok-"))
+            {
+                assert_eq!(table.scrub(value), REDACTED);
+            }
+            // Two keys pasted into one body with ordinary text around them.
+            let body = format!("before\n{}\nbetween\n{}\nafter", secrets[0], secrets[9]);
+            assert_eq!(
+                table.scrub(&body),
+                format!("before\n{REDACTED}\nbetween\n{REDACTED}\nafter")
+            );
+            assert_eq!(table.scrub("ordinary public text"), "ordinary public text");
+            Ok(())
+        })
+        .expect("admitted SSH coverage is usable at the sink");
+}
+
+/// The unconfigured default (`~/.ssh` of the platform profile) is scanned.
+/// Unix resolves the profile from `HOME`, which the isolated test home sets;
+/// Windows resolves the Known Folder profile, which a test cannot redirect,
+/// so the explicit-directory tests above carry the cross-platform coverage.
+#[cfg(unix)]
+#[tokio::test]
+async fn default_profile_ssh_directory_is_scanned() {
+    let env = crate::test_env::lock_async().await;
+    let home = tempfile::tempdir().unwrap();
+    env.set_isolated_home(home.path());
+    let ssh = home.path().join("home/.ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    let secret = test_only_private_key(ED25519_TEST_KEY_BODIES[1]);
+    std::fs::write(ssh.join("id_ed25519"), &secret).unwrap();
+    let cfg = crate::config::extended::RedactConfig {
+        scan_environment: false,
+        scan_dotenv: false,
+        ssh_key_dir: None,
+        ..Default::default()
+    };
+    let table = RedactionTable::build_scoped(
+        &cfg,
+        super::super::RedactionSourceScope::DaemonGlobal,
+        &HashMap::new(),
+        std::iter::empty(),
+    )
+    .expect("complete default-profile capture");
+    assert!(table.has_ssh_key_material());
+    for variant in private_key_representations(secret.trim()) {
+        assert_eq!(table.scrub(&variant), REDACTED);
+    }
+}
+
+/// The total budget keeps the daemon-global generation and several
+/// concurrent session generations resident at the size a ten-RSA-4096-key
+/// profile measures (about 12 MiB each). An evicted generation's installed
+/// table turns stale and scrubs every body to the placeholder, so these
+/// installed tables must all stay current.
+#[tokio::test]
+async fn total_budget_keeps_global_and_session_generations_of_a_many_key_profile() {
+    const MANY_KEY_GENERATION_BYTES: usize = 12 * 1024 * 1024;
+    let authority = RedactionCoverageAuthority::default();
+    let mut installed = Vec::new();
+    // Daemon-global plus four sessions, each installed for its lifetime.
+    for index in 0..5u8 {
+        let parts = [90 + index; 10];
+        let admission = authority
+            .acquire(key(parts), CoverageScope::SessionStart, move || {
+                let table = RedactionTable::empty().with_forced_literal(
+                    "coverage-canary-secret".to_string(),
+                    "$test:coverage".to_string(),
+                )?;
+                Ok(CoverageBuild::from_complete_table_and_artifact_bytes(
+                    table,
+                    MANY_KEY_GENERATION_BYTES,
+                    boundary_for(parts),
+                ))
+            })
+            .await
+            .unwrap_or_else(|error| panic!("generation {index} must admit: {error}"));
+        installed.push(admission.install_table().expect("installed table"));
+    }
+    for (index, table) in installed.iter().enumerate() {
+        assert_eq!(
+            table.scrub("ordinary public text"),
+            "ordinary public text",
+            "installed generation {index} was evicted"
+        );
+        assert_eq!(table.scrub("coverage-canary-secret"), REDACTED);
+    }
+}
+
+/// A capture over the per-generation budget still fails closed, and the
+/// refusal names private SSH key material and the settings that bound it
+/// when keys are part of the artifact.
+#[tokio::test]
+async fn over_budget_coverage_names_ssh_key_remediation() {
+    let env = crate::test_env::lock_async().await;
+    let home = tempfile::tempdir().unwrap();
+    env.set_isolated_home(home.path());
+    let ssh = home.path().join("home/.ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    std::fs::write(
+        ssh.join("id_ed25519"),
+        test_only_private_key(ED25519_TEST_KEY_BODIES[1]),
+    )
+    .unwrap();
+    let cfg = crate::config::extended::RedactConfig {
+        scan_environment: false,
+        scan_dotenv: false,
+        // Explicit: the default profile is platform-resolved (Windows uses
+        // the Known Folder, not HOME); see the default-profile test below.
+        ssh_key_dir: Some(ssh.clone()),
+        ..Default::default()
+    };
+    let with_keys = RedactionTable::build_scoped(
+        &cfg,
+        super::super::RedactionSourceScope::DaemonGlobal,
+        &HashMap::new(),
+        std::iter::empty(),
+    )
+    .expect("complete private-key capture");
+    let authority = RedactionCoverageAuthority::default();
+    let parts = [8, 1, 8, 1, 8, 1, 8, 1, 8, 1];
+    let refused = authority
+        .acquire(
+            key(parts),
+            CoverageScope::DaemonGlobalBootstrap,
+            move || {
+                Ok(CoverageBuild::from_complete_table_and_artifact_bytes(
+                    with_keys,
+                    COVERAGE_LIMITS.artifact_bytes_per_generation + 1,
+                    boundary_for(parts),
+                ))
+            },
+        )
+        .await
+        .map(|_| ())
+        .expect_err("an over-budget artifact never publishes");
+    assert_eq!(
+        refused,
+        CoverageError::ArtifactOverBudget {
+            ssh_key_material: true
+        }
+    );
+    let message = refused.to_string();
+    for needle in ["SSH key", "`redact.ssh_key_dir`", "`redact.scan_ssh_keys`"] {
+        assert!(message.contains(needle), "{message}");
+    }
+    assert!(!message.contains(&ssh.display().to_string()));
+
+    let parts = [8, 2, 8, 2, 8, 2, 8, 2, 8, 2];
+    let refused = authority
+        .acquire(
+            key(parts),
+            CoverageScope::DaemonGlobalBootstrap,
+            move || {
+                Ok(CoverageBuild::from_complete_table_and_artifact_bytes(
+                    RedactionTable::empty(),
+                    COVERAGE_LIMITS.artifact_bytes_per_generation + 1,
+                    boundary_for(parts),
+                ))
+            },
+        )
+        .await
+        .map(|_| ())
+        .expect_err("an over-budget artifact never publishes");
+    assert_eq!(
+        refused,
+        CoverageError::ArtifactOverBudget {
+            ssh_key_material: false
+        }
+    );
+    assert!(!refused.to_string().contains("ssh"));
+}
+
 fn binding(value: u8) -> CoverageBinding {
     CoverageBinding::from_daemon_bytes([value; 16])
 }
@@ -197,8 +593,8 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
         256,
         256,
         64,
-        4 * 1024 * 1024,
-        32 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64 * 1024 * 1024,
     );
     for mode in [
         CoverageOwnerMode::Persistent,
@@ -291,7 +687,9 @@ async fn coverage_limits_are_identical_in_persistent_ephemeral_and_inprocess_mod
                     ))
                 })
                 .await,
-            Err(CoverageError::Unavailable)
+            Err(CoverageError::ArtifactOverBudget {
+                ssh_key_material: false
+            })
         ));
 
         let pinned_parts = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6];

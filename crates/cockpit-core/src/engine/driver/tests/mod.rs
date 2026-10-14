@@ -24,24 +24,37 @@ mod schedule;
 mod skills_preflight;
 mod turn_loop;
 
-/// Await the producer-owned request/event signal without moving the paused
-/// production clock. The scripted provider sends this signal at request
-/// capture, so no scheduler polling is needed to infer readiness.
+/// Bound readiness/completion in real time while holding a paused production
+/// clock stationary. The blocking task inhibits Tokio's auto-advance while
+/// real socket I/O is pending; tests advance production timers explicitly.
+/// The independent timer is cancelled even if the enclosing test unwinds.
 async fn await_paused_driver_test_readiness<T>(
     future: impl std::future::Future<Output = T>,
-    _context: &str,
+    context: &str,
 ) -> T {
-    future.await
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let deadline = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("real-time test deadline runtime")
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), cancelled).await })
+    });
+    tokio::select! {
+        biased;
+        value = future => {
+            drop(cancel);
+            value
+        }
+        _ = deadline => panic!("timed out waiting for {context}"),
+    }
 }
 
-/// Await the spawned driver's terminal signal directly. Cancellation closes
-/// the in-flight provider future; the join handle is the completion authority,
-/// and cancellation itself has no production timer boundary to advance.
 async fn await_paused_driver_test_completion<T>(
     future: impl std::future::Future<Output = T>,
-    _context: &str,
+    context: &str,
 ) -> T {
-    future.await
+    await_paused_driver_test_readiness(future, context).await
 }
 
 /// `run_user_input` deliberately returns `Ok(())` after it has cleaned up a
@@ -393,7 +406,8 @@ async fn recovered_interactive_task_admission_replays_durable_seed_before_infere
         "the worker must acknowledge the claim before it releases execution"
     );
     activation_gate.release();
-    let recovered_child_request = provider.next_request_ready().await;
+    let recovered_child_request =
+        await_paused_driver_test_readiness(provider.next_request_ready(), "provider request").await;
     assert!(
         recovered_child_request
             .body

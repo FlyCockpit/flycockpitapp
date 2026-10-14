@@ -1764,7 +1764,8 @@ pub struct RedactConfig {
     pub scan_ssh_keys: bool,
     /// Directory scanned for private SSH keys when `scan_ssh_keys` is on.
     /// `None` (default) resolves to the user's `~/.ssh` cross-platform
-    /// (`%USERPROFILE%\.ssh` on Windows, via `dirs::home_dir()`).
+    /// (`%USERPROFILE%\.ssh` on Windows), through the shared profile resolver.
+    /// Test builds use an isolated profile unless explicitly overridden.
     #[serde(default)]
     pub ssh_key_dir: Option<PathBuf>,
     /// Gitignore-style globs (default `[".env", ".env.local"]`) matched

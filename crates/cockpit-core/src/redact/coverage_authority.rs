@@ -30,8 +30,14 @@ pub(crate) const COVERAGE_WAITERS_PER_KEY: usize = 16;
 pub(crate) const COVERAGE_WAITERS: usize = 256;
 pub(crate) const COVERAGE_ADMISSIONS: usize = 256;
 pub(crate) const COVERAGE_RESIDENT_GENERATIONS: usize = 64;
-pub(crate) const COVERAGE_ARTIFACT_BYTES_PER_GENERATION: usize = 4 * 1024 * 1024;
-pub(crate) const COVERAGE_ARTIFACT_BYTES_TOTAL: usize = 32 * 1024 * 1024;
+/// One generation's immutable artifact (entries plus both automata). 16 MiB
+/// admits a realistic developer `~/.ssh`: 10 RSA-4096 + 2 ed25519 keys + 40
+/// env values measure about 12.5 MiB with ContiguousNFA (#527).
+pub(crate) const COVERAGE_ARTIFACT_BYTES_PER_GENERATION: usize = 16 * 1024 * 1024;
+/// All resident generations together. Installed tables do not pin their
+/// generation (#542), so the total must hold the daemon-global table plus
+/// several sessions at the per-generation size: 64 MiB keeps 4 at the cap.
+pub(crate) const COVERAGE_ARTIFACT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CoverageOwnerMode {
@@ -290,6 +296,16 @@ fn coverage_capture_failure_category(error: &anyhow::Error) -> String {
         if cause.is::<super::RedactionSourceChangedError>() {
             return "source_changed".into();
         }
+        if let Some(ssh) = cause.downcast_ref::<super::ssh::SshKeyDirUnavailableError>() {
+            return match ssh.reason {
+                super::ssh::SshKeyDirUnavailableReason::Missing => "ssh_directory_missing",
+                super::ssh::SshKeyDirUnavailableReason::DanglingLink => {
+                    "ssh_directory_dangling_link"
+                }
+                super::ssh::SshKeyDirUnavailableReason::Unreadable(_) => "ssh_directory_unreadable",
+            }
+            .into();
+        }
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
             return format!("io_{:?}", io.kind());
         }
@@ -320,6 +336,40 @@ pub(crate) enum CoverageError {
     /// daemon's fixed file cap. The category is safe to surface; the source
     /// path and all other capture details remain confined to the worker.
     SourceFileOverLimit,
+    /// The complete capture's immutable artifact exceeds the per-generation
+    /// budget. Carries only whether private SSH key material is part of it,
+    /// which decides the remediation the message names; never a path, count,
+    /// or value.
+    ArtifactOverBudget {
+        ssh_key_material: bool,
+    },
+}
+
+impl CoverageError {
+    /// Construct every unavailable result here, including lifecycle and sink
+    /// failures. Categories are fixed internal labels (or sanitized source
+    /// error kinds), never source paths, values, or error messages.
+    fn unavailable(category: &str) -> Self {
+        tracing::warn!(category, "redaction coverage unavailable (fail closed)");
+        Self::Unavailable
+    }
+
+    /// The per-generation artifact cap refused a capture. Logged like every
+    /// unavailable category, plus the sanitized cause and its remediation.
+    fn artifact_over_budget(ssh_key_material: bool) -> Self {
+        let error = Self::ArtifactOverBudget { ssh_key_material };
+        let cause = if ssh_key_material {
+            "ssh_key_material"
+        } else {
+            "redaction_sources"
+        };
+        tracing::warn!(
+            category = "artifact_bytes_per_generation_exceeded",
+            cause,
+            "redaction coverage unavailable (fail closed): {error}"
+        );
+        error
+    }
 }
 
 impl fmt::Display for CoverageError {
@@ -329,6 +379,14 @@ impl fmt::Display for CoverageError {
             Self::Saturated => "coverage_saturated",
             Self::Invalidated => "coverage_invalidated",
             Self::SourceFileOverLimit => "redaction source exceeds the daemon file size limit",
+            Self::ArtifactOverBudget {
+                ssh_key_material: true,
+            } => {
+                "private SSH key material exceeds the redaction coverage memory budget; point `redact.ssh_key_dir` at a directory holding only the keys to protect, or set `redact.scan_ssh_keys` to false"
+            }
+            Self::ArtifactOverBudget {
+                ssh_key_material: false,
+            } => "redaction sources exceed the redaction coverage memory budget",
         })
     }
 }
@@ -421,7 +479,10 @@ impl CoverageTableBinding {
     }
 
     pub(crate) fn validate(&self) -> Result<(), CoverageError> {
-        let inner = self.authority.upgrade().ok_or(CoverageError::Unavailable)?;
+        let inner = self
+            .authority
+            .upgrade()
+            .ok_or_else(|| CoverageError::unavailable("binding_authority_dropped"))?;
         let state = lock(&inner.state);
         let current = !state.closed
             && state.epoch == self.epoch
@@ -695,7 +756,7 @@ impl RedactionCoverageAuthority {
         let (flight, leader) = {
             let mut state = lock(&self.inner.state);
             if state.closed {
-                return Err(CoverageError::Unavailable);
+                return Err(CoverageError::unavailable("acquire_authority_closed"));
             }
             if let Some(resident) = state.residents.get(&key) {
                 let generation = resident.generation.clone();
@@ -856,7 +917,7 @@ impl RedactionCoverageAuthority {
                         }
                     }
                 }
-                Ok(Ok(_)) => Err(CoverageError::Unavailable),
+                Ok(Ok(_)) => Err(CoverageError::unavailable("capture_interest_lost")),
                 Ok(Err(error)) => {
                     let category = coverage_capture_failure_category(&error);
                     log_coverage_capture_failure(scope_class, &flight.correlation, &category);
@@ -867,7 +928,7 @@ impl RedactionCoverageAuthority {
                         {
                             CoverageError::SourceFileOverLimit
                         } else {
-                            CoverageError::Unavailable
+                            CoverageError::unavailable(&category)
                         },
                     )
                 }
@@ -881,10 +942,19 @@ impl RedactionCoverageAuthority {
                             "capture_cancelled"
                         },
                     );
-                    Err(CoverageError::Unavailable)
+                    Err(CoverageError::unavailable(if join_error.is_panic() {
+                        "capture_panicked"
+                    } else {
+                        "capture_cancelled"
+                    }))
                 }
             },
-            Some(_) | None => Err(CoverageError::Unavailable),
+            Some(_) => Err(CoverageError::unavailable("capture_interest_lost")),
+            None => Err(CoverageError::unavailable(if cancelled {
+                "queued_interest_lost"
+            } else {
+                "worker_permit_unavailable"
+            })),
         };
         tracing::info!(
             target: crate::startup::TARGET,
@@ -921,7 +991,9 @@ impl RedactionCoverageAuthority {
         publish_revisions: super::coverage_bindings::OwnedSourceRevisions,
     ) -> std::result::Result<Arc<RedactionCoverageGeneration>, CoverageError> {
         if build.artifact_bytes > COVERAGE_ARTIFACT_BYTES_PER_GENERATION {
-            return Err(CoverageError::Unavailable);
+            return Err(CoverageError::artifact_over_budget(
+                build.table.has_ssh_key_material(),
+            ));
         }
         let mut state = lock(&self.inner.state);
         if state.closed
@@ -947,7 +1019,7 @@ impl RedactionCoverageAuthority {
         state.next_generation_order = state
             .next_generation_order
             .checked_add(1)
-            .ok_or(CoverageError::Unavailable)?;
+            .ok_or_else(|| CoverageError::unavailable("generation_order_exhausted"))?;
         let generation = Arc::new(RedactionCoverageGeneration::new(
             key.clone(),
             state.epoch,
@@ -1135,7 +1207,7 @@ impl RedactionCoverageAuthority {
             .map(|(_, flight)| flight)
             .collect::<Vec<_>>();
         for flight in flights {
-            *lock(&flight.result) = Some(Err(CoverageError::Unavailable));
+            *lock(&flight.result) = Some(Err(CoverageError::unavailable("authority_shutdown")));
             flight.ready.notify_waiters();
         }
     }
@@ -1237,7 +1309,7 @@ impl OwnerAuthorization {
 impl CoverageAdmission {
     fn validate_current(&self) -> std::result::Result<(), CoverageError> {
         let Some(inner) = self.inner.upgrade() else {
-            return Err(CoverageError::Unavailable);
+            return Err(CoverageError::unavailable("admission_authority_dropped"));
         };
         let state = lock(&inner.state);
         let current = !state.closed
@@ -1305,7 +1377,7 @@ impl CoverageAdmission {
         sink: impl FnOnce(RedactionTable) -> Result<T>,
     ) -> std::result::Result<T, CoverageError> {
         let table = self.bound_table_for_sink()?;
-        let result = sink(table).map_err(|_| CoverageError::Unavailable)?;
+        let result = sink(table).map_err(|_| CoverageError::unavailable("sink_failed"))?;
         self.validate_current()?;
         Ok(result)
     }
@@ -1322,7 +1394,9 @@ impl CoverageAdmission {
         Fut: std::future::Future<Output = Result<T>>,
     {
         let table = self.bound_table_for_sink()?;
-        let result = sink(table).await.map_err(|_| CoverageError::Unavailable)?;
+        let result = sink(table)
+            .await
+            .map_err(|_| CoverageError::unavailable("async_sink_failed"))?;
         self.validate_current()?;
         Ok(result)
     }
@@ -1349,7 +1423,7 @@ impl CoverageAdmission {
         sink: impl FnOnce(RedactionTable) -> Result<T>,
     ) -> std::result::Result<T, CoverageError> {
         let table = self.bound_table_for_sink()?;
-        let result = sink(table).map_err(|_| CoverageError::Unavailable)?;
+        let result = sink(table).map_err(|_| CoverageError::unavailable("sink_failed"))?;
         self.validate_current()?;
         Ok(result)
     }
@@ -1373,7 +1447,7 @@ impl CoverageAdmission {
         };
         let generation_id = self.generation.id;
         let Some(inner) = self.inner.upgrade() else {
-            return Err(CoverageError::Unavailable);
+            return Err(CoverageError::unavailable("admission_authority_dropped"));
         };
         let mut state = lock(&inner.state);
         let current = !state.closed

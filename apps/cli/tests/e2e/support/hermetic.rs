@@ -340,6 +340,8 @@ impl HermeticLaunchSpec {
 
     pub fn subprocess_env(&self) -> Vec<(String, String)> {
         let mut env = vec![
+            // The default SSH source must use this fixture's profile too;
+            // never inherit the developer's ~/.ssh into a spawned daemon.
             ("HOME".into(), self.home.display().to_string()),
             (
                 "XDG_CONFIG_HOME".into(),

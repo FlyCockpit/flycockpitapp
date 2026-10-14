@@ -59,7 +59,9 @@ async fn pending_recovery_defers_driver_owned_work_without_mutation() {
             driver.active_queue_target(),
         )
         .await;
-    let submission = queue.recv().await.unwrap();
+    let submission = await_paused_driver_test_readiness(queue.recv(), "queue event")
+        .await
+        .unwrap();
     driver
         .run_user_input_with_leading_history(
             submission,
@@ -153,7 +155,7 @@ async fn pending_recovery_defers_driver_owned_work_without_mutation() {
     assert_eq!(provider.request_count(), 0);
     driver.emit_turn_idle_if_settled(&tx).await;
     assert!(
-        matches!(events.recv().await.unwrap(), TurnEvent::AgentIdle {
+        matches!(await_paused_driver_test_readiness(events.recv(), "events event").await.unwrap(), TurnEvent::AgentIdle {
         turn_id: None,
         reason: crate::engine::IdleReason::NeedsIntervention { code },
     } if code == "pending_tool_recovery")
@@ -177,7 +179,13 @@ async fn pending_recovery_defers_driver_owned_work_without_mutation() {
     // Simulate a control arriving between the worker's durable skip commit
     // and ApplyCrashToolSkip. Admission remains owned by the live projection.
     driver
-        .run_user_input(queue.recv().await.unwrap(), &queue, &tx)
+        .run_user_input(
+            await_paused_driver_test_readiness(queue.recv(), "queue event")
+                .await
+                .unwrap(),
+            &queue,
+            &tx,
+        )
         .await
         .unwrap();
     assert_eq!(driver.stack[0].history, history);
@@ -269,7 +277,7 @@ async fn synchronize_driver_idle(control_tx: &mpsc::Sender<DriverControl>) {
         })
         .await
         .unwrap();
-    receipt
+    await_paused_driver_test_readiness(receipt, "driver idle receipt")
         .await
         .expect("driver returns the idle-boundary receipt")
         .expect("reselecting the current primary at idle is a no-op");
@@ -762,7 +770,9 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
-    boundary_rx.changed().await.unwrap();
+    await_paused_driver_test_readiness(boundary_rx.changed(), "driver loop boundary")
+        .await
+        .unwrap();
     assert_eq!(
         *boundary_rx.borrow_and_update(),
         Some(DriverLoopBoundaryObservation {
@@ -788,7 +798,9 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
     // proves that the queue wait and idle-inbox timer are both armed before
     // virtual time reaches their shared deadline.
     synchronize_driver_idle(&control_tx).await;
-    boundary_rx.changed().await.unwrap();
+    await_paused_driver_test_readiness(boundary_rx.changed(), "driver loop boundary")
+        .await
+        .unwrap();
     assert_eq!(
         *boundary_rx.borrow_and_update(),
         Some(DriverLoopBoundaryObservation {
@@ -800,7 +812,8 @@ async fn assistant_inbox_timer_yields_to_ready_human_input() {
         "both boundary arms are pending at the paused-clock deadline"
     );
     tokio::time::advance(Duration::from_millis(250)).await;
-    let request = provider.next_request_ready().await;
+    let request =
+        await_paused_driver_test_readiness(provider.next_request_ready(), "provider request").await;
     synchronize_driver_idle(&control_tx).await;
     let _ = drain_events(&mut rx);
 
@@ -847,7 +860,9 @@ async fn assistant_inbox_timers_are_disarmed_for_already_ready_human_input() {
     let (control_tx, control_rx) = mpsc::channel(1);
     let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
 
-    boundary_rx.changed().await.unwrap();
+    await_paused_driver_test_readiness(boundary_rx.changed(), "driver loop boundary")
+        .await
+        .unwrap();
     assert_eq!(
         *boundary_rx.borrow_and_update(),
         Some(DriverLoopBoundaryObservation {
@@ -859,7 +874,8 @@ async fn assistant_inbox_timers_are_disarmed_for_already_ready_human_input() {
         "an already-ready foreground submission explicitly disables every assistant-inbox timer arm"
     );
 
-    let request = provider.next_request_ready().await;
+    let request =
+        await_paused_driver_test_readiness(provider.next_request_ready(), "provider request").await;
     let prompt = chat_messages(&request)
         .iter()
         .map(message_content_text)
@@ -896,7 +912,8 @@ async fn queued_human_input_runs_before_control_disconnect_terminates_loop() {
     drop(control_tx);
 
     let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
-    let request = provider.next_request_ready().await;
+    let request =
+        await_paused_driver_test_readiness(provider.next_request_ready(), "provider request").await;
     run.await
         .expect("driver task joins")
         .expect("control disconnect terminates cleanly after queued input");
@@ -938,7 +955,8 @@ async fn simultaneously_ready_human_input_wins_before_control() {
         .unwrap();
 
     let run = tokio::spawn(async move { driver.run_main_loop(queue, control_rx, &tx).await });
-    let request = provider.next_request_ready().await;
+    let request =
+        await_paused_driver_test_readiness(provider.next_request_ready(), "provider request").await;
     let prompt = chat_messages(&request)
         .iter()
         .map(message_content_text)
@@ -999,6 +1017,7 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     let (mut driver, _tmp) = scripted_driver(&provider);
     let main_session_id = driver.session.live_id();
     let inbox_db = driver.session.db.clone();
+    let mut boundary_rx = driver.subscribe_loop_boundaries();
     assert_eq!(
         main_session_id, driver.session.id,
         "test session main id must match the live delivery id"
@@ -1023,7 +1042,14 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     let run =
         tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
 
-    let immediate_request = provider.next_request_ready().await;
+    // Observe timer registration before moving the paused clock to the idle
+    // poll. Readiness waits hold time stationary while loopback I/O completes.
+    await_paused_driver_test_readiness(boundary_rx.changed(), "initial inbox timer boundary")
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_millis(250)).await;
+    let immediate_request =
+        await_paused_driver_test_readiness(provider.next_request_ready(), "provider request").await;
     synchronize_driver_idle(&control_tx).await;
     let _ = drain_events(&mut rx);
     assert_eq!(
@@ -1053,7 +1079,8 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     );
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let heartbeat_request = provider.next_request_ready().await;
+    let heartbeat_request =
+        await_paused_driver_test_readiness(provider.next_request_ready(), "provider request").await;
     synchronize_driver_idle(&control_tx).await;
     let _ = drain_events(&mut rx);
     assert_eq!(
@@ -1072,7 +1099,8 @@ async fn assistant_inbox_defer_runs_at_heartbeat_while_immediate_runs_at_idle() 
     queue
         .push(UserSubmission::text("HUMAN_TURN_MARKER"), target)
         .await;
-    let human_request = provider.next_request_ready().await;
+    let human_request =
+        await_paused_driver_test_readiness(provider.next_request_ready(), "provider request").await;
     // Closing the real input queue is the loop's production shutdown signal.
     // Do it while the captured request is still in flight so the next biased
     // idle boundary exits before any post-control idle utility work can start.
@@ -1540,7 +1568,9 @@ async fn preflight_terminal_write_retry_does_not_rerun_preflight() {
     queue.push_idempotent(receipt, submission, target).await;
     driver.test_reject_next_submission_preflight = true;
 
-    let first = queue.recv().await.unwrap();
+    let first = await_paused_driver_test_readiness(queue.recv(), "queue event")
+        .await
+        .unwrap();
     assert!(
         driver
             .prepare_queued_user_submission(first, &queue, &tx)
@@ -1555,7 +1585,11 @@ async fn preflight_terminal_write_retry_does_not_rerun_preflight() {
         Some(crate::engine::message::PendingSubmissionTerminalDisposition::PreflightRejected)
     ));
 
-    let second = queue.recv().await.unwrap();
+    // The durable-write failure deliberately delays the exact queued payload.
+    tokio::time::advance(DURABLE_SUBMISSION_RETRY_BACKOFF).await;
+    let second = await_paused_driver_test_readiness(queue.recv(), "queue event")
+        .await
+        .unwrap();
     assert!(
         driver
             .prepare_queued_user_submission(second, &queue, &tx)
@@ -1574,7 +1608,10 @@ async fn preflight_terminal_write_retry_does_not_rerun_preflight() {
         })
         .await
         .unwrap();
-    let third = queue.recv().await.unwrap();
+    tokio::time::advance(DURABLE_SUBMISSION_RETRY_BACKOFF).await;
+    let third = await_paused_driver_test_readiness(queue.recv(), "queue event")
+        .await
+        .unwrap();
     assert!(
         driver
             .prepare_queued_user_submission(third, &queue, &tx)
@@ -1690,7 +1727,9 @@ fn later_batch_persist_failure_retains_recorded_history_and_recovers_fifo() {
             })
             .await
             .unwrap();
-        let first_retried = queue.recv().await.unwrap();
+        let first_retried = await_paused_driver_test_readiness(queue.recv(), "queue event")
+            .await
+            .unwrap();
         assert_eq!(first_retried.text, RETRIED);
         let mut recovered = vec![first_retried];
         queue
@@ -1813,7 +1852,9 @@ fn queued_user_fold_retry_does_not_duplicate_assistant_inbox_text() {
             .await
             .unwrap();
 
-        let first_retry = queue.recv().await.unwrap();
+        let first_retry = await_paused_driver_test_readiness(queue.recv(), "queue event")
+            .await
+            .unwrap();
         assert_eq!(
             first_retry.text, FIRST,
             "requeued text must remain authored-only"
@@ -1869,7 +1910,11 @@ fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
 
         let run = driver.run_user_input(UserSubmission::text("start continue path"), &queue, &tx);
         let enqueue = async {
-            let _ = provider.next_request_ready().await;
+            let _ = await_paused_driver_test_readiness(
+                provider.next_request_ready(),
+                "provider request",
+            )
+            .await;
             let (_, _, outcome) = queue
                 .push_idempotent(receipt, submission, target.clone())
                 .await;
@@ -1909,7 +1954,9 @@ fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
             "the failed receipt must not be falsely marked finished"
         );
 
-        let retried = queue.recv().await.unwrap();
+        let retried = await_paused_driver_test_readiness(queue.recv(), "queue event")
+            .await
+            .unwrap();
         let mut expected = expected;
         expected.queue_item_ids = vec![id];
         expected.queue_target = Some(target);
@@ -1959,7 +2006,11 @@ fn done_fold_failure_defers_exact_payload_without_second_inference() {
 
         let run = driver.run_user_input(UserSubmission::text("start done path"), &queue, &tx);
         let enqueue = async {
-            let _ = provider.next_request_ready().await;
+            let _ = await_paused_driver_test_readiness(
+                provider.next_request_ready(),
+                "provider request",
+            )
+            .await;
             let (_, _, outcome) = queue
                 .push_idempotent(receipt, submission, target.clone())
                 .await;
@@ -1996,7 +2047,9 @@ fn done_fold_failure_defers_exact_payload_without_second_inference() {
                 .is_none()
         );
 
-        let retried = queue.recv().await.unwrap();
+        let retried = await_paused_driver_test_readiness(queue.recv(), "queue event")
+            .await
+            .unwrap();
         let mut expected = expected;
         expected.queue_item_ids = vec![id];
         expected.queue_target = Some(target);

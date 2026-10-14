@@ -1614,9 +1614,17 @@ impl RedactionTable {
             entries.len(),
             "redaction matcher patterns must be 1:1 with typed entries"
         );
-        let matcher = AhoCorasick::builder()
+        // Coverage has a fixed per-generation memory budget. The library's
+        // automatic choice favors a DFA for small pattern counts, but a few
+        // long private keys (including their encodings) can inflate its dense
+        // transition tables past that budget. Use the compact representation
+        // for BOTH match semantics without dropping any candidate or variant.
+        let mut builder = AhoCorasick::builder();
+        builder
+            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+            .ascii_case_insensitive(false);
+        let matcher = builder
             .match_kind(MatchKind::LeftmostLongest)
-            .ascii_case_insensitive(false)
             .build(&patterns)
             .map_err(|e| anyhow::anyhow!("building aho-corasick: {e}"))?;
         // The substitution matcher over the SAME patterns. `Standard` is the
@@ -1625,9 +1633,8 @@ impl RedactionTable {
         // `PatternID`s index `entries` identically to `matcher` (same list,
         // same order). Kept separate from `matcher` so `is_match` and the
         // journaling `find_iter` keep their leftmost-longest semantics.
-        let overlap_matcher = AhoCorasick::builder()
+        let overlap_matcher = builder
             .match_kind(MatchKind::Standard)
-            .ascii_case_insensitive(false)
             .build(&patterns)
             .map_err(|e| anyhow::anyhow!("building aho-corasick (overlap): {e}"))?;
         Ok(Self {
@@ -1984,6 +1991,14 @@ impl RedactionTable {
         origins.sort();
         origins.dedup();
         Ok(origins)
+    }
+
+    /// Whether any entry was collected from a private SSH key. Only the
+    /// fact leaves: it selects the remediation an over-budget refusal names.
+    pub(super) fn has_ssh_key_material(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(&entry.class, EntryClass::Ordinary { origin, .. } if origin.starts_with("$ssh:"))
+        })
     }
 
     pub fn has_origin(&self, origin: &str) -> bool {

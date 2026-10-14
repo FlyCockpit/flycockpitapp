@@ -1371,6 +1371,10 @@ fn mount(tmp: &std::path::Path, owner: Owner) -> Fixture {
         }
         Owner::QuestionOverPane => {
             pane_input = mount_text_owner(&mut app, SurfaceTextOwner::EmbeddedPane, tmp);
+            assert!(
+                app.pane.is_some(),
+                "the PTY fixture must mount a pane on this platform"
+            );
             let painted = app.pane_rect.expect("embedded pane painted");
             old_rects.push(painted);
             app.question_dialog = Some(question());
@@ -2143,17 +2147,19 @@ fn a_popover_opened_before_the_next_draw_takes_the_old_frames_clicks() {
     let history = app.history.len();
     feed(
         &mut app,
-        vec![
-            mouse_at(MouseEventKind::Down(MouseButton::Left), covered),
-            mouse_at(MouseEventKind::Up(MouseButton::Left), covered),
-        ],
+        vec![mouse_at(MouseEventKind::Down(MouseButton::Left), covered)],
     );
     assert!(
         !pressed_transcript_control(&app),
         "the old frame's control was pressed"
     );
+    feed(
+        &mut app,
+        vec![mouse_at(MouseEventKind::Up(MouseButton::Left), covered)],
+    );
     assert!(app.pin_pick.is_none() && app.fork_pick.is_none());
     assert_eq!(app.history.len(), history, "the old frame's control acted");
+    assert!(app.toast.is_none(), "the old frame's control acted");
 
     // Inverse: once the help frame is drawn, a transcript control it does
     // not cover takes the pointer.
@@ -2216,10 +2222,12 @@ fn a_toast_press_dismisses_it_and_reaches_nothing_under_its_row() {
     let mut app = matrix_app(tmp.path());
     draw(&mut app, 120, 50);
     app.show_toast("a notice over the last row", super::ToastKind::Info);
-    draw(&mut app, 120, 50);
-    let row = surface_rect(&app, SurfacePart::Toast);
+    let buffer = draw(&mut app, 120, 50);
+    // Located by what is painted, not by the paint record under test.
+    let notice = find(&buffer, "a notice over the last row").expect("the toast is painted");
     let chat = app.chat_area.expect("transcript painted");
-    let cell = Position::new(row.x + chat.width / 2, row.y);
+    let cell = Position::new(chat.x + chat.width / 2, notice.y);
+    assert!(chat.contains(cell), "the toast must cover a transcript row");
     feed(
         &mut app,
         vec![mouse_at(MouseEventKind::Down(MouseButton::Right), cell)],
@@ -2383,5 +2391,79 @@ fn an_edge_clamped_context_menu_hit_tests_where_it_was_painted() {
         format!("{:?}", app.toast),
         format!("{executed_before:?}"),
         "the visible item did not run (the click was treated as outside)"
+    );
+}
+
+#[test]
+fn a_drag_on_the_find_bar_selects_nothing_under_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let mut app = matrix_app(tmp.path());
+    // Scroll until the transcript's last row holds message text, so the bar
+    // really covers selectable text.
+    let mut buffer = draw(&mut app, 120, 50);
+    let chat = app.chat_area.expect("transcript painted");
+    let row = chat.bottom() - 1;
+    let text_at = |buffer: &Buffer| {
+        (chat.x..chat.right()).any(|x| buffer[(x, row)].symbol().chars().any(char::is_alphanumeric))
+    };
+    for _ in 0..4 {
+        if text_at(&buffer) {
+            break;
+        }
+        app.scroll_chat_up(1);
+        buffer = draw(&mut app, 120, 50);
+    }
+    assert!(
+        text_at(&buffer),
+        "the fixture must put message text on the last row"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let buffer = draw(&mut app, 120, 50);
+    let start = find(&buffer, "find: ").expect("the find bar is painted");
+    assert_eq!(start.y, row, "the bar sits on the transcript's last row");
+    feed(
+        &mut app,
+        vec![
+            mouse_at(MouseEventKind::Down(MouseButton::Left), start),
+            mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                Position::new(start.x + 6, row),
+            ),
+        ],
+    );
+    assert!(
+        !app.mouse_gesture_state.dragging && app.selection.is_none(),
+        "the drag selected transcript text hidden under the find bar"
+    );
+    // Inverse: a transcript row above the bar still selects.
+    feed(
+        &mut app,
+        vec![mouse_at(MouseEventKind::Up(MouseButton::Left), start)],
+    );
+    let buffer = draw(&mut app, 120, 50);
+    let above = (chat.y..row)
+        .rev()
+        .flat_map(|y| (chat.x..chat.right().saturating_sub(12)).map(move |x| Position::new(x, y)))
+        .find(|pos| {
+            !buffer[(pos.x, pos.y)].symbol().trim().is_empty()
+                && !buffer[(pos.x + 2, pos.y)].symbol().trim().is_empty()
+                && app.button_registry.hit(pos.x, pos.y).is_none()
+                && app.button_registry.hit(pos.x + 2, pos.y).is_none()
+        })
+        .expect("transcript text above the bar");
+    feed(
+        &mut app,
+        vec![
+            mouse_at(MouseEventKind::Down(MouseButton::Left), above),
+            mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                Position::new(above.x + 2, above.y),
+            ),
+        ],
+    );
+    assert!(
+        app.mouse_gesture_state.dragging || app.selection.is_some(),
+        "the transcript above the bar lost its selection"
     );
 }

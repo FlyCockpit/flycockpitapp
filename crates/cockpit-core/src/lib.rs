@@ -30,6 +30,8 @@ pub mod container;
 pub mod conversation_rules;
 pub mod credentials;
 pub mod daemon;
+#[cfg(test)]
+mod debug_hygiene_inventory;
 pub mod diagnostics;
 pub mod embeddings;
 pub mod engine;

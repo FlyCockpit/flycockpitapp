@@ -242,12 +242,13 @@ impl FlycockpitClient {
             .text()
             .await
             .context("reading Flycockpit device-code response")?;
-        let resp: DeviceCodeResponse = serde_json::from_str(&body).with_context(|| {
-            format!(
-                "parsing Flycockpit device-code response: {}",
-                response_shape_hint(&body)
-            )
-        })?;
+        let resp: DeviceCodeResponse =
+            crate::config::value_free::from_str(&body).with_context(|| {
+                format!(
+                    "parsing Flycockpit device-code response: {}",
+                    response_shape_hint(&body)
+                )
+            })?;
         Ok(DeviceLogin {
             verification_uri: resp.verification_uri,
             verification_uri_complete: resp.verification_uri_complete,
@@ -547,7 +548,8 @@ pub fn load_credential_from_store(store: &CredentialStore) -> Result<StoredFlyco
     let raw = store
         .get_owned(CREDENTIAL_KEY)?
         .ok_or_else(|| anyhow!("not logged in to Flycockpit; run `cockpit account login`"))?;
-    serde_json::from_value(raw).context("parsing stored Flycockpit account credential")
+    crate::config::value_free::from_value(raw)
+        .context("parsing stored Flycockpit account credential")
 }
 
 pub fn load_credential_from_vault(
@@ -693,7 +695,7 @@ fn parse_orpc_json<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T> {
     if let Ok(envelope) = serde_json::from_str::<OrpcEnvelope<T>>(body) {
         return Ok(envelope.json);
     }
-    serde_json::from_str::<T>(body).with_context(|| response_shape_hint(body))
+    crate::config::value_free::from_str::<T>(body).with_context(|| response_shape_hint(body))
 }
 
 fn classify_poll_error(status: StatusCode, body: &str) -> PollErrorAction {

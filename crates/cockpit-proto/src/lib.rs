@@ -522,12 +522,23 @@ pub enum McpConfigPatchOperation {
     DeleteAuthoredServer { name: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderHeaderView {
     pub name: String,
     pub value: String,
     #[serde(default)]
     pub redacted: bool,
+}
+
+// An owner's provider view may carry the literal header value: name only.
+impl std::fmt::Debug for ProviderHeaderView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderHeaderView")
+            .field("name", &self.name)
+            .field("redacted", &self.redacted)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1957,12 +1968,24 @@ pub struct RemoteReplayResponse {
 }
 
 #[cfg(feature = "remote")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayAck {
     pub id: Uuid,
     pub delivery_id: CanonicalRfcUuidV1,
     pub lease_token: CanonicalRfcUuidV1,
+}
+
+#[cfg(feature = "remote")]
+impl std::fmt::Debug for RemoteReplayAck {
+    /// The lease token authorizes acknowledging the delivery: not printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteReplayAck")
+            .field("id", &self.id)
+            .field("delivery_id", &self.delivery_id)
+            .field("lease_token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -1974,7 +1997,7 @@ pub struct RemoteReplayAckResponse {
 }
 
 #[cfg(feature = "remote")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteOutboxDeliveryV1 {
     pub event_seq: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
@@ -1983,6 +2006,22 @@ pub struct RemoteOutboxDeliveryV1 {
     pub canonical_payload: Vec<u8>,
     pub lease_token: CanonicalRfcUuidV1,
     pub lease_expires_at_ms: i64,
+}
+
+#[cfg(feature = "remote")]
+impl std::fmt::Debug for RemoteOutboxDeliveryV1 {
+    /// The lease token authorizes acknowledging the delivery, and the
+    /// payload is session content: neither is printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteOutboxDeliveryV1")
+            .field("event_seq", &self.event_seq)
+            .field("delivery_id", &self.delivery_id)
+            .field("kind", &self.kind)
+            .field("canonical_payload_len", &self.canonical_payload.len())
+            .field("lease_token", &"<redacted>")
+            .field("lease_expires_at_ms", &self.lease_expires_at_ms)
+            .finish()
+    }
 }
 
 #[cfg(feature = "remote")]

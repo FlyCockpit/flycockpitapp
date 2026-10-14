@@ -262,7 +262,7 @@ fn x11_read_or_plant_generation(
     Ok(generation)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct X11SessionParts {
     pub transport: String,
     pub display_number: u32,
@@ -272,6 +272,21 @@ pub struct X11SessionParts {
     pub root_window_id: u32,
     /// Cookie bytes are credentials only — never hashed into identity.
     pub xauthority_cookie: Vec<u8>,
+}
+
+impl std::fmt::Debug for X11SessionParts {
+    /// The Xauthority cookie is a credential: print its length only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("X11SessionParts")
+            .field("transport", &self.transport)
+            .field("display_number", &self.display_number)
+            .field("screen", &self.screen)
+            .field("vendor", &self.vendor)
+            .field("release", &self.release)
+            .field("root_window_id", &self.root_window_id)
+            .field("xauthority_cookie_len", &self.xauthority_cookie.len())
+            .finish()
+    }
 }
 
 pub fn x11_session_or_seat_id(parts: &X11SessionParts) -> [u8; 32] {

@@ -197,12 +197,13 @@ pub async fn begin_device_code_login() -> Result<DeviceLogin> {
             .await
             .context("reading OpenAI Codex device-code response")?,
     );
-    let mut resp: DeviceCodeResponse = serde_json::from_str(&body).with_context(|| {
-        format!(
-            "parsing OpenAI Codex device-code response: {}",
-            response_shape_hint(&body)
-        )
-    })?;
+    let mut resp: DeviceCodeResponse =
+        crate::config::value_free::from_str(&body).with_context(|| {
+            format!(
+                "parsing OpenAI Codex device-code response: {}",
+                response_shape_hint(&body)
+            )
+        })?;
     Ok(DeviceLogin {
         verification_uri: VERIFY_URL.to_string(),
         user_code: std::mem::take(&mut resp.user_code),
@@ -269,8 +270,8 @@ async fn complete_device_code_login_tokens(login: DeviceLogin) -> Result<StoredT
         let status = resp.status();
         let body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
         if status.is_success() {
-            let approved: DeviceTokenResponse =
-                serde_json::from_str(&body).context("parsing Codex device approval response")?;
+            let approved: DeviceTokenResponse = crate::config::value_free::from_str(&body)
+                .context("parsing Codex device approval response")?;
             let _ = approved.code_challenge.as_deref();
             let tokens =
                 exchange_authorization_code(&approved.authorization_code, &approved.code_verifier)
@@ -407,12 +408,13 @@ async fn token_request(
     if !status.is_success() {
         return Err(classify_token_error(status, &body));
     }
-    let mut parsed: TokenResponse = serde_json::from_str(&body).with_context(|| {
-        format!(
-            "parsing Codex OAuth token response: {}",
-            response_shape_hint(&body)
-        )
-    })?;
+    let mut parsed: TokenResponse =
+        crate::config::value_free::from_str(&body).with_context(|| {
+            format!(
+                "parsing Codex OAuth token response: {}",
+                response_shape_hint(&body)
+            )
+        })?;
     let access_token = std::mem::take(&mut parsed.access_token)
         .or_else(|| previous.map(|tokens| tokens.access_token.clone()))
         .ok_or_else(|| anyhow!("Codex OAuth token response missing access_token"))?;

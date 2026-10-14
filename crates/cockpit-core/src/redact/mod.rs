@@ -104,7 +104,7 @@ impl std::error::Error for RedactionTableUnavailable {}
 
 mod command_output;
 pub(crate) use command_output::{
-    NovelScrubMode, NovelScrubOutput, NovelScrubStream, ObservedSecret,
+    NovelScrubMode, NovelScrubOutput, NovelScrubStream, ObservedSecret, ObservedSet,
 };
 pub(crate) mod coverage_authority;
 pub(crate) mod coverage_bindings;
@@ -1135,6 +1135,47 @@ pub struct RedactionTable {
     /// shipped build.
     #[cfg(test)]
     fail_enforced_view: bool,
+    /// Set only on a table a session's redaction owner PUBLISHED (and on its
+    /// enforced view): a weak link back to that owner plus the publication
+    /// generation. Every scrub/match entry point resolves it first, so a
+    /// snapshot that some model, utility, tandem target, backup candidate or
+    /// tool context captured earlier still scrubs with the owner's LATEST
+    /// committed table. This is the single egress chokepoint for same-turn
+    /// registrations: no send path can render with a stale session table.
+    /// A table DERIVED from a linked one (a union, a forced literal, an
+    /// observed or approved-file addition) keeps a derived link: it resolves
+    /// to the owner's newest table unioned with its own entries, so its local
+    /// additions survive and the owner's later registrations still apply.
+    /// Only the per-render sealed-replacement view is unlinked (it is built
+    /// from an already-resolved table at the send boundary).
+    live: Option<LiveLink>,
+}
+
+/// The owner side of a [`RedactionTable`] live link (implemented by the
+/// session redaction owner).
+pub(crate) trait LiveRedactionSource: Send + Sync {
+    /// The owner's latest table and its generation when it is NEWER than
+    /// `generation`; an enforced view of it when `enforced`.
+    fn newer_view(
+        &self,
+        generation: u64,
+        enforced: bool,
+    ) -> Option<(u64, std::sync::Arc<RedactionTable>)>;
+}
+
+/// The cached `newest ∪ derived` resolution of a derived table, keyed by the
+/// owner generation it was built against.
+type DerivedResolution =
+    std::sync::Arc<std::sync::Mutex<Option<(u64, std::sync::Arc<RedactionTable>)>>>;
+
+#[derive(Clone)]
+struct LiveLink {
+    source: std::sync::Weak<dyn LiveRedactionSource>,
+    generation: u64,
+    /// `Some` for a table derived from a published one (see the `live`
+    /// field): its resolution unions the owner's newest table with its own
+    /// entries.
+    derived: Option<DerivedResolution>,
 }
 
 /// The record of the file-backed sources one capture consumed, re-checkable
@@ -1625,6 +1666,7 @@ impl RedactionTable {
                 withhold_all: false,
                 #[cfg(test)]
                 fail_enforced_view: false,
+                live: None,
             });
         }
         let patterns: Vec<&str> = entries.iter().map(|entry| entry.value.as_str()).collect();
@@ -1672,6 +1714,7 @@ impl RedactionTable {
             withhold_all: false,
             #[cfg(test)]
             fail_enforced_view: false,
+            live: None,
         })
     }
 
@@ -1752,13 +1795,15 @@ impl RedactionTable {
         unsupported_files.sort();
         unsupported_files.dedup();
         let protected = self.protected.union(&other.protected);
-        Self::from_redaction_entries(
+        let mut merged = Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
             self.disabled && other.disabled,
             unsupported_files,
             protected,
-        )
+        )?;
+        merged.live = self.derived_link().or_else(|| other.derived_link());
+        Ok(merged)
     }
 
     /// Add one caller-supplied ordinary literal to this table.  Sealed-value
@@ -1782,6 +1827,30 @@ impl RedactionTable {
         )?;
         table.coverage_binding = self.coverage_binding.clone();
         table.source_freshness = self.source_freshness.clone();
+        table.live = self.derived_link();
+        Ok(table)
+    }
+
+    /// Add one forced literal classified as a Credential (not a contained
+    /// leak): used for a fork's captured sealed value mirrored into the
+    /// shared owner's egress table. `origin` must be a forced origin.
+    pub fn with_forced_credential_literal(&self, value: String, origin: String) -> Result<Self> {
+        let mut entries = self.entries.clone();
+        entries.push(RedactionEntry::ordinary(
+            value,
+            origin,
+            OrdinarySource::Credential,
+        ));
+        let mut table = Self::from_redaction_entries(
+            entries,
+            self.placeholder.clone(),
+            self.disabled,
+            self.unsupported_files.clone(),
+            self.protected.clone(),
+        )?;
+        table.coverage_binding = self.coverage_binding.clone();
+        table.source_freshness = self.source_freshness.clone();
+        table.live = self.derived_link();
         Ok(table)
     }
 
@@ -1805,6 +1874,7 @@ impl RedactionTable {
         )?;
         table.coverage_binding = self.coverage_binding.clone();
         table.source_freshness = self.source_freshness.clone();
+        table.live = self.derived_link();
         Ok(table)
     }
 
@@ -1835,6 +1905,9 @@ impl RedactionTable {
         &self,
         active_sealed_ids: &std::collections::HashSet<String>,
     ) -> Self {
+        if let Some(view) = self.live_view() {
+            return view.with_sealed_replacements(active_sealed_ids);
+        }
         let entries: Vec<RedactionEntry> = self
             .entries
             .iter()
@@ -1884,6 +1957,7 @@ impl RedactionTable {
             withhold_all: self.withhold_all,
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
+            live: None,
         }
     }
 
@@ -2101,6 +2175,9 @@ impl RedactionTable {
     /// no-table-or-disabled path returns a borrowed input, and a configured
     /// table with no match also avoids allocating.
     pub fn scrub_cow<'a>(&self, body: &'a str) -> Cow<'a, str> {
+        if let Some(view) = self.live_view() {
+            return view.scrub_cow(body);
+        }
         if self.withhold_all {
             if body.is_empty() {
                 return Cow::Borrowed(body);
@@ -2219,6 +2296,9 @@ impl RedactionTable {
     /// through. Useful for the debug command.
     // Retained for `cockpit debug redact` introspection.
     pub fn is_empty(&self) -> bool {
+        if let Some(view) = self.live_view() {
+            return view.is_empty();
+        }
         self.disabled || self.matcher.is_none()
     }
 
@@ -2305,7 +2385,82 @@ impl RedactionTable {
             withhold_all: self.withhold_all,
             #[cfg(test)]
             fail_enforced_view: self.fail_enforced_view,
+            // The enforced view of a published table follows the same owner
+            // (a derived table's resolution cache is per view: the enforced
+            // resolution differs from the opt-out one).
+            live: self.live.as_ref().map(|link| LiveLink {
+                derived: link
+                    .derived
+                    .as_ref()
+                    .map(|_| std::sync::Arc::new(std::sync::Mutex::new(None))),
+                ..link.clone()
+            }),
         }
+    }
+
+    /// Link this table to the session redaction owner that publishes it, at
+    /// `generation` (see the `live` field).
+    pub(crate) fn with_live_link(
+        mut self,
+        source: std::sync::Weak<dyn LiveRedactionSource>,
+        generation: u64,
+    ) -> Self {
+        self.live = Some(LiveLink {
+            source,
+            generation,
+            derived: None,
+        });
+        self
+    }
+
+    /// The publication generation of an owner-published table.
+    pub(crate) fn live_generation(&self) -> Option<u64> {
+        self.live.as_ref().map(|link| link.generation)
+    }
+
+    /// The owner's newer table when this is a stale owner-published snapshot
+    /// (an enforced view for an enforcing snapshot). `None` when unlinked,
+    /// current, or the owner is gone.
+    fn live_view(&self) -> Option<std::sync::Arc<Self>> {
+        let link = self.live.as_ref()?;
+        let source = link.source.upgrade()?;
+        let (newest_generation, newest) = source.newer_view(link.generation, !self.disabled)?;
+        let Some(cache) = &link.derived else {
+            return Some(newest);
+        };
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((generation, resolved)) = cache.as_ref()
+            && *generation == newest_generation
+        {
+            return Some(resolved.clone());
+        }
+        // The derived table's own entries plus the owner's newest. The merge
+        // is unlinked, so resolution never recurses.
+        match newest.scrub_only_union(self) {
+            Ok(merged) => {
+                let merged = std::sync::Arc::new(merged);
+                *cache = Some((newest_generation, merged.clone()));
+                Some(merged)
+            }
+            Err(error) => {
+                // Building the merged matcher failed: prefer the owner's
+                // newest table (the session registrations) over the stale
+                // derived snapshot.
+                tracing::warn!(error = %error, "resolving a derived redaction view failed");
+                Some(newest)
+            }
+        }
+    }
+
+    /// The live link a table derived from this one carries.
+    fn derived_link(&self) -> Option<LiveLink> {
+        self.live.as_ref().map(|link| LiveLink {
+            source: link.source.clone(),
+            generation: link.generation,
+            derived: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
+        })
     }
 
     pub(crate) fn with_coverage_binding(
@@ -2395,6 +2550,9 @@ impl RedactionTable {
     /// dropping `M - 1` leading bytes after scrubbing removes it. See the harness
     /// child-output scrub in `crate::harness::run`.
     pub fn max_match_len(&self) -> usize {
+        if let Some(view) = self.live_view() {
+            return view.max_match_len();
+        }
         self.entries
             .iter()
             .map(|entry| entry.value.len())
@@ -2428,6 +2586,9 @@ impl RedactionTable {
     /// this on the [`Self::enforced`] view (never disabled), and the spans are what
     /// a substitution WOULD cover.
     pub fn straddle_fixpoint_cut(&self, body: &str, start: usize) -> usize {
+        if let Some(view) = self.live_view() {
+            return view.straddle_fixpoint_cut(body, start);
+        }
         let mut cut = cockpit_host::text::ceil_char_boundary(body, start);
         let max_match = self.max_match_len();
         if max_match <= 1 || self.matcher.is_none() {
@@ -2502,6 +2663,9 @@ impl RedactionTable {
     /// A returned value `0` means the whole head is unsafe and the caller must
     /// withhold it (fail-closed).
     pub fn straddle_fixpoint_cut_back(&self, body: &str, start: usize) -> usize {
+        if let Some(view) = self.live_view() {
+            return view.straddle_fixpoint_cut_back(body, start);
+        }
         let mut cut = cockpit_host::text::floor_char_boundary(body, start.min(body.len()));
         let max_match = self.max_match_len();
         if max_match <= 1 || self.matcher.is_none() {
@@ -2619,6 +2783,7 @@ impl RedactionTable {
             withhold_all: false,
             #[cfg(test)]
             fail_enforced_view: false,
+            live: None,
         }
     }
 
@@ -2786,6 +2951,9 @@ pub(crate) fn match_sensitive_literals(
     table: &RedactionTable,
     haystack: &str,
 ) -> Vec<MatchedLiteral> {
+    if let Some(view) = table.live_view() {
+        return match_sensitive_literals(&view, haystack);
+    }
     let Some(matcher) = table.matcher.as_ref() else {
         return Vec::new();
     };
@@ -3319,6 +3487,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/engine/model/redact.rs",
         "crates/cockpit-core/src/engine/model_roles.rs",
         "crates/cockpit-core/src/engine/rehydrate.rs",
+        "crates/cockpit-core/src/engine/schedule/background.rs",
         "crates/cockpit-core/src/engine/verification/intercept.rs",
         "crates/cockpit-core/src/harness/run.rs",
         "crates/cockpit-core/src/knowledge.rs",

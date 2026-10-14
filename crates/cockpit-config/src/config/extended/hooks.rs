@@ -625,8 +625,18 @@ impl fmt::Debug for RawHook {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct RawHooks(Vec<(String, Value)>);
+
+// Raw hook JSON carries env literals: event names and entry counts only.
+impl fmt::Debug for RawHooks {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.0.iter().map(|(event, _)| event))
+            .finish()
+    }
+}
 
 impl<'de> Deserialize<'de> for RawHooks {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1012,4 +1022,19 @@ fn warn(
         event,
         message,
     });
+}
+
+#[cfg(test)]
+mod codex_r2_hook_probe {
+    use super::*;
+    #[test]
+    fn codex_r2_raw_hook_debug_is_value_free() {
+        let secret = "NovelRawHook515Secret78529";
+        let input = serde_json::json!({"hooks":{"SessionStart":[{"command":["echo"],"env":{"API_TOKEN":secret}}]}});
+        let raw: RawConfig = serde_json::from_value(input).unwrap();
+        assert!(
+            !format!("{raw:?}").contains(secret),
+            "raw hook config Debug leaks env value"
+        );
+    }
 }

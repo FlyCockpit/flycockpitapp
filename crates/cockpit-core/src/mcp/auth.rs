@@ -395,7 +395,7 @@ fn stored_tokens_from_store(
     store
         .named_secret(key)
         .map(|raw| {
-            serde_json::from_str(raw)
+            crate::config::value_free::from_str(raw)
                 .with_context(|| format!("parsing stored MCP OAuth tokens for {key}"))
         })
         .transpose()

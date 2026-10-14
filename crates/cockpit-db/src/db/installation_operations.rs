@@ -123,7 +123,7 @@ pub struct InstallationJournalRow {
     pub expected_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InstallationContinuationRow {
     pub continuation_token: Uuid,
     pub operation_id: Uuid,
@@ -131,6 +131,19 @@ pub struct InstallationContinuationRow {
     pub choice_set_json: String,
     pub expires_at_unix_ms: i64,
     pub submitted_choice_id: Option<String>,
+}
+
+impl std::fmt::Debug for InstallationContinuationRow {
+    /// The continuation token is the authority to complete the choice.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallationContinuationRow")
+            .field("continuation_token", &"<redacted>")
+            .field("operation_id", &self.operation_id)
+            .field("choice_set_json_len", &self.choice_set_json.len())
+            .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+            .field("submitted_choice_id", &self.submitted_choice_id)
+            .finish()
+    }
 }
 
 /// A single SQLite read snapshot of a continuation and its owning operation.

@@ -461,13 +461,18 @@ impl TrustedChildCaptureRegistry {
         // live after the transaction. Lock order: table lock, then journal
         // preparation, then the DB transaction; the lock is never taken inside
         // the transaction.
-        let capture = |base: std::sync::Arc<RedactionTable>| {
+        // Publish-before-await: the owner swaps the new table live BEFORE the
+        // journaled transaction is awaited, so a write cancelled after its
+        // enqueue (the DB writer may still commit it) can never leave the
+        // durable table ahead of the live one. A failed write restores the
+        // previous table; an extra live literal is the fail-closed direction.
+        let create = |table: std::sync::Arc<RedactionTable>| {
             let proceed = &proceed;
             let value = &value;
             async move {
                 session
                     .create_agent_acquired_sealed_value(
-                        &base,
+                        &table,
                         &proceed.acquisition_id,
                         &proceed.record_id,
                         &proceed.value_id,
@@ -479,32 +484,76 @@ impl TrustedChildCaptureRegistry {
                     .await
             }
         };
-        let result = match owner {
+        let sealed_table = |base: &RedactionTable| {
+            Session::agent_acquired_sealed_table(
+                base,
+                &proceed.record_id,
+                &proceed.value_id,
+                value.as_str(),
+            )
+        };
+        let result: anyhow::Result<()> = match owner {
             Some(owner) => {
                 let guard = owner.lock().await;
                 let owns_session = guard
                     .durable(session)
                     .is_ok_and(|durable| durable.live_id() == session.live_id());
                 if owns_session {
-                    match capture(guard.current()).await {
+                    let previous = guard.current();
+                    match sealed_table(&previous) {
                         Ok(table) => {
-                            guard.publish_persisted(table);
-                            Ok(())
+                            let table = guard.link(table);
+                            guard.publish_persisted(table.clone());
+                            let created = create(table).await;
+                            if created.is_err() {
+                                guard.publish_persisted(previous);
+                            }
+                            created
                         }
                         Err(error) => Err(error),
                     }
                 } else {
                     // A fork's child session owns its own durable table (the
                     // shared owner persists to the parent): capture onto that
-                    // table's latest durable state.
-                    match own_durable_base(session, redaction) {
-                        Ok(base) => capture(base).await.map(|_| ()),
+                    // table's latest durable state, then mirror the literal
+                    // into the shared owner so the fork's NEXT round (which
+                    // adopts the owner's table) still redacts it. The mirror
+                    // is a forced credential literal persisted to the owner's
+                    // durable session; failing it fails the capture closed.
+                    // The mirror is published first for the same
+                    // cancellation reason as above.
+                    let mirrored = guard.current().with_forced_credential_literal(
+                        value.as_str().to_owned(),
+                        format!("$secret:fork-capture:{}", proceed.record_id),
+                    );
+                    match mirrored {
+                        Ok(mirrored) => {
+                            let previous = guard.current();
+                            let mirrored = guard.link(mirrored);
+                            guard.publish_persisted(mirrored.clone());
+                            let captured = match own_durable_base(session, redaction)
+                                .and_then(|base| sealed_table(&base))
+                            {
+                                Ok(table) => create(std::sync::Arc::new(table)).await,
+                                Err(error) => Err(error),
+                            };
+                            let persisted = captured.and_then(|()| {
+                                guard
+                                    .durable(session)
+                                    .and_then(|durable| durable.persist_redaction_table(&mirrored))
+                            });
+                            if persisted.is_err() {
+                                guard.publish_persisted(previous);
+                            }
+                            persisted
+                        }
                         Err(error) => Err(error),
                     }
                 }
             }
-            None => match own_durable_base(session, redaction) {
-                Ok(base) => capture(base).await.map(|_| ()),
+            None => match own_durable_base(session, redaction).and_then(|base| sealed_table(&base))
+            {
+                Ok(table) => create(std::sync::Arc::new(table)).await,
                 Err(error) => Err(error),
             },
         };

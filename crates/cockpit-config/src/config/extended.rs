@@ -3285,7 +3285,6 @@ pub fn resolve_guidance_proposal_doc_layers_for_cwd(cwd: &Path) -> GuidancePropo
 /// metadata in the same file): the raw `Value` is held alongside the typed view
 /// so a write only overwrites the keys it models and never destroys the
 /// sibling layer/provider metadata (or fields a future cockpit version added).
-#[derive(Debug)]
 pub struct ExtendedConfigDoc {
     pub path: PathBuf,
     raw: Value,
@@ -3294,6 +3293,25 @@ pub struct ExtendedConfigDoc {
     /// at (see [`anchor_config_relative_path`]); `None` when the layer has no
     /// project root, in which case relative path settings are rejected.
     path_base: Option<PathBuf>,
+}
+
+// The raw layer document can carry literal secrets (deny-lists, hook env,
+// harness argv): Debug shows the path, origin and top-level keys only.
+impl std::fmt::Debug for ExtendedConfigDoc {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let top_level: Vec<&str> = self
+            .raw
+            .as_object()
+            .map(|object| object.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        formatter
+            .debug_struct("ExtendedConfigDoc")
+            .field("path", &self.path)
+            .field("raw_top_level_keys", &top_level)
+            .field("origin", &self.origin)
+            .field("path_base", &self.path_base)
+            .finish()
+    }
 }
 
 /// Trust origin of a captured config layer.

@@ -1643,6 +1643,32 @@ pub fn spawn_bounded_pipe_drain<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
+    spawn_bounded_pipe_drain_filtered(reader, head_bytes, tail_bytes, None)
+}
+
+/// A transform applied to EVERY byte a pipe produces, in order, before the
+/// head/tail bound drops anything. A consumer that must see the whole stream
+/// (a secret scanner whose context — a PEM BEGIN fence, a YAML key — may sit
+/// in the part the bound later omits) installs one here; what the filter
+/// returns is what the bound retains.
+pub trait PipeIntakeFilter: Send + 'static {
+    /// Transform one chunk as read from the pipe.
+    fn filter(&mut self, chunk: &[u8]) -> Vec<u8>;
+    /// Flush any buffered tail at end of stream.
+    fn finish(&mut self) -> Vec<u8>;
+}
+
+/// [`spawn_bounded_pipe_drain`] with an optional [`PipeIntakeFilter`] run on
+/// the raw stream before the head/tail bound.
+pub fn spawn_bounded_pipe_drain_filtered<R>(
+    reader: Option<R>,
+    head_bytes: usize,
+    tail_bytes: usize,
+    mut filter: Option<Box<dyn PipeIntakeFilter>>,
+) -> BoundedPipeDrain
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     let state = Arc::new(Mutex::new(BoundedPipeDrainState::new(
         head_bytes, tail_bytes,
     )));
@@ -1655,11 +1681,19 @@ where
         loop {
             match reader.read(&mut chunk).await {
                 Ok(0) => break,
-                Ok(n) => {
-                    lock_drain_state(&task_state).append(&chunk[..n]);
-                }
+                Ok(n) => match filter.as_mut() {
+                    Some(filter) => {
+                        let filtered = filter.filter(&chunk[..n]);
+                        lock_drain_state(&task_state).append(&filtered);
+                    }
+                    None => lock_drain_state(&task_state).append(&chunk[..n]),
+                },
                 Err(_) => break,
             }
+        }
+        if let Some(filter) = filter.as_mut() {
+            let tail = filter.finish();
+            lock_drain_state(&task_state).append(&tail);
         }
     });
     BoundedPipeDrain { task, state }

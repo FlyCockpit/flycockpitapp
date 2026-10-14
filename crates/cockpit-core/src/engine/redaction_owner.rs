@@ -43,6 +43,14 @@ pub struct SessionRedactionOwner {
     /// Union of every observed-output addition committed through this owner
     /// (`None` until the first one: no inert empty table is constructed).
     observed: std::sync::RwLock<Option<Arc<RedactionTable>>>,
+    /// Publication generation of the next table this owner publishes; every
+    /// published table carries its generation in its live link.
+    next_generation: std::sync::atomic::AtomicU64,
+    /// Cached enforced view of the current table (for a config opt-out
+    /// table), keyed by generation.
+    enforced_cache: std::sync::Mutex<Option<(u64, Arc<RedactionTable>)>>,
+    /// This owner as the weak live-link source of the tables it publishes.
+    weak_self: std::sync::Weak<SessionRedactionOwner>,
 }
 
 impl std::fmt::Debug for SessionRedactionOwner {
@@ -55,22 +63,58 @@ impl std::fmt::Debug for SessionRedactionOwner {
     }
 }
 
+impl crate::redact::LiveRedactionSource for SessionRedactionOwner {
+    fn newer_view(&self, generation: u64, enforced: bool) -> Option<(u64, Arc<RedactionTable>)> {
+        let current = self.current();
+        let current_generation = current.live_generation()?;
+        if current_generation == generation {
+            return None;
+        }
+        if !enforced || !current.disabled() {
+            return Some((current_generation, current));
+        }
+        let mut cache = self
+            .enforced_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_generation, view)) = cache.as_ref()
+            && *cached_generation == current_generation
+        {
+            return Some((current_generation, view.clone()));
+        }
+        let view = RedactionTable::enforced_arc(current);
+        *cache = Some((current_generation, view.clone()));
+        Some((current_generation, view))
+    }
+}
+
 impl SessionRedactionOwner {
     /// An owner whose durable session is identified by `owner_id`. A commit
     /// persists through the caller's session only when its id matches; bind
     /// the session with [`Self::bind_durable_session`] to make it explicit.
-    pub fn new(table: SharedRedactionTable, owner_id: Uuid) -> Self {
-        Self {
+    ///
+    /// The shared table's current content is re-published as this owner's
+    /// first generation (a live-linked copy), so every snapshot taken from
+    /// it from now on follows the owner's later commits.
+    pub fn new(table: SharedRedactionTable, owner_id: Uuid) -> Arc<Self> {
+        let owner = Arc::new_cyclic(|weak_self| Self {
             table,
             write_lock: tokio::sync::Mutex::new(()),
             owner_id,
             durable: std::sync::OnceLock::new(),
             observed: std::sync::RwLock::new(None),
-        }
+            next_generation: std::sync::atomic::AtomicU64::new(1),
+            enforced_cache: std::sync::Mutex::new(None),
+            weak_self: weak_self.clone(),
+        });
+        let initial = (*owner.current()).clone();
+        let linked = owner.link(initial);
+        set_current_redaction(&owner.table, linked);
+        owner
     }
 
     /// An owner bound to `session` as its durable target.
-    pub fn for_session(table: SharedRedactionTable, session: Arc<Session>) -> Self {
+    pub fn for_session(table: SharedRedactionTable, session: Arc<Session>) -> Arc<Self> {
         let owner = Self::new(table, session.id);
         owner.bind_durable_session(session);
         owner
@@ -89,6 +133,16 @@ impl SessionRedactionOwner {
     /// The latest committed live table.
     pub fn current(&self) -> Arc<RedactionTable> {
         current_redaction(&self.table)
+    }
+
+    /// `table` as this owner's next published generation.
+    fn link(&self, table: RedactionTable) -> Arc<RedactionTable> {
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let source: std::sync::Weak<dyn crate::redact::LiveRedactionSource> =
+            self.weak_self.clone();
+        Arc::new(table.with_live_link(source, generation))
     }
 
     /// Every observed-output addition committed so far (values plus their
@@ -138,6 +192,13 @@ impl RedactionWriteGuard<'_> {
         anyhow::bail!("redaction table write from a session that does not own the table")
     }
 
+    /// `table` as the owner's next published generation (live-linked), for a
+    /// caller that persists it in its own transaction before
+    /// [`Self::publish_persisted`].
+    pub fn link(&self, table: RedactionTable) -> Arc<RedactionTable> {
+        self.owner.link(table)
+    }
+
     /// Persist `table` to the durable owner, then swap it live
     /// (persist-before-swap). On a persist failure nothing is swapped.
     pub fn commit(
@@ -145,14 +206,13 @@ impl RedactionWriteGuard<'_> {
         caller: &Session,
         table: RedactionTable,
     ) -> anyhow::Result<Arc<RedactionTable>> {
-        let table = Arc::new(table);
+        let table = self.link(table);
         self.durable(caller)?.persist_redaction_table(&table)?;
         self.publish_persisted(table.clone());
         Ok(table)
     }
 
-    /// Swap in a table the caller already persisted to [`Self::durable`] in
-    /// its own transaction (journaled sealed adoption, trusted capture).
+    /// Swap in a published table.
     pub fn publish_persisted(&self, table: Arc<RedactionTable>) {
         set_current_redaction(&self.owner.table, table);
     }
@@ -197,4 +257,181 @@ pub(crate) fn adopt_live_redaction_for_round(
     *agent = Arc::new(refreshed);
     *redact = current;
     true
+}
+
+#[cfg(test)]
+mod codex_r2_successor_probe {
+    use super::*;
+    #[tokio::test]
+    async fn codex_r2_successor_keeps_registration_between_copy_and_adopt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let initial = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&initial).unwrap();
+        let table: SharedRedactionTable = Arc::new(std::sync::RwLock::new(initial.clone()));
+        let hub =
+            crate::engine::interrupt::InterruptHub::detached_owning(table.clone(), session.clone());
+        let predecessor = session.live_id();
+        let successor = Uuid::new_v4();
+        session.begin_compaction_successor(successor).unwrap();
+        let vault = session.secret_vault().clone();
+        let row = db
+            .transaction(move |conn| {
+                crate::session::lifecycle::copy_vault_session_secrets_on_conn(
+                    conn,
+                    &vault,
+                    predecessor,
+                    successor,
+                )?;
+                crate::db::Db::create_compaction_successor_conn(
+                    conn,
+                    predecessor,
+                    successor,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            })
+            .await
+            .unwrap();
+        let secret = "NovelSuccessor515Secret78529";
+        crate::tools::output_backstop::scrub_command_output(
+            &hub,
+            &session,
+            &initial,
+            &crate::config::extended::RedactConfig::default(),
+            &format!("DB_SECRET={secret}"),
+        )
+        .await
+        .unwrap();
+        assert!(!current_redaction(&table).scrub(secret).contains(secret));
+        session.adopt_compaction_successor(row.session_id, row.short_id);
+        let json = crate::session::lifecycle::require_redaction_table_json_from_vault(
+            session.secret_vault(),
+            successor,
+            "reviewer checking successor durable table",
+        )
+        .unwrap();
+        let durable = RedactionTable::from_persisted_json(&json).unwrap();
+        assert!(
+            !durable.scrub(secret).contains(secret),
+            "successful registration missing from resumed successor vault item"
+        );
+    }
+}
+
+#[cfg(test)]
+mod codex_r2_cancel_probe {
+    use super::*;
+    #[tokio::test]
+    async fn codex_r2_cancel_queued_write_keeps_live_and_durable_in_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("cancel.db")).unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        assert!(!session.unjournaled_inference_allowed());
+        let initial = Arc::new(RedactionTable::empty());
+        session.persist_redaction_table(&initial).unwrap();
+        let table: SharedRedactionTable = Arc::new(std::sync::RwLock::new(initial.clone()));
+        let hub =
+            crate::engine::interrupt::InterruptHub::detached_owning(table.clone(), session.clone());
+        let stall = db.stall_writer_for_test().unwrap();
+        let secret = "NovelCancelled515Secret78529";
+        let identity = crate::sealed::identity::SealedRedactionIdentity {
+            scope: crate::sealed::identity::SealedScopeKind::Session,
+            record_id: None,
+            name: crate::sealed::identity::SealedName::canonical("cancel_probe").unwrap(),
+            version: 0,
+        };
+        let mut operation =
+            Box::pin(hub.seal_redaction_with_identity(&session, secret.to_owned(), identity));
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        drop(operation);
+        drop(stall);
+        db.write(|_| Ok(())).await.unwrap();
+        let json = crate::session::lifecycle::require_redaction_table_json_from_vault(
+            session.secret_vault(),
+            session.live_id(),
+            "reviewer cancellation custody check",
+        )
+        .unwrap();
+        let durable = RedactionTable::from_persisted_json(&json).unwrap();
+        let live_scrubbed = !current_redaction(&table).scrub(secret).contains(secret);
+        let durable_scrubbed = !durable.scrub(secret).contains(secret);
+        assert_eq!(
+            live_scrubbed, durable_scrubbed,
+            "dropped owner future released lock while queued sealed-table write committed: live={live_scrubbed}, durable={durable_scrubbed}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_link_tests {
+    use super::*;
+
+    // R2 chokepoint: a table snapshot taken from the owner, a table DERIVED
+    // from that snapshot (the shape of an outbound guard extended with
+    // provider-auth values, a union or an addition) and an OutboundGuard over
+    // the snapshot all scrub a value the owner registered AFTER they were
+    // taken, so a send path holding any of them cannot render with a stale
+    // session table. The derived table keeps its own local literal too.
+    #[tokio::test]
+    async fn every_snapshot_and_derivation_resolves_to_the_owner_newest_table() {
+        let later = "LaterOwner515Value78529";
+        let local = "LocalForced515Value78529";
+        let table: SharedRedactionTable =
+            Arc::new(std::sync::RwLock::new(Arc::new(RedactionTable::empty())));
+        let owner = SessionRedactionOwner::new(table, Uuid::new_v4());
+        let snapshot = owner.current();
+        let derived = Arc::new(
+            snapshot
+                .with_forced_literal(local.to_owned(), "$forced:live-link-test".to_owned())
+                .unwrap(),
+        );
+        let enforced = Arc::new(snapshot.enforced());
+        let outbound = crate::engine::model::OutboundGuard::new(snapshot.clone());
+        assert!(snapshot.scrub(later).contains(later), "precondition");
+        {
+            let guard = owner.lock().await;
+            let next = guard.link(
+                guard
+                    .current()
+                    .with_forced_literal(later.to_owned(), "$forced:live-link-later".to_owned())
+                    .unwrap(),
+            );
+            guard.publish_persisted(next);
+        }
+        for (name, view) in [
+            ("snapshot", &snapshot),
+            ("derived", &derived),
+            ("enforced", &enforced),
+        ] {
+            assert!(
+                !view.scrub(later).contains(later),
+                "{name} rendered with a stale session table"
+            );
+        }
+        assert!(
+            !outbound.scrub(later).contains(later),
+            "outbound guard bypassed the owner"
+        );
+        assert!(
+            !derived.scrub(local).contains(local),
+            "derived resolution dropped the table's own literal"
+        );
+    }
 }

@@ -79,7 +79,7 @@ pub struct AgentInstallationBeginV1 {
     pub auto_select_first_exact: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInstallationSubmitChoiceV1 {
     pub dto_version: u32,
     pub continuation_token: String,
@@ -91,6 +91,19 @@ pub struct AgentInstallationSubmitChoiceV1 {
     /// choice set, rather than trusting a client-provided status.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub defer: bool,
+}
+
+impl std::fmt::Debug for AgentInstallationSubmitChoiceV1 {
+    /// The continuation token is the authority to complete the pending
+    /// choice: never printed by Debug.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentInstallationSubmitChoiceV1")
+            .field("dto_version", &self.dto_version)
+            .field("continuation_token", &"<redacted>")
+            .field("choice_id", &self.choice_id)
+            .field("defer", &self.defer)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,7 +189,7 @@ pub struct AgentInstallationUnmatchedRecommendationV1 {
     pub rationale: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum AgentInstallationResultV1 {
     NeedsChoice {
@@ -205,6 +218,50 @@ pub enum AgentInstallationResultV1 {
     Error {
         error: AgentInstallationErrorV1,
     },
+}
+
+impl std::fmt::Debug for AgentInstallationResultV1 {
+    /// As [`AgentInstallationSubmitChoiceV1`]: the continuation token is
+    /// never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeedsChoice {
+                continuation_token: _,
+                choices,
+                unmatched_recommendations,
+                expires_at_unix_ms,
+            } => f
+                .debug_struct("NeedsChoice")
+                .field("continuation_token", &"<redacted>")
+                .field("choices", choices)
+                .field("unmatched_recommendations", unmatched_recommendations)
+                .field("expires_at_unix_ms", expires_at_unix_ms)
+                .finish(),
+            Self::Receipt {
+                operation_id,
+                status,
+                installation_id,
+                source_revision,
+                binding_outcome,
+            } => f
+                .debug_struct("Receipt")
+                .field("operation_id", operation_id)
+                .field("status", status)
+                .field("installation_id", installation_id)
+                .field("source_revision", source_revision)
+                .field("binding_outcome", binding_outcome)
+                .finish(),
+            Self::Listed { installations } => f
+                .debug_struct("Listed")
+                .field("installations", installations)
+                .finish(),
+            Self::Inspected { installation } => f
+                .debug_struct("Inspected")
+                .field("installation", installation)
+                .finish(),
+            Self::Error { error } => f.debug_struct("Error").field("error", error).finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

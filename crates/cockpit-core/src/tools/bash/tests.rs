@@ -20,6 +20,7 @@ async fn build_test_check_commands_get_output_sidecars() {
         exit: 1,
         signaled: false,
         success: false,
+        intake_observed: Vec::new(),
     };
     let sidecar = bash_output_sidecar(
         "cargo test --workspace",
@@ -184,6 +185,10 @@ fn install_live_redaction_hub(ctx: &mut ToolCtx) -> crate::daemon::SharedRedacti
         ctx.session.db.clone(),
         ctx.session.id,
     ));
+    // As in production (the driver adopts the installed hub's published
+    // table, and every ToolCtx is built from it), the tool's snapshot is the
+    // owner-published, live-linked table.
+    ctx.redact = ctx.interrupts.current_live_redaction().unwrap();
     table
 }
 
@@ -1139,6 +1144,7 @@ fn shell_out(stdout: &str, stderr: &str, exit: i32) -> ShellOutcome {
         exit,
         signaled: false,
         success: exit == 0,
+        intake_observed: Vec::new(),
     }
 }
 
@@ -4001,6 +4007,7 @@ async fn missing_binary_diagnostic_names_cockpit_environment() {
         exit: 127,
         signaled: false,
         success: false,
+        intake_observed: Vec::new(),
     };
     let body = render_output(
         &outcome,
@@ -4060,6 +4067,7 @@ async fn nonzero_command_diagnostic_includes_attempted_command_and_cwd() {
         exit: 2,
         signaled: false,
         success: false,
+        intake_observed: Vec::new(),
     };
     let body = render_output(
         &outcome,
@@ -4410,6 +4418,83 @@ fn shell_command_log_identity_is_value_free() {
     let identity = shell_command_log_identity(&format!(
         "API_KEY={secret} /usr/local/bin/deploy --token={secret} now"
     ));
-    assert_eq!(identity, "deploy (+2 words)");
-    assert!(!identity.contains(&secret));
+    assert!(!identity.contains(&secret), "{identity}");
+    assert!(!identity.contains("deploy"), "{identity}");
+    assert!(identity.contains("words"), "{identity}");
+}
+
+#[tokio::test]
+async fn codex_r2_native_read_uses_registered_same_turn_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("other")).unwrap();
+    let command = "cat other/.env";
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let live = install_live_redaction_hub(&mut ctx);
+    let secret = "NovelNativeRead515Secret78529";
+    std::fs::write(
+        tmp.path().join("other/.env"),
+        format!("DB_SECRET={secret}\n"),
+    )
+    .unwrap();
+    let first = BashTool::new()
+        .call(serde_json::json!({"command":command}), &ctx)
+        .await
+        .unwrap();
+    assert!(!first.content.contains(secret));
+    assert!(!live.read().unwrap().scrub(secret).contains(secret));
+    std::fs::write(tmp.path().join("ordinary.txt"), format!("{secret}\n")).unwrap();
+    let read = crate::tools::read::ReadTool
+        .call(serde_json::json!({"path":"ordinary.txt"}), &ctx)
+        .await
+        .unwrap();
+    // r3: native tool results are raw history; every egress scrubs them with
+    // the round's table snapshot. That snapshot (the same owner-published
+    // table the tool context holds) resolves the same-turn registration
+    // through the owner's live link, so the read result is covered at send.
+    assert!(
+        !ctx.redact.scrub(&read.content).contains(secret),
+        "same-turn native result leaks at egress: {}",
+        read.content
+    );
+}
+
+#[tokio::test]
+async fn codex_r2_bounded_capture_preserves_yaml_context() {
+    let tmp = tempfile::tempdir().unwrap();
+    let command = "cat ordinary.yaml";
+    let mut ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
+    let _live = install_live_redaction_hub(&mut ctx);
+    ctx.session
+        .set_shell_compression(crate::config::extended::ShellCompression::Disabled);
+    let secret = "NovelOmittedYaml515Secret78529";
+    let mut output = "ordinary benign line\n".repeat(7000);
+    output.push_str("password: |\n");
+    output.push_str(&"  ordinary scalar filler\n".repeat(20000));
+    for _ in 0..10 {
+        output.push_str(&format!("  {secret}\n"));
+    }
+    std::fs::write(tmp.path().join("ordinary.yaml"), output).unwrap();
+    let result = BashTool::new()
+        .call(serde_json::json!({"command":command}), &ctx)
+        .await
+        .unwrap();
+    let sidecar = result
+        .output_sidecar
+        .as_ref()
+        .expect("large output has a retained sidecar");
+    assert!(
+        !sidecar.payload.to_string().contains(secret),
+        "bounded head/tail capture removed YAML secret intro before scanning retained body"
+    );
+}
+
+#[test]
+fn codex_r2_quoted_env_assignment_log_identity_is_value_free() {
+    let secret = "NovelQuotedArgv515Secret78529";
+    let command = format!("AUTH_HEADER='Bearer {secret}' deploy");
+    let identity = shell_command_log_identity(&command);
+    assert!(
+        !identity.contains(secret),
+        "quoted environment assignment credential becomes logged program: {identity}"
+    );
 }

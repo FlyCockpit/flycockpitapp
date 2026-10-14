@@ -1128,6 +1128,7 @@ async fn mid_turn_registrations_reach_the_next_round_egress_table() {
     driver.set_interrupt_hub(hub.clone());
     let secret = ["NovelMidTurn515", "Secret78529"].concat();
     let echo = format!("history line with {secret}");
+    let snapshot = driver.redact.clone();
     crate::tools::output_backstop::scrub_command_output(
         &hub,
         &driver.session,
@@ -1137,9 +1138,16 @@ async fn mid_turn_registrations_reach_the_next_round_egress_table() {
     )
     .await
     .unwrap();
+    // r3 (R2): the round snapshot is the owner-published table; without any
+    // adoption it already resolves the later registration through its live
+    // link, so no send path holding it can render stale.
     assert!(
-        driver.redact.scrub(&echo).contains(&secret),
-        "precondition: the driver's round snapshot predates the registration"
+        Arc::ptr_eq(&snapshot, &driver.redact),
+        "precondition: nothing adopted yet"
+    );
+    assert!(
+        !snapshot.scrub(&echo).contains(&secret),
+        "round snapshot rendered with a stale table"
     );
     driver.adopt_live_redaction();
     assert!(!driver.redact.scrub(&echo).contains(&secret));
@@ -1793,5 +1801,152 @@ async fn followup_reuse_decision_no_cache_provider() {
     assert_eq!(
         driver.followup_reuse_decision(),
         crate::engine::prune::FollowupReuse::NoCacheReuse
+    );
+}
+
+#[tokio::test]
+async fn codex_r2_compaction_provider_uses_current_owner_table() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text(
+            "A sufficiently detailed compact brief with several useful facts and no repetition."
+                .repeat(40),
+        ))
+        .start()
+        .await;
+    let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+    driver.test_compact_brief_calls = None;
+    driver.test_compact_brief_script = None;
+    let secret = "NovelCompact515Secret78529";
+    let hub = driver.interrupts.clone();
+    crate::tools::output_backstop::scrub_command_output(
+        &hub,
+        &driver.session,
+        &driver.redact,
+        &crate::config::extended::RedactConfig::default(),
+        &format!("DB_SECRET={secret}"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !hub.current_live_redaction()
+            .unwrap()
+            .scrub(secret)
+            .contains(secret)
+    );
+    assert!(
+        !driver.redact.scrub(secret).contains(secret),
+        "snapshot table must resolve through the owner live link"
+    );
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let draft = driver
+        .compact_brief_draft(
+            &tx,
+            vec![Message::user(format!(
+                "earlier ordinary read contains {secret}"
+            ))],
+            Arc::new(std::sync::Mutex::new(
+                crate::engine::driver::context_reduction::CompactPreparationQuota::default(),
+            )),
+        )
+        .await;
+    let _outcome = crate::engine::driver::context_reduction::execute_compact_brief(
+        draft,
+        "summarize".into(),
+        "codex_r2_compact_probe",
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let requests: Vec<_> = provider
+        .captured()
+        .into_iter()
+        .filter(|r| r.request_line.starts_with("POST "))
+        .collect();
+    assert_eq!(
+        requests.len(),
+        1,
+        "precondition: a real compact utility request must be sent"
+    );
+    let payload = serde_json::to_string(&requests[0].body).unwrap();
+    assert!(
+        !payload.contains(secret),
+        "compaction sent registered value using old model table: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn codex_r2_tandem_provider_uses_current_owner_table() {
+    use crate::engine::schedule::tandem::{TandemDispatch, TandemSet, TandemTarget};
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("shadow completed".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+    let old_model = driver.stack[0].agent.model.clone();
+    let mut tandem = TandemSet::default();
+    tandem.set(vec![TandemTarget {
+        provider: "lmstudio".into(),
+        model: "local".into(),
+        handle: old_model,
+    }]);
+    let secret = "NovelTandem515Secret78529";
+    let hub = driver.interrupts.clone();
+    crate::tools::output_backstop::scrub_command_output(
+        &hub,
+        &driver.session,
+        &driver.redact,
+        &crate::config::extended::RedactConfig::default(),
+        &format!("DB_SECRET={secret}"),
+    )
+    .await
+    .unwrap();
+    driver.adopt_live_redaction();
+    let prompt = Message::user(format!("ordinary raw history read contains {secret}"));
+    let current_main = driver.stack[0]
+        .agent
+        .model
+        .assemble_dispatch_request(
+            "",
+            &[],
+            &prompt,
+            &[],
+            &crate::engine::model::ModelParams::default(),
+        )
+        .unwrap();
+    assert!(
+        !current_main.to_string().contains(secret),
+        "precondition: current primary redacts"
+    );
+    crate::engine::schedule::tandem::dispatch_turn(
+        &driver.session,
+        &tandem,
+        TandemDispatch {
+            parent_call_id: uuid::Uuid::new_v4().to_string(),
+            agent: "Build".into(),
+            system: String::new(),
+            history: vec![],
+            prompt,
+            tools: vec![],
+            params: crate::engine::model::ModelParams::default(),
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), provider.next_request())
+        .await
+        .unwrap();
+    let requests: Vec<_> = provider
+        .captured()
+        .into_iter()
+        .filter(|r| r.request_line.starts_with("POST "))
+        .collect();
+    assert_eq!(
+        requests.len(),
+        1,
+        "precondition: actual shadow request captured"
+    );
+    let body = serde_json::to_string(&requests[0].body).unwrap();
+    assert!(
+        !body.contains(secret),
+        "current primary redacted but pinned tandem sent registered value: {body}"
     );
 }

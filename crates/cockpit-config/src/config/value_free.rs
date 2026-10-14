@@ -10,11 +10,16 @@
 //! quoted fragment with `…`.
 
 /// `message` with the contents of every `"…"` and `` `…` `` span replaced.
+/// Inside a span a backslash escapes the next character, so an escaped
+/// quote (`\"`) never closes the span early and leaks the remainder.
 pub fn value_free_message(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut open: Option<char> = None;
+    let mut escaped = false;
     for c in message.chars() {
         match open {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
             Some(quote) if c == quote => {
                 out.push('…');
                 out.push(c);
@@ -34,9 +39,74 @@ pub fn value_free_message(message: &str) -> String {
     out
 }
 
-/// A value-free `anyhow` error for a JSON (de)serialization failure.
+/// serde data-error kinds whose message structure is known: `<kind>: <the
+/// offending input>, expected <shape>`. Only the kind and the expected shape
+/// are kept.
+const SERDE_DATA_ERROR_KINDS: &[&str] = &[
+    "invalid type",
+    "invalid value",
+    "invalid length",
+    "unknown variant",
+    "unknown field",
+    "missing field",
+    "duplicate field",
+];
+
+/// A value-free `anyhow` error for a JSON (de)serialization failure, built
+/// from typed facts only — category, the data-error kind and expected
+/// shape when serde reports one, and the line/column — never from the
+/// input-bearing message text. A custom deserializer message (which may
+/// format the input) is reduced to its category.
 pub fn json_error(error: &serde_json::Error) -> anyhow::Error {
-    anyhow::anyhow!("{}", value_free_message(&error.to_string()))
+    use serde_json::error::Category;
+    let category = match error.classify() {
+        Category::Io => "read error",
+        Category::Syntax => "syntax error",
+        Category::Data => "invalid data",
+        Category::Eof => "unexpected end of input",
+    };
+    let mut out = category.to_string();
+    if matches!(error.classify(), Category::Data) {
+        let message = error.to_string();
+        let message = match message.rfind(" at line ") {
+            Some(at) => &message[..at],
+            None => message.as_str(),
+        };
+        if let Some(kind) = SERDE_DATA_ERROR_KINDS
+            .iter()
+            .find(|kind| message.starts_with(**kind))
+        {
+            out.push_str(": ");
+            out.push_str(kind);
+            if let Some((_, expected)) = message.rsplit_once(", expected ") {
+                out.push_str(", expected ");
+                out.push_str(&value_free_message(expected));
+            }
+        }
+    }
+    if error.line() > 0 {
+        out.push_str(&format!(
+            " at line {} column {}",
+            error.line(),
+            error.column()
+        ));
+    }
+    anyhow::anyhow!(out)
+}
+
+/// `serde_json::from_str` whose error is [`json_error`].
+pub fn from_str<T: serde::de::DeserializeOwned>(input: &str) -> anyhow::Result<T> {
+    serde_json::from_str(input).map_err(|error| json_error(&error))
+}
+
+/// `serde_json::from_slice` whose error is [`json_error`].
+pub fn from_slice<T: serde::de::DeserializeOwned>(input: &[u8]) -> anyhow::Result<T> {
+    serde_json::from_slice(input).map_err(|error| json_error(&error))
+}
+
+/// `serde_json::from_value` whose error is [`json_error`].
+pub fn from_value<T: serde::de::DeserializeOwned>(input: serde_json::Value) -> anyhow::Result<T> {
+    serde_json::from_value(input).map_err(|error| json_error(&error))
 }
 
 /// A URL with its credential-bearing parts removed, for `Debug` output:
@@ -92,6 +162,10 @@ mod tests {
             "{message}"
         );
         let message = value_free_message("invalid type: integer `987654321`, expected a string");
+        let escaped = value_free_message(
+            r#"invalid type: string "prefix\"inner-sentinel\"suffix", expected a map"#,
+        );
+        assert!(!escaped.contains("inner-sentinel"), "{escaped}");
         assert!(!message.contains("987654321"), "{message}");
         assert_eq!(
             value_free_message("auth_command must name a non-empty executable"),

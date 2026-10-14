@@ -693,11 +693,31 @@ pub enum ActiveModelWriteMode {
 /// Read+write a provider config layer while preserving fields cockpit
 /// doesn't model. Global provider metadata lives in `config.json`; provider
 /// entries live in sibling `providers/*.json` files.
-#[derive(Debug)]
 pub struct ConfigDoc {
     pub path: PathBuf,
     pub(crate) raw: Value,
     pub(crate) originally_loaded_providers: BTreeMap<String, ProviderEntry>,
+}
+
+// The raw document carries literal provider headers and keys: Debug shows
+// the path, top-level keys and provider ids only.
+impl std::fmt::Debug for ConfigDoc {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let top_level: Vec<&str> = self
+            .raw
+            .as_object()
+            .map(|object| object.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        formatter
+            .debug_struct("ConfigDoc")
+            .field("path", &self.path)
+            .field("raw_top_level_keys", &top_level)
+            .field(
+                "originally_loaded_providers",
+                &self.originally_loaded_providers.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 thread_local! {
@@ -1148,8 +1168,7 @@ impl ConfigDoc {
                         cfg.providers.insert(id.clone(), entry);
                     }
                     Err(error) => {
-                        let error =
-                            crate::config::value_free::value_free_message(&error.to_string());
+                        let error = crate::config::value_free::json_error(&error).to_string();
                         tracing::warn!(
                             path = %self.path.display(),
                             provider = %id,
@@ -1826,7 +1845,7 @@ where
     match serde_json::from_value::<T>(value.clone()) {
         Ok(parsed) => Some(parsed),
         Err(error) => {
-            let error = crate::config::value_free::value_free_message(&error.to_string());
+            let error = crate::config::value_free::json_error(&error).to_string();
             tracing::warn!(
                 path = %path.display(),
                 key,
@@ -2017,7 +2036,7 @@ fn load_provider_files_into_config(config_path: &Path, cfg: &mut ProvidersConfig
                     cfg.providers.insert(id.clone(), entry);
                 }
                 Err(e) => {
-                    let e = crate::config::value_free::value_free_message(&e.to_string());
+                    let e = crate::config::value_free::json_error(&e).to_string();
                     tracing::warn!(provider = %id, error = %e, "skipping malformed provider entry");
                 }
             }
@@ -2657,6 +2676,24 @@ mod atomic_write_tests {
             std::fs::read_dir(temp.path()).unwrap().count(),
             1,
             "the committed temporary replacement must not remain beside the destination"
+        );
+    }
+}
+
+#[cfg(test)]
+mod codex_r2_doc_probe {
+    use super::*;
+    #[test]
+    fn codex_r2_config_doc_debug_is_value_free() {
+        let secret = "NovelConfigDoc515Secret78529";
+        let doc = ConfigDoc {
+            path: std::path::PathBuf::from("config.json"),
+            raw: serde_json::json!({"providers":{"sample":{"headers":[{"name":"Authorization","value":format!("Bearer {secret}")}]}}}),
+            originally_loaded_providers: BTreeMap::new(),
+        };
+        assert!(
+            !format!("{doc:?}").contains(secret),
+            "raw config document Debug leaks header value"
         );
     }
 }

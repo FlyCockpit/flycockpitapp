@@ -363,7 +363,7 @@ async fn token_request(
         return Err(classify_token_error(status, &body));
     }
     let mut parsed: TokenResponse =
-        serde_json::from_str(&body).context("parsing xAI OAuth token response")?;
+        crate::config::value_free::from_str(&body).context("parsing xAI OAuth token response")?;
     let refresh_token = std::mem::take(&mut parsed.refresh_token)
         .or_else(|| fallback_refresh.map(str::to_string))
         .context("xAI OAuth token response missing refresh_token")?;

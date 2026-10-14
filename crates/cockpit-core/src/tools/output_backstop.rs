@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use crate::config::extended::RedactConfig;
 use crate::engine::interrupt::InterruptHub;
-use crate::redact::{NovelScrubMode, NovelScrubOutput, RedactionTable};
+use crate::redact::{
+    NovelScrubMode, NovelScrubOutput, NovelScrubStream, ObservedSecret, RedactionTable,
+};
 use crate::session::Session;
 
 /// Scrub novel secret-shaped values out of the freshly captured streams of
@@ -65,10 +67,25 @@ pub(crate) async fn scrub_command_streams(
     cfg: &RedactConfig,
     streams: &mut [&mut String],
 ) -> anyhow::Result<()> {
+    scrub_command_streams_with_intake(interrupts, session, redact, cfg, streams, Vec::new()).await
+}
+
+/// [`scrub_command_streams`] plus observations an [`IntakeObservations`]
+/// collected while the streams were READ — values whose context the
+/// head/tail bound later omitted. They are registered together with what the
+/// retained text still shows.
+pub(crate) async fn scrub_command_streams_with_intake(
+    interrupts: &InterruptHub,
+    session: &Session,
+    redact: &RedactionTable,
+    cfg: &RedactConfig,
+    streams: &mut [&mut String],
+    intake: Vec<ObservedSecret>,
+) -> anyhow::Result<()> {
     if redact.disabled() {
         return Ok(());
     }
-    let mut found = Vec::new();
+    let mut found = intake;
     for stream in streams.iter_mut() {
         if stream.is_empty() {
             continue;
@@ -123,15 +140,152 @@ pub(crate) async fn scrub_command_output(
     Ok(text)
 }
 
+/// Longest physical line the pipe intake scanner holds before scanning; the
+/// remainder of a longer line is discarded (the head/tail capture budget is
+/// smaller than this anyway) and the scanner fails closed for the context
+/// the discarded part could have opened ([`NovelScrubStream::push_truncated_line`]).
+pub(crate) const INTAKE_LINE_CAP: usize = 256 * 1024;
+
+/// Observations made by the narrow scanner on a command's pipes AS THEY
+/// WERE READ (see [`IntakeObservations::filter`]). Shared by every stream
+/// filter of one command.
+#[derive(Clone, Default)]
+pub(crate) struct IntakeObservations(Arc<std::sync::Mutex<crate::redact::ObservedSet>>);
+
+impl IntakeObservations {
+    /// A pipe-intake filter running the narrow scanner over the RAW stream,
+    /// before the bounded capture drops its middle: secret context (a PEM
+    /// BEGIN fence, a YAML key) that falls in the omitted part still governs
+    /// the retained lines, and what it replaces is collected here.
+    /// `None` when the table's opt-out is set or a trusted-child acquisition
+    /// owns the raw output.
+    pub(crate) fn filter(
+        &self,
+        redact: &RedactionTable,
+    ) -> Option<Box<dyn cockpit_host::process::PipeIntakeFilter>> {
+        if redact.disabled()
+            || crate::tools::trusted_child_acquisition::acquisition_quarantines_shell_output()
+        {
+            return None;
+        }
+        Some(Box::new(NovelScrubIntake {
+            stream: NovelScrubStream::new(redact.placeholder(), NovelScrubMode::KeyedNarrow),
+            partial: Vec::new(),
+            discarding: false,
+            observed: self.clone(),
+        }))
+    }
+
+    /// Drain everything collected so far.
+    pub(crate) fn take(&self) -> Vec<ObservedSecret> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn extend(&self, found: Vec<ObservedSecret>) {
+        if !found.is_empty() {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(found);
+        }
+    }
+}
+
+struct NovelScrubIntake {
+    stream: NovelScrubStream,
+    partial: Vec<u8>,
+    /// Bytes of an over-cap line are being discarded until its newline.
+    discarding: bool,
+    observed: IntakeObservations,
+}
+
+impl NovelScrubIntake {
+    fn emit_line(&mut self, out: &mut Vec<u8>, line: &[u8], newline: bool, truncated: bool) {
+        let text = String::from_utf8_lossy(line);
+        let scrubbed = if truncated {
+            self.stream.push_truncated_line(&text)
+        } else {
+            self.stream.push_line(&text)
+        };
+        if let Some(scrubbed) = scrubbed {
+            if scrubbed == text {
+                out.extend_from_slice(line);
+            } else {
+                out.extend_from_slice(scrubbed.as_bytes());
+            }
+            if truncated {
+                out.extend_from_slice(b" [line truncated: exceeds the scan limit]");
+            }
+            if newline {
+                out.push(b'\n');
+            }
+        }
+        self.observed.extend(self.stream.take_found());
+    }
+}
+
+impl cockpit_host::process::PipeIntakeFilter for NovelScrubIntake {
+    fn filter(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(chunk.len());
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            match rest.iter().position(|b| *b == b'\n') {
+                Some(newline) => {
+                    let (line, after) = rest.split_at(newline);
+                    rest = &after[1..];
+                    if self.discarding {
+                        self.discarding = false;
+                        out.push(b'\n');
+                        continue;
+                    }
+                    let mut full = std::mem::take(&mut self.partial);
+                    full.extend_from_slice(line);
+                    self.emit_line(&mut out, &full, true, false);
+                }
+                None => {
+                    if !self.discarding {
+                        self.partial.extend_from_slice(rest);
+                        if self.partial.len() > INTAKE_LINE_CAP {
+                            let prefix = std::mem::take(&mut self.partial);
+                            let cut = &prefix[..INTAKE_LINE_CAP];
+                            self.emit_line(&mut out, cut, false, true);
+                            self.discarding = true;
+                        }
+                    }
+                    rest = &[];
+                }
+            }
+        }
+        out
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.discarding && !self.partial.is_empty() {
+            let line = std::mem::take(&mut self.partial);
+            self.emit_line(&mut out, &line, false, false);
+        }
+        self.stream.finish();
+        self.observed.extend(self.stream.take_found());
+        out
+    }
+}
+
 /// Byte-stream form of [`scrub_command_streams`] for raw captured stdout /
 /// stderr. Invalid UTF-8 is only rewritten (lossily) when a stream actually
 /// changed; clean output keeps its exact bytes.
-pub(crate) async fn scrub_command_byte_streams(
+/// `intake` carries observations made at pipe intake
+/// ([`scrub_command_streams_with_intake`]).
+pub(crate) async fn scrub_command_byte_streams_with_intake(
     interrupts: &InterruptHub,
     session: &Session,
     redact: &RedactionTable,
     cfg: &RedactConfig,
     streams: &mut [&mut Vec<u8>],
+    intake: Vec<ObservedSecret>,
 ) -> anyhow::Result<()> {
     let originals: Vec<String> = streams
         .iter()
@@ -140,7 +294,8 @@ pub(crate) async fn scrub_command_byte_streams(
     let mut texts = originals.clone();
     {
         let mut refs: Vec<&mut String> = texts.iter_mut().collect();
-        scrub_command_streams(interrupts, session, redact, cfg, &mut refs).await?;
+        scrub_command_streams_with_intake(interrupts, session, redact, cfg, &mut refs, intake)
+            .await?;
     }
     for ((bytes, original), text) in streams.iter_mut().zip(&originals).zip(texts) {
         if &text != original {
@@ -359,12 +514,13 @@ mod tests {
         .unwrap();
         assert_eq!(scrubbed, output);
         let mut bytes = vec![0xff, b'\n'];
-        scrub_command_byte_streams(
+        scrub_command_byte_streams_with_intake(
             &hub,
             &session,
             &RedactionTable::empty(),
             &RedactConfig::default(),
             &mut [&mut bytes],
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -456,8 +612,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.contains("postgres://postgres:"), "{out}");
+        // r3: replaced in this output (the username equals the password, so
+        // the whole userinfo is withheld), registered only as the pair.
+        assert!(out.starts_with("DATABASE_URL=postgres://"), "{out}");
         assert!(!out.contains("postgres@localhost"), "{out}");
+        assert!(!out.contains("://postgres:"), "{out}");
         let live = live.read().unwrap().clone();
         assert!(live.scrub("image postgres:16").contains("postgres:16"));
         assert!(
@@ -586,7 +745,7 @@ mod tests {
     /// not secrets — they stay visible and are never registered, so reading a
     /// Rust/TypeScript file through the shell is not rewritten afterwards.
     #[tokio::test]
-    async fn code_type_annotations_under_secret_keys_stay_visible() {
+    async fn code_type_annotations_under_secret_keys_are_redacted_not_registered() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = test_session(&db, &tmp);
@@ -601,7 +760,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out, source);
+        // r3 (R5): the heuristic never leaves a keyed value visible — the type
+        // spelling is replaced in this output — but it is not registered, so
+        // later reads of source files are not rewritten. The surrounding
+        // structure (and the lines after a `<SecretString>` generic) survive.
+        assert!(!out.contains("password: String"), "{out}");
+        assert!(!out.contains("Option<SecretString>,"), "{out}");
+        assert!(out.starts_with("pub struct Creds {\n"), "{out}");
+        assert!(out.contains("}\ninterface X { token: "), "{out}");
         assert!(live.read().unwrap().is_empty());
     }
 }

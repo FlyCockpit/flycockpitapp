@@ -728,3 +728,54 @@ async fn trusted_capture_preserves_a_later_observed_registration() {
     );
     assert!(!live.read().unwrap().scrub(SECRET).contains(SECRET));
 }
+
+#[tokio::test]
+async fn codex_r2_fork_capture_reaches_its_next_round_table() {
+    let parent = std::sync::Arc::new(new_session());
+    let table = std::sync::Arc::new(RedactionTable::empty());
+    parent.persist_redaction_table(&table).unwrap();
+    let live = std::sync::Arc::new(std::sync::RwLock::new(table.clone()));
+    let hub = crate::engine::interrupt::InterruptHub::detached_owning(live.clone(), parent.clone());
+    let child = Session::create_fork(
+        parent.db.clone(),
+        parent.id,
+        None,
+        parent.redaction_key_resolver().clone(),
+        parent.secret_vault().clone(),
+    )
+    .unwrap();
+    assert_ne!(parent.id, child.id);
+    let registry = TrustedChildCaptureRegistry::new();
+    let authority = begin(&registry, &child);
+    publish_audit(&child).await;
+    let leaf = hub.leaf_sharing_redaction();
+    let outcome = registry
+        .verify_and_capture(
+            &child,
+            &table,
+            leaf.redaction_owner().map(|o| o.as_ref()),
+            &authority.to_ingress(),
+            SealedCaptureValue::new(SECRET.to_owned()),
+            NOW_MS,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        TrustedChildCaptureOutcome::Captured {
+            record_id: RECORD_ID.to_owned()
+        }
+    );
+    assert!(
+        !child
+            .persisted_redaction_table()
+            .unwrap()
+            .unwrap()
+            .scrub(SECRET)
+            .contains(SECRET)
+    );
+    let next_round = leaf.current_live_redaction().unwrap();
+    assert!(
+        !next_round.scrub(SECRET).contains(SECRET),
+        "fork capture persisted child table but loop adopts parent-only table next round"
+    );
+}

@@ -1329,12 +1329,32 @@ impl Session {
     /// Bind this in-memory session to a newly created compaction successor.
     /// Subsequent recording, custody, lifecycle, and wire events use
     /// [`Self::live_id`].
+    ///
+    /// Redaction custody moves with the identity: under the redaction cache
+    /// lock (which every committed table write holds or re-checks), the last
+    /// committed table is re-persisted onto the successor's vault item, so a
+    /// registration committed between the predecessor→successor custody copy
+    /// and this adoption is never missing from the resumed successor.
     pub fn adopt_compaction_successor(&self, successor_id: Uuid, successor_short_id: String) {
         let from = self.live_id();
-        *self
-            .live_id
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = successor_id;
+        {
+            let cache = self
+                .redaction_table_json
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *self
+                .live_id
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = successor_id;
+            if from != successor_id
+                && let Err(error) = self.retarget_redaction_custody(&cache, successor_id)
+            {
+                tracing::warn!(
+                    error = %error,
+                    "re-persisting the redaction table onto the compaction successor failed; the next table commit re-persists it"
+                );
+            }
+        }
         *self
             .short_id
             .lock()

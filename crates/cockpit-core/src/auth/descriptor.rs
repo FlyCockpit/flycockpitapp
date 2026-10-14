@@ -165,8 +165,8 @@ pub async fn begin_device_code_login(descriptor: &OAuthDescriptor) -> Result<Dev
         .error_for_status()
         .context("OAuth device-code request failed")?;
     let body = bounded_response_body(response).await?;
-    let parsed: DeviceAuthorizationResponse =
-        serde_json::from_str(&body).context("OAuth device-code response is malformed")?;
+    let parsed: DeviceAuthorizationResponse = crate::config::value_free::from_str(&body)
+        .context("OAuth device-code response is malformed")?;
     ensure_nonempty(&parsed.device_code, "device_code")?;
     ensure_nonempty(&parsed.user_code, "user_code")?;
     let verification_uri = parsed
@@ -667,7 +667,7 @@ fn oauth_client() -> Result<reqwest::Client> {
 
 fn parse_token_response(body: &str) -> Result<Map<String, Value>> {
     let Value::Object(token) =
-        serde_json::from_str(body).context("OAuth token response is malformed")?
+        crate::config::value_free::from_str(body).context("OAuth token response is malformed")?
     else {
         anyhow::bail!("OAuth token response must be a JSON object");
     };

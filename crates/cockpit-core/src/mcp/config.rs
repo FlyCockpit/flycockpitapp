@@ -1380,3 +1380,19 @@ mod value_free_tests {
         assert!(rendered.contains("mcp.example.test/sse"), "{rendered}");
     }
 }
+
+#[cfg(test)]
+mod codex_r2_error_probe {
+    use super::*;
+    #[test]
+    fn codex_r2_escaped_quote_error_is_value_free() {
+        let secret = "NovelQuotedError515Secret78529";
+        let input=serde_json::json!({"servers":{"demo":{"transport":"stdio","command":"server","env":format!("prefix\"{secret}\"suffix")}}}).to_string();
+        let error = McpConfig::parse(&input).unwrap_err();
+        let diagnostic = format!("{error:#} / {error:?}");
+        assert!(
+            !diagnostic.contains(secret),
+            "parse diagnostic leaked: {diagnostic}"
+        );
+    }
+}

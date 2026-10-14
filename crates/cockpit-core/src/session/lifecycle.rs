@@ -278,6 +278,12 @@ pub(crate) fn fail_next_redaction_vault_write_for_test() {
     FAIL_NEXT_REDACTION_VAULT_WRITE.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// Whether an injected vault write failure is still armed (not yet fired).
+#[cfg(test)]
+pub(crate) fn redaction_vault_write_failure_armed_for_test() -> bool {
+    FAIL_NEXT_REDACTION_VAULT_WRITE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) fn persist_empty_redaction_table_on_conn(
     vault: &crate::secure_key::SecretVault,
     conn: &rusqlite::Connection,
@@ -1619,11 +1625,65 @@ impl Session {
     /// updated only after the vault write commits. A failed persist leaves both
     /// the durable vault and every cache advertised as persisted at the last
     /// committed table (persist-before-swap).
+    ///
+    /// The cache lock is held across the vault write, and
+    /// [`Self::adopt_compaction_successor`] takes it to retarget: a persist
+    /// either lands before the retarget (and is copied onto the successor)
+    /// or after it (and targets the successor directly).
     pub fn persist_redaction_table(&self, table: &crate::redact::RedactionTable) -> Result<()> {
         let json = table.to_persisted_json()?;
+        let mut cache = self
+            .redaction_table_json
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         persist_redaction_table_to_vault(&self.secret_vault, self.live_id(), json.as_bytes())?;
-        *self.redaction_table_json.lock().unwrap() = Some(json);
+        *cache = Some(json);
         Ok(())
+    }
+
+    /// Advertise `json` as committed after a transaction wrote it to the
+    /// vault item of `written_for`. When the live identity moved to a
+    /// compaction successor while the transaction ran, the committed table is
+    /// re-persisted onto the successor too (the retarget copied the cache as
+    /// it was BEFORE this commit), so the successor never resumes without a
+    /// registration that committed during the retarget.
+    ///
+    /// The transaction already committed, so a failed re-persist is logged,
+    /// not returned: failing the caller would make it roll its live table
+    /// back BELOW the durable one. The next table commit re-persists the full
+    /// table to the successor.
+    pub(crate) fn commit_redaction_cache(&self, written_for: Uuid, json: String) {
+        let mut cache = self
+            .redaction_table_json
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let live = self.live_id();
+        if live != written_for
+            && let Err(error) =
+                persist_redaction_table_to_vault(&self.secret_vault, live, json.as_bytes())
+        {
+            tracing::warn!(
+                error = %error,
+                "re-persisting a committed redaction table onto the compaction successor failed"
+            );
+        }
+        *cache = Some(json);
+    }
+
+    /// Copy the last committed redaction table onto `successor` under the
+    /// cache lock (called by [`Self::adopt_compaction_successor`] while it
+    /// swaps the live identity).
+    pub(super) fn retarget_redaction_custody(
+        &self,
+        cache: &Option<String>,
+        successor: Uuid,
+    ) -> Result<()> {
+        match cache {
+            Some(json) => {
+                persist_redaction_table_to_vault(&self.secret_vault, successor, json.as_bytes())
+            }
+            None => Ok(()),
+        }
     }
 
     /// Load the last committed redaction table. The in-memory cache is a

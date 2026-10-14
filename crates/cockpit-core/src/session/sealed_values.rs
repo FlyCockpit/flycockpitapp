@@ -196,22 +196,15 @@ impl Session {
         machine_scoped_sealed_redactions(&self.db, &self.secret_vault).await
     }
 
-    /// Create a session-scoped value in the agent-acquired namespace. This is
-    /// deliberately a separate host path from owner create/rotate: it accepts
-    /// an already-minted acquisition id, creates version one only, and cannot
-    /// replace either a scoped or legacy owner-authored slot.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn create_agent_acquired_sealed_value(
-        &self,
-        redaction: &crate::redact::RedactionTable,
-        acquisition_id: &str,
+    /// `base` plus the agent-acquired sealed literal (validated), the table
+    /// [`Self::create_agent_acquired_sealed_value`] then journals and
+    /// persists.
+    pub(crate) fn agent_acquired_sealed_table(
+        base: &crate::redact::RedactionTable,
         record_id: &str,
         name: &str,
-        description: &str,
         value: &str,
-        source_tool_call_id: &str,
-        now_ms: i64,
-    ) -> Result<std::sync::Arc<crate::redact::RedactionTable>> {
+    ) -> Result<crate::redact::RedactionTable> {
         validate_agent_acquired_sealed_value(name, value).map_err(anyhow::Error::from)?;
         let identity = crate::sealed::identity::SealedRedactionIdentity {
             scope: crate::sealed::identity::SealedScopeKind::Session,
@@ -219,7 +212,29 @@ impl Session {
             name: crate::sealed::identity::SealedName::canonical(name)?,
             version: 1,
         };
-        let unioned = redaction.with_forced_sealed_literal(value.to_owned(), identity)?;
+        base.with_forced_sealed_literal(value.to_owned(), identity)
+    }
+
+    /// Create a session-scoped value in the agent-acquired namespace. This is
+    /// deliberately a separate host path from owner create/rotate: it accepts
+    /// an already-minted acquisition id, creates version one only, and cannot
+    /// replace either a scoped or legacy owner-authored slot. `unioned` is the
+    /// table from [`Self::agent_acquired_sealed_table`]; the caller publishes
+    /// it live BEFORE awaiting this write (a cancelled write must never leave
+    /// the durable table ahead of the live one).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_agent_acquired_sealed_value(
+        &self,
+        unioned: &crate::redact::RedactionTable,
+        acquisition_id: &str,
+        record_id: &str,
+        name: &str,
+        description: &str,
+        value: &str,
+        source_tool_call_id: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        validate_agent_acquired_sealed_value(name, value).map_err(anyhow::Error::from)?;
         let protected = crate::redact::protected_redaction_history::ProtectedLiteral::new(
             value.to_owned(),
             crate::redact::protected_redaction_history::RedactionHistorySource::Sealed,
@@ -305,8 +320,8 @@ impl Session {
             .await?;
         // Persist-before-swap: advertise the union as persisted only after the
         // vault write commits, matching [`Session::persist_redaction_table`].
-        *self.redaction_table_json.lock().unwrap() = Some(cache_json);
-        Ok(std::sync::Arc::new(unioned))
+        self.commit_redaction_cache(session_id, cache_json);
+        Ok(())
     }
 
     /// Build the enforced redaction union for text recalled from `target`.
@@ -570,7 +585,7 @@ impl Session {
         // Persist-before-swap: advertise the union as persisted only after the
         // transaction commits, so a rollback never leaves a cache ahead of the
         // durable table.
-        *self.redaction_table_json.lock().unwrap() = Some(json);
+        self.commit_redaction_cache(session_id, json);
         if let Some((authority, key, _policy_digest)) = self.redaction_coverage() {
             authority.invalidate_key(&key);
         }

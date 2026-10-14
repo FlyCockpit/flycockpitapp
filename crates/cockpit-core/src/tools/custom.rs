@@ -328,15 +328,19 @@ impl Tool for CustomBashTool {
         .await?;
         let mut child = cockpit_host::process::spawn_pinned(command)?;
         let child_pid = child.id();
-        let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain(
+        // Narrow backstop at pipe intake, before the head/tail bound.
+        let intake = crate::tools::output_backstop::IntakeObservations::default();
+        let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain_filtered(
             child.stdout.take(),
             CHILD_PIPE_CAPTURE_HEAD_BYTES,
             CHILD_PIPE_CAPTURE_TAIL_BYTES,
+            intake.filter(&ctx.redact),
         );
-        let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain(
+        let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain_filtered(
             child.stderr.take(),
             CHILD_PIPE_CAPTURE_HEAD_BYTES,
             CHILD_PIPE_CAPTURE_TAIL_BYTES,
+            intake.filter(&ctx.redact),
         );
         let status = match tokio::time::timeout(
             std::time::Duration::from_secs(SHELL_TIMEOUT_SECS),
@@ -383,12 +387,13 @@ impl Tool for CustomBashTool {
         // values the session table has never seen and register them, before
         // the output is assembled for the model.
         let redact_config = ctx.config.extended().redact;
-        crate::tools::output_backstop::scrub_command_streams(
+        crate::tools::output_backstop::scrub_command_streams_with_intake(
             &ctx.interrupts,
             &ctx.session,
             &ctx.redact,
             &redact_config,
             &mut [&mut stdout, &mut stderr],
+            intake.take(),
         )
         .await?;
 

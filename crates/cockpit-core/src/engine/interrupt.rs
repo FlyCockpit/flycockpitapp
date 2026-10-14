@@ -1515,9 +1515,9 @@ impl InterruptHub {
         session: Arc<crate::session::Session>,
     ) -> Self {
         Self {
-            redaction: Some(Arc::new(
+            redaction: Some(
                 crate::engine::redaction_owner::SessionRedactionOwner::for_session(table, session),
-            )),
+            ),
             ..Self::detached()
         }
     }
@@ -1566,8 +1566,8 @@ impl InterruptHub {
             registered_interrupts: Mutex::new(None),
             raised_interrupts: Mutex::new(None),
             events: Some(events),
-            redaction: Some(Arc::new(
-                crate::engine::redaction_owner::SessionRedactionOwner::new(redaction, session_id),
+            redaction: Some(crate::engine::redaction_owner::SessionRedactionOwner::new(
+                redaction, session_id,
             )),
             db: Some(db),
             session_id: Some(session_id),
@@ -1674,21 +1674,31 @@ impl InterruptHub {
         let sealed_version = identity.record_id.map(|_| i64::from(identity.version));
 
         let base = guard.current();
-        let table = Arc::new(base.with_forced_sealed_literal(value.clone(), identity)?);
+        let table = guard.link(base.with_forced_sealed_literal(value.clone(), identity)?);
 
-        if session.unjournaled_inference_allowed() {
+        // R9: publish the adoption live BEFORE awaiting its queued journal
+        // transaction. A caller cancelled at that await cannot cancel a
+        // transaction the DB writer already queued; publishing afterwards
+        // would leave the durable table ahead of the live one, and a later
+        // union based on the live table would erase the durable protection.
+        // Publishing first keeps live ⊇ durable whatever happens to the caller.
+        // On an error (the transaction rolled back) the previous table is
+        // restored under the still-held lock.
+        guard.publish_persisted(table.clone());
+        let committed = if session.unjournaled_inference_allowed() {
             // Opt-out: scratch / daemon-less sessions persist the table without
             // journaling (fail-safe, mirrors the inference path).
-            session.persist_redaction_table(&table)?;
+            session.persist_redaction_table(&table)
         } else {
-            // Journal the adoption atomically with the table persist. On any
-            // failure this returns Err having persisted nothing, so the live
-            // table below is only swapped once the adoption is durable.
+            // Journal the adoption atomically with the table persist.
             session
                 .adopt_sealed_literal_journaled(&table, value, sealed_record_id, sealed_version)
-                .await?;
+                .await
+        };
+        if let Err(error) = committed {
+            guard.publish_persisted(base);
+            return Err(error);
         }
-        guard.publish_persisted(table.clone());
         Ok(Some(table))
     }
 

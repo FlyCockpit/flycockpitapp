@@ -2818,6 +2818,9 @@ impl Driver {
             Arc::new(std::sync::RwLock::new(redact.clone())),
             session.clone(),
         ));
+        // Every consumer holds the owner-published (live-linked) table, so any
+        // scrub through a snapshot resolves to the owner's newest generation.
+        let redact = interrupts.current_live_redaction().unwrap_or(redact);
         let ctx = crate::engine::schedule::authority::ScheduleContext {
             session: session.clone(),
             locks: locks.clone(),
@@ -2858,7 +2861,8 @@ impl Driver {
             );
         }
         let root_target = crate::engine::message::QueueTarget::root(root.name.clone());
-        Self {
+        let linked_redact = redact.clone();
+        let mut driver = Self {
             session,
             locks,
             redact,
@@ -3014,7 +3018,12 @@ impl Driver {
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,
             redaction_unsupported_notified: HashSet::new(),
-        }
+        };
+        // The root model was built on the caller's (unlinked) table: rebuild
+        // every model view on the owner-published one, so every send resolves
+        // through the owner's newest table.
+        driver.set_redaction_table(linked_redact);
+        driver
     }
 
     /// Install a legacy plan-level model override before the main loop starts.
@@ -3083,6 +3092,7 @@ impl Driver {
         }
         self.model_override = model_override;
         self.redact = table.clone();
+        self.tandem_set.refresh_redaction(providers, &table);
         self.schedule.set_redaction_table(table);
         Ok(())
     }
@@ -3770,6 +3780,10 @@ impl Driver {
     pub fn set_interrupt_hub(&mut self, hub: Arc<crate::engine::interrupt::InterruptHub>) {
         self.schedule.set_interrupt_hub(hub.clone());
         self.interrupts = hub;
+        // Adopt the new owner's published (live-linked) table at once, so
+        // nothing between this swap and the next round scrubs through the
+        // detached hub's table.
+        self.adopt_live_redaction();
     }
 
     pub(crate) fn set_adopted_process_registry(

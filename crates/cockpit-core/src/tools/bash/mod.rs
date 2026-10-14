@@ -543,7 +543,7 @@ async fn call_bash_inner(
     // Never log the command text: inline `API_KEY=… cmd` assignments and
     // `--token=…` arguments are credentials the table may not know yet.
     tracing::debug!(
-        program = %shell_command_log_identity(command),
+        command = %shell_command_log_identity(command),
         command_bytes = command.len(),
         timeout_ms,
         "bash: spawning"
@@ -1205,37 +1205,16 @@ async fn call_bash_inner(
     Ok(out)
 }
 
-/// A value-free identity of a shell command for diagnostics: the program
-/// name of its first simple command (environment assignments skipped, path
-/// reduced to its file name, restricted to name characters) plus the number
-/// of further words. Arguments and assignment values are never included.
+/// A value-free identity of a shell command for diagnostics: what is
+/// launched (`sh -c`, never a token of the command, whose first word can be
+/// an `AUTH='Bearer …'` assignment) plus content-free counts — bytes, lines
+/// and whitespace-separated words. No part of the command text is included.
 pub(crate) fn shell_command_log_identity(command: &str) -> String {
-    let mut words = command.split_whitespace();
-    let mut program = None;
-    let mut rest = 0usize;
-    for word in words.by_ref() {
-        if program.is_none() && word.contains('=') {
-            continue;
-        }
-        if program.is_none() {
-            let name = word.rsplit('/').next().unwrap_or(word);
-            let name: String = name
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
-                .take(64)
-                .collect();
-            program = Some(if name.is_empty() {
-                "?".to_string()
-            } else {
-                name
-            });
-        } else {
-            rest += 1;
-        }
-    }
     format!(
-        "{} (+{rest} words)",
-        program.unwrap_or_else(|| "?".to_string())
+        "sh -c <command: {} bytes, {} lines, {} words>",
+        command.len(),
+        command.lines().count().max(1),
+        command.split_whitespace().count()
     )
 }
 
@@ -2014,6 +1993,9 @@ struct ShellOutcome {
     exit: i32,
     signaled: bool,
     success: bool,
+    /// What the narrow scanner replaced while the pipes were read, before
+    /// the bounded capture dropped anything (registered by the backstop).
+    intake_observed: Vec<crate::redact::ObservedSecret>,
 }
 
 /// Internal run result, distinguishing the abort paths from a completed
@@ -2877,12 +2859,14 @@ async fn scrub_shell_outcome_novel_secrets(
     if crate::tools::trusted_child_acquisition::acquisition_quarantines_shell_output() {
         return Ok(());
     }
-    crate::tools::output_backstop::scrub_command_byte_streams(
+    let intake = std::mem::take(&mut outcome.intake_observed);
+    crate::tools::output_backstop::scrub_command_byte_streams_with_intake(
         &ctx.interrupts,
         &ctx.session,
         &ctx.redact,
         cfg,
         &mut [&mut outcome.stdout, &mut outcome.stderr],
+        intake,
     )
     .await
 }
@@ -3149,15 +3133,21 @@ async fn run_prepared_command(
     };
     let child_pid = child.id();
 
-    let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain(
+    // Narrow novel-secret backstop at PIPE INTAKE (secrets I2): the scanner
+    // sees every byte before the head/tail bound omits the middle, so secret
+    // context in the omitted part still governs the retained lines.
+    let intake = crate::tools::output_backstop::IntakeObservations::default();
+    let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain_filtered(
         child.stdout.take(),
         CHILD_PIPE_CAPTURE_HEAD_BYTES,
         CHILD_PIPE_CAPTURE_TAIL_BYTES,
+        intake.filter(&ctx.redact),
     );
-    let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain(
+    let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain_filtered(
         child.stderr.take(),
         CHILD_PIPE_CAPTURE_HEAD_BYTES,
         CHILD_PIPE_CAPTURE_TAIL_BYTES,
+        intake.filter(&ctx.redact),
     );
 
     let timeout = std::time::Duration::from_millis(timeout_ms);
@@ -3260,6 +3250,7 @@ async fn run_prepared_command(
                     interrupts: ctx.interrupts.clone(),
                     session: ctx.session.clone(),
                     redact_config: ctx.config.extended().redact,
+                    intake: intake.clone(),
                 },
             )
             .await;
@@ -3291,6 +3282,7 @@ async fn run_prepared_command(
         exit,
         signaled,
         success: status.success(),
+        intake_observed: intake.take(),
     })
 }
 
@@ -3301,6 +3293,7 @@ struct AdoptedOutputBackstop {
     interrupts: std::sync::Arc<crate::engine::interrupt::InterruptHub>,
     session: std::sync::Arc<crate::session::Session>,
     redact_config: crate::config::extended::RedactConfig,
+    intake: crate::tools::output_backstop::IntakeObservations,
 }
 
 impl AdoptedOutputBackstop {
@@ -3313,12 +3306,13 @@ impl AdoptedOutputBackstop {
         mut stdout: String,
         mut stderr: String,
     ) -> (String, String) {
-        match crate::tools::output_backstop::scrub_command_streams(
+        match crate::tools::output_backstop::scrub_command_streams_with_intake(
             &self.interrupts,
             &self.session,
             redact,
             &self.redact_config,
             &mut [&mut stdout, &mut stderr],
+            self.intake.take(),
         )
         .await
         {

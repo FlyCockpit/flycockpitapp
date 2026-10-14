@@ -1059,6 +1059,26 @@ impl From<AgentRoleArg> for cockpit_proto::AgentInstallationRoleV1 {
     }
 }
 
+/// A daemon-issued installation continuation token on the command line.
+/// It is the authority to complete the pending choice, so the derived
+/// `Debug` of [`AgentCommand`] prints it as `<redacted>`.
+#[derive(Clone)]
+pub struct ContinuationTokenArg(pub String);
+
+impl std::str::FromStr for ContinuationTokenArg {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_string()))
+    }
+}
+
+impl std::fmt::Debug for ContinuationTokenArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Subcommand)]
 #[command(
     after_help = "Agent operation exit codes:\n  3  daemon choice required\n  4  acknowledgement required\n  5  primary slot unusable\n  6  optional slot unbound\n  7  rebind required\n  8  conflict"
@@ -1143,7 +1163,7 @@ pub enum AgentCommand {
     /// Submit one daemon-issued agent binding choice.
     SubmitChoice {
         #[arg(value_name = "CONTINUATION_TOKEN")]
-        continuation_token: String,
+        continuation_token: ContinuationTokenArg,
         #[arg(value_name = "CHOICE_ID", required_unless_present = "defer")]
         choice_id: Option<String>,
         /// Leave the selected slot unbound without exposing a provider route.

@@ -26,7 +26,7 @@ pub enum WaylandFocusGuarantee {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WaylandCapabilityDescriptor {
     pub kind: WaylandProviderKind,
     pub implementation: String,
@@ -43,6 +43,29 @@ pub struct WaylandCapabilityDescriptor {
     /// XWayland presence must never upgrade to native Wayland proof.
     pub xwayland_present: bool,
     pub registered: bool,
+}
+
+impl std::fmt::Debug for WaylandCapabilityDescriptor {
+    /// Portal session / source / display tokens authorize the capture
+    /// session: print their lengths only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaylandCapabilityDescriptor")
+            .field("kind", &self.kind)
+            .field("implementation", &self.implementation)
+            .field("version", &self.version)
+            .field("session_token_len", &self.session_token.len())
+            .field("source_token_len", &self.source_token.len())
+            .field("display_token_len", &self.display_token.len())
+            .field("focus_guarantee", &self.focus_guarantee)
+            .field("backend_generation", &self.backend_generation)
+            .field("portal_expired", &self.portal_expired)
+            .field("portal_revoked", &self.portal_revoked)
+            .field("source_replaced", &self.source_replaced)
+            .field("reconnected", &self.reconnected)
+            .field("xwayland_present", &self.xwayland_present)
+            .field("registered", &self.registered)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

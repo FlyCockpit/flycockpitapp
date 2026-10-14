@@ -128,6 +128,8 @@ pub(crate) enum HeaderSessionStatus {
     Attention,
     Reconnecting,
     Working,
+    /// The last turn ended in a terminal inference failure.
+    Failed,
     Done,
     #[default]
     Idle,
@@ -139,6 +141,7 @@ impl HeaderSessionStatus {
             HeaderSessionStatus::Attention => "● Waiting",
             HeaderSessionStatus::Reconnecting => "● Reconnecting",
             HeaderSessionStatus::Working => "● Working",
+            HeaderSessionStatus::Failed => "● Error",
             HeaderSessionStatus::Done => "● Done",
             HeaderSessionStatus::Idle => "● Idle",
         }
@@ -149,6 +152,7 @@ impl HeaderSessionStatus {
             HeaderSessionStatus::Attention => RED,
             HeaderSessionStatus::Reconnecting => YELLOW,
             HeaderSessionStatus::Working => YELLOW,
+            HeaderSessionStatus::Failed => RED,
             HeaderSessionStatus::Done => GREEN,
             HeaderSessionStatus::Idle => DISABLED,
         }
@@ -158,7 +162,7 @@ impl HeaderSessionStatus {
     /// non-truecolor terminal sees for this status.
     fn color_index(self) -> u8 {
         match self {
-            HeaderSessionStatus::Attention => RED_INDEX,
+            HeaderSessionStatus::Attention | HeaderSessionStatus::Failed => RED_INDEX,
             HeaderSessionStatus::Reconnecting | HeaderSessionStatus::Working => YELLOW_INDEX,
             HeaderSessionStatus::Done => GREEN_INDEX,
             HeaderSessionStatus::Idle => DISABLED_INDEX,

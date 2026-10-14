@@ -1325,23 +1325,14 @@ fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Resul
                 Err(error) => return Some(Err(anyhow!("model `{id}` capabilities: {error}"))),
             };
 
-            // Stash every remaining field into `extra` so re-saving
-            // doesn't lose provider-specific metadata.
-            let mut extra = Map::new();
-            for (k, v) in obj {
-                if matches!(
-                    k.as_str(),
-                    "id" | "name"
-                        | "display_name"
-                        | "thinking_modes"
-                        | "inputs"
-                        | "context_length"
-                        | "max_tokens"
-                ) {
-                    continue;
-                }
-                extra.insert(k.clone(), v.clone());
-            }
+            // Raw upstream metadata is deliberately NOT retained. The typed
+            // projection above (name, context, capabilities) is the catalog
+            // contract; the remaining upstream fields (descriptions,
+            // benchmarks, pricing tables, links, ...) have no consumer and
+            // roughly double a large catalog's persisted and wire size —
+            // OpenRouter's 462-model catalog is ~770 KB raw, which used to be
+            // stored twice per model and pushed every provider snapshot past
+            // the interactive RPC payload limit (#545).
 
             // Several providers include a request context window under
             // different names. Keep `context_length` in sync with the typed
@@ -1384,10 +1375,10 @@ fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Resul
                 // (implementation note).
                 wire_api: Default::default(),
                 wire_api_provenance: Default::default(),
-                extra: extra.clone(),
+                extra: Map::new(),
                 capabilities,
                 capability_overrides: Default::default(),
-                provider_metadata: extra,
+                provider_metadata: Map::new(),
             }))
         })
         .collect()
@@ -1836,7 +1827,7 @@ fn reasoning_effort_capability_from_metadata(
 
     // A default without selectable values cannot establish either a valid UI
     // choice or an outbound request encoding. Treat it as informational
-    // provider metadata only (it remains in `provider_metadata`).
+    // provider metadata only and is not projected.
     if values.is_empty() {
         return Ok(None);
     }
@@ -2132,7 +2123,10 @@ mod tests {
         let entries = parse_models_body(body).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "gpt-5.2");
-        assert!(entries[0].extra.contains_key("created"));
+        // Raw upstream fields are not retained (#545): the typed projection
+        // is the catalog contract.
+        assert!(entries[0].extra.is_empty());
+        assert!(entries[0].provider_metadata.is_empty());
     }
 
     #[test]
@@ -2161,22 +2155,9 @@ mod tests {
         assert_eq!(model.context_length, Some(262144));
         assert_eq!(model.capabilities.context_tokens, Some(262144));
         assert_eq!(model.capabilities.max_output_tokens, Some(16384));
-        assert_eq!(
-            model
-                .provider_metadata
-                .get("pricing")
-                .and_then(Value::as_object)
-                .and_then(|pricing| pricing.get("prompt"))
-                .and_then(Value::as_str),
-            Some("0.000001")
-        );
-        assert_eq!(
-            model
-                .provider_metadata
-                .get("quantization")
-                .and_then(Value::as_str),
-            Some("fp8")
-        );
+        // Pricing/quantization have no typed consumer and are not retained.
+        assert!(model.provider_metadata.is_empty());
+        assert!(model.extra.is_empty());
     }
 
     #[test]
@@ -2208,24 +2189,7 @@ mod tests {
         let model = &entries[0];
         assert_eq!(model.id, "gpt-5.2-codex");
         assert_eq!(model.name.as_deref(), Some("GPT-5.2 Codex"));
-        assert_eq!(
-            model.provider_metadata.get("slug").and_then(Value::as_str),
-            Some("gpt-5.2-codex")
-        );
-        assert_eq!(
-            model
-                .provider_metadata
-                .get("default_reasoning_level")
-                .and_then(Value::as_str),
-            Some("minimal")
-        );
-        assert_eq!(
-            model
-                .provider_metadata
-                .get("family")
-                .and_then(Value::as_str),
-            Some("gpt-5")
-        );
+        assert!(model.provider_metadata.is_empty());
 
         let reasoning = model
             .capabilities
@@ -2443,20 +2407,8 @@ mod tests {
         let entries = parse_models_body(body).unwrap();
         assert_eq!(entries[0].thinking_modes.len(), 2);
         assert_eq!(entries[0].inputs.as_ref().unwrap().images, Some(true));
-        assert_eq!(
-            entries[0]
-                .provider_metadata
-                .get("owned_by")
-                .and_then(serde_json::Value::as_str),
-            Some("provider")
-        );
-        assert_eq!(
-            entries[0]
-                .extra
-                .get("owned_by")
-                .and_then(serde_json::Value::as_str),
-            Some("provider")
-        );
+        assert!(entries[0].provider_metadata.is_empty());
+        assert!(entries[0].extra.is_empty());
     }
 
     #[test]
@@ -4379,7 +4331,7 @@ mod tests {
     }
 
     #[test]
-    fn baseten_models_preserve_unknown_catalog_metadata() {
+    fn baseten_models_drop_unknown_catalog_metadata() {
         // Table-driven unrecognised field shapes: absent key, object, array,
         // number, boolean, null, and malformed (non-object) top-level data entry.
         let cases: &[(&str, &str, serde_json::Value)] = &[
@@ -4423,8 +4375,9 @@ mod tests {
                 "null" => "weird",
                 _ => unreachable!(),
             };
+            // Unknown upstream fields are dropped rather than retained.
             for bag in [&m.extra, &m.provider_metadata] {
-                assert_eq!(bag.get(key), Some(expected), "{label}");
+                assert!(bag.get(key).is_none(), "{label}: {expected}");
             }
             let cfg = crate::config::providers::ProvidersConfig {
                 providers: std::collections::BTreeMap::from([(
@@ -4447,7 +4400,7 @@ mod tests {
 
         // Absent: bare id has no opaque capability/price keys and stays Unknown.
         let bare = parse_models_body(r#"{"data":[{"id":"m-absent"}]}"#).unwrap();
-        assert!(bare[0].extra.is_empty() || bare[0].extra.get("id").is_none());
+        assert!(bare[0].extra.is_empty());
         assert!(bare[0].cost_rank.is_none());
         let cfg = crate::config::providers::ProvidersConfig {
             providers: std::collections::BTreeMap::from([(
@@ -4468,29 +4421,17 @@ mod tests {
                 .expect("malformed siblings");
         assert_eq!(mixed.len(), 1);
         assert_eq!(mixed[0].id, "kept");
-        assert_eq!(
-            mixed[0]
-                .provider_metadata
-                .get("nested")
-                .and_then(|v| v.get("a")),
-            Some(&serde_json::json!([1, 2]))
-        );
+        assert!(mixed[0].provider_metadata.is_empty());
 
-        // Malformed field values remain opaque without widening capabilities.
+        // Malformed field values are dropped without widening capabilities.
         let malformed_field = parse_models_body(
             r#"{"data":[{"id":"m-mal","pricing":"not-an-object","capabilities":"nope"}]}"#,
         )
         .expect("malformed field values");
         assert_eq!(malformed_field.len(), 1);
         assert!(malformed_field[0].cost_rank.is_none());
-        assert_eq!(
-            malformed_field[0].extra.get("pricing"),
-            Some(&serde_json::json!("not-an-object"))
-        );
-        assert_eq!(
-            malformed_field[0].provider_metadata.get("capabilities"),
-            Some(&serde_json::json!("nope"))
-        );
+        assert!(malformed_field[0].extra.is_empty());
+        assert!(malformed_field[0].provider_metadata.is_empty());
         let cfg = crate::config::providers::ProvidersConfig {
             providers: std::collections::BTreeMap::from([(
                 "baseten".into(),

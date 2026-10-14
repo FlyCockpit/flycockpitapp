@@ -152,12 +152,59 @@ impl ApiKeyTemplate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthCheckKind {
+    /// The authenticated `/models` catalog fetch is the credential proof.
     ModelsEndpoint,
+    /// The provider's `/models` catalog is public: it answers 200 without (or
+    /// with a wrong) credential, so a catalog fetch proves nothing about the
+    /// key (#550). `GET {base}{path}` — an endpoint that does authenticate —
+    /// is the proof, and the catalog is fetched only after it succeeds.
+    AuthenticatedGetThenModels {
+        path: &'static str,
+        docs_url: &'static str,
+    },
     ChatCompletions {
         path: &'static str,
         model: &'static str,
         docs_url: &'static str,
     },
+}
+
+/// OpenRouter's `/models` is public; `/key` returns 401 for an unknown key.
+pub const OPENROUTER_AUTH_CHECK: AuthCheckKind = AuthCheckKind::AuthenticatedGetThenModels {
+    path: "/key",
+    docs_url: "https://openrouter.ai/keys",
+};
+
+/// Base-URL hosts whose `/models` catalog answers without authenticating the
+/// caller, mapped to the authenticated probe that replaces it. A generic
+/// (`openai-compatible` or template-less) entry pointed at one of these hosts
+/// must not pass verification on the catalog alone.
+const PUBLIC_CATALOG_HOST_AUTH_CHECKS: &[(&str, AuthCheckKind)] =
+    &[("openrouter.ai", OPENROUTER_AUTH_CHECK)];
+
+/// The credential check that actually authenticates for `base_url`: the
+/// template's own check, upgraded to the host's authenticated probe when a
+/// models-endpoint check would hit a known public catalog.
+pub fn effective_auth_check(declared: AuthCheckKind, base_url: &str) -> AuthCheckKind {
+    if declared != AuthCheckKind::ModelsEndpoint {
+        return declared;
+    }
+    public_catalog_auth_check(base_url).unwrap_or(declared)
+}
+
+/// The authenticated probe for a base URL whose `/models` catalog is public.
+pub fn public_catalog_auth_check(base_url: &str) -> Option<AuthCheckKind> {
+    let host = url::Url::parse(base_url)
+        .ok()?
+        .host_str()?
+        .to_ascii_lowercase();
+    // An absolute DNS name's terminal dot (`openrouter.ai.`) reaches the same
+    // service and must not bypass the match (review C5).
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    PUBLIC_CATALOG_HOST_AUTH_CHECKS
+        .iter()
+        .find(|(public, _)| host == *public || host.ends_with(&format!(".{public}")))
+        .map(|(_, check)| *check)
 }
 
 /// The catalog the wizard cycles through. `openai-compatible` is first
@@ -459,7 +506,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
             console_url: "https://openrouter.ai/keys",
         }),
         usage_probe: None,
-        auth_check: AuthCheckKind::ModelsEndpoint,
+        auth_check: OPENROUTER_AUTH_CHECK,
     },
     ProviderTemplate {
         id: "deepseek",

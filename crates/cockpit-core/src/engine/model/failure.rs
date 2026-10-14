@@ -264,6 +264,201 @@ pub(crate) fn safe_inference_error_detail(err: &anyhow::Error) -> Option<SafePro
     })
 }
 
+/// Longest provider-authored message the user-facing inline error carries.
+const MAX_USER_PROVIDER_MESSAGE_CHARS: usize = 300;
+/// Longest provider error `code` token accepted for display.
+const MAX_USER_PROVIDER_CODE_BYTES: usize = 64;
+/// Opaque token-like runs at least this long are masked before display: a
+/// provider may echo a key, request signature, or account token that the
+/// redaction table does not know about.
+const MIN_MASKED_OPAQUE_RUN_CHARS: usize = 40;
+/// JSON candidates tried while looking for the provider's error envelope.
+const MAX_ERROR_ENVELOPE_CANDIDATES: usize = 8;
+
+/// User-facing projection of a terminal failure's provider error, for the
+/// UI-only `InferenceFailed` event and nothing else (#551).
+///
+/// The fail-closed funnel ([`safe_provider_detail`]) still governs every sink
+/// that persists, audits, reports to a parent agent, or can reach model
+/// context; those keep the fixed [`PROVIDER_DETAIL_OMITTED`] marker. The inline
+/// red error is the one surface a human reads, and an opaque marker there makes
+/// a bad key or a mistyped model id undiagnosable. This projection therefore
+/// shows the provider's *structured* `error.message` / `error.code` only:
+///
+/// * the raw body is never shown: only those two fields of a JSON error
+///   envelope are read (OpenRouter's wrapped `metadata.raw` upstream envelope
+///   is unwrapped the same way); a non-JSON body yields the marker;
+/// * the code is accepted only as a short `[A-Za-z0-9_.:-]` token or a number;
+/// * control characters (terminal escapes included) are removed, whitespace is
+///   collapsed, opaque token-like runs are masked, and the message is bounded;
+/// * the result is scrubbed through the session redaction table (the daemon
+///   event boundary scrubs it again).
+pub fn user_facing_provider_error(
+    failure: &InferenceFailure,
+    redact: &crate::redact::RedactionTable,
+) -> String {
+    let Some((message, code)) = provider_error_envelope(&failure.detail) else {
+        return PROVIDER_DETAIL_OMITTED.to_string();
+    };
+    // Redaction runs on each COMPLETE field before any transformation:
+    // truncating or masking first could split a registered secret so its
+    // remainder no longer matches the table (review C1). The enforced view
+    // is used because owner event delivery has no later scrub.
+    let table = redact.enforced();
+    let message = message
+        .map(|message| table.scrub(&message))
+        .map(|message| sanitize_provider_text(&message))
+        .filter(|message| !message.is_empty());
+    // A code is shown only when it still looks like a semantic error code
+    // after scrubbing; opaque or token-like values are dropped (review C2).
+    let code = code
+        .map(|code| table.scrub(&code))
+        .filter(|code| semantic_error_code(code))
+        .filter(|code| {
+            Some(code.as_str()) != failure.observed_status.map(|s| s.to_string()).as_deref()
+        });
+    let text = match (message, code) {
+        (Some(message), Some(code)) => format!("{message} [{code}]"),
+        (Some(message), None) => message,
+        (None, Some(code)) => format!("[{code}]"),
+        (None, None) => return PROVIDER_DETAIL_OMITTED.to_string(),
+    };
+    // Bound the final projection, then scrub once more as defense in depth.
+    table.scrub(&bound_chars(&text, MAX_USER_PROVIDER_MESSAGE_CHARS))
+}
+
+/// Longest `-`/`_`/`.`/`:`-separated segment a displayed error code may have.
+/// Real codes (`invalid_function_parameters`, `model_not_found`, `1113`) are
+/// short words; a long segment is an opaque token, never a category.
+const MAX_ERROR_CODE_SEGMENT_CHARS: usize = 24;
+
+fn semantic_error_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_USER_PROVIDER_CODE_BYTES
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+        && code
+            .split(['_', '.', ':', '-'])
+            .all(|segment| segment.len() <= MAX_ERROR_CODE_SEGMENT_CHARS)
+}
+
+fn bound_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max - 1).collect::<String>();
+    out.push('…');
+    out
+}
+
+/// `(error.message, error.code)` from the first JSON error envelope embedded
+/// in `detail`. Rig renders an HTTP failure as `... with message: {body}`, so
+/// the envelope is located by trying the first few `{` offsets.
+fn provider_error_envelope(detail: &str) -> Option<(Option<String>, Option<String>)> {
+    detail
+        .match_indices('{')
+        .take(MAX_ERROR_ENVELOPE_CANDIDATES)
+        .find_map(|(offset, _)| {
+            let value = serde_json::Deserializer::from_str(&detail[offset..])
+                .into_iter::<serde_json::Value>()
+                .next()?
+                .ok()?;
+            envelope_fields(&value)
+        })
+}
+
+fn envelope_fields(value: &serde_json::Value) -> Option<(Option<String>, Option<String>)> {
+    let object = value.as_object()?;
+    let error = match object.get("error") {
+        Some(serde_json::Value::Object(error)) => error,
+        // `{"error": "text", "code": ...}` (xAI and others).
+        Some(serde_json::Value::String(message)) => {
+            return Some((Some(message.clone()), error_code(object.get("code"))));
+        }
+        _ => object,
+    };
+    let mut message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut code = error_code(error.get("code")).or_else(|| error_code(error.get("type")));
+    // OpenRouter wraps the routed provider's own envelope as a JSON string in
+    // `metadata.raw` behind a generic "Provider returned error" message.
+    if let Some(raw) = error
+        .get("metadata")
+        .and_then(|metadata| metadata.get("raw"))
+        .and_then(serde_json::Value::as_str)
+        && let Ok(inner) = serde_json::from_str::<serde_json::Value>(raw)
+        && let Some((inner_message, inner_code)) = envelope_fields(&inner)
+    {
+        if inner_message.is_some() {
+            message = inner_message;
+        }
+        if inner_code.is_some() {
+            code = inner_code;
+        }
+    }
+    (message.is_some() || code.is_some()).then_some((message, code))
+}
+
+/// The raw code field; validation happens after redaction in
+/// [`user_facing_provider_error`].
+fn error_code(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::String(code) if !code.is_empty() => Some(code.clone()),
+        _ => None,
+    }
+}
+
+/// Control characters removed, whitespace collapsed, opaque runs masked, and
+/// the result bounded to [`MAX_USER_PROVIDER_MESSAGE_CHARS`].
+fn sanitize_provider_text(raw: &str) -> String {
+    let flattened = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>();
+    let mut out = String::new();
+    for word in flattened.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&mask_opaque_runs(word));
+    }
+    if out.chars().count() > MAX_USER_PROVIDER_MESSAGE_CHARS {
+        out = out
+            .chars()
+            .take(MAX_USER_PROVIDER_MESSAGE_CHARS - 1)
+            .collect::<String>();
+        out.push('…');
+    }
+    out
+}
+
+fn mask_opaque_runs(word: &str) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.chars().count() >= MIN_MASKED_OPAQUE_RUN_CHARS {
+            out.push('…');
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in word.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '=') {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 /// Log a best-effort utility-model failure without formatting provider-owned
 /// completion errors. Non-inference control/configuration errors keep their
 /// useful internal diagnostic; provider errors are reduced to the same fixed
@@ -493,5 +688,178 @@ mod tests {
         assert_eq!(safe.marker, PROVIDER_DETAIL_OMITTED);
         assert_eq!(safe.observed_status, Some(429));
         assert_eq!(safe.recovery, ProviderRecoverySignal::BillingExhausted);
+    }
+
+    fn http_failure(status: u16, body: &str) -> InferenceFailure {
+        let err = rig::completion::CompletionError::HttpError(
+            rig::http_client::Error::InvalidStatusCodeWithMessage(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                body.to_string(),
+            ),
+        );
+        InferenceFailure {
+            provider: "openrouter".into(),
+            model: "deepseek/deepseek-v9-doesnotexist".into(),
+            phase: "dispatched".into(),
+            class: InferenceErrorClass::Http(status),
+            elapsed_ms: 1,
+            retry_attempts: 0,
+            detail: err.to_string(),
+            observed_status: Some(status),
+            recovery: ProviderRecoverySignal::None,
+        }
+    }
+
+    /// #551: the inline error shows the provider's structured message, not
+    /// the opaque marker — and nothing else from the body (`user_id`).
+    #[test]
+    fn user_facing_error_shows_structured_provider_message_only() {
+        let failure = http_failure(
+            400,
+            r#"{"error":{"message":"deepseek/deepseek-v9-doesnotexist is not a valid model ID","code":400},"user_id":"user_2abcdefSECRETUSER"}"#,
+        );
+        let shown = user_facing_provider_error(&failure, &crate::redact::RedactionTable::empty());
+        assert_eq!(
+            shown,
+            "deepseek/deepseek-v9-doesnotexist is not a valid model ID"
+        );
+        // The persisted/audit funnel is unchanged: still the fixed marker.
+        assert_eq!(
+            safe_provider_detail(&failure).marker,
+            PROVIDER_DETAIL_OMITTED
+        );
+    }
+
+    #[test]
+    fn user_facing_error_unwraps_openrouter_upstream_envelope() {
+        let raw = serde_json::json!({
+            "error": {
+                "message": "Invalid schema for function 'task': 'propertyNames' is not permitted.",
+                "type": "invalid_request_error",
+                "code": "invalid_function_parameters",
+                "param": "tools[21].parameters"
+            }
+        })
+        .to_string();
+        let body = serde_json::json!({
+            "error": {
+                "message": "Provider returned error",
+                "code": 400,
+                "metadata": {"raw": raw, "provider_name": "OpenAI"}
+            }
+        })
+        .to_string();
+        let shown = user_facing_provider_error(
+            &http_failure(400, &body),
+            &crate::redact::RedactionTable::empty(),
+        );
+        assert_eq!(
+            shown,
+            "Invalid schema for function 'task': 'propertyNames' is not permitted. [invalid_function_parameters]"
+        );
+    }
+
+    /// The projection never relaxes the secret boundary: known secrets are
+    /// scrubbed, unknown opaque tokens are masked, terminal escapes are
+    /// stripped, and a non-JSON body yields the marker.
+    #[test]
+    fn user_facing_error_scrubs_masks_and_fails_closed() {
+        const KNOWN: &str = "known-session-secret-value-1234567890";
+        const UNKNOWN_KEY: &str =
+            "opaque_token_fixture_0123456789abcdef0123456789abcdef01234567";
+        let table = crate::redact::RedactionTable::empty()
+            .with_forced_literal(KNOWN.to_string(), "test".into())
+            .unwrap();
+        let body = serde_json::json!({
+            "error": {
+                "message": format!("bad key {UNKNOWN_KEY} for \u{1b}[31maccount {KNOWN}\u{7}"),
+                "code": "invalid_api_key"
+            }
+        })
+        .to_string();
+        let shown = user_facing_provider_error(&http_failure(401, &body), &table);
+        assert!(!shown.contains(KNOWN), "{shown}");
+        assert!(!shown.contains(UNKNOWN_KEY), "{shown}");
+        assert!(
+            !shown.contains('\u{1b}') && !shown.contains('\u{7}'),
+            "{shown:?}"
+        );
+        assert!(shown.starts_with("bad key … for"), "{shown}");
+        assert!(shown.ends_with("[invalid_api_key]"), "{shown}");
+
+        let plain = user_facing_provider_error(
+            &http_failure(502, "<html>Bad Gateway SECRET</html>"),
+            &table,
+        );
+        assert_eq!(plain, PROVIDER_DETAIL_OMITTED);
+
+        let bounded = user_facing_provider_error(
+            &http_failure(
+                400,
+                &serde_json::json!({"error": {"message": "word ".repeat(400)}}).to_string(),
+            ),
+            &table,
+        );
+        assert_eq!(bounded.chars().count(), MAX_USER_PROVIDER_MESSAGE_CHARS);
+    }
+
+    /// Review C1: a registered secret is scrubbed as a whole literal before
+    /// truncation or opaque-run masking could split it.
+    #[test]
+    fn user_facing_error_redacts_registered_secrets_before_transforming() {
+        const CROSSING: &str = "registered-credential-crossing-cutoff-0042";
+        let masked_inside = format!("prefix{}/private-fragment", "a".repeat(50));
+        let table = crate::redact::RedactionTable::empty()
+            .with_forced_literal(CROSSING.to_string(), "test".into())
+            .unwrap()
+            .with_forced_literal(masked_inside.clone(), "test".into())
+            .unwrap();
+        let near_cutoff = format!("{} {CROSSING}", "x".repeat(280));
+        let shown = user_facing_provider_error(
+            &http_failure(
+                401,
+                &serde_json::json!({"error": {"message": near_cutoff}}).to_string(),
+            ),
+            &table,
+        );
+        assert!(!shown.contains("registered-credential"), "{shown}");
+        assert!(
+            shown.chars().count() <= MAX_USER_PROVIDER_MESSAGE_CHARS,
+            "{shown}"
+        );
+        let shown = user_facing_provider_error(
+            &http_failure(
+                401,
+                &serde_json::json!({"error": {"message": format!("echo {masked_inside}")}})
+                    .to_string(),
+            ),
+            &table,
+        );
+        assert!(!shown.contains("private-fragment"), "{shown}");
+    }
+
+    /// Review C2: `error.code` is shown only as a short semantic token; an
+    /// opaque credential-shaped code is dropped, never emitted verbatim.
+    #[test]
+    fn user_facing_error_drops_opaque_codes() {
+        const OPAQUE: &str = "opaque_token_fixture_0123456789abcdef0123456789ab";
+        let table = crate::redact::RedactionTable::empty();
+        let shown = user_facing_provider_error(
+            &http_failure(
+                401,
+                &serde_json::json!({"error": {"message": "denied", "code": OPAQUE}}).to_string(),
+            ),
+            &table,
+        );
+        assert_eq!(shown, "denied");
+        let shown = user_facing_provider_error(
+            &http_failure(
+                400,
+                &serde_json::json!({"error": {"message": "nope", "code": "model_not_found"}})
+                    .to_string(),
+            ),
+            &table,
+        );
+        assert_eq!(shown, "nope [model_not_found]");
     }
 }

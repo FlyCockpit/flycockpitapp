@@ -1380,3 +1380,95 @@ fn coverage_header_keeps_global_and_attachment_state_separate() {
             .any(|p| p.kind == HeaderPillKind::Coverage)
     );
 }
+
+/// #551: a turn that ended in a terminal provider error reads `● Error`, not
+/// `● Done`, and carries actionable guidance built from the scrubbed provider
+/// message; a later successful reply settles back to done.
+#[test]
+fn failed_turn_reads_error_with_actionable_guidance() {
+    use crate::tui::chat_header::HeaderSessionStatus;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut app = App::new(Some(tmp.path()), false);
+    app.history.push(user_entry("Say hi in one word."));
+    app.apply_event(cockpit_client::presentation::TurnEvent::InferenceFailed {
+        agent: "Build".into(),
+        provider: "openrouter".into(),
+        model: "deepseek/deepseek-v9-doesnotexist".into(),
+        error_class: cockpit_proto::InferenceErrorClass::Http(400),
+        detail: "deepseek/deepseek-v9-doesnotexist is not a valid model ID".into(),
+        auth_failure: None,
+    });
+    assert_eq!(app.chat_header_state().status, HeaderSessionStatus::Failed);
+    let summary = app
+        .history
+        .iter()
+        .find_map(|entry| match entry {
+            HistoryEntry::InferenceError { summary, .. } => Some(summary.clone()),
+            _ => None,
+        })
+        .expect("inline error row");
+    assert!(
+        summary.contains("is not a valid model ID"),
+        "the provider's reason is shown: {summary}"
+    );
+    let guidance = plain_lines(&app);
+    assert!(
+        guidance.iter().any(|line| line
+            .contains("openrouter does not serve `deepseek/deepseek-v9-doesnotexist`")
+            && line.contains("/model")),
+        "{guidance:?}"
+    );
+
+    app.history.push(user_entry("again"));
+    app.history.push(agent_entry("hi"));
+    assert_eq!(app.chat_header_state().status, HeaderSessionStatus::Done);
+}
+
+#[test]
+fn rejected_key_guidance_points_at_provider_settings() {
+    let guidance = super::events::inference_failure_guidance(
+        &cockpit_proto::InferenceErrorClass::Http(401),
+        "User not found.",
+        "openrouter",
+        "deepseek/deepseek-v4.1-flash",
+    )
+    .expect("401 is actionable");
+    assert!(guidance.contains("rejected the API key"), "{guidance}");
+    assert!(guidance.contains("/settings › Providers"), "{guidance}");
+    // Retryable classes defer to the daemon's `continue` notice.
+    assert!(
+        super::events::inference_failure_guidance(
+            &cockpit_proto::InferenceErrorClass::Http(503),
+            "overloaded",
+            "openrouter",
+            "m",
+        )
+        .is_none()
+    );
+}
+
+/// Review C9: a generic "does not exist" about a request parameter is not
+/// an unknown-model failure; a structured model code is.
+#[test]
+fn unknown_model_guidance_requires_a_model_signal() {
+    use cockpit_proto::InferenceErrorClass as Class;
+    let generic = super::events::inference_failure_guidance(
+        &Class::Http(400),
+        "The request parameter 'temperature' does not exist",
+        "openrouter",
+        "vendor/valid-model",
+    )
+    .expect("400 is actionable");
+    assert!(!generic.contains("does not serve"), "{generic}");
+    let coded = super::events::inference_failure_guidance(
+        &Class::Http(400),
+        "Requested resource is not available [model_not_found]",
+        "openrouter",
+        "vendor/valid-model",
+    )
+    .expect("400 is actionable");
+    assert!(
+        coded.contains("does not serve `vendor/valid-model`"),
+        "{coded}"
+    );
+}

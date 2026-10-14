@@ -22192,6 +22192,11 @@ async fn provider_catalog_snapshot(
         }
     }
     view.extended_config_json = Some(redacted_extended_config_json(ctx, &cwd, &trust_policy)?);
+    let largest = view
+        .providers
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.entry.models.len()))
+        .max_by_key(|(_, models)| *models);
     bounded_provider_response(Response::ProviderCatalogSnapshot {
         config: view,
         snapshot_session_id: snapshot_session_id.to_string(),
@@ -22199,6 +22204,15 @@ async fn provider_catalog_snapshot(
         owner_root: canonical_root,
         base_revision: revision,
         config_generation,
+    })
+    .map_err(|error| match largest {
+        // A catalog persisted by an older build (or edited by hand) can be
+        // too large to read. Say which one and how to recover instead of a
+        // generic size error; a refresh trims it to the snapshot budget.
+        Some((provider, models)) => bad_request(format!(
+            "the provider catalog is too large to read (largest: `{provider}` with {models} models); run `cockpit fetch-models {provider}` to trim it to the readable limit"
+        )),
+        None => error,
     })
 }
 
@@ -24125,7 +24139,6 @@ pub(super) async fn provider_models_fetch(
     if provider_ids.is_empty() {
         return bounded_provider_response(Response::ProviderModelsFetched {
             results: Vec::new(),
-            config: crate::secret_ref::redact_provider_view(&config),
             config_generation: inventory::current_config_generation(),
         });
     }
@@ -24152,10 +24165,19 @@ pub(super) async fn provider_models_fetch(
         .or(config.on_unlisted_models_fetch)
         .unwrap_or(crate::config::providers::OnUnlistedModelsFetch::Keep);
     let mut changed_provider_ids = std::collections::BTreeSet::new();
+    // One preview budget shared by every result keeps the summary response
+    // bounded for any catalog size and any number of providers.
+    let mut id_budget = proto::MAX_PROVIDER_MODEL_SUMMARY_ID_BYTES;
     let results = if deep {
-        let (results, completed_provider_ids) =
-            daemon_deep_provider_fetch(&mut config, &provider_ids, model_id, store.clone(), &env)
-                .await?;
+        let (results, completed_provider_ids) = daemon_deep_provider_fetch(
+            &mut config,
+            &provider_ids,
+            model_id,
+            store.clone(),
+            &env,
+            &mut id_budget,
+        )
+        .await?;
         // A failed provider may have completed an earlier target before its
         // later probe failed. Do not expose or persist that ambiguous partial
         // mutation; retain the original provider snapshot and account only
@@ -24226,14 +24248,35 @@ pub(super) async fn provider_models_fetch(
                 })
                 .map_err(anyhow::Error::new)
             } else {
-                crate::providers::models_fetch::fetch_models_for_provider_with_store(
-                    &provider_id,
-                    &entry,
-                    &resolved,
-                    std::time::Duration::from_secs(15),
-                    Some(store.clone()),
-                    |name| env.get(name).cloned(),
-                )
+                // A template-less entry pointed at a public catalog (OpenRouter
+                // answers `/models` for any key) must still prove its key.
+                let probe = match crate::providers::public_catalog_auth_check(&resolved.base_url) {
+                    Some(crate::providers::AuthCheckKind::AuthenticatedGetThenModels {
+                        path,
+                        docs_url,
+                    }) => crate::providers::auth_check::get_credential_probe(
+                        &resolved.base_url,
+                        &resolved.headers,
+                        path,
+                        docs_url,
+                        std::time::Duration::from_secs(15),
+                    )
+                    .await
+                    .map_err(anyhow::Error::new),
+                    _ => Ok(()),
+                };
+                async {
+                    probe?;
+                    crate::providers::models_fetch::fetch_models_for_provider_with_store(
+                        &provider_id,
+                        &entry,
+                        &resolved,
+                        std::time::Duration::from_secs(15),
+                        Some(store.clone()),
+                        |name| env.get(name).cloned(),
+                    )
+                    .await
+                }
                 .await
                 .and_then(|outcome| match outcome {
                     crate::providers::models_fetch::FetchOutcome::Unsupported => Err(
@@ -24262,7 +24305,10 @@ pub(super) async fn provider_models_fetch(
                         results.push(crate::daemon::proto::ProviderModelFetchResult {
                             provider_id,
                             outcome: crate::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
-                                unlisted_count: u32::try_from(unlisted.len()).unwrap_or(u32::MAX),
+                                unlisted: proto::ProviderModelIdSummary::bounded(
+                                    unlisted.iter().map(|model| model.id.clone()),
+                                    &mut id_budget,
+                                ),
                             },
                             verification: None,
                         });
@@ -24286,8 +24332,35 @@ pub(super) async fn provider_models_fetch(
                     updated.models_fetched_at = Some(chrono::Utc::now());
                     updated.model_catalog = catalog;
                     config.providers.insert(provider_id.clone(), updated);
-                    changed_provider_ids.insert(provider_id.clone());
-                    crate::daemon::proto::ProviderModelFetchOutcome::Models { models, catalog }
+                    match enforce_persisted_catalog_budget(
+                        &mut config,
+                        &provider_id,
+                        &entry,
+                        &models,
+                    ) {
+                        Ok(kept) => {
+                            changed_provider_ids.insert(provider_id.clone());
+                            crate::daemon::proto::ProviderModelFetchOutcome::Models {
+                                models: proto::ProviderModelIdSummary::bounded(
+                                    models.iter().map(|model| model.id.clone()),
+                                    &mut id_budget,
+                                ),
+                                catalog,
+                                kept,
+                            }
+                        }
+                        Err(message) => {
+                            // Nothing is persisted: a catalog every snapshot
+                            // reader would refuse must not become durable.
+                            config.providers.insert(provider_id.clone(), entry.clone());
+                            verification = Some(
+                                crate::daemon::proto::ProviderModelVerification::CatalogTooLarge {
+                                    message: message.clone(),
+                                },
+                            );
+                            crate::daemon::proto::ProviderModelFetchOutcome::Error { message }
+                        }
+                    }
                 }
                 Ok(crate::providers::models_fetch::FetchOutcome::FallbackAvailable {
                     models,
@@ -24330,7 +24403,10 @@ pub(super) async fn provider_models_fetch(
                         changed_provider_ids.insert(provider_id.clone());
                     }
                     crate::daemon::proto::ProviderModelFetchOutcome::FallbackAvailable {
-                        models,
+                        models: proto::ProviderModelIdSummary::bounded(
+                            models.iter().map(|model| model.id.clone()),
+                            &mut id_budget,
+                        ),
                         catalog,
                         reason,
                     }
@@ -24385,14 +24461,15 @@ pub(super) async fn provider_models_fetch(
             config.on_unlisted_models_fetch = Some(on_unlisted);
         }
     }
-    // Build and bound the exact response before any persistence. Otherwise a
-    // large fetched catalog could become durable while the caller receives an
-    // error and therefore cannot distinguish a safe retry from a replay.
+    // Build and bound the exact response before any persistence. The
+    // response is a bounded summary (no provider config, a budgeted id
+    // preview), so this check is a backstop rather than a catalog-size limit;
+    // it still runs first so a durable write can never be paired with an
+    // error the caller cannot distinguish from a safe retry.
     // Size-check the worst-case generation width before any durable write.
     // The exact generation is installed after publication below.
     let response = Response::ProviderModelsFetched {
         results,
-        config: crate::secret_ref::redact_provider_view(&config),
         config_generation: u64::MAX,
     };
     let mut response =
@@ -24440,6 +24517,114 @@ pub(super) async fn provider_models_fetch(
     };
     *response_generation = config_generation;
     Ok(response)
+}
+
+/// Largest serialized provider projection a catalog refresh may persist.
+/// Every model reader (settings, model picker, onboarding's model step, CLI)
+/// gets the catalog through `GetProviderCatalogSnapshot`, which is capped at
+/// [`proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES`] and also carries MCP and
+/// extended-config projections; the headroom keeps the snapshot readable.
+pub(super) const MAX_PERSISTED_PROVIDER_VIEW_BYTES: usize =
+    proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES - 128 * 1024;
+
+/// Keep a refreshed catalog readable (#545, review C3). When the merged
+/// configuration's provider projection would exceed
+/// [`MAX_PERSISTED_PROVIDER_VIEW_BYTES`], newly fetched models are dropped
+/// from the end of the upstream order until it fits; then, if still over,
+/// previously fetched models. Manual and favorite models are never dropped.
+/// Raw upstream metadata left by an older build on non-manual models is
+/// cleared first, so a refresh always recovers an over-limit legacy entry.
+/// Returns how many fetched models remain persisted; the caller reports a
+/// smaller-than-fetched count to the user. Errors (nothing may be persisted)
+/// only when manual and favorite models alone exceed the limit.
+pub(super) fn enforce_persisted_catalog_budget(
+    config: &mut crate::config::providers::ProvidersConfig,
+    provider_id: &str,
+    previous: &crate::config::providers::ProviderEntry,
+    fetched: &[crate::config::providers::ModelEntry],
+) -> std::result::Result<u32, String> {
+    let fetched_ids = fetched
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let kept_count = |entry: &crate::config::providers::ProviderEntry| {
+        u32::try_from(
+            entry
+                .models
+                .iter()
+                .filter(|model| fetched_ids.contains(model.id.as_str()))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    };
+    let view_bytes = |config: &crate::config::providers::ProvidersConfig| {
+        serde_json::to_vec(&crate::secret_ref::redact_provider_view(config))
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+    };
+    let total = view_bytes(config);
+    let entry = config
+        .providers
+        .get_mut(provider_id)
+        .expect("refreshed provider is configured");
+    if total <= MAX_PERSISTED_PROVIDER_VIEW_BYTES {
+        return Ok(kept_count(entry));
+    }
+    for model in entry.models.iter_mut().filter(|model| !model.manual) {
+        model.provider_metadata.clear();
+        model.extra.clear();
+    }
+    let total = view_bytes(config);
+    let entry = config
+        .providers
+        .get_mut(provider_id)
+        .expect("refreshed provider is configured");
+    if total <= MAX_PERSISTED_PROVIDER_VIEW_BYTES {
+        return Ok(kept_count(entry));
+    }
+    let previous_ids = previous
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let protected = |model: &crate::config::providers::ModelEntry| model.manual || model.favorite;
+    // Each serialized model costs its JSON plus a separating comma. Newly
+    // fetched models go first (from the end of upstream order), then older
+    // fetched ones.
+    let mut excess = total - MAX_PERSISTED_PROVIDER_VIEW_BYTES;
+    let mut drop = vec![false; entry.models.len()];
+    for newly_fetched_pass in [true, false] {
+        for (index, model) in entry.models.iter().enumerate().rev() {
+            if excess == 0 {
+                break;
+            }
+            if drop[index]
+                || protected(model)
+                || previous_ids.contains(model.id.as_str()) == newly_fetched_pass
+            {
+                continue;
+            }
+            let cost = serde_json::to_vec(model)
+                .map(|bytes| bytes.len() + 1)
+                .unwrap_or(0);
+            excess = excess.saturating_sub(cost);
+            drop[index] = true;
+        }
+    }
+    if excess > 0 {
+        return Err(format!(
+            "provider `{provider_id}` manual and favorite models alone exceed the catalog limit ({} KiB, limit {} KiB); remove some in /settings › Providers",
+            total / 1024,
+            MAX_PERSISTED_PROVIDER_VIEW_BYTES / 1024
+        ));
+    }
+    let mut index = 0;
+    entry.models.retain(|_| {
+        let keep = !drop[index];
+        index += 1;
+        keep
+    });
+    Ok(kept_count(entry))
 }
 
 pub(super) fn categorize_provider_model_fetch_error(
@@ -24542,6 +24727,7 @@ async fn daemon_deep_provider_fetch(
     model_id: Option<&str>,
     store: crate::credentials::CredentialStore,
     env: &std::collections::HashMap<String, String>,
+    id_budget: &mut usize,
 ) -> std::result::Result<
     (
         Vec<crate::daemon::proto::ProviderModelFetchResult>,
@@ -24647,9 +24833,16 @@ async fn daemon_deep_provider_fetch(
             .filter_map(|provider_id| {
                 config.providers.get(provider_id).map(|entry| {
                     let outcome = failures.get(provider_id).map_or_else(
-                        || crate::daemon::proto::ProviderModelFetchOutcome::Models {
-                            models: entry.models.clone(),
-                            catalog: entry.model_catalog,
+                        || {
+                            let models = proto::ProviderModelIdSummary::bounded(
+                                entry.models.iter().map(|model| model.id.clone()),
+                                id_budget,
+                            );
+                            crate::daemon::proto::ProviderModelFetchOutcome::Models {
+                                kept: models.count,
+                                models,
+                                catalog: entry.model_catalog,
+                            }
                         },
                         |message| crate::daemon::proto::ProviderModelFetchOutcome::Error {
                             message: message.clone(),

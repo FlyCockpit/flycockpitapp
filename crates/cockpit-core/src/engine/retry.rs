@@ -145,6 +145,32 @@ pub(crate) fn failure_retry_decision_and_rationale(
     }
 }
 
+/// Whether resending the same turn unchanged can plausibly succeed (#551):
+/// timeouts, transport failures, rate limits, and server errors. Credential,
+/// model-id, request-shape, entitlement, and billing failures fail the same
+/// way until the user changes something, so `continue` must not be offered.
+pub(crate) fn failure_retryable_unchanged(
+    class: &InferenceErrorClass,
+    provider_status: Option<u16>,
+) -> bool {
+    match class {
+        InferenceErrorClass::TimeoutTtft
+        | InferenceErrorClass::TimeoutIdle
+        | InferenceErrorClass::Network
+        | InferenceErrorClass::UtilityTimeout
+        | InferenceErrorClass::ProviderRateLimit => true,
+        InferenceErrorClass::BillingOrQuotaExhausted
+        | InferenceErrorClass::MissingToolEntitlement { .. }
+        | InferenceErrorClass::ClientSideToolsUnsupported
+        | InferenceErrorClass::ResponsesToolIdentity
+        | InferenceErrorClass::ProviderNotConfigured
+        | InferenceErrorClass::UnrenderableWireField => false,
+        InferenceErrorClass::Http(_) | InferenceErrorClass::Other(_) => provider_status
+            .or_else(|| class.provider_status())
+            .is_some_and(|status| status == 408 || status == 429 || (500..=599).contains(&status)),
+    }
+}
+
 pub(crate) fn is_usage_limit_failure(
     class: &InferenceErrorClass,
     provider_status: Option<u16>,
@@ -1740,5 +1766,32 @@ mod tests {
         // Initial attempt + 2 turn-budgeted retries, not DEFAULT_MAX_ATTEMPTS (4).
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(!budget.allow_retry());
+    }
+
+    /// #551: `continue` is offered only when an unchanged retry can succeed.
+    #[test]
+    fn only_transient_failures_are_retryable_unchanged() {
+        use super::failure_retryable_unchanged as retryable;
+        for (class, status) in [
+            (InferenceErrorClass::Http(400), Some(400)),
+            (InferenceErrorClass::Http(401), Some(401)),
+            (InferenceErrorClass::Http(403), Some(403)),
+            (InferenceErrorClass::Http(404), Some(404)),
+            (InferenceErrorClass::BillingOrQuotaExhausted, Some(429)),
+            (InferenceErrorClass::ProviderNotConfigured, None),
+        ] {
+            assert!(
+                !retryable(&class, status),
+                "{class:?} must not offer continue"
+            );
+        }
+        for (class, status) in [
+            (InferenceErrorClass::Http(429), Some(429)),
+            (InferenceErrorClass::Http(503), Some(503)),
+            (InferenceErrorClass::Network, None),
+            (InferenceErrorClass::TimeoutTtft, None),
+        ] {
+            assert!(retryable(&class, status), "{class:?} may offer continue");
+        }
     }
 }

@@ -41,7 +41,12 @@ impl App {
                     }
                     for result in results {
                         match result.outcome {
-                            ProviderModelFetchOutcome::Models { models, catalog } => {
+                            ProviderModelFetchOutcome::Models {
+                                models,
+                                catalog,
+                                kept,
+                            } => {
+                                let trimmed = cockpit_proto::catalog_trim_note(models.count, kept);
                                 let suffix = if catalog
                                     == cockpit_config::providers::ProviderModelCatalog::CodexFallback
                                 {
@@ -50,9 +55,8 @@ impl App {
                                     ""
                                 };
                                 push(format!(
-                                    "/fetch-models: provider {} → {} provider model(s){suffix}",
-                                    result.provider_id,
-                                    models.len()
+                                    "/fetch-models: provider {} → {} provider model(s){suffix}{trimmed}",
+                                    result.provider_id, models.count
                                 ));
                             }
                             ProviderModelFetchOutcome::FallbackAvailable { reason, .. } => {
@@ -65,7 +69,8 @@ impl App {
                                 "/fetch-models: provider {} has no /models endpoint",
                                 result.provider_id
                             )),
-                            ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted_count } => {
+                            ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } => {
+                                let unlisted_count = unlisted.count;
                                 push(format!(
                                     "/fetch-models: provider {} has {unlisted_count} configured model(s) absent from the fetched catalog; choose keep or remove in Provider settings",
                                     result.provider_id

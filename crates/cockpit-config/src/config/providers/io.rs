@@ -1590,11 +1590,15 @@ pub fn is_xai_grok_provider(provider_id: &str, entry: &ProviderEntry) -> bool {
             .as_deref()
             .is_some_and(|credential| credential.eq_ignore_ascii_case("grok-oauth"))
         || entry.url.to_ascii_lowercase().contains("api.x.ai")
-        || metadata_mentions_xai_grok(&entry.provider_metadata)
+        // The immutable template identity covers renamed or proxied xAI
+        // entries; it no longer depends on fetched model metadata, which is
+        // not persisted (#545) and misfired on aggregators whose catalogs
+        // merely list `x-ai/grok-*` models (OpenRouter).
         || entry
-            .models
-            .iter()
-            .any(|model| metadata_mentions_xai_grok(&model.provider_metadata))
+            .template
+            .as_deref()
+            .is_some_and(|template| matches!(template, "grok" | "grok-oauth"))
+        || metadata_mentions_xai_grok(&entry.provider_metadata)
 }
 
 fn metadata_mentions_xai_grok(metadata: &Map<String, Value>) -> bool {

@@ -1571,7 +1571,7 @@ fn prompt_fixture(kind: PromptFixture) -> (tempfile::TempDir, SettingsDialog) {
         PromptFixture::FetchFallback => {
             ProvidersPage::FetchFallbackPrompt(FetchFallbackPromptState {
                 provider_id: "p".into(),
-                models: vec![model("fallback", false)],
+                fallback_count: 1,
                 catalog: ProviderModelCatalog::CodexFallback,
                 reason: "live catalog unavailable".into(),
                 cursor: 0,
@@ -5225,6 +5225,7 @@ fn fetch_all_prompt_remove_drops_only_non_manual_unlisted_models() {
             outcome: Ok(FetchOutcome::Models {
                 models: vec![model("current", false)],
                 catalog: ProviderModelCatalog::Live,
+                trim_note: String::new(),
             }),
         }],
         pre_fetch_models: [(
@@ -5275,6 +5276,7 @@ fn fetch_all_stored_remove_applies_without_prompt() {
             outcome: Ok(FetchOutcome::Models {
                 models: vec![model("current", false)],
                 catalog: ProviderModelCatalog::Live,
+                trim_note: String::new(),
             }),
         }],
         pre_fetch_models: [(
@@ -5316,6 +5318,7 @@ fn fetch_all_stored_keep_applies_without_prompt() {
             outcome: Ok(FetchOutcome::Models {
                 models: vec![model("current", false)],
                 catalog: ProviderModelCatalog::Live,
+                trim_note: String::new(),
             }),
         }],
         pre_fetch_models: [(
@@ -5423,6 +5426,7 @@ fn fetch_all_save_failure_surfaces() {
             outcome: Ok(FetchOutcome::Models {
                 models: vec![model("current", false)],
                 catalog: ProviderModelCatalog::Live,
+                trim_note: String::new(),
             }),
         }],
         pre_fetch_models: [(
@@ -5961,6 +5965,7 @@ fn refetch_result_preserves_staged_favorite() {
         Ok(FetchOutcome::Models {
             models: vec![model("new", false)],
             catalog: ProviderModelCatalog::Live,
+            trim_note: String::new(),
         }),
     );
     let TestPageRef::Providers(ProvidersPage::Edit(state)) = dialog.test_page() else {
@@ -5995,6 +6000,7 @@ fn refetch_result_marks_codex_fallback_catalog_active() {
         Ok(FetchOutcome::Models {
             models: vec![model("gpt-5.5", false)],
             catalog: ProviderModelCatalog::CodexFallback,
+            trim_note: String::new(),
         }),
     );
 
@@ -6028,7 +6034,7 @@ fn refetch_result_with_fallback_available_opens_explicit_prompt() {
     dialog.apply_fetch_result(
         "p",
         Ok(FetchOutcome::FallbackAvailable {
-            models: vec![model("fallback", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason:
                 "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
@@ -6073,6 +6079,7 @@ fn onboarding_live_validation_refreshes_authority_before_final_settlement() {
         Ok(FetchOutcome::Models {
             models: vec![model("live", false)],
             catalog: ProviderModelCatalog::Live,
+            trim_note: String::new(),
         }),
     );
     dialog.settle_test_effects();
@@ -6116,7 +6123,7 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
     dialog.apply_fetch_result(
         "p",
         Ok(FetchOutcome::FallbackAvailable {
-            models: vec![model("fallback", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason:
                 "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
@@ -6162,7 +6169,7 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
     dialog.apply_fetch_result(
         "p",
         Ok(FetchOutcome::FallbackAvailable {
-            models: vec![model("fallback", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason: "offline".into(),
         }),
@@ -6200,9 +6207,10 @@ fn onboarding_validation_with_fallback_available_stays_resumable_and_offers_offl
                     .is_some_and(|message| message.contains("Asking the daemon"))
     ));
 
+    // The offline continuation allowed the fallback: the daemon applied it.
     dialog.apply_fetch_result(
         "p",
-        Ok(FetchOutcome::FallbackAvailable {
+        Ok(FetchOutcome::FallbackApplied {
             models: vec![model("fallback", false)],
             catalog: ProviderModelCatalog::CodexFallback,
             reason: "offline".into(),
@@ -6258,7 +6266,7 @@ fn onboarding_does_not_offer_unpersisted_builtin_fallback() {
     dialog.apply_fetch_result(
         "p",
         Ok(FetchOutcome::FallbackAvailable {
-            models: vec![model("builtin-only", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason: "network unavailable".into(),
         }),
@@ -6283,7 +6291,7 @@ fn fetch_fallback_prompt_use_fallback_records_degraded_status() {
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchFallbackPrompt(
         FetchFallbackPromptState {
             provider_id: "p".to_string(),
-            models: vec![model("fallback", false)],
+            fallback_count: 1,
             catalog: ProviderModelCatalog::CodexFallback,
             reason:
                 "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
@@ -6298,10 +6306,32 @@ fn fetch_fallback_prompt_use_fallback_records_degraded_status() {
         else {
             panic!("expected fallback prompt");
         };
+        // Choosing the fallback re-runs the daemon fetch with
+        // `allow_fallback`; the daemon owns and persists the fallback catalog.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
         cx.handle_fetch_fallback_prompt_key(press(KeyCode::Enter), state)
     };
 
-    assert!(matches!(replaced_provider(&nav), ProvidersPage::Edit(_)));
+    let ProvidersPage::Edit(edit) = replaced_provider(&nav) else {
+        panic!("expected the provider editor");
+    };
+    assert!(edit.fetch.is_some(), "the fallback fetch is in flight");
+    let edit = EditState::new("p".into(), dialog.config.providers["p"].clone());
+    dialog.set_test_page(Page::Providers(ProvidersPage::Edit(edit)));
+    dialog.apply_fetch_result(
+        "p",
+        Ok(FetchOutcome::FallbackApplied {
+            models: vec![model("fallback", false)],
+            catalog: ProviderModelCatalog::CodexFallback,
+            reason:
+                "GET /models returned 500. Bearer sk-test-token-abcdefghijklmnopqrstuvwxyz123456"
+                    .into(),
+        }),
+    );
     let provider = &dialog.config.providers["p"];
     assert_eq!(provider.model_catalog, ProviderModelCatalog::CodexFallback);
     assert_eq!(
@@ -6418,6 +6448,7 @@ fn apply_fetch_result_save_failure_surfaces() {
         Ok(FetchOutcome::Models {
             models: vec![model("new", false)],
             catalog: ProviderModelCatalog::Live,
+            trim_note: String::new(),
         }),
     );
 

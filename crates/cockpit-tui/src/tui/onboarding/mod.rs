@@ -66,6 +66,7 @@ use model::ModelScreen;
 use profile::ProfileScreen;
 use search::{ProviderSearchScreen, onboarding_catalog};
 use secure_store::SecureStoreScreen;
+pub(crate) use verify::ModelList;
 pub(crate) use verify::VerifyOutcome;
 pub(crate) use verify::VerifyPhase;
 pub(crate) use verify::VerifyScreen;

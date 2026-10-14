@@ -119,7 +119,7 @@ pub use failure::{
     InferenceTiming, LateUserSteerDeferred, PROVIDER_DETAIL_OMITTED, ProviderRecoverySignal,
     SafeProviderDetail, as_inference_failure, auth_failure_kind, cancellation_phase,
     failure_engages_backup, is_cancelled, is_gated, is_late_user_steer_deferred,
-    safe_completion_error_detail, safe_provider_detail,
+    safe_completion_error_detail, safe_provider_detail, user_facing_provider_error,
 };
 pub(crate) use failure::{log_utility_model_failure, safe_inference_error_detail};
 #[allow(unused_imports)]

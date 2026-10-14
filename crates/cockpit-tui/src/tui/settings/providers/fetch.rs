@@ -84,7 +84,9 @@ pub(in crate::tui::settings) struct FetchOnePromptState {
 
 pub(in crate::tui::settings) struct FetchFallbackPromptState {
     pub(in crate::tui::settings) provider_id: String,
-    pub(in crate::tui::settings) models: Vec<ModelEntry>,
+    /// Size of the fallback catalog the daemon offers. Choosing it re-runs the
+    /// fetch with `allow_fallback` so the daemon applies it.
+    pub(in crate::tui::settings) fallback_count: u32,
     pub(in crate::tui::settings) catalog: ProviderModelCatalog,
     pub(in crate::tui::settings) reason: String,
     /// 0 = retry live, 1 = keep existing, 2 = use fallback, 3 = cancel.
@@ -357,10 +359,14 @@ pub(in crate::tui::settings) fn render_fetch_all_results(
 ) {
     for f in &s.finished {
         let (glyph, text, style) = match &f.outcome {
-            Ok(FetchOutcome::Models { models, catalog }) => (
+            Ok(FetchOutcome::Models {
+                models,
+                catalog,
+                trim_note,
+            }) => (
                 "✓",
                 format!(
-                    "{} — {} model(s){}",
+                    "{} — {} model(s){}{trim_note}",
                     f.provider_id,
                     models.len(),
                     provider_catalog_suffix(*catalog)
@@ -381,9 +387,18 @@ pub(in crate::tui::settings) fn render_fetch_all_results(
                 ),
                 red,
             ),
-            Ok(FetchOutcome::UnlistedModelsPreview { .. } | FetchOutcome::Error { .. }) => {
-                unreachable!("FetchHandle converts protocol-only outcomes into errors")
-            }
+            Ok(FetchOutcome::FallbackApplied {
+                models, catalog, ..
+            }) => (
+                "✓",
+                format!(
+                    "{} — {} model(s){}",
+                    f.provider_id,
+                    models.len(),
+                    provider_catalog_suffix(*catalog)
+                ),
+                green,
+            ),
             Err(e) => (
                 "✗",
                 format!(
@@ -444,7 +459,9 @@ fn fetch_all_merges(
     s.finished
         .iter()
         .filter_map(|summary| match &summary.outcome {
-            Ok(FetchOutcome::Models { models, catalog }) => Some((
+            Ok(FetchOutcome::Models {
+                models, catalog, ..
+            }) => Some((
                 summary.provider_id.clone(),
                 s.pre_fetch_models
                     .get(&summary.provider_id)
@@ -477,8 +494,7 @@ fn fetch_all_degraded_statuses(dialog: &SettingsDialog) -> Vec<(String, FetchDeg
                 summary.provider_id.clone(),
                 FetchDegradedStatus::Failed(redact_model_fetch_reason(error.as_str())),
             )),
-            Ok(FetchOutcome::Models { .. }) => None,
-            Ok(FetchOutcome::UnlistedModelsPreview { .. } | FetchOutcome::Error { .. }) => None,
+            Ok(FetchOutcome::Models { .. } | FetchOutcome::FallbackApplied { .. }) => None,
         })
         .collect()
 }

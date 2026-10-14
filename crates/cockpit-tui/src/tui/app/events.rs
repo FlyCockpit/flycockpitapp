@@ -1868,11 +1868,15 @@ impl App {
                 self.finalize_pending();
                 let reason = inference_failure_reason(&error_class, &detail);
                 let summary = format!("Inference failed ({provider}/{model}): {reason}");
+                let guidance = inference_failure_guidance(&error_class, &detail, &provider, &model);
                 self.history.push(HistoryEntry::InferenceError {
                     detail,
                     summary,
                     expanded: false,
                 });
+                if let Some(guidance) = guidance {
+                    self.push_plain(format!("→ {guidance}"));
+                }
                 // Attention: the foreground turn failed
                 // (implementation note). Toast-only (not
                 // action-required) — generic, secret-safe text; the inline red
@@ -3087,6 +3091,82 @@ fn inference_failure_reason(
         other if detail.is_empty() => other.to_string(),
         other => format!("{other}: {}", cockpit_host::text::first_line(detail, 200)),
     }
+}
+
+/// Actionable next step for a terminal inference failure the user must fix
+/// before a retry can succeed (#551). `detail` is the daemon's scrubbed
+/// provider message (or the omission marker). Retryable classes (timeouts,
+/// transport, 5xx) return `None`: the daemon's own notice offers `continue`.
+pub(super) fn inference_failure_guidance(
+    error_class: &cockpit_proto::InferenceErrorClass,
+    detail: &str,
+    provider: &str,
+    model: &str,
+) -> Option<String> {
+    use cockpit_proto::InferenceErrorClass as Class;
+    let lower = detail.to_ascii_lowercase();
+    // The daemon appends a validated semantic provider code as a trailing
+    // `[code]`; prefer it over prose (review C9).
+    let code = lower
+        .strip_suffix(']')
+        .and_then(|rest| rest.rsplit_once(" ["))
+        .map(|(_, code)| code)
+        .or_else(|| {
+            lower
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+        })
+        .unwrap_or_default();
+    let mentions = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+    let model_lower = model.to_ascii_lowercase();
+    // Unknown-model guidance needs a model-specific signal: a model code, an
+    // explicit model phrase, or the configured model id itself next to an
+    // existence phrase. Generic "does not exist" prose (a request parameter,
+    // a file) is not evidence that the model is missing.
+    let unknown_model = matches!(
+        code,
+        "model_not_found" | "invalid_model" | "model_not_available" | "unknown_model"
+    ) || mentions(&[
+        "not a valid model",
+        "model not found",
+        "unknown model",
+        "invalid model",
+        "no endpoints found for",
+    ]) || (!model_lower.is_empty()
+        && lower.contains(&model_lower)
+        && mentions(&["does not exist", "is not available", "not found"]));
+    let invalid_schema = matches!(code, "invalid_function_parameters" | "invalid_schema")
+        || mentions(&["invalid schema", "json schema", "tools["]);
+    Some(match error_class {
+        Class::Http(401) => format!(
+            "{provider} rejected the API key. Update it in /settings › Providers, then send your message again."
+        ),
+        Class::Http(403) => format!(
+            "{provider} refused this request (403): the key may not have access to `{model}`, or the account needs credits or an entitlement. Check your {provider} account, or pick another model with /model."
+        ),
+        Class::Http(404) if !invalid_schema => format!(
+            "`{model}` (or its endpoint) was not found on {provider}. Pick another model with /model, or check the base URL in /settings › Providers."
+        ),
+        Class::Http(400 | 404 | 422) if unknown_model => {
+            format!("{provider} does not serve `{model}`. Pick another model with /model.")
+        }
+        Class::Http(400 | 422) if invalid_schema => format!(
+            "{provider} rejected Cockpit's tool schema for `{model}`. Try another model, or another Wire API for it in /settings › Providers."
+        ),
+        Class::Http(400 | 422) => format!(
+            "{provider} rejected the request; the reason above is the provider's. Resending it unchanged will fail the same way."
+        ),
+        Class::Http(402) | Class::BillingOrQuotaExhausted => format!(
+            "Your {provider} account is out of credits or quota. Top it up, or pick another provider's model with /model."
+        ),
+        Class::ProviderNotConfigured => {
+            format!("Set up {provider} in /settings › Providers, then send your message again.")
+        }
+        Class::MissingToolEntitlement { .. } | Class::ClientSideToolsUnsupported => format!(
+            "`{model}` cannot run Cockpit's tools on {provider}. Pick another model with /model."
+        ),
+        _ => return None,
+    })
 }
 
 fn backup_failure_reason(error_class: &cockpit_proto::InferenceErrorClass) -> String {

@@ -10347,7 +10347,6 @@ fn oversized_provider_model_fetch_response_is_rejected_before_persistence() {
             },
             verification: None,
         }],
-        config: crate::daemon::proto::ProviderConfigView::default(),
         config_generation: u64::MAX,
     };
     let error = bounded_provider_response(response).expect_err("oversized fetch response");
@@ -32737,6 +32736,261 @@ fn daemon_provider_probe_returns_all_stable_verification_classes() {
         .build()
         .expect("provider verification test runtime");
     runtime.block_on(daemon_provider_probe_returns_all_stable_verification_classes_case());
+}
+
+/// An OpenRouter-shaped `/models` body: every model carries the bulky
+/// descriptive metadata the real catalog does (description, benchmarks,
+/// pricing, architecture, links, ...), about 1.7 KB raw per model.
+fn openrouter_shaped_models_body(count: usize) -> String {
+    let data = (0..count)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("vendor-{}/model-{index}-instruct", index % 60),
+                "canonical_slug": format!("vendor-{}/model-{index}-instruct-20260901", index % 60),
+                "hugging_face_id": format!("vendor/model-{index}"),
+                "name": format!("Vendor {}: Model {index} Instruct", index % 60),
+                "created": 1_790_000_000 + index,
+                "description": "A general-purpose instruction-tuned model with strong coding, reasoning, and tool-use ability across long contexts. ".repeat(2),
+                "context_length": 262_144,
+                "architecture": {
+                    "modality": "text+image->text",
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"],
+                    "tokenizer": "Other",
+                    "instruct_type": null
+                },
+                "pricing": {"prompt": "0.0000025", "completion": "0.0000075", "input_cache_read": "0.00000025"},
+                "top_provider": {"context_length": 262_144, "max_completion_tokens": 131_072, "is_moderated": false},
+                "per_request_limits": null,
+                "supported_parameters": ["include_reasoning", "max_tokens", "reasoning", "response_format", "seed", "stop", "structured_outputs", "temperature", "tool_choice", "tools", "top_k", "top_p"],
+                "default_parameters": {"temperature": 0.6, "top_p": 0.95},
+                "benchmarks": {"swe_bench": 0.61, "mmlu_pro": 0.79, "gpqa": 0.66, "aime": 0.71, "livecodebench": 0.58, "note": "Self-reported by the vendor; not independently verified by OpenRouter."},
+                "knowledge_cutoff": "2026-03-01",
+                "expiration_date": null,
+                "links": {"details": format!("/api/v1/models/vendor-{}/model-{index}-instruct/endpoints", index % 60)}
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "data": data }).to_string()
+}
+
+/// Fresh install: commit an OpenAI-compatible provider pointed at `url`
+/// through the production snapshot + mutation flow (global layer).
+async fn commit_public_catalog_provider(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    workspace: &Path,
+    url: String,
+) {
+    use crate::config::providers::{AuthKind, ProviderEntry};
+    let catalog = take_onboarding_catalog(ctx, state, workspace, "large-catalog-save").await;
+    apply_onboarding_mutation(
+        ctx,
+        state,
+        &catalog,
+        "large-catalog-save",
+        cockpit_proto::ProviderMutationBatch {
+            upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                provider_id: "catalog".into(),
+                entry: ProviderEntry {
+                    template: Some("openai-compatible".into()),
+                    url,
+                    allow_insecure_http: true,
+                    auth: Some(AuthKind::None),
+                    ..ProviderEntry::default()
+                },
+                header_secrets: Vec::new(),
+            }],
+            deletes: Vec::new(),
+            metadata: None,
+        },
+    )
+    .await;
+}
+
+/// #545: the verification/catalog-refresh RPC is a bounded summary, so a
+/// 5000-model catalog still fits the interactive payload limit (the old
+/// response embedded every model twice and failed with `bad_request`).
+#[tokio::test]
+async fn provider_models_fetch_summary_fits_for_5000_model_catalog() {
+    let (_env, _tmp, ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    let body = openrouter_shaped_models_body(5000);
+    let url = one_shot_models_response(200, "OK", &body).await;
+    commit_public_catalog_provider(&ctx, &mut state, &workspace, url).await;
+    let response = provider_models_fetch(
+        &ctx,
+        &workspace.to_string_lossy(),
+        Some("catalog"),
+        None,
+        false,
+        Some(crate::config::providers::OnUnlistedModelsFetch::Keep),
+        false,
+        HashMap::new(),
+    )
+    .await
+    .expect("a 5000-model catalog refresh must fit the interactive payload limit");
+    let encoded = serde_json::to_vec(&response).unwrap();
+    assert!(
+        encoded.len() <= proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES,
+        "summary response is {} bytes",
+        encoded.len()
+    );
+    let Response::ProviderModelsFetched { results, .. } = response else {
+        panic!("daemon returned wrong response");
+    };
+    let crate::daemon::proto::ProviderModelFetchOutcome::Models { models, .. } =
+        &results[0].outcome
+    else {
+        panic!("expected a fetched catalog: {:?}", results[0].outcome);
+    };
+    assert_eq!(models.count, 5000, "the exact count always travels");
+    assert!(!models.ids.is_empty(), "a bounded id preview travels");
+    assert_eq!(models.ids[0], "vendor-0/model-0-instruct");
+    // Review C3: the refresh must not strand later readers. The daemon trims
+    // what it persists to the snapshot budget and reports the kept count.
+    let crate::daemon::proto::ProviderModelFetchOutcome::Models { kept, .. } = &results[0].outcome
+    else {
+        unreachable!()
+    };
+    let kept = *kept;
+    assert!(kept > 0 && kept < 5000, "kept {kept} of 5000");
+    let response = handle_request(
+        Request::GetProviderCatalogSnapshot {
+            project_root: workspace.to_string_lossy().into_owned(),
+            provider_id: None,
+            snapshot_session_id: "trimmed-catalog-snapshot".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("a trimmed catalog stays readable through the snapshot");
+    let Response::ProviderCatalogSnapshot { config, .. } = response else {
+        panic!("expected ProviderCatalogSnapshot response");
+    };
+    let persisted = &config.providers["catalog"].entry.models;
+    assert_eq!(persisted.len(), kept as usize);
+    assert_eq!(
+        persisted[0].id, "vendor-0/model-0-instruct",
+        "upstream order kept"
+    );
+}
+
+/// Review C3: the trim never drops manual or favorite models, and a
+/// catalog that is already within budget is persisted whole.
+#[test]
+fn persisted_catalog_budget_trims_only_fetched_models() {
+    use crate::config::providers::{ModelEntry, ProviderEntry, ProvidersConfig};
+    let fetched = (0..4000)
+        .map(|index| ModelEntry {
+            id: format!("vendor/model-{index:04}-with-a-reasonably-long-identifier"),
+            name: Some(format!("Vendor Model {index} With A Long Display Name")),
+            context_length: Some(131_072),
+            ..ModelEntry::default()
+        })
+        .collect::<Vec<_>>();
+    let previous = ProviderEntry {
+        models: vec![
+            ModelEntry {
+                id: "my/manual".into(),
+                manual: true,
+                ..ModelEntry::default()
+            },
+            ModelEntry {
+                id: "vendor/model-3999-with-a-reasonably-long-identifier".into(),
+                favorite: true,
+                ..ModelEntry::default()
+            },
+        ],
+        ..ProviderEntry::default()
+    };
+    let mut merged = previous.clone();
+    merged.models = fetched.clone();
+    merged.models[3999].favorite = true;
+    merged.models.push(previous.models[0].clone());
+    let mut config = ProvidersConfig::default();
+    config.providers.insert("big".into(), merged);
+    let kept = enforce_persisted_catalog_budget(&mut config, "big", &previous, &fetched).unwrap();
+    let view = serde_json::to_vec(&crate::secret_ref::redact_provider_view(&config)).unwrap();
+    assert!(
+        view.len() <= MAX_PERSISTED_PROVIDER_VIEW_BYTES,
+        "{} bytes",
+        view.len()
+    );
+    assert!(kept < 4000, "trimmed: kept {kept}");
+    let models = &config.providers["big"].models;
+    assert!(models.iter().any(|model| model.manual));
+    assert!(models.iter().any(|model| model.favorite));
+
+    let mut small = ProvidersConfig::default();
+    small.providers.insert(
+        "small".into(),
+        ProviderEntry {
+            models: fetched[..10].to_vec(),
+            ..ProviderEntry::default()
+        },
+    );
+    assert_eq!(
+        enforce_persisted_catalog_budget(
+            &mut small,
+            "small",
+            &ProviderEntry::default(),
+            &fetched[..10]
+        )
+        .unwrap(),
+        10
+    );
+}
+
+/// #545: after an OpenRouter-scale (462-model, ~770 KB raw) catalog is
+/// persisted, the provider snapshot every client reads (settings, model
+/// picker, onboarding's model step) still fits: fetched models persist only
+/// their typed projection, not the raw upstream metadata twice.
+#[tokio::test]
+async fn openrouter_scale_catalog_persists_a_snapshot_that_fits() {
+    let (_env, _tmp, ctx, mut state, workspace) = fresh_untrusted_workspace().await;
+    let body = openrouter_shaped_models_body(462);
+    assert!(
+        body.len() > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES,
+        "fixture is larger than the interactive limit, like the real catalog"
+    );
+    let url = one_shot_models_response(200, "OK", &body).await;
+    commit_public_catalog_provider(&ctx, &mut state, &workspace, url).await;
+    provider_models_fetch(
+        &ctx,
+        &workspace.to_string_lossy(),
+        Some("catalog"),
+        None,
+        false,
+        Some(crate::config::providers::OnUnlistedModelsFetch::Keep),
+        false,
+        HashMap::new(),
+    )
+    .await
+    .expect("an OpenRouter-scale refresh must succeed");
+    let response = handle_request(
+        Request::GetProviderCatalogSnapshot {
+            project_root: workspace.to_string_lossy().into_owned(),
+            provider_id: None,
+            snapshot_session_id: "large-catalog-snapshot".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("the persisted catalog snapshot must fit the interactive payload limit");
+    let Response::ProviderCatalogSnapshot { config, .. } = response else {
+        panic!("expected ProviderCatalogSnapshot response");
+    };
+    let models = &config.providers["catalog"].entry.models;
+    assert_eq!(models.len(), 462);
+    assert!(
+        models
+            .iter()
+            .all(|model| model.provider_metadata.is_empty() && model.extra.is_empty()),
+        "raw upstream metadata must not be persisted"
+    );
+    assert_eq!(models[0].context_length, Some(262_144));
 }
 
 async fn attach_fake_secure_key_actor(ctx: &mut Arc<DaemonContext>) {

@@ -1205,6 +1205,7 @@ fn init_tracing(
         Some(l) => EnvFilter::try_new(l).unwrap_or_else(|_| EnvFilter::new("warn")),
         None => EnvFilter::try_from_env("COCKPIT_LOG").unwrap_or_else(|_| EnvFilter::new("warn")),
     };
+    let filter = without_provider_library_diagnostics(filter);
 
     // The interactive shell has not painted yet. Do not open a rotating file
     // or write stderr into the alternate-screen handoff before it does. Keep
@@ -1253,6 +1254,26 @@ fn init_tracing(
             None
         }
     }
+}
+
+/// The provider HTTP library (rig) formats provider-owned text into its own
+/// diagnostics: `error!(?error, "SSE error")` carries the raw HTTP error
+/// body, and response-decode failures log the raw body. Those bodies are
+/// attacker-controllable and can echo credentials or prompt text, and no
+/// sink here scrubs them, so they must never reach `cockpit.log` or stderr
+/// (#551, review C8). Cockpit records its own classified, secret-safe
+/// failure events instead. Forced last so no `COCKPIT_LOG`/`--log-level`
+/// directive can re-enable it.
+const PROVIDER_LIBRARY_LOG_DIRECTIVE: &str = "rig_core=off";
+
+fn without_provider_library_diagnostics(
+    filter: tracing_subscriber::EnvFilter,
+) -> tracing_subscriber::EnvFilter {
+    filter.add_directive(
+        PROVIDER_LIBRARY_LOG_DIRECTIVE
+            .parse()
+            .expect("static provider-library log directive"),
+    )
 }
 
 /// Owns the installed tracing sink for a command.  Interactive sessions use
@@ -2318,5 +2339,50 @@ mod tests {
             !victim.join("cockpit.log").exists(),
             "no log file may be created inside the victim"
         );
+    }
+
+    /// Review C8: the provider library's raw-body diagnostics never reach a
+    /// Cockpit log sink, even when the operator's filter asks for them.
+    #[test]
+    fn provider_library_diagnostics_never_reach_log_sinks() {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for base in ["warn", "rig_core=trace,warn", "trace"] {
+            let capture = Capture::default();
+            let writer = capture.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(without_provider_library_diagnostics(
+                    tracing_subscriber::EnvFilter::new(base),
+                ))
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!(
+                    target: "rig_core::providers::internal::sse_transport",
+                    body = "{\"error\":\"RAW_PROVIDER_BODY_SENTINEL\"}",
+                    "SSE error"
+                );
+                tracing::error!(target: "cockpit_core::engine", "cockpit failure recorded");
+            });
+            let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                !logged.contains("RAW_PROVIDER_BODY_SENTINEL"),
+                "{base}: provider body reached the log: {logged}"
+            );
+            assert!(
+                logged.contains("cockpit failure recorded"),
+                "{base}: {logged}"
+            );
+        }
     }
 }

@@ -126,7 +126,7 @@ async fn provider_settlement_sequence(scenario: Scenario) {
     assert!(matches!(
         &results[0].outcome,
         proto::ProviderModelFetchOutcome::Models { models, .. }
-            if models.iter().any(|model| model.id == "verified-model")
+            if models.ids.iter().any(|id| id == "verified-model")
     ));
 
     if matches!(scenario, Scenario::InterveningAfterCatalog) {

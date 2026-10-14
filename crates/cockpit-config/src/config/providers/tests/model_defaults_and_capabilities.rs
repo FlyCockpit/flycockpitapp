@@ -2389,3 +2389,49 @@ fn missing_output_limit_fails_closed() {
     assert!(error.contains("no output limit"), "{error}");
     assert!(error.contains("max_output_tokens"), "{error}");
 }
+
+/// Review C7: xAI identity comes from the immutable template, so a renamed
+/// Grok entry behind a proxy keeps the multi-agent entitlement rule even
+/// though fetched model metadata is no longer persisted; an aggregator that
+/// merely lists Grok models (OpenRouter) is not treated as xAI.
+#[test]
+fn xai_rule_follows_template_identity_not_catalog_metadata() {
+    let model = |id: &str, owned_by: &str| ModelEntry {
+        id: id.into(),
+        provider_metadata: serde_json::Map::from_iter([(
+            "owned_by".to_string(),
+            serde_json::json!(owned_by),
+        )]),
+        ..ModelEntry::default()
+    };
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "my-grok-proxy".into(),
+        ProviderEntry {
+            template: Some("grok".into()),
+            url: "https://llm-proxy.example/v1".into(),
+            models: vec![ModelEntry {
+                id: "grok-4-multi-agent".into(),
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+    cfg.providers.insert(
+        "openrouter".into(),
+        ProviderEntry {
+            template: Some("openrouter".into()),
+            url: "https://openrouter.ai/api/v1".into(),
+            models: vec![model("x-ai/grok-4-multi-agent", "xai")],
+            ..ProviderEntry::default()
+        },
+    );
+    assert!(
+        cfg.xai_multi_agent_client_side_tools_rule("my-grok-proxy", "grok-4-multi-agent")
+            .is_some()
+    );
+    assert!(
+        cfg.xai_multi_agent_client_side_tools_rule("openrouter", "x-ai/grok-4-multi-agent")
+            .is_none()
+    );
+}

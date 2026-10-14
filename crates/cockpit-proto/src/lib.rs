@@ -518,23 +518,134 @@ pub struct ProviderEntryView {
     pub credential_configured: bool,
 }
 
+/// Total model-id bytes one [`Response::ProviderModelsFetched`] may carry
+/// across all of its results. A model fetch response is a *summary* of the
+/// catalog the daemon persisted, never the catalog itself: the daemon is the
+/// only merge/persist authority, and clients that need full model entries
+/// re-read them through `GetProviderCatalogSnapshot`. Exact counts always
+/// travel; only the id preview is bounded, so the response stays far below
+/// [`MAX_INTERACTIVE_RPC_PAYLOAD_BYTES`] for any catalog size (#545).
+pub const MAX_PROVIDER_MODEL_SUMMARY_ID_BYTES: usize = 128 * 1024;
+
+/// Bounded summary of a list of model ids: the exact `count` plus the leading
+/// ids in catalog order. `ids.len() < count` means the preview was truncated
+/// to keep the response inside its payload budget.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderModelIdSummary {
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<String>,
+}
+
+impl ProviderModelIdSummary {
+    /// Summarize `ids`, charging each previewed id (plus its JSON framing)
+    /// against the shared response `budget`. Counting never stops; the
+    /// preview stops at the first id that no longer fits.
+    pub fn bounded<I, S>(ids: I, budget: &mut usize) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut summary = Self::default();
+        let mut previewing = true;
+        for id in ids {
+            summary.count = summary.count.saturating_add(1);
+            if !previewing {
+                continue;
+            }
+            let id = id.into();
+            // Quotes, separator, and worst-case escaping headroom.
+            let cost = id.len().saturating_mul(2).saturating_add(3);
+            if cost > *budget {
+                previewing = false;
+                continue;
+            }
+            *budget -= cost;
+            summary.ids.push(id);
+        }
+        summary
+    }
+
+    /// Number of ids counted but not previewed.
+    pub fn omitted(&self) -> u32 {
+        self.count
+            .saturating_sub(u32::try_from(self.ids.len()).unwrap_or(u32::MAX))
+    }
+}
+
+#[cfg(test)]
+mod provider_model_id_summary_tests {
+    use super::*;
+
+    /// The preview is bounded by the shared budget for any id length or
+    /// script, ids are never sliced, and the count stays exact (#545).
+    #[test]
+    fn preview_is_budgeted_whole_ids_with_exact_count() {
+        let long = "m".repeat(200_000);
+        let ids = vec![
+            "ascii/model".to_string(),
+            "模型/中文-模型".to_string(),
+            long.clone(),
+            "after-long".to_string(),
+        ];
+        let mut budget = 1024;
+        let summary = ProviderModelIdSummary::bounded(ids.clone(), &mut budget);
+        assert_eq!(summary.count, 4);
+        assert_eq!(
+            summary.ids,
+            ids[..2].to_vec(),
+            "preview stops at the first misfit"
+        );
+        assert_eq!(summary.omitted(), 2);
+        let mut shared = MAX_PROVIDER_MODEL_SUMMARY_ID_BYTES;
+        let many = (0..100_000).map(|index| format!("vendor/model-{index}"));
+        let first = ProviderModelIdSummary::bounded(many, &mut shared);
+        let second = ProviderModelIdSummary::bounded(vec!["x".to_string()], &mut shared);
+        assert_eq!(first.count, 100_000);
+        let encoded = serde_json::to_vec(&(first, second)).unwrap();
+        assert!(encoded.len() <= MAX_PROVIDER_MODEL_SUMMARY_ID_BYTES + 64);
+    }
+}
+
+/// User-facing suffix for a refresh whose catalog the daemon trimmed to stay
+/// readable through the bounded provider snapshot (`kept < fetched`). Empty
+/// otherwise. One spelling for every client.
+pub fn catalog_trim_note(fetched: u32, kept: u32) -> String {
+    if kept < fetched {
+        format!(
+            " — only {kept} of {fetched} saved: the catalog was trimmed to fit Cockpit's provider snapshot limit"
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Secret-free provider model discovery result returned by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProviderModelFetchOutcome {
+    /// The live catalog was fetched and durably merged by the daemon.
+    /// `models` summarizes the fetched upstream list.
     Models {
-        models: Vec<cockpit_config::config::providers::ModelEntry>,
+        models: ProviderModelIdSummary,
         catalog: cockpit_config::config::providers::ProviderModelCatalog,
+        /// How many of the fetched models the daemon persisted. Smaller than
+        /// `models.count` when the catalog was trimmed to stay readable
+        /// through the bounded provider snapshot; clients must say so.
+        kept: u32,
     },
+    /// The live fetch failed and a fallback catalog is available. It was
+    /// persisted only when the request set `allow_fallback`.
     FallbackAvailable {
-        models: Vec<cockpit_config::config::providers::ModelEntry>,
+        models: ProviderModelIdSummary,
         catalog: cockpit_config::config::providers::ProviderModelCatalog,
         reason: String,
     },
     /// The effective unlisted-model policy is `ask` and the fetched catalog
     /// would drop one or more configured models.  This is a no-write preview:
-    /// callers must retry explicitly with `keep` or `remove`.
+    /// callers must retry explicitly with `keep` or `remove`. `unlisted`
+    /// names the configured models absent from the fetched catalog.
     UnlistedModelsPreview {
-        unlisted_count: u32,
+        unlisted: ProviderModelIdSummary,
     },
     Unsupported,
     Error {
@@ -549,11 +660,25 @@ pub enum ProviderModelFetchOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProviderModelVerification {
     NoEndpoint,
-    Unauthorized { status: u16 },
+    Unauthorized {
+        status: u16,
+    },
     NotFound,
-    HttpStatus { status: u16, snippet: String },
-    Network { message: String },
-    Parse { message: String },
+    HttpStatus {
+        status: u16,
+        snippet: String,
+    },
+    Network {
+        message: String,
+    },
+    Parse {
+        message: String,
+    },
+    /// The catalog could not be stored within the provider snapshot limit
+    /// even without newly fetched models. Nothing was persisted.
+    CatalogTooLarge {
+        message: String,
+    },
 }
 
 /// One provider result from a daemon-owned catalog refresh.  The request can

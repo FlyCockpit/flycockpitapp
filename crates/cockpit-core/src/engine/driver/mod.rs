@@ -8614,11 +8614,16 @@ impl Driver {
         {
             tracing::warn!(error = %e, "record failed_turn_recovery event failed");
         }
-        let _ = tx
-            .send(TurnEvent::Notice {
-                text: "inference failed; type `continue` to retry the same turn from the stored recovery record".to_string(),
-            })
-            .await;
+        // Offer `continue` only when an unchanged retry can succeed. For a
+        // rejected key, unknown model, or invalid request the inline error
+        // carries the provider's reason and the TUI's guidance instead.
+        if crate::engine::retry::failure_retryable_unchanged(&failure.class, provider_status) {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: "inference failed; type `continue` to retry the same turn from the stored recovery record".to_string(),
+                })
+                .await;
+        }
     }
 
     async fn goal_continue_progress_since(&self, anchor_seq: i64) -> bool {

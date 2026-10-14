@@ -177,10 +177,119 @@ async fn run_deep_fetch(
     let client = crate::tui::settings::settings_daemon_client(&lifecycle)
         .await
         .map_err(|error| format!("deep fetch failed: {error}"))?;
-    // Use one daemon operation per model. This keeps probing and persistence
-    // daemon-owned while giving the TUI an observable target boundary: Esc
-    // never interrupts an in-flight probe, but prevents the next request.
-    for target in &targets {
+    let client = &client;
+    deep_fetch_with(
+        |request| async move {
+            client
+                .request(request)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+        },
+        &project_root,
+        &provider_id,
+        &targets,
+        progress,
+        cancel,
+    )
+    .await
+}
+
+/// Deep fetch over an injected daemon request function. One daemon
+/// operation per model keeps probing and persistence daemon-owned while
+/// giving the TUI an observable target boundary: Esc never interrupts an
+/// in-flight probe, but prevents the next request.
+///
+/// The fetch RPC returns a bounded summary, never the catalog (#545), so the
+/// entry the daemon persisted is adopted from its provider snapshot. That
+/// read-back runs on EVERY exit after at least one durable success —
+/// including a later target's failure — and a read-back failure is surfaced,
+/// so the editor never keeps stale model metadata (review C4).
+async fn deep_fetch_with<F, Fut>(
+    request: F,
+    project_root: &str,
+    provider_id: &str,
+    targets: &[DeepfetchTarget],
+    progress: &Arc<Mutex<DeepFetchProgress>>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String>
+where
+    F: Fn(cockpit_proto::Request) -> Fut,
+    Fut: std::future::Future<Output = Result<cockpit_proto::Response, String>>,
+{
+    let outcome = deep_fetch_targets(
+        &request,
+        project_root,
+        provider_id,
+        targets,
+        progress,
+        cancel,
+    )
+    .await;
+    let completed = progress
+        .lock()
+        .map(|progress| progress.completed)
+        .unwrap_or_default();
+    let refresh = if completed > 0 {
+        let refreshed = request(cockpit_proto::Request::GetProviderCatalogSnapshot {
+            project_root: project_root.to_string(),
+            provider_id: Some(provider_id.to_string()),
+            snapshot_session_id: uuid::Uuid::new_v4().to_string(),
+        })
+        .await;
+        match refreshed {
+            Ok(cockpit_proto::Response::ProviderCatalogSnapshot { config, .. }) => {
+                if let Ok(mut state) = progress.lock() {
+                    state.config = Some(config);
+                }
+                Ok(())
+            }
+            Ok(_) => Err("daemon returned an unexpected provider catalog snapshot".to_string()),
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(())
+    };
+    let refresh_note = |message: String| match &refresh {
+        Ok(()) => message,
+        Err(error) => format!(
+            "{message}; reading the refreshed catalog failed ({error}) — reopen the provider before editing"
+        ),
+    };
+    if let Err(error) = outcome {
+        return Err(refresh_note(error));
+    }
+    if let Err(error) = &refresh {
+        return Err(format!(
+            "deep fetch saved {completed} model(s) but reading the refreshed catalog failed ({error}) — reopen the provider before editing"
+        ));
+    }
+    if cancel.load(Ordering::Acquire) && completed < targets.len() {
+        return Ok(format!(
+            "deep fetch cancelled: completed model results have already been saved ({completed}/{})",
+            targets.len()
+        ));
+    }
+    Ok(format!(
+        "deep fetch complete: {} model(s), up to {} request(s)",
+        targets.len(),
+        plan_deepfetch(targets).total_requests()
+    ))
+}
+
+async fn deep_fetch_targets<F, Fut>(
+    request: &F,
+    project_root: &str,
+    provider_id: &str,
+    targets: &[DeepfetchTarget],
+    progress: &Arc<Mutex<DeepFetchProgress>>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String>
+where
+    F: Fn(cockpit_proto::Request) -> Fut,
+    Fut: std::future::Future<Output = Result<cockpit_proto::Response, String>>,
+{
+    for target in targets {
         if cancel.load(Ordering::Acquire) {
             break;
         }
@@ -188,22 +297,17 @@ async fn run_deep_fetch(
             progress,
             format!("→ {}:{}", target.provider_id, target.model_id),
         );
-        let response = client
-            .request(cockpit_proto::Request::FetchProviderModels {
-                project_root: project_root.clone(),
-                provider_id: Some(provider_id.clone()),
-                model_id: Some(target.model_id.clone()),
-                deep: true,
-                on_unlisted: None,
-                allow_fallback: false,
-            })
-            .await
-            .map_err(|error| format!("deep fetch failed: {error}"))?
-            .map_err(|error| format!("deep fetch failed: {error}"))?;
-        let cockpit_proto::Response::ProviderModelsFetched {
-            results, config, ..
-        } = response
-        else {
+        let response = request(cockpit_proto::Request::FetchProviderModels {
+            project_root: project_root.to_string(),
+            provider_id: Some(provider_id.to_string()),
+            model_id: Some(target.model_id.clone()),
+            deep: true,
+            on_unlisted: None,
+            allow_fallback: false,
+        })
+        .await
+        .map_err(|error| format!("deep fetch failed: {error}"))?;
+        let cockpit_proto::Response::ProviderModelsFetched { results, .. } = response else {
             return Err("deep fetch failed: daemon returned unexpected response".into());
         };
         let result = results
@@ -217,7 +321,8 @@ async fn run_deep_fetch(
             cockpit_proto::ProviderModelFetchOutcome::Error { message } => {
                 return Err(format!("deep fetch failed: {message}"));
             }
-            cockpit_proto::ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted_count } => {
+            cockpit_proto::ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } => {
+                let unlisted_count = unlisted.count;
                 return Err(format!(
                     "deep fetch needs a keep/remove decision for {unlisted_count} configured model(s)"
                 ));
@@ -231,24 +336,9 @@ async fn run_deep_fetch(
         }
         if let Ok(mut state) = progress.lock() {
             state.completed += 1;
-            state.config = Some(config);
         }
     }
-    let completed = progress
-        .lock()
-        .map(|progress| progress.completed)
-        .unwrap_or_default();
-    if cancel.load(Ordering::Acquire) && completed < targets.len() {
-        return Ok(format!(
-            "deep fetch cancelled: completed model results have already been saved ({completed}/{})",
-            targets.len()
-        ));
-    }
-    Ok(format!(
-        "deep fetch complete: {} model(s), up to {} request(s)",
-        targets.len(),
-        plan_deepfetch(&targets).total_requests()
-    ))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -595,4 +685,128 @@ fn deep_fetch_back(parent: &mut Box<EditState>, status: String) -> Nav {
     );
     owned.status = Some(status);
     Nav::Replace(super::super::providers_page(ProvidersPage::Edit(*owned)))
+}
+
+#[cfg(test)]
+mod read_back_tests {
+    use super::*;
+    use cockpit_config::providers::WireApi;
+    use cockpit_proto::{ProviderModelFetchOutcome, ProviderModelFetchResult, Request, Response};
+
+    fn target(model_id: &str) -> DeepfetchTarget {
+        DeepfetchTarget {
+            provider_id: "p".into(),
+            model_id: model_id.into(),
+            explicit_wire_api: WireApi::Auto,
+            inherited_wire_api: WireApi::Auto,
+            supported_wire_apis: Vec::new(),
+            automatic_wire_api: WireApi::Completions,
+            direct_model_scope: true,
+        }
+    }
+
+    fn fetched(outcome: ProviderModelFetchOutcome) -> Response {
+        Response::ProviderModelsFetched {
+            results: vec![ProviderModelFetchResult {
+                provider_id: "p".into(),
+                outcome,
+                verification: None,
+            }],
+            config_generation: 2,
+        }
+    }
+
+    fn snapshot() -> Response {
+        let mut config = cockpit_proto::ProviderConfigView::default();
+        config.providers.insert(
+            "p".into(),
+            cockpit_proto::ProviderEntryView {
+                entry: ProviderEntry {
+                    models: vec![cockpit_config::providers::ModelEntry {
+                        id: "a".into(),
+                        context_length: Some(4242),
+                        ..Default::default()
+                    }],
+                    ..ProviderEntry::default()
+                },
+                headers: Vec::new(),
+                credential_configured: true,
+            },
+        );
+        Response::ProviderCatalogSnapshot {
+            config,
+            snapshot_session_id: "s".into(),
+            layer_id: "l".into(),
+            owner_root: String::new(),
+            base_revision: "r".into(),
+            config_generation: 2,
+        }
+    }
+
+    /// Review C4: target A is durably updated, target B then fails. The
+    /// editor must still adopt the daemon's persisted catalog, and a failed
+    /// read-back must be reported rather than swallowed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_target_failure_still_adopts_persisted_catalog() {
+        for snapshot_fails in [false, true] {
+            let progress = Arc::new(Mutex::new(DeepFetchProgress::default()));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let requests = Mutex::new(Vec::new());
+            let result = deep_fetch_with(
+                |request: Request| {
+                    let kind = request.wire_tag().to_string();
+                    let model = match &request {
+                        Request::FetchProviderModels { model_id, .. } => model_id.clone(),
+                        _ => None,
+                    };
+                    requests.lock().unwrap().push(kind.clone());
+                    async move {
+                        match (kind.as_str(), model.as_deref()) {
+                            ("fetch_provider_models", Some("a")) => {
+                                Ok(fetched(ProviderModelFetchOutcome::Models {
+                                    models: Default::default(),
+                                    catalog: Default::default(),
+                                    kept: 1,
+                                }))
+                            }
+                            ("fetch_provider_models", _) => {
+                                Ok(fetched(ProviderModelFetchOutcome::Error {
+                                    message: "probe for b failed".into(),
+                                }))
+                            }
+                            _ if snapshot_fails => Err("snapshot unavailable".into()),
+                            _ => Ok(snapshot()),
+                        }
+                    }
+                },
+                "/tmp/project",
+                "p",
+                &[target("a"), target("b")],
+                &progress,
+                &cancel,
+            )
+            .await;
+            let error = result.expect_err("target b failed");
+            assert!(error.contains("probe for b failed"), "{error}");
+            assert_eq!(
+                requests.lock().unwrap().last().map(String::as_str),
+                Some("get_provider_catalog_snapshot"),
+                "read-back runs after the failed target"
+            );
+            let adopted = progress.lock().unwrap().config.take();
+            if snapshot_fails {
+                assert!(adopted.is_none());
+                assert!(
+                    error.contains("reading the refreshed catalog failed"),
+                    "{error}"
+                );
+            } else {
+                let adopted = adopted.expect("persisted catalog adopted");
+                assert_eq!(
+                    adopted.providers["p"].entry.models[0].context_length,
+                    Some(4242)
+                );
+            }
+        }
+    }
 }

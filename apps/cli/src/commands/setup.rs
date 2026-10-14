@@ -1141,16 +1141,21 @@ impl ProviderSetupActions {
         };
         let outcome = results.into_iter().next().map(|result| result.outcome);
         match outcome {
-            Some(crate::daemon::proto::ProviderModelFetchOutcome::Models { models, .. }) => {
-                io.write_line(&format!("key verified · {} models", models.len()))?
-            }
+            Some(crate::daemon::proto::ProviderModelFetchOutcome::Models {
+                models, kept, ..
+            }) => io.write_line(&format!(
+                "key verified · {} models{}",
+                models.count,
+                cockpit_proto::catalog_trim_note(models.count, kept)
+            ))?,
             Some(crate::daemon::proto::ProviderModelFetchOutcome::Unsupported) => {
                 io.write_line("credential verified with the provider")?
             }
             Some(crate::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
-                unlisted_count,
+                unlisted,
             }) => io.write_line(&format!(
-                "credential verified · model fetch needs a keep/remove decision for {unlisted_count} configured model(s)"
+                "credential verified · model fetch needs a keep/remove decision for {} configured model(s)",
+                unlisted.count
             ))?,
             Some(crate::daemon::proto::ProviderModelFetchOutcome::FallbackAvailable {
                 reason,

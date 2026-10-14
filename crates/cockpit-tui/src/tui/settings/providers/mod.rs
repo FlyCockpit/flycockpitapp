@@ -53,6 +53,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use super::auth::FetchOutcome;
 use crate::tui::settings::provider_entries_equal;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::{BRASS, BRASS_INDEX, FOG, FOG_INDEX, INK, INK_INDEX, resolve_color};
@@ -65,7 +66,6 @@ use cockpit_config::providers::{
 use cockpit_core::auth::copilot_setup::Shell as CopilotShell;
 use cockpit_core::providers::{self as templates, ProviderTemplate};
 use cockpit_core::wizard::{WizardAnswer, WizardRun};
-use cockpit_proto::ProviderModelFetchOutcome as FetchOutcome;
 
 pub(super) use row_editor::{
     HeaderEditor, HeaderMode, HeaderResult, ModelEditor, ModelField, ModelMode, ModelResult,
@@ -1211,7 +1211,12 @@ impl SettingsDialog {
         let mut message = String::new();
         let mut fallback_offer = None;
         let mut validation_failure = None;
-        if let Ok(FetchOutcome::Models { models, catalog }) = result {
+        if let Ok(FetchOutcome::Models {
+            models,
+            catalog,
+            trim_note,
+        }) = result
+        {
             if onboarding_validation {
                 // FetchProviderModels has already persisted the daemon-owned
                 // catalog. Refresh its edit capability before writing the
@@ -1222,7 +1227,9 @@ impl SettingsDialog {
                         provider_id: provider_id.to_string(),
                         catalog,
                     });
-                message = "Provider validated; refreshing its authoritative catalog before committing the onboarding checkpoint…".into();
+                message = format!(
+                    "Provider validated{trim_note}; refreshing its authoritative catalog before committing the onboarding checkpoint…"
+                );
                 self.queue_provider_catalog(Some(provider_id.to_string()));
             } else {
                 let Some(pre_fetch_models) = self
@@ -1269,19 +1276,21 @@ impl SettingsDialog {
                     let count = entry.models.len();
                     message = match self.save_config() {
                         Ok(()) => format!(
-                            "{}; saving provider catalog…",
+                            "{}{trim_note}; saving provider catalog…",
                             fetch_success_message(count, catalog)
                         ),
                         Err(e) => format!("save failed: {e}"),
                     };
                 }
             }
-        } else if let Ok(FetchOutcome::FallbackAvailable {
+        } else if let Ok(FetchOutcome::FallbackApplied {
             models,
             catalog,
             reason,
         }) = result
         {
+            // The request allowed the fallback catalog and the daemon
+            // persisted it; `models` is that persisted catalog.
             if self.config.providers.contains_key(provider_id) {
                 let reason = redact_model_fetch_reason(reason);
                 if onboarding_validation && fallback_commit_pending {
@@ -1292,7 +1301,35 @@ impl SettingsDialog {
                         });
                     message = "Fallback catalog committed by the daemon; refreshing its authority before finalizing onboarding…".into();
                     self.queue_provider_catalog(Some(provider_id.to_string()));
-                } else if onboarding_validation {
+                } else if let Some(entry) = self.config.providers.get_mut(provider_id) {
+                    entry.models = merge_fetched_models_with_policy(
+                        entry.effective_template(provider_id),
+                        &entry.models,
+                        models,
+                        ModelMergePolicy::KeepUnlisted,
+                    );
+                    entry.models_fetched_at = Some(Utc::now());
+                    entry.model_catalog = catalog;
+                    entry.mark_model_fetch_fallback(reason);
+                    let count = entry.models.len();
+                    message = match self.save_config() {
+                        Ok(()) => format!(
+                            "{}; saving provider catalog…",
+                            fetch_success_message(count, catalog)
+                        ),
+                        Err(e) => format!("save failed: {e}"),
+                    };
+                }
+            }
+        } else if let Ok(FetchOutcome::FallbackAvailable {
+            catalog,
+            reason,
+            fallback_count,
+        }) = result
+        {
+            if self.config.providers.contains_key(provider_id) {
+                let reason = redact_model_fetch_reason(reason);
+                if onboarding_validation {
                     let eligible = self.config.providers.get(provider_id).is_some_and(|entry| {
                         entry.model_catalog == catalog && !entry.models.is_empty()
                     });
@@ -1313,7 +1350,7 @@ impl SettingsDialog {
                     self.page = super::providers_page(ProvidersPage::FetchFallbackPrompt(
                         FetchFallbackPromptState {
                             provider_id: provider_id.to_string(),
-                            models,
+                            fallback_count,
                             catalog,
                             reason,
                             cursor: 0,
@@ -1356,11 +1393,12 @@ impl SettingsDialog {
                         }
                     };
                 }
-                Ok(FetchOutcome::Models { .. }) | Ok(FetchOutcome::FallbackAvailable { .. }) => {
+                Ok(
+                    FetchOutcome::Models { .. }
+                    | FetchOutcome::FallbackAvailable { .. }
+                    | FetchOutcome::FallbackApplied { .. },
+                ) => {
                     unreachable!()
-                }
-                Ok(FetchOutcome::UnlistedModelsPreview { .. } | FetchOutcome::Error { .. }) => {
-                    unreachable!("FetchHandle converts protocol-only outcomes into errors")
                 }
             }
         }
@@ -1383,19 +1421,23 @@ impl SettingsDialog {
                         s.validation_failure = Some(reason.clone());
                     }
                     if let (Some(reason), Some(screen)) = (validation_failure, s.verify.as_mut()) {
-                        screen.apply(crate::tui::onboarding::VerifyOutcome::Network(reason), None);
+                        screen.apply(crate::tui::onboarding::VerifyOutcome::Failed(reason), None);
                     } else if live_validation_succeeded && let Some(screen) = s.verify.as_mut() {
                         if unsupported {
                             screen.apply(crate::tui::onboarding::VerifyOutcome::NoEndpoint, None);
                         } else {
-                            let models = refreshed
+                            let models: Vec<String> = refreshed
                                 .as_ref()
                                 .map(|(models, _, _)| {
                                     models.iter().map(|model| model.id.clone()).collect()
                                 })
                                 .unwrap_or_default();
-                            screen
-                                .apply(crate::tui::onboarding::VerifyOutcome::Models(models), None);
+                            screen.apply(
+                                crate::tui::onboarding::VerifyOutcome::Models(
+                                    crate::tui::onboarding::ModelList::from(models),
+                                ),
+                                None,
+                            );
                         }
                     }
                     if s.is_step("fetching") {
@@ -3265,29 +3307,27 @@ impl SettingsCx {
                     );
                 }
                 2 => {
-                    if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
-                        entry.models = merge_fetched_models_with_policy(
-                            entry.effective_template(&s.provider_id),
-                            &entry.models,
-                            s.models.clone(),
-                            ModelMergePolicy::KeepUnlisted,
-                        );
-                        entry.models_fetched_at = Some(Utc::now());
-                        entry.model_catalog = s.catalog;
-                        entry.mark_model_fetch_fallback(s.reason.clone());
-                    }
-                    let count = self
-                        .config
-                        .providers
-                        .get(&s.provider_id)
-                        .map(|entry| entry.models.len())
-                        .unwrap_or(0);
-                    return self.commit_provider_mutation(
-                        super::ProviderMutationNavigation::Edit {
-                            provider_id: s.provider_id.clone(),
-                            status: fetch_success_message(count, s.catalog),
-                        },
-                    );
+                    // The daemon owns the fallback catalog: re-run the fetch
+                    // allowing it, then adopt what the daemon persisted.
+                    let Some(entry) = self.config.providers.get(&s.provider_id).cloned() else {
+                        return Nav::Replace(super::providers_page(ProvidersPage::List {
+                            cursor: initial_list_cursor(&self.config),
+                            status: Some("provider no longer exists".into()),
+                            delete_pending: false,
+                        }));
+                    };
+                    let mut edit = EditState::new(s.provider_id.clone(), entry.clone());
+                    edit.status = Some(format!(
+                        "applying the {}-model fallback catalog...",
+                        s.fallback_count
+                    ));
+                    edit.fetch = Some(FetchHandle::spawn_allowing_fallback(
+                        self.lifecycle.clone(),
+                        s.provider_id.clone(),
+                        entry,
+                        self.provider_fetch_root(),
+                    ));
+                    return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
                 }
                 _ => {
                     return Nav::Replace(super::providers_page(ProvidersPage::List {

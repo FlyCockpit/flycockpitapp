@@ -723,6 +723,7 @@ fn fetch_all_unlisted_picks_only_drifted_ids() {
             },
         ],
         catalog: cockpit_config::providers::ProviderModelCatalog::Live,
+        trim_note: String::new(),
     };
     let (unlisted, prompt) =
         fetch_all_unlisted_dialog(&cfg, vec![("p1".into(), Ok(remote_outcome))], None);
@@ -737,6 +738,7 @@ fn fetch_all_unlisted_skips_prompt_when_user_has_chosen() {
     let remote_outcome = FetchOutcome::Models {
         models: vec![],
         catalog: cockpit_config::providers::ProviderModelCatalog::Live,
+        trim_note: String::new(),
     };
     let (_unlisted, prompt) = fetch_all_unlisted_dialog(
         &cfg,

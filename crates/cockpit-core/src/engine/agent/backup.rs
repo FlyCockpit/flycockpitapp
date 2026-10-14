@@ -474,16 +474,16 @@ pub async fn turn_with_backup(
                     // failure/auth classification even when this live UI event
                     // is suppressed.
                     if !emit_failure_ui && !display_error_emitted {
-                        // Route the raw provider detail through the omission
-                        // funnel: the user-facing reason is the fixed marker
-                        // (optionally prefixed to the advisory custody block),
-                        // never the provider body.
-                        let safe = crate::engine::model::safe_provider_detail(failure);
+                        // UI-only inline error: the scrubbed, bounded
+                        // structured provider message (never the raw body;
+                        // persisted/audit/report sinks keep the omission
+                        // marker), optionally followed by the advisory
+                        // custody block.
+                        let shown =
+                            crate::engine::model::user_facing_provider_error(failure, &redact);
                         let detail = match applied_block {
-                            Some(block) => {
-                                format!("{}\n{}", safe.marker, block.user_message())
-                            }
-                            None => safe.marker_string(),
+                            Some(block) => format!("{shown}\n{}", block.user_message()),
+                            None => shown,
                         };
                         let _ = tx
                             .send(TurnEvent::InferenceFailed {
@@ -598,6 +598,8 @@ pub(crate) struct InferenceOutcomeRecord<'a> {
     pub(crate) emit_inference_error_ui: bool,
     pub(crate) goal_provenance: Option<(Uuid, i64)>,
     pub(crate) tx: &'a mpsc::Sender<TurnEvent>,
+    /// Session redaction table for the UI-only provider error projection.
+    pub(crate) redact: Arc<RedactionTable>,
 }
 
 pub(crate) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, err: &anyhow::Error) {
@@ -614,6 +616,7 @@ pub(crate) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
         emit_inference_error_ui,
         goal_provenance,
         tx,
+        redact,
     } = ctx;
     // Goal provenance is stamped on the row at body-insert time; the terminal
     // settle only advances status + phase columns.
@@ -735,9 +738,9 @@ pub(crate) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
                 provider: failure.provider.clone(),
                 model: failure.model.clone(),
                 error_class: failure.class.clone(),
-                // Raw provider detail is omitted; the red inline error shows the
-                // fixed marker (the typed `error_class` carries the real class).
-                detail: crate::engine::model::safe_provider_detail(failure).marker_string(),
+                // UI-only: the scrubbed structured provider message, never the
+                // raw body (the audit record above keeps the omission marker).
+                detail: crate::engine::model::user_facing_provider_error(failure, &redact),
                 auth_failure: crate::engine::model::auth_failure_kind(failure),
             })
             .await;
@@ -766,6 +769,7 @@ pub(crate) async fn record_inference_outcome_for_export_test(
             emit_inference_error_ui: false,
             goal_provenance: None,
             tx: &tx,
+            redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
         },
         err,
     )
@@ -882,6 +886,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: true,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )
@@ -966,6 +971,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: true,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )
@@ -1065,6 +1071,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: false,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )
@@ -1143,6 +1150,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: true,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )
@@ -1211,6 +1219,7 @@ mod inference_outcome_tests {
                 emit_inference_error_ui: true,
                 goal_provenance: None,
                 tx: &tx,
+                redact: std::sync::Arc::new(crate::redact::RedactionTable::empty()),
             },
             &err,
         )

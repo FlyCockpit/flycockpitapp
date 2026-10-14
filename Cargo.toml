@@ -44,7 +44,7 @@ csv = "1"
 croner = "3.0.1"
 dirs = "6"
 dotenvy = "0.15"
-flate2 = "=1.1.9"
+flate2 = "=1.1.10"
 futures = "0.3"
 globset = "0.4"
 grep-matcher = "0.1"
@@ -61,7 +61,7 @@ ignore = "0.4"
 # change that touches this line. `cargo audit`/`cargo deny` (cli-ci.yml) flag
 # advisories against the locked version in the meantime.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-jiff = "=0.2.35"
+jiff = "=0.2.38"
 jsonc-parser = { version = "0.33.0", default-features = false }
 jsonschema = { version = "0.46", default-features = false }
 jaq-core = "3.1.0"
@@ -140,7 +140,7 @@ which = "8"
 zbus = "5"
 zerobox = "0.3"
 # Direct pin: zeroize 1.9.0, no derive; alloc for Zeroizing/Vec paths.
-zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
+zeroize = { version = "=1.9.1", default-features = false, features = ["alloc"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # Shared lint posture for every workspace member (each opts in with

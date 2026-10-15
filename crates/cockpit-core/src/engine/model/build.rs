@@ -598,6 +598,13 @@ pub(super) fn build_anthropic_model_with_can_delegate(
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
+    let session_redact = Arc::new(
+        crate::providers::provider_http::with_diagnostic_credentials(
+            (*session_redact).clone(),
+            &resolved.headers,
+        )?,
+    );
+
     let x_api_key = resolved
         .headers
         .iter()
@@ -770,6 +777,13 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
+    let session_redact = Arc::new(
+        crate::providers::provider_http::with_diagnostic_credentials(
+            (*session_redact).clone(),
+            &resolved.headers,
+        )?,
+    );
+
     let access_token = resolved
         .headers
         .iter()
@@ -1003,6 +1017,13 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
+    let session_redact = Arc::new(
+        crate::providers::provider_http::with_diagnostic_credentials(
+            (*session_redact).clone(),
+            &resolved.headers,
+        )?,
+    );
+
     let resolved_wire_api = if wire_api.is_auto() {
         let default = crate::config::providers::default_wire_api_for_template(Some(provider_id));
         if wire_api_explicit {

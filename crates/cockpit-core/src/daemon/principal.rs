@@ -1047,6 +1047,7 @@ mod tests {
             #[cfg(feature = "extended")]
             "image_workflow_get",
             "get_provider_catalog_snapshot",
+            "get_provider_catalog_page",
             // #390 adds the daemon-owned redaction status projection as a
             // concurrent public-read request; it exposes no matcher/source
             // inventory and performs authorization before owner diagnostics.

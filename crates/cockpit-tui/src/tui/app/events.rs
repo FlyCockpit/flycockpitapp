@@ -3142,22 +3142,29 @@ pub(super) fn inference_failure_guidance(
                     .iter()
                     .any(|signal| {
                         lower.match_indices(signal).any(|(index, _)| {
-                            index == 0
+                            let object_boundary = index == 0
                                 || lower[..index]
                                     .chars()
                                     .next_back()
-                                    .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_')
+                                    .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_');
+                            let tail = lower[index + signal.len()..].trim_start();
+                            object_boundary
+                                && (tail.is_empty() || tail.starts_with(['.', '!', ';']))
                         })
                     })
                 });
+            let named_invalid = ["", "`", "'", "\""].iter().any(|quote| {
+                let signal = format!("{quote}{model_lower}{quote} is not a valid model id");
+                lower.match_indices(&signal).any(|(index, _)| {
+                    index == 0
+                        || lower[..index]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_')
+                })
+            });
             (
-                mentions(&[
-                    "not a valid model",
-                    "model not found",
-                    "unknown model",
-                    "invalid model",
-                    "no endpoints found for",
-                ]) || (!model_lower.is_empty() && named_missing),
+                !model_lower.is_empty() && (named_missing || named_invalid),
                 mentions(&["invalid schema", "json schema", "tools["]),
             )
         }

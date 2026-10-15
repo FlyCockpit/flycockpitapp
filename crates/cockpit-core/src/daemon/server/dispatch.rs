@@ -18218,6 +18218,22 @@ async fn handle_serialized_request_inner(
             .map(|account| Response::FlycockpitAccount { account })
             .map_err(internal),
 
+        Request::GetProviderCatalogPage {
+            project_root,
+            provider_id,
+            snapshot_session_id,
+            offset,
+        } => {
+            provider_catalog_snapshot_page(
+                ctx,
+                &project_root,
+                provider_id.as_deref(),
+                &snapshot_session_id,
+                settings_capability_owner(state),
+                offset,
+            )
+            .await
+        }
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
@@ -21448,6 +21464,22 @@ async fn handle_concurrent_request_impl(
         // sibling `GetProviderUsageSnapshot` stays serialized because it needs
         // the attached session's env overlay snapshot, which is not carried on
         // the concurrent (shared) path.
+        Request::GetProviderCatalogPage {
+            project_root,
+            provider_id,
+            snapshot_session_id,
+            offset,
+        } => {
+            provider_catalog_snapshot_page(
+                &ctx,
+                &project_root,
+                provider_id.as_deref(),
+                &snapshot_session_id,
+                shared.capability_owner.clone(),
+                offset,
+            )
+            .await
+        }
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
@@ -22049,9 +22081,68 @@ async fn provider_catalog_snapshot(
         true,
     )
     .await?;
-    bounded_provider_response(response).map_err(|_| bad_request(
-        "the complete provider/config snapshot exceeds the readable limit; reduce provider catalogs or MCP/extended configuration before editing"
-    ))
+    catalog_snapshot_wire_page(response, 0)
+}
+
+/// Serialize the complete durable view before slicing it. No model or
+/// auxiliary field is dropped to make a frame fit, and every root (including
+/// roots unknown at mutation time) uses the same bounded page representation.
+fn catalog_snapshot_wire_page(
+    response: Response,
+    offset: usize,
+) -> std::result::Result<Response, ErrorPayload> {
+    let json = serde_json::to_string(&response).map_err(internal)?;
+    if offset == 0 && json.len() <= proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES {
+        return Ok(response);
+    }
+    if offset >= json.len() || !json.is_char_boundary(offset) {
+        return Err(bad_request("invalid provider catalog page offset"));
+    }
+    let mut end = offset
+        .saturating_add(proto::PROVIDER_CATALOG_PAGE_BYTES)
+        .min(json.len());
+    while !json.is_char_boundary(end) {
+        end -= 1;
+    }
+    bounded_provider_response(Response::ProviderCatalogPage {
+        snapshot_digest: crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(
+            json.as_bytes(),
+        )),
+        offset,
+        total_bytes: json.len(),
+        json: json[offset..end].to_string(),
+    })
+}
+
+async fn provider_catalog_snapshot_page(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: Option<&str>,
+    snapshot_session_id: &str,
+    capability_owner: String,
+    offset: u64,
+) -> std::result::Result<Response, ErrorPayload> {
+    let offset = usize::try_from(offset)
+        .map_err(|_| bad_request("provider catalog page offset is out of range"))?;
+    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    recover_provider_config_journals(ctx, project_root, None).await?;
+    let (cwd, policy, config, warnings) =
+        daemon_provider_config_with_warnings(ctx, project_root).await?;
+    let response = provider_catalog_candidate_snapshot(
+        ctx,
+        project_root,
+        provider_id,
+        snapshot_session_id,
+        capability_owner,
+        cwd,
+        policy,
+        config,
+        warnings,
+        inventory::current_config_generation(),
+        false,
+    )
+    .await?;
+    catalog_snapshot_wire_page(response, offset)
 }
 
 /// Both reads and pre-commit guards serialize this exact representation. A
@@ -22270,6 +22361,45 @@ fn ensure_catalog_entries_editable(
         ));
     }
     Ok(())
+}
+
+/// The prospective serializer and the real writer share ConfigDoc's raw-field
+/// patching and layer merge. This charges inherited fields, URL tombstones,
+/// empty catalogs and lower/higher precedence rows before any durable intent.
+fn catalog_config_after_layer_writes(
+    ctx: &DaemonContext,
+    cwd: &std::path::Path,
+    policy: &crate::config::trust::WorkspaceTrustPolicy,
+    writes: &std::collections::BTreeMap<
+        std::path::PathBuf,
+        crate::config::providers::ProvidersConfig,
+    >,
+) -> std::result::Result<crate::config::providers::ProvidersConfig, ErrorPayload> {
+    let paths = if global_config_root(cwd)? {
+        vec![cockpit_config::config::dirs::global_config_file().map_err(internal)?]
+    } else {
+        crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
+            ctx.config_source().watch_paths(cwd).config_files
+        })
+    };
+    let writes = writes
+        .iter()
+        .map(|(path, layer)| {
+            Ok((
+                crate::config::providers::ConfigDoc::load(path)
+                    .map_err(internal)?
+                    .path,
+                layer.clone(),
+            ))
+        })
+        .collect::<std::result::Result<std::collections::BTreeMap<_, _>, ErrorPayload>>()?;
+    if writes.keys().any(|path| !paths.contains(path)) {
+        return Err(bad_request(
+            "provider write target is absent from the authoritative layer chain; no provider configuration was written",
+        ));
+    }
+    crate::config::providers::ConfigDoc::providers_from_paths_after_writes(&paths, &writes)
+        .map_err(internal)
 }
 
 async fn ensure_catalog_candidate_readable(
@@ -23701,6 +23831,7 @@ async fn stage_and_recover_provider_batch(
         if let Some(reference) = &upsert.entry.credential_ref {
             credential_claims.push((upsert.provider_id.clone(), reference.clone()));
         }
+        upsert.entry.models_replace = true;
         desired.providers.insert(upsert.provider_id, upsert.entry);
     }
     for delete in mutation.deletes {
@@ -23723,13 +23854,12 @@ async fn stage_and_recover_provider_batch(
         }
     }
 
-    let mut candidate = effective.clone();
-    // Include inherited siblings as well as the entire candidate layer. A
-    // deletion cannot increase this conservative pre-commit projection.
-    candidate.providers.extend(desired.providers.clone());
-    candidate.category_defaults = desired.category_defaults.clone();
-    candidate.on_unlisted_models_fetch = desired.on_unlisted_models_fetch;
-    candidate.active_model = desired.active_model.clone();
+    let candidate = catalog_config_after_layer_writes(
+        ctx,
+        &cwd,
+        &trust_policy,
+        &std::collections::BTreeMap::from([(target.clone(), desired.clone())]),
+    )?;
     ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &candidate).await?;
 
     // Cleanup is pair-scoped. A reference retained by the same provider in
@@ -24533,6 +24663,9 @@ pub(super) async fn provider_models_fetch(
         }
     }
     if !changed_provider_ids.is_empty() || on_unlisted.is_some_and(|_| !aggregate_fetch_failed) {
+        for id in &changed_provider_ids {
+            config.providers.get_mut(id).expect("changed provider exists").models_replace = true;
+        }
         let (_, _, _, warnings) = daemon_provider_config_with_warnings(ctx, project_root).await?;
         let snapshot = provider_catalog_candidate_snapshot(
             ctx,
@@ -24604,10 +24737,29 @@ pub(super) async fn provider_models_fetch(
     // Preflight every durable intermediate projection before the first
     // write. Multi-provider operations must also stay readable if interrupted
     // between layer updates, not only after their final write.
-    let mut intermediate = original_config.clone();
+    let mut planned_writes = std::collections::BTreeMap::new();
     for id in &changed_provider_ids {
-        intermediate.providers.insert(id.clone(), config.providers[id].clone());
+        let path = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || ctx.config_source().config_write_target_for_provider(&cwd, id)).map_err(config_write_target_error)?;
+        let path = canonical_user_level_write_target(ctx, &path)?;
+        let doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+        let path = doc.path.clone();
+        let layer = match planned_writes.entry(path.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(doc.providers()),
+        };
+        layer.providers.insert(id.clone(), config.providers[id].clone());
+        let intermediate = catalog_config_after_layer_writes(ctx, &cwd, &trust_policy, &planned_writes)?;
         ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &intermediate).await?;
+    }
+    if let Some(policy) = on_unlisted.filter(|_| !aggregate_fetch_failed) {
+        let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || ctx.config_source().config_write_target_for_provider(&cwd, "default")).map_err(config_write_target_error)?;
+        let target = canonical_user_level_write_target(ctx, &target)?;
+        let doc = crate::config::providers::ConfigDoc::load(&target).map_err(internal)?;
+        let layer = planned_writes.entry(doc.path.clone()).or_insert_with(|| doc.providers());
+        layer.category_defaults = config.category_defaults.clone();
+        layer.on_unlisted_models_fetch = Some(policy);
+        let final_config = catalog_config_after_layer_writes(ctx, &cwd, &trust_policy, &planned_writes)?;
+        ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &final_config).await?;
     }
     for provider_id in changed_provider_ids {
         let entry = config
@@ -26932,6 +27084,7 @@ async fn provider_config_save_under_lock(
             ));
         }
     }
+    entry.models_replace = true;
     let entry_json = serde_json::to_string(&entry).map_err(internal)?;
     let named_json = serde_json::to_string(&old_references.0).map_err(internal)?;
     let credentials_json = serde_json::to_string(&old_references.1).map_err(internal)?;
@@ -26967,10 +27120,12 @@ async fn provider_config_save_under_lock(
     intended_layer
         .providers
         .insert(provider_id.to_owned(), entry.clone());
-    let mut candidate = config.clone();
-    candidate
-        .providers
-        .insert(provider_id.to_string(), entry.clone());
+    let candidate = catalog_config_after_layer_writes(
+        ctx,
+        &cwd,
+        &trust_policy,
+        &std::collections::BTreeMap::from([(config_path.clone(), intended_layer.clone())]),
+    )?;
     ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &candidate).await?;
     let intended_revision = provider_config_revision(ctx, &config_path, &intended_layer)?;
     let consumed_config_generation = inventory::current_config_generation();

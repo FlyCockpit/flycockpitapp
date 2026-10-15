@@ -1330,8 +1330,7 @@ impl ConfigDoc {
 
     fn persist_raw_unlocked(&self) -> Result<()> {
         crate::config::dirs::authorize_config_file_write(&self.path)?;
-        let pretty = serde_json::to_string_pretty(&self.raw).context("serializing config.json")?;
-        atomic_write(&self.path, format!("{pretty}\n").as_bytes())?;
+        atomic_write(&self.path, &readable_document_bytes(&self.raw)?)?;
         Ok(())
     }
 
@@ -1365,9 +1364,7 @@ impl ConfigDoc {
     ) -> Result<()> {
         let path = provider_file_path_for_config(&self.path, provider_id)?;
         crate::config::dirs::authorize_config_file_write(&path)?;
-        let pretty = serde_json::to_string_pretty(&Value::Object(provider))
-            .context("serializing provider")?;
-        atomic_write(&path, format!("{pretty}\n").as_bytes())?;
+        atomic_write(&path, &readable_document_bytes(&provider)?)?;
         Ok(())
     }
 
@@ -1396,39 +1393,120 @@ impl ConfigDoc {
                 continue;
             }
 
-            let provider_path = provider_file_path_for_config(&self.path, id)?;
-            let provider_exists = provider_path.exists();
-            let mut raw = self.provider_raw_object(id)?;
-            match original_entry {
-                Some(_) if provider_exists => {
-                    merge_changed_provider_fields(
-                        &mut raw,
-                        original_raw.as_ref().expect("serialized original provider"),
-                        &requested_raw,
-                    );
-                    for key in PROVIDER_SKIPPED_KEYS {
-                        if !requested_raw.contains_key(*key) {
-                            raw.remove(*key);
-                        }
-                    }
-                }
-                Some(_) => {
-                    raw = requested_raw;
-                }
-                None => {
-                    for key in PROVIDER_SKIPPED_KEYS {
-                        if !requested_raw.contains_key(*key) {
-                            raw.remove(*key);
-                        }
-                    }
-                    for (key, value) in requested_raw {
-                        raw.insert(key, value);
-                    }
-                }
-            }
+            let raw = self.provider_raw_for_write(
+                id,
+                original_entry,
+                requested_raw,
+                original_raw.as_ref(),
+            )?;
             self.persist_provider_raw_unlocked(id, raw)?;
         }
         Ok(())
+    }
+
+    fn provider_raw_for_write(
+        &self,
+        id: &str,
+        original_entry: Option<&ProviderEntry>,
+        requested_raw: Map<String, Value>,
+        original_raw: Option<&Map<String, Value>>,
+    ) -> Result<Map<String, Value>> {
+        let changed = original_raw != Some(&requested_raw);
+        let provider_path = provider_file_path_for_config(&self.path, id)?;
+        let provider_exists = provider_path.exists();
+        let mut raw = self.provider_raw_object(id)?;
+        match original_entry {
+            Some(_) if provider_exists => {
+                merge_changed_provider_fields(
+                    &mut raw,
+                    original_raw.expect("serialized original provider"),
+                    &requested_raw,
+                );
+                for key in PROVIDER_SKIPPED_KEYS {
+                    if !requested_raw.contains_key(*key) {
+                        raw.remove(*key);
+                    }
+                }
+            }
+            Some(_) => {
+                raw = requested_raw;
+            }
+            None => {
+                for key in PROVIDER_SKIPPED_KEYS {
+                    if !requested_raw.contains_key(*key) {
+                        raw.remove(*key);
+                    }
+                }
+                for (key, value) in requested_raw {
+                    raw.insert(key, value);
+                }
+            }
+        }
+        if changed {
+            readable_document_bytes(&raw)?;
+        }
+        Ok(raw)
+    }
+
+    /// Resolve the exact prospective files through the same merge as reads,
+    /// without writing a file or changing ambient process/thread state.
+    pub fn providers_from_paths_after_writes(
+        paths: &[PathBuf],
+        writes: &BTreeMap<PathBuf, ProvidersConfig>,
+    ) -> Result<ProvidersConfig> {
+        let mut merged = Value::Object(Map::new());
+        let mut warnings = Vec::new();
+        for path in paths {
+            if let Some(requested) = writes.get(path) {
+                let mut doc = Self::load(path)?;
+                let original = doc.providers();
+                doc.set_layer_metadata_raw(
+                    requested,
+                    original.on_unlisted_models_fetch != requested.on_unlisted_models_fetch,
+                    original.category_defaults != requested.category_defaults,
+                )?;
+                readable_document_bytes(&doc.raw)?;
+                let mut layer = doc.raw.clone();
+                if let Some(object) = layer.as_object_mut() {
+                    object.remove("providers");
+                }
+                deep_merge_value(&mut merged, &layer);
+                for (id, entry) in &requested.providers {
+                    let requested_raw = serialize_json_object(entry, "provider")?;
+                    let original_raw = original
+                        .providers
+                        .get(id)
+                        .map(|entry| serialize_json_object(entry, "provider"))
+                        .transpose()?;
+                    let raw = doc.provider_raw_for_write(
+                        id,
+                        original.providers.get(id),
+                        requested_raw,
+                        original_raw.as_ref(),
+                    )?;
+                    // Apply project executable-config stripping and URL-change
+                    // credential tombstones exactly as ordinary file reads do.
+                    merge_provider_raw_for_layer(&mut merged, path, id, raw, &mut warnings);
+                }
+            } else {
+                // Re-read raw files so omitted/default fields and URL-change
+                // tombstones keep their ordinary layered semantics.
+                if path.exists() {
+                    let mut raw = Self::load(path)?.raw;
+                    if let Some(object) = raw.as_object_mut() {
+                        object.remove("providers");
+                    }
+                    deep_merge_value(&mut merged, &raw);
+                }
+                merge_provider_files_for_layer(&mut merged, path, &mut warnings);
+            }
+        }
+        Ok(Self {
+            path: PathBuf::new(),
+            raw: merged,
+            originally_loaded_providers: BTreeMap::new(),
+        }
+        .providers())
     }
 
     fn refresh_from_disk_unlocked(&mut self) -> Result<()> {
@@ -1437,6 +1515,19 @@ impl ConfigDoc {
         self.originally_loaded_providers = refreshed.originally_loaded_providers;
         Ok(())
     }
+}
+
+/// Same pretty JSON plus newline that the durable writer publishes. Parsed
+/// views omit unknown provider keys, so charge these bytes before writing too.
+fn readable_document_bytes(value: &impl Serialize) -> Result<Vec<u8>> {
+    let mut bytes =
+        serde_json::to_vec_pretty(value).context("serializing provider/config layer")?;
+    bytes.push(b'\n');
+    anyhow::ensure!(
+        bytes.len() <= crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES,
+        "serialized provider/config layer exceeds the readable byte limit; no provider configuration was written"
+    );
+    Ok(bytes)
 }
 
 fn serialize_json_object<T: Serialize>(value: &T, label: &str) -> Result<Map<String, Value>> {
@@ -1674,50 +1765,8 @@ fn merge_provider_files_for_layer(
             continue;
         };
         match load_provider_raw_file(&path) {
-            Ok(mut provider) => {
-                if !config_path_is_global_user_layer(config_path) {
-                    strip_project_auth_command(
-                        &id,
-                        &mut provider,
-                        "project provider config",
-                        warnings,
-                    );
-                    strip_project_oauth_descriptor(
-                        &id,
-                        &mut provider,
-                        "project provider config",
-                        warnings,
-                    );
-                }
-                let url_changed = provider.get("url").is_some_and(|new_url| {
-                    merged
-                        .get("providers")
-                        .and_then(Value::as_object)
-                        .and_then(|providers| providers.get(&id))
-                        .and_then(Value::as_object)
-                        .and_then(|previous| previous.get("url"))
-                        .is_some_and(|previous_url| new_url != previous_url)
-                });
-                if url_changed {
-                    provider
-                        .entry("credential_ref".to_string())
-                        .or_insert(Value::Null);
-                    provider
-                        .entry("headers".to_string())
-                        .or_insert_with(|| Value::Array(Vec::new()));
-                    // A higher-precedence destination must never inherit a
-                    // host-executed global credential producer. `null` is a
-                    // deliberate deep-merge tombstone for the optional field.
-                    provider
-                        .entry("auth_command".to_string())
-                        .or_insert(Value::Null);
-                    provider.entry("oauth".to_string()).or_insert(Value::Null);
-                }
-                let mut layer = Map::new();
-                let mut providers = Map::new();
-                providers.insert(id, Value::Object(provider));
-                layer.insert("providers".to_string(), Value::Object(providers));
-                deep_merge_value(merged, &Value::Object(layer));
+            Ok(provider) => {
+                merge_provider_raw_for_layer(merged, config_path, &id, provider, warnings);
             }
             Err(error) => {
                 tracing::warn!(
@@ -1729,6 +1778,48 @@ fn merge_provider_files_for_layer(
             }
         }
     }
+}
+
+fn merge_provider_raw_for_layer(
+    merged: &mut Value,
+    config_path: &Path,
+    id: &str,
+    mut provider: Map<String, Value>,
+    warnings: &mut Vec<String>,
+) {
+    if !config_path_is_global_user_layer(config_path) {
+        strip_project_auth_command(id, &mut provider, "project provider config", warnings);
+        strip_project_oauth_descriptor(id, &mut provider, "project provider config", warnings);
+    }
+    let url_changed = provider.get("url").is_some_and(|new_url| {
+        merged
+            .get("providers")
+            .and_then(Value::as_object)
+            .and_then(|providers| providers.get(id))
+            .and_then(Value::as_object)
+            .and_then(|previous| previous.get("url"))
+            .is_some_and(|previous_url| new_url != previous_url)
+    });
+    if url_changed {
+        provider
+            .entry("credential_ref".to_string())
+            .or_insert(Value::Null);
+        provider
+            .entry("headers".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        // A higher-precedence destination must never inherit a
+        // host-executed global credential producer. `null` is a
+        // deliberate deep-merge tombstone for the optional field.
+        provider
+            .entry("auth_command".to_string())
+            .or_insert(Value::Null);
+        provider.entry("oauth".to_string()).or_insert(Value::Null);
+    }
+    let mut layer = Map::new();
+    let mut providers = Map::new();
+    providers.insert(id.to_string(), Value::Object(provider));
+    layer.insert("providers".to_string(), Value::Object(providers));
+    deep_merge_value(merged, &Value::Object(layer));
 }
 
 /// Only the canonical platform global config file has global authority.
@@ -1827,6 +1918,53 @@ mod atomic_write_tests {
     use serde_json::{Map, Value};
 
     use super::{strip_project_auth_command, strip_project_oauth_descriptor};
+
+    #[test]
+    fn prospective_layer_write_matches_actual_raw_patch_and_reloaded_composition() {
+        use super::super::{ConfigDoc, ModelEntry};
+        use std::collections::BTreeMap;
+        let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
+        let global = crate::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap().join("providers")).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        std::fs::write(global.parent().unwrap().join("providers/p.json"), r#"{"url":"https://example.com","models":[{"id":"a","name":"retained"},{"id":"b"}],"opaque_field":{"keep":true}}"#).unwrap();
+        let paths = vec![global.clone()];
+        for models in [
+            vec![ModelEntry {
+                id: "a".into(),
+                name: Some("fresh".into()),
+                ..Default::default()
+            }],
+            Vec::new(),
+        ] {
+            let mut doc = ConfigDoc::load(&global).unwrap();
+            let mut desired = doc.providers();
+            desired.providers.get_mut("p").unwrap().models = models;
+            desired.providers.get_mut("p").unwrap().models_replace = true;
+            let before = std::fs::read(global.parent().unwrap().join("providers/p.json")).unwrap();
+            let preview = ConfigDoc::providers_from_paths_after_writes(
+                &paths,
+                &BTreeMap::from([(global.clone(), desired.clone())]),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(global.parent().unwrap().join("providers/p.json")).unwrap(),
+                before,
+                "preflight must not write"
+            );
+            doc.write(&desired).unwrap();
+            let actual = ConfigDoc::providers_from_paths(&paths);
+            assert_eq!(
+                serde_json::to_value(&preview).unwrap(),
+                serde_json::to_value(&actual).unwrap()
+            );
+            assert_eq!(
+                super::load_provider_raw_file(&global.parent().unwrap().join("providers/p.json"))
+                    .unwrap()["opaque_field"],
+                serde_json::json!({"keep":true})
+            );
+        }
+    }
 
     #[test]
     fn project_auth_command_is_ignored_and_reported() {

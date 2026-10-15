@@ -677,6 +677,11 @@ pub struct ProviderEntry {
     #[serde(default, skip_serializing_if = "ThinkingParams::is_empty")]
     pub thinking_params: ThinkingParams,
 
+    /// This layer owns a complete catalog, including deliberate removals and
+    /// budget trimming. Partial hand-authored model overlays still merge by ID.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub models_replace: bool,
+
     /// Cached model list. Populated by `/fetch-models` (or the wizard).
     #[serde(default)]
     pub models: Vec<ModelEntry>,

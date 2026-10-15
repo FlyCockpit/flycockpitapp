@@ -1086,6 +1086,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::WorkspaceHistoryScope { .. }
         | proto::Response::SecretInventory { .. }
         | proto::Response::ProviderCatalogSnapshot { .. }
+        | proto::Response::ProviderCatalogPage { .. }
         | proto::Response::ProviderModelsFetched { .. }
         | proto::Response::ProviderUsageSnapshot { .. }
         | proto::Response::ProviderConfigUpserted { .. }

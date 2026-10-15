@@ -23,13 +23,13 @@ enum DeepFetchPhase {
 }
 
 #[derive(Default)]
-struct DeepFetchProgress {
-    completed: usize,
+pub(super) struct DeepFetchProgress {
+    pub(super) completed: usize,
     attempted: bool,
     lines: Vec<String>,
     result: Option<Result<String, String>>,
     /// Latest authoritative catalog returned with a successful daemon probe.
-    config: Option<crate::tui::settings::auth::ProviderSnapshot>,
+    pub(super) config: Option<crate::tui::settings::auth::ProviderSnapshot>,
 }
 
 /// State is deliberately prepared from the config document, rather than from
@@ -206,7 +206,7 @@ async fn run_deep_fetch(
 /// read-back runs on EVERY exit after at least one durable success —
 /// including a later target's failure — and a read-back failure is surfaced,
 /// so the editor never keeps stale model metadata (review C4).
-async fn deep_fetch_with<F, Fut>(
+pub(super) async fn deep_fetch_with<F, Fut>(
     request: F,
     project_root: &str,
     provider_id: &str,
@@ -749,6 +749,90 @@ mod read_back_tests {
             base_revision: "r".into(),
             config_generation: 2,
         }
+    }
+
+    #[tokio::test]
+    async fn pending_success_after_cancel_reads_current_authority_without_second_probe() {
+        let progress = Arc::new(Mutex::new(DeepFetchProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = Mutex::new(Vec::new());
+        let entered = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let targets = [target("a"), target("b")];
+        let work = deep_fetch_with(
+            |request: Request| {
+                let snapshot_id = match &request {
+                    Request::GetProviderCatalogSnapshot {
+                        snapshot_session_id,
+                        ..
+                    } => snapshot_session_id.clone(),
+                    _ => String::new(),
+                };
+                let fetch = matches!(request, Request::FetchProviderModels { .. });
+                calls.lock().unwrap().push(request.wire_tag().to_string());
+                if fetch {
+                    assert_eq!(
+                        calls
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|kind| kind.as_str() == "fetch_provider_models")
+                            .count(),
+                        1,
+                        "cancellation must stop the second probe"
+                    );
+                }
+                let entered = &entered;
+                let release = &release;
+                async move {
+                    if fetch {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(fetched(ProviderModelFetchOutcome::Models {
+                            models: Default::default(),
+                            catalog: Default::default(),
+                            kept: 1,
+                        }))
+                    } else {
+                        Ok(snapshot(&snapshot_id))
+                    }
+                }
+            },
+            "/project",
+            "p",
+            &targets,
+            &progress,
+            &cancel,
+        );
+        tokio::pin!(work);
+        tokio::select! {
+            _ = entered.notified() => {},
+            result = &mut work => panic!("request must remain pending before Esc: {result:?}"),
+        }
+        cancel.store(true, Ordering::Release);
+        assert_eq!(progress.lock().unwrap().completed, 0);
+        release.notify_one();
+        let result = work.await.unwrap();
+        assert!(result.contains("cancelled"), "{result}");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["fetch_provider_models", "get_provider_catalog_snapshot"]
+        );
+        let state = progress.lock().unwrap();
+        assert_eq!(
+            state.completed, 1,
+            "first request succeeds after cancellation"
+        );
+        let snapshot = state
+            .config
+            .as_ref()
+            .expect("authoritative adoption after pending success");
+        assert_eq!(snapshot.authority.config_generation, 2);
+        assert_eq!(snapshot.authority.base_revision, "r");
+        assert_eq!(
+            snapshot.config.providers["p"].entry.models[0].context_length,
+            Some(4242)
+        );
     }
 
     #[tokio::test]

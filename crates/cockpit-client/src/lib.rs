@@ -1383,6 +1383,102 @@ impl DaemonClient {
     pub async fn request_with_timeout(
         &self,
         request: Request,
+        response_timeout: Duration,
+    ) -> Result<std::result::Result<Response, ErrorPayload>> {
+        let catalog_request = match &request {
+            Request::GetProviderCatalogSnapshot {
+                project_root,
+                provider_id,
+                snapshot_session_id,
+            } => Some((
+                project_root.clone(),
+                provider_id.clone(),
+                snapshot_session_id.clone(),
+            )),
+            _ => None,
+        };
+        let deadline = tokio::time::Instant::now() + response_timeout;
+        let mut response = self
+            .request_one_with_timeout(request, deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await?;
+        let Some((project_root, provider_id, snapshot_session_id)) = catalog_request else {
+            return Ok(response);
+        };
+        let mut assembled = String::new();
+        let mut expected = None;
+        loop {
+            match response {
+                Ok(Response::ProviderCatalogPage {
+                    snapshot_digest,
+                    offset,
+                    total_bytes,
+                    json,
+                }) => {
+                    anyhow::ensure!(
+                        offset == assembled.len()
+                            && !json.is_empty()
+                            && json.len() <= proto::PROVIDER_CATALOG_PAGE_BYTES
+                            && offset
+                                .checked_add(json.len())
+                                .is_some_and(|end| end <= total_bytes),
+                        "invalid provider catalog page"
+                    );
+                    let identity = (snapshot_digest, total_bytes);
+                    if let Some(expected) = &expected {
+                        anyhow::ensure!(
+                            expected == &identity,
+                            "provider catalog changed during paged read; reload it"
+                        );
+                    } else {
+                        expected = Some(identity.clone());
+                    }
+                    assembled.push_str(&json);
+                    if assembled.len() == total_bytes {
+                        // sha2 is already a transport dependency.
+                        use sha2::Digest as _;
+                        let digest = sha2::Sha256::digest(assembled.as_bytes());
+                        let actual = digest
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>();
+                        anyhow::ensure!(
+                            actual == identity.0,
+                            "provider catalog page digest mismatch"
+                        );
+                        let snapshot: Response = serde_json::from_str(&assembled)?;
+                        anyhow::ensure!(
+                            matches!(&snapshot, Response::ProviderCatalogSnapshot {snapshot_session_id: actual, ..} if actual == &snapshot_session_id),
+                            "invalid assembled provider catalog snapshot"
+                        );
+                        return Ok(Ok(snapshot));
+                    }
+                    response = self
+                        .request_one_with_timeout(
+                            Request::GetProviderCatalogPage {
+                                project_root: project_root.clone(),
+                                provider_id: provider_id.clone(),
+                                snapshot_session_id: snapshot_session_id.clone(),
+                                offset: assembled.len().try_into()?,
+                            },
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await?;
+                }
+                Err(error) => return Ok(Err(error)),
+                other => {
+                    anyhow::ensure!(
+                        assembled.is_empty(),
+                        "provider catalog changed during paged read; reload it"
+                    );
+                    return Ok(other);
+                }
+            }
+        }
+    }
+
+    async fn request_one_with_timeout(
+        &self,
+        request: Request,
         request_timeout: Duration,
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
         let exchange = async {
@@ -3879,5 +3975,102 @@ mod tests {
             .await
             .expect("second connection");
         broker.await.expect("connection broker");
+    }
+}
+
+
+#[cfg(test)]
+mod catalog_page_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn catalog_pages_reassemble_complete_view_and_fail_closed_on_mixed_or_missing_pages() {
+        for fault in ["none", "digest", "offset", "truncated", "changed"] {
+            let (requests, mut receive) = mpsc::channel::<InProcessRequest>(8);
+            let (_events, events) = mpsc::channel(8);
+            let client = DaemonClient::from_in_process(InProcessConnection { requests, events });
+            let config = proto::ProviderConfigView {
+                configuration_warnings: vec!["useful diagnostic 模型\"".repeat(40000)],
+                ..Default::default()
+            };
+            let expected = Response::ProviderCatalogSnapshot {
+                config,
+                snapshot_session_id: "paged-test".into(),
+                layer_id: "layer".into(),
+                owner_root: "/project".into(),
+                base_revision: "revision".into(),
+                config_generation: 42,
+            };
+            let json = serde_json::to_string(&expected).unwrap();
+            assert!(json.len() > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES);
+            let expected_json = json.clone();
+            let digest = Sha256::digest(json.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let server = tokio::spawn(async move {
+                let mut count = 0;
+                while let Some(request) = receive.recv().await {
+                    let offset = match request.request {
+                        Request::GetProviderCatalogSnapshot { .. } => 0,
+                        Request::GetProviderCatalogPage { offset, .. } => {
+                            usize::try_from(offset).unwrap()
+                        }
+                        other => panic!("unexpected request: {other:?}"),
+                    };
+                    let mut end = (offset + proto::PROVIDER_CATALOG_PAGE_BYTES).min(json.len());
+                    while !json.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let response = if count > 0 && fault == "truncated" {
+                        Response::Ack
+                    } else {
+                        Response::ProviderCatalogPage {
+                            snapshot_digest: if count > 0 && matches!(fault, "digest" | "changed") {
+                                "f".repeat(64)
+                            } else {
+                                digest.clone()
+                            },
+                            offset: if count > 0 && fault == "offset" {
+                                offset + 1
+                            } else {
+                                offset
+                            },
+                            total_bytes: json.len(),
+                            json: json[offset..end].to_string(),
+                        }
+                    };
+                    assert!(
+                        serde_json::to_vec(&response).unwrap().len()
+                            <= proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES
+                    );
+                    if request.reply.send(Ok(response)).is_err() {
+                        break;
+                    }
+                    count += 1;
+                }
+            });
+            let response = client
+                .request_ok(Request::GetProviderCatalogSnapshot {
+                    project_root: "/project".into(),
+                    provider_id: None,
+                    snapshot_session_id: "paged-test".into(),
+                })
+                .await;
+            if fault == "none" {
+                assert_eq!(
+                    serde_json::to_string(&response.unwrap()).unwrap(),
+                    expected_json
+                );
+            } else {
+                assert!(
+                    response.is_err(),
+                    "mixed/non-contiguous snapshot must not be adopted: {fault}"
+                );
+            }
+            drop(client);
+            server.await.unwrap();
+        }
     }
 }

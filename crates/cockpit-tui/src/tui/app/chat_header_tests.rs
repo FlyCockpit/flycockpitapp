@@ -1507,6 +1507,31 @@ fn provider_guidance_code_precedence_and_model_token_boundaries() {
 }
 
 #[test]
+fn codeless_model_parameter_prose_keeps_generic_request_advice() {
+    use cockpit_proto::InferenceErrorClass as Class;
+    for model in ["m", "parameter", "vendor/valid-model"] {
+        for detail in [
+            "Invalid model parameter: temperature",
+            "unknown model parameter: temperature",
+            "model not found in parameter schema",
+            "model parameter not found in schema",
+            "No endpoints found for request parameter",
+            "not a valid model parameter",
+            "The model temperature parameter does not exist",
+        ] {
+            let shown =
+                super::events::inference_failure_guidance(&Class::Http(400), detail, "p", model)
+                    .unwrap();
+            assert!(
+                !shown.contains("does not serve"),
+                "{model}: {detail}: {shown}"
+            );
+            assert!(shown.contains("rejected the request"), "{shown}");
+        }
+    }
+}
+
+#[test]
 fn recognized_non_model_codes_block_model_prose_fallbacks() {
     use cockpit_proto::InferenceErrorClass as Class;
     for detail in [

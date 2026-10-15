@@ -9,6 +9,86 @@ use rig::providers::{anthropic, chatgpt, openai};
 use super::wire::{normalize_openai_usage_aliases_bytes, take_normalized_sse_lines};
 
 const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// Errors and finite successes are bounded before Rig can collect them. SSE
+// additionally has a per-line cap and a finite per-response wire-byte budget.
+const MAX_INFERENCE_ERROR_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INFERENCE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INFERENCE_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const INFERENCE_BODY_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn transport_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> rig::http_client::Error {
+    rig::http_client::Error::Instance(Box::new(error))
+}
+
+async fn read_inference_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> rig::http_client::Result<bytes::Bytes> {
+    let read = async move {
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(transport_error(std::io::Error::other(format!(
+                "provider response body exceeded {limit} byte limit"
+            ))));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+            if body.len().saturating_add(chunk.len()) > limit {
+                return Err(transport_error(std::io::Error::other(format!(
+                    "provider response body exceeded {limit} byte limit"
+                ))));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(bytes::Bytes::from(body))
+    };
+    tokio::time::timeout(INFERENCE_BODY_TIMEOUT, read)
+        .await
+        .map_err(transport_error)?
+}
+
+async fn check_inference_status(
+    response: reqwest::Response,
+) -> rig::http_client::Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let headers = Box::new(response.headers().clone());
+    // Keep status and retry headers even when the bounded reader rejects the
+    // body. Oversized/failed bodies are dropped, never sent to Rig's collector.
+    let body = match read_inference_body(response, MAX_INFERENCE_ERROR_BYTES).await {
+        Ok(body) => String::from_utf8_lossy(&body).into_owned(),
+        Err(error) => error.to_string(),
+    };
+    Err(rig::http_client::Error::InvalidStatusCodeWithDetails {
+        status,
+        body,
+        headers,
+    })
+}
+
+async fn lazy_inference_response<U: From<bytes::Bytes> + Send + 'static>(
+    response: reqwest::Response,
+) -> rig::http_client::Result<rig::http_client::Response<rig::http_client::LazyBody<U>>> {
+    let response = check_inference_status(response).await?;
+    let mut builder = rig::http_client::Response::builder()
+        .status(response.status())
+        .version(response.version());
+    *builder.headers_mut().expect("valid response status") = response.headers().clone();
+    let body: rig::http_client::LazyBody<U> = Box::pin(async move {
+        let bytes = read_inference_body(response, MAX_INFERENCE_RESPONSE_BYTES).await?;
+        retain_anthropic_native_items_from_response(&bytes);
+        Ok(U::from(normalize_openai_usage_aliases_bytes(bytes)))
+    });
+    builder
+        .body(body)
+        .map_err(rig::http_client::Error::Protocol)
+}
 
 /// Maximum bytes the SSE line-normalizer may buffer waiting for a `\n`.
 ///
@@ -364,14 +444,15 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
             inject_native_computer_continuations(body.into()),
         );
         async move {
-            let response = client.send::<bytes::Bytes, bytes::Bytes>(req).await?;
-            let (parts, body) = response.into_parts();
-            let body: rig::http_client::LazyBody<U> = Box::pin(async move {
-                let bytes = body.await?;
-                retain_anthropic_native_items_from_response(&bytes);
-                Ok(U::from(normalize_openai_usage_aliases_bytes(bytes)))
-            });
-            Ok(rig::http_client::Response::from_parts(parts, body))
+            let (parts, body) = req.into_parts();
+            let response = client
+                .request(parts.method, parts.uri.to_string())
+                .headers(parts.headers)
+                .body(body)
+                .send()
+                .await
+                .map_err(transport_error)?;
+            lazy_inference_response(response).await
         }
     }
 
@@ -388,12 +469,19 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
         U: From<bytes::Bytes>,
         U: Send + 'static,
     {
-        self.client.send_multipart(apply_extra_headers(
+        let client = self.client.clone();
+        let req = apply_extra_headers(
             req,
             &self.extra_headers,
             self.strip_codex_headers,
             self.strip_x_api_key,
-        ))
+        );
+        let (parts, body) = req.into_parts();
+        let request = client
+            .request(parts.method, parts.uri.to_string())
+            .headers(parts.headers)
+            .multipart(reqwest::multipart::Form::from(body));
+        async move { lazy_inference_response(request.send().await.map_err(transport_error)?).await }
     }
 
     fn send_streaming<T>(
@@ -418,8 +506,24 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
             inject_native_computer_continuations(body.into()),
         );
         async move {
-            let response = client.send_streaming(req).await?;
-            let (parts, body) = response.into_parts();
+            let (parts, body) = req.into_parts();
+            let response = client
+                .request(parts.method, parts.uri.to_string())
+                .headers(parts.headers)
+                .body(body)
+                .send()
+                .await
+                .map_err(transport_error)?;
+            let response = check_inference_status(response).await?;
+            let mut builder = rig::http_client::Response::builder()
+                .status(response.status())
+                .version(response.version());
+            *builder.headers_mut().expect("valid response status") = response.headers().clone();
+            let body = Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|chunk| chunk.map_err(transport_error)),
+            );
             let stream: Pin<
                 Box<
                     dyn rig::wasm_compat::WasmCompatSendStream<
@@ -432,8 +536,9 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
                     Vec::<u8>::new(),
                     false,
                     AnthropicNativeStreamCapture::default(),
+                    0usize,
                 ),
-                |(mut body, mut pending, aborted, mut native_capture)| async move {
+                |(mut body, mut pending, aborted, mut native_capture, mut received)| async move {
                     // A prior iteration hit the no-newline cap and yielded a
                     // terminal error; end the stream rather than spin.
                     if aborted {
@@ -443,29 +548,39 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
                         let normalized = take_normalized_sse_lines(&mut pending, false);
                         if !normalized.is_empty() {
                             native_capture.ingest(&normalized);
-                            return Some((Ok(normalized), (body, pending, false, native_capture)));
+                            return Some((
+                                Ok(normalized),
+                                (body, pending, false, native_capture, received),
+                            ));
                         }
                         match body.next().await {
                             Some(Ok(bytes)) => {
-                                pending.extend_from_slice(&bytes);
-                                if pending.len() > MAX_SSE_PENDING_BYTES {
+                                received = received.saturating_add(bytes.len());
+                                if received > MAX_INFERENCE_STREAM_BYTES
+                                    || pending.len().saturating_add(bytes.len())
+                                        > MAX_SSE_PENDING_BYTES
+                                {
                                     let error = rig::http_client::Error::Instance(Box::new(
                                         std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
                                             format!(
-                                                "provider SSE stream buffered {} bytes with no newline (cap {MAX_SSE_PENDING_BYTES}); treating the connection as hostile",
+                                                "provider SSE stream exceeded its byte budget (received {received}, pending {}, line cap {MAX_SSE_PENDING_BYTES}, response cap {MAX_INFERENCE_STREAM_BYTES})",
                                                 pending.len(),
                                             ),
                                         ),
                                     ));
                                     return Some((
                                         Err(error),
-                                        (body, pending, true, native_capture),
+                                        (body, pending, true, native_capture, received),
                                     ));
                                 }
+                                pending.extend_from_slice(&bytes);
                             }
                             Some(Err(e)) => {
-                                return Some((Err(e), (body, pending, false, native_capture)));
+                                return Some((
+                                    Err(e),
+                                    (body, pending, false, native_capture, received),
+                                ));
                             }
                             None => {
                                 let normalized = take_normalized_sse_lines(&mut pending, true);
@@ -475,14 +590,16 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
                                 native_capture.ingest(&normalized);
                                 return Some((
                                     Ok(normalized),
-                                    (body, pending, false, native_capture),
+                                    (body, pending, false, native_capture, received),
                                 ));
                             }
                         }
                     }
                 },
             ));
-            Ok(rig::http_client::Response::from_parts(parts, stream))
+            builder
+                .body(stream)
+                .map_err(rig::http_client::Error::Protocol)
         }
     }
 }
@@ -636,5 +753,247 @@ mod redirect_policy_tests {
                 .contains("x-api-key: leaked-secret"),
             "{captured}"
         );
+    }
+}
+
+#[cfg(test)]
+mod body_budget_tests {
+    use super::*;
+    use rig::http_client::HttpClientExt;
+
+    async fn adapter_error(
+        client: &UsageAliasHttpClient,
+        url: &str,
+        mode: u8,
+    ) -> rig::http_client::Error {
+        let request = rig::http_client::Request::builder().method("POST").uri(url);
+        match mode {
+            0 => client
+                .send::<_, bytes::Bytes>(request.body(bytes::Bytes::new()).unwrap())
+                .await
+                .err(),
+            1 => client
+                .send_streaming(request.body(bytes::Bytes::new()).unwrap())
+                .await
+                .err(),
+            2 => client
+                .send_multipart::<bytes::Bytes>(
+                    request
+                        .body(rig::http_client::MultipartForm::new())
+                        .unwrap(),
+                )
+                .await
+                .err(),
+            _ => unreachable!(),
+        }
+        .expect("non-success status must fail")
+    }
+
+    #[tokio::test]
+    async fn inference_adapter_bounds_errors_on_all_three_paths_and_preserves_small_diagnostics() {
+        for mode in 0..3 {
+            for chunked in [false, true] {
+                let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![
+                    (
+                        401,
+                        "useful small authentication diagnostic".into(),
+                        chunked,
+                    ),
+                    (400, "x".repeat(MAX_INFERENCE_ERROR_BYTES + 1), chunked),
+                ])
+                .await;
+                let client = UsageAliasHttpClient::default();
+                let small = adapter_error(&client, &url, mode).await;
+                match small {
+                    rig::http_client::Error::InvalidStatusCodeWithDetails {
+                        status,
+                        body,
+                        headers,
+                    } => {
+                        assert_eq!(status.as_u16(), 401);
+                        assert_eq!(body, "useful small authentication diagnostic");
+                        assert_eq!(headers["retry-after"], "0");
+                    }
+                    error => panic!("lost status/body/headers: {error}"),
+                }
+                // Same adapter after a first credential failure: retry bodies
+                // have the identical bound, independent of mode/framing.
+                let error = adapter_error(&client, &url, mode).await;
+                match error {
+                    rig::http_client::Error::InvalidStatusCodeWithDetails {
+                        status, body, ..
+                    } => {
+                        assert_eq!(status.as_u16(), 400);
+                        assert!(
+                            body.contains("byte limit"),
+                            "mode={mode} chunked={chunked}: body len={}",
+                            body.len()
+                        );
+                        assert!(body.len() < 256, "the overflow body must be dropped");
+                    }
+                    error => panic!("lost error status: {error}"),
+                }
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_adapter_accepts_exact_error_limit_and_bounds_finite_successes() {
+        for mode in 0..3 {
+            let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+                400,
+                "x".repeat(MAX_INFERENCE_ERROR_BYTES),
+                true,
+            )])
+            .await;
+            let error = adapter_error(&UsageAliasHttpClient::default(), &url, mode).await;
+            assert!(
+                matches!(error, rig::http_client::Error::InvalidStatusCodeWithDetails {body, ..} if body.len() == MAX_INFERENCE_ERROR_BYTES)
+            );
+            server.await.unwrap();
+        }
+        for multipart in [false, true] {
+            for (body, overflow) in [
+                ("{\"useful\":true}".to_string(), false),
+                ("x".repeat(MAX_INFERENCE_RESPONSE_BYTES + 1), true),
+            ] {
+                let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+                    200,
+                    body.clone(),
+                    true,
+                )])
+                .await;
+                let client = UsageAliasHttpClient::default();
+                let builder = rig::http_client::Request::builder().method("POST").uri(url);
+                let response = if multipart {
+                    client
+                        .send_multipart::<bytes::Bytes>(
+                            builder
+                                .body(rig::http_client::MultipartForm::new())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                } else {
+                    client
+                        .send::<_, bytes::Bytes>(builder.body(bytes::Bytes::new()).unwrap())
+                        .await
+                        .unwrap()
+                };
+                let received = response.into_body().await;
+                if overflow {
+                    assert!(received.unwrap_err().to_string().contains("byte limit"));
+                } else {
+                    assert_eq!(received.unwrap().as_ref(), body.as_bytes());
+                }
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_adapter_bounds_stream_success_and_keeps_small_sse() {
+        for oversized in [false, true] {
+            let body = if oversized {
+                format!("data: {}\n", "a".repeat(1024 * 1024)).repeat(65)
+            } else {
+                "data: {\"useful\":true}\n\n".into()
+            };
+            let (url, server) =
+                crate::providers::provider_http::serve_test_bodies(vec![(200, body.clone(), true)])
+                    .await;
+            let client = UsageAliasHttpClient::default();
+            let request = rig::http_client::Request::builder()
+                .method("POST")
+                .uri(url)
+                .body(bytes::Bytes::new())
+                .unwrap();
+            let mut stream = client.send_streaming(request).await.unwrap().into_body();
+            let mut received = 0;
+            let mut failed = false;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => received += chunk.len(),
+                    Err(_) => {
+                        failed = true;
+                        assert!(stream.next().await.is_none(), "budget failure is terminal");
+                        break;
+                    }
+                }
+            }
+            assert_eq!(failed, oversized);
+            if !oversized {
+                assert_eq!(received, body.len());
+            }
+            assert!(received <= MAX_INFERENCE_STREAM_BYTES);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_adapter_pending_error_drop_releases_connection_for_every_mode() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for mode in 0..3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let mut headers = Vec::new();
+                while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = socket.read(&mut request).await.unwrap();
+                    assert!(read > 0);
+                    headers.extend_from_slice(&request[..read]);
+                }
+                socket.write_all(b"HTTP/1.1 400 Bad Request\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n1\r\nx\r\n").await.unwrap();
+                entered.send(()).unwrap();
+                // Multipart may still have request bytes queued. Drain those
+                // and require actual EOF after the owner future is dropped.
+                while socket.read(&mut request).await.unwrap_or(0) != 0 {}
+            });
+            let request = tokio::spawn(async move {
+                adapter_error(&UsageAliasHttpClient::default(), &url, mode).await
+            });
+            waiting.await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(
+                !request.is_finished(),
+                "unterminated error body must be pending"
+            );
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .expect("dropped adapter releases socket")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_adapter_slow_error_body_has_owned_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let client = UsageAliasHttpClient::default();
+        let request = tokio::spawn(async move { adapter_error(&client, &url, 1).await });
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0; 8192];
+        assert!(socket.read(&mut buffer).await.unwrap() > 0);
+        socket.write_all(b"HTTP/1.1 400 Bad Request\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n1\r\nx\r\n").await.unwrap();
+        // Schedule all ready HTTP work, then advance a paused clock beyond
+        // the adapter's own deadline (rather than imposing a test timeout).
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!request.is_finished());
+        tokio::time::pause();
+        tokio::time::advance(INFERENCE_BODY_TIMEOUT + Duration::from_secs(1)).await;
+        let error = request.await.unwrap();
+        assert!(
+            matches!(error, rig::http_client::Error::InvalidStatusCodeWithDetails {status, body, ..} if status.as_u16() == 400 && body.contains("deadline has elapsed"))
+        );
+        assert_eq!(socket.read(&mut buffer).await.unwrap_or(0), 0);
     }
 }

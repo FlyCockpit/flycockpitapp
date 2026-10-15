@@ -179,6 +179,10 @@ pub mod wire_scalar;
 /// Payload ceiling for latency-sensitive local daemon RPC responses.
 pub const MAX_INTERACTIVE_RPC_PAYLOAD_BYTES: usize = 512 * 1024;
 
+/// UTF-8 source bytes per catalog page. JSON escaping costs at most six bytes
+/// per byte, leaving envelope space inside the fixed interactive wire limit.
+pub const PROVIDER_CATALOG_PAGE_BYTES: usize = 64 * 1024;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
@@ -4563,22 +4567,35 @@ mod proto_fixture_tests {
             "{file_name} must contain exactly one full-shape fixture per {tag} variant"
         );
 
+        let mut failures = Vec::new();
         for (kind, value) in fixtures {
-            assert_eq!(
-                value.get(tag).and_then(Value::as_str),
-                Some(kind.as_str()),
-                "{file_name}:{kind} must carry its serde tag"
-            );
-            let parsed: T = serde_json::from_value(value.clone())
-                .unwrap_or_else(|error| panic!("deserialize {file_name}:{kind}: {error}"));
-            let serialized = serde_json::to_value(parsed)
-                .unwrap_or_else(|error| panic!("serialize {file_name}:{kind}: {error}"));
-            assert_eq!(
-                canonical(serialized),
-                canonical(value),
-                "{file_name}:{kind} must round-trip byte-equivalent after canonicalization"
-            );
+            // Retain every assertion and report all stale shapes in one run.
+            // A caught fixture failure still fails the enclosing test below.
+            if std::panic::catch_unwind(|| {
+                assert_eq!(
+                    value.get(tag).and_then(Value::as_str),
+                    Some(kind.as_str()),
+                    "{file_name}:{kind} must carry its serde tag"
+                );
+                let parsed: T = serde_json::from_value(value.clone())
+                    .unwrap_or_else(|error| panic!("deserialize {file_name}:{kind}: {error}"));
+                let serialized = serde_json::to_value(parsed)
+                    .unwrap_or_else(|error| panic!("serialize {file_name}:{kind}: {error}"));
+                assert_eq!(
+                    canonical(serialized),
+                    canonical(value),
+                    "{file_name}:{kind} must round-trip byte-equivalent after canonicalization"
+                );
+            })
+            .is_err()
+            {
+                failures.push(kind);
+            }
         }
+        assert!(
+            failures.is_empty(),
+            "{file_name} failed fixtures: {failures:?}"
+        );
     }
 
     fn assert_fixture_wire_tags<T>(

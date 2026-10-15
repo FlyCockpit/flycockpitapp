@@ -8663,3 +8663,98 @@ async fn untrusted_provider_wire_inventory_is_closed() {
         "no provider I/O on fail-closed"
     );
 }
+
+#[test]
+fn session_diagnostic_tables_cover_resolved_credentials_for_every_model_constructor() {
+    use crate::providers::models_fetch::ResolvedHeader;
+    let mut resolved = resolved_local_request("http://127.0.0.1:1/v1".into());
+    resolved.headers = vec![
+        ResolvedHeader {
+            name: "Authorization".into(),
+            value: "Bearer known/session-key/+fragment-0042".into(),
+        },
+        ResolvedHeader {
+            name: "x-api-key".into(),
+            value: "known/header-key/+fragment-0042".into(),
+        },
+        ResolvedHeader {
+            name: "chatgpt-account-id".into(),
+            value: "known/account-id/+fragment-0042".into(),
+        },
+        ResolvedHeader {
+            name: "anthropic-version".into(),
+            value: "2023-06-01".into(),
+        },
+    ];
+    for trusted in [false, true] {
+        let empty = Arc::new(RedactionTable::empty());
+        let timeout = TimeoutConfig::default();
+        let models = [
+            build_openai_model_from_resolved(
+                "p",
+                &resolved,
+                "m",
+                &timeout,
+                false,
+                ClientSideToolsCapability::default(),
+                WireApi::Completions,
+                true,
+                trusted,
+                None,
+                0,
+                0,
+                false,
+                empty.clone(),
+                empty.clone(),
+            )
+            .unwrap(),
+            build_chatgpt_model(
+                "p",
+                &resolved,
+                "m",
+                &timeout,
+                false,
+                trusted,
+                None,
+                0,
+                0,
+                false,
+                empty.clone(),
+                empty.clone(),
+            )
+            .unwrap(),
+            build_anthropic_model(
+                "p",
+                &resolved,
+                "m",
+                1024,
+                &Default::default(),
+                &timeout,
+                false,
+                trusted,
+                None,
+                0,
+                0,
+                false,
+                empty.clone(),
+                empty.clone(),
+            )
+            .unwrap(),
+        ];
+        for model in models {
+            let shown = model.session_redact_table().enforced().scrub("useful diagnostic known/session-key/+fragment-0042 known/header-key/+fragment-0042 known/account-id/+fragment-0042 2023-06-01");
+            for secret in ["known/session-key", "known/header-key", "known/account-id"] {
+                assert!(
+                    !shown.contains(secret),
+                    "credential escaped from {}: {shown}",
+                    model.provider_id()
+                );
+            }
+            assert!(shown.contains("useful diagnostic"));
+            assert!(
+                shown.contains("2023-06-01"),
+                "public metadata remains useful"
+            );
+        }
+    }
+}

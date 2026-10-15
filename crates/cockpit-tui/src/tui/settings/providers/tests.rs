@@ -8467,3 +8467,314 @@ fn refetch_rebase_keeps_explicit_model_intent_without_restoring_unchanged_trimme
     assert!(rebased.models[0].favorite);
     assert_eq!(rebased.models[0].context_length, Some(4242));
 }
+
+/// C4: a real daemon RPC is pending in provider I/O when Esc arrives. The
+/// successful commit must be read back and adopted before editing resumes;
+/// cancellation alone must prevent dispatch of the second target.
+#[test]
+fn pending_daemon_deep_success_after_escape_adopts_current_snapshot() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut entered = Some(entered);
+            while !stop_server.load(Ordering::Acquire) {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(socket) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = [0; 16384];
+                let read = socket.read(&mut request).unwrap();
+                assert!(read > 0);
+                if let Some(entered) = entered.take() {
+                    entered.send(()).unwrap();
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+                write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}").unwrap();
+            }
+        });
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        let entry = config.providers.get_mut("p").unwrap();
+        entry.url = format!("http://{address}/v1");
+        entry.allow_insecure_http = true;
+        entry.auth = Some(AuthKind::None);
+        entry.models = vec![model("a", false), model("b", false)];
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let old_generation = initial.authority.config_generation;
+        let old_revision = initial.authority.base_revision.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let progress = Arc::new(Mutex::new(deepfetch::DeepFetchProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = Mutex::new(Vec::new());
+        let targets =
+            ["a", "b"].map(
+                |model_id| cockpit_core::providers::deepfetch::DeepfetchTarget {
+                    provider_id: "p".into(),
+                    model_id: model_id.into(),
+                    explicit_wire_api: WireApi::Completions,
+                    inherited_wire_api: WireApi::Completions,
+                    supported_wire_apis: Vec::new(),
+                    automatic_wire_api: WireApi::Completions,
+                    direct_model_scope: true,
+                },
+            );
+        runtime.block_on(async {
+            let work = deepfetch::deep_fetch_with(|request: cockpit_proto::Request| {
+                calls.lock().unwrap().push(request.wire_tag().to_string());
+                let client = &client;
+                async move {client.request_ok(request).await.map_err(|error| error.to_string())}
+            }, &root, "p", &targets, &progress, &cancel);
+            tokio::pin!(work);
+            tokio::select! {
+                _ = waiting => {},
+                result = &mut work => panic!("provider I/O must remain pending until Esc: {result:?}"),
+            }
+            cancel.store(true, Ordering::Release);
+            assert_eq!(progress.lock().unwrap().completed, 0);
+            release.send(()).unwrap();
+            let status = tokio::time::timeout(std::time::Duration::from_secs(20), work).await.unwrap().unwrap();
+            assert!(status.contains("cancelled"), "{status}");
+        });
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["fetch_provider_models", "get_provider_catalog_snapshot"]
+        );
+        let state = progress.lock().unwrap();
+        assert_eq!(state.completed, 1);
+        let snapshot = state
+            .config
+            .clone()
+            .expect("read-back after successful pending RPC");
+        assert!(snapshot.authority.config_generation > old_generation);
+        assert_ne!(snapshot.authority.base_revision, old_revision);
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.authority.base_revision,
+            snapshot.authority.base_revision
+        );
+        assert_eq!(
+            serde_json::to_value(&current.config.providers).unwrap(),
+            serde_json::to_value(&snapshot.config.providers).unwrap()
+        );
+        let generation = snapshot.authority.config_generation;
+        let revision = snapshot.authority.base_revision.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(snapshot))
+            .unwrap();
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .config_generation,
+            generation
+        );
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .base_revision,
+            revision
+        );
+    });
+}
+
+/// C4 transport inverse: a real client timeout drops the pending reply receiver;
+/// the real daemon commits after the provider is released and read-back adopts it.
+#[test]
+fn pending_daemon_deep_lost_reply_after_escape_reads_committed_snapshot() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut entered = Some(entered);
+            while !stop_server.load(Ordering::Acquire) {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(socket) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = [0; 16384];
+                let read = socket.read(&mut request).unwrap();
+                assert!(read > 0);
+                if let Some(entered) = entered.take() {
+                    entered.send(()).unwrap();
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+                write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}").unwrap();
+            }
+        });
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        let entry = config.providers.get_mut("p").unwrap();
+        entry.url = format!("http://{address}/v1");
+        entry.allow_insecure_http = true;
+        entry.auth = Some(AuthKind::None);
+        entry.models = vec![model("a", false), model("b", false)];
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let old_generation = initial.authority.config_generation;
+        let old_revision = initial.authority.base_revision.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let progress = Arc::new(Mutex::new(deepfetch::DeepFetchProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = Mutex::new(Vec::new());
+        let lost_reply = tokio::sync::Notify::new();
+        let targets =
+            ["a", "b"].map(
+                |model_id| cockpit_core::providers::deepfetch::DeepfetchTarget {
+                    provider_id: "p".into(),
+                    model_id: model_id.into(),
+                    explicit_wire_api: WireApi::Completions,
+                    inherited_wire_api: WireApi::Completions,
+                    supported_wire_apis: Vec::new(),
+                    automatic_wire_api: WireApi::Completions,
+                    direct_model_scope: true,
+                },
+            );
+        runtime.block_on(async {
+            let work = deepfetch::deep_fetch_with(|request: cockpit_proto::Request| {
+                calls.lock().unwrap().push(request.wire_tag().to_string());
+                let client = &client;
+                let lost_reply = &lost_reply;
+                async move {
+                    if matches!(request, cockpit_proto::Request::FetchProviderModels { .. }) {
+                        // The production client drops its reply receiver on timeout.
+                        // The daemon still owns the pending request and its commit.
+                        let result = client.request_with_timeout(request, std::time::Duration::from_secs(1)).await;
+                        let error = result.expect_err("provider I/O must outlive the client reply deadline");
+                        assert!(error.to_string().contains("request timed out"), "{error}");
+                        lost_reply.notify_one();
+                        Err(error.to_string())
+                    } else {
+                        client.request_ok(request).await.map_err(|error| error.to_string())
+                    }
+                }
+            }, &root, "p", &targets, &progress, &cancel);
+            tokio::pin!(work);
+            tokio::select! {
+                _ = waiting => {},
+                result = &mut work => panic!("provider I/O must remain pending until Esc: {result:?}"),
+            }
+            cancel.store(true, Ordering::Release);
+            assert_eq!(progress.lock().unwrap().completed, 0);
+            tokio::select! {
+                _ = lost_reply.notified() => {},
+                result = &mut work => panic!("read-back must wait behind the daemon's pending commit: {result:?}"),
+            }
+            assert_eq!(progress.lock().unwrap().completed, 0);
+            release.send(()).unwrap();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(20), work).await.unwrap().unwrap_err();
+            assert!(error.contains("request timed out"), "{error}");
+        });
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["fetch_provider_models", "get_provider_catalog_snapshot"]
+        );
+        let state = progress.lock().unwrap();
+        assert_eq!(
+            state.completed, 0,
+            "the committed operation had no acknowledged reply"
+        );
+        let snapshot = state
+            .config
+            .clone()
+            .expect("read-back after the daemon committed despite a lost reply");
+        assert!(snapshot.authority.config_generation > old_generation);
+        assert_ne!(snapshot.authority.base_revision, old_revision);
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.authority.base_revision,
+            snapshot.authority.base_revision
+        );
+        assert_eq!(
+            serde_json::to_value(&current.config.providers).unwrap(),
+            serde_json::to_value(&snapshot.config.providers).unwrap()
+        );
+        let generation = snapshot.authority.config_generation;
+        let revision = snapshot.authority.base_revision.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(snapshot))
+            .unwrap();
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .config_generation,
+            generation
+        );
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .base_revision,
+            revision
+        );
+    });
+}

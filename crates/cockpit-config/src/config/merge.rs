@@ -20,7 +20,16 @@ pub(crate) fn deep_merge_value_at(base: &mut Value, overlay: &Value, path: &mut 
     }
     match (base, overlay) {
         (Value::Object(base_map), Value::Object(overlay_map)) => {
+            // A fetched/saved catalog is a complete inventory. In particular,
+            // an empty list must not resurrect inherited entries after trim.
+            let replace_models = path.len() == 2
+                && path[0] == "providers"
+                && overlay_map.get("models_replace").and_then(Value::as_bool) == Some(true);
             for (k, v) in overlay_map {
+                if replace_models && k == "models" {
+                    base_map.insert(k.clone(), v.clone());
+                    continue;
+                }
                 match base_map.get_mut(k) {
                     Some(existing) => {
                         path.push(k.clone());
@@ -104,5 +113,36 @@ pub(crate) fn merge_model_arrays_by_id(base: &mut Vec<Value>, overlay: &[Value])
             index_by_id.insert(id, base.len());
             base.push(overlay_item.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_membership_tests {
+    use super::*;
+    #[test]
+    fn complete_catalog_replaces_inherited_rows_including_an_empty_catalog() {
+        for models in [
+            serde_json::json!([]),
+            serde_json::json!([{"id":"kept", "name":"fresh"}]),
+        ] {
+            let mut base = serde_json::json!({"providers":{"p":{"url":"https://example.com", "models":[{"id":"trimmed"},{"id":"kept", "name":"old", "context_length":123}]}}});
+            let overlay =
+                serde_json::json!({"providers":{"p":{"models_replace":true,"models":models}}});
+            deep_merge_value(&mut base, &overlay);
+            assert_eq!(base["providers"]["p"]["models"], models);
+            assert_eq!(base["providers"]["p"]["url"], "https://example.com");
+        }
+    }
+    #[test]
+    fn partial_authored_model_overlays_still_inherit_unmentioned_rows_and_fields() {
+        let mut base = serde_json::json!({"providers":{"p":{"models":[{"id":"a", "name":"useful", "context_length":123},{"id":"b"}]}}});
+        deep_merge_value(
+            &mut base,
+            &serde_json::json!({"providers":{"p":{"models":[{"id":"a","favorite":true}]}}}),
+        );
+        assert_eq!(
+            base["providers"]["p"]["models"],
+            serde_json::json!([{"id":"a", "name":"useful", "context_length":123, "favorite":true},{"id":"b"}])
+        );
     }
 }

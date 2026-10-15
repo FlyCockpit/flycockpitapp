@@ -89,17 +89,13 @@ pub(crate) fn authorization_payload(value: &str) -> Option<&str> {
     .filter(|payload| !payload.is_empty())
 }
 
-/// Scrub complete decoded fields before callers slice, escape, persist or log
-/// provider diagnostics. The table includes every outbound header literal and
-/// its authorization payload, including dynamically resolved credentials.
-/// Failure to construct the table omits the diagnostic rather than releasing it.
-pub(crate) fn diagnostic_body(
-    raw: &str,
+/// Include actual outbound credentials before any provider-controlled field is
+/// transformed. Directory diagnostics and every inference client constructor
+/// use this same boundary, including authorization payloads and private headers.
+pub(crate) fn with_diagnostic_credentials(
+    mut table: crate::redact::RedactionTable,
     headers: &[super::models_fetch::ResolvedHeader],
-) -> String {
-    let mut table = DIAGNOSTIC_CREDENTIALS
-        .try_with(Clone::clone)
-        .unwrap_or_else(|_| crate::redact::RedactionTable::empty());
+) -> Result<crate::redact::RedactionTable> {
     for header in headers {
         if public_header_literal(&header.name, &header.value) {
             continue;
@@ -110,14 +106,28 @@ pub(crate) fn diagnostic_body(
             if value.is_empty() {
                 continue;
             }
-            table = match table
+            table = table
                 .with_forced_literal(value.to_string(), "provider request credential".into())
-            {
-                Ok(table) => table,
-                Err(_) => return "[provider diagnostic omitted]".into(),
-            };
+                .map_err(|_| anyhow::anyhow!("provider request credential coverage unavailable"))?;
         }
     }
+    Ok(table)
+}
+
+/// Scrub complete decoded fields before callers slice, escape, persist or log
+/// provider diagnostics. The table includes every outbound header literal and
+/// its authorization payload, including dynamically resolved credentials.
+/// Failure to construct the table omits the diagnostic rather than releasing it.
+pub(crate) fn diagnostic_body(
+    raw: &str,
+    headers: &[super::models_fetch::ResolvedHeader],
+) -> String {
+    let table = DIAGNOSTIC_CREDENTIALS
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| crate::redact::RedactionTable::empty());
+    let Ok(table) = with_diagnostic_credentials(table, headers) else {
+        return "[provider diagnostic omitted]".into();
+    };
     fn scrub(value: &mut serde_json::Value, table: &crate::redact::RedactionTable) {
         match value {
             serde_json::Value::String(text) => {

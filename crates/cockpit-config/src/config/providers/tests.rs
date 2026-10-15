@@ -1090,6 +1090,7 @@ fn round_trips_a_provider_entry() {
             }],
             capabilities: Default::default(),
             provider_metadata: Default::default(),
+            models_replace: false,
             last_model_fetch: None,
         },
     );

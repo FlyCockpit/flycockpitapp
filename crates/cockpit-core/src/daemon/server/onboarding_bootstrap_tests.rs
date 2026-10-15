@@ -865,14 +865,36 @@ async fn send_secure_intent_on_wire(
         },
     )
     .expect("encode secure intent");
+    // Capture the real OS identity while this peer is connected. Darwin
+    // refuses LOCAL_PEERPID after a full close, even with the request buffered;
+    // that is an admission refusal, not abandonment of an admitted response.
+    let departure = if !read_response {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        *served.locked.sensitive_read_boundary.lock().unwrap() =
+            Some(super::LockedSensitiveReadBoundary {
+                entered,
+                resume: resumed,
+            });
+        Some((observed, resume))
+    } else {
+        None
+    };
     let mut stream = tokio::net::UnixStream::connect(served.locked.paths.leak_reveal_socket())
         .await
         .expect("connect sensitive sibling");
     stream.write_all(&payload).await.expect("write intent");
     stream.flush().await.expect("flush intent");
     stream.shutdown().await.expect("half-close intent");
-    if !read_response {
+    if let Some((observed, resume)) = departure {
+        tokio::time::timeout(std::time::Duration::from_secs(5), observed)
+            .await
+            .expect("server captures the connecting OS identity")
+            .unwrap();
         drop(stream);
+        resume
+            .send(())
+            .expect("resume after the response becomes undeliverable");
         return None;
     }
     let mut response = Vec::new();
@@ -921,6 +943,17 @@ async fn abandoned_secure_intent_response_never_discards_ready_construction() {
         matches!(outcome, super::LockedRunOutcome::Ready(..)),
         "an abandoned response must not discard the constructed ready graph"
     );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !served
+            .locked
+            .sensitive_response_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual response write must fail on the abandoned connection");
     let snapshot = served
         .locked
         .onboarding
@@ -936,6 +969,64 @@ async fn abandoned_secure_intent_response_never_discards_ready_construction() {
     );
     drop(served.locked);
     drop(served.tmp);
+}
+
+/// A fully disconnected peer that Darwin can no longer identify is denied;
+/// possession of another connection's token cannot replace the OS PID binding.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn disconnected_sensitive_peer_is_refused_before_any_secure_intent_effect() {
+    use tokio::io::AsyncWriteExt as _;
+    let (_tmp, locked) = fresh_locked_services().await;
+    let locked = std::sync::Arc::new(locked);
+    let secure = advance_to_secure_store(&locked).await;
+    let peer = test_process_peer();
+    let token = locked.peer_credential_registry.mint(
+        peer,
+        uuid::Uuid::new_v4(),
+        crate::daemon::principal::LocalClientRole::Tui,
+        vec![],
+    );
+    assert!(
+        locked
+            .peer_credential_registry
+            .verify_sensitive_peer(peer, token.as_str())
+            .is_some()
+    );
+    let listener = tokio::net::UnixListener::bind(locked.paths.leak_reveal_socket()).unwrap();
+    let mut client = tokio::net::UnixStream::connect(locked.paths.leak_reveal_socket())
+        .await
+        .unwrap();
+    let payload = cockpit_proto::encode_sensitive_onboarding_intent(
+        cockpit_proto::SensitiveOnboardingIntentFrame {
+            connection_id: uuid::Uuid::nil(),
+            owner_capability: Some(cockpit_proto::OwnerCapabilityToken::new(token.0)),
+            request: secure_intent(
+                &secure,
+                "unidentified-intent",
+                OnboardingSecurePlacement::MachineBoundFile,
+                None,
+            ),
+        },
+    )
+    .unwrap();
+    client.write_all(&payload).await.unwrap();
+    client.shutdown().await.unwrap();
+    drop(client);
+    let (accepted, _) = listener.accept().await.unwrap();
+    let error = super::handle_locked_sensitive_connection(accepted, locked.clone())
+        .await
+        .expect_err("a disconnected unidentified peer cannot be authorized from its token");
+    assert!(format!("{error:#}").contains("LOCAL_PEERPID"), "{error:#}");
+    assert!(!locked.vault_committed());
+    let snapshot = locked
+        .onboarding
+        .snapshot(locked.host_capabilities())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.stage, OnboardingStage::SecureStore);
+    assert_eq!(snapshot.revision, secure.revision);
 }
 
 /// While ready construction runs the locked owner keeps accepting
@@ -2438,16 +2529,31 @@ async fn authenticated_locked_stop_daemon_stops_the_owner() {
     let Response::LocalPeerCredential { token, .. } = *response else {
         panic!("credential response");
     };
+    let stop_id = uuid::Uuid::new_v4();
     client
         .send(&cockpit_proto::Envelope::request_with_owner_capability(
-            uuid::Uuid::new_v4(),
+            stop_id,
             Request::StopDaemon { grace_secs: None },
             Some(token),
         ))
         .await
         .unwrap();
-    let _ = client.recv().await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    let Some(cockpit_proto::RecvFrame::Envelope(reply)) = client.recv().await.unwrap() else {
+        panic!("stop response");
+    };
+    assert!(
+        matches!(reply.body, cockpit_proto::Body::Response { id, response }
+        if id == stop_id && matches!(*response, Response::Ack))
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("authorized stop finishes")
+        .expect("locked handler joins")
+        .expect("clean authorized stop");
+    assert_eq!(
+        locked.peer_credential_registry.connection_count_for_test(),
+        0
+    );
     assert!(
         locked
             .stop_requested
@@ -2526,7 +2632,9 @@ async fn locked_connection_renews_rechecks_each_envelope_and_releases_on_io_erro
         panic!("query response");
     };
     assert!(
-        matches!(reply.body, cockpit_proto::Body::Error { .. }),
+        matches!(reply.body, cockpit_proto::Body::Error { error, .. }
+            if error.code == cockpit_proto::ErrorCode::BootstrapLocked
+                && error.message == "daemon bootstrap is locked: bootstrap peer is not authenticated"),
         "a revoked credential is refused on the very next envelope"
     );
     assert!(
@@ -2545,9 +2653,19 @@ async fn locked_connection_renews_rechecks_each_envelope_and_releases_on_io_erro
         1
     );
     client.send_raw_line("{malformed".into()).await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+    let error = tokio::time::timeout(std::time::Duration::from_secs(3), task)
         .await
-        .expect("the handler ends on a protocol error");
+        .expect("the handler ends on a protocol error")
+        .expect("locked handler joins")
+        .expect_err("malformed protocol is an I/O error");
+    assert!(
+        error.to_string().contains("deserializing envelope"),
+        "{error:#}"
+    );
+    assert_eq!(
+        locked.peer_credential_registry.connection_count_for_test(),
+        0
+    );
     assert!(
         locked
             .peer_credential_registry

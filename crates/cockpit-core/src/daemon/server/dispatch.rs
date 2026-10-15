@@ -18837,11 +18837,16 @@ async fn handle_serialized_request_impl(
             } else {
                 Vec::new()
             };
-            let connection_id = state.terminal_context.client_instance_id;
+            let connection = state
+                .peer_credential_connection
+                .ok_or_else(|| authorization_error("local peer connection lease is closed"))?;
             let token = ctx
                 .peer_credential_registry
-                .try_mint(peer, connection_id, role, grants.clone())
-                .map_err(|_| authorization_error(super::PEER_CREDENTIAL_CAPACITY_MESSAGE))?;
+                .try_mint(peer, connection, role, grants.clone())
+                .map_err(|error| authorization_error(match error {
+                    crate::daemon::peer_authority::PeerCredentialMintError::Full => super::PEER_CREDENTIAL_CAPACITY_MESSAGE,
+                    crate::daemon::peer_authority::PeerCredentialMintError::ConnectionClosed => "local peer connection lease is closed",
+                }))?;
             state.has_owner_capability = role.is_owner_class();
             if state.has_owner_capability {
                 state.owner_credential_revoked = None;

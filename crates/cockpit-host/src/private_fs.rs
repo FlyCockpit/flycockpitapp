@@ -2196,6 +2196,44 @@ pub enum PrivateFileAccess {
     Append,
 }
 
+/// Separate first creation from opening an existing name. Concurrent
+/// O_CREAT|O_NOFOLLOW opens of the same absent name can fail with ENOENT on
+/// Darwin even though the held parent and the winning file still exist.
+/// Exclusive creation gives the loser an explicit existing-name path, without
+/// following links or ever truncating an existing lock/log.
+#[cfg(unix)]
+fn open_or_create_nofollow(
+    dir_fd: &std::fs::File,
+    name: &std::ffi::CStr,
+    access_flags: libc::c_int,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let flags = access_flags | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    for _ in 0..8 {
+        match held_fd::openat_mode(
+            dir_fd.as_raw_fd(),
+            name,
+            flags | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(file) => return Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        match held_fd::openat(dir_fd.as_raw_fd(), name, flags) {
+            Ok(file) => return Ok(file),
+            // A rotating log can disappear between the collision and open.
+            // Retry the same held-fd, no-follow ladder, with a fixed bound.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "private file kept changing during open",
+    ))
+}
+
 /// Open (creating if absent) a `0600` owner-only file `name` inside an
 /// **already-held, verified** private directory fd `dir_fd`. The file is opened
 /// via `openat` with `O_NOFOLLOW` (a symlink at the name is refused with
@@ -2212,7 +2250,6 @@ pub fn open_private_file_in_dir_fd(
     access: PrivateFileAccess,
     label: &str,
 ) -> Result<std::fs::File, PrivateFsError> {
-    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -2223,25 +2260,15 @@ pub fn open_private_file_in_dir_fd(
         PrivateFileAccess::ReadWrite => libc::O_RDWR,
         PrivateFileAccess::Append => libc::O_WRONLY | libc::O_APPEND,
     };
-    let fd = unsafe {
-        libc::openat(
-            dir_fd.as_raw_fd(),
-            cname.as_ptr(),
-            access_flags | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600 as libc::c_uint,
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(match error.raw_os_error() {
-            Some(code) if code == libc::ELOOP => {
-                PrivateFsError::Containment(format!("{label}: {name:?} is a symlink"))
+    let file =
+        open_or_create_nofollow(dir_fd, &cname, access_flags).map_err(|error| {
+            match error.raw_os_error() {
+                Some(code) if code == libc::ELOOP => {
+                    PrivateFsError::Containment(format!("{label}: {name:?} is a symlink"))
+                }
+                _ => PrivateFsError::io(format!("opening {label} file {name:?}"), error),
             }
-            _ => PrivateFsError::io(format!("opening {label} file {name:?}"), error),
-        });
-    }
-    // SAFETY: `fd` was just returned by openat and is uniquely owned.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        })?;
 
     // Enforce 0600 through the held fd (fchmod, not a path chmod) then verify.
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -4251,6 +4278,94 @@ mod tests {
             0o755,
             "the shared parent must not be tightened"
         );
+    }
+
+    /// Both access patterns use the same first-creation ladder. Competing
+    /// creators must open the same private inode, and an existing file is never
+    /// truncated or redirected through a symlink/hard link.
+    #[cfg(unix)]
+    #[test]
+    fn private_fs_security_concurrent_first_file_opens_share_the_same_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        ensure_private_dir(root.path()).unwrap();
+        let parent = std::sync::Arc::new(open_private_dir_handle(root.path()).unwrap());
+        for access in [PrivateFileAccess::ReadWrite, PrivateFileAccess::Append] {
+            for round in 0..32 {
+                let name = format!("{access:?}-{round}");
+                let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let threads: Vec<_> = (0..2)
+                    .map(|_| {
+                        let parent = parent.clone();
+                        let barrier = barrier.clone();
+                        let name = name.clone();
+                        std::thread::spawn(move || {
+                            barrier.wait();
+                            open_private_file_in_dir_fd(
+                                &parent,
+                                std::ffi::OsStr::new(&name),
+                                access,
+                                "concurrent lock",
+                            )
+                        })
+                    })
+                    .collect();
+                let results: Vec<_> = threads
+                    .into_iter()
+                    .map(|thread| thread.join().unwrap())
+                    .collect();
+                let files: Vec<_> = results
+                    .into_iter()
+                    .map(|result| result.expect("every competing creator opens the lock"))
+                    .collect();
+                let first = files[0].metadata().unwrap();
+                let second = files[1].metadata().unwrap();
+                assert_eq!((first.dev(), first.ino()), (second.dev(), second.ino()));
+                assert_eq!(first.nlink(), 1);
+                assert_eq!(first.permissions().mode() & 0o777, 0o600);
+                std::fs::write(root.path().join(&name), b"retained lock contents").unwrap();
+                drop(files);
+                let reopened = open_private_file_in_dir_fd(
+                    &parent,
+                    std::ffi::OsStr::new(&name),
+                    access,
+                    "existing lock",
+                )
+                .unwrap();
+                assert_eq!(reopened.metadata().unwrap().ino(), first.ino());
+                assert_eq!(
+                    std::fs::read(root.path().join(name)).unwrap(),
+                    b"retained lock contents"
+                );
+            }
+        }
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        for access in [PrivateFileAccess::ReadWrite, PrivateFileAccess::Append] {
+            let symlink = format!("symlink-{access:?}");
+            std::os::unix::fs::symlink(&victim, root.path().join(&symlink)).unwrap();
+            assert!(matches!(
+                open_private_file_in_dir_fd(
+                    &parent,
+                    std::ffi::OsStr::new(&symlink),
+                    access,
+                    "symlink"
+                ),
+                Err(PrivateFsError::Containment(_))
+            ));
+            let hardlink = format!("hardlink-{access:?}");
+            std::fs::hard_link(&victim, root.path().join(&hardlink)).unwrap();
+            assert!(matches!(
+                open_private_file_in_dir_fd(
+                    &parent,
+                    std::ffi::OsStr::new(&hardlink),
+                    access,
+                    "hardlink"
+                ),
+                Err(PrivateFsError::MultiplyLinked(_))
+            ));
+        }
+        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
     }
 
     // -- ensure refuses a symlinked intermediate component (Unix, AC4) ----

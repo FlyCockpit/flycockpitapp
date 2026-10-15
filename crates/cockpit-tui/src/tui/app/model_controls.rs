@@ -952,6 +952,7 @@ impl App {
         let refresh_tool_surface_on_failure =
             matches!(pending.applied, ControlApplied::ToolSurfaceOverride { .. });
         let unauthorized = matches!(outcome, ControlRequestOutcome::Unauthorized(_));
+        let transport_failed = matches!(outcome, ControlRequestOutcome::TransportFailed(_));
         match outcome {
             ControlRequestOutcome::ConfigRefreshed {
                 applied_generation,
@@ -996,7 +997,9 @@ impl App {
                     ));
                 }
             }
-            ControlRequestOutcome::Rejected(error) | ControlRequestOutcome::Unauthorized(error) => {
+            ControlRequestOutcome::Rejected(error)
+            | ControlRequestOutcome::Unauthorized(error)
+            | ControlRequestOutcome::TransportFailed(error) => {
                 if refresh_tool_surface_on_failure {
                     self.refuse_tool_surface_override(format!(
                         "Tool surface update was refused: {error}"
@@ -1017,12 +1020,15 @@ impl App {
                     let outcome = tok.on_response(confirm_id, 0, false, code);
                     self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
-                    let mut message =
-                        format!("{}: daemon rejected request: {error}", pending.label);
+                    let mut message = if transport_failed {
+                        format!("{}: daemon response unavailable: {error}", pending.label)
+                    } else {
+                        format!("{}: daemon rejected request: {error}", pending.label)
+                    };
                     // Only the exit check itself, only for a typed
-                    // authorization refusal, and never from a fenced or
-                    // stale receipt (C4).
-                    if unauthorized
+                    // authorization refusal or an unavailable response, and
+                    // never from a fenced or stale receipt (C4).
+                    if (unauthorized || transport_failed)
                         && !skip_confirmation
                         && matches!(pending.applied, ControlApplied::ExitGuardStatus)
                     {
@@ -1034,7 +1040,7 @@ impl App {
                         request_id,
                         message,
                         &error,
-                        false,
+                        transport_failed,
                     );
                 }
             }

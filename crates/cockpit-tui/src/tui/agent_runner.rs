@@ -183,19 +183,35 @@ pub struct ControlRequest {
     pub response_tx: oneshot::Sender<Result<Response, ControlRequestError>>,
 }
 
-/// A control request's failure, keeping whether the daemon refused it with
-/// a typed authorization error.
+/// Keep delivery failure separate from a refusal actually returned by the
+/// daemon. A timeout may leave daemon-side work running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlRequestError {
     pub message: String,
-    pub authorization: bool,
+    kind: ControlRequestErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlRequestErrorKind {
+    Rejected,
+    Unauthorized,
+    Transport,
+}
+
+impl ControlRequestError {
+    pub(crate) fn rejected(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ControlRequestErrorKind::Rejected,
+        }
+    }
 }
 
 impl From<String> for ControlRequestError {
     fn from(message: String) -> Self {
         Self {
             message,
-            authorization: false,
+            kind: ControlRequestErrorKind::Transport,
         }
     }
 }
@@ -1105,11 +1121,11 @@ async fn dispatch_control_request_for_current_attachment<F, Fut>(
     if control_request.intended_session_id != current_session_id
         || control_request.intended_attachment_epoch != current_epoch
     {
-        let _ = control_request.response_tx.send(Err(
-            "request belongs to a session attachment that has been replaced; retry"
-                .to_string()
-                .into(),
-        ));
+        let _ = control_request
+            .response_tx
+            .send(Err(ControlRequestError::rejected(
+                "request belongs to a session attachment that has been replaced; retry",
+            )));
         return;
     }
     let response = send(control_request.request).await;
@@ -3237,14 +3253,7 @@ async fn try_spawn_inner(
                         let current_client = current_client.clone();
                         async move {
                             let client = current_client.read().await.clone();
-                            match client.request(request).await {
-                                Ok(Ok(response)) => Ok(response),
-                                Ok(Err(payload)) => Err(ControlRequestError {
-                                    authorization: payload.code == proto::ErrorCode::Authorization,
-                                    message: format!("daemon request: daemon error: {payload}"),
-                                }),
-                                Err(error) => Err(format!("daemon request: {error}").into()),
-                            }
+                            control_request_result(client.request(request).await)
                         }
                     },
                 )
@@ -3709,6 +3718,23 @@ pub(crate) fn send_control_request(
     }
 }
 
+pub(crate) fn control_request_result(
+    result: anyhow::Result<Result<Response, proto::ErrorPayload>>,
+) -> Result<Response, ControlRequestError> {
+    match result {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(payload)) => Err(ControlRequestError {
+            kind: if payload.code == proto::ErrorCode::Authorization {
+                ControlRequestErrorKind::Unauthorized
+            } else {
+                ControlRequestErrorKind::Rejected
+            },
+            message: format!("daemon request: daemon error: {payload}"),
+        }),
+        Err(error) => Err(format!("daemon request: {error}").into()),
+    }
+}
+
 pub(crate) fn control_response_outcome(
     result: Result<Response, ControlRequestError>,
 ) -> ControlRequestOutcome {
@@ -3734,8 +3760,15 @@ pub(crate) fn control_response_outcome(
             has_live_work,
         },
         Ok(_) => ControlRequestOutcome::Applied,
-        Err(error) if error.authorization => ControlRequestOutcome::Unauthorized(error.message),
-        Err(error) => ControlRequestOutcome::Rejected(error.message),
+        Err(error) => match error.kind {
+            ControlRequestErrorKind::Unauthorized => {
+                ControlRequestOutcome::Unauthorized(error.message)
+            }
+            ControlRequestErrorKind::Rejected => ControlRequestOutcome::Rejected(error.message),
+            ControlRequestErrorKind::Transport => {
+                ControlRequestOutcome::TransportFailed(error.message)
+            }
+        },
     }
 }
 

@@ -49,6 +49,9 @@ pub enum ControlRequestOutcome {
     /// (`ErrorCode::Authorization`). Presented like [`Self::Rejected`];
     /// kept distinct so callers never infer authorization from text.
     Unauthorized(String),
+    /// The transport could not provide a daemon response. Delivery and any
+    /// daemon-side effects are unknown; this is never an authoritative refusal.
+    TransportFailed(String),
     Applied,
     ConfigRefreshed {
         applied_generation: u64,

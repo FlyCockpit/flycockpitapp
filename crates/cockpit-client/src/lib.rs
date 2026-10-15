@@ -980,10 +980,13 @@ pub struct DaemonClient {
 }
 
 #[cfg(any(unix, windows))]
+type WireReply = oneshot::Sender<Result<std::result::Result<Response, ErrorPayload>>>;
+
+#[cfg(any(unix, windows))]
 struct Pending {
     id: Uuid,
     request: Request,
-    reply: oneshot::Sender<std::result::Result<Response, ErrorPayload>>,
+    reply: WireReply,
 }
 
 #[derive(Clone, Debug)]
@@ -1317,12 +1320,12 @@ impl DaemonClient {
         request: Request,
         response_timeout: Duration,
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
-        let (tx, rx) = oneshot::channel();
         #[cfg(any(unix, windows))]
         let id = Uuid::now_v7();
         match &self.backend {
             #[cfg(any(unix, windows))]
             ClientBackend::Wire(request_tx) => {
+                let (tx, rx) = oneshot::channel();
                 request_tx
                     .send(IoCommand::Request(Box::new(Pending {
                         id,
@@ -1332,7 +1335,7 @@ impl DaemonClient {
                     .await
                     .map_err(|_| anyhow!("daemon client task has stopped"))?;
                 match tokio::time::timeout(response_timeout, rx).await {
-                    Ok(Ok(result)) => Ok(result),
+                    Ok(Ok(result)) => result,
                     Ok(Err(_)) => Err(anyhow!("daemon client dropped reply channel")),
                     Err(_) => {
                         let _ = request_tx.send(IoCommand::Cancel { id }).await;
@@ -1341,6 +1344,7 @@ impl DaemonClient {
                 }
             }
             ClientBackend::InProcess(request_tx) => {
+                let (tx, rx) = oneshot::channel();
                 request_tx
                     .send(InProcessRequest { request, reply: tx })
                     .await
@@ -1749,8 +1753,7 @@ async fn run_io<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    let mut pending: HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>> =
-        HashMap::new();
+    let mut pending: HashMap<Uuid, WireReply> = HashMap::new();
     let mut inbound_burst = InboundBurst::default();
     let mut dropped_events: u64 = 0;
     let mut attached_session: Option<Uuid> = None;
@@ -1822,7 +1825,7 @@ async fn run_io<S>(
                                         }
                                         _ => {}
                                     }
-                                    let _ = tx.send(Ok(response));
+                                    let _ = tx.send(Ok(Ok(response)));
                                 } else if is_nil_daemon_status_hello(id, &response) {
                                     tracing::debug!("daemon hello status received");
                                 } else {
@@ -1833,7 +1836,7 @@ async fn run_io<S>(
                                 match id {
                                     Some(id) => {
                                         if let Some(tx) = pending.remove(&id) {
-                                            let _ = tx.send(Err(error));
+                                            let _ = tx.send(Ok(Err(error)));
                                         } else {
                                             tracing::warn!(id = %id, ?error, "daemon error for unknown id");
                                         }
@@ -1874,10 +1877,10 @@ async fn run_io<S>(
                         if let Some(id) = id
                             && let Some(tx) = pending.remove(&id)
                         {
-                            let _ = tx.send(Err(ErrorPayload {
+                            let _ = tx.send(Ok(Err(ErrorPayload {
                                 code: proto::ErrorCode::ProtocolVersion,
                                 message: proto::version_mismatch_message(v),
-                            }));
+                            })));
                         }
                         break;
                     }
@@ -1886,7 +1889,7 @@ async fn run_io<S>(
                             && let Some(id) = id
                             && let Some(tx) = pending.remove(&id)
                         {
-                            let _ = tx.send(Err(proto::unsupported_request_error(v, tag.as_deref())));
+                            let _ = tx.send(Ok(Err(proto::unsupported_request_error(v, tag.as_deref()))));
                         } else {
                             tracing::debug!(
                                 version = v,
@@ -1919,12 +1922,10 @@ async fn run_io<S>(
         }
     }
 
-    // Drain any pending requests with an explicit "connection closed."
+    // Local I/O failure is distinct from a daemon ErrorPayload: callers must
+    // not mistake a missing response for an authoritative policy refusal.
     for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(ErrorPayload {
-            code: proto::ErrorCode::Internal,
-            message: "daemon connection closed".into(),
-        }));
+        let _ = tx.send(Err(anyhow!("daemon connection closed")));
     }
 
     if dropped_events > 0 {
@@ -1988,7 +1989,7 @@ impl InboundBurst {
 async fn handle_io_command<S>(
     cmd: IoCommand,
     proto: &mut ProtoStream<S>,
-    pending: &mut HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>>,
+    pending: &mut HashMap<Uuid, WireReply>,
     owner_capability: Option<&proto::OwnerCapabilityToken>,
 ) -> bool
 where
@@ -2009,10 +2010,7 @@ where
             if let Err(e) = proto.send(&envelope).await {
                 tracing::warn!(error = ?e, "daemon write failed");
                 if let Some(tx) = pending.remove(&id) {
-                    let _ = tx.send(Err(ErrorPayload {
-                        code: proto::ErrorCode::Internal,
-                        message: format!("write to daemon failed: {e}"),
-                    }));
+                    let _ = tx.send(Err(anyhow!(e).context("write to daemon failed")));
                 }
                 false
             } else {
@@ -2023,10 +2021,7 @@ where
 }
 
 #[cfg(any(unix, windows))]
-fn remove_pending_request(
-    pending: &mut HashMap<Uuid, oneshot::Sender<std::result::Result<Response, ErrorPayload>>>,
-    id: Uuid,
-) -> Option<oneshot::Sender<std::result::Result<Response, ErrorPayload>>> {
+fn remove_pending_request(pending: &mut HashMap<Uuid, WireReply>, id: Uuid) -> Option<WireReply> {
     pending.remove(&id)
 }
 
@@ -2795,6 +2790,132 @@ mod tests {
             .expect("full event queue must not block request handling");
         assert!(matches!(response, Response::DaemonStatus { .. }));
         daemon_task.await.unwrap();
+    }
+
+    /// Local socket EOF and an already stopped I/O task must stay outer
+    /// transport errors, never synthetic delivered Internal refusals.
+    #[tokio::test]
+    async fn control_request_wire_eof_and_stopped_task_are_transport_failures() {
+        let (client_stream, daemon_stream) = tokio::io::duplex(4096);
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { client.request(Request::ExitGuardStatus).await }
+        });
+        let _id = recv_request_id(&mut daemon).await;
+        drop(daemon);
+        let error = request
+            .await
+            .unwrap()
+            .expect_err("EOF is a transport failure");
+        assert_eq!(error.to_string(), "daemon connection closed");
+        let error = client
+            .request(Request::ExitGuardStatus)
+            .await
+            .expect_err("a stopped I/O task is a transport failure");
+        assert_eq!(error.to_string(), "daemon client task has stopped");
+    }
+
+    /// The exact production writer fails, while its reader remains pending,
+    /// so this case cannot pass merely because EOF won a select race.
+    #[tokio::test]
+    async fn control_request_wire_write_failure_is_a_transport_failure() {
+        struct BrokenWriter;
+        impl tokio::io::AsyncRead for BrokenWriter {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+        impl tokio::io::AsyncWrite for BrokenWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test peer closed its read half",
+                )))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let client = DaemonClient::from_proto(ProtoStream::new(BrokenWriter));
+        let error = client
+            .request(Request::ExitGuardStatus)
+            .await
+            .expect_err("wire send failure is a transport error");
+        assert_eq!(error.to_string(), "write to daemon failed");
+        assert!(format!("{error:#}").contains("test peer closed its read half"));
+    }
+
+    /// The response timeout need not close the event stream. A subsequent
+    /// actual daemon Internal/policy refusal must retain its delivered type.
+    #[tokio::test(start_paused = true)]
+    async fn control_request_wire_timeout_keeps_events_and_delivered_refusal_distinct() {
+        let (client_stream, daemon_stream) = tokio::io::duplex(4096);
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_with_timeout(Request::ExitGuardStatus, Duration::from_millis(50))
+                    .await
+            }
+        });
+        let _id = recv_request_id(&mut daemon).await;
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let error = request
+            .await
+            .unwrap()
+            .expect_err("missing reply times out as transport failure");
+        assert!(error.to_string().contains("request timed out"));
+        daemon
+            .send(&Envelope::event(proto::Event::LspNotice {
+                text: "events remain live".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            matches!(client.next_event().await, Some(proto::Event::LspNotice { text }) if text == "events remain live")
+        );
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { client.request(Request::ExitGuardStatus).await }
+        });
+        let id = recv_request_id(&mut daemon).await;
+        let payload = ErrorPayload {
+            code: proto::ErrorCode::Internal,
+            message: "another client is deciding how to detach live work".into(),
+        };
+        daemon
+            .send(&Envelope::error(Some(id), payload.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            request
+                .await
+                .unwrap()
+                .expect("daemon response was delivered")
+                .unwrap_err(),
+            payload
+        );
     }
 
     #[tokio::test(start_paused = true)]

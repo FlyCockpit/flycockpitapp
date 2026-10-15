@@ -427,7 +427,11 @@ pub fn build_package_draft_with_diagnostics(
         enabled.contains(&draft.default_route_index),
         "default model must be an enabled grant"
     );
-    for index in draft.pending_trust_route_indices(projection) {
+    if let Some(index) = draft
+        .pending_trust_route_indices(projection)
+        .into_iter()
+        .next()
+    {
         let route = &projection.policy.routes[index];
         bail!(
             "model trust confirmation is required for {}/{}",
@@ -817,7 +821,11 @@ fn validate_child_tree(
         let slug = child_slug(child);
         ensure!(seen.insert(slug.clone()), "duplicate child name `{slug}`");
         validate_authored_agent_name(&slug)?;
-        for index in child.pending_trust_route_indices(projection) {
+        if let Some(index) = child
+            .pending_trust_route_indices(projection)
+            .into_iter()
+            .next()
+        {
             let route = &projection.policy.routes[index];
             bail!(
                 "model trust confirmation is required for subagent `{slug}` route {}/{}",

@@ -1,13 +1,12 @@
-// Fixture mirror structs below deserialize the shared JSON corpus; several
-// fields exist only to assert schema shape and are not all read back, so the
-// file opts into the codebase's sanctioned module-scoped dead-code allowance.
-#![allow(dead_code)]
+// Mirror the shared JSON corpus. Schema metadata is asserted alongside the
+// encoded vectors so no parsed fixture field is silently ignored.
 
 use cockpit_proto::remote_connection_metadata::{
-    self, BytesBucket, COMPONENT_KIND_ACCOUNT, COMPONENT_KIND_TENANT, DOMAIN_ACCOUNT,
-    DOMAIN_TENANT, DurationBucket, MetadataError, Outcome, PseudonymComponent, Region, RouteClass,
-    ServiceTier, cell_tuple, correction_closes_at, decode_pseudonym_message, pseudonym_message,
-    time_bucket, validate_retention_days,
+    self, BytesBucket, COMPONENT_KIND_ACCOUNT, COMPONENT_KIND_ATTEMPT, COMPONENT_KIND_DEVICE,
+    COMPONENT_KIND_INSTANCE, COMPONENT_KIND_TENANT, DOMAIN_ACCOUNT, DOMAIN_ATTEMPT, DOMAIN_DEVICE,
+    DOMAIN_INSTANCE, DOMAIN_TENANT, DurationBucket, MetadataError, Outcome, PseudonymComponent,
+    Region, RouteClass, ServiceTier, cell_tuple, correction_closes_at, decode_pseudonym_message,
+    pseudonym_message, time_bucket, validate_retention_days,
 };
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -224,6 +223,30 @@ fn remote_metadata_cross_language_fixtures() {
     for schema in &fixture.pseudonym_schemas {
         assert_eq!(schema.components.len(), 1);
     }
+    let schema_fields: BTreeSet<_> = fixture
+        .pseudonym_schemas
+        .iter()
+        .flat_map(|schema| {
+            schema.components.iter().map(|component| {
+                (
+                    schema.domain.as_str(),
+                    component.kind,
+                    component.name.as_str(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        schema_fields,
+        BTreeSet::from([
+            (DOMAIN_TENANT, COMPONENT_KIND_TENANT, "tenant_id"),
+            (DOMAIN_ACCOUNT, COMPONENT_KIND_ACCOUNT, "account_id"),
+            (DOMAIN_DEVICE, COMPONENT_KIND_DEVICE, "device_id"),
+            (DOMAIN_INSTANCE, COMPONENT_KIND_INSTANCE, "instance_id"),
+            (DOMAIN_ATTEMPT, COMPONENT_KIND_ATTEMPT, "attempt_id"),
+        ]),
+        "every fixture schema must match the production domain/kind and canonical component name"
+    );
 
     for vector in &fixture.positive_vectors {
         let alias_bytes = decode_hex(&vector.alias_hex);

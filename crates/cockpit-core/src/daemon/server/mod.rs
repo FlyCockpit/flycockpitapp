@@ -5328,6 +5328,12 @@ impl LockedHostProbes {
     }
 }
 
+#[cfg(test)]
+struct LockedSensitiveReadBoundary {
+    entered: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
 /// Vault-free construction boundary published while a fresh installation is
 /// waiting for an explicit secure-store choice. This type cannot construct or
 /// expose any provider, OAuth, credential, session, MCP, redaction, or
@@ -5395,6 +5401,10 @@ pub(crate) struct LockedServices {
     /// tests can observe the locked owner while construction is in flight.
     #[cfg(test)]
     construction_gate: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    #[cfg(test)]
+    sensitive_read_boundary: StdMutex<Option<LockedSensitiveReadBoundary>>,
+    #[cfg(test)]
+    sensitive_response_failed: AtomicBool,
     /// Test seam: fail the next construction attempt with a real error that
     /// takes the production rollback path.
     #[cfg(test)]
@@ -5782,6 +5792,10 @@ impl LockedServices {
             client_presence,
             #[cfg(test)]
             construction_gate: StdMutex::new(None),
+            #[cfg(test)]
+            sensitive_read_boundary: StdMutex::new(None),
+            #[cfg(test)]
+            sensitive_response_failed: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_construction: AtomicBool::new(false),
             #[cfg(test)]
@@ -7674,7 +7688,7 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
     let connection_id = Uuid::new_v4();
     // Renews this connection's credential while it is served and releases
     // it on every exit path (issue #546).
-    let _credential_lease = crate::daemon::peer_authority::PeerCredentialLease::hold(
+    let credential_lease = crate::daemon::peer_authority::PeerCredentialLease::hold(
         locked.peer_credential_registry.clone(),
         connection_id,
     );
@@ -7787,21 +7801,26 @@ async fn handle_locked_client(stream: DaemonStream, locked: Arc<LockedServices>)
                 } else {
                     Vec::new()
                 };
-                match locked
-                    .peer_credential_registry
-                    .try_mint(peer, connection_id, role, grants)
-                {
+                match locked.peer_credential_registry.try_mint(
+                    peer,
+                    credential_lease.connection(),
+                    role,
+                    grants,
+                ) {
                     Ok(token) => Ok(Response::LocalPeerCredential {
                         token: cockpit_proto::OwnerCapabilityToken::new(token.0),
                         role: proto_local_role(role),
                     }),
-                    Err(_) => {
+                    Err(error) => {
                         proto_stream
                             .send(&Envelope::error(
                                 Some(id),
                                 ErrorPayload {
                                     code: ErrorCode::Authorization,
-                                    message: PEER_CREDENTIAL_CAPACITY_MESSAGE.into(),
+                                    message: match error {
+                                        crate::daemon::peer_authority::PeerCredentialMintError::Full => PEER_CREDENTIAL_CAPACITY_MESSAGE,
+                                        crate::daemon::peer_authority::PeerCredentialMintError::ConnectionClosed => "local peer connection lease is closed",
+                                    }.into(),
                                 },
                             ))
                             .await?;
@@ -7865,6 +7884,20 @@ async fn handle_locked_sensitive_connection(
     locked: Arc<LockedServices>,
 ) -> Result<()> {
     let peer = socket_peer_identity(&stream)?;
+    #[cfg(test)]
+    {
+        let boundary = locked.sensitive_read_boundary.lock().unwrap().take();
+        if let Some(boundary) = boundary {
+            boundary
+                .entered
+                .send(())
+                .map_err(|_| anyhow::anyhow!("sensitive read observer dropped"))?;
+            boundary
+                .resume
+                .await
+                .context("resuming sensitive read test boundary")?;
+        }
+    }
     let frame = tokio::time::timeout(
         Duration::from_secs(10),
         crate::daemon::leak_reveal_socket::read_sensitive_request_frame(&mut stream),
@@ -7908,6 +7941,10 @@ async fn handle_locked_sensitive_connection(
     })
     .await;
     if !matches!(delivered, Ok(Ok(()))) {
+        #[cfg(test)]
+        locked
+            .sensitive_response_failed
+            .store(true, Ordering::Release);
         tracing::info!(
             applied = matches!(
                 response,
@@ -8413,6 +8450,9 @@ struct MutableClientState {
     principal: ClientPrincipal,
     /// Captured at socket accept; used to verify peer-bound credentials.
     socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
+    /// Exact handler lease generation; copied into the executor without
+    /// extending the lifetime in which it may produce credentials.
+    peer_credential_connection: Option<crate::daemon::peer_authority::PeerCredentialConnection>,
     /// Whether this connection has presented a valid peer-bound owner
     /// credential. In-process clients start true; socket peers start false.
     has_owner_capability: bool,
@@ -8542,6 +8582,7 @@ impl MutableClientState {
         Self {
             principal,
             socket_peer,
+            peer_credential_connection: None,
             has_owner_capability: false,
             active_peer_credential: None,
             owner_credential_revoked: None,
@@ -9186,7 +9227,7 @@ where
     // revocation, live exactly as long as this handler: renewed while it
     // serves the peer, released when it ends, unwinds or is cancelled
     // (issue #546).
-    let _credential_lease = socket_peer.map(|peer| {
+    let credential_lease = socket_peer.map(|peer| {
         let invalidation_principal_tx = principal_tx.clone();
         let invalidation_executor_tx = executor_tx.clone();
         crate::daemon::peer_authority::PeerCredentialLease::hold_with_invalidation_hook(
@@ -9274,6 +9315,9 @@ where
         next_terminal_connection_epoch(),
         has_owner_capability,
         socket_peer,
+        credential_lease
+            .as_ref()
+            .map(crate::daemon::peer_authority::PeerCredentialLease::connection),
         executor_rx,
         principal_tx.clone(),
         event_cmd_tx,
@@ -9575,11 +9619,24 @@ fn peer_credential_invalidation_hook(
     connection_id: Uuid,
 ) -> impl Fn(&str, crate::daemon::peer_authority::PeerCredentialRevocation) + Send + Sync {
     move |token, reason| {
-        let _ = principal_tx.send(ClientEventAuthority {
-            principal: ClientPrincipal::local_unauthenticated(peer),
-            socket_peer: Some(peer),
-            connection_id,
-            token: None,
+        // Clear only the withdrawn candidate, atomically with respect to
+        // executor publications. A delayed A callback must never erase B,
+        // even when this best-effort notice cannot be queued. Both event
+        // buses also verify the latest candidate against the registry.
+        principal_tx.send_if_modified(|candidate| {
+            if candidate.token.as_deref() != Some(token)
+                || candidate.connection_id != connection_id
+                || candidate.socket_peer != Some(peer)
+            {
+                return false;
+            }
+            *candidate = ClientEventAuthority {
+                principal: ClientPrincipal::local_unauthenticated(peer),
+                socket_peer: Some(peer),
+                connection_id,
+                token: None,
+            };
+            true
         });
         let _ = executor_tx.try_send(ClientExecutorInput::PeerCredentialInvalidated {
             token: token.to_string(),
@@ -9734,6 +9791,7 @@ async fn run_client_executor(
     connection_epoch: u64,
     has_owner_capability: bool,
     socket_peer: Option<cockpit_host::peer_cred::PeerIdentity>,
+    peer_credential_connection: Option<crate::daemon::peer_authority::PeerCredentialConnection>,
     mut executor_rx: mpsc::Receiver<ClientExecutorInput>,
     principal_tx: watch::Sender<ClientEventAuthority>,
     event_cmd_tx: mpsc::Sender<ClientEventCommand>,
@@ -9748,6 +9806,7 @@ async fn run_client_executor(
         connection_epoch,
     );
     state.has_owner_capability = has_owner_capability;
+    state.peer_credential_connection = peer_credential_connection;
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();
     let mut credential_expiry = peer_credential_deadline(&state, &ctx);

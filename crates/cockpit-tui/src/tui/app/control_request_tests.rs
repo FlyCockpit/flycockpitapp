@@ -169,7 +169,9 @@ async fn control_request_daemon_error_reports_rejected() {
     let control = control_rx.recv().await.expect("control request");
     control
         .response_tx
-        .send(Err("no active session".to_string().into()))
+        .send(Err(
+            crate::tui::agent_runner::ControlRequestError::rejected("no active session"),
+        ))
         .unwrap();
     drain_control_events(&mut app).await;
 
@@ -242,7 +244,7 @@ fn control_response_outcome_table() {
         ControlRequestOutcome::Rejected(message) if message.contains("Unknown")
     ));
     assert!(matches!(
-        control_response_outcome(Err("daemon error".to_string().into())),
+        control_response_outcome(Err(crate::tui::agent_runner::ControlRequestError::rejected("daemon error"))),
         ControlRequestOutcome::Rejected(message) if message == "daemon error"
     ));
     assert!(matches!(

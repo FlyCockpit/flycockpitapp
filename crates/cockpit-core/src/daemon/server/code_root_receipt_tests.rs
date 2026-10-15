@@ -9,6 +9,16 @@ const PUBLIC_HISTORY: &str = "Public frozen history";
 const PUBLIC_TITLE: &str = "Public frozen title";
 const LATER_HISTORY: &str = "Later row must not enter the frozen receipt";
 
+fn environment_snapshot() -> proto::EnvSnapshotWire {
+    crate::env_snapshot::EnvSnapshot::new(
+        proto::EnvSnapshotSource::TuiShell,
+        (0..16)
+            .map(|i| (format!("RECEIPT_MAP_{i}"), format!("public-value-{i}")))
+            .collect(),
+    )
+    .to_wire()
+}
+
 struct ReceiptConnection {
     client: ProtoStream<tokio::io::DuplexStream>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -144,6 +154,46 @@ impl ReceiptConnection {
         .expect("bounded live dispatcher projection")
     }
 
+    async fn assert_environment_value_conflicts(&mut self, request: &Request) {
+        let mut changed = request.clone();
+        let options = match &mut changed {
+            Request::CreateCodeRootV1(base) => &mut base.options,
+            Request::CreateCodeRootWithAcpIngressV1(request) => &mut request.base.options,
+            Request::AttachExistingCodeRootV1(base) => &mut base.options,
+            Request::AttachExistingCodeRootWithAcpIngressV1(request) => &mut request.base.options,
+            other => panic!("Code-root request: {other:?}"),
+        };
+        // Leave the caller-supplied digest unchanged: it cannot replace the
+        // complete typed environment as the operation's identity.
+        options
+            .env_snapshot
+            .as_mut()
+            .unwrap()
+            .vars
+            .insert("RECEIPT_MAP_0".into(), "changed-public-value".into());
+        let id = Uuid::now_v7();
+        self.client
+            .send(&Envelope::request(id, changed))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match recv_body(&mut self.client).await {
+                    Body::Event { .. } => {}
+                    Body::Error { id: got, error } => {
+                        assert_eq!(got, Some(id));
+                        assert_eq!(error.code, ErrorCode::Conflict);
+                        assert!(error.message.contains("Code-root idempotency conflict"));
+                        break;
+                    }
+                    other => panic!("changed environment must conflict: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("bounded changed-environment conflict");
+    }
+
     async fn ack(&mut self, request: Request) {
         let id = Uuid::now_v7();
         self.client
@@ -274,7 +324,7 @@ enum ReceiptRoute {
     Attach,
 }
 
-async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
+async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool, environment: bool) {
     let project = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(project.path()).unwrap();
     let dotenv = workspace.join(".env");
@@ -300,7 +350,7 @@ async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
         false,
         true,
         None,
-        None,
+        environment.then(environment_snapshot),
         proto::EnvDriftPolicy::Daemon,
     ) else {
         panic!("create request constructor");
@@ -468,6 +518,20 @@ async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
         .set_len(crate::resource_limits::ResourceLimits::defaults().fs_read_max_file_bytes + 1)
         .unwrap();
     let (receipt, withheld, events) = connection.project(&request).await;
+    if environment {
+        let before_conflict = initial_operation_rows(&ctx.db, session_id).await;
+        connection
+            .assert_environment_value_conflicts(&request)
+            .await;
+        assert_eq!(
+            initial_operation_rows(&ctx.db, session_id).await,
+            before_conflict
+        );
+        assert_eq!(
+            ctx.db.list_sessions(false, u32::MAX).await.unwrap().len(),
+            1
+        );
+    }
     assert_coverage(
         &events,
         session_id,
@@ -702,7 +766,7 @@ async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
 async fn code_root_create_receipt_replay_projects_current_coverage() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
-        exercise_receipt_projection(ReceiptRoute::Create, acp).await;
+        exercise_receipt_projection(ReceiptRoute::Create, acp, false).await;
     }
 }
 
@@ -710,7 +774,7 @@ async fn code_root_create_receipt_replay_projects_current_coverage() {
 async fn code_root_attach_receipt_replay_explains_withholding_and_recovers() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
-        exercise_receipt_projection(ReceiptRoute::Attach, acp).await;
+        exercise_receipt_projection(ReceiptRoute::Attach, acp, false).await;
     }
 }
 
@@ -718,7 +782,31 @@ async fn code_root_attach_receipt_replay_explains_withholding_and_recovers() {
 async fn code_root_recovered_create_receipt_replay_keeps_canonical_snapshot() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
-        exercise_receipt_projection(ReceiptRoute::RecoveredCreate, acp).await;
+        exercise_receipt_projection(ReceiptRoute::RecoveredCreate, acp, false).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_root_environment_create_receipt_replay_projects_current_coverage() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for acp in [false, true] {
+        exercise_receipt_projection(ReceiptRoute::Create, acp, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_root_environment_attach_receipt_replay_explains_withholding_and_recovers() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for acp in [false, true] {
+        exercise_receipt_projection(ReceiptRoute::Attach, acp, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_root_environment_recovered_create_receipt_replay_keeps_canonical_snapshot() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for acp in [false, true] {
+        exercise_receipt_projection(ReceiptRoute::RecoveredCreate, acp, true).await;
     }
 }
 
@@ -760,7 +848,12 @@ async fn initial_operation_rows(db: &Db, session_id: Uuid) -> Vec<Vec<rusqlite::
     .unwrap()
 }
 
-async fn exercise_initial_delivery_cancellation(create: bool, acp: bool, accepted: bool) {
+async fn exercise_initial_delivery_cancellation(
+    create: bool,
+    acp: bool,
+    accepted: bool,
+    environment: bool,
+) {
     use crate::db::code_root_projection::ProjectionWritePhaseForTest;
     let temp = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(temp.path()).unwrap();
@@ -778,7 +871,7 @@ async fn exercise_initial_delivery_cancellation(create: bool, acp: bool, accepte
         false,
         true,
         None,
-        None,
+        environment.then(environment_snapshot),
         proto::EnvDriftPolicy::Daemon,
     ) else {
         panic!("create constructor")
@@ -944,7 +1037,7 @@ async fn exercise_initial_delivery_cancellation(create: bool, acp: bool, accepte
 async fn code_root_create_initial_delivery_survives_accepted_cancel() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
-        exercise_initial_delivery_cancellation(true, acp, true).await;
+        exercise_initial_delivery_cancellation(true, acp, true, false).await;
     }
 }
 
@@ -952,7 +1045,7 @@ async fn code_root_create_initial_delivery_survives_accepted_cancel() {
 async fn code_root_attach_initial_delivery_survives_accepted_cancel() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
-        exercise_initial_delivery_cancellation(false, acp, true).await;
+        exercise_initial_delivery_cancellation(false, acp, true, false).await;
     }
 }
 
@@ -960,7 +1053,7 @@ async fn code_root_attach_initial_delivery_survives_accepted_cancel() {
 async fn code_root_create_initial_delivery_follows_preaccept_cancel() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
-        exercise_initial_delivery_cancellation(true, acp, false).await;
+        exercise_initial_delivery_cancellation(true, acp, false, false).await;
     }
 }
 
@@ -968,6 +1061,36 @@ async fn code_root_create_initial_delivery_follows_preaccept_cancel() {
 async fn code_root_attach_initial_delivery_follows_preaccept_cancel() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
-        exercise_initial_delivery_cancellation(false, acp, false).await;
+        exercise_initial_delivery_cancellation(false, acp, false, false).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_root_environment_attach_initial_delivery_survives_accepted_cancel_base() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    exercise_initial_delivery_cancellation(false, false, true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_root_environment_attach_initial_delivery_survives_accepted_cancel_acp() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    exercise_initial_delivery_cancellation(false, true, true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_root_environment_create_initial_delivery_survives_accepted_cancel() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for acp in [false, true] {
+        exercise_initial_delivery_cancellation(true, acp, true, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_root_environment_initial_delivery_follows_preaccept_cancel() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for create in [false, true] {
+        for acp in [false, true] {
+            exercise_initial_delivery_cancellation(create, acp, false, true).await;
+        }
     }
 }

@@ -128,11 +128,10 @@ impl CodeRootAuthorityV1 {
         route: &'static str,
         request: &T,
     ) -> Result<String> {
-        let bytes = serde_json::to_vec(request)
-            .context("serializing Code-root initial delivery identity")?;
+        let fingerprint = request_fingerprint(request)?;
         use std::fmt::Write as _;
         let mut source_key = format!("initial:{}:{route}:", self.initial_delivery_namespace);
-        for byte in Sha256::digest(bytes) {
+        for byte in fingerprint {
             write!(&mut source_key, "{byte:02x}")?;
         }
         Ok(source_key)
@@ -805,7 +804,15 @@ impl CodeRootAuthorityV1 {
 }
 
 pub(crate) fn request_fingerprint<T: serde::Serialize>(value: &T) -> Result<[u8; 32]> {
-    let bytes = serde_json::to_vec(value).context("serializing Code-root idempotency input")?;
+    // Hash the complete typed input, including environment values rather than
+    // trusting its caller-supplied digest. Independent wire decodes randomize
+    // HashMap iteration, so order every nested object before serialization.
+    // Explicit sorting also holds if serde_json enables `preserve_order`.
+    let mut canonical =
+        serde_json::to_value(value).context("canonicalizing Code-root idempotency input")?;
+    canonical.sort_all_objects();
+    let bytes =
+        serde_json::to_vec(&canonical).context("serializing Code-root idempotency input")?;
     Ok(Sha256::digest(bytes).into())
 }
 
@@ -955,6 +962,127 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn environment_create_request() -> proto::CreateCodeRootV1Request {
+        let mut request = create_request();
+        request.options.env_snapshot = Some(
+            crate::env_snapshot::EnvSnapshot::new(
+                proto::EnvSnapshotSource::TuiShell,
+                (0..16)
+                    .map(|i| (format!("IDENTITY_MAP_{i}"), format!("public-value-{i}")))
+                    .collect(),
+            )
+            .to_wire(),
+        );
+        request
+    }
+
+    fn environment_attach_request() -> proto::AttachExistingCodeRootV1Request {
+        let create = environment_create_request();
+        proto::AttachExistingCodeRootV1Request {
+            root_id: proto::CodeRootIdV1(Uuid::nil()),
+            capture_generation: 1,
+            logical_client_id: create.logical_client_id,
+            client_request_id: create.client_request_id,
+            replay_cursor: None,
+            since_seq: None,
+            options: create.options,
+        }
+    }
+
+    fn assert_same_wire_identity<T, I>(request: T, identity: impl Fn(&T) -> I)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        I: PartialEq + std::fmt::Debug,
+    {
+        let wire = serde_json::to_vec(&request).unwrap();
+        let expected = identity(&request);
+        for _ in 0..32 {
+            let decoded: T = serde_json::from_slice(&wire).unwrap();
+            assert_eq!(decoded, request, "same wire retains every typed field");
+            assert_eq!(
+                identity(&decoded),
+                expected,
+                "same wire retains operation identity"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_same_wire_source_identity_is_stable() {
+        let authority = CodeRootAuthorityV1::default();
+        assert_same_wire_identity(environment_create_request(), |request| {
+            authority
+                .initial_delivery_source_key("create", request)
+                .unwrap()
+        });
+        assert_same_wire_identity(environment_attach_request(), |request| {
+            authority
+                .initial_delivery_source_key("attach", request)
+                .unwrap()
+        });
+    }
+
+    #[test]
+    fn environment_same_wire_receipt_fingerprint_is_stable() {
+        assert_same_wire_identity(environment_create_request(), |request| {
+            request_fingerprint(request).unwrap()
+        });
+        assert_same_wire_identity(environment_attach_request(), |request| {
+            request_fingerprint(request).unwrap()
+        });
+    }
+
+    #[test]
+    fn environment_changed_value_keeps_distinct_identity_despite_same_digest() {
+        let authority = CodeRootAuthorityV1::default();
+        let create = environment_create_request();
+        let attach = environment_attach_request();
+        let mut changed_create = create.clone();
+        let mut changed_attach = attach.clone();
+        for snapshot in [
+            &mut changed_create.options.env_snapshot,
+            &mut changed_attach.options.env_snapshot,
+        ] {
+            snapshot
+                .as_mut()
+                .unwrap()
+                .vars
+                .insert("IDENTITY_MAP_0".into(), "changed-environment-value".into());
+        }
+        assert_eq!(
+            create.options.env_snapshot.as_ref().unwrap().digest,
+            changed_create.options.env_snapshot.as_ref().unwrap().digest
+        );
+        assert_eq!(
+            attach.options.env_snapshot.as_ref().unwrap().digest,
+            changed_attach.options.env_snapshot.as_ref().unwrap().digest
+        );
+        assert_ne!(
+            request_fingerprint(&create).unwrap(),
+            request_fingerprint(&changed_create).unwrap()
+        );
+        assert_ne!(
+            request_fingerprint(&attach).unwrap(),
+            request_fingerprint(&changed_attach).unwrap()
+        );
+        assert_ne!(
+            authority
+                .initial_delivery_source_key("create", &create)
+                .unwrap(),
+            authority
+                .initial_delivery_source_key("create", &changed_create)
+                .unwrap()
+        );
+        assert_ne!(
+            authority
+                .initial_delivery_source_key("attach", &attach)
+                .unwrap(),
+            authority
+                .initial_delivery_source_key("attach", &changed_attach)
+                .unwrap()
+        );
+    }
 
     #[test]
     fn initial_delivery_identity_is_scoped_to_boot_route_and_logical_request() {

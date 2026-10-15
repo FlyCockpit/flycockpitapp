@@ -463,7 +463,7 @@ async fn successful_repair_resume_ack_wakes_retained_submission_retry() {
 }
 
 #[tokio::test]
-async fn control_request_runner_teardown_reports_not_delivered() {
+async fn control_request_runner_teardown_reports_unknown_delivery() {
     let mut app = app();
     let (record_tx, _record_rx) = mpsc::channel(1);
     let (control_tx, mut control_rx) = mpsc::channel(1);
@@ -475,7 +475,9 @@ async fn control_request_runner_teardown_reports_not_delivered() {
 
     assert_eq!(
         history_lines(&app),
-        vec!["/prune: request not sent - daemon control channel closed; try again"]
+        vec![
+            "/prune: daemon response unavailable: daemon request: runner stopped before returning a daemon response; delivery and effects are unknown"
+        ]
     );
     assert!(app.pending_control_requests.is_empty());
 }

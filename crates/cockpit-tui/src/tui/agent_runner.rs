@@ -3690,12 +3690,15 @@ pub(crate) fn send_control_request(
                 let events = events.clone();
                 let event_notify = event_notify.clone();
                 handle.spawn(async move {
-                    let outcome = match response_rx.await {
-                        Ok(result) => control_response_outcome(result),
-                        Err(_) => ControlRequestOutcome::NotDelivered(
-                            ControlRequestNotDelivered::RunnerTeardown,
-                        ),
-                    };
+                    // Queue acceptance transfers dispatch ownership to the
+                    // runner. Losing its reply cannot prove non-delivery: the
+                    // daemon may already own the mutation when dispatch stops.
+                    let result = response_rx.await.unwrap_or_else(|_| {
+                        control_request_result(Err(anyhow::anyhow!(
+                            "runner stopped before returning a daemon response; delivery and effects are unknown"
+                        )))
+                    });
+                    let outcome = control_response_outcome(result);
                     push_turn_event(
                         &events,
                         &event_notify,
@@ -8594,6 +8597,168 @@ mod tests {
                     applied_generation: 17,
                     changed: false
                 }
+            }]
+        ));
+    }
+
+    #[test]
+    fn control_queue_rejection_stays_not_delivered() {
+        for reason in [
+            ControlRequestNotDelivered::ChannelFull,
+            ControlRequestNotDelivered::ChannelClosed,
+        ] {
+            let (control_tx, control_rx) = mpsc::channel(1);
+            let session_id = Uuid::new_v4();
+            if reason == ControlRequestNotDelivered::ChannelFull {
+                let (response_tx, _response_rx) = oneshot::channel();
+                control_tx
+                    .try_send(ControlRequest {
+                        request: Request::Prune,
+                        intended_session_id: session_id,
+                        intended_attachment_epoch: 3,
+                        response_tx,
+                    })
+                    .unwrap();
+            } else {
+                drop(control_rx);
+            }
+            let events = Arc::new(Mutex::new(Vec::new()));
+            assert_eq!(
+                send_control_request(
+                    &control_tx,
+                    &events,
+                    &Arc::new(Notify::new()),
+                    ControlRequestId(41),
+                    session_id,
+                    3,
+                    Request::Prune,
+                ),
+                Err(reason),
+                "immediate queue rejection proves the mutation was not delivered"
+            );
+            assert!(drain_turn_events(&events).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_control_reply_loss_stays_transport_unknown_after_mutation_delivery() {
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let session_id = Uuid::new_v4();
+        let session_id_state = Arc::new(Mutex::new(session_id));
+        let attachment_epoch = Arc::new(AtomicU64::new(3));
+        let transition_gate = Arc::new(AsyncMutex::new(()));
+        let (requests, mut request_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let client = DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+            requests,
+            events: event_rx,
+        });
+        let dispatch = |control_request| {
+            let client = client.clone();
+            let session_id_state = session_id_state.clone();
+            let attachment_epoch = attachment_epoch.clone();
+            let transition_gate = transition_gate.clone();
+            tokio::spawn(async move {
+                dispatch_control_request_for_current_attachment(
+                    control_request,
+                    &session_id_state,
+                    &attachment_epoch,
+                    transition_gate,
+                    |request| async move { control_request_result(client.request(request).await) },
+                )
+                .await;
+            })
+        };
+
+        send_control_request(
+            &control_tx,
+            &events,
+            &notify,
+            ControlRequestId(41),
+            session_id,
+            3,
+            Request::Prune,
+        )
+        .unwrap();
+        let dispatcher = dispatch(control_rx.recv().await.unwrap());
+        let delivered = tokio::time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .expect("mutation must reach the actual daemon channel")
+            .unwrap();
+        assert!(matches!(delivered.request, Request::Prune));
+        assert!(drain_turn_events(&events).is_empty());
+
+        // The daemon still owns its reply and can complete the mutation after
+        // the actual attachment dispatcher has been cancelled and joined.
+        dispatcher.abort();
+        assert!(dispatcher.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("accepted control must settle after dispatcher cancellation");
+        let finished = drain_turn_events(&events);
+        assert!(
+            matches!(
+                finished.as_slice(),
+                [QueuedTurnEvent {
+                    attachment_epoch: 3,
+                    event: TurnEvent::ControlRequestFinished {
+                        request_id: ControlRequestId(41),
+                        outcome: ControlRequestOutcome::TransportFailed(message),
+                    },
+                }] if message.contains("delivery and effects are unknown")
+            ),
+            "accepted mutation reply loss must stay TransportFailed, never NotDelivered: {finished:?}"
+        );
+
+        send_control_request(
+            &control_tx,
+            &events,
+            &notify,
+            ControlRequestId(42),
+            session_id,
+            3,
+            Request::SetPreflight {
+                enabled: Some(true),
+            },
+        )
+        .unwrap();
+        let successor_dispatcher = dispatch(control_rx.recv().await.unwrap());
+        let successor = tokio::time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .expect("successor must enter dispatch after the cancelled guard drops")
+            .unwrap();
+        assert!(matches!(
+            successor.request,
+            Request::SetPreflight {
+                enabled: Some(true)
+            }
+        ));
+        assert!(
+            delivered.reply.send(Ok(Response::Ack)).is_err(),
+            "late daemon completion has no cancelled request receiver"
+        );
+        assert!(!successor_dispatcher.is_finished());
+        assert!(drain_turn_events(&events).is_empty());
+
+        successor
+            .reply
+            .send(Ok(Response::PreflightState { enabled: true }))
+            .unwrap();
+        successor_dispatcher.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("successor must settle from its own daemon response");
+        let finished = drain_turn_events(&events);
+        assert!(matches!(
+            finished.as_slice(),
+            [QueuedTurnEvent {
+                attachment_epoch: 3,
+                event: TurnEvent::ControlRequestFinished {
+                    request_id: ControlRequestId(42),
+                    outcome: ControlRequestOutcome::Applied,
+                },
             }]
         ));
     }

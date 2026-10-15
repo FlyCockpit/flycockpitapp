@@ -90,7 +90,7 @@ impl App {
     }
 
     /// The exit check bound to `binding` was refused for authorization or
-    /// never delivered: let the next exit attempt on that attachment quit
+    /// could not be answered: let the next exit attempt on that attachment quit
     /// without it, and tell the user how. Returns `message` with that hint.
     pub(super) fn arm_exit_check_escape(
         &mut self,

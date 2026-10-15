@@ -983,23 +983,81 @@ pub struct DaemonClient {
 type WireReply = oneshot::Sender<Result<std::result::Result<Response, ErrorPayload>>>;
 
 #[cfg(any(unix, windows))]
-struct Pending {
+struct WireRequest {
     id: Uuid,
-    request: Request,
-    reply: WireReply,
+    request: Box<Request>,
+}
+
+/// Callers register before queue admission and own exact-ID cleanup. The I/O
+/// task only removes entries: it cannot resurrect an expired/aborted caller
+/// when a stalled write or queue eventually resumes. No lock crosses I/O or
+/// reply delivery, and cleanup never needs an outbound queue slot.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Default)]
+struct PendingReplies(Mutex<HashMap<Uuid, WireReply>>);
+
+#[cfg(any(unix, windows))]
+impl PendingReplies {
+    fn remove(&self, id: Uuid) -> Option<WireReply> {
+        self.0.lock().expect("pending replies lock").remove(&id)
+    }
+
+    fn contains(&self, id: Uuid) -> bool {
+        self.0
+            .lock()
+            .expect("pending replies lock")
+            .contains_key(&id)
+    }
+
+    fn fail_all(&self) {
+        let replies = std::mem::take(&mut *self.0.lock().expect("pending replies lock"));
+        for (_, reply) in replies {
+            let _ = reply.send(Err(anyhow!("daemon connection closed")));
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+struct PendingRequest {
+    id: Uuid,
+    replies: Arc<PendingReplies>,
+}
+
+#[cfg(any(unix, windows))]
+impl PendingRequest {
+    fn register(replies: &Arc<PendingReplies>, reply: WireReply) -> Self {
+        let id = Uuid::now_v7();
+        replies
+            .0
+            .lock()
+            .expect("pending replies lock")
+            .insert(id, reply);
+        Self {
+            id,
+            replies: Arc::clone(replies),
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.replies.remove(self.id);
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug)]
+struct WireBackend {
+    requests: mpsc::Sender<WireRequest>,
+    pending: Arc<PendingReplies>,
 }
 
 #[derive(Clone, Debug)]
 enum ClientBackend {
     #[cfg(any(unix, windows))]
-    Wire(mpsc::Sender<IoCommand>),
+    Wire(WireBackend),
     InProcess(mpsc::Sender<InProcessRequest>),
-}
-
-#[cfg(any(unix, windows))]
-enum IoCommand {
-    Request(Box<Pending>),
-    Cancel { id: Uuid },
 }
 
 impl DaemonClient {
@@ -1269,7 +1327,8 @@ impl DaemonClient {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (request_tx, request_rx) = mpsc::channel::<IoCommand>(REQUEST_QUEUE);
+        let (request_tx, request_rx) = mpsc::channel::<WireRequest>(REQUEST_QUEUE);
+        let pending = Arc::new(PendingReplies::default());
         let (event_tx, event_rx) = mpsc::channel::<proto::Event>(EVENT_QUEUE);
         for event in initial_events {
             // The confirmation exchange occurs before the client exposes its
@@ -1284,9 +1343,13 @@ impl DaemonClient {
             request_rx,
             event_tx,
             owner_capability.clone(),
+            Arc::clone(&pending),
         ));
         Self {
-            backend: ClientBackend::Wire(request_tx),
+            backend: ClientBackend::Wire(WireBackend {
+                requests: request_tx,
+                pending,
+            }),
             negotiated,
             events: Arc::new(tokio::sync::Mutex::new(event_rx)),
             owner_capability,
@@ -1308,54 +1371,50 @@ impl DaemonClient {
         self.request_with_timeout(request, REQUEST_TIMEOUT).await
     }
 
-    /// Send a request with a caller-selected response deadline.
+    /// Send a request with one caller-selected deadline for queue admission
+    /// and the matching response.
     ///
     /// Most daemon operations use [`Self::request`]'s short default deadline.
     /// Operations whose protocol explicitly includes a user wait, such as a
     /// device-code approval poll, must opt into a deadline that covers their
-    /// documented lifetime. Timing out here only stops waiting for the reply;
-    /// it does not cancel daemon-side work.
+    /// documented lifetime. Expiry or dropping the future releases local reply
+    /// tracking without waiting for the writer. It does not cancel daemon-side
+    /// work: delivery and effects may be unknown, including after a timeout.
     pub async fn request_with_timeout(
         &self,
         request: Request,
-        response_timeout: Duration,
+        request_timeout: Duration,
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
-        #[cfg(any(unix, windows))]
-        let id = Uuid::now_v7();
-        match &self.backend {
-            #[cfg(any(unix, windows))]
-            ClientBackend::Wire(request_tx) => {
-                let (tx, rx) = oneshot::channel();
-                request_tx
-                    .send(IoCommand::Request(Box::new(Pending {
-                        id,
-                        request,
-                        reply: tx,
-                    })))
-                    .await
-                    .map_err(|_| anyhow!("daemon client task has stopped"))?;
-                match tokio::time::timeout(response_timeout, rx).await {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(_)) => Err(anyhow!("daemon client dropped reply channel")),
-                    Err(_) => {
-                        let _ = request_tx.send(IoCommand::Cancel { id }).await;
-                        Err(anyhow!("request timed out after {:?}", response_timeout))
-                    }
+        let exchange = async {
+            match &self.backend {
+                #[cfg(any(unix, windows))]
+                ClientBackend::Wire(wire) => {
+                    let (tx, rx) = oneshot::channel();
+                    let pending = PendingRequest::register(&wire.pending, tx);
+                    wire.requests
+                        .send(WireRequest {
+                            id: pending.id,
+                            request: Box::new(request),
+                        })
+                        .await
+                        .map_err(|_| anyhow!("daemon client task has stopped"))?;
+                    rx.await
+                        .map_err(|_| anyhow!("daemon client dropped reply channel"))?
+                }
+                ClientBackend::InProcess(request_tx) => {
+                    let (tx, rx) = oneshot::channel();
+                    request_tx
+                        .send(InProcessRequest { request, reply: tx })
+                        .await
+                        .map_err(|_| anyhow!("in-process daemon client task has stopped"))?;
+                    rx.await
+                        .map_err(|_| anyhow!("in-process daemon client dropped reply channel"))
                 }
             }
-            ClientBackend::InProcess(request_tx) => {
-                let (tx, rx) = oneshot::channel();
-                request_tx
-                    .send(InProcessRequest { request, reply: tx })
-                    .await
-                    .map_err(|_| anyhow!("in-process daemon client task has stopped"))?;
-                match tokio::time::timeout(response_timeout, rx).await {
-                    Ok(Ok(result)) => Ok(result),
-                    Ok(Err(_)) => Err(anyhow!("in-process daemon client dropped reply channel")),
-                    Err(_) => Err(anyhow!("request timed out after {:?}", response_timeout)),
-                }
-            }
-        }
+        };
+        tokio::time::timeout(request_timeout, exchange)
+            .await
+            .map_err(|_| anyhow!("request timed out after {:?}", request_timeout))?
     }
 
     /// Convenience: send a request, unwrap typed errors as `Err`.
@@ -1747,13 +1806,13 @@ fn protocol_handshake_error(reason: &'static str) -> anyhow::Error {
 #[cfg(any(unix, windows))]
 async fn run_io<S>(
     mut proto: ProtoStream<S>,
-    mut request_rx: mpsc::Receiver<IoCommand>,
+    mut request_rx: mpsc::Receiver<WireRequest>,
     event_tx: mpsc::Sender<proto::Event>,
     owner_capability: Option<proto::OwnerCapabilityToken>,
+    pending: Arc<PendingReplies>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    let mut pending: HashMap<Uuid, WireReply> = HashMap::new();
     let mut inbound_burst = InboundBurst::default();
     let mut dropped_events: u64 = 0;
     let mut attached_session: Option<Uuid> = None;
@@ -1763,7 +1822,7 @@ async fn run_io<S>(
             match request_rx.try_recv() {
                 Ok(cmd) => {
                     inbound_burst.reset();
-                    if !handle_io_command(cmd, &mut proto, &mut pending, owner_capability.as_ref())
+                    if !send_wire_request(cmd, &mut proto, &pending, owner_capability.as_ref())
                         .await
                     {
                         break;
@@ -1806,7 +1865,7 @@ async fn run_io<S>(
                         match env.body {
                             Body::Response { id, response } => {
                                 let response = *response;
-                                if let Some(tx) = pending.remove(&id) {
+                                if let Some(tx) = pending.remove(id) {
                                     match &response {
                                         Response::Attached { session_id, .. } => {
                                             attached_session = Some(*session_id);
@@ -1835,7 +1894,7 @@ async fn run_io<S>(
                             Body::Error { id, error } => {
                                 match id {
                                     Some(id) => {
-                                        if let Some(tx) = pending.remove(&id) {
+                                        if let Some(tx) = pending.remove(id) {
                                             let _ = tx.send(Ok(Err(error)));
                                         } else {
                                             tracing::warn!(id = %id, ?error, "daemon error for unknown id");
@@ -1875,7 +1934,7 @@ async fn run_io<S>(
                     }
                     Ok(Some(RecvFrame::VersionMismatch { v, id, .. })) => {
                         if let Some(id) = id
-                            && let Some(tx) = pending.remove(&id)
+                            && let Some(tx) = pending.remove(id)
                         {
                             let _ = tx.send(Ok(Err(ErrorPayload {
                                 code: proto::ErrorCode::ProtocolVersion,
@@ -1887,7 +1946,7 @@ async fn run_io<S>(
                     Ok(Some(RecvFrame::Unknown { v, kind, tag, id })) => {
                         if matches!(kind.as_str(), "res" | "err")
                             && let Some(id) = id
-                            && let Some(tx) = pending.remove(&id)
+                            && let Some(tx) = pending.remove(id)
                         {
                             let _ = tx.send(Ok(Err(proto::unsupported_request_error(v, tag.as_deref()))));
                         } else {
@@ -1913,7 +1972,7 @@ async fn run_io<S>(
                 let Some(cmd) = cmd else {
                     break;
                 };
-                if !handle_io_command(cmd, &mut proto, &mut pending, owner_capability.as_ref())
+                if !send_wire_request(cmd, &mut proto, &pending, owner_capability.as_ref())
                     .await
                 {
                     break;
@@ -1924,9 +1983,8 @@ async fn run_io<S>(
 
     // Local I/O failure is distinct from a daemon ErrorPayload: callers must
     // not mistake a missing response for an authoritative policy refusal.
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(anyhow!("daemon connection closed")));
-    }
+    request_rx.close();
+    pending.fail_all();
 
     if dropped_events > 0 {
         emit_lag_marker_on_close(&event_tx, dropped_events).await;
@@ -1986,43 +2044,33 @@ impl InboundBurst {
 }
 
 #[cfg(any(unix, windows))]
-async fn handle_io_command<S>(
-    cmd: IoCommand,
+async fn send_wire_request<S>(
+    request: WireRequest,
     proto: &mut ProtoStream<S>,
-    pending: &mut HashMap<Uuid, WireReply>,
+    pending: &PendingReplies,
     owner_capability: Option<&proto::OwnerCapabilityToken>,
 ) -> bool
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    match cmd {
-        IoCommand::Cancel { id } => {
-            if remove_pending_request(pending, id).is_some() {
-                tracing::debug!(id = %id, "daemon request timed out; removed pending entry");
-            }
-            true
-        }
-        IoCommand::Request(p) => {
-            let id = p.id;
-            pending.insert(id, p.reply);
-            let envelope =
-                Envelope::request_with_owner_capability(id, p.request, owner_capability.cloned());
-            if let Err(e) = proto.send(&envelope).await {
-                tracing::warn!(error = ?e, "daemon write failed");
-                if let Some(tx) = pending.remove(&id) {
-                    let _ = tx.send(Err(anyhow!(e).context("write to daemon failed")));
-                }
-                false
-            } else {
-                true
-            }
-        }
+    let id = request.id;
+    if !pending.contains(id) {
+        // The caller expired or was dropped while waiting in the queue.
+        return true;
     }
-}
-
-#[cfg(any(unix, windows))]
-fn remove_pending_request(pending: &mut HashMap<Uuid, WireReply>, id: Uuid) -> Option<WireReply> {
-    pending.remove(&id)
+    let envelope =
+        Envelope::request_with_owner_capability(id, *request.request, owner_capability.cloned());
+    // Do not cancel a partial framed write on caller expiry. The request may
+    // already be delivered; its eventual reply is ignored by exact ID.
+    if let Err(e) = proto.send(&envelope).await {
+        tracing::warn!(error = ?e, "daemon write failed");
+        if let Some(tx) = pending.remove(id) {
+            let _ = tx.send(Err(anyhow!(e).context("write to daemon failed")));
+        }
+        false
+    } else {
+        true
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -2753,14 +2801,30 @@ mod tests {
 
     #[test]
     fn pending_cancel_removes_entry_and_late_repeat_is_ignored() {
-        let id = Uuid::new_v4();
+        let pending = Arc::new(PendingReplies::default());
         let (tx, _rx) = oneshot::channel();
-        let mut pending = HashMap::new();
-        pending.insert(id, tx);
+        let registration = PendingRequest::register(&pending, tx);
+        let id = registration.id;
+        assert!(pending.remove(id).is_some());
+        assert!(pending.0.lock().unwrap().is_empty());
+        assert!(pending.remove(id).is_none());
 
-        assert!(remove_pending_request(&mut pending, id).is_some());
-        assert!(pending.is_empty());
-        assert!(remove_pending_request(&mut pending, id).is_none());
+        let (tx, rx) = oneshot::channel();
+        let successor = PendingRequest::register(&pending, tx);
+        assert_ne!(id, successor.id);
+        drop(registration); // late cleanup of the already-settled predecessor
+        assert!(pending.contains(successor.id));
+        pending
+            .remove(successor.id)
+            .unwrap()
+            .send(Ok(Ok(Response::Ack)))
+            .unwrap();
+        assert!(matches!(
+            rx.blocking_recv().unwrap().unwrap(),
+            Ok(Response::Ack)
+        ));
+        drop(successor);
+        assert!(pending.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2790,6 +2854,377 @@ mod tests {
             .expect("full event queue must not block request handling");
         assert!(matches!(response, Response::DaemonStatus { .. }));
         daemon_task.await.unwrap();
+    }
+
+    /// Port of the independent r4 native socket probe. The real writer is
+    /// pending on an open non-reading peer and ordinary callers fill its real
+    /// queue. Both an already-delivered check and a new admission must settle
+    /// without a cancellation slot or peer teardown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_deadline_settles_with_stalled_wire_and_full_queue() {
+        let (client_stream, daemon_stream) = UnixStream::pair().unwrap();
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+        let mut exit = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_with_timeout(Request::ExitGuardStatus, Duration::from_secs(1))
+                    .await
+            }
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(3), daemon.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(RecvFrame::Envelope(envelope)) = frame else {
+            panic!("expected actual request envelope")
+        };
+        let Body::Request {
+            id: exit_id,
+            request: Request::ExitGuardStatus,
+            ..
+        } = envelope.body
+        else {
+            panic!("expected actual ExitGuardStatus request")
+        };
+        let mut callers = tokio::task::JoinSet::new();
+        for _ in 0..4096 {
+            let client = client.clone();
+            callers.spawn(async move { client.request(Request::ExitGuardStatus).await });
+        }
+        let ClientBackend::Wire(wire) = &client.backend else {
+            unreachable!()
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while wire.requests.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary callers fill the real production queue");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            wire.requests.capacity(),
+            0,
+            "the peer stays open without draining writes"
+        );
+        assert!(
+            !exit.is_finished(),
+            "the response deadline has not elapsed before backpressure"
+        );
+        let mut admission = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_with_timeout(Request::ExitGuardStatus, Duration::from_millis(250))
+                    .await
+            }
+        });
+        let (exit_settled, admission_settled) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(2), &mut exit),
+            tokio::time::timeout(Duration::from_secs(2), &mut admission),
+        );
+        let expired_tracking_removed = !wire.pending.contains(exit_id);
+        // Join every caller while the writer is STILL pending. Their cleanup
+        // must remove pending entries even if no queued work can be consumed.
+        exit.abort();
+        admission.abort();
+        callers.abort_all();
+        while callers.join_next().await.is_some() {}
+        if exit_settled.is_err() {
+            let _ = exit.await;
+        }
+        if admission_settled.is_err() {
+            let _ = admission.await;
+        }
+        let pending_empty = wire.pending.0.lock().unwrap().is_empty();
+        let still_full = wire.requests.capacity() == 0;
+        drop(daemon); // release actual I/O before assertions on a faulted run
+        assert!(
+            still_full,
+            "caller settlement did not require queue drainage"
+        );
+        assert!(
+            exit_settled.is_ok(),
+            "expired reply waited for the full cancellation queue"
+        );
+        assert!(
+            admission_settled.is_ok(),
+            "queue admission escaped the request deadline"
+        );
+        for result in [exit_settled.unwrap(), admission_settled.unwrap()] {
+            assert!(
+                result
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("request timed out")
+            );
+        }
+        assert!(
+            expired_tracking_removed,
+            "expiry removes its exact pending entry before peer release"
+        );
+        assert!(
+            pending_empty,
+            "aborted callers cannot leak pending entries behind a stalled writer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_includes_in_process_admission_and_reply() {
+        let (requests, mut request_rx) = mpsc::channel(1);
+        let (_events, events) = mpsc::channel(1);
+        let (reply, _receive) = oneshot::channel();
+        requests
+            .send(InProcessRequest {
+                request: Request::DaemonStatus,
+                reply,
+            })
+            .await
+            .unwrap();
+        let client = DaemonClient::from_in_process(InProcessConnection { requests, events });
+        let started = tokio::time::Instant::now();
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_with_timeout(Request::ExitGuardStatus, Duration::from_millis(100))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await; // register the deadline while admission is blocked
+        tokio::time::advance(Duration::from_millis(60)).await;
+        let _filler = request_rx.recv().await.unwrap();
+        let admitted = request_rx.recv().await.unwrap();
+        assert!(matches!(admitted.request, Request::ExitGuardStatus));
+        tokio::time::advance(Duration::from_millis(40)).await;
+        assert!(
+            request
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("request timed out")
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_millis(100),
+            "reply wait must use the remaining admission deadline"
+        );
+        assert!(
+            admitted.reply.is_closed(),
+            "late in-process replies have no expired receiver"
+        );
+
+        // A deadline must also settle without admission ever becoming possible.
+        let (reply, _receive) = oneshot::channel();
+        let ClientBackend::InProcess(queue) = &client.backend else {
+            unreachable!()
+        };
+        queue
+            .send(InProcessRequest {
+                request: Request::DaemonStatus,
+                reply,
+            })
+            .await
+            .unwrap();
+        let error = client
+            .request_with_timeout(
+                Request::StopDaemon { grace_secs: None },
+                Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("request timed out"));
+        let _filler = request_rx.recv().await.unwrap();
+        assert!(
+            matches!(request_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "expired admission cannot enqueue later"
+        );
+        let successor = tokio::spawn(async move { client.request(Request::DaemonStatus).await });
+        let successor_request = request_rx.recv().await.unwrap();
+        assert!(
+            admitted.reply.send(Ok(Response::Ack)).is_err(),
+            "late reply cannot find a successor's independent channel"
+        );
+        assert!(!successor.is_finished());
+        successor_request
+            .reply
+            .send(Ok(daemon_status_response()))
+            .unwrap();
+        assert!(matches!(
+            successor.await.unwrap().unwrap().unwrap(),
+            Response::DaemonStatus { .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_expired_queue_entry_is_not_sent_on_resume() {
+        // A one-byte real duplex buffer keeps the production framer's first
+        // write pending until this test starts reading the peer.
+        let (client_stream, daemon_stream) = tokio::io::duplex(1);
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.request(Request::ExitGuardStatus).await }
+        });
+        let ClientBackend::Wire(wire) = &client.backend else {
+            unreachable!()
+        };
+        while wire.pending.0.lock().unwrap().is_empty() || wire.requests.capacity() != REQUEST_QUEUE
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        let error = client
+            .request_with_timeout(
+                Request::StopDaemon { grace_secs: None },
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("request timed out"));
+        assert_eq!(
+            wire.requests.capacity(),
+            REQUEST_QUEUE - 1,
+            "expired request remains physically queued behind the active write"
+        );
+        assert_eq!(
+            wire.pending.0.lock().unwrap().len(),
+            1,
+            "only the active request retains reply tracking"
+        );
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let successor = tokio::spawn({
+            let client = client.clone();
+            async move { client.request(Request::DaemonStatus).await }
+        });
+        let first_id = recv_request_id(&mut daemon).await;
+        let frame = daemon.recv().await.unwrap().unwrap();
+        let RecvFrame::Envelope(envelope) = frame else {
+            panic!("request frame")
+        };
+        let Body::Request {
+            id: successor_id,
+            request: Request::DaemonStatus,
+            ..
+        } = envelope.body
+        else {
+            panic!("expired queued StopDaemon must be skipped when the writer resumes")
+        };
+        assert_ne!(first_id, successor_id);
+        daemon
+            .send(&Envelope::response(successor_id, daemon_status_response()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            successor.await.unwrap().unwrap().unwrap(),
+            Response::DaemonStatus { .. }
+        ));
+        assert!(
+            wire.pending.0.lock().unwrap().is_empty(),
+            "draining old work cannot resurrect expired registrations"
+        );
+    }
+
+    /// A delivered mutation can take effect after its caller times out. Late
+    /// replies for it and for an aborted caller must leave a successor alone.
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_late_mutation_reply_and_abort_cannot_settle_successor() {
+        let (client_stream, daemon_stream) = tokio::io::duplex(4096);
+        let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
+        let mut daemon = ProtoStream::new(daemon_stream);
+        let mutation = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request_with_timeout(
+                        Request::StopDaemon { grace_secs: None },
+                        Duration::from_millis(50),
+                    )
+                    .await
+            }
+        });
+        let frame = daemon.recv().await.unwrap().unwrap();
+        let RecvFrame::Envelope(envelope) = frame else {
+            panic!("request frame")
+        };
+        let Body::Request {
+            id: mutation_id,
+            request: Request::StopDaemon { grace_secs: None },
+            ..
+        } = envelope.body
+        else {
+            panic!("mutation delivered")
+        };
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert!(
+            mutation.await.unwrap().is_err(),
+            "delivered mutation timeout is outer transport/effect-unknown, never a typed not-delivered refusal"
+        );
+        let aborted = tokio::spawn({
+            let client = client.clone();
+            async move { client.request(Request::ExitGuardStatus).await }
+        });
+        let aborted_id = recv_request_id(&mut daemon).await;
+        aborted.abort();
+        assert!(aborted.await.unwrap_err().is_cancelled());
+        let successor = tokio::spawn({
+            let client = client.clone();
+            async move { client.request(Request::ExitGuardStatus).await }
+        });
+        let successor_id = recv_request_id(&mut daemon).await;
+        assert_ne!(mutation_id, successor_id);
+        assert_ne!(aborted_id, successor_id);
+        let ClientBackend::Wire(wire) = &client.backend else {
+            unreachable!()
+        };
+        assert!(!wire.pending.contains(mutation_id));
+        assert!(!wire.pending.contains(aborted_id));
+        // Effect completion belongs to the daemon even after local expiry.
+        daemon
+            .send(&Envelope::response(mutation_id, Response::Ack))
+            .await
+            .unwrap();
+        daemon
+            .send(&Envelope::response(aborted_id, Response::Ack))
+            .await
+            .unwrap();
+        daemon
+            .send(&Envelope::event(lsp_event("late replies processed")))
+            .await
+            .unwrap();
+        assert!(
+            matches!(client.next_event().await, Some(proto::Event::LspNotice { text }) if text == "late replies processed")
+        );
+        assert!(
+            !successor.is_finished(),
+            "neither late reply settles the successor"
+        );
+        assert!(wire.pending.contains(successor_id));
+        daemon
+            .send(&Envelope::response(
+                successor_id,
+                Response::ExitGuardStatus {
+                    ephemeral_owner: true,
+                    has_live_work: true,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            successor.await.unwrap().unwrap().unwrap(),
+            Response::ExitGuardStatus {
+                ephemeral_owner: true,
+                has_live_work: true
+            }
+        ));
+        assert!(wire.pending.0.lock().unwrap().is_empty());
     }
 
     /// Local socket EOF and an already stopped I/O task must stay outer

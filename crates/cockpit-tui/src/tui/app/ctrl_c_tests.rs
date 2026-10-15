@@ -852,6 +852,48 @@ async fn transport_failed_exit_guard_settles_closed_task_dropped_reply_and_timeo
     }
 }
 
+/// A mutation already accepted by the transport can still complete after
+/// timeout. Its receipt must retain uncertainty through the real conversion.
+#[tokio::test]
+async fn timed_out_mutation_stays_transport_unknown_after_delivery() {
+    let (requests, mut request_rx) = tokio::sync::mpsc::channel(1);
+    let (_events, events) = tokio::sync::mpsc::channel(1);
+    let client =
+        cockpit_client::DaemonClient::from_in_process(cockpit_client::InProcessConnection {
+            requests,
+            events,
+        });
+    let mutation = tokio::spawn(async move {
+        client
+            .request_with_timeout(cockpit_proto::Request::Prune, Duration::from_millis(25))
+            .await
+    });
+    let delivered = request_rx.recv().await.unwrap();
+    assert!(matches!(delivered.request, cockpit_proto::Request::Prune));
+    let result = mutation.await.unwrap();
+    assert!(
+        result.is_err(),
+        "timeout cannot manufacture a daemon refusal"
+    );
+    let outcome = crate::tui::agent_runner::control_response_outcome(
+        crate::tui::agent_runner::control_request_result(result),
+    );
+    assert!(
+        matches!(
+            outcome,
+            cockpit_client::presentation::ControlRequestOutcome::TransportFailed(_)
+        ),
+        "an admitted mutation stays delivery/effect-unknown, never NotDelivered"
+    );
+    assert!(
+        delivered
+            .reply
+            .send(Ok(cockpit_proto::Response::Ack))
+            .is_err(),
+        "late mutation completion has no expired reply receiver"
+    );
+}
+
 /// Inverse: actual delivered Internal/policy refusals do not masquerade as
 /// transport loss. Typed Authorization still permits local recovery.
 #[tokio::test]

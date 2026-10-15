@@ -4343,7 +4343,12 @@ impl Request {
                     if upsert.header_secrets.len() != upsert.entry.headers.len() {
                         return Err("provider header secret count does not match headers".into());
                     }
-                    if serde_json::to_vec(&upsert.entry)
+                    if upsert.model_patch.is_some() && !upsert.entry.models.is_empty() {
+                        return Err(
+                            "provider model patch requires an empty replacement inventory".into(),
+                        );
+                    }
+                    if serde_json::to_vec(&(&upsert.entry, &upsert.model_patch))
                         .map_err(|_| "provider entry must be serializable".to_string())?
                         .len()
                         > MAX_OWNER_PROVIDER_ENTRY_BYTES

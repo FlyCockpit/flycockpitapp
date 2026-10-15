@@ -249,8 +249,9 @@ impl DeclarativeUsageProbe {
         }
         let body =
             crate::providers::provider_http::read_body_limited(response, "usage API").await?;
-        let body =
+        let mut body =
             serde_json::from_str::<Value>(&body).context("parsing declarative usage JSON")?;
+        crate::providers::provider_http::diagnostic_value(&mut body, &resolved.headers)?;
         extract_usage_fields(&body, &self.spec)
     }
 }
@@ -409,7 +410,8 @@ async fn fetch_codex_usage_with_store(
         );
     }
     let body = crate::providers::provider_http::read_body_limited(resp, "Codex usage API").await?;
-    let body = serde_json::from_str::<Value>(&body).context("parsing Codex usage JSON")?;
+    let mut body = serde_json::from_str::<Value>(&body).context("parsing Codex usage JSON")?;
+    crate::providers::provider_http::diagnostic_value(&mut body, &resolved.headers)?;
     Ok(parse_codex_usage(&body))
 }
 
@@ -680,6 +682,86 @@ mod tests {
             assert!(message.contains("useful diagnostic"), "{message}");
             assert!(message.contains("400"), "{message}");
             server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_success_scrubs_nested_values_and_keys_before_serialization() {
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let store = crate::credentials::CredentialStore::open_default().unwrap();
+        for secret in [
+            r#"known/session-key/+private\fragment-0042"#,
+            r#"known/session-key/+private"fragment-0042"#,
+        ] {
+            let nested = serde_json::json!({"quota":"42 requests remain",(secret):[{"echo":secret},"ordinary quota text"]});
+            let body = serde_json::json!({"credits":nested,"plan_type":"useful plan","rate_limit":{"primary_window":{"detail":"ordinary quota text","used_percent":12}}}).to_string();
+            for codex in [false, true] {
+                let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+                    200,
+                    body.clone(),
+                    true,
+                )])
+                .await;
+                let entry = crate::config::providers::ProviderEntry {
+                    url,
+                    allow_insecure_http: true,
+                    auth: Some(crate::config::providers::AuthKind::None),
+                    headers: vec![crate::config::providers::HeaderSpec {
+                        name: "x-api-key".into(),
+                        value: "$LANE545_KEY".into(),
+                    }],
+                    ..Default::default()
+                };
+                let env = std::collections::HashMap::from([("LANE545_KEY".into(), secret.into())]);
+                let details = if codex {
+                    let (plan, windows, details) =
+                        fetch_codex_usage_with_store("local", &entry, Some(store.clone()), env)
+                            .await
+                            .unwrap();
+                    assert_eq!(plan.as_deref(), Some("useful plan"));
+                    assert_eq!(windows[0].detail.as_deref(), Some("ordinary quota text"));
+                    details
+                } else {
+                    let probe = DeclarativeUsageProbe::new(UsageProbeSpec {
+                        endpoint: "/usage".into(),
+                        method: UsageProbeMethod::Get,
+                        fields: [
+                            UsageProbeFieldKind::Credits,
+                            UsageProbeFieldKind::RequestsRemaining,
+                            UsageProbeFieldKind::Text,
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, kind)| UsageProbeField {
+                            pointer: "/credits".into(),
+                            label: format!("quota-{i}").into(),
+                            kind,
+                        })
+                        .collect(),
+                    });
+                    probe
+                        .fetch_result_with_store("local", &entry, Some(store.clone()), env)
+                        .await
+                        .unwrap()
+                        .1
+                };
+                let shown = serde_json::to_string(&details).unwrap();
+                assert!(
+                    !shown.contains("known/session-key"),
+                    "escaped credential leaked: {shown}"
+                );
+                assert!(
+                    shown.contains("42 requests remain"),
+                    "useful nested quota lost: {shown}"
+                );
+                assert!(
+                    !shown.contains("fragment-0042"),
+                    "credential suffix leaked: {shown}"
+                );
+                assert!(shown.contains("ordinary quota text"));
+                assert_eq!(details.len(), if codex { 1 } else { 3 });
+                server.await.unwrap();
+            }
         }
     }
 

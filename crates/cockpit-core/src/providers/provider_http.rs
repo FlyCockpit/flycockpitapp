@@ -30,16 +30,25 @@ pub(crate) fn build_with_timeout(timeout: Duration) -> Result<reqwest::Client> {
 
 /// Charge decoded bytes on every consuming provider path, irrespective of
 /// status, transfer encoding, or retry. Status-only callers drop the response.
-pub(crate) async fn read_body_limited(
+pub(crate) async fn read_body_limited(response: reqwest::Response, name: &str) -> Result<String> {
+    read_body_with_limit(
+        response,
+        name,
+        super::models_fetch::MAX_PROVIDER_RESPONSE_BYTES,
+    )
+    .await
+}
+
+pub(crate) async fn read_body_with_limit(
     mut response: reqwest::Response,
     name: &str,
+    limit: usize,
 ) -> Result<String> {
-    const LIMIT: usize = super::models_fetch::MAX_PROVIDER_RESPONSE_BYTES;
     if response
         .content_length()
-        .is_some_and(|bytes| bytes > LIMIT as u64)
+        .is_some_and(|bytes| bytes > limit as u64)
     {
-        anyhow::bail!("{name} response body exceeded {LIMIT} byte limit");
+        anyhow::bail!("{name} response body exceeded {limit} byte limit");
     }
     let mut body = Vec::new();
     while let Some(chunk) = response
@@ -47,8 +56,8 @@ pub(crate) async fn read_body_limited(
         .await
         .context("reading provider response body")?
     {
-        if body.len().saturating_add(chunk.len()) > LIMIT {
-            anyhow::bail!("{name} response body exceeded {LIMIT} byte limit");
+        if body.len().saturating_add(chunk.len()) > limit {
+            anyhow::bail!("{name} response body exceeded {limit} byte limit");
         }
         body.extend_from_slice(&chunk);
     }
@@ -100,11 +109,19 @@ pub(crate) fn with_diagnostic_credentials(
         if public_header_literal(&header.name, &header.value) {
             continue;
         }
-        for value in
-            std::iter::once(header.value.as_str()).chain(authorization_payload(&header.value))
+        // Native clients normalize surrounding HTTP whitespace on credential
+        // fields such as x-api-key/account-id. Cover both actual forms.
+        for value in std::iter::once(header.value.as_str())
+            .chain((header.value.trim() != header.value).then_some(header.value.trim()))
+            .chain(authorization_payload(&header.value))
         {
             if value.is_empty() {
                 continue;
+            }
+            if value.len() < crate::redact::MIN_REDACTION_ENTRY_LENGTH {
+                anyhow::bail!(
+                    "provider request credential is below the safe diagnostic coverage length"
+                );
             }
             table = table
                 .with_forced_literal(value.to_string(), "provider request credential".into())
@@ -112,6 +129,46 @@ pub(crate) fn with_diagnostic_credentials(
         }
     }
     Ok(table)
+}
+
+fn scrub_diagnostic_value(value: &mut serde_json::Value, table: &crate::redact::RedactionTable) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(text)
+                && (inner.is_object() || inner.is_array())
+            {
+                scrub_diagnostic_value(&mut inner, table);
+                *text = serde_json::to_string(&inner)
+                    .unwrap_or_else(|_| "[provider diagnostic omitted]".into());
+            } else {
+                *text = table.scrub(text);
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|v| scrub_diagnostic_value(v, table)),
+        serde_json::Value::Object(fields) => {
+            let prior = std::mem::take(fields);
+            for (key, mut value) in prior {
+                scrub_diagnostic_value(&mut value, table);
+                fields.insert(table.scrub(&key), value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scrub decoded successful usage values before compact JSON can escape literals.
+pub(crate) fn diagnostic_value(
+    value: &mut serde_json::Value,
+    headers: &[super::models_fetch::ResolvedHeader],
+) -> Result<()> {
+    let table = DIAGNOSTIC_CREDENTIALS
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| crate::redact::RedactionTable::empty());
+    let table = with_diagnostic_credentials(table, headers)?;
+    scrub_diagnostic_value(value, &table);
+    Ok(())
 }
 
 /// Scrub complete decoded fields before callers slice, escape, persist or log
@@ -125,35 +182,19 @@ pub(crate) fn diagnostic_body(
     let table = DIAGNOSTIC_CREDENTIALS
         .try_with(Clone::clone)
         .unwrap_or_else(|_| crate::redact::RedactionTable::empty());
-    let Ok(table) = with_diagnostic_credentials(table, headers) else {
+    diagnostic_body_with_table(raw, headers, table)
+}
+
+pub(crate) fn diagnostic_body_with_table(
+    raw: &str,
+    headers: &[super::models_fetch::ResolvedHeader],
+    table: crate::redact::RedactionTable,
+) -> String {
+    let Ok(table) = with_diagnostic_credentials(table.enforced(), headers) else {
         return "[provider diagnostic omitted]".into();
     };
-    fn scrub(value: &mut serde_json::Value, table: &crate::redact::RedactionTable) {
-        match value {
-            serde_json::Value::String(text) => {
-                if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(text)
-                    && (inner.is_object() || inner.is_array())
-                {
-                    scrub(&mut inner, table);
-                    *text = serde_json::to_string(&inner)
-                        .unwrap_or_else(|_| "[provider diagnostic omitted]".into());
-                } else {
-                    *text = table.scrub(text);
-                }
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| scrub(v, table)),
-            serde_json::Value::Object(fields) => {
-                let prior = std::mem::take(fields);
-                for (key, mut value) in prior {
-                    scrub(&mut value, table);
-                    fields.insert(table.scrub(&key), value);
-                }
-            }
-            _ => {}
-        }
-    }
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
-        scrub(&mut value, &table);
+        scrub_diagnostic_value(&mut value, &table);
         // A nested encoded envelope (e.g. metadata.raw) is scrubbed again after
         // decoding by the inference projection; discovery never exposes it.
         serde_json::to_string(&value).unwrap_or_else(|_| "[provider diagnostic omitted]".into())
@@ -630,6 +671,26 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("x-api-key: leaked-secret"),
             "{captured}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod credential_floor_tests {
+    use super::*;
+
+    #[test]
+    fn credential_coverage_below_matcher_floor_fails_closed() {
+        let headers = vec![super::super::models_fetch::ResolvedHeader {
+            name: "x-api-key".into(),
+            value: "abc".into(),
+        }];
+        assert!(
+            with_diagnostic_credentials(crate::redact::RedactionTable::empty(), &headers).is_err()
+        );
+        assert_eq!(
+            diagnostic_body("abc reflected", &headers),
+            "[provider diagnostic omitted]"
         );
     }
 }

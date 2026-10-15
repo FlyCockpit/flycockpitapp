@@ -8675,11 +8675,11 @@ fn session_diagnostic_tables_cover_resolved_credentials_for_every_model_construc
         },
         ResolvedHeader {
             name: "x-api-key".into(),
-            value: "known/header-key/+fragment-0042".into(),
+            value: "  known/header-key/+fragment-0042  ".into(),
         },
         ResolvedHeader {
             name: "chatgpt-account-id".into(),
-            value: "known/account-id/+fragment-0042".into(),
+            value: "  known/account-id/+fragment-0042  ".into(),
         },
         ResolvedHeader {
             name: "anthropic-version".into(),
@@ -8741,7 +8741,34 @@ fn session_diagnostic_tables_cover_resolved_credentials_for_every_model_construc
             )
             .unwrap(),
         ];
-        for model in models {
+        for mut model in models {
+            let discovered = Arc::new(
+                RedactionTable::empty()
+                    .with_forced_literal(
+                        "newly-discovered-private-literal".into(),
+                        "test discovery".into(),
+                    )
+                    .unwrap(),
+            );
+            model
+                .set_redact_table_for_config(&ProvidersConfig::default(), discovered)
+                .unwrap();
+            assert!(
+                !model
+                    .session_redact_table()
+                    .scrub("newly-discovered-private-literal")
+                    .contains("newly-discovered")
+            );
+            model
+                .set_redact_table_for_config(&ProvidersConfig::default(), empty.clone())
+                .unwrap();
+            assert!(
+                model
+                    .session_redact_table()
+                    .scrub("newly-discovered-private-literal")
+                    .contains("newly-discovered"),
+                "replace obsolete discovery coverage"
+            );
             let shown = model.session_redact_table().enforced().scrub("useful diagnostic known/session-key/+fragment-0042 known/header-key/+fragment-0042 known/account-id/+fragment-0042 2023-06-01");
             for secret in ["known/session-key", "known/header-key", "known/account-id"] {
                 assert!(

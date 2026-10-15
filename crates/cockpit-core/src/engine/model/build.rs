@@ -598,12 +598,13 @@ pub(super) fn build_anthropic_model_with_can_delegate(
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    let session_redact = Arc::new(
+    let client_credentials = Arc::new(
         crate::providers::provider_http::with_diagnostic_credentials(
-            (*session_redact).clone(),
+            RedactionTable::empty(),
             &resolved.headers,
         )?,
     );
+    let session_redact = Arc::new(session_redact.union(&client_credentials)?);
 
     let x_api_key = resolved
         .headers
@@ -716,6 +717,7 @@ pub(super) fn build_anthropic_model_with_can_delegate(
         // shared gate via `Model::with_shutdown_gate` for worker models.
         gate: crate::daemon::shutdown::ShutdownSignal::new(),
         session_redact,
+        client_credentials,
         redact,
     })
 }
@@ -777,12 +779,13 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    let session_redact = Arc::new(
+    let client_credentials = Arc::new(
         crate::providers::provider_http::with_diagnostic_credentials(
-            (*session_redact).clone(),
+            RedactionTable::empty(),
             &resolved.headers,
         )?,
     );
+    let session_redact = Arc::new(session_redact.union(&client_credentials)?);
 
     let access_token = resolved
         .headers
@@ -866,6 +869,7 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         can_delegate,
         gate: crate::daemon::shutdown::ShutdownSignal::new(),
         session_redact,
+        client_credentials,
         redact,
     })
 }
@@ -1017,12 +1021,13 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
 ) -> Result<Model> {
-    let session_redact = Arc::new(
+    let client_credentials = Arc::new(
         crate::providers::provider_http::with_diagnostic_credentials(
-            (*session_redact).clone(),
+            RedactionTable::empty(),
             &resolved.headers,
         )?,
     );
+    let session_redact = Arc::new(session_redact.union(&client_credentials)?);
 
     let resolved_wire_api = if wire_api.is_auto() {
         let default = crate::config::providers::default_wire_api_for_template(Some(provider_id));
@@ -1109,6 +1114,7 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
         // shared gate via `Model::with_shutdown_gate` for worker models.
         gate: crate::daemon::shutdown::ShutdownSignal::new(),
         session_redact,
+        client_credentials,
         redact,
     })
 }

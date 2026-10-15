@@ -66,6 +66,7 @@ fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
     assert!(!format!("{payload:?}").contains(sentinel));
 
     let save = ProviderSavePlan {
+        model_patch: None,
         provider_id: "example".into(),
         entry: ProviderEntry::default(),
         header_secrets: vec![Some(cockpit_proto::ProviderSecretValue::new(

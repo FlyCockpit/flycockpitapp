@@ -8778,3 +8778,271 @@ fn pending_daemon_deep_lost_reply_after_escape_reads_committed_snapshot() {
         );
     });
 }
+
+#[test]
+fn global_refresh_composed_overlay_remains_editable_through_real_settings_save() {
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
+            let mut buf = [0; 8192];
+            assert!(socket.read(&mut buf).unwrap() > 0);
+            let body =
+                serde_json::json!({"data":[{"id":"g","name":"global quota ".repeat(15*1024)}]})
+                    .to_string();
+            write!(socket,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+        });
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut global_config = ProvidersConfig::default();
+        global_config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: url.clone(),
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: vec![model("g", false)],
+                ..Default::default()
+            },
+        );
+        ConfigDoc::load(&global)
+            .unwrap()
+            .write(&global_config)
+            .unwrap();
+        let mut config = ProvidersConfig::default();
+        let authored = ModelEntry {
+            id: "l".into(),
+            name: Some("local authored ".repeat(12 * 1024)),
+            manual: true,
+            favorite: true,
+            ..Default::default()
+        };
+        config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: vec![authored.clone()],
+                ..Default::default()
+            },
+        );
+        for i in 0..4 {
+            config.providers.insert(
+                format!("sibling-{i}"),
+                ProviderEntry {
+                    url: "http://localhost:1/v1".into(),
+                    auth: Some(AuthKind::None),
+                    models: vec![ModelEntry {
+                        id: format!("sibling-{i}"),
+                        name: Some("s".repeat(180 * 1024)),
+                        manual: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("models_replace");
+        raw["authored_extension"] = serde_json::json!({"keep":"workspace sentinel"});
+        std::fs::write(&provider_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            initial.config.providers["p"].entry.models.len(),
+            2,
+            "unmarked authored overlay keeps inherited membership"
+        );
+        let result = runtime
+            .block_on(
+                client.request_ok(cockpit_proto::Request::FetchProviderModels {
+                    project_root: global.parent().unwrap().display().to_string(),
+                    provider_id: Some("p".into()),
+                    model_id: None,
+                    deep: false,
+                    on_unlisted: Some(OnUnlistedModelsFetch::Keep),
+                    allow_fallback: false,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            cockpit_proto::Response::ProviderModelsFetched { .. }
+        ));
+        server.join().unwrap();
+        let refreshed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let expected = refreshed.config.providers["p"].entry.models.clone();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(
+            serde_json::to_value(expected.iter().find(|m| m.id == "l").unwrap()).unwrap(),
+            serde_json::to_value(&authored).unwrap()
+        );
+        assert!(
+            serde_json::to_vec(&refreshed.config.providers["p"].entry)
+                .unwrap()
+                .len()
+                > cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES,
+            "fixture must exceed full-entry ingress cap"
+        );
+        assert!(
+            serde_json::to_vec(&refreshed.config.providers)
+                .unwrap()
+                .len()
+                > cockpit_proto::MAX_NDJSON_FRAME_BYTES,
+            "fixture must exceed one config event frame"
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(refreshed))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        assert!(
+            !dialog.provider_catalog_reload_required,
+            "save must adopt current authority: {:?}",
+            dialog.extended_warnings
+        );
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(current.config.providers["p"].entry.favorite, Some(true));
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "ordinary metadata edit preserves complete composed inventory"
+        );
+        assert_eq!(current.config.providers.len(), 5, "siblings remain intact");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert_eq!(saved["authored_extension"]["keep"], "workspace sentinel");
+        // A per-model favorite edit uses a bounded delta too, preserving the other large row.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog
+            .config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .iter_mut()
+            .find(|m| m.id == "g")
+            .unwrap()
+            .favorite = true;
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(current.config.providers["p"].entry.models.len(), 2);
+        assert!(
+            current.config.providers["p"]
+                .entry
+                .models
+                .iter()
+                .all(|m| m.favorite)
+        );
+        let mut expected_order = current.config.providers["p"]
+            .entry
+            .models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        expected_order.reverse();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog
+            .config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .reverse();
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"]
+                .entry
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<Vec<_>>(),
+            expected_order,
+            "ordinary settings preserves explicit row order"
+        );
+        let mut entry = current.config.providers["p"].entry.clone();
+        entry.name = Some("receipt-bound provider edit".into());
+        let save = super::super::ProviderSavePlan {
+            provider_id: "p".into(),
+            model_patch: Some(
+                cockpit_proto::ProviderModelPatch::between(
+                    &current.config.providers["p"].entry.models,
+                    &entry.models,
+                )
+                .unwrap(),
+            ),
+            header_secrets: vec![None; entry.headers.len()],
+            entry,
+        };
+        let saves = vec![save];
+        let intent = super::super::provider_plan_intent_hash(&saves, &[], &None).unwrap();
+        let authority = current.authority;
+        let work = super::super::SettingsDaemonEffectWork::ProviderMutation(
+            super::super::ProviderMutationPlan {
+                snapshot_session_id: authority.snapshot_session_id,
+                layer_id: authority.layer_id,
+                owner_root: authority.owner_root,
+                expected_revision: authority.base_revision,
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                mutation_intent_hash: intent,
+                saves,
+                deletes: Vec::new(),
+                metadata: None,
+            },
+        );
+        let result = runtime
+            .block_on(super::super::execute_settings_daemon_work(
+                work,
+                crate::tui::settings::test_lifecycle_client(),
+            ))
+            .expect("production worker must accept a complete, matching delta receipt");
+        assert!(
+            result.response.is_ok(),
+            "production receipt gate: {:?}",
+            result.response
+        );
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"].entry.name.as_deref(),
+            Some("receipt-bound provider edit")
+        );
+        assert_eq!(current.config.providers["p"].entry.models.len(), 2);
+    });
+}

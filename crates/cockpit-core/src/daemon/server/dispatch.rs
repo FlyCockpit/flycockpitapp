@@ -22092,6 +22092,11 @@ fn catalog_snapshot_wire_page(
     offset: usize,
 ) -> std::result::Result<Response, ErrorPayload> {
     let json = serde_json::to_string(&response).map_err(internal)?;
+    if json.len() > proto::MAX_CONFIG_TRANSFER_BYTES {
+        return Err(bad_request(
+            "provider catalog exceeds the complete transfer limit",
+        ));
+    }
     if offset == 0 && json.len() <= proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES {
         return Ok(response);
     }
@@ -22351,11 +22356,26 @@ fn ensure_catalog_entries_editable(
     config: &crate::config::providers::ProvidersConfig,
 ) -> std::result::Result<(), ErrorPayload> {
     let view = crate::secret_ref::redact_provider_view(config);
-    if view
-        .providers
-        .values()
-        .any(|entry| editable_provider_entry_bytes(entry) > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES)
-    {
+    if view.providers.values().any(|view| {
+        let mut entry = view.editable_entry();
+        let models = std::mem::take(&mut entry.models);
+        let metadata_bytes = serde_json::to_vec(&entry)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX);
+        let model_bytes = models
+            .iter()
+            .map(|model| {
+                serde_json::to_vec(model)
+                    .map(|v| v.len())
+                    .unwrap_or(usize::MAX)
+            })
+            .max()
+            .unwrap_or(0);
+        metadata_bytes
+            .saturating_add(model_bytes)
+            .saturating_add(256)
+            > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
+    }) {
         return Err(bad_request(
             "protected models or other provider configuration exceed the editable entry limit; no catalog was written",
         ));
@@ -22408,13 +22428,30 @@ async fn ensure_catalog_candidate_readable(
     cwd: &std::path::Path,
     trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
     config: &crate::config::providers::ProvidersConfig,
+    allow_paged_edit: bool,
 ) -> std::result::Result<(), ErrorPayload> {
     ensure_catalog_entries_editable(config)?;
     let (_, _, _, warnings) = daemon_provider_config_with_warnings(ctx, project_root).await?;
-    bounded_provider_response(provider_catalog_candidate_snapshot(
-        ctx, project_root, None, &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES), String::new(),
-        cwd.to_path_buf(), trust_policy.clone(), config.clone(), warnings, u64::MAX, false,
-    ).await?).map(|_| ()).map_err(|_| bad_request(
+    let candidate = provider_catalog_candidate_snapshot(
+        ctx,
+        project_root,
+        None,
+        &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES),
+        String::new(),
+        cwd.to_path_buf(),
+        trust_policy.clone(),
+        config.clone(),
+        warnings,
+        u64::MAX,
+        false,
+    )
+    .await?;
+    let checked = if allow_paged_edit {
+        catalog_snapshot_wire_page(candidate, 0)
+    } else {
+        bounded_provider_response(candidate)
+    };
+    checked.map(|_| ()).map_err(|_| bad_request(
         "the complete provider/config snapshot exceeds the readable limit; no provider configuration was written"
     ))
 }
@@ -22452,6 +22489,15 @@ async fn apply_provider_mutation(
     capability_owner: String,
     provider_env: std::collections::HashMap<String, String>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    for upsert in &mutation.upserts {
+        if serde_json::to_vec(&(&upsert.entry, &upsert.model_patch))
+            .map_err(internal)?
+            .len()
+            > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        {
+            return Err(bad_request("provider entry exceeds maximum length"));
+        }
+    }
     let observed_intent_hash = mutation.sanitized_intent_hash().map_err(internal)?;
     if observed_intent_hash != mutation_intent_hash {
         return Err(bad_request(
@@ -23566,6 +23612,36 @@ async fn commit_local_provider_credential(
     Ok(response)
 }
 
+/// The durable operation ledger and provider journal both cap receipts at
+/// 1 MiB. Large catalogs remain behind the existing paged snapshot RPC; the
+/// receipt contains only its committed authority and an explicit read-back state.
+fn bound_provider_mutation_receipt(
+    response: &mut Response,
+) -> std::result::Result<(), ErrorPayload> {
+    if !matches!(response, Response::ProviderMutationCommitted { .. }) {
+        return Ok(());
+    }
+    if serde_json::to_vec(&*response).map_err(internal)?.len()
+        > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES
+        && let Response::ProviderMutationCommitted {
+            config,
+            catalog_readback,
+            ..
+        } = response
+    {
+        *config = Default::default();
+        *catalog_readback = proto::ProviderCatalogReadback::Required;
+    }
+    if serde_json::to_vec(&*response).map_err(internal)?.len()
+        > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES
+    {
+        return Err(bad_request(
+            "provider receipt exceeds durable byte limit; no provider configuration was written",
+        ));
+    }
+    Ok(())
+}
+
 fn client_operation_id_from_response(
     response: &Response,
 ) -> std::result::Result<String, ErrorPayload> {
@@ -23742,7 +23818,27 @@ async fn stage_and_recover_provider_batch(
         .map(|upsert| upsert.provider_id.clone())
         .collect::<Vec<_>>();
 
+    let allow_paged_edit = !mutation.upserts.is_empty()
+        && mutation
+            .upserts
+            .iter()
+            .all(|upsert| upsert.model_patch.is_some());
     for mut upsert in mutation.upserts {
+        if let Some(patch) = &upsert.model_patch {
+            if !upsert.entry.models.is_empty() {
+                return Err(bad_request(
+                    "provider model patch requires an empty replacement inventory",
+                ));
+            }
+            let mut models = effective
+                .providers
+                .get(&upsert.provider_id)
+                .ok_or_else(|| bad_request("provider model patch has no existing inventory"))?
+                .models
+                .clone();
+            patch.apply(&mut models).map_err(bad_request)?;
+            upsert.entry.models = models;
+        }
         // Secret resolution validates a header against the complete provider
         // projection. Keep that projection separate from the mutable headers
         // below so a batch cannot observe a partially staged entry.
@@ -23860,7 +23956,15 @@ async fn stage_and_recover_provider_batch(
         &trust_policy,
         &std::collections::BTreeMap::from([(target.clone(), desired.clone())]),
     )?;
-    ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &candidate).await?;
+    ensure_catalog_candidate_readable(
+        ctx,
+        project_root,
+        &cwd,
+        &trust_policy,
+        &candidate,
+        allow_paged_edit,
+    )
+    .await?;
 
     // Cleanup is pair-scoped. A reference retained by the same provider in
     // the final layer must keep both its vault row and its exact ownership
@@ -23878,6 +23982,7 @@ async fn stage_and_recover_provider_batch(
     // leave both a lying receipt and a generation from the wrong daemon boot.
     let config_generation = 0;
     let response = Response::ProviderMutationCommitted {
+        catalog_readback: Default::default(),
         client_operation_id: client_operation_id.to_owned(),
         snapshot_session_id: snapshot_session_id.to_owned(),
         layer_id: layer_id.to_owned(),
@@ -23891,6 +23996,8 @@ async fn stage_and_recover_provider_batch(
         status: cockpit_proto::ConfigCommitStatus::Committed,
         publication: cockpit_proto::ConfigPublicationStatus::Published,
     };
+    let mut response = response;
+    bound_provider_mutation_receipt(&mut response)?;
     let terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
     let journal_id = format!("provider-batch-{batch_id}");
     let cleanup_named_json = serde_json::to_string(&cleanup_named).map_err(internal)?;
@@ -23902,6 +24009,29 @@ async fn stage_and_recover_provider_batch(
     let receipt_operation_id = client_operation_id.to_owned();
     let journal_owner = receipt_owner.clone();
     let journal_operation_id = receipt_operation_id.clone();
+    let mut projected_claims =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for (provider, reference) in &credential_claims {
+        projected_claims
+            .entry(provider.clone())
+            .or_default()
+            .insert(reference.clone());
+    }
+    let projected_payload = ProviderBatchJournalPayload {
+        config: desired.clone(),
+        cleanup_credentials: cleanup_credentials.clone(),
+        inserted_named_claims: staged.iter().map(|(name, _)| name.clone()).collect(),
+        inserted_credential_claims: projected_claims,
+    };
+    if serde_json::to_vec(&projected_payload)
+        .map_err(internal)?
+        .len()
+        > proto::MAX_CONFIG_TRANSFER_BYTES
+    {
+        return Err(bad_request(
+            "provider batch intent exceeds durable byte limit; no provider configuration was written",
+        ));
+    }
     let consumed_revision_for_tx = consumed_revision.to_owned();
     let intended_revision_for_tx = result_revision.clone();
     let consumed_config_generation_for_tx = i64::try_from(consumed_config_generation)
@@ -23970,6 +24100,7 @@ async fn stage_and_recover_provider_batch(
                 inserted_named_claims,
                 inserted_credential_claims,
             })?;
+            if payload_json.len() > proto::MAX_CONFIG_TRANSFER_BYTES {anyhow::bail!("provider batch intent exceeds durable byte limit");}
             conn.execute(
                 "INSERT INTO provider_config_journals
                  (journal_id, owner_digest, client_operation_id, request_hash,
@@ -24749,7 +24880,7 @@ pub(super) async fn provider_models_fetch(
         };
         layer.providers.insert(id.clone(), config.providers[id].clone());
         let intermediate = catalog_config_after_layer_writes(ctx, &cwd, &trust_policy, &planned_writes)?;
-        ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &intermediate).await?;
+        ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &intermediate, false).await?;
     }
     if let Some(policy) = on_unlisted.filter(|_| !aggregate_fetch_failed) {
         let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || ctx.config_source().config_write_target_for_provider(&cwd, "default")).map_err(config_write_target_error)?;
@@ -24759,7 +24890,7 @@ pub(super) async fn provider_models_fetch(
         layer.category_defaults = config.category_defaults.clone();
         layer.on_unlisted_models_fetch = Some(policy);
         let final_config = catalog_config_after_layer_writes(ctx, &cwd, &trust_policy, &planned_writes)?;
-        ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &final_config).await?;
+        ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &final_config, false).await?;
     }
     for provider_id in changed_provider_ids {
         let entry = config
@@ -26299,6 +26430,7 @@ async fn recover_provider_config_journals_inner(
                     )));
                 }
             }
+            bound_provider_mutation_receipt(&mut response)?;
             *response_json = serde_json::to_string(&response).map_err(internal)?;
         } else {
             // Legacy delete journals have no typed receipt, but still advance
@@ -27126,7 +27258,8 @@ async fn provider_config_save_under_lock(
         &trust_policy,
         &std::collections::BTreeMap::from([(config_path.clone(), intended_layer.clone())]),
     )?;
-    ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &candidate).await?;
+    ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &candidate, false)
+        .await?;
     let intended_revision = provider_config_revision(ctx, &config_path, &intended_layer)?;
     let consumed_config_generation = inventory::current_config_generation();
     let intended_config_generation = consumed_config_generation

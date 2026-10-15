@@ -8,6 +8,10 @@ use crate::engine::model::{Model, OutboundGuard};
 use crate::providers::models_fetch;
 use crate::redact::RedactionTable;
 
+// Finite embedding batches can legitimately exceed the directory/error budget.
+const MAX_EMBEDDING_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const EMBEDDING_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[async_trait]
 pub trait Embedder: Send + Sync {
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
@@ -205,7 +209,7 @@ impl OpenAiCompatEmbedder {
         guard: OutboundGuard,
     ) -> Result<Self> {
         Ok(Self {
-            client: crate::providers::provider_http::build()
+            client: crate::providers::provider_http::build_with_timeout(EMBEDDING_REQUEST_TIMEOUT)
                 .context("building embedding HTTP client")?,
             base_url: request.base_url,
             headers: request.headers,
@@ -273,6 +277,18 @@ impl OpenAiCompatEmbedder {
 #[async_trait]
 impl Embedder for OpenAiCompatEmbedder {
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        tokio::time::timeout(EMBEDDING_REQUEST_TIMEOUT, self.embed_with_deadline(texts))
+            .await
+            .context("embedding request deadline exceeded")?
+    }
+
+    fn identity(&self) -> String {
+        format!("openai-compatible:{}:{}", self.base_url, self.model)
+    }
+}
+
+impl OpenAiCompatEmbedder {
+    async fn embed_with_deadline(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let redacted = self.guard().scrub_many(texts);
         let redacted_refs: Vec<&str> = redacted.iter().map(String::as_str).collect();
         let body = EmbeddingsRequest {
@@ -280,6 +296,7 @@ impl Embedder for OpenAiCompatEmbedder {
             input: &redacted_refs,
         };
         let (base_url, headers, request_generation) = self.current_request();
+        let mut diagnostic_headers = headers.clone();
         let response = self
             .request(&body, &base_url, &headers)
             .send()
@@ -294,6 +311,7 @@ impl Embedder for OpenAiCompatEmbedder {
             None
         };
         let response = if let Some(refresh) = refreshed {
+            drop(response);
             let request = models_fetch::refresh_provider_request_async_with_store_authorized(
                 &refresh.provider_id,
                 refresh.store.clone(),
@@ -316,6 +334,7 @@ impl Embedder for OpenAiCompatEmbedder {
                 .request
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = request.clone();
+            diagnostic_headers.extend(request.headers.iter().cloned());
             self.request(&body, &request.base_url, &request.headers)
                 .send()
                 .await
@@ -324,56 +343,73 @@ impl Embedder for OpenAiCompatEmbedder {
             response
         };
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .context("reading embeddings response")?;
-        let diagnostic = self.guard().scrub(&text);
+        let limit = if status.is_success() {
+            MAX_EMBEDDING_RESPONSE_BYTES
+        } else {
+            crate::providers::models_fetch::MAX_PROVIDER_RESPONSE_BYTES
+        };
+        let text =
+            crate::providers::provider_http::read_body_with_limit(response, "embeddings", limit)
+                .await
+                .with_context(|| format!("reading embeddings response ({status})"))?;
+        let diagnostic = || self.guard().provider_diagnostic(&text, &diagnostic_headers);
         if !status.is_success() {
             anyhow::bail!(
                 "embeddings request returned {status}: {}",
-                snippet(&diagnostic)
+                snippet(&diagnostic())
             );
         }
-        let parsed: EmbeddingsResponse = serde_json::from_str(&text)
-            .with_context(|| format!("parsing embeddings response: {}", snippet(&diagnostic)))?;
-        if parsed.data.len() != texts.len() {
-            anyhow::bail!(
-                "embeddings response count mismatch: requested {}, got {}",
-                texts.len(),
-                parsed.data.len()
-            );
-        }
-
-        let mut by_index: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-        for item in parsed.data {
-            if item.index >= texts.len() {
-                anyhow::bail!("embeddings response index {} out of range", item.index);
-            }
-            if let Some(expected) = self.expected_dimensions
-                && item.embedding.len() != expected as usize
-            {
+        let parsed: EmbeddingsResponse = serde_json::from_str(&text).map_err(|error| {
+            // Serde's Unexpected::Str prints decoded provider data. Never retain
+            // that raw error as an anyhow cause, even behind a scrubbed context.
+            anyhow!(
+                "parsing embeddings response at line {}, column {}: {}",
+                error.line(),
+                error.column(),
+                snippet(&diagnostic())
+            )
+        })?;
+        let validate = || -> Result<Vec<Vec<f32>>> {
+            if parsed.data.len() != texts.len() {
                 anyhow::bail!(
-                    "embedding dimension mismatch: expected {}, got {}",
-                    expected,
-                    item.embedding.len()
+                    "embeddings response count mismatch: requested {}, got {}",
+                    texts.len(),
+                    parsed.data.len()
                 );
             }
-            if by_index[item.index].replace(item.embedding).is_some() {
-                anyhow::bail!("duplicate embedding response index {}", item.index);
-            }
-        }
-        by_index
-            .into_iter()
-            .enumerate()
-            .map(|(index, embedding)| {
-                embedding.ok_or_else(|| anyhow!("missing embedding response index {index}"))
-            })
-            .collect()
-    }
 
-    fn identity(&self) -> String {
-        format!("openai-compatible:{}:{}", self.base_url, self.model)
+            let mut by_index: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+            for item in parsed.data {
+                if item.index >= texts.len() {
+                    anyhow::bail!("embeddings response index {} out of range", item.index);
+                }
+                if let Some(expected) = self.expected_dimensions
+                    && item.embedding.len() != expected as usize
+                {
+                    anyhow::bail!(
+                        "embedding dimension mismatch: expected {}, got {}",
+                        expected,
+                        item.embedding.len()
+                    );
+                }
+                if by_index[item.index].replace(item.embedding).is_some() {
+                    anyhow::bail!("duplicate embedding response index {}", item.index);
+                }
+            }
+            by_index
+                .into_iter()
+                .enumerate()
+                .map(|(index, embedding)| {
+                    embedding.ok_or_else(|| anyhow!("missing embedding response index {index}"))
+                })
+                .collect()
+        };
+        validate().map_err(|error| {
+            anyhow!(
+                self.guard()
+                    .provider_diagnostic(&error.to_string(), &diagnostic_headers)
+            )
+        })
     }
 }
 
@@ -398,7 +434,11 @@ fn snippet(body: &str) -> String {
     const MAX: usize = 500;
     let compact = body.replace(['\n', '\r'], " ");
     if compact.len() > MAX {
-        format!("{}…", &compact[..MAX])
+        let mut end = MAX;
+        while !compact.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &compact[..end])
     } else {
         compact
     }
@@ -950,5 +990,329 @@ mod tests {
             "{}",
             captured.head
         );
+    }
+    #[tokio::test]
+    async fn embedding_parse_success_validation_scrubs_actual_numeric_credentials() {
+        const CREDENTIAL: &str = "65432109";
+        let (url, capture) = capture_embedding_server_with_response(
+            r#"{"data":[{"index":65432109,"embedding":[1,2,3]}]}"#,
+        )
+        .await;
+        let embedder = OpenAiCompatEmbedder::from_resolved_request(
+            models_fetch::ResolvedRequest {
+                base_url: url,
+                headers: vec![models_fetch::ResolvedHeader {
+                    name: "x-api-key".into(),
+                    value: CREDENTIAL.into(),
+                }],
+                is_codex_credential: false,
+            },
+            "m".into(),
+            Some(3),
+            OutboundGuard::new(Arc::new(RedactionTable::empty())),
+        )
+        .unwrap();
+        let error = format!("{:#}", embedder.embed(&["test"]).await.unwrap_err());
+        let request = capture.await.unwrap();
+        assert!(
+            request.head.lines().any(|line| line
+                .split_once(':')
+                .is_some_and(|(name, value)| name.eq_ignore_ascii_case("x-api-key")
+                    && value.trim() == CREDENTIAL)),
+            "actual private credential must reach the provider"
+        );
+        assert!(
+            !error.contains(CREDENTIAL),
+            "numeric credential escaped a post-parse validation error: {error}"
+        );
+        assert!(
+            error.contains("out of range"),
+            "useful validation diagnostic lost: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod response_budget_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_embedder(url: String) -> OpenAiCompatEmbedder {
+        OpenAiCompatEmbedder::from_resolved_request(
+            models_fetch::ResolvedRequest {
+                base_url: url,
+                headers: vec![],
+                is_codex_credential: false,
+            },
+            "m".into(),
+            None,
+            OutboundGuard::new(Arc::new(RedactionTable::empty())),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn embedding_bodies_bound_declared_chunked_exact_and_large_vectors() {
+        for success in [false, true] {
+            let limit = if success {
+                MAX_EMBEDDING_RESPONSE_BYTES
+            } else {
+                crate::providers::models_fetch::MAX_PROVIDER_RESPONSE_BYTES
+            };
+            for chunked in [false, true] {
+                for overflow in [false, true] {
+                    let prefix = if success {
+                        r#"{"data":[{"index":0,"embedding":[1,2,3]}]}"#
+                    } else {
+                        "useful embedding diagnostic"
+                    };
+                    let body = format!(
+                        "{prefix}{}",
+                        " ".repeat(limit + usize::from(overflow) - prefix.len())
+                    );
+                    let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+                        if success { 200 } else { 400 },
+                        body,
+                        chunked,
+                    )])
+                    .await;
+                    let result = test_embedder(url).embed(&["a"]).await;
+                    if success && !overflow {
+                        assert_eq!(result.unwrap(), vec![vec![1.0, 2.0, 3.0]]);
+                    } else {
+                        let shown = format!("{:#}", result.unwrap_err());
+                        if overflow {
+                            assert!(shown.contains("byte limit"), "{shown}");
+                        } else {
+                            assert!(
+                                shown.contains("400")
+                                    && shown.contains("useful embedding diagnostic"),
+                                "{shown}"
+                            );
+                        }
+                        assert!(
+                            !shown.contains("Unauthorized"),
+                            "body overflow is not an auth failure: {shown}"
+                        );
+                    }
+                    server.await.unwrap();
+                }
+            }
+        }
+        let count = 900_000;
+        let body = format!(
+            r#"{{"data":[{{"index":0,"embedding":[{}0]}}]}}"#,
+            "0.123456789,".repeat(count)
+        );
+        assert!(body.len() > crate::providers::models_fetch::MAX_PROVIDER_RESPONSE_BYTES);
+        let (url, server) =
+            crate::providers::provider_http::serve_test_bodies(vec![(200, body, true)]).await;
+        let vectors = test_embedder(url)
+            .embed(&["large finite vector"])
+            .await
+            .unwrap();
+        assert_eq!(vectors[0].len(), count + 1);
+        assert_eq!(vectors[0][count], 0.0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn embedding_pending_success_and_error_deadline_and_drop_release_body() {
+        for status in [200, 400] {
+            for deadline in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let retained = Arc::new(test_embedder(url));
+                let sending = retained.clone();
+                let task = tokio::spawn(async move { sending.embed(&["a"]).await });
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 8192];
+                let mut received = Vec::new();
+                while !received.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    received.extend_from_slice(&buf[..n]);
+                }
+                socket.write_all(format!("HTTP/1.1 {status} OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n1\r\nx\r\n").as_bytes()).await.unwrap();
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(!task.is_finished(), "body must be pending");
+                if deadline {
+                    tokio::time::pause();
+                    tokio::time::advance(
+                        EMBEDDING_REQUEST_TIMEOUT + std::time::Duration::from_secs(1),
+                    )
+                    .await;
+                    let error = format!(
+                        "{:#}",
+                        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                            .await
+                            .expect("embedding transport must own a finite deadline")
+                            .unwrap()
+                            .unwrap_err()
+                    );
+                    assert!(
+                        error.contains("deadline") || error.contains("timed out"),
+                        "{error}"
+                    );
+                    tokio::time::resume();
+                } else {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while socket.read(&mut buf).await.unwrap_or(0) != 0 {}
+                })
+                .await
+                .expect("body future drop releases TCP connection");
+                assert_eq!(
+                    Arc::strong_count(&retained),
+                    1,
+                    "the configured client remains alive after the consumed body is dropped"
+                );
+                let next_client = retained.clone();
+                let next =
+                    tokio::spawn(async move { next_client.embed(&["after cancellation"]).await });
+                tokio::time::timeout(std::time::Duration::from_secs(5),async {
+                    let (mut next_socket,_) = listener.accept().await.unwrap();
+                    assert!(next_socket.read(&mut buf).await.unwrap()>0);
+                    let body=r#"{"data":[{"index":0,"embedding":[1,2,3]}]}"#;
+                    next_socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                    assert_eq!(next.await.unwrap().unwrap(),vec![vec![1.0,2.0,3.0]]);
+                }).await.expect("retained client handles the next normal embedding after body cancellation/deadline");
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod retry_response_budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedding_credential_retry_uses_same_body_budget_and_preserves_vectors() {
+        use crate::config::providers::{AuthKind, ModelEntry};
+        use crate::daemon::session_worker::{SessionConfigHandle, SessionConfigSnapshot};
+        for status in [200, 400] {
+            for overflow in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let body = if overflow {
+                    "x".repeat(if status == 200 {
+                        MAX_EMBEDDING_RESPONSE_BYTES + 1
+                    } else {
+                        crate::providers::models_fetch::MAX_PROVIDER_RESPONSE_BYTES + 1
+                    })
+                } else if status == 200 {
+                    r#"{"data":[{"index":0,"embedding":[1,2,3]}]}"#.into()
+                } else {
+                    "useful retry diagnostic".into()
+                };
+                let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![
+                    (401, "expired".into(), true),
+                    (status, body, true),
+                ])
+                .await;
+                let id = format!("embedding-retry-{status}-{overflow}");
+                let entry = ProviderEntry {
+                    url,
+                    auth: Some(AuthKind::Command),
+                    auth_command: Some(vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "printf '%s' '{\"token\":\"test-retry-token\",\"expires_at\":null}'".into(),
+                    ]),
+                    models: vec![ModelEntry {
+                        id: "m".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let mut providers = ProvidersConfig::default();
+                providers.providers.insert(id.clone(), entry.clone());
+                let config = SessionConfigHandle::new(Arc::new(std::sync::RwLock::new(
+                    SessionConfigSnapshot::new(1, providers.clone(), Default::default()),
+                )));
+                let store =
+                    crate::credentials::CredentialStore::open(temp.path().join("credentials.json"))
+                        .unwrap();
+                let embedder = OpenAiCompatEmbedder::for_provider_entry_with_store(
+                    &providers,
+                    &id,
+                    &entry,
+                    "m",
+                    Some(3),
+                    Arc::new(RedactionTable::empty()),
+                    Some(store),
+                    Some(&config),
+                )
+                .await
+                .unwrap();
+                let result = embedder.embed(&["retry"]).await;
+                if status == 200 && !overflow {
+                    assert_eq!(result.unwrap(), vec![vec![1.0, 2.0, 3.0]]);
+                } else {
+                    let error = format!("{:#}", result.unwrap_err());
+                    if overflow {
+                        assert!(error.contains("byte limit"), "{error}");
+                    } else {
+                        assert!(
+                            error.contains("400") && error.contains("useful retry diagnostic"),
+                            "{error}"
+                        );
+                    }
+                }
+                server.await.unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod parse_diagnostic_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedding_parse_error_chain_scrubs_decoded_header_and_session_values() {
+        for credential in [
+            r#"known/header-key/+private\fragment-0042"#,
+            r#"known/header-key/+private"fragment-0042"#,
+        ] {
+            let session_secret = r#"known/session-key/+private"fragment-0042"#;
+            let body=serde_json::json!({"data":[{"index":0,"embedding":[credential]}],"detail":{"useful":"useful vector diagnostic","local":session_secret}}).to_string();
+            let (url, server) =
+                crate::providers::provider_http::serve_test_bodies(vec![(200, body, true)]).await;
+            let guard = OutboundGuard::new(Arc::new(
+                RedactionTable::empty()
+                    .with_forced_literal(session_secret.into(), "session discovery".into())
+                    .unwrap(),
+            ));
+            let embedder = OpenAiCompatEmbedder::from_resolved_request(
+                models_fetch::ResolvedRequest {
+                    base_url: url,
+                    headers: vec![models_fetch::ResolvedHeader {
+                        name: "x-api-key".into(),
+                        value: credential.into(),
+                    }],
+                    is_codex_credential: false,
+                },
+                "m".into(),
+                Some(3),
+                guard,
+            )
+            .unwrap();
+            let error = format!("{:#}", embedder.embed(&["test"]).await.unwrap_err());
+            assert!(
+                !error.contains("known/header-key")
+                    && !error.contains("known/session-key")
+                    && !error.contains("fragment-0042"),
+                "credential escaped error chain: {error}"
+            );
+            assert!(
+                error.contains("useful vector diagnostic") && error.contains("line 1"),
+                "useful parse diagnostic lost: {error}"
+            );
+            server.await.unwrap();
+        }
     }
 }

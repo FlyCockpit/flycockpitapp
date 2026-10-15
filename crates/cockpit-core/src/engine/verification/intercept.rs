@@ -690,12 +690,12 @@ async fn run_verification(
                 "verification could not build a trusted-minimal approval projection"
             )),
             None => match adjudicator {
-                Ok(adjudicator) => {
+                Ok(adjudicator) => async {
                     let mut adjudicator = adjudicator.as_ref().clone();
                     adjudicator.set_redact_table_for_config(
                         &input.ctx.config.providers(),
                         input.ctx.redact.clone(),
-                    );
+                    )?;
                     adjudicate(
                         input.ctx.session.clone(),
                         &adjudicator,
@@ -710,7 +710,7 @@ async fn run_verification(
                         adjudication_deadline,
                     )
                     .await
-                }
+                }.await,
                 Err(error) => Err(error),
             },
         };

@@ -21,6 +21,19 @@ impl OutboundGuard {
         texts.iter().map(|text| self.scrub(text)).collect()
     }
 
+    /// Provider diagnostics are decoded and scrubbed before escaping or slicing.
+    pub(crate) fn provider_diagnostic(
+        &self,
+        text: &str,
+        headers: &[crate::providers::models_fetch::ResolvedHeader],
+    ) -> String {
+        crate::providers::provider_http::diagnostic_body_with_table(
+            text,
+            headers,
+            self.redact.enforced(),
+        )
+    }
+
     /// Extend this request guard with the current command-authentication
     /// material from the credential store. A refreshed command result is
     /// persisted before its retry is constructed, so rebuilding the guard at

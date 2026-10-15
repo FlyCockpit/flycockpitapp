@@ -12180,6 +12180,7 @@ async fn fresh_untrusted_provider_save_commits_to_the_global_layer() {
         "fresh-untrusted-provider-save",
         cockpit_proto::ProviderMutationBatch {
             upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                model_patch: None,
                 provider_id: "onboard".into(),
                 entry: onboard_provider_entry(),
                 header_secrets: Vec::new(),
@@ -12233,6 +12234,7 @@ async fn fresh_untrusted_provider_delete_commits_to_the_global_layer() {
         "fresh-untrusted-provider-delete-save",
         cockpit_proto::ProviderMutationBatch {
             upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                model_patch: None,
                 provider_id: "onboard".into(),
                 entry: onboard_provider_entry(),
                 header_secrets: Vec::new(),
@@ -12304,6 +12306,7 @@ async fn ephemeral_daemon_onboarding_first_write_succeeds_without_promotion() {
         "ephemeral-onboarding-first-write",
         cockpit_proto::ProviderMutationBatch {
             upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                model_patch: None,
                 provider_id: "onboard".into(),
                 entry: onboard_provider_entry(),
                 header_secrets: Vec::new(),
@@ -12689,6 +12692,7 @@ async fn trusted_workspace_provider_definition_is_preserved_on_save() {
         "trusted-workspace-scope",
         cockpit_proto::ProviderMutationBatch {
             upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                model_patch: None,
                 provider_id: "existing".into(),
                 entry,
                 header_secrets: Vec::new(),
@@ -23169,6 +23173,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             mutation_intent_hash: "00".repeat(32),
             mutation: cockpit_proto::ProviderMutationBatch {
                 upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                    model_patch: None,
                     provider_id: "example".into(),
                     entry: crate::config::providers::ProviderEntry::default(),
                     header_secrets: Vec::new(),
@@ -29442,6 +29447,105 @@ async fn dispatch_attach_delivers_config_snapshot_event() {
     );
 }
 
+#[tokio::test]
+async fn dispatch_attach_delivers_large_composed_config_over_bounded_frames() {
+    let project = tempfile::tempdir().unwrap();
+    let mut providers = crate::config::providers::ProvidersConfig::default();
+    providers.providers.insert(
+        "p".to_string(),
+        crate::config::providers::ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            ..crate::config::providers::ProviderEntry::default()
+        },
+    );
+    providers.active_model = Some(crate::config::providers::ActiveModelRef {
+        provider: "p".to_string(),
+        model: "m".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    for i in 0..6 {
+        providers.providers.insert(
+            format!("large-{i}"),
+            crate::config::providers::ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                models: vec![crate::config::providers::ModelEntry {
+                    id: format!("row-{i}"),
+                    name: Some("模型 ".repeat(40 * 1024)),
+                    manual: true,
+                    favorite: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+    }
+    let expected_models = providers
+        .providers
+        .iter()
+        .map(|(id, entry)| (id.clone(), serde_json::to_value(&entry.models).unwrap()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        providers,
+        crate::config::extended::ExtendedConfig::default(),
+    ));
+    ctx.db
+        .set_workspace_trust(
+            project.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let session = ctx
+        .db
+        .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
+        .unwrap();
+    establish_fixture_redaction_custody(&ctx.db, session.session_id);
+    let (server_stream, client_stream) = test_stream_pair();
+    let mut client = ProtoStream::new(client_stream);
+    let server = tokio::spawn(handle_client_transport(server_stream, ctx.clone()));
+    let _hello = recv_body(&mut client).await;
+    client
+        .send(&Envelope::request(
+            Uuid::new_v4(),
+            attach_existing_request(session.session_id, project.path()),
+        ))
+        .await
+        .unwrap();
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match recv_body(&mut client).await {
+                Body::Event {
+                    event: proto::Event::ConfigSnapshot { snapshot },
+                } => break snapshot,
+                Body::Error { error, .. } => panic!("attach failed: {error:?}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("complete attach config event");
+    assert_eq!(snapshot.session_id, session.session_id);
+    let event = Envelope::event(proto::Event::ConfigSnapshot {
+        snapshot: snapshot.clone(),
+    });
+    assert!(
+        serde_json::to_vec(&event).unwrap().len() > proto::MAX_NDJSON_FRAME_BYTES,
+        "fixture must require actual chunked transport"
+    );
+    for (id, models) in expected_models {
+        assert_eq!(
+            serde_json::to_value(&snapshot.providers.providers[&id].entry.models).unwrap(),
+            models,
+            "complete models survive attach: {id}"
+        );
+    }
+    drop(client);
+    let _ = server.await;
+}
+
 /// Criterion 6 (`engine-config-snapshot-adoption`): after a re-resolution
 /// over a malformed layer, a dispatched client still holds the last good
 /// snapshot (no new `ConfigSnapshot` event) and receives a terminal error. Driven
@@ -31698,7 +31802,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::CancelMcpOAuth { client_operation_id: "cancel-mcp".into(), begin_client_operation_id: "begin-mcp".into(), flow_id: Some("flow".into()) }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None, snapshot_session_id: "fixture-snapshot".into() }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::GetProviderCatalogPage { project_root: "/tmp/project".into(), provider_id: None, snapshot_session_id: "fixture-snapshot".into(), offset: 0 }, kind: "get_provider_catalog_page", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
-        CommandMetadataCase { request: Request::ApplyProviderMutation { snapshot_session_id: "fixture-snapshot".into(), layer_id: "fixture-layer".into(), expected_revision: "fixture-revision".into(), client_operation_id: "fixture-operation".into(), mutation_intent_hash: "00".repeat(32), mutation: cockpit_proto::ProviderMutationBatch { upserts: vec![cockpit_proto::ProviderMutationUpsert { provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }], deletes: Vec::new(), metadata: None } }, kind: "apply_provider_mutation", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::ApplyProviderMutation { snapshot_session_id: "fixture-snapshot".into(), layer_id: "fixture-layer".into(), expected_revision: "fixture-revision".into(), client_operation_id: "fixture-operation".into(), mutation_intent_hash: "00".repeat(32), mutation: cockpit_proto::ProviderMutationBatch { upserts: vec![cockpit_proto::ProviderMutationUpsert { model_patch: None, provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }], deletes: Vec::new(), metadata: None } }, kind: "apply_provider_mutation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetLocalOperationSettlement { client_operation_id: "fixture-operation".into() }, kind: "get_local_operation_settlement", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::FetchProviderModels { project_root: "/tmp/project".into(), provider_id: None, model_id: None, deep: false, on_unlisted: None, allow_fallback: false }, kind: "fetch_provider_models", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetProviderUsageSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_usage_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
@@ -32969,6 +33073,7 @@ async fn commit_public_catalog_provider(
         "large-catalog-save",
         cockpit_proto::ProviderMutationBatch {
             upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                model_patch: None,
                 provider_id: "catalog".into(),
                 entry: ProviderEntry {
                     template: Some("openai-compatible".into()),
@@ -46603,6 +46708,7 @@ async fn catalog_settings_save_overflow_rejects_before_provider_or_secret_write(
         take_onboarding_catalog(&ctx, &mut state, &workspace, "oversized-settings-save").await;
     let mutation = cockpit_proto::ProviderMutationBatch {
         upserts: vec![cockpit_proto::ProviderMutationUpsert {
+            model_patch: None,
             provider_id: "too-large".into(),
             entry: ProviderEntry {
                 url: "https://example.com/v1".into(),
@@ -47067,4 +47173,111 @@ async fn catalog_metadata_raw_overflow_rejects_before_catalog_write() {
     );
     assert_eq!(std::fs::read(&global).unwrap(), before_config);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn usage_success_final_wire_scrubs_decoded_nested_credentials() {
+    use crate::config::providers::{
+        AuthKind, HeaderSpec, ProviderEntry, ProvidersConfig, UsageProbeField, UsageProbeFieldKind,
+        UsageProbeMethod, UsageProbeSpec,
+    };
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for codex in [false, true] {
+        for secret in [
+            r#"known/session-key/+private\fragment-0042"#,
+            r#"known/session-key/+private"fragment-0042"#,
+        ] {
+            let body=serde_json::json!({"plan_type":"ordinary plan","credits":{"quota":"42 requests remain",(secret):[{"echo":secret},"ordinary nested quota"]}}).to_string();
+            let (url, server) =
+                crate::providers::provider_http::serve_test_bodies(vec![(200, body, true)]).await;
+            let entry = ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                template: codex.then(|| crate::auth::codex_oauth::CREDENTIAL_KEY.into()),
+                credential_ref: codex.then(|| crate::auth::codex_oauth::CREDENTIAL_KEY.into()),
+                headers: vec![HeaderSpec {
+                    name: "x-api-key".into(),
+                    value: "$LANE545_USAGE_WIRE".into(),
+                }],
+                usage_probe: (!codex).then(|| UsageProbeSpec {
+                    endpoint: "/usage".into(),
+                    method: UsageProbeMethod::Get,
+                    fields: [
+                        UsageProbeFieldKind::Credits,
+                        UsageProbeFieldKind::RequestsRemaining,
+                        UsageProbeFieldKind::Text,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, kind)| UsageProbeField {
+                        pointer: "/credits".into(),
+                        label: format!("quota-{i}").into(),
+                        kind,
+                    })
+                    .collect(),
+                }),
+                ..Default::default()
+            };
+            let provider_id = if codex {
+                crate::auth::codex_oauth::CREDENTIAL_KEY
+            } else {
+                "local"
+            };
+            let mut providers = ProvidersConfig::default();
+            providers.providers.insert(provider_id.into(), entry);
+            let ctx = test_ctx_with_config_source(
+                crate::daemon::config_source::ConfigSource::fixed(providers, Default::default()),
+            );
+            let root = tempfile::tempdir().unwrap();
+            trust_workspace_root(&ctx, root.path()).await;
+            if codex {
+                let record = serde_json::json!({"access_token":"codex-test-access","refresh_token":"codex-test-refresh","id_token":"codex-test-id","account_id":"codex-test-account","expires_at":i64::MAX});
+                ctx.secret_vault
+                    .put_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        crate::auth::codex_oauth::CREDENTIAL_KEY,
+                        &serde_json::to_vec(&record).unwrap(),
+                    )
+                    .unwrap();
+                let owner_root = crate::secret_ownership::canonical_owner_root(
+                    &root.path().display().to_string(),
+                );
+                ctx.db.write(move |conn| {
+                    conn.execute("INSERT INTO secret_credential_ownership (item_id,provider_id,project_root,created_at) VALUES (?1,?1,?2,1)",rusqlite::params![crate::auth::codex_oauth::CREDENTIAL_KEY,owner_root])?;
+                    Ok(())
+                }).await.unwrap();
+            }
+            *ctx.env_baseline.write().unwrap() = EnvSnapshot::new(
+                EnvSnapshotSource::DaemonStart,
+                HashMap::from([("LANE545_USAGE_WIRE".into(), secret.into())]),
+            );
+            let mut state = MutableClientState::detached_for_test();
+            let response = handle_request(
+                Request::GetProviderUsageSnapshot {
+                    project_root: root.path().display().to_string(),
+                    provider_id: Some(provider_id.into()),
+                },
+                &mut state,
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let wire =
+                serde_json::to_string(&Envelope::response(Uuid::new_v4(), response)).unwrap();
+            assert!(
+                !wire.contains("known/session-key"),
+                "nested credential escaped final daemon projection: {wire}"
+            );
+            assert!(
+                wire.contains("42 requests remain") && wire.contains("ordinary nested quota"),
+                "useful quota lost: {wire}"
+            );
+            let decoded: Envelope = serde_json::from_str(&wire).unwrap();
+            assert!(
+                matches!(decoded.body,Body::Response {response,..} if matches!(*response,Response::ProviderUsageSnapshot {ref snapshots} if snapshots.len()==1))
+            );
+            server.await.unwrap();
+        }
+    }
 }

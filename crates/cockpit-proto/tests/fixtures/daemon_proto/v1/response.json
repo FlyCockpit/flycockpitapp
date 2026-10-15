@@ -260,6 +260,9 @@
   },
   "provider_mutation_committed": {
     "data": {
+      "catalog_readback": {
+        "state": "required"
+      },
       "client_operation_id": "provider-operation-fixture",
       "config": {
         "providers": {}

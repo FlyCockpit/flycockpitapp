@@ -1185,8 +1185,32 @@ fn apply_provider_mutation(
     let mut doc = cockpit_config::providers::ConfigDoc::load(&capability.target)
         .map_err(|error| error.to_string())?;
     let mut desired = doc.providers();
+    let mut paths = cockpit_config::dirs::config_file_paths_for_load(&capability.root);
+    if !paths.contains(&capability.target) {
+        paths.push(capability.target.clone());
+    }
+    let effective = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
+    let upserted_provider_ids = mutation
+        .upserts
+        .iter()
+        .map(|upsert| upsert.provider_id.clone())
+        .collect();
     for upsert in mutation.upserts.drain(..) {
         let mut entry = upsert.entry;
+        if let Some(patch) = upsert.model_patch {
+            if !entry.models.is_empty() {
+                return Err("provider model patch requires empty replacement inventory".into());
+            }
+            let mut models = effective
+                .providers
+                .get(&upsert.provider_id)
+                .ok_or_else(|| "provider model patch has no inventory".to_string())?
+                .models
+                .clone();
+            patch.apply(&mut models)?;
+            entry.models = models;
+        }
+        entry.models_replace = true;
         if upsert.header_secrets.len() != entry.headers.len() {
             return Err("provider header secret count does not match headers".into());
         }
@@ -1265,16 +1289,13 @@ fn apply_provider_mutation(
         );
     }
     Ok(Response::ProviderMutationCommitted {
+        catalog_readback: Default::default(),
         client_operation_id,
         snapshot_session_id,
         layer_id,
         owner_root: capability.owner_root,
         mutation_intent_hash,
-        upserted_provider_ids: mutation
-            .upserts
-            .iter()
-            .map(|upsert| upsert.provider_id.clone())
-            .collect(),
+        upserted_provider_ids,
         consumed_revision: expected_revision,
         result_revision,
         config_generation,

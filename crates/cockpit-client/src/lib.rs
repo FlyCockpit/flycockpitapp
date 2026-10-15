@@ -1402,7 +1402,9 @@ impl DaemonClient {
             .request_one_with_timeout(request, deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await?;
         let Some((project_root, provider_id, snapshot_session_id)) = catalog_request else {
-            return Ok(response);
+            return self
+                .resolve_provider_catalog_readback(response, deadline)
+                .await;
         };
         let mut assembled = String::new();
         let mut expected = None;
@@ -1415,7 +1417,8 @@ impl DaemonClient {
                     json,
                 }) => {
                     anyhow::ensure!(
-                        offset == assembled.len()
+                        total_bytes <= proto::MAX_CONFIG_TRANSFER_BYTES
+                            && offset == assembled.len()
                             && !json.is_empty()
                             && json.len() <= proto::PROVIDER_CATALOG_PAGE_BYTES
                             && offset
@@ -1474,6 +1477,95 @@ impl DaemonClient {
                 }
             }
         }
+    }
+
+    async fn resolve_provider_catalog_readback(
+        &self,
+        mut response: std::result::Result<Response, ErrorPayload>,
+        deadline: tokio::time::Instant,
+    ) -> Result<std::result::Result<Response, ErrorPayload>> {
+        if let Ok(Response::LocalOperationSettlement {
+            response: Some(nested),
+            ..
+        }) = &mut response
+        {
+            let resolved =
+                Box::pin(self.resolve_provider_catalog_readback(Ok((**nested).clone()), deadline))
+                    .await?;
+            match resolved {
+                Ok(value) => **nested = value,
+                Err(error) => return Ok(Err(error)),
+            }
+            return Ok(response);
+        }
+        let Ok(Response::ProviderMutationCommitted {
+            catalog_readback,
+            owner_root,
+            snapshot_session_id: receipt_snapshot_session_id,
+            layer_id,
+            result_revision,
+            config_generation,
+            config,
+            ..
+        }) = &mut response
+        else {
+            return Ok(response);
+        };
+        match catalog_readback {
+            proto::ProviderCatalogReadback::Inline => return Ok(response),
+            proto::ProviderCatalogReadback::Current { .. } => {
+                anyhow::bail!("daemon supplied unverified provider read-back authority")
+            }
+            proto::ProviderCatalogReadback::Required => {}
+        }
+        let nonce = receipt_snapshot_session_id.clone();
+        let loaded = tokio::time::timeout_at(
+            deadline,
+            Box::pin(self.request_with_timeout(
+                Request::GetProviderCatalogSnapshot {
+                    project_root: owner_root.clone(),
+                    provider_id: None,
+                    snapshot_session_id: nonce.clone(),
+                },
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )),
+        )
+        .await
+        .context("provider mutation committed; catalog read-back deadline exceeded")?
+        .context("provider mutation committed; catalog read-back failed")?;
+        let Response::ProviderCatalogSnapshot {
+            config: loaded,
+            snapshot_session_id,
+            layer_id: read_layer,
+            owner_root: read_root,
+            base_revision,
+            config_generation: read_generation,
+        } = loaded.map_err(|error| {
+            anyhow::anyhow!(
+                "provider mutation committed; catalog read-back rejected: {}",
+                error.message
+            )
+        })?
+        else {
+            anyhow::bail!("provider mutation committed; unexpected catalog read-back response")
+        };
+        anyhow::ensure!(
+            snapshot_session_id == nonce
+                && &read_root == owner_root
+                && &read_layer == layer_id
+                && read_generation >= *config_generation
+                && (read_generation > *config_generation || &base_revision == result_revision),
+            "provider mutation committed; catalog read-back authority mismatch"
+        );
+        *config = loaded;
+        *catalog_readback = proto::ProviderCatalogReadback::Current {
+            snapshot_session_id,
+            layer_id: read_layer,
+            owner_root: read_root,
+            base_revision,
+            config_generation: read_generation,
+        };
+        Ok(response)
     }
 
     async fn request_one_with_timeout(
@@ -3986,7 +4078,17 @@ mod catalog_page_tests {
 
     #[tokio::test]
     async fn catalog_pages_reassemble_complete_view_and_fail_closed_on_mixed_or_missing_pages() {
-        for fault in ["none", "digest", "offset", "truncated", "changed"] {
+        for fault in [
+            "none",
+            "digest",
+            "offset",
+            "truncated",
+            "changed",
+            "consistent_digest",
+            "corrupt",
+            "wrong_nonce",
+            "wrong_response",
+        ] {
             let (requests, mut receive) = mpsc::channel::<InProcessRequest>(8);
             let (_events, events) = mpsc::channel(8);
             let client = DaemonClient::from_in_process(InProcessConnection { requests, events });
@@ -4002,9 +4104,17 @@ mod catalog_page_tests {
                 base_revision: "revision".into(),
                 config_generation: 42,
             };
-            let json = serde_json::to_string(&expected).unwrap();
+            let mut json = serde_json::to_string(&expected).unwrap();
             assert!(json.len() > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES);
             let expected_json = json.clone();
+            if fault == "wrong_nonce" {
+                json = json.replace("paged-test", "wrong-test");
+            }
+            if fault == "wrong_response" {
+                let size = json.len();
+                json = serde_json::to_string(&Response::Ack).unwrap();
+                json.push_str(&" ".repeat(size - json.len()));
+            }
             let digest = Sha256::digest(json.as_bytes())
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
@@ -4027,7 +4137,9 @@ mod catalog_page_tests {
                         Response::Ack
                     } else {
                         Response::ProviderCatalogPage {
-                            snapshot_digest: if count > 0 && matches!(fault, "digest" | "changed") {
+                            snapshot_digest: if (count > 0 && matches!(fault, "digest" | "changed"))
+                                || fault == "consistent_digest"
+                            {
                                 "f".repeat(64)
                             } else {
                                 digest.clone()
@@ -4038,7 +4150,11 @@ mod catalog_page_tests {
                                 offset
                             },
                             total_bytes: json.len(),
-                            json: json[offset..end].to_string(),
+                            json: if fault == "corrupt" && count == 0 {
+                                json[offset..end].replace("useful", "xxxxxx")
+                            } else {
+                                json[offset..end].to_string()
+                            },
                         }
                     };
                     assert!(
@@ -4068,9 +4184,296 @@ mod catalog_page_tests {
                     response.is_err(),
                     "mixed/non-contiguous snapshot must not be adopted: {fault}"
                 );
+                let error = response.unwrap_err().to_string();
+                if matches!(fault, "consistent_digest" | "corrupt") {
+                    assert!(error.contains("page digest mismatch"), "{fault}: {error}");
+                }
+                if matches!(fault, "wrong_nonce" | "wrong_response") {
+                    assert!(
+                        error.contains("invalid assembled provider catalog snapshot"),
+                        "{fault}: {error}"
+                    );
+                }
             }
             drop(client);
             server.await.unwrap();
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod provider_mutation_readback_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn provider_mutation_readback_reassembles_direct_and_settlement_catalogs_with_current_authority()
+     {
+        for settlement in [false, true] {
+            for fault in [
+                "none",
+                "newer",
+                "older",
+                "root",
+                "layer",
+                "revision",
+                "response",
+                "read_error",
+                "stalled",
+                "forged",
+            ] {
+                let (requests, mut receive) = mpsc::channel::<InProcessRequest>(8);
+                let (_events, events) = mpsc::channel(8);
+                let client =
+                    DaemonClient::from_in_process(InProcessConnection { requests, events });
+                let server = tokio::spawn(async move {
+                    let mut json = String::new();
+                    let mut digest = String::new();
+                    let mut calls = Vec::new();
+                    let mut held = Vec::new();
+                    while let Some(request) = receive.recv().await {
+                        calls.push(request.request.wire_tag().to_string());
+                        let response = match request.request {
+                            Request::ApplyProviderMutation { .. }
+                            | Request::GetLocalOperationSettlement { .. } => {
+                                let receipt = Response::ProviderMutationCommitted {
+                                    catalog_readback: if fault == "forged" {
+                                        proto::ProviderCatalogReadback::Current {
+                                            snapshot_session_id: "original".into(),
+                                            layer_id: "layer".into(),
+                                            owner_root: "/project".into(),
+                                            base_revision: "a".repeat(64),
+                                            config_generation: 10,
+                                        }
+                                    } else {
+                                        proto::ProviderCatalogReadback::Required
+                                    },
+                                    client_operation_id: "operation".into(),
+                                    snapshot_session_id: "original".into(),
+                                    layer_id: "layer".into(),
+                                    owner_root: "/project".into(),
+                                    mutation_intent_hash: "1".repeat(64),
+                                    upserted_provider_ids: vec!["p".into()],
+                                    consumed_revision: "0".repeat(64),
+                                    result_revision: "a".repeat(64),
+                                    config_generation: 10,
+                                    config: Default::default(),
+                                    status: proto::ConfigCommitStatus::Committed,
+                                    publication: proto::ConfigPublicationStatus::Published,
+                                };
+                                Ok(if settlement {
+                                    Response::LocalOperationSettlement {
+                                        client_operation_id: "operation".into(),
+                                        operation_kind: "apply_provider_mutation".into(),
+                                        request_hash: "1".repeat(64),
+                                        pending: false,
+                                        response: Some(Box::new(receipt)),
+                                        terminal_error: None,
+                                        terminal_cancelled: false,
+                                    }
+                                } else {
+                                    receipt
+                                })
+                            }
+                            Request::GetProviderCatalogSnapshot {
+                                snapshot_session_id,
+                                ..
+                            } => {
+                                if fault == "stalled" {
+                                    held.push(request.reply);
+                                    continue;
+                                }
+                                if fault == "response" {
+                                    Ok(Response::Ack)
+                                } else if fault == "read_error" {
+                                    Err(ErrorPayload {
+                                        code: proto::ErrorCode::Internal,
+                                        message: "read-back rejected".into(),
+                                    })
+                                } else {
+                                    let snapshot = Response::ProviderCatalogSnapshot {
+                                        config: proto::ProviderConfigView {
+                                            configuration_warnings: vec![
+                                                "useful quota 模型".repeat(50_000),
+                                            ],
+                                            ..Default::default()
+                                        },
+                                        snapshot_session_id,
+                                        layer_id: if fault == "layer" { "other" } else { "layer" }
+                                            .into(),
+                                        owner_root: if fault == "root" {
+                                            "/other"
+                                        } else {
+                                            "/project"
+                                        }
+                                        .into(),
+                                        base_revision: if matches!(fault, "revision" | "newer") {
+                                            "b"
+                                        } else {
+                                            "a"
+                                        }
+                                        .repeat(64),
+                                        config_generation: match fault {
+                                            "newer" => 11,
+                                            "older" => 9,
+                                            _ => 10,
+                                        },
+                                    };
+                                    json = serde_json::to_string(&snapshot).unwrap();
+                                    assert!(json.len() > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES);
+                                    digest = Sha256::digest(json.as_bytes())
+                                        .iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect();
+                                    Ok(page(&json, &digest, 0))
+                                }
+                            }
+                            Request::GetProviderCatalogPage { offset, .. } => {
+                                Ok(page(&json, &digest, offset.try_into().unwrap()))
+                            }
+                            other => panic!("unexpected request {other:?}"),
+                        };
+                        if request.reply.send(response).is_err() {
+                            break;
+                        }
+                    }
+                    calls
+                });
+                let request = if settlement {
+                    Request::GetLocalOperationSettlement {
+                        client_operation_id: "operation".into(),
+                    }
+                } else {
+                    let mut entry = proto::ProviderEntryView {
+                        entry: Default::default(),
+                        headers: Vec::new(),
+                        credential_configured: false,
+                    }
+                    .editable_entry();
+                    entry.url = "https://example.test/v1".into();
+                    let mutation = proto::ProviderMutationBatch {
+                        upserts: vec![proto::ProviderMutationUpsert {
+                            provider_id: "p".into(),
+                            entry,
+                            header_secrets: Vec::new(),
+                            model_patch: None,
+                        }],
+                        deletes: Vec::new(),
+                        metadata: None,
+                    };
+                    Request::ApplyProviderMutation {
+                        snapshot_session_id: "original".into(),
+                        layer_id: "layer".into(),
+                        expected_revision: "0".repeat(64),
+                        client_operation_id: "operation".into(),
+                        mutation_intent_hash: mutation.sanitized_intent_hash().unwrap(),
+                        mutation,
+                    }
+                };
+                let result = if fault == "stalled" {
+                    client
+                        .request_with_timeout(request, Duration::from_millis(100))
+                        .await
+                        .and_then(|r| r.map_err(|e| anyhow::anyhow!(e.message)))
+                } else {
+                    client.request_ok(request).await
+                };
+                if matches!(fault, "none" | "newer") {
+                    let mut response = result.unwrap();
+                    if let Response::LocalOperationSettlement {
+                        response: Some(nested),
+                        ..
+                    } = response
+                    {
+                        response = *nested;
+                    }
+                    let Response::ProviderMutationCommitted {
+                        catalog_readback,
+                        config,
+                        result_revision,
+                        config_generation,
+                        ..
+                    } = response
+                    else {
+                        panic!("receipt")
+                    };
+                    assert_eq!(config_generation, 10, "commit generation remains truthful");
+                    assert_eq!(result_revision, "a".repeat(64));
+                    assert_eq!(
+                        config.configuration_warnings,
+                        vec!["useful quota 模型".repeat(50_000)]
+                    );
+                    let proto::ProviderCatalogReadback::Current {
+                        snapshot_session_id,
+                        base_revision,
+                        config_generation,
+                        ..
+                    } = catalog_readback
+                    else {
+                        panic!("verified current authority")
+                    };
+                    assert_eq!(
+                        snapshot_session_id, "original",
+                        "layer capability stays bound to its snapshot nonce"
+                    );
+                    assert_eq!(config_generation, if fault == "newer" { 11 } else { 10 });
+                    assert_eq!(
+                        base_revision,
+                        if fault == "newer" { "b" } else { "a" }.repeat(64)
+                    );
+                } else {
+                    let error = format!("{:#}", result.unwrap_err());
+                    if fault == "forged" {
+                        assert!(error.contains("unverified"), "{error}");
+                    } else {
+                        assert!(
+                            error.contains("committed")
+                                && (error.contains("authority mismatch")
+                                    || error.contains("read-back")),
+                            "{fault}: {error}"
+                        );
+                    }
+                    if fault == "stalled" {
+                        assert!(
+                            error.contains("deadline") || error.contains("timed out"),
+                            "pending read-back must hit its owned deadline: {error}"
+                        );
+                    }
+                }
+                drop(client);
+                let calls = server.await.unwrap();
+                if fault == "forged" {
+                    assert_eq!(
+                        calls.len(),
+                        1,
+                        "unverified server authority is rejected before a follow-up"
+                    );
+                } else {
+                    assert_eq!(calls[1], "get_provider_catalog_snapshot");
+                }
+                if matches!(fault, "none" | "newer") {
+                    assert!(
+                        calls
+                            .iter()
+                            .filter(|s| s.as_str() == "get_provider_catalog_page")
+                            .count()
+                            > 1
+                    );
+                }
+            }
+        }
+    }
+
+    fn page(json: &str, digest: &str, offset: usize) -> Response {
+        let mut end = (offset + proto::PROVIDER_CATALOG_PAGE_BYTES).min(json.len());
+        while !json.is_char_boundary(end) {
+            end -= 1;
+        }
+        Response::ProviderCatalogPage {
+            snapshot_digest: digest.into(),
+            offset,
+            total_bytes: json.len(),
+            json: json[offset..end].into(),
         }
     }
 }

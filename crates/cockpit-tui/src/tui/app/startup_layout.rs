@@ -2358,6 +2358,7 @@ impl App {
                 );
                 let mutation = ProviderMutationBatch {
                     upserts: vec![ProviderMutationUpsert {
+                        model_patch: None,
                         provider_id: provider_id.clone(),
                         entry,
                         header_secrets,

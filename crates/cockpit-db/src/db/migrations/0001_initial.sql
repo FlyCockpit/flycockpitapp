@@ -7690,7 +7690,7 @@ CREATE TABLE provider_config_journals (
     entry_json       TEXT CHECK (
         entry_json IS NULL OR (
             json_valid(entry_json)
-            AND length(CAST(entry_json AS BLOB)) <= 1048576
+            AND length(CAST(entry_json AS BLOB)) <= 33554432
         )
     ),
     cleanup_named_json TEXT NOT NULL
@@ -7723,7 +7723,7 @@ CREATE TABLE provider_config_journals (
         OR (action = 'batch' AND provider_id = '__provider_batch__'
             AND entry_json IS NOT NULL AND json_valid(entry_json)
             AND json_type(entry_json) = 'object'
-            AND length(CAST(entry_json AS BLOB)) <= 1048576)
+            AND length(CAST(entry_json AS BLOB)) <= 33554432)
     ),
     CHECK (config_path IS NOT NULL
        AND consumed_revision IS NOT NULL

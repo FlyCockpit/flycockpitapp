@@ -7,7 +7,7 @@
 //! Layout:
 //!
 //! ```text
-//! { "v": 10, "kind": "req"|"res"|"evt"|"err", ... }
+//! { "v": 1, "kind": "req"|"res"|"evt"|"err", ... }
 //! ```
 //!
 //! - **`req`** — client → daemon. Carries a uuid `id` the daemon
@@ -22,14 +22,18 @@
 //!
 //! The schema version (`v`) sits on every envelope so a future bump
 //! can be detected on a per-line basis without buffering. Clients
-//! refuse envelopes whose `v` is outside the supported range.
+//! require an exact `v` match. Large config publications use bounded
+//! `config_chunk` transport frames, reassembled with a size cap, digest and
+//! deadline before a complete envelope is delivered.
 
 pub mod acp;
 pub mod agent_authoring;
 pub mod agent_installation;
 pub mod agent_management;
 pub mod capability_ceiling;
+mod config_frames;
 pub mod config_management;
+pub use config_frames::MAX_CONFIG_TRANSFER_BYTES;
 #[cfg(feature = "remote")]
 pub mod es256;
 pub use acp::{
@@ -123,8 +127,8 @@ pub use onboarding::{
     encode_sensitive_onboarding_intent, encode_sensitive_onboarding_response,
 };
 pub use provider_management::{
-    ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
-    ProviderMutationUpsert, ProviderSecretValue,
+    ProviderCatalogReadback, ProviderLayerMetadataPatch, ProviderModelPatch, ProviderMutationBatch,
+    ProviderMutationDelete, ProviderMutationUpsert, ProviderSecretValue,
 };
 pub mod session_setup;
 pub use session_setup::{
@@ -527,8 +531,8 @@ pub struct ProviderEntryView {
 pub const PRESERVED_PROVIDER_HEADER_VALUE: &str = "********";
 
 impl ProviderEntryView {
-    /// Exact entry representation submitted by catalog-backed settings editors.
-    /// Sharing it with producer budgeting keeps the read/edit/save caps aligned.
+    /// Complete editable view with daemon-owned header values preserved.
+    /// Catalog-backed settings derive bounded model deltas from this view.
     pub fn editable_entry(&self) -> cockpit_config::providers::ProviderEntry {
         let mut entry = self.entry.clone();
         entry.headers = self
@@ -1572,7 +1576,8 @@ pub const MAX_OWNER_PROVIDER_URL_BYTES: usize = 8 * 1024;
 pub const MAX_OWNER_PROVIDER_MODEL_ID_BYTES: usize = 1024;
 pub const MAX_OWNER_PROJECT_ROOT_BYTES: usize = 16 * 1024;
 pub const MAX_OWNER_ORG_ID_BYTES: usize = 256;
-/// Maximum canonical JSON size accepted for one provider configuration entry.
+/// Maximum canonical JSON size for one provider edit: a full replacement,
+/// or entry metadata together with its revision-bound model delta.
 pub const MAX_OWNER_PROVIDER_ENTRY_BYTES: usize = 256 * 1024;
 /// Maximum canonical JSON size accepted for one MCP config patch, secret
 /// envelope, or agent-scope MCP server payload. Kept below the 512 KiB
@@ -4267,11 +4272,7 @@ where
         let mut env = env.clone();
         env.v = PROTOCOL_VERSION;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
-        self.framed
-            .send(line)
-            .await
-            .map_err(codec_error)
-            .context("writing envelope")?;
+        config_frames::send(&mut self.framed, &env, line).await?;
         Ok(())
     }
 
@@ -4324,11 +4325,7 @@ where
         let mut env = env.clone();
         env.v = PROTOCOL_VERSION;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
-        self.framed
-            .send(line)
-            .await
-            .map_err(codec_error)
-            .context("writing envelope")?;
+        config_frames::send(&mut self.framed, &env, line).await?;
         Ok(())
     }
 
@@ -4360,8 +4357,7 @@ where
     match recv_raw_line(framed).await? {
         None => Ok(None),
         Some(line) => {
-            let value: serde_json::Value =
-                serde_json::from_str(&line).context("deserializing envelope")?;
+            let (value, chunked) = config_frames::receive(framed, line).await?;
             let v = value
                 .get("v")
                 .and_then(serde_json::Value::as_u64)
@@ -4393,6 +4389,10 @@ where
                 return Ok(Some(RecvFrame::Unknown { v, kind, tag, id }));
             }
             let env: Envelope = serde_json::from_value(value).context("deserializing envelope")?;
+            anyhow::ensure!(
+                !chunked || config_frames::eligible(&env),
+                "chunked envelope is not a configuration publication"
+            );
             if envelope_contains_unknown(&env) {
                 return Ok(Some(RecvFrame::Unknown { v, kind, tag, id }));
             }

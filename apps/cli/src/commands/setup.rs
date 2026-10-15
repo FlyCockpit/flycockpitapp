@@ -739,6 +739,7 @@ async fn apply_model_wizard_via_daemon(
     let mutation = cockpit_proto::ProviderMutationBatch {
         upserts: model_changed
             .then(|| cockpit_proto::ProviderMutationUpsert {
+                model_patch: None,
                 provider_id: provider_id.clone(),
                 header_secrets: vec![None; entry.headers.len()],
                 entry,
@@ -1049,6 +1050,7 @@ impl ProviderSetupActions {
         let expected_entry = entry.clone();
         let mutation = cockpit_proto::ProviderMutationBatch {
             upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                model_patch: None,
                 provider_id: id.clone(),
                 entry,
                 header_secrets,

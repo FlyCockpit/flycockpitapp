@@ -70,6 +70,7 @@ async fn provider_settlement_sequence(scenario: Scenario) {
     let catalog = take_onboarding_catalog(&ctx, &mut state, &workspace, "provider-verify").await;
     let mutation = proto::ProviderMutationBatch {
         upserts: vec![proto::ProviderMutationUpsert {
+            model_patch: None,
             provider_id: "onboard".into(),
             entry: crate::config::providers::ProviderEntry {
                 template: Some("openai-compatible".into()),

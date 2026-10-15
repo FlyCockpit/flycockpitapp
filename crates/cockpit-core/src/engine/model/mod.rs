@@ -585,6 +585,9 @@ pub enum Model {
         /// applied. Backup and utility model construction uses this table so
         /// each target `(provider, model)` resolves its own trust setting.
         session_redact: Arc<RedactionTable>,
+        /// Actual credentials owned by this retained HTTP client, independent
+        /// of replaceable session-source discovery coverage.
+        client_credentials: Arc<RedactionTable>,
         /// The effective outbound-provider redaction table. For trusted
         /// model rows (`trust: "trusted"`), this is an empty table, so stored
         /// debug/request payloads are exact-as-sent and may contain secrets.
@@ -627,6 +630,9 @@ pub enum Model {
         gate: crate::daemon::shutdown::ShutdownSignal,
         /// Same session redaction table as [`Model::OpenAi`].
         session_redact: Arc<RedactionTable>,
+        /// Actual credentials owned by this retained HTTP client, independent
+        /// of replaceable session-source discovery coverage.
+        client_credentials: Arc<RedactionTable>,
         /// Same effective outbound-provider redaction table as [`Model::OpenAi`].
         redact: Arc<RedactionTable>,
     },
@@ -677,6 +683,9 @@ pub enum Model {
         gate: crate::daemon::shutdown::ShutdownSignal,
         /// Same session redaction table as [`Model::OpenAi`].
         session_redact: Arc<RedactionTable>,
+        /// Actual credentials owned by this retained HTTP client, independent
+        /// of replaceable session-source discovery coverage.
+        client_credentials: Arc<RedactionTable>,
         /// Same effective outbound-provider redaction table as [`Model::OpenAi`].
         redact: Arc<RedactionTable>,
     },
@@ -974,13 +983,25 @@ impl Model {
     /// Replace the redaction table carried by this model. The
     /// driver calls this at idle turn boundaries so the next provider request
     /// uses the freshly rebuilt table while any in-flight request keeps the
-    /// table it started with. This legacy setter installs the same table as
-    /// both the session and effective table.
+    /// table it started with. Actual credentials stay covered for as long as
+    /// this client can send them. Construction failure leaves the model intact.
     pub fn set_redact_table_for_config(
         &mut self,
         providers: &ProvidersConfig,
         table: Arc<RedactionTable>,
-    ) {
+    ) -> anyhow::Result<()> {
+        let credentials = match self {
+            Model::OpenAi {
+                client_credentials, ..
+            }
+            | Model::ChatGpt {
+                client_credentials, ..
+            }
+            | Model::Anthropic {
+                client_credentials, ..
+            } => client_credentials,
+        };
+        let table = Arc::new(table.union(credentials)?);
         let effective = Self::effective_redact_table_for_configured(
             providers,
             self.provider_id(),
@@ -1007,6 +1028,7 @@ impl Model {
                 *redact = effective;
             }
         }
+        Ok(())
     }
 
     /// The configured provider id this model was built from (a key in the

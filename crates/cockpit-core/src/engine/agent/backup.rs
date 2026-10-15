@@ -3036,6 +3036,145 @@ mod backup_fallback_tests {
     }
 
     #[tokio::test]
+    async fn retained_client_after_table_replacement_scrubs_both_terminal_emitters() {
+        use cockpit_test_support::provider::{ScriptedProvider, Turn};
+        for wrapper in [false, true] {
+            let provider = ScriptedProvider::builder().turn(Turn::HttpError {
+                status: 400,
+                body: serde_json::json!({"error":{"message":"useful nonsecret diagnostic old/+key fresh/+key", "code":"invalid_request_error"}}).to_string(),
+            }).start().await;
+            let db = crate::db::Db::open_in_memory().unwrap();
+            let root = tempfile::tempdir().unwrap().keep();
+            let session = Arc::new(
+                Session::create_for_test(
+                    db.clone(),
+                    root,
+                    "Build",
+                    crate::session::test_redaction_key_resolver(),
+                )
+                .unwrap(),
+            );
+            session.install_test_external_journal();
+            let mut cfg = ProvidersConfig::default();
+            cfg.providers.insert(
+                "cloud".into(),
+                ProviderEntry {
+                    url: provider.base_url(),
+                    headers: vec![crate::config::providers::HeaderSpec {
+                        name: "x-api-key".into(),
+                        value: "$RETAINED_TEST_KEY".into(),
+                    }],
+                    models: vec![ModelEntry {
+                        id: "m".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let table = Arc::new(RedactionTable::empty());
+            let store = crate::credentials::CredentialStore::from_vault(
+                crate::secure_key::vault_for_db(&db).unwrap(),
+            )
+            .unwrap();
+            let mut primary = Model::for_provider_with_store(
+                &cfg,
+                "cloud",
+                "m",
+                table.clone(),
+                |_: &str| Some("old/+key".into()),
+                store,
+            )
+            .unwrap();
+            let discovered = Arc::new(
+                table
+                    .with_forced_literal("fresh/+key".into(), "new discovery".into())
+                    .unwrap(),
+            );
+            primary
+                .set_redact_table_for_config(&cfg, discovered)
+                .unwrap();
+            let agent = agent_with(Arc::new(primary));
+            let locks = Arc::new(crate::locks::LockManager::in_memory(
+                crate::db::Db::open_in_memory().unwrap(),
+            ));
+            let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+            let call_id = Uuid::new_v4();
+            let cwd = session.project_root.clone();
+            let outcome = turn_with_backup(
+                &agent,
+                wrapper.then_some(&agent.model),
+                &[],
+                &mut Vec::new(),
+                Message::user("hello"),
+                session.clone(),
+                locks,
+                table.clone(),
+                cwd,
+                crate::daemon::session_worker::SessionConfigHandle::detached(
+                    crate::daemon::session_worker::SessionConfigSnapshot::new(
+                        0,
+                        cfg.clone(),
+                        crate::config::extended::ExtendedConfig::default(),
+                    ),
+                ),
+                Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+                None,
+                None,
+                crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+                false,
+                crate::skills::manage::SkillWriteOrigin::Foreground,
+                None,
+                crate::engine::tool::ContextUsageSnapshot::unavailable(),
+                crate::engine::deferred::DeferredLog::new(),
+                call_id,
+                None,
+                None,
+                None,
+                &tx,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(crate::engine::model::as_inference_failure(&outcome).is_some());
+            assert_eq!(
+                provider.request_count(),
+                1,
+                "retained client, no rebuild or second probe"
+            );
+            let captured = provider.captured();
+            assert!(
+                captured[0]
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("x-api-key")
+                        && value == "old/+key")
+            );
+            let events = drain(&mut rx);
+            let details = events
+                .iter()
+                .filter_map(|event| match event {
+                    TurnEvent::InferenceFailed { detail, .. } => Some(detail),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(details.len(), 1);
+            assert!(
+                !details[0].contains("old/+"),
+                "retained credential leaked: {}",
+                details[0]
+            );
+            assert!(
+                !details[0].contains("fresh/+"),
+                "new discovery lost: {}",
+                details[0]
+            );
+            assert!(details[0].contains("useful nonsecret diagnostic"));
+        }
+    }
+
+    #[tokio::test]
     async fn rotated_terminal_error_uses_attempt_credentials_in_both_emitters() {
         use cockpit_test_support::provider::{CapturedRequest, ScriptedProvider, Turn, Usage};
 

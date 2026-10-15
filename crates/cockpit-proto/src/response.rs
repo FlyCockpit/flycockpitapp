@@ -711,6 +711,11 @@ pub enum Response {
         result_revision: String,
         config_generation: u64,
         config: ProviderConfigView,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::ProviderCatalogReadback::is_inline"
+        )]
+        catalog_readback: crate::ProviderCatalogReadback,
         status: crate::ConfigCommitStatus,
         publication: crate::ConfigPublicationStatus,
     },

@@ -105,7 +105,12 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "usage_probe",
     "model_field_patches",
     "model_order",
+    "model_membership",
 ];
+
+/// Canonical JSON budget for one authored provider layer, shared by raw
+/// writers and daemon edit ingress. Composition does not consume this budget.
+pub const MAX_AUTHORED_PROVIDER_ENTRY_BYTES: usize = 256 * 1024;
 
 const MODEL_WIZARD_MODEL_FIELD_KEYS: &[&str] = &[
     "trust",
@@ -697,6 +702,11 @@ pub struct ProviderEntry {
         deserialize_with = "deserialize_model_order"
     )]
     pub model_order: Option<Vec<String>>,
+
+    /// Sparse membership intent for large composed catalogs. Tombstones prevent
+    /// inherited deletions from returning; placements never copy inherited rows.
+    #[serde(default, skip_serializing_if = "ModelMembershipPatch::is_empty")]
+    pub model_membership: ModelMembershipPatch,
 
     /// Cached model list. Populated by `/fetch-models` (or the wizard).
     #[serde(default)]
@@ -1363,6 +1373,131 @@ pub struct ModelEntryFieldPatch {
     pub set: BTreeMap<String, Value>,
     #[serde(deserialize_with = "deserialize_model_field_remove")]
     pub remove: Vec<String>,
+}
+
+/// Move an existing row after an ID, or to the beginning when `after` is absent.
+/// Missing rows in a later lower-layer refresh are never recreated by a move.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelPlacement {
+    pub id: String,
+    pub after: Option<String>,
+}
+
+impl ModelPlacement {
+    pub fn apply(&self, order: &mut Vec<String>, strict: bool) -> Result<()> {
+        anyhow::ensure!(
+            self.after.as_ref() != Some(&self.id),
+            "model order placement refers to itself"
+        );
+        let Some(index) = order.iter().position(|id| id == &self.id) else {
+            anyhow::ensure!(!strict, "model order placement has no existing row");
+            return Ok(());
+        };
+        let destination = match &self.after {
+            None => 0,
+            Some(anchor) => match order.iter().position(|id| id == anchor) {
+                Some(anchor_index) => anchor_index + usize::from(anchor_index < index),
+                None => {
+                    anyhow::ensure!(!strict, "model order placement has no existing anchor");
+                    order.len() - 1
+                }
+            },
+        };
+        let id = order.remove(index);
+        order.insert(destination, id);
+        Ok(())
+    }
+
+    /// Minimal moves relative to the surviving rows followed by appended new
+    /// rows. An increasing subsequence stays in place, avoiding O(catalog size)
+    /// operations when one row moves from the beginning to the end.
+    pub fn between(before: &[String], after: &[String]) -> Vec<Self> {
+        let positions = before
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect::<BTreeMap<_, _>>();
+        let mut tails: Vec<usize> = Vec::new();
+        let mut previous = vec![None; after.len()];
+        for (i, id) in after.iter().enumerate() {
+            let position = positions[id];
+            let slot = tails.partition_point(|prior| positions[&after[*prior]] < position);
+            if slot > 0 {
+                previous[i] = Some(tails[slot - 1]);
+            }
+            if slot == tails.len() {
+                tails.push(i);
+            } else {
+                tails[slot] = i;
+            }
+        }
+        let mut stable = std::collections::BTreeSet::new();
+        let mut cursor = tails.last().copied();
+        while let Some(index) = cursor {
+            stable.insert(index);
+            cursor = previous[index];
+        }
+        after
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !stable.contains(i))
+            .map(|(i, id)| Self {
+                id: id.clone(),
+                after: i.checked_sub(1).map(|prior| after[prior].clone()),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(try_from = "RawModelMembershipPatch")]
+pub struct ModelMembershipPatch {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deletes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placements: Vec<ModelPlacement>,
+}
+
+#[derive(Deserialize)]
+struct RawModelMembershipPatch {
+    #[serde(default)]
+    deletes: Vec<String>,
+    #[serde(default)]
+    placements: Vec<ModelPlacement>,
+}
+
+impl TryFrom<RawModelMembershipPatch> for ModelMembershipPatch {
+    type Error = &'static str;
+    fn try_from(raw: RawModelMembershipPatch) -> std::result::Result<Self, Self::Error> {
+        let deletes = raw
+            .deletes
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let placements = raw
+            .placements
+            .iter()
+            .map(|p| &p.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if deletes.len() != raw.deletes.len()
+            || placements.len() != raw.placements.len()
+            || raw
+                .placements
+                .iter()
+                .any(|p| deletes.contains(&p.id) || p.after.as_ref() == Some(&p.id))
+        {
+            return Err("invalid model membership operations");
+        }
+        Ok(Self {
+            deletes: raw.deletes,
+            placements: raw.placements,
+        })
+    }
+}
+
+impl ModelMembershipPatch {
+    pub fn is_empty(&self) -> bool {
+        self.deletes.is_empty() && self.placements.is_empty()
+    }
 }
 
 fn deserialize_model_order<'de, D: serde::Deserializer<'de>>(

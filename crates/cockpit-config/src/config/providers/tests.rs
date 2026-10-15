@@ -1093,6 +1093,7 @@ fn round_trips_a_provider_entry() {
             models_replace: false,
             model_field_patches: Vec::new(),
             model_order: None,
+            model_membership: Default::default(),
             last_model_fetch: None,
         },
     );

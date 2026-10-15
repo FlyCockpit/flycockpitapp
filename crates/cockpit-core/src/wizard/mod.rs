@@ -2108,6 +2108,7 @@ pub fn provider_entry_for_template_with_wire_api(
         models_replace: false,
         model_field_patches: Vec::new(),
         model_order: None,
+        model_membership: Default::default(),
         models: vec![],
         capabilities: Default::default(),
         provider_metadata: Default::default(),

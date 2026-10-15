@@ -23838,6 +23838,7 @@ async fn stage_and_recover_provider_batch(
             upsert.entry.models_replace = authored.models_replace;
             upsert.entry.model_field_patches = authored.model_field_patches;
             upsert.entry.model_order = authored.model_order;
+            upsert.entry.model_membership = authored.model_membership;
         }
         // Secret resolution validates a header against the complete provider
         // projection. Keep that projection separate from the mutable headers
@@ -23931,6 +23932,7 @@ async fn stage_and_recover_provider_batch(
             upsert.entry.models_replace = true;
             upsert.entry.model_field_patches.clear();
             upsert.entry.model_order = None;
+            upsert.entry.model_membership = Default::default();
         }
         desired.providers.insert(upsert.provider_id, upsert.entry);
     }

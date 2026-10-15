@@ -1578,7 +1578,8 @@ pub const MAX_OWNER_PROJECT_ROOT_BYTES: usize = 16 * 1024;
 pub const MAX_OWNER_ORG_ID_BYTES: usize = 256;
 /// Maximum canonical JSON size for one provider edit: a full replacement,
 /// or entry metadata together with its revision-bound model delta.
-pub const MAX_OWNER_PROVIDER_ENTRY_BYTES: usize = 256 * 1024;
+pub const MAX_OWNER_PROVIDER_ENTRY_BYTES: usize =
+    cockpit_config::config::providers::MAX_AUTHORED_PROVIDER_ENTRY_BYTES;
 /// Maximum canonical JSON size accepted for one MCP config patch, secret
 /// envelope, or agent-scope MCP server payload. Kept below the 512 KiB
 /// remote interactive-lane cap, including JSON envelope overhead.

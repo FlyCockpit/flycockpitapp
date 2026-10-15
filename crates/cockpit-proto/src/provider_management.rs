@@ -95,6 +95,12 @@ pub struct ProviderModelPatch {
     /// do not pay to resend their complete id sequence on a favorite/header edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Vec<String>>,
+    /// Sparse alternative to full order for large composed catalogs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moves: Vec<cockpit_config::config::providers::ModelPlacement>,
+    /// Empty membership is constant size even when the base has long IDs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear: bool,
 }
 
 impl ProviderModelPatch {
@@ -136,17 +142,44 @@ impl ProviderModelPatch {
             .iter()
             .map(|model| model.id.clone())
             .collect::<Vec<_>>();
-        let order = (before_order != after_order).then_some(after_order);
-        Ok(Self {
-            order,
-            base_digest: Self::digest(before)?,
-            upserts,
-            updates,
-            deletes: before
+        let changed = before_order != after_order;
+        let clear = changed && after.is_empty();
+        let deletes = if clear {
+            Vec::new()
+        } else {
+            before
                 .iter()
                 .filter(|prior| !next_ids.contains(prior.id.as_str()))
                 .map(|model| model.id.clone())
-                .collect(),
+                .collect::<Vec<_>>()
+        };
+        // Select centrally for settings, CLI, and every other producer. Never
+        // make a small edit pay for an unchanged ID sequence when operations
+        // are cheaper. Complete small orders retain exact membership semantics.
+        let mut baseline = before_order;
+        baseline.retain(|id| !deletes.contains(id));
+        baseline.extend(upserts.iter().map(|row| row.id.clone()));
+        let mut moves = if changed && !clear {
+            cockpit_config::config::providers::ModelPlacement::between(&baseline, &after_order)
+        } else {
+            Vec::new()
+        };
+        let order_bytes = serde_json::to_vec(&after_order)?.len();
+        let order = (changed
+            && (clear
+                || (order_bytes <= 16 * 1024 && order_bytes <= serde_json::to_vec(&moves)?.len())))
+        .then_some(after_order);
+        if order.is_some() {
+            moves.clear();
+        }
+        Ok(Self {
+            order,
+            moves,
+            clear,
+            base_digest: Self::digest(before)?,
+            upserts,
+            updates,
+            deletes,
         })
     }
 
@@ -202,8 +235,51 @@ impl ProviderModelPatch {
                 layer.model_field_patches.push(update.clone());
             }
         }
-        if let Some(order) = &self.order {
-            layer.model_order = Some(order.clone());
+        if self.clear {
+            layer.models.clear();
+            layer.model_field_patches.clear();
+            layer.models_replace = true;
+        }
+        if self.order.is_some()
+            || (layer.model_order.is_some()
+                && (!self.deletes.is_empty() || !self.upserts.is_empty() || !self.moves.is_empty()))
+        {
+            layer.model_order = Some(after.iter().map(|row| row.id.clone()).collect());
+            layer.model_membership = Default::default();
+        } else if !self.deletes.is_empty() || !self.upserts.is_empty() || !self.moves.is_empty() {
+            let next_ids = after
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let moved = layer
+                .model_membership
+                .placements
+                .iter()
+                .map(|p| p.id.as_str())
+                .chain(self.moves.iter().map(|p| p.id.as_str()))
+                .chain(self.upserts.iter().map(|row| row.id.as_str()))
+                .collect::<std::collections::BTreeSet<_>>();
+            let placements = after
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| moved.contains(row.id.as_str()))
+                .map(
+                    |(i, row)| cockpit_config::config::providers::ModelPlacement {
+                        id: row.id.clone(),
+                        after: i.checked_sub(1).map(|prior| after[prior].id.clone()),
+                    },
+                )
+                .collect();
+            let deletes = layer
+                .model_membership
+                .deletes
+                .iter()
+                .chain(&self.deletes)
+                .filter(|id| !next_ids.contains(id.as_str()))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            layer.model_membership.deletes = deletes.into_iter().collect();
+            layer.model_membership.placements = placements;
         }
         Ok(())
     }
@@ -224,6 +300,15 @@ impl ProviderModelPatch {
         if Self::digest(models).map_err(|error| error.to_string())? != self.base_digest {
             return Err("provider model inventory changed; reload before saving".into());
         }
+        if models
+            .iter()
+            .map(|row| &row.id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != models.len()
+        {
+            return Err("provider model inventory contains duplicate ids".into());
+        }
         let mut ids = std::collections::BTreeSet::new();
         for id in self
             .deletes
@@ -236,7 +321,34 @@ impl ProviderModelPatch {
                 return Err("provider model patch contains duplicate ids".into());
             }
         }
-        let mut updated_models = models.clone();
+        if self.order.is_some() && !self.moves.is_empty() {
+            return Err("provider model patch contains conflicting order operations".into());
+        }
+        if self.clear
+            && (!self.deletes.is_empty()
+                || !self.upserts.is_empty()
+                || !self.updates.is_empty()
+                || !self.moves.is_empty()
+                || self.order.as_ref().is_some_and(|order| !order.is_empty()))
+        {
+            return Err("provider model clear contains other operations".into());
+        }
+        let mut moved = std::collections::BTreeSet::new();
+        if self.moves.iter().any(|p| !moved.insert(&p.id)) {
+            return Err("provider model patch contains duplicate order placements".into());
+        }
+        if self
+            .deletes
+            .iter()
+            .any(|id| !models.iter().any(|row| &row.id == id))
+        {
+            return Err("provider model delete has no existing row".into());
+        }
+        let mut updated_models = if self.clear {
+            Vec::new()
+        } else {
+            models.clone()
+        };
         for update in &self.updates {
             let model = updated_models
                 .iter_mut()
@@ -249,7 +361,7 @@ impl ProviderModelPatch {
             *model = serde_json::from_value(value).map_err(|error| error.to_string())?;
         }
         if let Some(order) = &self.order {
-            let expected = models
+            let expected = updated_models
                 .iter()
                 .filter(|model| !self.deletes.contains(&model.id))
                 .map(|model| model.id.as_str())
@@ -265,18 +377,27 @@ impl ProviderModelPatch {
                 );
             }
         }
-        *models = updated_models;
-        models.retain(|model| !self.deletes.contains(&model.id));
+        updated_models.retain(|model| !self.deletes.contains(&model.id));
         for model in &self.upserts {
-            if let Some(prior) = models.iter_mut().find(|prior| prior.id == model.id) {
+            if let Some(prior) = updated_models.iter_mut().find(|prior| prior.id == model.id) {
                 *prior = model.clone();
             } else {
-                models.push(model.clone());
+                updated_models.push(model.clone());
             }
         }
+        let mut moved_order = updated_models
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        for placement in &self.moves {
+            placement
+                .apply(&mut moved_order, true)
+                .map_err(|error| error.to_string())?;
+        }
+        let order = self.order.as_ref().unwrap_or(&moved_order);
         // Restore the requested order only after validating all membership.
-        if let Some(order) = &self.order {
-            let mut entries = std::mem::take(models)
+        {
+            let mut entries = updated_models
                 .into_iter()
                 .map(|model| (model.id.clone(), model))
                 .collect::<BTreeMap<_, _>>();
@@ -534,6 +655,8 @@ mod model_patch_tests {
             ],
             deletes: Vec::new(),
             order: None,
+            moves: Vec::new(),
+            clear: false,
         };
         patch.apply_to_layer(&before, &mut layer).unwrap();
         assert!(
@@ -558,6 +681,8 @@ mod model_patch_tests {
             ],
             deletes: Vec::new(),
             order: None,
+            moves: Vec::new(),
+            clear: false,
         };
         patch.apply_to_layer(&after, &mut layer).unwrap();
         assert!(
@@ -797,6 +922,165 @@ mod model_patch_tests {
             serde_json::to_value(&actual).unwrap(),
             serde_json::to_value(&before).unwrap()
         );
+    }
+    #[test]
+    fn model_patch_sparse_membership_permutations_and_repeated_edits_preserve_all_rows() {
+        use cockpit_config::config::{
+            WorkspaceConfigLayerSnapshot,
+            providers::{ConfigDoc, ProviderEntry},
+        };
+        fn permutations(ids: &mut [String], start: usize, all: &mut Vec<Vec<String>>) {
+            if start == ids.len() {
+                all.push(ids.to_vec());
+                return;
+            }
+            for index in start..ids.len() {
+                ids.swap(start, index);
+                permutations(ids, start + 1, all);
+                ids.swap(start, index);
+            }
+        }
+        let lower = ProviderEntry {
+            url: "https://example.com".into(),
+            models: (0..5)
+                .map(|i| ModelEntry {
+                    id: format!("row-{i}-{}", "x".repeat(4096)),
+                    name: Some(format!("owner-{i}")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let snapshot = |entry: &ProviderEntry| WorkspaceConfigLayerSnapshot {
+            origin: None,
+            project_root: None,
+            config_json: None,
+            provider_files: vec![("p".into(), serde_json::to_vec(entry).unwrap())],
+            effective_default_artifact_digest: None,
+            digest: "layer".into(),
+        };
+        let mut ids = lower
+            .models
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let mut orders = Vec::new();
+        permutations(&mut ids, 0, &mut orders);
+        let mut layer = ProviderEntry {
+            url: lower.url.clone(),
+            ..Default::default()
+        };
+        let mut before = lower.models.clone();
+        for order in orders {
+            let after = order
+                .iter()
+                .map(|id| {
+                    lower
+                        .models
+                        .iter()
+                        .find(|row| &row.id == id)
+                        .unwrap()
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let patch = ProviderModelPatch::between(&before, &after).unwrap();
+            assert!(
+                patch.order.is_none(),
+                "large catalogs always use sparse membership"
+            );
+            assert!(patch.upserts.is_empty() && patch.updates.is_empty());
+            let mut applied = before.clone();
+            patch.apply(&mut applied).unwrap();
+            assert_eq!(
+                serde_json::to_value(&applied).unwrap(),
+                serde_json::to_value(&after).unwrap()
+            );
+            patch.apply_to_layer(&before, &mut layer).unwrap();
+            assert!(
+                layer.models.is_empty() && layer.model_field_patches.is_empty(),
+                "reorder never materializes inherited rows"
+            );
+            let actual = ConfigDoc::providers_from_workspace_layer_snapshots(&[
+                snapshot(&lower),
+                snapshot(&layer),
+            ])
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&actual.providers["p"].models).unwrap(),
+                serde_json::to_value(&after).unwrap(),
+                "cumulative durable reorder must preserve every exact row"
+            );
+            before = after;
+        }
+        // Moving one row across the entire catalog takes one operation in
+        // either direction, including IDs longer than ordinary catalog IDs.
+        let mut rotated = before.clone();
+        rotated.rotate_left(1);
+        let patch = ProviderModelPatch::between(&before, &rotated).unwrap();
+        assert_eq!(patch.moves.len(), 1);
+        let reverse = ProviderModelPatch::between(&rotated, &before).unwrap();
+        assert_eq!(reverse.moves.len(), 1);
+        let encoded = serde_json::to_vec(&patch).unwrap();
+        let decoded: ProviderModelPatch = serde_json::from_slice(&encoded).unwrap();
+        let mut actual = before.clone();
+        decoded.apply(&mut actual).unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(rotated).unwrap()
+        );
+    }
+
+    #[test]
+    fn model_patch_sparse_membership_invalid_operations_make_no_changes() {
+        use cockpit_config::config::providers::ModelPlacement;
+        let before = (0..5)
+            .map(|i| ModelEntry {
+                id: format!("row-{i}-{}", "x".repeat(4096)),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut after = before.clone();
+        after.rotate_left(1);
+        let valid = ProviderModelPatch::between(&before, &after).unwrap();
+        let mut variants = Vec::new();
+        let mut invalid = valid.clone();
+        invalid.moves[0].after = Some("missing".into());
+        variants.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.moves[0].id = "missing".into();
+        variants.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.moves.push(invalid.moves[0].clone());
+        variants.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.moves[0] = ModelPlacement {
+            id: before[0].id.clone(),
+            after: Some(before[0].id.clone()),
+        };
+        variants.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.clear = true;
+        variants.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.order = Some(after.iter().map(|row| row.id.clone()).collect());
+        variants.push(invalid);
+        for invalid in variants {
+            let mut actual = before.clone();
+            assert!(invalid.apply(&mut actual).is_err());
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&before).unwrap(),
+                "invalid order/membership is atomic"
+            );
+            let mut layer = cockpit_config::config::providers::ProviderEntry::default();
+            let old = serde_json::to_value(&layer).unwrap();
+            assert!(invalid.apply_to_layer(&before, &mut layer).is_err());
+            assert_eq!(
+                serde_json::to_value(&layer).unwrap(),
+                old,
+                "invalid intent never mutates authored state"
+            );
+        }
     }
 }
 

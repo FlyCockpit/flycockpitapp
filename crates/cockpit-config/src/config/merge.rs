@@ -98,6 +98,46 @@ fn apply_model_layer_edits(provider: &mut serde_json::Map<String, Value>) {
         }
         provider.remove("model_field_patches");
     }
+    if let Some(raw) = provider.get("model_membership") {
+        let Ok(patch) =
+            serde_json::from_value::<super::providers::ModelMembershipPatch>(raw.clone())
+        else {
+            return;
+        };
+        if let Some(models) = provider.get_mut("models").and_then(Value::as_array_mut) {
+            if !array_is_id_object_list(models) {
+                return;
+            }
+            models.retain(|row| {
+                !patch
+                    .deletes
+                    .iter()
+                    .any(|id| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            });
+            // Match the ordinary merge-by-ID rule: last image wins, first
+            // position wins. Repeated raw IDs must not panic during replay.
+            let mut seen = std::collections::BTreeSet::new();
+            let mut order = models
+                .iter()
+                .filter_map(|row| row.get("id")?.as_str().map(str::to_owned))
+                .filter(|id| seen.insert(id.clone()))
+                .collect::<Vec<_>>();
+            for placement in patch.placements {
+                if placement.apply(&mut order, false).is_err() {
+                    return;
+                }
+            }
+            let mut rows = std::mem::take(models)
+                .into_iter()
+                .filter_map(|row| Some((row.get("id")?.as_str()?.to_owned(), row)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            *models = order
+                .iter()
+                .map(|id| rows.remove(id).expect("existing model placement"))
+                .collect();
+        }
+        provider.remove("model_membership");
+    }
     if let Some(raw) = provider.get("model_order") {
         let Ok(order) = serde_json::from_value::<Vec<String>>(raw.clone()) else {
             return;
@@ -199,6 +239,35 @@ pub(crate) fn merge_model_arrays_by_id(base: &mut Vec<Value>, overlay: &[Value])
 #[cfg(test)]
 mod catalog_membership_tests {
     use super::*;
+    #[test]
+    fn sparse_membership_replay_preserves_unique_rows_without_resurrecting_missing_rows() {
+        let overlay = serde_json::json!({"providers":{"p":{"model_membership":{"deletes":["gone"],"placements":[{"id":"b","after":null},{"id":"missing","after":"a"}]}}}});
+        let mut base = serde_json::json!({"providers":{"p":{"models":[{"id":"a","name":"first"},{"id":"a","name":"last"},{"id":"b"},{"id":"gone"}]}}});
+        deep_merge_value(&mut base, &overlay);
+        assert_eq!(
+            base["providers"]["p"]["models"],
+            serde_json::json!([{"id":"b"},{"id":"a","name":"last"}])
+        );
+        assert!(base["providers"]["p"].get("model_membership").is_none());
+        let mut refreshed =
+            serde_json::json!({"providers":{"p":{"models":[{"id":"a","name":"fresh"}]}}});
+        deep_merge_value(&mut refreshed, &overlay);
+        assert_eq!(
+            refreshed["providers"]["p"]["models"],
+            serde_json::json!([{"id":"a","name":"fresh"}]),
+            "missing lower rows are never recreated by placements"
+        );
+        for invalid in [
+            serde_json::json!({"model_membership":{"deletes":["a","a"]}}),
+            serde_json::json!({"model_membership":{"placements":[{"id":"a","after":"a"}]}}),
+            serde_json::json!({"model_membership":{"deletes":["a"],"placements":[{"id":"a","after":null}]}}),
+        ] {
+            assert!(
+                serde_json::from_value::<super::super::providers::ProviderEntry>(invalid).is_err()
+            );
+        }
+    }
+
     #[test]
     fn complete_row_edits_reset_only_the_target_model_and_preserve_its_sibling() {
         let mut base = serde_json::json!({"providers":{"p":{"models":[{"id":"m","name":"old","extra":{"old":true}},{"id":"sibling","name":"keep"}]}}});

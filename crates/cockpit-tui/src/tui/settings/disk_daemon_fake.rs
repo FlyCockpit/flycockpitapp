@@ -1201,16 +1201,28 @@ fn apply_provider_mutation(
             if !entry.models.is_empty() {
                 return Err("provider model patch requires empty replacement inventory".into());
             }
-            let mut models = effective
+            let models = &effective
                 .providers
                 .get(&upsert.provider_id)
                 .ok_or_else(|| "provider model patch has no inventory".to_string())?
-                .models
-                .clone();
-            patch.apply(&mut models)?;
-            entry.models = models;
+                .models;
+            let mut authored = desired
+                .providers
+                .get(&upsert.provider_id)
+                .cloned()
+                .unwrap_or_default();
+            patch.apply_to_layer(models, &mut authored)?;
+            entry.models = authored.models;
+            entry.models_replace = authored.models_replace;
+            entry.model_field_patches = authored.model_field_patches;
+            entry.model_order = authored.model_order;
+            entry.model_membership = authored.model_membership;
+        } else {
+            entry.models_replace = true;
+            entry.model_field_patches.clear();
+            entry.model_order = None;
+            entry.model_membership = Default::default();
         }
-        entry.models_replace = true;
         if upsert.header_secrets.len() != entry.headers.len() {
             return Err("provider header secret count does not match headers".into());
         }

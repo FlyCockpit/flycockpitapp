@@ -144,6 +144,29 @@ impl ReceiptConnection {
         .expect("bounded live dispatcher projection")
     }
 
+    async fn ack(&mut self, request: Request) {
+        let id = Uuid::now_v7();
+        self.client
+            .send(&Envelope::request(id, request))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match recv_body(&mut self.client).await {
+                    Body::Event { .. } => {}
+                    Body::Response { id: got, response } => {
+                        assert_eq!(got, id);
+                        assert!(matches!(*response, Response::Ack));
+                        break;
+                    }
+                    other => panic!("paused-work transition response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("paused-work transition completes");
+    }
+
     async fn close(self) {
         drop(self.client);
         match tokio::time::timeout(Duration::from_secs(10), self.server)
@@ -291,6 +314,23 @@ async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
     connection
         .settle_worker_startup(&ctx, session_id, events)
         .await;
+    let tree_seq = ctx
+        .db
+        .latest_agent_tree_event_seq(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let persisted_tree: i64 = ctx.db.read(move |conn| {
+        Ok(conn.query_row(
+            "SELECT count(*) FROM code_root_projection_deliveries WHERE session_id = ?1 AND source_key = ?2",
+            rusqlite::params![session_id.to_string(), format!("state:agent_tree:{tree_seq}")],
+            |row| row.get(0),
+        )?)
+    }).await.unwrap();
+    assert_eq!(
+        persisted_tree, 1,
+        "a real committed startup agent-tree transition remains durable"
+    );
 
     // Inverse control: healthy initial receipts keep good text and do not
     // manufacture withholding merely because this is a retry.
@@ -319,6 +359,21 @@ async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
             Some("Build"),
             None,
             &serde_json::json!({"text": format!("{PUBLIC_HISTORY} {OLD_SECRET} {NEW_SECRET}")}),
+        )
+        .await
+        .unwrap();
+
+    // Persist real paused state before attaching/recovering a receipt. A
+    // create receipt already exists, so its reconnect must hydrate the newer
+    // paused row without changing the frozen result or either durable ledger.
+    ctx.db
+        .upsert_paused_session_work(
+            session_id,
+            "Build",
+            &workspace.to_string_lossy(),
+            "daemon restart",
+            1,
+            proto::DAEMON_VERSION,
         )
         .await
         .unwrap();
@@ -453,7 +508,9 @@ async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
         )
         .await
         .unwrap();
-    let history_rows = ctx.db.list_session_events(session_id).await.unwrap().len();
+    let history_rows = complete_history(&ctx.db, session_id).await;
+    let paused_rows = ctx.db.paused_session_work(session_id).await.unwrap();
+    assert!(paused_rows.is_some(), "the paused row remains unresolved");
 
     connection.close().await;
 
@@ -461,6 +518,13 @@ async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
     let mut connection = ReceiptConnection::open(&ctx).await;
     let (reconnected, root, events) = connection.project(&request).await;
     assert_same_receipt(&receipt, &reconnected, &root);
+    assert!(
+        events.iter().any(|event| matches!(event,
+            proto::Event::Notice { session_id: id, text }
+            if *id == session_id && text.starts_with("paused work is waiting")
+        )),
+        "reconnect still receives the paused-state reminder"
+    );
     assert_coverage(
         &events,
         session_id,
@@ -521,8 +585,13 @@ async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
         1
     );
     assert_eq!(
-        ctx.db.list_session_events(session_id).await.unwrap().len(),
-        history_rows
+        complete_history(&ctx.db, session_id).await,
+        history_rows,
+        "paused-work hydration must preserve complete history rows"
+    );
+    assert_eq!(
+        ctx.db.paused_session_work(session_id).await.unwrap(),
+        paused_rows
     );
     assert_eq!(
         ctx.db
@@ -540,6 +609,91 @@ async fn exercise_receipt_projection(route: ReceiptRoute, acp: bool) {
             .authenticate(&same_connection.attachment_capability)
             .is_err()
     );
+    // Inverse: the very same text from a new worker notice remains durable.
+    // Publication intent, rather than the Notice variant or its text, decides
+    // whether this is hydration or a committed transition.
+    let handle = ctx.registry.live_handle(session_id).unwrap();
+    handle.broadcast_notice(
+        "paused work is waiting for resume or cancel after daemon restart".into(),
+    );
+    assert_eq!(
+        complete_history(&ctx.db, session_id).await.len(),
+        history_rows.len() + 1
+    );
+    assert_eq!(
+        ctx.db
+            .read_code_root_projection_deliveries(session_id, None, 256)
+            .await
+            .unwrap()
+            .len(),
+        deliveries.len() + 1
+    );
+    for (request, expected_text) in [
+        (
+            Request::ResumePausedWork { session_id },
+            "paused work resumed",
+        ),
+        (
+            Request::CancelPausedWork { session_id },
+            "paused work cancelled",
+        ),
+    ] {
+        if matches!(request, Request::CancelPausedWork { .. }) {
+            ctx.db
+                .upsert_paused_session_work(
+                    session_id,
+                    "Build",
+                    &workspace.to_string_lossy(),
+                    "parked again",
+                    1,
+                    proto::DAEMON_VERSION,
+                )
+                .await
+                .unwrap();
+        }
+        let before = ctx
+            .db
+            .read_code_root_projection_deliveries(session_id, None, 256)
+            .await
+            .unwrap();
+        let rows_before = ctx.db.list_session_events(session_id).await.unwrap().len();
+        connection.ack(request).await;
+        let rows = ctx.db.list_session_events(session_id).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            rows_before + 1,
+            "real paused-work changes retain durable notices"
+        );
+        assert_eq!(rows.last().unwrap().kind, "notice");
+        assert!(
+            rows.last().unwrap().data["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(expected_text)
+        );
+        assert!(
+            ctx.db
+                .paused_session_work(session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let after = ctx
+            .db
+            .read_code_root_projection_deliveries(session_id, None, 256)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            before.len() + 1,
+            "real paused-work changes still invalidate the root"
+        );
+        assert_eq!(&after[..before.len()], before);
+        assert_ne!(
+            after.last().unwrap().replay_cursor,
+            before.last().unwrap().replay_cursor
+        );
+    }
     connection.close().await;
     let _ = ctx.registry.drain_all(Duration::ZERO).await;
 }
@@ -565,5 +719,255 @@ async fn code_root_recovered_create_receipt_replay_keeps_canonical_snapshot() {
     let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     for acp in [false, true] {
         exercise_receipt_projection(ReceiptRoute::RecoveredCreate, acp).await;
+    }
+}
+
+/// Compare every stored column, including identities, timestamps and payloads.
+async fn complete_history(db: &Db, session_id: Uuid) -> Vec<Vec<rusqlite::types::Value>> {
+    db.read(move |conn| {
+        let mut stmt =
+            conn.prepare("SELECT * FROM session_events WHERE session_id = ?1 ORDER BY seq")?;
+        let columns = stmt.column_count();
+        let rows = stmt.query_map([session_id.to_string()], |row| {
+            (0..columns)
+                .map(|column| row.get(column))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+    .await
+    .unwrap()
+}
+
+/// Include unkeyed deliveries so restoring the old writer cannot evade the
+/// assertion. Other keyed rows are independently committed worker transitions,
+/// not the initial operation being cancelled by this fixture.
+async fn initial_operation_rows(db: &Db, session_id: Uuid) -> Vec<Vec<rusqlite::types::Value>> {
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT * FROM code_root_projection_deliveries WHERE session_id = ?1
+             AND (source_key IS NULL OR source_key LIKE 'initial:%') ORDER BY sequence",
+        )?;
+        let columns = stmt.column_count();
+        let rows = stmt.query_map([session_id.to_string()], |row| {
+            (0..columns)
+                .map(|column| row.get(column))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+    .await
+    .unwrap()
+}
+
+async fn exercise_initial_delivery_cancellation(create: bool, acp: bool, accepted: bool) {
+    use crate::db::code_root_projection::ProjectionWritePhaseForTest;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = std::fs::canonicalize(temp.path()).unwrap();
+    let ctx = disk_test_ctx(&workspace.join("receipt.db"), &workspace.join("spool"));
+    ctx.db
+        .set_workspace_trust(
+            &workspace,
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let Request::CreateCodeRootV1(base) = proto::create_code_root_v1_request(
+        workspace.to_string_lossy().into_owned(),
+        None,
+        false,
+        true,
+        None,
+        None,
+        proto::EnvDriftPolicy::Daemon,
+    ) else {
+        panic!("create constructor")
+    };
+    let mut connection = ReceiptConnection::open(&ctx).await;
+    let request = if create {
+        composed_create(base.clone(), acp)
+    } else {
+        let (created, _, events) = connection
+            .project(&composed_create(base.clone(), acp))
+            .await;
+        connection
+            .settle_worker_startup(&ctx, created.root_id.0, events)
+            .await;
+        composed_attach(
+            proto::AttachExistingCodeRootV1Request {
+                root_id: created.root_id,
+                capture_generation: created.capture_generation,
+                logical_client_id: base.logical_client_id.clone(),
+                client_request_id: proto::OpaqueAsciiId128V1::new("cancelled-initial-attach")
+                    .unwrap(),
+                replay_cursor: None,
+                since_seq: None,
+                options: base.options.clone(),
+            },
+            acp,
+        )
+    };
+    let mut pause = ctx
+        .db
+        .pause_next_code_root_projection_for_test(if accepted {
+            ProjectionWritePhaseForTest::Accepted
+        } else {
+            ProjectionWritePhaseForTest::BeforeEnqueue
+        })
+        .unwrap();
+    connection
+        .client
+        .send(&Envelope::request(Uuid::now_v7(), request.clone()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), pause.entered())
+        .await
+        .expect("initial projection reaches the selected real writer boundary")
+        .unwrap();
+    // This drops the stream and joins the real transport, which must abort and
+    // join its executor while the write is paused. No dispatch future remains.
+    connection.close().await;
+    let sessions = ctx.db.list_sessions(false, u32::MAX).await.unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "cancelled create has exactly one durable root"
+    );
+    let session_id = sessions[0].session_id;
+    // No response receipt was recorded at either pause. Check the real
+    // authority after the transport joined, then relinquish this probe claim.
+    {
+        use crate::daemon::code_roots::CodeRootRequestStart;
+        let mut authority = crate::sync::lock_or_recover(&ctx.code_root_authority);
+        if create {
+            assert!(
+                matches!(authority.start_create(&base).unwrap(), CodeRootRequestStart::Recovering(id) if id.0 == session_id)
+            );
+            authority.abandon_code_root_request(
+                &base.logical_client_id,
+                &base.client_request_id,
+                "create",
+            );
+        } else {
+            let attach = match &request {
+                Request::AttachExistingCodeRootV1(attach) => attach,
+                Request::AttachExistingCodeRootWithAcpIngressV1(attach) => &attach.base,
+                _ => panic!("attach request"),
+            };
+            assert!(matches!(
+                authority.start_attach(attach).unwrap(),
+                CodeRootRequestStart::Started
+            ));
+            authority.abandon_code_root_request(
+                &attach.logical_client_id,
+                &attach.client_request_id,
+                "attach",
+            );
+        }
+    }
+    drop(pause);
+    // The FIFO writer barrier drains the accepted job even though its reply
+    // receiver was cancelled. Pre-enqueue cancellation has no job to drain.
+    ctx.db.write(|_| Ok(())).await.unwrap();
+    let before_retry = initial_operation_rows(&ctx.db, session_id).await;
+    let preceding_create = usize::from(!create);
+    assert_eq!(before_retry.len(), preceding_create + usize::from(accepted));
+    let mut connection = ReceiptConnection::open(&ctx).await;
+    let (receipt, _, _) = connection.project(&request).await;
+    assert_eq!(receipt.root_id.0, session_id);
+    let after_retry = initial_operation_rows(&ctx.db, session_id).await;
+    assert_eq!(
+        after_retry.len(),
+        preceding_create + 1,
+        "cancel/retry must leave exactly one initial delivery for the logical operation"
+    );
+    if accepted {
+        assert_eq!(
+            after_retry, before_retry,
+            "accepted delivery identity, cursor and complete row survive cancellation"
+        );
+    }
+    let deliveries = ctx
+        .db
+        .read_code_root_projection_deliveries(session_id, None, 256)
+        .await
+        .unwrap();
+    let initial_cursor = deliveries
+        .iter()
+        .find(|row| {
+            Some(row.replay_cursor.as_str())
+                == after_retry
+                    .last()
+                    .and_then(|row| row.get(2))
+                    .and_then(|v| match v {
+                        rusqlite::types::Value::Text(value) => Some(value.as_str()),
+                        _ => None,
+                    })
+        })
+        .expect("initial operation cursor resolves in the real ledger");
+    assert_eq!(
+        receipt.replay_cursor.expose_opaque(),
+        initial_cursor.replay_cursor
+    );
+    let (retry, retry_root, _) = connection.project(&request).await;
+    assert_same_receipt(&receipt, &retry, &retry_root);
+    assert_eq!(
+        initial_operation_rows(&ctx.db, session_id).await,
+        after_retry
+    );
+
+    // A distinct logical attach must keep its own initial delivery and cursor.
+    let distinct = composed_attach(
+        proto::AttachExistingCodeRootV1Request {
+            root_id: receipt.root_id,
+            capture_generation: receipt.capture_generation,
+            logical_client_id: base.logical_client_id.clone(),
+            client_request_id: proto::OpaqueAsciiId128V1::new("different-attach").unwrap(),
+            replay_cursor: None,
+            since_seq: None,
+            options: base.options,
+        },
+        acp,
+    );
+    let (distinct, _, _) = connection.project(&distinct).await;
+    assert_ne!(distinct.replay_cursor, receipt.replay_cursor);
+    assert_eq!(
+        initial_operation_rows(&ctx.db, session_id).await.len(),
+        preceding_create + 2,
+        "distinct logical operations must not share an initial delivery"
+    );
+    connection.close().await;
+    let _ = ctx.registry.drain_all(Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_root_create_initial_delivery_survives_accepted_cancel() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for acp in [false, true] {
+        exercise_initial_delivery_cancellation(true, acp, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_root_attach_initial_delivery_survives_accepted_cancel() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for acp in [false, true] {
+        exercise_initial_delivery_cancellation(false, acp, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_root_create_initial_delivery_follows_preaccept_cancel() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for acp in [false, true] {
+        exercise_initial_delivery_cancellation(true, acp, false).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_root_attach_initial_delivery_follows_preaccept_cancel() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    for acp in [false, true] {
+        exercise_initial_delivery_cancellation(false, acp, false).await;
     }
 }

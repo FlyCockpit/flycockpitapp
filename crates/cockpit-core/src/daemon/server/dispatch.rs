@@ -9,7 +9,6 @@ use super::sessions_remote::{self, RemoteSessionLedger};
 use super::*;
 use crate::daemon::acp_catalog_composition::PendingAcpCatalogCompositionV1;
 use crate::daemon::agent_management::{bad_config, conflict};
-use crate::daemon::code_roots::CodeRootProjectionWriterV1;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
 use sha2::{Digest, Sha256};
@@ -7246,7 +7245,13 @@ async fn handle_serialized_request_inner(
             }
             let writer =
                 crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
-            let initial = match writer.write_root_state_changed(root.root_id).await {
+            let initial_source_key = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .initial_delivery_source_key("create", &request)
+                .map_err(code_root_contract_error)?;
+            let initial = match writer
+                .write_initial_root_state_changed(root.root_id, initial_source_key)
+                .await
+            {
                 Ok(initial) => initial,
                 Err(error) => {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -7417,7 +7422,13 @@ async fn handle_serialized_request_inner(
             };
             let writer =
                 crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
-            let initial = match writer.write_root_state_changed(root.root_id).await {
+            let initial_source_key = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .initial_delivery_source_key("attach", &request)
+                .map_err(code_root_contract_error)?;
+            let initial = match writer
+                .write_initial_root_state_changed(root.root_id, initial_source_key)
+                .await
+            {
                 Ok(initial) => initial,
                 Err(error) => {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -31107,12 +31118,14 @@ pub(super) async fn attach(
         })
         .await
         .map_err(internal)?;
-    if !paused_work.is_empty()
-        && let Some(att) = state.attached.as_ref()
-    {
-        att.handle.broadcast_notice(
-            "paused work is waiting for resume or cancel after daemon restart".to_string(),
-        );
+    if !paused_work.is_empty() {
+        // This reminder describes the rows just read. Hydrate only this
+        // connection: broadcasting it as a worker transition would append a
+        // fresh Notice and Code-root delivery on every receipt reconnect.
+        state.pending_replay.push(proto::Event::Notice {
+            session_id,
+            text: "paused work is waiting for resume or cancel after daemon restart".to_string(),
+        });
     }
 
     replay_attach_hydration_events(&mut event_rx, &mut state.pending_replay, session_id);

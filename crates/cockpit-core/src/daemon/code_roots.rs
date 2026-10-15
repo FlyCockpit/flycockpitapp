@@ -93,8 +93,9 @@ struct DiscoverySnapshot {
     expires_at: Instant,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct CodeRootAuthorityV1 {
+    initial_delivery_namespace: Uuid,
     attachments: HashMap<String, CodeRootAttachmentRecord>,
     idempotency: HashMap<(String, String, &'static str), IdempotencyReceipt>,
     discovery: HashMap<String, DiscoverySnapshot>,
@@ -103,7 +104,39 @@ pub(crate) struct CodeRootAuthorityV1 {
     interrupt_resolutions_in_flight: HashSet<(String, String)>,
 }
 
+impl Default for CodeRootAuthorityV1 {
+    fn default() -> Self {
+        Self {
+            initial_delivery_namespace: Uuid::new_v4(),
+            attachments: HashMap::new(),
+            idempotency: HashMap::new(),
+            discovery: HashMap::new(),
+            attachment_reservations: HashSet::new(),
+            code_root_requests_in_flight: HashMap::new(),
+            interrupt_resolutions_in_flight: HashSet::new(),
+        }
+    }
+}
+
 impl CodeRootAuthorityV1 {
+    /// Bind the initial snapshot to this boot's logical operation before any
+    /// durable enqueue. An accepted DB job outlives a cancelled dispatch and
+    /// its boot-local receipt; retrying must recover that job's exact cursor.
+    /// Route and full request fingerprint keep distinct operations separate.
+    pub fn initial_delivery_source_key<T: serde::Serialize>(
+        &self,
+        route: &'static str,
+        request: &T,
+    ) -> Result<String> {
+        let bytes = serde_json::to_vec(request)
+            .context("serializing Code-root initial delivery identity")?;
+        use std::fmt::Write as _;
+        let mut source_key = format!("initial:{}:{route}:", self.initial_delivery_namespace);
+        for byte in Sha256::digest(bytes) {
+            write!(&mut source_key, "{byte:02x}")?;
+        }
+        Ok(source_key)
+    }
     fn reap_expired(&mut self, now: Instant) {
         self.attachments.retain(|_, record| {
             record.open
@@ -809,10 +842,24 @@ impl DurableCodeRootProjectionWriterV1 {
         Self { db }
     }
 
+    pub(crate) async fn write_initial_root_state_changed(
+        &self,
+        root_id: proto::CodeRootIdV1,
+        source_key: String,
+    ) -> Result<proto::CodeRootDeliveryV1> {
+        self.write(
+            root_id,
+            proto::CodeRootDeliveryPayloadV1::RootStateChanged,
+            Some(source_key),
+        )
+        .await
+    }
+
     async fn write(
         &self,
         root_id: proto::CodeRootIdV1,
         mut payload: proto::CodeRootDeliveryPayloadV1,
+        initial_source_key: Option<String>,
     ) -> Result<proto::CodeRootDeliveryV1> {
         let (mut kind, mut source_key) = match &payload {
             proto::CodeRootDeliveryPayloadV1::History { entry } => {
@@ -830,7 +877,9 @@ impl DurableCodeRootProjectionWriterV1 {
                     entry.decision_request_id, entry.revision
                 )),
             ),
-            proto::CodeRootDeliveryPayloadV1::RootStateChanged => ("root_state_changed", None),
+            proto::CodeRootDeliveryPayloadV1::RootStateChanged => {
+                ("root_state_changed", initial_source_key)
+            }
             proto::CodeRootDeliveryPayloadV1::ClientIncompatible => ("client_incompatible", None),
         };
         let mut payload_json = serde_json::to_string(&payload)?;
@@ -869,8 +918,12 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
         root_id: proto::CodeRootIdV1,
         entry: proto::HistoryEntry,
     ) -> Result<proto::CodeRootDeliveryV1> {
-        self.write(root_id, proto::CodeRootDeliveryPayloadV1::History { entry })
-            .await
+        self.write(
+            root_id,
+            proto::CodeRootDeliveryPayloadV1::History { entry },
+            None,
+        )
+        .await
     }
 
     async fn write_attention(
@@ -881,6 +934,7 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
         self.write(
             root_id,
             proto::CodeRootDeliveryPayloadV1::Attention { entry },
+            None,
         )
         .await
     }
@@ -889,14 +943,70 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
         &self,
         root_id: proto::CodeRootIdV1,
     ) -> Result<proto::CodeRootDeliveryV1> {
-        self.write(root_id, proto::CodeRootDeliveryPayloadV1::RootStateChanged)
-            .await
+        self.write(
+            root_id,
+            proto::CodeRootDeliveryPayloadV1::RootStateChanged,
+            None,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_delivery_identity_is_scoped_to_boot_route_and_logical_request() {
+        let authority = CodeRootAuthorityV1::default();
+        let request = create_request();
+        let key = authority
+            .initial_delivery_source_key("create", &request)
+            .unwrap();
+        assert!(key.len() <= 128);
+        assert_eq!(
+            key,
+            authority
+                .initial_delivery_source_key("create", &request)
+                .unwrap()
+        );
+        assert_ne!(
+            key,
+            authority
+                .initial_delivery_source_key("attach", &request)
+                .unwrap()
+        );
+        assert_ne!(
+            key,
+            CodeRootAuthorityV1::default()
+                .initial_delivery_source_key("create", &request)
+                .unwrap()
+        );
+        let mut distinct = request.clone();
+        distinct.client_request_id = proto::OpaqueAsciiId128V1::new("another-request").unwrap();
+        assert_ne!(
+            key,
+            authority
+                .initial_delivery_source_key("create", &distinct)
+                .unwrap()
+        );
+        distinct = request.clone();
+        distinct.logical_client_id = proto::OpaqueAsciiId128V1::new("another-client").unwrap();
+        assert_ne!(
+            key,
+            authority
+                .initial_delivery_source_key("create", &distinct)
+                .unwrap()
+        );
+        distinct = request.clone();
+        distinct.options.interactive = !distinct.options.interactive;
+        assert_ne!(
+            key,
+            authority
+                .initial_delivery_source_key("create", &distinct)
+                .unwrap()
+        );
+    }
 
     fn create_request() -> proto::CreateCodeRootV1Request {
         proto::CreateCodeRootV1Request {

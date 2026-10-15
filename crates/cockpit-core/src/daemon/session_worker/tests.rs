@@ -3523,6 +3523,67 @@ async fn context_projection_rehydration_does_not_mint_code_root_deliveries() {
     );
 }
 
+#[tokio::test]
+async fn code_root_history_changes_keep_distinct_transition_deliveries() {
+    let session = Session::create_for_test(
+        Db::open_in_memory().unwrap(),
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let (event_tx, mut event_rx) = broadcast::channel(8);
+    let table = Arc::new(RedactionTable::empty());
+    for text in ["first committed message", "second committed message"] {
+        let seq = session
+            .db
+            .insert_session_event(
+                session.id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": text}),
+            )
+            .await
+            .unwrap();
+        send_session_event(
+            &session,
+            &event_tx,
+            &table,
+            proto::Event::UserMessageRecorded {
+                session_id: session.id,
+                seq,
+                client_submission_ids: Vec::new(),
+                preflight_cleaned: None,
+            },
+            NoticeSource::DaemonDirect,
+        );
+        assert!(matches!(event_rx.try_recv().unwrap().event,
+            proto::Event::UserMessageRecorded { seq: delivered, .. } if delivered == seq));
+    }
+    let deliveries = session
+        .db
+        .read_code_root_projection_deliveries(session.id, None, 256)
+        .await
+        .unwrap();
+    assert_eq!(
+        deliveries.len(),
+        2,
+        "distinct committed history changes each invalidate the same root"
+    );
+    assert_ne!(deliveries[0].delivery_id, deliveries[1].delivery_id);
+    assert_ne!(deliveries[0].replay_cursor, deliveries[1].replay_cursor);
+    assert_eq!(
+        session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 async fn persisted_notice_text(session: &Session) -> String {
     let events = session.db.list_session_events(session.id).await.unwrap();
     assert_eq!(events.len(), 1);

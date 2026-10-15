@@ -3039,9 +3039,10 @@ mod backup_fallback_tests {
     async fn retained_client_after_table_replacement_scrubs_both_terminal_emitters() {
         use cockpit_test_support::provider::{ScriptedProvider, Turn};
         for wrapper in [false, true] {
+            let credential_directory = tempfile::tempdir().unwrap();
             let provider = ScriptedProvider::builder().turn(Turn::HttpError {
                 status: 400,
-                body: serde_json::json!({"error":{"message":"useful nonsecret diagnostic old/+key fresh/+key", "code":"invalid_request_error"}}).to_string(),
+                body: serde_json::json!({"error":{"message":format!("useful nonsecret diagnostic old/+key fresh/+key {}",credential_directory.path().display()), "code":"invalid_request_error"}}).to_string(),
             }).start().await;
             let db = crate::db::Db::open_in_memory().unwrap();
             let root = tempfile::tempdir().unwrap().keep();
@@ -3060,10 +3061,16 @@ mod backup_fallback_tests {
                 "cloud".into(),
                 ProviderEntry {
                     url: provider.base_url(),
-                    headers: vec![crate::config::providers::HeaderSpec {
-                        name: "x-api-key".into(),
-                        value: "$RETAINED_TEST_KEY".into(),
-                    }],
+                    headers: vec![
+                        crate::config::providers::HeaderSpec {
+                            name: "x-api-key".into(),
+                            value: "$RETAINED_TEST_KEY".into(),
+                        },
+                        crate::config::providers::HeaderSpec {
+                            name: "x-private-path".into(),
+                            value: "$RETAINED_TEST_PATH".into(),
+                        },
+                    ],
                     models: vec![ModelEntry {
                         id: "m".into(),
                         ..Default::default()
@@ -3081,7 +3088,13 @@ mod backup_fallback_tests {
                 "cloud",
                 "m",
                 table.clone(),
-                |_: &str| Some("old/+key".into()),
+                |name: &str| {
+                    Some(if name == "RETAINED_TEST_PATH" {
+                        credential_directory.path().display().to_string()
+                    } else {
+                        "old/+key".into()
+                    })
+                },
                 store,
             )
             .unwrap();
@@ -3169,6 +3182,10 @@ mod backup_fallback_tests {
                 !details[0].contains("fresh/+"),
                 "new discovery lost: {}",
                 details[0]
+            );
+            assert!(
+                !details[0].contains(&credential_directory.path().display().to_string()),
+                "private path credential leaked"
             );
             assert!(details[0].contains("useful nonsecret diagnostic"));
         }

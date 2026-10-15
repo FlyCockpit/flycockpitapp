@@ -1091,6 +1091,8 @@ fn round_trips_a_provider_entry() {
             capabilities: Default::default(),
             provider_metadata: Default::default(),
             models_replace: false,
+            model_field_patches: Vec::new(),
+            model_order: None,
             last_model_fetch: None,
         },
     );

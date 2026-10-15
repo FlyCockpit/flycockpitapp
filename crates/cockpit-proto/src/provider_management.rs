@@ -88,6 +88,8 @@ impl std::fmt::Debug for ProviderMutationUpsert {
 pub struct ProviderModelPatch {
     pub base_digest: String,
     pub upserts: Vec<cockpit_config::config::providers::ModelEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub updates: Vec<cockpit_config::config::providers::ModelEntryFieldPatch>,
     pub deletes: Vec<String>,
     /// Present only when the owner changes membership/order. Unchanged catalogs
     /// do not pay to resend their complete id sequence on a favorite/header edit.
@@ -102,15 +104,27 @@ impl ProviderModelPatch {
     ) -> Result<Self, serde_json::Error> {
         let prior = before
             .iter()
-            .map(|model| Ok((model.id.as_str(), serde_json::to_vec(model)?)))
-            .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+            .map(|model| (model.id.as_str(), model))
+            .collect::<BTreeMap<_, _>>();
         let next_ids = after
             .iter()
             .map(|model| model.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         let mut upserts = Vec::new();
+        let mut updates = Vec::new();
         for model in after {
-            if prior.get(model.id.as_str()) != Some(&serde_json::to_vec(model)?) {
+            if let Some(prior) = prior.get(model.id.as_str()) {
+                if serde_json::to_vec(prior)? != serde_json::to_vec(model)? {
+                    // Both IDs come from this lookup; serialization is the only
+                    // fallible operation in the field diff.
+                    updates.push(
+                        cockpit_config::config::providers::ModelEntryFieldPatch::between(
+                            prior, model,
+                        )
+                        .map_err(<serde_json::Error as serde::ser::Error>::custom)?,
+                    );
+                }
+            } else {
                 upserts.push(model.clone());
             }
         }
@@ -127,12 +141,71 @@ impl ProviderModelPatch {
             order,
             base_digest: Self::digest(before)?,
             upserts,
+            updates,
             deletes: before
                 .iter()
                 .filter(|prior| !next_ids.contains(prior.id.as_str()))
                 .map(|model| model.id.clone())
                 .collect(),
         })
+    }
+
+    /// Preserve this layer's authored rows/edits while recording only the
+    /// changes over the complete, revision-bound effective inventory.
+    pub fn apply_to_layer(
+        &self,
+        effective: &[cockpit_config::config::providers::ModelEntry],
+        layer: &mut cockpit_config::config::providers::ProviderEntry,
+    ) -> Result<(), String> {
+        let mut after = effective.to_vec();
+        self.apply(&mut after)?;
+        let replacements = self
+            .upserts
+            .iter()
+            .map(|model| model.id.as_str())
+            .chain(
+                self.updates
+                    .iter()
+                    .filter(|update| update.replace)
+                    .map(|update| update.id.as_str()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        layer.models.retain(|model| {
+            !self.deletes.contains(&model.id) && !replacements.contains(model.id.as_str())
+        });
+        layer.model_field_patches.retain(|model| {
+            !self.deletes.contains(&model.id) && !replacements.contains(model.id.as_str())
+        });
+        for id in &replacements {
+            let model = after
+                .iter()
+                .find(|model| model.id == *id)
+                .expect("validated replacement row");
+            layer.model_field_patches.push(
+                cockpit_config::config::providers::ModelEntryFieldPatch::replacement(model)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        for update in self.updates.iter().filter(|update| !update.replace) {
+            if let Some(model) = layer.models.iter_mut().find(|model| model.id == update.id) {
+                update
+                    .evict_authored_fields(model)
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Some(prior) = layer
+                .model_field_patches
+                .iter_mut()
+                .find(|prior| prior.id == update.id)
+            {
+                prior.extend(update);
+            } else {
+                layer.model_field_patches.push(update.clone());
+            }
+        }
+        if let Some(order) = &self.order {
+            layer.model_order = Some(order.clone());
+        }
+        Ok(())
     }
 
     fn digest(
@@ -157,10 +230,23 @@ impl ProviderModelPatch {
             .iter()
             .map(String::as_str)
             .chain(self.upserts.iter().map(|model| model.id.as_str()))
+            .chain(self.updates.iter().map(|model| model.id.as_str()))
         {
             if !ids.insert(id) {
                 return Err("provider model patch contains duplicate ids".into());
             }
+        }
+        let mut updated_models = models.clone();
+        for update in &self.updates {
+            let model = updated_models
+                .iter_mut()
+                .find(|model| model.id == update.id)
+                .ok_or_else(|| "provider model field patch has no existing row".to_string())?;
+            let mut value = serde_json::to_value(&*model).map_err(|error| error.to_string())?;
+            update
+                .apply_value(&mut value)
+                .map_err(|error| error.to_string())?;
+            *model = serde_json::from_value(value).map_err(|error| error.to_string())?;
         }
         if let Some(order) = &self.order {
             let expected = models
@@ -179,6 +265,7 @@ impl ProviderModelPatch {
                 );
             }
         }
+        *models = updated_models;
         models.retain(|model| !self.deletes.contains(&model.id));
         for model in &self.upserts {
             if let Some(prior) = models.iter_mut().find(|prior| prior.id == model.id) {
@@ -416,6 +503,219 @@ mod model_patch_tests {
     use cockpit_config::config::providers::ModelEntry;
 
     #[test]
+    fn model_patch_owned_values_are_evicted_before_a_replacement_value_is_persisted() {
+        let mut own = ModelEntry {
+            id: "same".into(),
+            name: Some("old".repeat(60 * 1024)),
+            ..Default::default()
+        };
+        own.extra
+            .insert("owned".into(), serde_json::json!("x".repeat(20 * 1024)));
+        let mut row = own.clone();
+        row.extra.insert(
+            "inherited".into(),
+            serde_json::json!("z".repeat(190 * 1024)),
+        );
+        let before = vec![row];
+        let mut after = before.clone();
+        after[0].name = Some("new".repeat(60 * 1024));
+        let mut layer = cockpit_config::config::providers::ProviderEntry {
+            models: vec![own],
+            ..Default::default()
+        };
+        let patch = ProviderModelPatch {
+            base_digest: ProviderModelPatch::digest(&before).unwrap(),
+            upserts: Vec::new(),
+            updates: vec![
+                cockpit_config::config::providers::ModelEntryFieldPatch::between(
+                    &before[0], &after[0],
+                )
+                .unwrap(),
+            ],
+            deletes: Vec::new(),
+            order: None,
+        };
+        patch.apply_to_layer(&before, &mut layer).unwrap();
+        assert!(
+            layer.models[0].name.is_none(),
+            "overwritten owned data must not survive beside its replacement"
+        );
+        assert!(
+            serde_json::to_vec(&layer).unwrap().len() < crate::MAX_OWNER_PROVIDER_ENTRY_BYTES,
+            "no duplicate old value or unchanged inherited extra in durable intent"
+        );
+        let mut cleared = after.clone();
+        cleared[0].extra.clear();
+        let patch = ProviderModelPatch {
+            base_digest: ProviderModelPatch::digest(&after).unwrap(),
+            upserts: Vec::new(),
+            updates: vec![
+                cockpit_config::config::providers::ModelEntryFieldPatch::between(
+                    &after[0],
+                    &cleared[0],
+                )
+                .unwrap(),
+            ],
+            deletes: Vec::new(),
+            order: None,
+        };
+        patch.apply_to_layer(&after, &mut layer).unwrap();
+        assert!(
+            layer.models[0].extra.is_empty(),
+            "removed owned data must be evicted physically"
+        );
+        let mut actual = serde_json::to_value(&before[0]).unwrap();
+        layer.model_field_patches[0]
+            .apply_value(&mut actual)
+            .unwrap();
+        assert_eq!(actual, serde_json::to_value(&cleared[0]).unwrap());
+    }
+
+    #[test]
+    fn model_patch_new_rows_replace_hidden_lower_images_without_inheriting_old_fields() {
+        use cockpit_config::config::{
+            WorkspaceConfigLayerSnapshot,
+            providers::{ConfigDoc, ProviderEntry},
+        };
+        let visible = ModelEntry {
+            id: "visible".into(),
+            context_length: Some(4242),
+            ..Default::default()
+        };
+        let hidden = ModelEntry {
+            id: "hidden".into(),
+            name: Some("stale hidden field".into()),
+            favorite: true,
+            ..Default::default()
+        };
+        let lower = ProviderEntry {
+            url: "https://example.com".into(),
+            models: vec![visible.clone(), hidden.clone()],
+            ..Default::default()
+        };
+        let mut layer = ProviderEntry {
+            url: lower.url.clone(),
+            models: vec![hidden],
+            model_order: Some(vec!["visible".into()]),
+            ..Default::default()
+        };
+        let before = vec![visible.clone()];
+        let after = vec![
+            visible,
+            ModelEntry {
+                id: "hidden".into(),
+                manual: true,
+                ..Default::default()
+            },
+        ];
+        ProviderModelPatch::between(&before, &after)
+            .unwrap()
+            .apply_to_layer(&before, &mut layer)
+            .unwrap();
+        assert!(
+            !layer.models.iter().any(|model| model.id == "hidden"),
+            "old hidden authored image is removed"
+        );
+        let snapshot = |entry: &ProviderEntry| WorkspaceConfigLayerSnapshot {
+            origin: None,
+            project_root: None,
+            config_json: None,
+            provider_files: vec![("p".into(), serde_json::to_vec(entry).unwrap())],
+            effective_default_artifact_digest: None,
+            digest: "layer".into(),
+        };
+        let actual = ConfigDoc::providers_from_workspace_layer_snapshots(&[
+            snapshot(&lower),
+            snapshot(&layer),
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual.providers["p"].models).unwrap(),
+            serde_json::to_value(&after).unwrap(),
+            "new row cannot inherit hidden name/favorite/metadata"
+        );
+    }
+
+    #[test]
+    fn model_patch_large_composed_unchanged_inventory_stays_in_its_owner_layers() {
+        let before = vec![ModelEntry {
+            id: "same".into(),
+            name: Some("unchanged ".repeat(48 * 1024)),
+            ..Default::default()
+        }];
+        assert!(serde_json::to_vec(&before).unwrap().len() > crate::MAX_OWNER_PROVIDER_ENTRY_BYTES);
+        let patch = ProviderModelPatch::between(&before, &before).unwrap();
+        assert!(patch.upserts.is_empty() && patch.updates.is_empty());
+        let mut layer = cockpit_config::config::providers::ProviderEntry::default();
+        patch.apply_to_layer(&before, &mut layer).unwrap();
+        assert!(
+            layer.models.is_empty(),
+            "unchanged composed rows must remain in their owning layers"
+        );
+        assert!(layer.model_field_patches.is_empty());
+    }
+
+    #[test]
+    fn model_patch_large_composed_rows_remain_sparse_and_repeated_edits_accumulate() {
+        let mut row = ModelEntry {
+            id: "same".into(),
+            name: Some("name".repeat(48 * 1024)),
+            ..Default::default()
+        };
+        row.extra.insert(
+            "owner_note".into(),
+            serde_json::json!("owner".repeat(48 * 1024)),
+        );
+        let before = vec![row];
+        assert!(serde_json::to_vec(&before).unwrap().len() > crate::MAX_OWNER_PROVIDER_ENTRY_BYTES);
+        let mut after = before.clone();
+        after[0].favorite = true;
+        let patch = ProviderModelPatch::between(&before, &after).unwrap();
+        assert!(
+            serde_json::to_vec(&patch).unwrap().len() < 1024,
+            "favorite delta never contains unchanged composed fields"
+        );
+        let mut layer = cockpit_config::config::providers::ProviderEntry::default();
+        patch.apply_to_layer(&before, &mut layer).unwrap();
+        assert!(
+            layer.models.is_empty(),
+            "durable sparse edit must not materialize inherited rows"
+        );
+        assert_eq!(layer.model_field_patches.len(), 1);
+        let mut again = after.clone();
+        again[0].context_length = Some(4242);
+        ProviderModelPatch::between(&after, &again)
+            .unwrap()
+            .apply_to_layer(&after, &mut layer)
+            .unwrap();
+        assert_eq!(layer.model_field_patches.len(), 1, "same-row edits compose");
+        assert_eq!(
+            layer.model_field_patches[0].set["favorite"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            layer.model_field_patches[0].set["context_length"],
+            serde_json::json!(4242)
+        );
+        let mut actual = serde_json::to_value(&before[0]).unwrap();
+        layer.model_field_patches[0]
+            .apply_value(&mut actual)
+            .unwrap();
+        assert_eq!(actual, serde_json::to_value(&again[0]).unwrap());
+        let mut invalid = ProviderModelPatch::between(&before, &after).unwrap();
+        invalid.updates[0]
+            .set
+            .insert("id".into(), serde_json::json!("other"));
+        let mut actual = before.clone();
+        assert!(invalid.apply(&mut actual).unwrap_err().contains("identity"));
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(&before).unwrap(),
+            "invalid fields make no changes"
+        );
+    }
+
+    #[test]
     fn model_patch_preserves_unchanged_rows_and_rejects_stale_or_duplicate_inventory() {
         let before = vec![
             ModelEntry {
@@ -434,7 +734,13 @@ mod model_patch_tests {
         let mut after = before.clone();
         after[0].favorite = true;
         let patch = ProviderModelPatch::between(&before, &after).unwrap();
-        assert_eq!(patch.upserts.len(), 1);
+        assert!(patch.upserts.is_empty(), "existing rows use field deltas");
+        assert_eq!(patch.updates.len(), 1);
+        assert_eq!(
+            patch.updates[0].set,
+            BTreeMap::from([("favorite".into(), serde_json::json!(true))])
+        );
+        assert!(patch.updates[0].remove.is_empty());
         assert!(serde_json::to_vec(&patch).unwrap().len() < crate::MAX_OWNER_PROVIDER_ENTRY_BYTES);
         let mut actual = before.clone();
         patch.apply(&mut actual).unwrap();

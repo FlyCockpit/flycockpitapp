@@ -9044,5 +9044,242 @@ fn global_refresh_composed_overlay_remains_editable_through_real_settings_save()
             Some("receipt-bound provider edit")
         );
         assert_eq!(current.config.providers["p"].entry.models.len(), 2);
+        // These plans have no provider upsert. The existing large inventory
+        // must stay paged for ordinary policy and deletion saves as well.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.on_unlisted_models_fetch = Some(OnUnlistedModelsFetch::Ask);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.on_unlisted_models_fetch,
+            Some(OnUnlistedModelsFetch::Ask),
+            "metadata-only save retains paged readability: {:?}",
+            dialog.extended_warnings
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.remove("sibling-3");
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            !current.config.providers.contains_key("sibling-3"),
+            "deletion-only save retains paged readability: {:?}",
+            dialog.extended_warnings
+        );
+        assert_eq!(current.config.providers["p"].entry.models.len(), 2);
+    });
+}
+
+// A fetched global field and an authored workspace field compose on the same ID.
+#[test]
+fn global_refresh_same_row_composition_remains_editable_through_settings() {
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .unwrap();
+            let mut buf = [0; 8192];
+            assert!(socket.read(&mut buf).unwrap() > 0);
+            let body =
+                serde_json::json!({"data":[{"id":"g","name":"global quota ".repeat(15*1024)}]})
+                    .to_string();
+            write!(socket,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+        });
+        let global = cockpit_config::config::dirs::global_config_file().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        let mut global_config = ProvidersConfig::default();
+        global_config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: url.clone(),
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: vec![model("g", false)],
+                ..Default::default()
+            },
+        );
+        ConfigDoc::load(&global)
+            .unwrap()
+            .write(&global_config)
+            .unwrap();
+        let mut config = ProvidersConfig::default();
+        let mut authored = ModelEntry {
+            id: "g".into(),
+            favorite: true,
+            ..Default::default()
+        };
+        authored.extra.insert(
+            "owner_note".into(),
+            serde_json::json!("owner note ".repeat(16 * 1024)),
+        );
+        config.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(AuthKind::None),
+                models: vec![authored],
+                ..Default::default()
+            },
+        );
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let provider_path = tmp.path().join(".cockpit/providers/p.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("models_replace");
+        std::fs::write(&provider_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            serde_json::to_vec(&initial.config.providers["p"].entry.models[0])
+                .unwrap()
+                .len()
+                < cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        // A legitimate metadata save works before the global directory grows.
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let before = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(before.config.providers["p"].entry.favorite, Some(true));
+        // Restore partial authored semantics, which are explicitly supported.
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("models_replace");
+        std::fs::write(&provider_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        runtime
+            .block_on(
+                client.request_ok(cockpit_proto::Request::FetchProviderModels {
+                    project_root: global.parent().unwrap().display().to_string(),
+                    provider_id: Some("p".into()),
+                    model_id: None,
+                    deep: false,
+                    on_unlisted: Some(OnUnlistedModelsFetch::Keep),
+                    allow_fallback: false,
+                }),
+            )
+            .unwrap();
+        server.join().unwrap();
+        let refreshed = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let row = &refreshed.config.providers["p"].entry.models[0];
+        let row_bytes = serde_json::to_vec(row).unwrap().len();
+        assert!(
+            row_bytes > cockpit_proto::MAX_OWNER_PROVIDER_ENTRY_BYTES,
+            "same-row composition must exceed the delta cap: {row_bytes}"
+        );
+        assert!(row.extra.contains_key("owner_note"));
+        assert!(row.name.as_ref().unwrap().contains("global quota"));
+        let expected = refreshed.config.providers["p"].entry.models.clone();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(refreshed))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().favorite = Some(false);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            current.config.providers["p"].entry.favorite,
+            Some(false),
+            "same-row global growth stranded a previously editable provider; warnings={:?}",
+            dialog.extended_warnings
+        );
+        assert!(
+            !dialog.provider_catalog_reload_required,
+            "current authority adopted"
+        );
+        assert_eq!(
+            serde_json::to_value(&current.config.providers["p"].entry.models).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        // Editing this oversized row must not send a whole-row upsert, nor
+        // duplicate its inherited name into the workspace's durable file.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models[0].favorite = false;
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        let row = &current.config.providers["p"].entry.models[0];
+        assert!(
+            !row.favorite,
+            "per-model favorite applied on composed row: {:?}",
+            dialog.extended_warnings
+        );
+        assert_eq!(row.name, expected[0].name);
+        assert_eq!(row.extra, expected[0].extra);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+        assert!(
+            saved["models"][0].get("name").is_none(),
+            "inherited name stays in its owner layer"
+        );
+        assert_eq!(
+            saved["model_field_patches"][0]["remove"],
+            serde_json::json!(["favorite"])
+        );
+        // Subsequent settings saves must load the authored patch (not lose it
+        // by expanding a single layer); complete empty membership is explicit.
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().name = Some("still editable".into());
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(!current.config.providers["p"].entry.models[0].favorite);
+        assert_eq!(
+            current.config.providers["p"].entry.name.as_deref(),
+            Some("still editable")
+        );
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(current))
+            .unwrap();
+        dialog.config.providers.get_mut("p").unwrap().models.clear();
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let current = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert!(
+            current.config.providers["p"].entry.models.is_empty(),
+            "empty inventory cannot resurrect inherited row"
+        );
     });
 }

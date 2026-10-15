@@ -79,32 +79,72 @@ where
         .context("configuration publication deadline exceeded")?
 }
 
-pub(super) async fn receive<T>(framed: &mut T, line: String) -> Result<(serde_json::Value, bool)>
-where
-    T: futures::Stream<Item = std::result::Result<String, LinesCodecError>> + Unpin,
-{
-    let value: serde_json::Value = serde_json::from_str(&line).context("deserializing envelope")?;
-    if value.get("kind").and_then(serde_json::Value::as_str) != Some(KIND) {
-        return Ok((value, false));
-    }
-    let transfer = async {
-        let mut chunk: Chunk = serde_json::from_value(value)?;
-        let total = chunk.total;
-        let digest = chunk.digest.clone();
-        anyhow::ensure!(
-            total > MAX_NDJSON_FRAME_BYTES
-                && total <= MAX_CONFIG_TRANSFER_BYTES
-                && digest.len() == 64,
-            "invalid configuration transfer size or digest"
-        );
-        let mut bytes = Vec::new();
+/// Assembly belongs to the read side of the connection, never to a recv future.
+/// Every consumed physical frame is recorded before the next await. Cancelling
+/// recv (for example to send an outbound request) retains bytes and the original
+/// deadline; resuming cannot extend the transfer's lifetime.
+#[derive(Default)]
+pub(super) struct Receiver {
+    assembly: Option<Assembly>,
+}
+
+struct Assembly {
+    total: usize,
+    digest: String,
+    bytes: Vec<u8>,
+    deadline: tokio::time::Instant,
+}
+
+impl Receiver {
+    pub(super) async fn receive<T>(
+        &mut self,
+        framed: &mut T,
+    ) -> Result<Option<(serde_json::Value, bool)>>
+    where
+        T: futures::Stream<Item = std::result::Result<String, LinesCodecError>> + Unpin,
+    {
         loop {
+            let line = if let Some(assembly) = &self.assembly {
+                tokio::time::timeout_at(assembly.deadline, recv_raw_line(framed))
+                    .await
+                    .context("configuration transfer deadline exceeded")??
+                    .context("incomplete configuration transfer")?
+            } else {
+                let Some(line) = recv_raw_line(framed).await? else {
+                    return Ok(None);
+                };
+                line
+            };
+            let value: serde_json::Value = serde_json::from_str(&line)
+                .context("deserializing envelope/configuration chunk")?;
+            if self.assembly.is_none()
+                && value.get("kind").and_then(serde_json::Value::as_str) != Some(KIND)
+            {
+                return Ok(Some((value, false)));
+            }
+            let chunk: Chunk =
+                serde_json::from_value(value).context("deserializing configuration chunk")?;
+            if self.assembly.is_none() {
+                anyhow::ensure!(
+                    chunk.total > MAX_NDJSON_FRAME_BYTES
+                        && chunk.total <= MAX_CONFIG_TRANSFER_BYTES
+                        && chunk.digest.len() == 64,
+                    "invalid configuration transfer size or digest"
+                );
+                self.assembly = Some(Assembly {
+                    total: chunk.total,
+                    digest: chunk.digest.clone(),
+                    bytes: Vec::new(),
+                    deadline: tokio::time::Instant::now() + TRANSFER_TIMEOUT,
+                });
+            }
+            let assembly = self.assembly.as_mut().expect("assembly initialized");
             anyhow::ensure!(
                 chunk.v == PROTOCOL_VERSION
                     && chunk.kind == KIND
-                    && chunk.total == total
-                    && chunk.digest == digest
-                    && chunk.offset == bytes.len(),
+                    && chunk.total == assembly.total
+                    && chunk.digest == assembly.digest
+                    && chunk.offset == assembly.bytes.len(),
                 "configuration transfer identity or offset mismatch"
             );
             anyhow::ensure!(
@@ -115,27 +155,20 @@ where
             anyhow::ensure!(
                 !decoded.is_empty()
                     && decoded.len() <= CHUNK_BYTES
-                    && bytes.len().saturating_add(decoded.len()) <= total,
+                    && assembly.bytes.len().saturating_add(decoded.len()) <= assembly.total,
                 "invalid configuration chunk length"
             );
-            bytes.extend_from_slice(&decoded);
-            if bytes.len() == total {
-                break;
+            assembly.bytes.extend_from_slice(&decoded);
+            if assembly.bytes.len() == assembly.total {
+                let assembly = self.assembly.take().expect("complete assembly");
+                anyhow::ensure!(
+                    hex(&Sha256::digest(&assembly.bytes)) == assembly.digest,
+                    "configuration transfer digest mismatch"
+                );
+                return Ok(Some((serde_json::from_slice(&assembly.bytes)?, true)));
             }
-            let line = recv_raw_line(framed)
-                .await?
-                .context("incomplete configuration transfer")?;
-            chunk = serde_json::from_str(&line).context("deserializing configuration chunk")?;
         }
-        anyhow::ensure!(
-            hex(&Sha256::digest(&bytes)) == digest,
-            "configuration transfer digest mismatch"
-        );
-        Ok((serde_json::from_slice(&bytes)?, true))
-    };
-    tokio::time::timeout(TRANSFER_TIMEOUT, transfer)
-        .await
-        .context("configuration transfer deadline exceeded")?
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -253,8 +286,10 @@ mod tests {
                 }
             }
             let mut stream = futures::stream::iter(lines);
-            let first = stream.next().await.unwrap().unwrap();
-            let error = format!("{:#}", receive(&mut stream, first).await.unwrap_err());
+            let error = format!(
+                "{:#}",
+                Receiver::default().receive(&mut stream).await.unwrap_err()
+            );
             let expected = match fault {
                 "size" => "size or digest",
                 "offset" => "identity or offset",
@@ -265,6 +300,106 @@ mod tests {
             };
             assert!(error.contains(expected), "{fault}: {error}");
         }
+    }
+
+    #[tokio::test]
+    async fn config_transport_cancellation_preserves_deadline_and_buffered_bytes_when_split() {
+        use tokio::io::AsyncWriteExt;
+        let env = large_event();
+        let expected = serde_json::to_value(&env).unwrap();
+        let bytes = serde_json::to_vec(&env).unwrap();
+        let digest = hex(&Sha256::digest(&bytes));
+        let lines = bytes
+            .chunks(CHUNK_BYTES)
+            .enumerate()
+            .map(|(index, data)| {
+                let mut line = serde_json::to_vec(&Chunk {
+                    v: PROTOCOL_VERSION,
+                    kind: KIND.into(),
+                    digest: digest.clone(),
+                    offset: index * CHUNK_BYTES,
+                    total: bytes.len(),
+                    data: base64::engine::general_purpose::STANDARD.encode(data),
+                })
+                .unwrap();
+                line.push(b'\n');
+                line
+            })
+            .collect::<Vec<_>>();
+        let (left, mut right) = tokio::io::duplex(256 * 1024);
+        right.write_all(&lines[0]).await.unwrap();
+        right.write_all(&lines[1][..100]).await.unwrap();
+        let mut reader = ProtoStream::new(left);
+        {
+            let receive = reader.recv();
+            tokio::pin!(receive);
+            assert!(
+                futures::poll!(receive).is_pending(),
+                "first chunk and partial next physical frame consumed"
+            );
+        }
+        assert_eq!(
+            reader
+                .config_receiver
+                .assembly
+                .as_ref()
+                .unwrap()
+                .bytes
+                .len(),
+            CHUNK_BYTES
+        );
+        assert!(
+            !reader.framed.read_buffer().is_empty(),
+            "partial next frame is in codec buffer"
+        );
+        let deadline = reader.config_receiver.assembly.as_ref().unwrap().deadline;
+        let (mut reader, _writer) = reader.into_split();
+        assert_eq!(
+            reader.config_receiver.assembly.as_ref().unwrap().deadline,
+            deadline
+        );
+        let sender = tokio::spawn(async move {
+            right.write_all(&lines[1][100..]).await.unwrap();
+            for line in lines.iter().skip(2) {
+                right.write_all(line).await.unwrap();
+            }
+        });
+        let RecvFrame::Envelope(actual) = reader.recv().await.unwrap().unwrap() else {
+            panic!("complete config")
+        };
+        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+        sender.await.unwrap();
+        assert!(reader.config_receiver.assembly.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn config_transport_cancelled_receives_cannot_extend_transfer_deadline() {
+        let env = large_event();
+        let bytes = serde_json::to_vec(&env).unwrap();
+        let chunk = Chunk {
+            v: PROTOCOL_VERSION,
+            kind: KIND.into(),
+            digest: hex(&Sha256::digest(&bytes)),
+            offset: 0,
+            total: bytes.len(),
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes[..CHUNK_BYTES]),
+        };
+        let mut stream = futures::stream::iter([Ok(serde_json::to_string(&chunk).unwrap())]).chain(
+            futures::stream::pending::<std::result::Result<String, LinesCodecError>>(),
+        );
+        let mut receiver = Receiver::default();
+        for _ in 0..3 {
+            {
+                let receive = receiver.receive(&mut stream);
+                tokio::pin!(receive);
+                assert!(futures::poll!(receive).is_pending());
+            }
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        }
+        assert!(
+            format!("{:#}", receiver.receive(&mut stream).await.unwrap_err())
+                .contains("configuration transfer deadline exceeded")
+        );
     }
 
     #[tokio::test]
@@ -281,11 +416,12 @@ mod tests {
         };
         let line = serde_json::to_string(&chunk).unwrap();
         let task = tokio::spawn(async move {
-            receive(
-                &mut futures::stream::pending::<std::result::Result<String, LinesCodecError>>(),
-                line,
-            )
-            .await
+            let mut stream = futures::stream::once(async move { Ok(line) })
+                .chain(futures::stream::pending::<
+                    std::result::Result<String, LinesCodecError>,
+                >())
+                .boxed();
+            Receiver::default().receive(&mut stream).await
         });
         tokio::task::yield_now().await;
         assert!(!task.is_finished());

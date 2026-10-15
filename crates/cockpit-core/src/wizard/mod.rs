@@ -2106,6 +2106,8 @@ pub fn provider_entry_for_template_with_wire_api(
         text_embedded_recovery: None,
         thinking_params: Default::default(),
         models_replace: false,
+        model_field_patches: Vec::new(),
+        model_order: None,
         models: vec![],
         capabilities: Default::default(),
         provider_metadata: Default::default(),

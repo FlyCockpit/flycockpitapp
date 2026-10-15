@@ -103,6 +103,8 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "provider_metadata",
     "last_model_fetch",
     "usage_probe",
+    "model_field_patches",
+    "model_order",
 ];
 
 const MODEL_WIZARD_MODEL_FIELD_KEYS: &[&str] = &[
@@ -681,6 +683,20 @@ pub struct ProviderEntry {
     /// budget trimming. Partial hand-authored model overlays still merge by ID.
     #[serde(default, skip_serializing_if = "is_false")]
     pub models_replace: bool,
+
+    /// Sparse edits over this layer's merged model rows. Settings saves retain
+    /// inherited fields in their owning layers instead of copying composed rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_field_patches: Vec<ModelEntryFieldPatch>,
+
+    /// Explicit complete membership/order after applying this layer's edits.
+    /// `Some([])` removes all inherited models; absence preserves merge-by-ID.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_model_order"
+    )]
+    pub model_order: Option<Vec<String>>,
 
     /// Cached model list. Populated by `/fetch-models` (or the wizard).
     #[serde(default)]
@@ -1331,6 +1347,146 @@ where
         ));
     }
     Ok(value)
+}
+
+/// An owned field edit or complete image for one model. Unchanged composed
+/// values never need to fit an edit request or be copied into the editing layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEntryFieldPatch {
+    pub id: String,
+    /// A newly inserted/full-replacement row owns its complete image, including
+    /// absence of fields that a hidden lower row with this ID might contain.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub replace: bool,
+    #[serde(deserialize_with = "deserialize_model_field_set")]
+    pub set: BTreeMap<String, Value>,
+    #[serde(deserialize_with = "deserialize_model_field_remove")]
+    pub remove: Vec<String>,
+}
+
+fn deserialize_model_order<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error> {
+    let order = Option::<Vec<String>>::deserialize(deserializer)?;
+    if let Some(order) = &order {
+        let ids = order.iter().collect::<std::collections::BTreeSet<_>>();
+        if ids.len() != order.len() {
+            return Err(serde::de::Error::custom(
+                "model order contains duplicate ids",
+            ));
+        }
+    }
+    Ok(order)
+}
+
+fn deserialize_model_field_set<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, Value>, D::Error> {
+    let set = BTreeMap::<String, Value>::deserialize(deserializer)?;
+    if set.contains_key("id") {
+        return Err(serde::de::Error::custom(
+            "model field patch cannot change id",
+        ));
+    }
+    Ok(set)
+}
+
+fn deserialize_model_field_remove<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    let remove = Vec::<String>::deserialize(deserializer)?;
+    if remove.iter().any(|key| key == "id") {
+        return Err(serde::de::Error::custom(
+            "model field patch cannot remove id",
+        ));
+    }
+    Ok(remove)
+}
+
+impl ModelEntryFieldPatch {
+    pub fn between(before: &ModelEntry, after: &ModelEntry) -> Result<Self> {
+        anyhow::ensure!(before.id == after.id, "model field patch cannot change id");
+        let before = serde_json::to_value(before)?;
+        let after = serde_json::to_value(after)?;
+        let before = before.as_object().expect("model is an object");
+        let after = after.as_object().expect("model is an object");
+        Ok(Self {
+            id: after["id"].as_str().expect("model id").into(),
+            replace: false,
+            set: after
+                .iter()
+                .filter(|(key, value)| before.get(*key) != Some(*value))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            remove: before
+                .keys()
+                .filter(|key| !after.contains_key(*key))
+                .cloned()
+                .collect(),
+        })
+    }
+
+    pub fn apply_value(&self, model: &mut Value) -> Result<()> {
+        anyhow::ensure!(
+            model.get("id").and_then(Value::as_str) == Some(self.id.as_str())
+                && !self.set.contains_key("id")
+                && !self.remove.iter().any(|key| key == "id"),
+            "model field patch identity mismatch"
+        );
+        if self.replace {
+            *model = serde_json::json!({"id": self.id});
+        }
+        let object = model.as_object_mut().expect("model id requires an object");
+        for key in &self.remove {
+            object.remove(key);
+        }
+        for (key, value) in &self.set {
+            object.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+
+    /// Evict touched values from the authored row before storing the field
+    /// delta. An owned large value must have one durable copy, not old + new.
+    pub fn evict_authored_fields(&self, model: &mut ModelEntry) -> Result<()> {
+        anyhow::ensure!(model.id == self.id, "model field patch identity mismatch");
+        let mut raw = serde_json::to_value(&*model)?;
+        let object = raw.as_object_mut().expect("model is an object");
+        for key in self.set.keys().chain(self.remove.iter()) {
+            object.remove(key);
+        }
+        *model = serde_json::from_value(raw)?;
+        Ok(())
+    }
+
+    pub fn replacement(model: &ModelEntry) -> Result<Self> {
+        let baseline = ModelEntry {
+            id: model.id.clone(),
+            ..Default::default()
+        };
+        let mut patch = Self::between(&baseline, model)?;
+        patch.replace = true;
+        Ok(patch)
+    }
+
+    /// Compose a later owner edit without retaining overwritten values.
+    pub fn extend(&mut self, next: &Self) {
+        if next.replace {
+            *self = next.clone();
+            return;
+        }
+        for key in &next.remove {
+            self.set.remove(key);
+            if !self.remove.contains(key) {
+                self.remove.push(key.clone());
+            }
+        }
+        for (key, value) in &next.set {
+            self.remove.retain(|old| old != key);
+            self.set.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

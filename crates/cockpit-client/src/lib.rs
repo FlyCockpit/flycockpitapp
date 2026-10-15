@@ -1399,7 +1399,10 @@ impl DaemonClient {
         };
         let deadline = tokio::time::Instant::now() + response_timeout;
         let mut response = self
-            .request_one_with_timeout(request, deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .request_one_with_timeout(
+                request,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await?;
         let Some((project_root, provider_id, snapshot_session_id)) = catalog_request else {
             return self
@@ -4070,7 +4073,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod catalog_page_tests {
     use super::*;
@@ -4475,5 +4477,159 @@ mod provider_mutation_readback_tests {
             total_bytes: json.len(),
             json: json[offset..end].into(),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod chunk_cancellation_tests {
+    use super::*;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+    struct Observed {
+        io: tokio::io::DuplexStream,
+        saw_line: bool,
+        pending: Option<oneshot::Sender<()>>,
+    }
+    impl AsyncRead for Observed {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let result = Pin::new(&mut self.io).poll_read(cx, buf);
+            if matches!(result, Poll::Ready(Ok(()))) && buf.filled()[before..].contains(&b'\n') {
+                self.saw_line = true;
+            }
+            if result.is_pending()
+                && self.saw_line
+                && let Some(tx) = self.pending.take()
+            {
+                let _ = tx.send(());
+            }
+            result
+        }
+    }
+    impl AsyncWrite for Observed {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+    #[tokio::test]
+    async fn config_transport_outbound_request_preserves_partial_publication() {
+        let (left, mut right) = tokio::io::duplex(4096);
+        let (entered, waiting) = oneshot::channel();
+        let client = DaemonClient::from_proto(ProtoStream::new(Observed {
+            io: left,
+            saw_line: false,
+            pending: Some(entered),
+        }));
+        let env = Envelope::event(proto::Event::ConfigSnapshot {
+            snapshot: Box::new(proto::ConfigSnapshot {
+                session_id: Uuid::nil(),
+                generation: 42,
+                extended: Default::default(),
+                providers: proto::ProviderConfigView {
+                    configuration_warnings: vec!["ordinary config text ".repeat(60_000)],
+                    ..Default::default()
+                },
+            }),
+        });
+        let json = serde_json::to_vec(&env).unwrap();
+        assert!(json.len() > proto::MAX_NDJSON_FRAME_BYTES);
+        let digest = Sha256::digest(&json)
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect::<String>();
+        let frames=json.chunks(64*1024).enumerate().map(|(i,bytes)| {
+            let mut line=serde_json::to_vec(&serde_json::json!({"v":1,"kind":"config_chunk","digest":digest,"offset":i*64*1024,"total":json.len(),"data":base64::engine::general_purpose::STANDARD.encode(bytes)})).unwrap();
+            line.push(b'\n');line
+        }).collect::<Vec<_>>();
+        right.write_all(&frames[0]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("real receiver must be pending after consuming first config chunk")
+            .unwrap();
+        let requesting = client.clone();
+        let request = tokio::spawn(async move {
+            requesting
+                .request_with_timeout(Request::DaemonStatus, Duration::from_secs(5))
+                .await
+        });
+        let mut daemon = ProtoStream::new(right);
+        let outgoing = tokio::time::timeout(Duration::from_secs(3), daemon.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let RecvFrame::Envelope(outgoing) = outgoing else {
+            panic!("outbound request envelope required")
+        };
+        let Body::Request {
+            id,
+            request: outgoing_request,
+            ..
+        } = outgoing.body
+        else {
+            panic!("outbound request required")
+        };
+        assert!(
+            matches!(outgoing_request, Request::DaemonStatus),
+            "outbound branch must win while config transfer is pending"
+        );
+        for frame in frames.iter().skip(1) {
+            let line = String::from_utf8(frame[..frame.len() - 1].to_vec()).unwrap();
+            if daemon.send_raw_line(line).await.is_err() {
+                break;
+            }
+        }
+        let response_result = daemon.send(&Envelope::response(id, Response::Ack)).await;
+        let received = tokio::time::timeout(Duration::from_secs(3), client.next_event())
+            .await
+            .expect("publication must settle within test bound");
+        assert!(
+            matches!(received,Some(proto::Event::ConfigSnapshot {snapshot}) if snapshot.generation==42),
+            "complete config publication lost when outbound request cancelled partial recv"
+        );
+        assert!(
+            response_result.is_ok(),
+            "daemon can reply after publication"
+        );
+        assert!(
+            matches!(request.await.unwrap().unwrap().unwrap(), Response::Ack),
+            "interleaved outbound request completes"
+        );
+        let reentering = client.clone();
+        let next = tokio::spawn(async move { reentering.request_ok(Request::DaemonStatus).await });
+        let RecvFrame::Envelope(env) = daemon.recv().await.unwrap().unwrap() else {
+            panic!("next request")
+        };
+        let Body::Request { id, .. } = env.body else {
+            panic!("next request body")
+        };
+        daemon
+            .send(&Envelope::response(id, Response::Ack))
+            .await
+            .unwrap();
+        assert!(
+            matches!(next.await.unwrap().unwrap(), Response::Ack),
+            "connection remains usable after completed publication"
+        );
     }
 }

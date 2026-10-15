@@ -8668,6 +8668,7 @@ async fn untrusted_provider_wire_inventory_is_closed() {
 fn session_diagnostic_tables_cover_resolved_credentials_for_every_model_constructor() {
     use crate::providers::models_fetch::ResolvedHeader;
     let mut resolved = resolved_local_request("http://127.0.0.1:1/v1".into());
+    let credential_directory = tempfile::tempdir().unwrap();
     resolved.headers = vec![
         ResolvedHeader {
             name: "Authorization".into(),
@@ -8684,6 +8685,10 @@ fn session_diagnostic_tables_cover_resolved_credentials_for_every_model_construc
         ResolvedHeader {
             name: "anthropic-version".into(),
             value: "2023-06-01".into(),
+        },
+        ResolvedHeader {
+            name: "x-private-path".into(),
+            value: credential_directory.path().display().to_string(),
         },
     ];
     for trusted in [false, true] {

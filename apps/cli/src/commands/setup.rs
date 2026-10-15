@@ -736,10 +736,13 @@ async fn apply_model_wizard_via_daemon(
         return Ok((false, false, None));
     }
     let expected_entry = entry.clone();
+    let model_patch =
+        cockpit_proto::ProviderModelPatch::between(&provider_view.entry.models, &entry.models)?;
+    entry.models.clear();
     let mutation = cockpit_proto::ProviderMutationBatch {
         upserts: model_changed
             .then(|| cockpit_proto::ProviderMutationUpsert {
-                model_patch: None,
+                model_patch: Some(model_patch),
                 provider_id: provider_id.clone(),
                 header_secrets: vec![None; entry.headers.len()],
                 entry,

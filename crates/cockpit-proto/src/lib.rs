@@ -4232,6 +4232,7 @@ pub enum InterruptRaiseReason {
 /// `Body` variants differ per direction.
 pub struct ProtoStream<S> {
     framed: Framed<S, LinesCodec>,
+    config_receiver: config_frames::Receiver,
 }
 
 impl<S> ProtoStream<S>
@@ -4240,6 +4241,7 @@ where
 {
     pub fn new(stream: S) -> Self {
         Self {
+            config_receiver: Default::default(),
             framed: Framed::new(
                 stream,
                 LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
@@ -4248,20 +4250,26 @@ where
     }
 
     pub fn into_split(self) -> (ProtoReadHalf<ReadHalf<S>>, ProtoWriteHalf<WriteHalf<S>>) {
-        let (read, write) = tokio::io::split(self.framed.into_inner());
+        let parts = self.framed.into_parts();
+        let (read, write) = tokio::io::split(parts.io);
+        let mut reader = FramedRead::new(
+            read,
+            LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
+        );
+        reader.read_buffer_mut().extend_from_slice(&parts.read_buf);
+        let mut writer = FramedWrite::new(
+            write,
+            LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
+        );
+        writer
+            .write_buffer_mut()
+            .extend_from_slice(&parts.write_buf);
         (
             ProtoReadHalf {
-                framed: FramedRead::new(
-                    read,
-                    LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
-                ),
+                config_receiver: self.config_receiver,
+                framed: reader,
             },
-            ProtoWriteHalf {
-                framed: FramedWrite::new(
-                    write,
-                    LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
-                ),
-            },
+            ProtoWriteHalf { framed: writer },
         )
     }
 
@@ -4286,7 +4294,7 @@ where
     }
 
     pub async fn recv(&mut self) -> Result<Option<RecvFrame>> {
-        recv_frame(&mut self.framed).await
+        recv_frame(&mut self.framed, &mut self.config_receiver).await
     }
 
     pub async fn recv_raw_line(&mut self) -> Result<Option<String>> {
@@ -4296,6 +4304,7 @@ where
 
 pub struct ProtoReadHalf<R> {
     framed: FramedRead<R, LinesCodec>,
+    config_receiver: config_frames::Receiver,
 }
 
 impl<R> ProtoReadHalf<R>
@@ -4306,7 +4315,7 @@ where
     /// returns `Err` on framing failure (frame too large, invalid UTF-8)
     /// or JSON/header deserialization failure.
     pub async fn recv(&mut self) -> Result<Option<RecvFrame>> {
-        recv_frame(&mut self.framed).await
+        recv_frame(&mut self.framed, &mut self.config_receiver).await
     }
 }
 
@@ -4350,14 +4359,16 @@ where
     }
 }
 
-async fn recv_frame<T>(framed: &mut T) -> Result<Option<RecvFrame>>
+async fn recv_frame<T>(
+    framed: &mut T,
+    receiver: &mut config_frames::Receiver,
+) -> Result<Option<RecvFrame>>
 where
     T: futures::Stream<Item = std::result::Result<String, LinesCodecError>> + Unpin,
 {
-    match recv_raw_line(framed).await? {
+    match receiver.receive(framed).await? {
         None => Ok(None),
-        Some(line) => {
-            let (value, chunked) = config_frames::receive(framed, line).await?;
+        Some((value, chunked)) => {
             let v = value
                 .get("v")
                 .and_then(serde_json::Value::as_u64)

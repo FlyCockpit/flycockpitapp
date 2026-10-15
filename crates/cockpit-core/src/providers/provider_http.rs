@@ -124,7 +124,10 @@ pub(crate) fn with_diagnostic_credentials(
                 );
             }
             table = table
-                .with_forced_literal(value.to_string(), "provider request credential".into())
+                .with_forced_literal(
+                    value.to_string(),
+                    "$secret:provider request credential".into(),
+                )
                 .map_err(|_| anyhow::anyhow!("provider request credential coverage unavailable"))?;
         }
     }

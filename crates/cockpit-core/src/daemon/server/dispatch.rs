@@ -22358,23 +22358,13 @@ fn ensure_catalog_entries_editable(
     let view = crate::secret_ref::redact_provider_view(config);
     if view.providers.values().any(|view| {
         let mut entry = view.editable_entry();
-        let models = std::mem::take(&mut entry.models);
+        entry.models.clear();
         let metadata_bytes = serde_json::to_vec(&entry)
             .map(|v| v.len())
             .unwrap_or(usize::MAX);
-        let model_bytes = models
-            .iter()
-            .map(|model| {
-                serde_json::to_vec(model)
-                    .map(|v| v.len())
-                    .unwrap_or(usize::MAX)
-            })
-            .max()
-            .unwrap_or(0);
-        metadata_bytes
-            .saturating_add(model_bytes)
-            .saturating_add(256)
-            > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
+        // Existing rows are edited as field deltas and stay in their owning
+        // layers; only provider metadata has to fit one editable entry.
+        metadata_bytes.saturating_add(256) > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES
     }) {
         return Err(bad_request(
             "protected models or other provider configuration exceed the editable entry limit; no catalog was written",
@@ -23818,11 +23808,12 @@ async fn stage_and_recover_provider_batch(
         .map(|upsert| upsert.provider_id.clone())
         .collect::<Vec<_>>();
 
-    let allow_paged_edit = !mutation.upserts.is_empty()
-        && mutation
-            .upserts
-            .iter()
-            .all(|upsert| upsert.model_patch.is_some());
+    // Metadata/deletion-only edits also retain the already readable model
+    // inventory. They must not force a composed catalog back into one frame.
+    let allow_paged_edit = mutation
+        .upserts
+        .iter()
+        .all(|upsert| upsert.model_patch.is_some());
     for mut upsert in mutation.upserts {
         if let Some(patch) = &upsert.model_patch {
             if !upsert.entry.models.is_empty() {
@@ -23830,14 +23821,23 @@ async fn stage_and_recover_provider_batch(
                     "provider model patch requires an empty replacement inventory",
                 ));
             }
-            let mut models = effective
+            let effective_models = &effective
                 .providers
                 .get(&upsert.provider_id)
                 .ok_or_else(|| bad_request("provider model patch has no existing inventory"))?
-                .models
-                .clone();
-            patch.apply(&mut models).map_err(bad_request)?;
-            upsert.entry.models = models;
+                .models;
+            let mut authored = desired
+                .providers
+                .get(&upsert.provider_id)
+                .cloned()
+                .unwrap_or_default();
+            patch
+                .apply_to_layer(effective_models, &mut authored)
+                .map_err(bad_request)?;
+            upsert.entry.models = authored.models;
+            upsert.entry.models_replace = authored.models_replace;
+            upsert.entry.model_field_patches = authored.model_field_patches;
+            upsert.entry.model_order = authored.model_order;
         }
         // Secret resolution validates a header against the complete provider
         // projection. Keep that projection separate from the mutable headers
@@ -23927,7 +23927,11 @@ async fn stage_and_recover_provider_batch(
         if let Some(reference) = &upsert.entry.credential_ref {
             credential_claims.push((upsert.provider_id.clone(), reference.clone()));
         }
-        upsert.entry.models_replace = true;
+        if upsert.model_patch.is_none() {
+            upsert.entry.models_replace = true;
+            upsert.entry.model_field_patches.clear();
+            upsert.entry.model_order = None;
+        }
         desired.providers.insert(upsert.provider_id, upsert.entry);
     }
     for delete in mutation.deletes {
@@ -23992,7 +23996,7 @@ async fn stage_and_recover_provider_batch(
         consumed_revision: consumed_revision.to_owned(),
         result_revision: result_revision.clone(),
         config_generation,
-        config: crate::secret_ref::redact_provider_view(&desired),
+        config: crate::secret_ref::redact_provider_view(&candidate),
         status: cockpit_proto::ConfigCommitStatus::Committed,
         publication: cockpit_proto::ConfigPublicationStatus::Published,
     };

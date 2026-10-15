@@ -518,6 +518,27 @@ pub struct ProviderEntryView {
     pub credential_configured: bool,
 }
 
+/// Marker used when an owner edits a redacted provider header without
+/// replacing its daemon-owned value.
+pub const PRESERVED_PROVIDER_HEADER_VALUE: &str = "********";
+
+impl ProviderEntryView {
+    /// Exact entry representation submitted by catalog-backed settings editors.
+    /// Sharing it with producer budgeting keeps the read/edit/save caps aligned.
+    pub fn editable_entry(&self) -> cockpit_config::providers::ProviderEntry {
+        let mut entry = self.entry.clone();
+        entry.headers = self
+            .headers
+            .iter()
+            .map(|header| cockpit_config::providers::HeaderSpec {
+                name: header.name.clone(),
+                value: PRESERVED_PROVIDER_HEADER_VALUE.to_string(),
+            })
+            .collect();
+        entry
+    }
+}
+
 /// Total model-id bytes one [`Response::ProviderModelsFetched`] may carry
 /// across all of its results. A model fetch response is a *summary* of the
 /// catalog the daemon persisted, never the catalog itself: the daemon is the
@@ -554,8 +575,11 @@ impl ProviderModelIdSummary {
                 continue;
             }
             let id = id.into();
-            // Quotes, separator, and worst-case escaping headroom.
-            let cost = id.len().saturating_mul(2).saturating_add(3);
+            // Charge the actual escaped JSON string plus its separator.
+            let cost = serde_json::to_vec(&id)
+                .expect("string serializes")
+                .len()
+                .saturating_add(1);
             if cost > *budget {
                 previewing = false;
                 continue;
@@ -2089,8 +2113,9 @@ pub const COMPLETE_MCP_OAUTH_RECEIPT_LABEL: &str = "complete_mcp_oauth_receipt_v
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,
-    RunInvocationOptions, SealedActionDeclaration, UsageKind, UserMessageOrigin,
+    ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction,
+    MAX_OWNER_WIRE_IDENTIFIER_BYTES, Request, RunInvocationOptions, SealedActionDeclaration,
+    UsageKind, UserMessageOrigin,
 };
 #[cfg(feature = "remote")]
 pub use request::{

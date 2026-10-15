@@ -113,17 +113,25 @@ impl SettingsDialog {
             return;
         }
 
-        let mut newly_done: Vec<FetchedSummary> = Vec::new();
+        let mut completed = Vec::new();
         s.in_flight.retain(|handle| match handle.take() {
-            Some(outcome) => {
-                newly_done.push(FetchedSummary {
-                    provider_id: handle.provider_id.clone(),
-                    outcome,
-                });
+            Some(completion) => {
+                completed.push((handle.provider_id.clone(), completion));
                 false
             }
             None => true,
         });
+        let mut newly_done = Vec::new();
+        for (provider_id, completion) in completed {
+            let outcome = match self.adopt_refreshed_provider_snapshot(completion.snapshot) {
+                Ok(()) => completion.outcome,
+                Err(error) => Err(error),
+            };
+            newly_done.push(FetchedSummary {
+                provider_id,
+                outcome,
+            });
+        }
         if newly_done.is_empty() {
             return;
         }
@@ -169,7 +177,11 @@ impl SettingsDialog {
             self.apply_fetch_all_policy(merges, policy);
         }
         self.apply_fetch_all_degraded_statuses(degraded);
-        let _ = self.save_config();
+        // Read once after *all* requests have settled. Per-handle snapshots
+        // may have raced a later provider commit or a failed read-back.
+        // Status saves wait for this final authority, too.
+        self.pending_fetch_all_save = true;
+        self.queue_provider_catalog(None);
         if let Some(ProvidersPage::FetchAll(s)) = self.page.downcast_mut::<ProvidersPage>() {
             s.unlisted = if auto_policy.is_some() {
                 Vec::new()
@@ -190,11 +202,24 @@ impl SettingsDialog {
         )>,
         policy: ModelMergePolicy,
     ) {
-        for (provider_id, pre_fetch_models, remote, catalog) in merges {
+        for (provider_id, _pre_fetch_models, remote, catalog) in merges {
             if let Some(entry) = self.config.providers.get_mut(&provider_id) {
+                // A sibling refresh may have trimmed this provider since
+                // this summary was read. Only current authoritative entries
+                // can supply model data; old summaries select ids, not rows.
+                let current = entry
+                    .models
+                    .iter()
+                    .map(|model| (model.id.as_str(), model))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let remote = remote
+                    .iter()
+                    .filter_map(|model| current.get(model.id.as_str()).copied().cloned())
+                    .collect();
+                drop(current);
                 entry.models = merge_fetched_models_with_policy(
                     entry.effective_template(&provider_id),
-                    &pre_fetch_models,
+                    &entry.models,
                     remote,
                     policy,
                 );
@@ -231,11 +256,24 @@ impl SettingsCx {
         )>,
         policy: ModelMergePolicy,
     ) {
-        for (provider_id, pre_fetch_models, remote, catalog) in merges {
+        for (provider_id, _pre_fetch_models, remote, catalog) in merges {
             if let Some(entry) = self.config.providers.get_mut(&provider_id) {
+                // A sibling refresh may have trimmed this provider since
+                // this summary was read. Only current authoritative entries
+                // can supply model data; old summaries select ids, not rows.
+                let current = entry
+                    .models
+                    .iter()
+                    .map(|model| (model.id.as_str(), model))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let remote = remote
+                    .iter()
+                    .filter_map(|model| current.get(model.id.as_str()).copied().cloned())
+                    .collect();
+                drop(current);
                 entry.models = merge_fetched_models_with_policy(
                     entry.effective_template(&provider_id),
-                    &pre_fetch_models,
+                    &entry.models,
                     remote,
                     policy,
                 );

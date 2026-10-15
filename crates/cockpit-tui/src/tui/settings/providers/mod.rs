@@ -1263,13 +1263,21 @@ impl SettingsDialog {
                         ModelMergePolicy::KeepUnlisted
                     }
                 };
+                let baseline = self
+                    .original_config
+                    .providers
+                    .get(provider_id)
+                    .cloned()
+                    .unwrap_or_default();
                 if let Some(entry) = self.config.providers.get_mut(provider_id) {
+                    let staged = entry.clone();
                     entry.models = merge_fetched_models_with_policy(
                         entry.effective_template(provider_id),
-                        &pre_fetch_models,
-                        models,
+                        &entry.models,
+                        models.clone(),
                         policy,
                     );
+                    entry.models = super::rebase_provider_entry(&baseline, &staged, entry).models;
                     entry.models_fetched_at = Some(Utc::now());
                     entry.model_catalog = catalog;
                     entry.mark_model_fetch_success(catalog);
@@ -1301,24 +1309,35 @@ impl SettingsDialog {
                         });
                     message = "Fallback catalog committed by the daemon; refreshing its authority before finalizing onboarding…".into();
                     self.queue_provider_catalog(Some(provider_id.to_string()));
-                } else if let Some(entry) = self.config.providers.get_mut(provider_id) {
-                    entry.models = merge_fetched_models_with_policy(
-                        entry.effective_template(provider_id),
-                        &entry.models,
-                        models,
-                        ModelMergePolicy::KeepUnlisted,
-                    );
-                    entry.models_fetched_at = Some(Utc::now());
-                    entry.model_catalog = catalog;
-                    entry.mark_model_fetch_fallback(reason);
-                    let count = entry.models.len();
-                    message = match self.save_config() {
-                        Ok(()) => format!(
-                            "{}; saving provider catalog…",
-                            fetch_success_message(count, catalog)
-                        ),
-                        Err(e) => format!("save failed: {e}"),
-                    };
+                } else {
+                    let baseline = self
+                        .original_config
+                        .providers
+                        .get(provider_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(entry) = self.config.providers.get_mut(provider_id) {
+                        let staged = entry.clone();
+                        entry.models = merge_fetched_models_with_policy(
+                            entry.effective_template(provider_id),
+                            &entry.models,
+                            models.clone(),
+                            ModelMergePolicy::KeepUnlisted,
+                        );
+                        entry.models =
+                            super::rebase_provider_entry(&baseline, &staged, entry).models;
+                        entry.models_fetched_at = Some(Utc::now());
+                        entry.model_catalog = catalog;
+                        entry.mark_model_fetch_fallback(reason);
+                        let count = entry.models.len();
+                        message = match self.save_config() {
+                            Ok(()) => format!(
+                                "{}; saving provider catalog…",
+                                fetch_success_message(count, catalog)
+                            ),
+                            Err(e) => format!("save failed: {e}"),
+                        };
+                    }
                 }
             }
         } else if let Ok(FetchOutcome::FallbackAvailable {
@@ -1478,7 +1497,7 @@ impl SettingsDialog {
         }
     }
 
-    fn clear_fetch_handle(&mut self, provider_id: &str) {
+    pub(super) fn clear_fetch_handle(&mut self, provider_id: &str) {
         let Some(page) = self.page.downcast_mut::<ProvidersPage>() else {
             return;
         };
@@ -3229,8 +3248,17 @@ impl SettingsCx {
                 if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
                     entry.models = merge_fetched_models_with_policy(
                         entry.effective_template(&s.provider_id),
-                        &s.pre_fetch_models,
-                        s.remote.clone(),
+                        &entry.models,
+                        s.remote
+                            .iter()
+                            .filter_map(|model| {
+                                entry
+                                    .models
+                                    .iter()
+                                    .find(|current| current.id == model.id)
+                                    .cloned()
+                            })
+                            .collect(),
                         policy,
                     );
                     entry.models_fetched_at = Some(Utc::now());

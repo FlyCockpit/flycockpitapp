@@ -3123,20 +3123,45 @@ pub(super) fn inference_failure_guidance(
     // explicit model phrase, or the configured model id itself next to an
     // existence phrase. Generic "does not exist" prose (a request parameter,
     // a file) is not evidence that the model is missing.
-    let unknown_model = matches!(
-        code,
-        "model_not_found" | "invalid_model" | "model_not_available" | "unknown_model"
-    ) || mentions(&[
-        "not a valid model",
-        "model not found",
-        "unknown model",
-        "invalid model",
-        "no endpoints found for",
-    ]) || (!model_lower.is_empty()
-        && lower.contains(&model_lower)
-        && mentions(&["does not exist", "is not available", "not found"]));
-    let invalid_schema = matches!(code, "invalid_function_parameters" | "invalid_schema")
-        || mentions(&["invalid schema", "json schema", "tools["]);
+    let (unknown_model, invalid_schema) = match code {
+        "model_not_found" | "invalid_model" | "model_not_available" | "unknown_model" => {
+            (true, false)
+        }
+        "invalid_function_parameters" | "invalid_schema" => (false, true),
+        _ if !code.is_empty() => (false, false),
+        _ => {
+            let named_missing = ["does not exist", "is not available", "not found"]
+                .iter()
+                .any(|phrase| {
+                    [
+                        format!("model {model_lower} {phrase}"),
+                        format!("model `{model_lower}` {phrase}"),
+                        format!("model '{model_lower}' {phrase}"),
+                        format!("model \"{model_lower}\" {phrase}"),
+                    ]
+                    .iter()
+                    .any(|signal| {
+                        lower.match_indices(signal).any(|(index, _)| {
+                            index == 0
+                                || lower[..index]
+                                    .chars()
+                                    .next_back()
+                                    .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_')
+                        })
+                    })
+                });
+            (
+                mentions(&[
+                    "not a valid model",
+                    "model not found",
+                    "unknown model",
+                    "invalid model",
+                    "no endpoints found for",
+                ]) || (!model_lower.is_empty() && named_missing),
+                mentions(&["invalid schema", "json schema", "tools["]),
+            )
+        }
+    };
     Some(match error_class {
         Class::Http(401) => format!(
             "{provider} rejected the API key. Update it in /settings › Providers, then send your message again."
@@ -3150,7 +3175,7 @@ pub(super) fn inference_failure_guidance(
         Class::Http(400 | 404 | 422) if unknown_model => {
             format!("{provider} does not serve `{model}`. Pick another model with /model.")
         }
-        Class::Http(400 | 422) if invalid_schema => format!(
+        Class::Http(400 | 404 | 422) if invalid_schema => format!(
             "{provider} rejected Cockpit's tool schema for `{model}`. Try another model, or another Wire API for it in /settings › Providers."
         ),
         Class::Http(400 | 422) => format!(

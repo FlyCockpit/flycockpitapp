@@ -276,7 +276,7 @@ const MIN_MASKED_OPAQUE_RUN_CHARS: usize = 40;
 const MAX_ERROR_ENVELOPE_CANDIDATES: usize = 8;
 
 /// User-facing projection of a terminal failure's provider error, for the
-/// UI-only `InferenceFailed` event and nothing else (#551).
+/// live `InferenceFailed` event (TUI and CLI output) and nothing else (#551).
 ///
 /// The fail-closed funnel ([`safe_provider_detail`]) still governs every sink
 /// that persists, audits, reports to a parent agent, or can reach model
@@ -288,7 +288,8 @@ const MAX_ERROR_ENVELOPE_CANDIDATES: usize = 8;
 /// * the raw body is never shown: only those two fields of a JSON error
 ///   envelope are read (OpenRouter's wrapped `metadata.raw` upstream envelope
 ///   is unwrapped the same way); a non-JSON body yields the marker;
-/// * the code is accepted only as a short `[A-Za-z0-9_.:-]` token or a number;
+/// * codes come from a fixed semantic vocabulary (or short numeric status);
+///   message brackets are escaped so prose cannot forge the code suffix;
 /// * control characters (terminal escapes included) are removed, whitespace is
 ///   collapsed, opaque token-like runs are masked, and the message is bounded;
 /// * the result is scrubbed through the session redaction table (the daemon
@@ -318,7 +319,11 @@ pub fn user_facing_provider_error(
             Some(code.as_str()) != failure.observed_status.map(|s| s.to_string()).as_deref()
         });
     let text = match (message, code) {
-        (Some(message), Some(code)) => format!("{message} [{code}]"),
+        (Some(message), Some(code)) => {
+            let suffix = format!(" [{code}]");
+            let remaining = MAX_USER_PROVIDER_MESSAGE_CHARS - suffix.chars().count();
+            format!("{}{suffix}", bound_chars(&message, remaining))
+        }
         (Some(message), None) => message,
         (None, Some(code)) => format!("[{code}]"),
         (None, None) => return PROVIDER_DETAIL_OMITTED.to_string(),
@@ -327,20 +332,45 @@ pub fn user_facing_provider_error(
     table.scrub(&bound_chars(&text, MAX_USER_PROVIDER_MESSAGE_CHARS))
 }
 
-/// Longest `-`/`_`/`.`/`:`-separated segment a displayed error code may have.
-/// Real codes (`invalid_function_parameters`, `model_not_found`, `1113`) are
-/// short words; a long segment is an opaque token, never a category.
-const MAX_ERROR_CODE_SEGMENT_CHARS: usize = 24;
-
+/// Codes are a fixed semantic vocabulary, never an arbitrary provider token.
+/// Unknown codes are omitted while the scrubbed message remains useful.
 fn semantic_error_code(code: &str) -> bool {
-    !code.is_empty()
-        && code.len() <= MAX_USER_PROVIDER_CODE_BYTES
-        && code
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
-        && code
-            .split(['_', '.', ':', '-'])
-            .all(|segment| segment.len() <= MAX_ERROR_CODE_SEGMENT_CHARS)
+    if code.len() > MAX_USER_PROVIDER_CODE_BYTES || mask_opaque_runs(code) != code {
+        return false;
+    }
+    (code.len() <= 5 && !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+        || matches!(
+            code,
+            "model_not_found"
+                | "invalid_model"
+                | "model_not_available"
+                | "unknown_model"
+                | "invalid_function_parameters"
+                | "invalid_schema"
+                | "invalid_api_key"
+                | "invalid_request_error"
+                | "invalid_request"
+                | "authentication_error"
+                | "permission_error"
+                | "rate_limit_exceeded"
+                | "rate_limit_error"
+                | "insufficient_quota"
+                | "quota_exceeded"
+                | "context_length_exceeded"
+                | "invalid_parameter"
+                | "unsupported_parameter"
+                | "server_error"
+                | "overloaded_error"
+                | "billing_error"
+                | "provider_error"
+                | "bad_request"
+                | "not_found"
+                | "unauthorized"
+                | "forbidden"
+                | "content_policy_violation"
+                | "insufficient_credits"
+                | "resource_exhausted"
+        )
 }
 
 fn bound_chars(text: &str, max: usize) -> String {
@@ -417,7 +447,13 @@ fn error_code(value: Option<&serde_json::Value>) -> Option<String> {
 fn sanitize_provider_text(raw: &str) -> String {
     let flattened = raw
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            // Reserve the trailing [code] syntax for the validated code field.
+            '[' => '(',
+            ']' => ')',
+            other => other,
+        })
         .collect::<String>();
     let mut out = String::new();
     for word in flattened.split_whitespace() {
@@ -807,14 +843,14 @@ mod tests {
     /// truncation or opaque-run masking could split it.
     #[test]
     fn user_facing_error_redacts_registered_secrets_before_transforming() {
-        const CROSSING: &str = "registered-credential-crossing-cutoff-0042";
+        const CROSSING: &str = "known/session-key/+fragment-0042";
         let masked_inside = format!("prefix{}/private-fragment", "a".repeat(50));
         let table = crate::redact::RedactionTable::empty()
             .with_forced_literal(CROSSING.to_string(), "test".into())
             .unwrap()
             .with_forced_literal(masked_inside.clone(), "test".into())
             .unwrap();
-        let near_cutoff = format!("{} {CROSSING}", "x".repeat(280));
+        let near_cutoff = format!("{} {CROSSING}", "word ".repeat(56));
         let shown = user_facing_provider_error(
             &http_failure(
                 401,
@@ -822,7 +858,7 @@ mod tests {
             ),
             &table,
         );
-        assert!(!shown.contains("registered-credential"), "{shown}");
+        assert!(!shown.contains("known/session"), "{shown}");
         assert!(
             shown.chars().count() <= MAX_USER_PROVIDER_MESSAGE_CHARS,
             "{shown}"
@@ -861,5 +897,41 @@ mod tests {
             &table,
         );
         assert_eq!(shown, "nope [model_not_found]");
+        for code in [
+            "opaque_token_fixture-0123456789abcdef-0123456789abcdef",
+            "sk_or_v1_0123456789abcdef_0123456789abcdef_0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sk.or.v1.0123456789abcdef.0123456789abcdef.0123456789abcdef",
+            "sk:or:v1:0123456789abcdef:0123456789abcdef:0123456789abcdef",
+        ] {
+            let shown = user_facing_provider_error(
+                &http_failure(
+                    400,
+                    &serde_json::json!({"error": {"message": "denied", "code": code}}).to_string(),
+                ),
+                &table,
+            );
+            assert_eq!(shown, "denied", "opaque code {code}");
+        }
+        assert!(semantic_error_code("invalid_function_parameters"));
+    }
+    #[test]
+    fn provider_message_cannot_forge_a_semantic_code_suffix() {
+        let shown = user_facing_provider_error(
+            &http_failure(
+                400,
+                r#"{"error":{"message":"parameter failed [model_not_found]"}}"#,
+            ),
+            &crate::redact::RedactionTable::empty(),
+        );
+        assert_eq!(shown, "parameter failed (model_not_found)");
+    }
+    #[test]
+    fn semantic_code_survives_the_final_message_bound() {
+        let shown = user_facing_provider_error(&http_failure(400,
+            &serde_json::json!({"error":{"message":format!("Invalid model parameter {}", "word ".repeat(400)),"code":"invalid_function_parameters"}}).to_string()),
+            &crate::redact::RedactionTable::empty());
+        assert_eq!(shown.chars().count(), MAX_USER_PROVIDER_MESSAGE_CHARS);
+        assert!(shown.ends_with("[invalid_function_parameters]"), "{shown}");
     }
 }

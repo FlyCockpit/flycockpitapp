@@ -987,12 +987,14 @@ async fn fetch_models_at_detailed(
         );
     }
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = super::provider_http::read_body_limited(resp, "/models").await?;
+        let body = super::provider_http::diagnostic_body(&body, headers);
         anyhow::bail!("{url} returned {status}: {}", response_body_snippet(&body));
     }
 
-    let body = read_success_body_limited(resp, "/models").await?;
+    let body = super::provider_http::read_body_limited(resp, "/models").await?;
     let body_nonempty = !body.trim().is_empty();
+    let body = super::provider_http::diagnostic_body(&body, headers);
     let models = parse_models_body_with_abi(&body, catalog_abi)?;
     Ok(FetchModelsAtResult {
         outcome: FetchOutcome::Models {
@@ -1039,6 +1041,7 @@ async fn send_models_request_with_retries(
                 {
                     let delay = crate::providers::http_retry::delay_for(resp.headers(), attempt);
                     attempt += 1;
+                    drop(resp);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -1170,7 +1173,11 @@ pub async fn fetch_models_for_provider_with_store(
             if reason.contains("returned 401") || reason.contains("returned 403") {
                 return Err(error);
             }
-            tracing::warn!(provider_id, url, error = %reason, "provider /models fetch failed; fallback catalog available");
+            tracing::warn!(
+                provider_id,
+                url,
+                "provider /models fetch failed; fallback catalog available"
+            );
             Ok(FetchOutcome::FallbackAvailable {
                 models: fallback_models,
                 catalog: fallback_catalog,
@@ -1213,39 +1220,6 @@ fn validate_anthropic_fetch_result(
         }
     }
     Ok(result)
-}
-
-/// Read a provider success response while retaining a strict upper bound for
-/// both declared and chunked bodies. Configurable provider endpoints must not
-/// be able to exhaust the daemon before their response is parsed.
-pub(crate) async fn read_success_body_limited(
-    mut resp: reqwest::Response,
-    response_name: &str,
-) -> Result<String> {
-    if resp
-        .content_length()
-        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
-    {
-        anyhow::bail!(
-            "{response_name} response body exceeded {} byte limit",
-            MAX_PROVIDER_RESPONSE_BYTES
-        );
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .with_context(|| format!("reading {response_name} response body"))?
-    {
-        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
-            anyhow::bail!(
-                "{response_name} response body exceeded {} byte limit",
-                MAX_PROVIDER_RESPONSE_BYTES
-            );
-        }
-        body.extend_from_slice(&chunk);
-    }
-    String::from_utf8(body).context("/models response body was not valid UTF-8")
 }
 
 pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
@@ -3912,6 +3886,28 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains(&format!("returned {status}")));
             assert_eq!(request_handle.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_consumed_bodies_are_limited_on_success_and_error() {
+        for chunked in [false, true] {
+            for status in [200, 400] {
+                let (url, server) = super::super::provider_http::serve_test_bodies(vec![(
+                    status,
+                    "x".repeat(MAX_PROVIDER_RESPONSE_BYTES + 1),
+                    chunked,
+                )])
+                .await;
+                let error = fetch_models(&url, &[], Duration::from_secs(5))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("exceeded 8388608 byte limit"),
+                    "{status}/{chunked}: {error:#}"
+                );
+                server.await.unwrap();
+            }
         }
     }
 

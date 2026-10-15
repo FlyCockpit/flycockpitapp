@@ -1472,3 +1472,65 @@ fn unknown_model_guidance_requires_a_model_signal() {
         "{coded}"
     );
 }
+
+#[test]
+fn provider_guidance_code_precedence_and_model_token_boundaries() {
+    use cockpit_proto::InferenceErrorClass as Class;
+    for detail in [
+        "Invalid model parameter: temperature [invalid_function_parameters]",
+        "Unknown model [invalid_schema]",
+    ] {
+        let shown =
+            super::events::inference_failure_guidance(&Class::Http(400), detail, "p", "m").unwrap();
+        assert!(shown.contains("tool schema"), "{shown}");
+        assert!(!shown.contains("does not serve"), "{shown}");
+    }
+    for model in ["m", "temp", "temperature"] {
+        let shown = super::events::inference_failure_guidance(
+            &Class::Http(400),
+            "The request parameter 'temperature' does not exist",
+            "p",
+            model,
+        )
+        .unwrap();
+        assert!(!shown.contains("does not serve"), "{model}: {shown}");
+    }
+    for detail in [
+        "model `m` does not exist",
+        "model m is not available",
+        "nope [model_not_found]",
+    ] {
+        let shown =
+            super::events::inference_failure_guidance(&Class::Http(400), detail, "p", "m").unwrap();
+        assert!(shown.contains("does not serve"), "{shown}");
+    }
+}
+
+#[test]
+fn recognized_non_model_codes_block_model_prose_fallbacks() {
+    use cockpit_proto::InferenceErrorClass as Class;
+    for detail in [
+        "Invalid model parameter [invalid_parameter]",
+        "unknown model [invalid_api_key]",
+    ] {
+        let shown =
+            super::events::inference_failure_guidance(&Class::Http(400), detail, "p", "m").unwrap();
+        assert!(!shown.contains("does not serve"), "{shown}");
+    }
+    let shown = super::events::inference_failure_guidance(
+        &Class::Http(400),
+        "supermodel m does not exist",
+        "p",
+        "m",
+    )
+    .unwrap();
+    assert!(!shown.contains("does not serve"), "{shown}");
+    let shown = super::events::inference_failure_guidance(
+        &Class::Http(404),
+        "Invalid model [invalid_schema]",
+        "p",
+        "m",
+    )
+    .unwrap();
+    assert!(shown.contains("tool schema"), "{shown}");
+}

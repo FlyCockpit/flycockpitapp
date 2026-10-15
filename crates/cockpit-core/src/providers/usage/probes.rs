@@ -247,7 +247,8 @@ impl DeclarativeUsageProbe {
         if !status.is_success() {
             anyhow::bail!("usage API returned {status}");
         }
-        let body = models_fetch::read_success_body_limited(response, "usage API").await?;
+        let body =
+            crate::providers::provider_http::read_body_limited(response, "usage API").await?;
         let body =
             serde_json::from_str::<Value>(&body).context("parsing declarative usage JSON")?;
         extract_usage_fields(&body, &self.spec)
@@ -399,16 +400,16 @@ async fn fetch_codex_usage_with_store(
     let resp = send_codex_usage_request_with_retries(&client, &url, &resolved.headers).await?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body =
+            crate::providers::provider_http::read_body_limited(resp, "Codex usage API").await?;
+        let body = crate::providers::provider_http::diagnostic_body(&body, &resolved.headers);
         anyhow::bail!(
             "Codex usage API returned {status}: {}",
             crate::providers::models_fetch::response_body_snippet(&body)
         );
     }
-    let body = resp
-        .json::<Value>()
-        .await
-        .context("parsing Codex usage JSON")?;
+    let body = crate::providers::provider_http::read_body_limited(resp, "Codex usage API").await?;
+    let body = serde_json::from_str::<Value>(&body).context("parsing Codex usage JSON")?;
     Ok(parse_codex_usage(&body))
 }
 
@@ -448,6 +449,7 @@ async fn send_codex_usage_request_with_retries(
                 {
                     let delay = crate::providers::http_retry::delay_for(resp.headers(), attempt);
                     attempt += 1;
+                    drop(resp);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -613,6 +615,74 @@ fn display_name(provider_id: &str, entry: &ProviderEntry) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn codex_usage_consumed_bodies_are_limited_for_json_and_errors() {
+        for chunked in [false, true] {
+            for status in [200, 400] {
+                let (url, server) = crate::providers::provider_http::serve_test_bodies(vec![(
+                    status,
+                    "x".repeat(crate::providers::models_fetch::MAX_PROVIDER_RESPONSE_BYTES + 1),
+                    chunked,
+                )])
+                .await;
+                let entry = crate::config::providers::ProviderEntry {
+                    url,
+                    allow_insecure_http: true,
+                    auth: Some(crate::config::providers::AuthKind::None),
+                    ..Default::default()
+                };
+                let error =
+                    super::fetch_codex_usage_with_store("local", &entry, None, Default::default())
+                        .await
+                        .unwrap_err();
+                assert!(
+                    error.to_string().contains("exceeded 8388608 byte limit"),
+                    "{status}/{chunked}: {error:#}"
+                );
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_diagnostic_redacts_complete_credentials_before_cutoffs() {
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let store = crate::credentials::CredentialStore::open_default().unwrap();
+        const SECRET: &str = "known/session-key/+fragment-0042";
+        for padding in [210, 230, 245] {
+            let message = format!(
+                "useful diagnostic {}{SECRET} denied",
+                "word ".repeat(padding / 5)
+            );
+            let (url, server) =
+                crate::providers::provider_http::serve_test_bodies(vec![(400, message, true)])
+                    .await;
+            let entry = crate::config::providers::ProviderEntry {
+                url,
+                allow_insecure_http: true,
+                auth: Some(crate::config::providers::AuthKind::None),
+                headers: vec![crate::config::providers::HeaderSpec {
+                    name: "Authorization".into(),
+                    value: "Bearer $LANE545_KEY".into(),
+                }],
+                ..Default::default()
+            };
+            let error = super::fetch_codex_usage_with_store(
+                "local",
+                &entry,
+                Some(store.clone()),
+                std::collections::HashMap::from([("LANE545_KEY".into(), SECRET.into())]),
+            )
+            .await
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(!message.contains("known/session"), "{message}");
+            assert!(message.contains("useful diagnostic"), "{message}");
+            assert!(message.contains("400"), "{message}");
+            server.await.unwrap();
+        }
+    }
+
     use super::*;
     use crate::config::providers::{
         HeaderSpec, ProvidersConfig, UsageProbeField, UsageProbeFieldKind, UsageProbeSpec,

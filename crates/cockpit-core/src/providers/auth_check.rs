@@ -936,6 +936,10 @@ mod tests {
             .host_str()
             .map(str::to_string);
         eprintln!("LANE545_C5_HOST={host:?}");
-        assert!(host.is_some());
+        assert_eq!(host.as_deref(), Some("openrouter.ai."));
+        assert!(matches!(
+            crate::providers::public_catalog_auth_check("https://openrouter.ai./api/v1"),
+            Some(crate::providers::AuthCheckKind::AuthenticatedGetThenModels { path: "/key", .. })
+        ));
     }
 }

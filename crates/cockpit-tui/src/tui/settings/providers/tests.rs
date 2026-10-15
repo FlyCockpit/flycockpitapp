@@ -5073,10 +5073,21 @@ fn deep_fetch_success_refreshes_cached_and_parent_provider_entry() {
 
     let mut state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
     state.set_running_for_test();
-    state.finish_with_config_for_test(
+    let snapshot = runtime.block_on(async {
+        let client = crate::tui::settings::settings_daemon_client(
+            &crate::tui::settings::test_lifecycle_client(),
+        )
+        .await
+        .unwrap();
+        super::super::auth::provider_snapshot(&client, &tmp.path().display().to_string())
+            .await
+            .unwrap()
+    });
+    let expected_revision = snapshot.authority.base_revision.clone();
+    state.finish_with_snapshot_for_test(
         Ok("deep fetch complete: refreshed".into()),
         Vec::new(),
-        &persisted,
+        snapshot,
     );
     let stale_parent = EditState::new("p".into(), dialog.config.providers["p"].clone());
     dialog.set_test_page(Page::Providers(ProvidersPage::DeepFetch {
@@ -5084,6 +5095,14 @@ fn deep_fetch_success_refreshes_cached_and_parent_provider_entry() {
         parent: Box::new(stale_parent),
     }));
     dialog.tick();
+    assert_eq!(
+        dialog
+            .provider_edit_authority
+            .as_ref()
+            .unwrap()
+            .base_revision,
+        expected_revision
+    );
 
     assert!(
         dialog.config.providers["p"]
@@ -8125,4 +8144,326 @@ fn pointer_confirmation_cleanup_keeps_committed_oauth_copy_and_copilot_setup() {
         state.operation.is_pending(),
         "the committed Copilot setup operation must stay in flight"
     );
+}
+
+#[test]
+fn refresh_adopts_authority_then_saves_without_reconstructing_trimmed_models() {
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 16384];
+            let read = socket.read(&mut request).unwrap();
+            assert!(read > 0);
+            let body = serde_json::json!({"data":(0..5000).map(|i| serde_json::json!({"id":format!("vendor/model-{i:04}-long-name"),"name":"a long display name ".repeat(8),"context_length":131072})).collect::<Vec<_>>()}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        config.providers.get_mut("p").unwrap().url = format!("http://{address}/v1");
+        config.providers.get_mut("p").unwrap().allow_insecure_http = true;
+        config.providers.get_mut("p").unwrap().auth = Some(AuthKind::None);
+        config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .push(model("manual-only", true));
+        // Refresh the same existing ids with larger metadata so the daemon
+        // must trim old rows. Copying a pre-fetch bag back would fail below.
+        config
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .models
+            .extend((0..5000).map(|i| ModelEntry {
+                id: format!("vendor/model-{i:04}-long-name"),
+                ..Default::default()
+            }));
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let before = dialog
+            .provider_edit_authority
+            .as_ref()
+            .unwrap()
+            .config_generation;
+        let mut editor = EditState::new("p".into(), dialog.config.providers["p"].clone());
+        editor.entry.favorite = Some(true); // staged owner intent survives adoption
+        dialog.set_test_page(Page::Providers(ProvidersPage::Edit(editor)));
+        let handle = FetchHandle::spawn(
+            crate::tui::settings::test_lifecycle_client(),
+            "p".into(),
+            dialog.config.providers["p"].clone(),
+            root.clone(),
+        );
+        let completion = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if let Some(result) = handle.take() {
+                        break result;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap()
+        });
+        server.join().unwrap();
+        let expected = completion.snapshot.as_ref().unwrap().config.providers["p"]
+            .entry
+            .models
+            .clone();
+        assert!(expected.len() < 5000 && !expected.is_empty());
+        assert!(
+            !expected
+                .iter()
+                .any(|m| m.id == "vendor/model-4999-long-name"),
+            "an existing row must actually be trimmed"
+        );
+        assert!(expected.iter().any(|m| m.id == "manual-only" && m.manual));
+        dialog
+            .adopt_refreshed_provider_snapshot(completion.snapshot)
+            .unwrap();
+        dialog.sync_refreshed_provider_editor();
+        assert!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .config_generation
+                > before
+        );
+        dialog.apply_fetch_result("p", completion.outcome);
+        dialog.settle_test_effects();
+        let Some(ProvidersPage::Edit(editor)) = dialog.page.downcast_mut::<ProvidersPage>() else {
+            panic!("editor");
+        };
+        assert_eq!(editor.entry.favorite, Some(true));
+        assert_eq!(editor.entry.models.len(), expected.len());
+        let entry = (*editor.entry).clone();
+        dialog.config.providers.insert("p".into(), entry);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        let saved = load_provider(&tmp.path().join(".cockpit/config.json"), "p");
+        assert_eq!(saved.favorite, Some(true));
+        assert_eq!(
+            serde_json::to_value(&saved.models).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "save must not recreate entries omitted by the daemon"
+        );
+
+        // A real failed snapshot read cannot leave the editor usable.
+        let mcp_path = tmp.path().join(".cockpit/mcp.json");
+        std::fs::write(&mcp_path, "[").unwrap();
+        let failed = runtime.block_on(super::super::auth::provider_snapshot(&client, &root));
+        assert!(failed.is_err());
+        assert!(dialog.adopt_refreshed_provider_snapshot(failed).is_err());
+        assert!(dialog.provider_edit_authority.is_none());
+        assert!(dialog.provider_catalog_reload_required);
+        assert!(dialog.save_config().is_err());
+        assert!(!dialog.handle_key(press(KeyCode::Char('f'))));
+        assert_eq!(
+            load_provider(&tmp.path().join(".cockpit/config.json"), "p").favorite,
+            Some(true)
+        );
+        std::fs::write(&mcp_path, "{}").unwrap();
+        let recovered = runtime.block_on(super::super::auth::provider_snapshot(&client, &root));
+        dialog.adopt_refreshed_provider_snapshot(recovered).unwrap();
+        dialog.sync_refreshed_provider_editor();
+        assert!(!dialog.provider_catalog_reload_required);
+        assert!(dialog.provider_edit_authority.is_some());
+    });
+}
+
+#[test]
+fn fetch_all_final_snapshot_precedes_editable_status_save() {
+    use std::io::{Read, Write};
+    let (_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    super::super::with_settings_daemon_effect(Arc::new(InProcessSettingsDaemonEffect), || {
+        let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+        let mut servers = Vec::new();
+        for id in ["p", "sibling"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let id_owned = id.to_string();
+            servers.push(std::thread::spawn(move || {
+                let (mut socket, _)=listener.accept().unwrap();
+                let mut request=[0;16384];let read = socket.read(&mut request).unwrap(); assert!(read > 0);
+                let body=serde_json::json!({"data":[{"id":format!("{id_owned}/fetched")}]}).to_string();
+                write!(socket,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }));
+            let mut entry = config.providers["p"].clone();
+            entry.url = format!("http://{address}/v1");
+            entry.allow_insecure_http = true;
+            entry.auth = Some(AuthKind::None);
+            entry.models.push(model("manual-only", true));
+            config.providers.insert(id.into(), entry);
+        }
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let root = tmp.path().display().to_string();
+        let client = runtime
+            .block_on(crate::tui::settings::settings_daemon_client(
+                &crate::tui::settings::test_lifecycle_client(),
+            ))
+            .unwrap();
+        let initial = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        dialog
+            .adopt_refreshed_provider_snapshot(Ok(initial))
+            .unwrap();
+        let all = FetchAllState::spawn(
+            crate::tui::settings::test_lifecycle_client(),
+            &dialog.config,
+            root.clone(),
+        );
+        dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(all)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            dialog.tick();
+            dialog.settle_test_effects();
+            let finished = matches!(dialog.page.downcast_ref::<ProvidersPage>(),Some(ProvidersPage::FetchAll(state)) if state.in_flight.is_empty() && state.policy_resolved);
+            if finished
+                && !dialog.authority_operation_pending()
+                && !dialog.provider_catalog_reload_required
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fetch-all failed to adopt final authority: {:?}",
+                dialog.extended_warnings
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
+        let final_snapshot = runtime
+            .block_on(super::super::auth::provider_snapshot(&client, &root))
+            .unwrap();
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .config_generation,
+            final_snapshot.authority.config_generation
+        );
+        assert_eq!(
+            dialog
+                .provider_edit_authority
+                .as_ref()
+                .unwrap()
+                .base_revision,
+            final_snapshot.authority.base_revision
+        );
+        for id in ["p", "sibling"] {
+            assert!(
+                dialog.config.providers[id]
+                    .models
+                    .iter()
+                    .any(|m| m.id == "manual-only" && m.manual)
+            );
+            assert!(
+                dialog.config.providers[id]
+                    .models
+                    .iter()
+                    .any(|m| m.id == format!("{id}/fetched"))
+            );
+        }
+        dialog.config.providers.get_mut("sibling").unwrap().favorite = Some(true);
+        dialog.save_config().unwrap();
+        dialog.settle_test_effects();
+        assert_eq!(
+            load_provider(&tmp.path().join(".cockpit/config.json"), "sibling").favorite,
+            Some(true)
+        );
+    });
+}
+
+#[test]
+fn fetch_all_stale_summary_cannot_restore_trimmed_rows_or_metadata() {
+    let mut config = one_provider_config(Some(OnUnlistedModelsFetch::Keep));
+    let entry = config.providers.get_mut("p").unwrap();
+    entry.models = vec![
+        ModelEntry {
+            id: "current".into(),
+            context_length: Some(4242),
+            ..Default::default()
+        },
+        model("manual-only", true),
+    ];
+    let (_tmp, mut dialog) = dialog_with_config(config);
+    dialog.cx.apply_fetch_all_policy(
+        vec![(
+            "p".into(),
+            vec![model("trimmed", false)],
+            vec![
+                model("trimmed", false),
+                ModelEntry {
+                    id: "current".into(),
+                    context_length: Some(1),
+                    ..Default::default()
+                },
+            ],
+            ProviderModelCatalog::Live,
+        )],
+        ModelMergePolicy::KeepUnlisted,
+    );
+    let models = &dialog.config.providers["p"].models;
+    assert!(!models.iter().any(|m| m.id == "trimmed"));
+    assert_eq!(
+        models
+            .iter()
+            .find(|m| m.id == "current")
+            .unwrap()
+            .context_length,
+        Some(4242)
+    );
+    assert!(models.iter().any(|m| m.id == "manual-only" && m.manual));
+}
+
+#[test]
+fn refetch_rebase_keeps_explicit_model_intent_without_restoring_unchanged_trimmed_rows() {
+    let baseline = provider_with_models(vec![
+        model("unchanged-trimmed", false),
+        model("edited", false),
+    ]);
+    let mut staged = baseline.clone();
+    staged.models[1].favorite = true;
+    let fresh = provider_with_models(vec![model("new-server-model", false)]);
+    let rebased = super::super::rebase_provider_entry(&baseline, &staged, &fresh);
+    assert!(!rebased.models.iter().any(|m| m.id == "unchanged-trimmed"));
+    assert!(
+        rebased
+            .models
+            .iter()
+            .any(|m| m.id == "edited" && m.favorite)
+    );
+    assert!(rebased.models.iter().any(|m| m.id == "new-server-model"));
+    let fresh = provider_with_models(vec![ModelEntry {
+        id: "edited".into(),
+        context_length: Some(4242),
+        ..Default::default()
+    }]);
+    let rebased = super::super::rebase_provider_entry(&baseline, &staged, &fresh);
+    assert_eq!(rebased.models.len(), 1);
+    assert!(rebased.models[0].favorite);
+    assert_eq!(rebased.models[0].context_length, Some(4242));
 }

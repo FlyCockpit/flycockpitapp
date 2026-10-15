@@ -22033,8 +22033,44 @@ async fn provider_catalog_snapshot(
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     recover_provider_config_journals(ctx, project_root, None).await?;
-    let (cwd, trust_policy, mut config, provider_warnings) =
+    let (cwd, trust_policy, config, provider_warnings) =
         daemon_provider_config_with_warnings(ctx, project_root).await?;
+    let response = provider_catalog_candidate_snapshot(
+        ctx,
+        project_root,
+        provider_id,
+        snapshot_session_id,
+        capability_owner,
+        cwd,
+        trust_policy,
+        config,
+        provider_warnings,
+        inventory::current_config_generation(),
+        true,
+    )
+    .await?;
+    bounded_provider_response(response).map_err(|_| bad_request(
+        "the complete provider/config snapshot exceeds the readable limit; reduce provider catalogs or MCP/extended configuration before editing"
+    ))
+}
+
+/// Both reads and pre-commit guards serialize this exact representation. A
+/// dry run includes all authority/envelope/MCP/extended fields but publishes no
+/// capability; generation is charged at its maximum width before a commit.
+#[allow(clippy::too_many_arguments)]
+async fn provider_catalog_candidate_snapshot(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: Option<&str>,
+    snapshot_session_id: &str,
+    capability_owner: String,
+    cwd: std::path::PathBuf,
+    trust_policy: crate::config::trust::WorkspaceTrustPolicy,
+    mut config: crate::config::providers::ProvidersConfig,
+    provider_warnings: Vec<String>,
+    config_generation: u64,
+    publish_capability: bool,
+) -> std::result::Result<Response, ErrorPayload> {
     // The CAS covers the complete effective provider projection even when the
     // caller asks to render only one row. A sibling provider edit therefore
     // invalidates this capability instead of being overwritten by a partial
@@ -22048,7 +22084,6 @@ async fn provider_catalog_snapshot(
         config.providers.clear();
         config.providers.insert(provider_id.to_string(), entry);
     }
-    let config_generation = inventory::current_config_generation();
     let canonical_root = crate::secret_ownership::canonical_owner_root(project_root);
     // User-level config always has a writable home: the resolver falls back
     // to the global layer even when that directory does not yet exist, so
@@ -22125,50 +22160,52 @@ async fn provider_catalog_snapshot(
             mcp_scope_targets.insert("workspace".to_string(), (path, revision));
         }
     }
-    let mut mcp_scope_revisions = std::collections::BTreeMap::new();
+    let mcp_scope_revisions = mcp_scope_targets
+        .iter()
+        .map(|(scope, (_, revision))| (scope.clone(), revision.clone()))
+        .collect();
     let minted_edit_capability = if let Some(target_path) = target_path {
         let create_on_first_write = is_missing_global_layer_target(&target_path);
-        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
-            .lock()
-            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
-        let now = Instant::now();
-        capabilities.retain(|_, capability| capability.expires_at > now);
-        if capabilities.len() >= PROVIDER_EDIT_CAPABILITY_CAPACITY
-            && !capabilities.contains_key(snapshot_session_id)
-        {
-            return Err(bad_request(
-                "provider edit capability capacity reached; retry after an edit expires",
-            ));
+        if publish_capability {
+            let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+                .lock()
+                .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+            let now = Instant::now();
+            capabilities.retain(|_, capability| capability.expires_at > now);
+            if capabilities.len() >= PROVIDER_EDIT_CAPABILITY_CAPACITY
+                && !capabilities.contains_key(snapshot_session_id)
+            {
+                return Err(bad_request(
+                    "provider edit capability capacity reached; retry after an edit expires",
+                ));
+            }
+
+            capabilities.insert(
+                snapshot_session_id.to_string(),
+                ProviderEditCapability {
+                    owner: capability_owner,
+                    project_root: canonical_root.clone(),
+                    target_path,
+                    layer_id: layer_id.clone(),
+                    revision: revision.clone(),
+                    config_generation,
+                    create_on_first_write,
+                    // An absent MCP layer leaves empty bindings; `save_mcp_config`
+                    // then fails its path/revision equality checks, so the
+                    // capability cannot be replayed against an MCP target.
+                    mcp_target_path: mcp
+                        .as_ref()
+                        .map(|mcp| std::path::PathBuf::from(&mcp.config_path))
+                        .unwrap_or_default(),
+                    mcp_revision: mcp
+                        .as_ref()
+                        .map(|mcp| mcp.revision.clone())
+                        .unwrap_or_default(),
+                    mcp_scope_targets,
+                    expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
+                },
+            );
         }
-        mcp_scope_revisions = mcp_scope_targets
-            .iter()
-            .map(|(scope, (_path, revision))| (scope.clone(), revision.clone()))
-            .collect();
-        capabilities.insert(
-            snapshot_session_id.to_string(),
-            ProviderEditCapability {
-                owner: capability_owner,
-                project_root: canonical_root.clone(),
-                target_path,
-                layer_id: layer_id.clone(),
-                revision: revision.clone(),
-                config_generation,
-                create_on_first_write,
-                // An absent MCP layer leaves empty bindings; `save_mcp_config`
-                // then fails its path/revision equality checks, so the
-                // capability cannot be replayed against an MCP target.
-                mcp_target_path: mcp
-                    .as_ref()
-                    .map(|mcp| std::path::PathBuf::from(&mcp.config_path))
-                    .unwrap_or_default(),
-                mcp_revision: mcp
-                    .as_ref()
-                    .map(|mcp| mcp.revision.clone())
-                    .unwrap_or_default(),
-                mcp_scope_targets,
-                expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
-            },
-        );
         true
     } else {
         false
@@ -22192,12 +22229,7 @@ async fn provider_catalog_snapshot(
         }
     }
     view.extended_config_json = Some(redacted_extended_config_json(ctx, &cwd, &trust_policy)?);
-    let largest = view
-        .providers
-        .iter()
-        .map(|(id, entry)| (id.clone(), entry.entry.models.len()))
-        .max_by_key(|(_, models)| *models);
-    bounded_provider_response(Response::ProviderCatalogSnapshot {
+    Ok(Response::ProviderCatalogSnapshot {
         config: view,
         snapshot_session_id: snapshot_session_id.to_string(),
         layer_id,
@@ -22205,15 +22237,56 @@ async fn provider_catalog_snapshot(
         base_revision: revision,
         config_generation,
     })
-    .map_err(|error| match largest {
-        // A catalog persisted by an older build (or edited by hand) can be
-        // too large to read. Say which one and how to recover instead of a
-        // generic size error; a refresh trims it to the snapshot budget.
-        Some((provider, models)) => bad_request(format!(
-            "the provider catalog is too large to read (largest: `{provider}` with {models} models); run `cockpit fetch-models {provider}` to trim it to the readable limit"
-        )),
-        None => error,
-    })
+}
+
+/// Charge the exact editable header representation, the standard favorite
+/// toggle, and maximum timestamp fractional precision used by status saves.
+fn editable_provider_entry_bytes(view: &proto::ProviderEntryView) -> usize {
+    let mut entry = view.editable_entry();
+    entry.favorite = Some(false);
+    entry.models_fetched_at = entry.models_fetched_at.map(|time| {
+        chrono::Timelike::with_nanosecond(&time, 999_999_999).expect("valid nanosecond")
+    });
+    if let Some(status) = entry.last_model_fetch.as_mut() {
+        status.at =
+            chrono::Timelike::with_nanosecond(&status.at, 999_999_999).expect("valid nanosecond");
+    }
+    serde_json::to_vec(&entry)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn ensure_catalog_entries_editable(
+    config: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<(), ErrorPayload> {
+    let view = crate::secret_ref::redact_provider_view(config);
+    if view
+        .providers
+        .values()
+        .any(|entry| editable_provider_entry_bytes(entry) > proto::MAX_OWNER_PROVIDER_ENTRY_BYTES)
+    {
+        return Err(bad_request(
+            "protected models or other provider configuration exceed the editable entry limit; no catalog was written",
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_catalog_candidate_readable(
+    ctx: &DaemonContext,
+    project_root: &str,
+    cwd: &std::path::Path,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+    config: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<(), ErrorPayload> {
+    ensure_catalog_entries_editable(config)?;
+    let (_, _, _, warnings) = daemon_provider_config_with_warnings(ctx, project_root).await?;
+    bounded_provider_response(provider_catalog_candidate_snapshot(
+        ctx, project_root, None, &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES), String::new(),
+        cwd.to_path_buf(), trust_policy.clone(), config.clone(), warnings, u64::MAX, false,
+    ).await?).map(|_| ()).map_err(|_| bad_request(
+        "the complete provider/config snapshot exceeds the readable limit; no provider configuration was written"
+    ))
 }
 
 fn provider_config_revision(
@@ -23556,7 +23629,7 @@ async fn stage_and_recover_provider_batch(
                 .or_default()
                 .extend(refs.1);
             for (index, header) in upsert.entry.headers.iter_mut().enumerate() {
-                if header.value.trim() == "********"
+                if header.value.trim() == proto::PRESERVED_PROVIDER_HEADER_VALUE
                     && let Some(old_header) = prior
                         .headers
                         .iter()
@@ -23649,6 +23722,15 @@ async fn stage_and_recover_provider_batch(
             desired.active_model = Some(active_model);
         }
     }
+
+    let mut candidate = effective.clone();
+    // Include inherited siblings as well as the entire candidate layer. A
+    // deletion cannot increase this conservative pre-commit projection.
+    candidate.providers.extend(desired.providers.clone());
+    candidate.category_defaults = desired.category_defaults.clone();
+    candidate.on_unlisted_models_fetch = desired.on_unlisted_models_fetch;
+    candidate.active_model = desired.active_model.clone();
+    ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &candidate).await?;
 
     // Cleanup is pair-scoped. A reference retained by the same provider in
     // the final layer must keep both its vault row and its exact ownership
@@ -24161,14 +24243,18 @@ pub(super) async fn provider_models_fetch(
         &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
+    let credential_table = provider_response_credential_table(&store, &config, &env)?;
+    crate::providers::provider_http::diagnostic_scope(credential_table, async {
     let selected_policy = on_unlisted
         .or(config.on_unlisted_models_fetch)
         .unwrap_or(crate::config::providers::OnUnlistedModelsFetch::Keep);
     let mut changed_provider_ids = std::collections::BTreeSet::new();
+    let mut fetched_model_ids =
+        std::collections::BTreeMap::<String, std::collections::HashSet<String>>::new();
     // One preview budget shared by every result keeps the summary response
     // bounded for any catalog size and any number of providers.
     let mut id_budget = proto::MAX_PROVIDER_MODEL_SUMMARY_ID_BYTES;
-    let results = if deep {
+    let mut results = if deep {
         let (results, completed_provider_ids) = daemon_deep_provider_fetch(
             &mut config,
             &provider_ids,
@@ -24290,6 +24376,10 @@ pub(super) async fn provider_models_fetch(
             let mut verification = None;
             let outcome = match fetched {
                 Ok(crate::providers::models_fetch::FetchOutcome::Models { models, catalog }) => {
+                    fetched_model_ids.insert(
+                        provider_id.clone(),
+                        models.iter().map(|model| model.id.clone()).collect(),
+                    );
                     let mut updated = entry.clone();
                     let unlisted = entry
                         .models
@@ -24331,35 +24421,16 @@ pub(super) async fn provider_models_fetch(
                     );
                     updated.models_fetched_at = Some(chrono::Utc::now());
                     updated.model_catalog = catalog;
+                    updated.mark_model_fetch_success(catalog);
                     config.providers.insert(provider_id.clone(), updated);
-                    match enforce_persisted_catalog_budget(
-                        &mut config,
-                        &provider_id,
-                        &entry,
-                        &models,
-                    ) {
-                        Ok(kept) => {
-                            changed_provider_ids.insert(provider_id.clone());
-                            crate::daemon::proto::ProviderModelFetchOutcome::Models {
-                                models: proto::ProviderModelIdSummary::bounded(
-                                    models.iter().map(|model| model.id.clone()),
-                                    &mut id_budget,
-                                ),
-                                catalog,
-                                kept,
-                            }
-                        }
-                        Err(message) => {
-                            // Nothing is persisted: a catalog every snapshot
-                            // reader would refuse must not become durable.
-                            config.providers.insert(provider_id.clone(), entry.clone());
-                            verification = Some(
-                                crate::daemon::proto::ProviderModelVerification::CatalogTooLarge {
-                                    message: message.clone(),
-                                },
-                            );
-                            crate::daemon::proto::ProviderModelFetchOutcome::Error { message }
-                        }
+                    changed_provider_ids.insert(provider_id.clone());
+                    crate::daemon::proto::ProviderModelFetchOutcome::Models {
+                        models: proto::ProviderModelIdSummary::bounded(
+                            models.iter().map(|model| model.id.clone()),
+                            &mut id_budget,
+                        ),
+                        catalog,
+                        kept: u32::try_from(models.len()).unwrap_or(u32::MAX),
                     }
                 }
                 Ok(crate::providers::models_fetch::FetchOutcome::FallbackAvailable {
@@ -24367,10 +24438,10 @@ pub(super) async fn provider_models_fetch(
                     catalog,
                     reason,
                 }) => {
+                    let reason = redact_provider_response_text(&reason, &store, &config, &env);
                     verification = Some(categorize_provider_model_fetch_error(&anyhow::anyhow!(
                         reason.clone()
                     )));
-                    let reason = crate::config::providers::redact_model_fetch_reason(reason);
                     if allow_fallback {
                         let mut updated = entry.clone();
                         let merge_policy = match selected_policy {
@@ -24426,12 +24497,12 @@ pub(super) async fn provider_models_fetch(
                     crate::daemon::proto::ProviderModelFetchOutcome::Unsupported
                 }
                 Err(error) => {
-                    verification = Some(categorize_provider_model_fetch_error(&error));
-                    crate::daemon::proto::ProviderModelFetchOutcome::Error {
-                        message: crate::config::providers::redact_model_fetch_reason(
-                            error.to_string(),
-                        ),
-                    }
+                    let message =
+                        redact_provider_response_text(&error.to_string(), &store, &config, &env);
+                    verification = Some(categorize_provider_model_fetch_error(&anyhow::anyhow!(
+                        message.clone()
+                    )));
+                    crate::daemon::proto::ProviderModelFetchOutcome::Error { message }
                 }
             };
             results.push(crate::daemon::proto::ProviderModelFetchResult {
@@ -24450,7 +24521,7 @@ pub(super) async fn provider_models_fetch(
             )
         });
     if aggregate_fetch_failed && !deep {
-        config = original_config;
+        config = original_config.clone();
         changed_provider_ids.clear();
     }
     if let Some(on_unlisted) = on_unlisted {
@@ -24459,6 +24530,60 @@ pub(super) async fn provider_models_fetch(
         // it to a failed multi-provider network probe.
         if !aggregate_fetch_failed {
             config.on_unlisted_models_fetch = Some(on_unlisted);
+        }
+    }
+    if !changed_provider_ids.is_empty() || on_unlisted.is_some_and(|_| !aggregate_fetch_failed) {
+        let (_, _, _, warnings) = daemon_provider_config_with_warnings(ctx, project_root).await?;
+        let snapshot = provider_catalog_candidate_snapshot(
+            ctx,
+            project_root,
+            None,
+            &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES),
+            String::new(),
+            cwd.clone(),
+            trust_policy.clone(),
+            config.clone(),
+            warnings.clone(),
+            u64::MAX,
+            false,
+        )
+        .await?;
+        let provider_bytes = serde_json::to_vec(&crate::secret_ref::redact_provider_view(&config))
+            .map_err(internal)?
+            .len();
+        let complete_bytes = serde_json::to_vec(&snapshot).map_err(internal)?.len();
+        let overhead = complete_bytes.saturating_sub(provider_bytes);
+        let limit = proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES.checked_sub(overhead)
+            .ok_or_else(|| bad_request("MCP/extended configuration alone exceeds the readable snapshot limit; no catalog was written"))?;
+        for id in &changed_provider_ids {
+            let previous = &original_config.providers[id];
+            let fetched = config.providers[id].models.clone();
+            // Trim every changed provider; the final exact check rejects the
+            // whole operation if protected or unchanged data still cannot fit.
+            let _ = enforce_persisted_catalog_budget(&mut config, id, previous, &fetched, limit);
+        }
+        ensure_catalog_entries_editable(&config)?;
+        bounded_provider_response(provider_catalog_candidate_snapshot(
+            ctx, project_root, None, &"\u{1}".repeat(proto::MAX_OWNER_WIRE_IDENTIFIER_BYTES), String::new(),
+            cwd.clone(), trust_policy.clone(), config.clone(), warnings, u64::MAX, false,
+        ).await?).map_err(|_| bad_request("protected models or auxiliary configuration exceed the readable snapshot limit; no catalog was written"))?;
+        for result in &mut results {
+            if let crate::daemon::proto::ProviderModelFetchOutcome::Models { kept, .. } =
+                &mut result.outcome
+            {
+                *kept = u32::try_from(
+                    config.providers[&result.provider_id]
+                        .models
+                        .iter()
+                        .filter(|model| {
+                            fetched_model_ids
+                                .get(&result.provider_id)
+                                .is_none_or(|ids| ids.contains(&model.id))
+                        })
+                        .count(),
+                )
+                .unwrap_or(u32::MAX);
+            }
         }
     }
     // Build and bound the exact response before any persistence. The
@@ -24476,6 +24601,14 @@ pub(super) async fn provider_models_fetch(
         bounded_provider_response(scrub_provider_response(response, &config, &store, &env)?)?;
     let config_changed =
         !changed_provider_ids.is_empty() || on_unlisted.is_some_and(|_| !aggregate_fetch_failed);
+    // Preflight every durable intermediate projection before the first
+    // write. Multi-provider operations must also stay readable if interrupted
+    // between layer updates, not only after their final write.
+    let mut intermediate = original_config.clone();
+    for id in &changed_provider_ids {
+        intermediate.providers.insert(id.clone(), config.providers[id].clone());
+        ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &intermediate).await?;
+    }
     for provider_id in changed_provider_ids {
         let entry = config
             .providers
@@ -24517,31 +24650,26 @@ pub(super) async fn provider_models_fetch(
     };
     *response_generation = config_generation;
     Ok(response)
+    }).await
 }
 
-/// Largest serialized provider projection a catalog refresh may persist.
-/// Every model reader (settings, model picker, onboarding's model step, CLI)
-/// gets the catalog through `GetProviderCatalogSnapshot`, which is capped at
-/// [`proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES`] and also carries MCP and
-/// extended-config projections; the headroom keeps the snapshot readable.
+/// A small explicit limit for the pure trim regression; production computes
+/// its limit from the complete reader representation below.
+#[cfg(test)]
 pub(super) const MAX_PERSISTED_PROVIDER_VIEW_BYTES: usize =
     proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES - 128 * 1024;
 
-/// Keep a refreshed catalog readable (#545, review C3). When the merged
-/// configuration's provider projection would exceed
-/// [`MAX_PERSISTED_PROVIDER_VIEW_BYTES`], newly fetched models are dropped
-/// from the end of the upstream order until it fits; then, if still over,
-/// previously fetched models. Manual and favorite models are never dropped.
-/// Raw upstream metadata left by an older build on non-manual models is
-/// cleared first, so a refresh always recovers an over-limit legacy entry.
-/// Returns how many fetched models remain persisted; the caller reports a
-/// smaller-than-fetched count to the user. Errors (nothing may be persisted)
-/// only when manual and favorite models alone exceed the limit.
+/// Trim unprotected fetched models to the caller's measured provider budget.
+/// Manual/favorite entries and other providers are retained. The caller must
+/// check the complete snapshot before writing, even if trimming exhausts this
+/// provider's removable entries. Newly fetched entries go first, then older
+/// fetched entries. Auxiliary configuration is never silently discarded.
 pub(super) fn enforce_persisted_catalog_budget(
     config: &mut crate::config::providers::ProvidersConfig,
     provider_id: &str,
     previous: &crate::config::providers::ProviderEntry,
     fetched: &[crate::config::providers::ModelEntry],
+    limit: usize,
 ) -> std::result::Result<u32, String> {
     let fetched_ids = fetched
         .iter()
@@ -24557,29 +24685,34 @@ pub(super) fn enforce_persisted_catalog_budget(
         )
         .unwrap_or(u32::MAX)
     };
-    let view_bytes = |config: &crate::config::providers::ProvidersConfig| {
-        serde_json::to_vec(&crate::secret_ref::redact_provider_view(config))
+    let view_sizes = |config: &crate::config::providers::ProvidersConfig| {
+        let view = crate::secret_ref::redact_provider_view(config);
+        let total = serde_json::to_vec(&view)
             .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX)
+            .unwrap_or(usize::MAX);
+        (
+            total,
+            editable_provider_entry_bytes(&view.providers[provider_id]),
+        )
     };
-    let total = view_bytes(config);
+    let (total, editable) = view_sizes(config);
     let entry = config
         .providers
         .get_mut(provider_id)
         .expect("refreshed provider is configured");
-    if total <= MAX_PERSISTED_PROVIDER_VIEW_BYTES {
+    if total <= limit && editable <= proto::MAX_OWNER_PROVIDER_ENTRY_BYTES {
         return Ok(kept_count(entry));
     }
     for model in entry.models.iter_mut().filter(|model| !model.manual) {
         model.provider_metadata.clear();
         model.extra.clear();
     }
-    let total = view_bytes(config);
+    let (total, editable) = view_sizes(config);
     let entry = config
         .providers
         .get_mut(provider_id)
         .expect("refreshed provider is configured");
-    if total <= MAX_PERSISTED_PROVIDER_VIEW_BYTES {
+    if total <= limit && editable <= proto::MAX_OWNER_PROVIDER_ENTRY_BYTES {
         return Ok(kept_count(entry));
     }
     let previous_ids = previous
@@ -24591,7 +24724,9 @@ pub(super) fn enforce_persisted_catalog_budget(
     // Each serialized model costs its JSON plus a separating comma. Newly
     // fetched models go first (from the end of upstream order), then older
     // fetched ones.
-    let mut excess = total - MAX_PERSISTED_PROVIDER_VIEW_BYTES;
+    let mut excess = total
+        .saturating_sub(limit)
+        .max(editable.saturating_sub(proto::MAX_OWNER_PROVIDER_ENTRY_BYTES));
     let mut drop = vec![false; entry.models.len()];
     for newly_fetched_pass in [true, false] {
         for (index, model) in entry.models.iter().enumerate().rev() {
@@ -24611,20 +24746,19 @@ pub(super) fn enforce_persisted_catalog_budget(
             drop[index] = true;
         }
     }
-    if excess > 0 {
-        return Err(format!(
-            "provider `{provider_id}` manual and favorite models alone exceed the catalog limit ({} KiB, limit {} KiB); remove some in /settings › Providers",
-            total / 1024,
-            MAX_PERSISTED_PROVIDER_VIEW_BYTES / 1024
-        ));
-    }
     let mut index = 0;
     entry.models.retain(|_| {
         let keep = !drop[index];
         index += 1;
         keep
     });
-    Ok(kept_count(entry))
+    let kept = kept_count(entry);
+    if excess > 0 {
+        return Err(
+            "protected models or other configuration exceed the readable snapshot limit".into(),
+        );
+    }
+    Ok(kept)
 }
 
 pub(super) fn categorize_provider_model_fetch_error(
@@ -24886,11 +25020,15 @@ async fn provider_usage_snapshot(
         &crate::secret_ref::provider_credential_record_references(&config),
     )
     .map_err(internal)?;
-    let rows = crate::providers::usage::probes::fetch_all_provider_usage_with_store(
-        &config,
-        provider_id,
-        Some(store.clone()),
-        env.clone(),
+    let credential_table = provider_response_credential_table(&store, &config, &env)?;
+    let rows = crate::providers::provider_http::diagnostic_scope(
+        credential_table,
+        crate::providers::usage::probes::fetch_all_provider_usage_with_store(
+            &config,
+            provider_id,
+            Some(store.clone()),
+            env.clone(),
+        ),
     )
     .await
     .map_err(internal)?;
@@ -25005,12 +25143,28 @@ pub(super) fn redact_provider_response_text_with_values(
     secret_values: impl IntoIterator<Item = String>,
 ) -> String {
     let mut value = text.to_string();
+    let mut secret_values = secret_values.into_iter().collect::<Vec<_>>();
+    secret_values.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     for secret in secret_values {
         if !secret.is_empty() {
             value = value.replace(&secret, "[redacted]");
         }
     }
     crate::config::providers::redact_model_fetch_reason(value)
+}
+
+fn provider_response_credential_table(
+    store: &crate::credentials::CredentialStore,
+    config: &crate::config::providers::ProvidersConfig,
+    env: &std::collections::HashMap<String, String>,
+) -> std::result::Result<crate::redact::RedactionTable, ErrorPayload> {
+    let mut table = crate::redact::RedactionTable::empty();
+    for value in provider_response_secret_values(store, config, env) {
+        table = table
+            .with_forced_literal(value, "provider credential".into())
+            .map_err(internal)?;
+    }
+    Ok(table)
 }
 
 /// Provider APIs can reflect credentials in error, quota, and even catalog
@@ -25032,6 +25186,25 @@ fn provider_response_secret_values(
     values.extend(configured_provider_env_values(config, |name| {
         env.get(name).cloned()
     }));
+    for header in config.providers.values().flat_map(|entry| &entry.headers) {
+        if !header.value.contains('$')
+            && !header.value.is_empty()
+            && !crate::providers::provider_http::public_header_literal(&header.name, &header.value)
+        {
+            values.insert(header.value.clone());
+            if let Some(value) =
+                crate::providers::provider_http::authorization_payload(&header.value)
+            {
+                values.insert(value.to_string());
+            }
+        }
+    }
+    let payloads = values
+        .iter()
+        .filter_map(|value| crate::providers::provider_http::authorization_payload(value))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.extend(payloads);
     values
 }
 
@@ -25042,15 +25215,21 @@ pub(super) fn configured_provider_env_values<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    config
-        .providers
-        .values()
-        .flat_map(|entry| &entry.headers)
-        .flat_map(|header| crate::envref::referenced_names(&header.value))
-        .filter(|name| !name.starts_with("secret:"))
-        .filter_map(|name| lookup(&name))
-        .filter(|value| !value.is_empty())
-        .collect()
+    let mut values = std::collections::BTreeSet::new();
+    for header in config.providers.values().flat_map(|entry| &entry.headers) {
+        for name in crate::envref::referenced_names(&header.value) {
+            if name.starts_with("secret:") {
+                continue;
+            }
+            if let Some(value) = lookup(&name)
+                && !value.is_empty()
+                && !crate::providers::provider_http::public_header_literal(&header.name, &value)
+            {
+                values.insert(value);
+            }
+        }
+    }
+    values
 }
 
 /// Fetch results contain upstream-owned strings such as model labels and
@@ -26700,7 +26879,7 @@ async fn provider_config_save_under_lock(
     if let Some(old_entry) = config.providers.get(provider_id) {
         validate_unique_provider_header_names(&old_entry.headers)?;
         for (index, header) in entry.headers.iter_mut().enumerate() {
-            if header.value.trim() == "********"
+            if header.value.trim() == proto::PRESERVED_PROVIDER_HEADER_VALUE
                 && let Some(old_header) = old_entry
                     .headers
                     .iter()
@@ -26773,11 +26952,12 @@ async fn provider_config_save_under_lock(
         .into_iter()
         .filter(|name| !staged_name_set.contains(name))
         .collect::<std::collections::BTreeSet<_>>();
-    let config_path = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
-        ctx.config_source()
-            .config_write_target_for_provider(&cwd, provider_id)
-    })
-    .map_err(config_write_target_error)?;
+    let config_path =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            ctx.config_source()
+                .config_write_target_for_provider(&cwd, provider_id)
+        })
+        .map_err(config_write_target_error)?;
     let config_path = prepare_user_level_write_target(ctx, &config_path)?;
     let raw_layer = crate::config::providers::ConfigDoc::load(&config_path)
         .map_err(internal)?
@@ -26787,6 +26967,11 @@ async fn provider_config_save_under_lock(
     intended_layer
         .providers
         .insert(provider_id.to_owned(), entry.clone());
+    let mut candidate = config.clone();
+    candidate
+        .providers
+        .insert(provider_id.to_string(), entry.clone());
+    ensure_catalog_candidate_readable(ctx, project_root, &cwd, &trust_policy, &candidate).await?;
     let intended_revision = provider_config_revision(ctx, &config_path, &intended_layer)?;
     let consumed_config_generation = inventory::current_config_generation();
     let intended_config_generation = consumed_config_generation

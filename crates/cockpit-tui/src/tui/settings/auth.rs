@@ -10,19 +10,27 @@ use cockpit_config::providers::{ModelEntry, ProviderEntry, ProviderModelCatalog}
 use cockpit_proto::{ProviderModelFetchOutcome, Request, Response};
 use std::sync::{Arc, Mutex};
 
+/// An indivisible editable read: never adopt a catalog without its baseline
+/// and authority. Every refresh exit (including ambiguous transport failure)
+/// reads the full snapshot so sibling providers remain in the dialog.
+#[derive(Clone)]
+pub(super) struct ProviderSnapshot {
+    pub config: cockpit_proto::ProviderConfigView,
+    pub authority: super::ProviderEditAuthority,
+}
+
+pub struct FetchCompletion {
+    pub outcome: Result<FetchOutcome, String>,
+    pub(super) snapshot: Result<ProviderSnapshot, String>,
+}
+
 /// Settings-side result of one daemon catalog refresh.
 ///
-/// `FetchProviderModels` answers with a bounded summary (#545): the daemon is
-/// the merge/persist authority and never ships a catalog over that RPC. The
-/// handle therefore re-reads the provider entry the daemon persisted and
-/// hands the dialog full entries:
-///
-/// * `Models::models` are the persisted entries for the fetched upstream ids
-///   (the daemon's merge keeps per-model overrides). When the summary's id
-///   preview was truncated (very large catalogs) the whole persisted list is
-///   returned instead, so no configured model is mistaken for an unlisted one.
-/// * `FallbackApplied` follows a request that allowed the fallback catalog;
-///   `models` is the persisted catalog.
+/// The fetch RPC returns a summary; the background task also reads a full
+/// authoritative snapshot. `Models::models` and `FallbackApplied::models`
+/// contain the complete persisted provider catalog, including retained manual
+/// and favorite entries. The dialog adopts its matching authority and baseline
+/// before applying UI status. No consumer reconstructs a pre-fetch model bag.
 #[derive(Debug, Clone)]
 pub enum FetchOutcome {
     Models {
@@ -57,7 +65,7 @@ pub struct FetchHandle {
 
 pub enum FetchState {
     Running,
-    Done(Result<FetchOutcome, String>),
+    Done(FetchCompletion),
     /// Consumed already — left as a terminal marker so the dialog
     /// doesn't double-apply the result.
     Consumed,
@@ -93,83 +101,61 @@ impl FetchHandle {
         let state_w = Arc::clone(&state);
         let pid = provider_id.clone();
         tokio::spawn(async move {
-            let result = async {
-                let client = crate::tui::settings::settings_daemon_client(&lifecycle)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let response = client
-                    .request(Request::FetchProviderModels {
-                        project_root: project_root.clone(),
-                        provider_id: Some(pid.clone()),
-                        model_id: None,
-                        deep: false,
-                        on_unlisted: None,
-                        allow_fallback,
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
-                let Response::ProviderModelsFetched { mut results, .. } = response else {
-                    return Err(
-                        "daemon returned unexpected provider model fetch response".to_string()
-                    );
-                };
-                let outcome = results
-                    .pop()
-                    .ok_or_else(|| "daemon returned no provider model fetch result".to_string())?
-                    .outcome;
-                match outcome {
-                    ProviderModelFetchOutcome::Models {
-                        models,
-                        catalog,
-                        kept,
-                    } => {
-                        let persisted =
-                            persisted_provider_models(&client, &project_root, &pid).await?;
-                        Ok(FetchOutcome::Models {
-                            trim_note: cockpit_proto::catalog_trim_note(models.count, kept),
-                            models: fetched_entries(persisted, &models),
-                            catalog,
+            let completion = match crate::tui::settings::settings_daemon_client(&lifecycle).await {
+                Err(error) => FetchCompletion {
+                    outcome: Err(error.to_string()),
+                    snapshot: Err(error.to_string()),
+                },
+                Ok(client) => {
+                    let response = client
+                        .request(Request::FetchProviderModels {
+                            project_root: project_root.clone(),
+                            provider_id: Some(pid.clone()),
+                            model_id: None,
+                            deep: false,
+                            on_unlisted: None,
+                            allow_fallback,
                         })
-                    }
-                    ProviderModelFetchOutcome::FallbackAvailable {
-                        models,
-                        catalog,
-                        reason,
-                    } if allow_fallback => Ok(FetchOutcome::FallbackApplied {
-                        models: fetched_entries(
-                            persisted_provider_models(&client, &project_root, &pid).await?,
-                            &models,
-                        ),
-                        catalog,
-                        reason,
-                    }),
-                    ProviderModelFetchOutcome::FallbackAvailable {
-                        models,
-                        catalog,
-                        reason,
-                    } => Ok(FetchOutcome::FallbackAvailable {
-                        catalog,
-                        reason,
-                        fallback_count: models.count,
-                    }),
-                    ProviderModelFetchOutcome::Unsupported => Ok(FetchOutcome::Unsupported),
-                    ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } => Err(format!(
-                        "model fetch needs a keep/remove decision for {} configured model(s)",
-                        unlisted.count
-                    )),
-                    ProviderModelFetchOutcome::Error { message } => Err(message),
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                    // A lost reply can follow a commit. Always read back, even
+                    // when the very first request returned a transport error.
+                    let snapshot = provider_snapshot(&client, &project_root).await;
+                    let outcome = response.and_then(|response| {
+                        let Response::ProviderModelsFetched { mut results, .. } = response else {
+                            return Err("daemon returned unexpected provider model fetch response".into());
+                        };
+                        let result = results.pop().ok_or_else(|| "daemon returned no provider model fetch result".to_string())?;
+                        let persisted = || snapshot.as_ref().map_err(Clone::clone)?
+                            .config.providers.get(&pid).map(|view| view.entry.models.clone())
+                            .ok_or_else(|| format!("provider `{pid}` disappeared after the model fetch"));
+                        match result.outcome {
+                            ProviderModelFetchOutcome::Models { models, catalog, kept } => Ok(FetchOutcome::Models {
+                                models: persisted()?, catalog,
+                                trim_note: cockpit_proto::catalog_trim_note(models.count, kept),
+                            }),
+                            ProviderModelFetchOutcome::FallbackAvailable { models: _, catalog, reason } if allow_fallback =>
+                                Ok(FetchOutcome::FallbackApplied { models: persisted()?, catalog, reason }),
+                            ProviderModelFetchOutcome::FallbackAvailable { models, catalog, reason } =>
+                                Ok(FetchOutcome::FallbackAvailable { fallback_count: models.count, catalog, reason }),
+                            ProviderModelFetchOutcome::Unsupported => Ok(FetchOutcome::Unsupported),
+                            ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted } => Err(format!(
+                                "model fetch needs a keep/remove decision for {} configured model(s)", unlisted.count)),
+                            ProviderModelFetchOutcome::Error { message } => Err(message),
+                        }
+                    });
+                    FetchCompletion { outcome, snapshot }
                 }
-            }
-            .await;
+            };
             if let Ok(mut s) = state_w.lock() {
-                *s = FetchState::Done(result);
+                *s = FetchState::Done(completion);
             }
         });
         Self { provider_id, state }
     }
 
-    pub fn take(&self) -> Option<Result<FetchOutcome, String>> {
+    pub fn take(&self) -> Option<FetchCompletion> {
         let mut s = self.state.lock().ok()?;
         match std::mem::replace(&mut *s, FetchState::Consumed) {
             FetchState::Running => {
@@ -182,59 +168,47 @@ impl FetchHandle {
     }
 }
 
-/// Read back the model entries the daemon just persisted for `provider_id`.
-async fn persisted_provider_models(
+/// Reconcile after every potentially committed request. The full config,
+/// capability, revision and generation are returned as one value.
+pub(super) async fn provider_snapshot(
     client: &cockpit_client::DaemonClient,
     project_root: &str,
-    provider_id: &str,
-) -> Result<Vec<ModelEntry>, String> {
-    let mut config = provider_snapshot_view(client, project_root, provider_id).await?;
-    config
-        .providers
-        .remove(provider_id)
-        .map(|view| view.entry.models)
-        .ok_or_else(|| format!("provider `{provider_id}` disappeared after the model fetch"))
-}
-
-/// The daemon's provider-scoped catalog snapshot: the authoritative entry
-/// after a catalog refresh the daemon persisted.
-async fn provider_snapshot_view(
-    client: &cockpit_client::DaemonClient,
-    project_root: &str,
-    provider_id: &str,
-) -> Result<cockpit_proto::ProviderConfigView, String> {
+) -> Result<ProviderSnapshot, String> {
+    let requested_id = uuid::Uuid::new_v4().to_string();
     let response = client
         .request(Request::GetProviderCatalogSnapshot {
             project_root: project_root.to_string(),
-            provider_id: Some(provider_id.to_string()),
-            snapshot_session_id: uuid::Uuid::new_v4().to_string(),
+            provider_id: None,
+            snapshot_session_id: requested_id.clone(),
         })
         .await
         .map_err(|error| format!("reading the refreshed catalog failed: {error}"))?
         .map_err(|error| format!("reading the refreshed catalog failed: {error}"))?;
-    let Response::ProviderCatalogSnapshot { config, .. } = response else {
-        return Err("daemon returned an unexpected provider catalog snapshot".to_string());
-    };
-    Ok(config)
+    snapshot_from_response(response, Some(&requested_id))
 }
 
-/// The persisted entries that correspond to the fetched upstream ids. A
-/// truncated id preview cannot separate fetched from retained models, so the
-/// whole persisted list stands in for the fetched one.
-fn fetched_entries(
-    persisted: Vec<ModelEntry>,
-    fetched: &cockpit_proto::ProviderModelIdSummary,
-) -> Vec<ModelEntry> {
-    if fetched.omitted() > 0 {
-        return persisted;
+pub(super) fn snapshot_from_response(
+    response: Response,
+    expected_id: Option<&str>,
+) -> Result<ProviderSnapshot, String> {
+    match response {
+        Response::ProviderCatalogSnapshot {
+            config,
+            snapshot_session_id,
+            layer_id,
+            owner_root,
+            base_revision,
+            config_generation,
+        } if expected_id.is_none_or(|id| id == snapshot_session_id) => Ok(ProviderSnapshot {
+            config,
+            authority: super::ProviderEditAuthority {
+                snapshot_session_id,
+                layer_id,
+                owner_root,
+                base_revision,
+                config_generation,
+            },
+        }),
+        _ => Err("daemon returned an unexpected provider catalog snapshot".into()),
     }
-    let ids = fetched
-        .ids
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
-    persisted
-        .into_iter()
-        .filter(|model| ids.contains(model.id.as_str()))
-        .collect()
 }

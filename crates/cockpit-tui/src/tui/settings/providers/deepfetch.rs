@@ -25,10 +25,11 @@ enum DeepFetchPhase {
 #[derive(Default)]
 struct DeepFetchProgress {
     completed: usize,
+    attempted: bool,
     lines: Vec<String>,
     result: Option<Result<String, String>>,
     /// Latest authoritative catalog returned with a successful daemon probe.
-    config: Option<cockpit_proto::ProviderConfigView>,
+    config: Option<crate::tui::settings::auth::ProviderSnapshot>,
 }
 
 /// State is deliberately prepared from the config document, rather than from
@@ -230,21 +231,27 @@ where
         .lock()
         .map(|progress| progress.completed)
         .unwrap_or_default();
-    let refresh = if completed > 0 {
+    let attempted = progress
+        .lock()
+        .map(|progress| progress.attempted)
+        .unwrap_or(true);
+    let refresh = if attempted {
+        let snapshot_id = uuid::Uuid::new_v4().to_string();
         let refreshed = request(cockpit_proto::Request::GetProviderCatalogSnapshot {
             project_root: project_root.to_string(),
-            provider_id: Some(provider_id.to_string()),
-            snapshot_session_id: uuid::Uuid::new_v4().to_string(),
+            provider_id: None,
+            snapshot_session_id: snapshot_id.clone(),
         })
         .await;
-        match refreshed {
-            Ok(cockpit_proto::Response::ProviderCatalogSnapshot { config, .. }) => {
+        match refreshed.and_then(|response| {
+            crate::tui::settings::auth::snapshot_from_response(response, Some(&snapshot_id))
+        }) {
+            Ok(snapshot) => {
                 if let Ok(mut state) = progress.lock() {
-                    state.config = Some(config);
+                    state.config = Some(snapshot);
                 }
                 Ok(())
             }
-            Ok(_) => Err("daemon returned an unexpected provider catalog snapshot".to_string()),
             Err(error) => Err(error),
         }
     } else {
@@ -297,6 +304,9 @@ where
             progress,
             format!("→ {}:{}", target.provider_id, target.model_id),
         );
+        if let Ok(mut state) = progress.lock() {
+            state.attempted = true;
+        }
         let response = request(cockpit_proto::Request::FetchProviderModels {
             project_root: project_root.to_string(),
             provider_id: Some(provider_id.to_string()),
@@ -435,15 +445,16 @@ impl DeepFetchState {
         progress.result = Some(result);
     }
 
-    pub(super) fn finish_with_config_for_test(
+    pub(super) fn finish_with_snapshot_for_test(
         &mut self,
         result: Result<String, String>,
         lines: Vec<String>,
-        config: &ProvidersConfig,
+        snapshot: crate::tui::settings::auth::ProviderSnapshot,
     ) {
         let mut progress = self.progress.lock().expect("test progress lock");
         progress.lines = lines;
-        progress.config = Some(cockpit_core::secret_ref::redact_provider_view(config));
+        progress.attempted = true;
+        progress.config = Some(snapshot);
         progress.result = Some(result);
     }
 }
@@ -646,34 +657,31 @@ impl SettingsDialog {
         let Some(result) = state.drain() else {
             return;
         };
-        // The daemon persisted the probe result. Adopt its returned catalog
-        // before returning to the editor so a later editor save cannot put
-        // stale model metadata back on disk.
-        let catalog_update = if let Ok(mut progress) = state.progress.lock()
-            && let Some(config) = progress.config.take()
-            && let Some(entry) = config.providers.get(&state.provider_id)
-        {
-            let update = (state.provider_id.clone(), entry.entry.clone());
-            *parent.entry = entry.entry.clone();
-            Some(update)
+        let snapshot = state
+            .progress
+            .lock()
+            .ok()
+            .and_then(|mut progress| progress.config.take());
+        let attempted = state
+            .progress
+            .lock()
+            .map(|progress| progress.attempted)
+            .unwrap_or(true);
+        let adoption = if attempted {
+            Some(snapshot.ok_or_else(|| "reading the refreshed catalog failed".to_string()))
         } else {
             None
         };
         state.phase = DeepFetchPhase::Done;
         state.status = Some(match result {
-            // The daemon already persisted this fetch.  Do not reload a
-            // mutable client-side config layer just to mirror its model
-            // metadata; the next daemon catalog refresh is authoritative.
             Ok(summary) => summary,
             Err(error) => error,
         });
-        let _ = state;
         let _ = parent;
-        if let Some((provider_id, entry)) = catalog_update {
-            self.config
-                .providers
-                .insert(provider_id.clone(), entry.clone());
-            self.original_config.providers.insert(provider_id, entry);
+        let _ = state;
+        if let Some(snapshot) = adoption {
+            let _ = self.adopt_refreshed_provider_snapshot(snapshot);
+            self.sync_refreshed_provider_editor();
         }
     }
 }
@@ -716,7 +724,7 @@ mod read_back_tests {
         }
     }
 
-    fn snapshot() -> Response {
+    fn snapshot(snapshot_id: &str) -> Response {
         let mut config = cockpit_proto::ProviderConfigView::default();
         config.providers.insert(
             "p".into(),
@@ -735,12 +743,60 @@ mod read_back_tests {
         );
         Response::ProviderCatalogSnapshot {
             config,
-            snapshot_session_id: "s".into(),
+            snapshot_session_id: snapshot_id.into(),
             layer_id: "l".into(),
             owner_root: String::new(),
             base_revision: "r".into(),
             config_generation: 2,
         }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_first_deep_reply_reads_back_and_cancellation_stops_next_target() {
+        let progress = Arc::new(Mutex::new(DeepFetchProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = Mutex::new(Vec::new());
+        let result = deep_fetch_with(
+            |request: Request| {
+                let snapshot_id = match &request {
+                    Request::GetProviderCatalogSnapshot {
+                        snapshot_session_id,
+                        ..
+                    } => snapshot_session_id.clone(),
+                    _ => String::new(),
+                };
+                let fetch = matches!(request, Request::FetchProviderModels { .. });
+                calls.lock().unwrap().push(request.wire_tag().to_string());
+                if fetch {
+                    cancel.store(true, Ordering::Release);
+                }
+                async move {
+                    if fetch {
+                        Err("response lost after commit".into())
+                    } else {
+                        Ok(snapshot(&snapshot_id))
+                    }
+                }
+            },
+            "/project",
+            "p",
+            &[target("a"), target("b")],
+            &progress,
+            &cancel,
+        )
+        .await;
+        assert!(result.unwrap_err().contains("response lost after commit"));
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            ["fetch_provider_models", "get_provider_catalog_snapshot"]
+        );
+        let state = progress.lock().unwrap();
+        assert_eq!(state.completed, 0);
+        assert_eq!(
+            state.config.as_ref().unwrap().authority.config_generation,
+            2
+        );
     }
 
     /// Review C4: target A is durably updated, target B then fails. The
@@ -754,6 +810,13 @@ mod read_back_tests {
             let requests = Mutex::new(Vec::new());
             let result = deep_fetch_with(
                 |request: Request| {
+                    let snapshot_id = match &request {
+                        Request::GetProviderCatalogSnapshot {
+                            snapshot_session_id,
+                            ..
+                        } => snapshot_session_id.clone(),
+                        _ => String::new(),
+                    };
                     let kind = request.wire_tag().to_string();
                     let model = match &request {
                         Request::FetchProviderModels { model_id, .. } => model_id.clone(),
@@ -775,7 +838,7 @@ mod read_back_tests {
                                 }))
                             }
                             _ if snapshot_fails => Err("snapshot unavailable".into()),
-                            _ => Ok(snapshot()),
+                            _ => Ok(snapshot(&snapshot_id)),
                         }
                     }
                 },
@@ -802,8 +865,10 @@ mod read_back_tests {
                 );
             } else {
                 let adopted = adopted.expect("persisted catalog adopted");
+                assert_eq!(adopted.authority.config_generation, 2);
+                assert_eq!(adopted.authority.base_revision, "r");
                 assert_eq!(
-                    adopted.providers["p"].entry.models[0].context_length,
+                    adopted.config.providers["p"].entry.models[0].context_length,
                     Some(4242)
                 );
             }

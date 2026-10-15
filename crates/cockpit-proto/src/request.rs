@@ -336,7 +336,7 @@ fn validate_owner_identifier(label: &str, value: &str, max: usize) -> Result<(),
 /// Wire-boundary cap for owner identifiers (operation ids, capabilities,
 /// revisions, intent hashes). Field validation re-checks the exact per-field
 /// bound; ingress enforces the loosest one.
-const MAX_OWNER_WIRE_IDENTIFIER_BYTES: usize = 128;
+pub const MAX_OWNER_WIRE_IDENTIFIER_BYTES: usize = 128;
 
 fn deserialize_owner_identifier<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -4245,7 +4245,11 @@ impl Request {
                 snapshot_session_id,
             } => {
                 validate_owner_project_root(project_root)?;
-                validate_owner_identifier("provider snapshot session", snapshot_session_id, 128)?;
+                validate_owner_identifier(
+                    "provider snapshot session",
+                    snapshot_session_id,
+                    MAX_OWNER_WIRE_IDENTIFIER_BYTES,
+                )?;
                 if let Some(provider_id) = provider_id {
                     validate_owner_identifier(
                         "provider id",

@@ -59,6 +59,75 @@ pub(crate) fn is_package_child_installation(row: &AgentInstallationRow) -> bool 
     row.source_identity.contains(PACKAGE_CHILD_SOURCE_MARKER)
 }
 
+/// The name a session's active agent uses to run an installed root: the
+/// final segment of its source id (`authored/pilot` runs as `pilot`).
+pub(crate) fn installation_launch_target(row: &AgentInstallationRow) -> Option<&str> {
+    row.source_agent_id
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+/// Live installed roots (not package children) visible to a workspace: the
+/// global scope plus that workspace's private and shared scopes.
+pub(crate) async fn visible_installed_roots(
+    db: &cockpit_db::db::Db,
+    canonical_workspace_id: &str,
+) -> Result<Vec<AgentInstallationRow>> {
+    use cockpit_db::db::agent_installations::AgentInstallationScope;
+    let mut visible = db
+        .list_agent_installations(AgentInstallationScope::Global, None)
+        .await?;
+    for scope in [
+        AgentInstallationScope::WorkspacePrivate,
+        AgentInstallationScope::WorkspaceShared,
+    ] {
+        visible.extend(
+            db.list_agent_installations(scope, Some(canonical_workspace_id.to_string()))
+                .await?,
+        );
+    }
+    visible.retain(|row| row.deleted_at_unix_ms.is_none() && !is_package_child_installation(row));
+    Ok(visible)
+}
+
+/// Launch targets of the visible installed roots, sorted and deduplicated:
+/// the installed agents a session may run as its primary.
+pub(crate) async fn installed_root_launch_targets(
+    db: &cockpit_db::db::Db,
+    canonical_workspace_id: &str,
+) -> Result<Vec<String>> {
+    let mut names = visible_installed_roots(db, canonical_workspace_id)
+        .await?
+        .iter()
+        .filter_map(installation_launch_target)
+        .filter(|name| !crate::agents::is_builtin_primary(name))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// The default agent: the launch target of the machine-wide default
+/// installation (written by onboarding's "make default agent" and by
+/// authored-agent apply), when that installation is still live. This is the
+/// single source of truth for which agent a new code session runs.
+pub(crate) async fn default_installed_root_launch_target(
+    db: &cockpit_db::db::Db,
+) -> Result<Option<String>> {
+    let Some(id) = db.default_agent_installation().await? else {
+        return Ok(None);
+    };
+    Ok(db
+        .agent_installation(id)
+        .await?
+        .filter(|row| row.deleted_at_unix_ms.is_none() && !is_package_child_installation(row))
+        .as_ref()
+        .and_then(installation_launch_target)
+        .map(str::to_string))
+}
+
 const MAX_AGENT_MARKDOWN_BYTES: usize = 1024 * 1024;
 const MAX_AGENT_PACKAGE_BYTES: usize = crate::agents::MAX_PACKAGE_BYTES as usize;
 /// Hook files share the bounded retained-workspace config policy.  Keep this

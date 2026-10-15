@@ -124,14 +124,13 @@ pub struct AgentAuthoringDraft {
 }
 
 impl AgentAuthoringDraft {
-    /// Construct defaults from the authoritative projection.
+    /// Construct defaults from the authoritative projection. The route of
+    /// the configured default model (`projection.default_route`) is granted
+    /// and starred; when the projection cannot name it, nothing is granted
+    /// and the user picks.
     pub fn from_projection(projection: &AgentAuthoringProjection) -> Self {
         let route_count = projection.policy.routes.len();
-        let mut route_grants = vec![RouteGrantDraft { enabled: false }];
-        route_grants.resize(route_count, RouteGrantDraft { enabled: false });
-        if route_count > 0 {
-            route_grants[0].enabled = true;
-        }
+        let (route_grants, default_route_index) = initial_route_grants(projection);
         let source_index = projection
             .sources
             .iter()
@@ -142,7 +141,6 @@ impl AgentAuthoringDraft {
             .get(source_index)
             .and_then(|source| source.slug.clone())
             .unwrap_or_else(|| "pilot".to_string());
-        let default_route_index = 0;
         Self {
             name: catalog_name,
             source_selection: if projection.sources.is_empty() {
@@ -183,27 +181,16 @@ impl AgentAuthoringDraft {
 
     /// Routes that require an explicit trust confirmation before apply.
     pub fn pending_trust_route_indices(&self, projection: &AgentAuthoringProjection) -> Vec<usize> {
-        self.route_grants
-            .iter()
-            .enumerate()
-            .filter_map(|(index, grant)| {
-                if !grant.enabled {
-                    return None;
-                }
-                let route = projection.policy.routes.get(index)?;
-                if route.confirmation_required
-                    && !self
-                        .trust_confirmations
-                        .get(index)
-                        .copied()
-                        .unwrap_or(false)
-                {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        pending_trust_routes(&self.route_grants, &self.trust_confirmations, projection)
+    }
+
+    /// Enabled routes whose trust needs a confirmation, confirmed or not, in
+    /// policy order: the rows of the trust-confirmation list.
+    pub fn trust_confirmation_route_indices(
+        &self,
+        projection: &AgentAuthoringProjection,
+    ) -> Vec<usize> {
+        trust_confirmation_routes(&self.route_grants, projection)
     }
 
     pub fn enabled_route_count(&self) -> usize {
@@ -212,6 +199,30 @@ impl AgentAuthoringDraft {
             .filter(|grant| grant.enabled)
             .count()
     }
+}
+
+/// The route of the configured default model, when the projection names one.
+pub fn projection_default_route(projection: &AgentAuthoringProjection) -> Option<usize> {
+    match projection.default_route.as_ref()? {
+        cockpit_proto::AgentAuthoringDefaultRoute::Route { index } => usize::try_from(*index)
+            .ok()
+            .filter(|index| *index < projection.policy.routes.len()),
+        cockpit_proto::AgentAuthoringDefaultRoute::Unresolved { .. } => None,
+    }
+}
+
+/// The initial grants of a fresh draft: only the default model's route is
+/// enabled, and it is the default. Without a resolved default nothing is
+/// granted — never an unrelated first route (#553, Codex C5) — and the
+/// default index is a placeholder that the first enabled grant replaces.
+fn initial_route_grants(projection: &AgentAuthoringProjection) -> (Vec<RouteGrantDraft>, usize) {
+    let default_route = projection_default_route(projection);
+    let grants = (0..projection.policy.routes.len())
+        .map(|index| RouteGrantDraft {
+            enabled: Some(index) == default_route,
+        })
+        .collect();
+    (grants, default_route.unwrap_or(0))
 }
 
 /// Keep `default_route_index` aligned with an enabled grant when any exist.
@@ -278,28 +289,41 @@ pub fn migrate_default_route_verification(
 
 impl ChildAuthoringDraft {
     pub fn pending_trust_route_indices(&self, projection: &AgentAuthoringProjection) -> Vec<usize> {
-        self.route_grants
-            .iter()
-            .enumerate()
-            .filter_map(|(index, grant)| {
-                if !grant.enabled {
-                    return None;
-                }
-                let route = projection.policy.routes.get(index)?;
-                if route.confirmation_required
-                    && !self
-                        .trust_confirmations
-                        .get(index)
-                        .copied()
-                        .unwrap_or(false)
-                {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        pending_trust_routes(&self.route_grants, &self.trust_confirmations, projection)
     }
+
+    /// Enabled routes whose trust needs a confirmation, confirmed or not, in
+    /// policy order: the rows of the trust-confirmation list.
+    pub fn trust_confirmation_route_indices(
+        &self,
+        projection: &AgentAuthoringProjection,
+    ) -> Vec<usize> {
+        trust_confirmation_routes(&self.route_grants, projection)
+    }
+}
+
+fn trust_confirmation_routes(
+    route_grants: &[RouteGrantDraft],
+    projection: &AgentAuthoringProjection,
+) -> Vec<usize> {
+    route_grants
+        .iter()
+        .zip(&projection.policy.routes)
+        .enumerate()
+        .filter(|(_, (grant, route))| grant.enabled && route.confirmation_required)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn pending_trust_routes(
+    route_grants: &[RouteGrantDraft],
+    trust_confirmations: &[bool],
+    projection: &AgentAuthoringProjection,
+) -> Vec<usize> {
+    trust_confirmation_routes(route_grants, projection)
+        .into_iter()
+        .filter(|index| !trust_confirmations.get(*index).copied().unwrap_or(false))
+        .collect()
 }
 
 fn preferred_sidecar_route_index(projection: &AgentAuthoringProjection) -> Option<usize> {
@@ -973,14 +997,11 @@ fn child_slug(child: &ChildAuthoringDraft) -> String {
 }
 
 /// Construct a fresh nested subagent draft with runner-like defaults.
+/// Grants and stars the default model's route as
+/// [`AgentAuthoringDraft::from_projection`] does.
 pub fn default_child_draft(projection: &AgentAuthoringProjection) -> ChildAuthoringDraft {
     let route_count = projection.policy.routes.len();
-    let mut route_grants = vec![RouteGrantDraft { enabled: false }];
-    route_grants.resize(route_count, RouteGrantDraft { enabled: false });
-    if route_count > 0 {
-        route_grants[0].enabled = true;
-    }
-    let default_route_index = 0;
+    let (route_grants, default_route_index) = initial_route_grants(projection);
     ChildAuthoringDraft {
         name: "runner".to_string(),
         route_grants,
@@ -1063,6 +1084,8 @@ mod tests {
                 }],
                 definition_frontmatter_yaml: None,
             }],
+            route_provider_labels: Vec::new(),
+            default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
             review_trust_disclosure: "shared trust".into(),
         }
     }

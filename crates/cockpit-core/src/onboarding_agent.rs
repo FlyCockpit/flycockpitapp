@@ -12,12 +12,13 @@ use cockpit_config::config::image_sidecar::SidecarProviderModel;
 use cockpit_config::config::providers::{ModelLocation, ModelTrust, ProvidersConfig};
 use cockpit_proto::{
     AGENT_AUTHORING_DTO_VERSION, AgentAuthoringCatalogOrigin, AgentAuthoringCompatibleRoute,
-    AgentAuthoringProjection, AgentAuthoringSource, AgentAuthoringSourceKind, AgentPolicyRoute,
-    AgentPolicySnapshot, AgentPolicyTrustClassification, ApplyAuthoredAgentPackageReceipt,
-    AuthoredAgentPackageDraft, AuthoredAgentReceiptStatus, AuthoredAgentRejectReason,
-    AuthoredAgentReview, AuthoredAgentReviewAdjudicator, AuthoredAgentReviewChild,
-    AuthoredAgentReviewGrant, AuthoredAgentReviewVerificationSurface, AuthoredAgentSource,
-    AuthoredSidecarDeclaration, ModelTrustConfirmation,
+    AgentAuthoringDefaultRoute, AgentAuthoringProjection, AgentAuthoringSource,
+    AgentAuthoringSourceKind, AgentPolicyRoute, AgentPolicySnapshot,
+    AgentPolicyTrustClassification, ApplyAuthoredAgentPackageReceipt, AuthoredAgentPackageDraft,
+    AuthoredAgentReceiptStatus, AuthoredAgentRejectReason, AuthoredAgentReview,
+    AuthoredAgentReviewAdjudicator, AuthoredAgentReviewChild, AuthoredAgentReviewGrant,
+    AuthoredAgentReviewVerificationSurface, AuthoredAgentSource, AuthoredSidecarDeclaration,
+    ModelTrustConfirmation,
 };
 use sha2::{Digest, Sha256};
 
@@ -157,6 +158,89 @@ pub fn policy_snapshot(
     }
 }
 
+/// Names for the wire routes of an [`AgentPolicySnapshot`], computed from the
+/// same provider inventory as the policy.
+///
+/// A route's `provider_id` is the portable token an authored definition
+/// stores: the provider's template id, or `configured-provider-N` for a
+/// custom provider. It is not the configured provider id the user chose
+/// (`openrouter` configured from the `openai-compatible` template is the
+/// route `openai-compatible/…`). The daemon maps each route back to that
+/// provider id and locates the configured default model, and ships both in
+/// the projection, so a client never re-derives them from a different
+/// inventory (a cold resume, or a refresh after another client's edit).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfiguredRouteNames {
+    /// `(route provider token, model id, configured provider id)` per offering.
+    offerings: Vec<(String, String, String)>,
+    /// The active default model as `(configured provider id, model id)`.
+    active: Option<(String, String)>,
+}
+
+impl ConfiguredRouteNames {
+    pub fn from_providers(providers: &ProvidersConfig) -> Self {
+        Self {
+            offerings: crate::daemon::agent_installation::setup_offerings(providers)
+                .into_iter()
+                .map(|offering| {
+                    (
+                        offering.provider_id,
+                        offering.model_id,
+                        offering.provider_profile_handle,
+                    )
+                })
+                .collect(),
+            active: providers
+                .active_model
+                .as_ref()
+                .map(|active| (active.provider.clone(), active.model.clone())),
+        }
+    }
+
+    /// The configured provider id behind a route, when exactly one
+    /// configured offering carries it.
+    fn configured_provider(&self, route_provider: &str, model_id: &str) -> Option<&str> {
+        let mut matches = self
+            .offerings
+            .iter()
+            .filter(|(token, model, _)| token == route_provider && model == model_id);
+        let (_, _, configured) = matches.next()?;
+        matches.next().is_none().then_some(configured.as_str())
+    }
+
+    /// The configured provider id of each route (index-aligned), when
+    /// exactly one configured provider offers it.
+    pub fn route_labels(&self, routes: &[AgentPolicyRoute]) -> Vec<Option<String>> {
+        routes
+            .iter()
+            .map(|route| {
+                self.configured_provider(&route.provider_id, &route.model_id)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Where the configured default model sits among `routes`. A default
+    /// whose route token is shared by several providers (or that is not
+    /// offered) is `Unresolved`, never silently another route.
+    pub fn default_route(&self, routes: &[AgentPolicyRoute]) -> Option<AgentAuthoringDefaultRoute> {
+        let (provider, model) = self.active.as_ref()?;
+        let index = routes.iter().position(|route| {
+            route.model_id == *model
+                && self.configured_provider(&route.provider_id, &route.model_id)
+                    == Some(provider.as_str())
+        });
+        Some(match index {
+            Some(index) => AgentAuthoringDefaultRoute::Route {
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+            },
+            None => AgentAuthoringDefaultRoute::Unresolved {
+                model_id: model.clone(),
+            },
+        })
+    }
+}
+
 pub fn authoring_projection(
     providers: &ProvidersConfig,
     catalog: &AgentCatalogIndex,
@@ -192,8 +276,11 @@ pub fn authoring_projection(
             sources.push(source);
         }
     }
+    let names = ConfiguredRouteNames::from_providers(providers);
     Ok(AgentAuthoringProjection {
         dto_version: AGENT_AUTHORING_DTO_VERSION,
+        route_provider_labels: names.route_labels(&policy.routes),
+        default_route: names.default_route(&policy.routes),
         policy,
         sources,
         review_trust_disclosure: REVIEW_TRUST_DISCLOSURE.to_string(),
@@ -1470,6 +1557,8 @@ mod tests {
             dto_version: AGENT_AUTHORING_DTO_VERSION,
             policy: snapshot.clone(),
             sources: vec![],
+            route_provider_labels: Vec::new(),
+            default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
             review_trust_disclosure: REVIEW_TRUST_DISCLOSURE.into(),
         };
         let mut authored =
@@ -1899,6 +1988,75 @@ mod tests {
             err.reason == AuthoredAgentRejectReason::IncompletePackage
                 || err.reason == AuthoredAgentRejectReason::UnpinnedThirdPartySource
                 || err.reason == AuthoredAgentRejectReason::MissingThirdPartyTrustConfirmation
+        );
+    }
+
+    #[test]
+    fn configured_route_names_label_by_provider_and_find_the_active_default() {
+        use cockpit_config::config::providers::ActiveModelRef;
+        let entry = |models: &[&str]| ProviderEntry {
+            template: Some("openai-compatible".into()),
+            models: models
+                .iter()
+                .map(|id| ModelEntry {
+                    id: (*id).to_string(),
+                    ..ModelEntry::default()
+                })
+                .collect(),
+            ..ProviderEntry::default()
+        };
+        let mut providers = ProvidersConfig::default();
+        providers
+            .providers
+            .insert("openrouter".into(), entry(&["a/one", "b/two"]));
+        providers
+            .providers
+            .insert("orcompat".into(), entry(&["b/two"]));
+        providers.active_model = Some(ActiveModelRef {
+            provider: "openrouter".into(),
+            model: "a/one".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        });
+        let snapshot = snapshot_for(&providers);
+        let names = ConfiguredRouteNames::from_providers(&providers);
+        let labels = names.route_labels(&snapshot.routes);
+        let one = snapshot
+            .routes
+            .iter()
+            .position(|route| route.model_id == "a/one")
+            .unwrap();
+        assert_eq!(
+            snapshot.routes[one].provider_id, "openai-compatible",
+            "the wire token"
+        );
+        assert_eq!(labels[one].as_deref(), Some("openrouter"));
+        assert_eq!(
+            names.default_route(&snapshot.routes),
+            Some(AgentAuthoringDefaultRoute::Route { index: one as u32 })
+        );
+        // Two providers behind one template offer `b/two`: the route cannot
+        // name either, so it has no label rather than a guess.
+        for (route, label) in snapshot.routes.iter().zip(&labels) {
+            if route.model_id == "b/two" {
+                assert_eq!(label, &None);
+            }
+        }
+        // Codex C5: a default model on such a shared route is unresolved,
+        // never silently another (first) route.
+        let mut shared = providers.clone();
+        shared.active_model.as_mut().unwrap().model = "b/two".into();
+        assert_eq!(
+            ConfiguredRouteNames::from_providers(&shared).default_route(&snapshot.routes),
+            Some(AgentAuthoringDefaultRoute::Unresolved {
+                model_id: "b/two".into()
+            })
+        );
+        shared.active_model = None;
+        assert_eq!(
+            ConfiguredRouteNames::from_providers(&shared).default_route(&snapshot.routes),
+            None
         );
     }
 

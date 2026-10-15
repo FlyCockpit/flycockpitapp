@@ -608,6 +608,9 @@ impl App {
             );
         }
         self.refresh_open_composer_model_menu();
+        // The panes render provider/model text; show the configured
+        // provider id rather than the route token (#553 class).
+        let snapshot = relabel_session_setup_providers(snapshot, &self.config_snapshot);
         if let Overlay::SessionSetup(pane) = &mut self.overlay {
             pane.apply_snapshot(snapshot.clone());
         }
@@ -689,6 +692,53 @@ impl App {
 /// config generation. The ordered index is nonsecret and avoids reversing a
 /// display template/model pair, which is ambiguous when multiple credential
 /// profiles share the same provider template.
+/// Rewrite the display `provider_id` of every session-setup model choice and
+/// model reference to the configured provider id, using the snapshot's own
+/// correlated route metadata (`choice_routes[].config_provider_index`) and
+/// only when the snapshot was computed against the held config generation.
+/// Uncorrelated or unmatched entries keep the daemon's portable token. The
+/// field is display-only in the panes; choices are selected by `choice_id`.
+pub(super) fn relabel_session_setup_providers(
+    mut snapshot: cockpit_proto::SessionSetupSnapshotV1,
+    held: &super::HeldConfig,
+) -> cockpit_proto::SessionSetupSnapshotV1 {
+    if snapshot.config_generation != held.generation {
+        return snapshot;
+    }
+    let mut by_choice = std::collections::HashMap::new();
+    for candidate in &mut snapshot.candidates {
+        for slot in &mut candidate.slots {
+            for choice in &mut slot.choices {
+                let Some(route) = slot
+                    .choice_routes
+                    .iter()
+                    .find(|route| route.choice_id == choice.choice_id)
+                else {
+                    continue;
+                };
+                if let Some((handle, _)) =
+                    resolve_setup_config_model(&held.providers, route, choice)
+                {
+                    by_choice.insert(route.route_choice_id.clone(), handle.clone());
+                    choice.provider_id = handle;
+                }
+            }
+        }
+    }
+    let model = &mut snapshot.model;
+    for reference in model
+        .effective
+        .iter_mut()
+        .chain(model.pending.iter_mut())
+        .chain(model.allowed.iter_mut())
+    {
+        if let Some(handle) = by_choice.get(&reference.choice_id) {
+            reference.provider_id = handle.clone();
+        }
+    }
+    snapshot
+}
+
 fn resolve_setup_config_model(
     providers: &cockpit_config::providers::ProvidersConfig,
     route: &cockpit_proto::SessionSetupModelChoiceRouteV1,
@@ -811,6 +861,108 @@ mod tests {
         assert_eq!(
             resolve_setup_config_model(&providers, &route(0), &choice(0, "openai", "shared"),),
             Some(("a-template".into(), "shared".into()))
+        );
+    }
+
+    /// #553 class (session-setup Model row): display labels use the
+    /// configured provider id from the snapshot's own correlated route
+    /// indices, and only against the same held config generation.
+    #[test]
+    fn session_setup_rows_show_configured_provider_ids() {
+        let mut providers = ProvidersConfig::default();
+        for handle in ["openrouter", "orcompat"] {
+            providers.providers.insert(
+                handle.into(),
+                ProviderEntry {
+                    template: Some("openai-compatible".into()),
+                    models: vec![ModelEntry {
+                        id: "deepseek/flash".into(),
+                        ..ModelEntry::default()
+                    }],
+                    ..ProviderEntry::default()
+                },
+            );
+        }
+        let held = super::super::HeldConfig {
+            generation: 7,
+            from_daemon: true,
+            extended: Default::default(),
+            provider_view: Default::default(),
+            providers,
+        };
+        let model_ref = |index: u32| cockpit_proto::AgentModelRefV1 {
+            choice_id: format!("route-{index}"),
+            provider_id: "openai-compatible".into(),
+            model_id: "deepseek/flash".into(),
+            is_default: index == 1,
+        };
+        let snapshot = cockpit_proto::SessionSetupSnapshotV1 {
+            dto_version: 1,
+            session_id: uuid::Uuid::from_u128(1).to_string(),
+            config_generation: 7,
+            revision: 0,
+            selected_installation_id: Some("inst-1".to_string()),
+            resolved_agent: None,
+            last_used_agent: None,
+            available_agents: Vec::new(),
+            root_agent_instance_id: None,
+            override_revision: 0,
+            root_foreground: true,
+            model: cockpit_proto::AgentModelControlV1 {
+                effective: Some(model_ref(1)),
+                allowed: vec![model_ref(0), model_ref(1)],
+                pending: None,
+                locked_reason: None,
+            },
+            tools: Vec::new(),
+            mcps: Vec::new(),
+            candidates: vec![cockpit_proto::SessionSetupAgentCandidateV1 {
+                installation: cockpit_proto::AgentInstallationRecordV1 {
+                    installation_id: "inst-1".to_string(),
+                    scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                    source_agent_id: "authored/pilot".to_string(),
+                    source_identity: "identity".to_string(),
+                    source_revision: None,
+                    source_digest: "digest".to_string(),
+                    installation_revision: 1,
+                    bindings: Vec::new(),
+                },
+                selected: true,
+                slots: vec![cockpit_proto::SessionSetupModelSlotV1 {
+                    slot_id: "primary".into(),
+                    choices: vec![
+                        choice(0, "openai-compatible", "deepseek/flash"),
+                        choice(1, "openai-compatible", "deepseek/flash"),
+                    ],
+                    choice_routes: vec![route(0), route(1)],
+                    allowed_choice_ids: Vec::new(),
+                    unmatched_recommendations: Vec::new(),
+                    default_choice_id: None,
+                    unavailable_reason: None,
+                }],
+                locked_reason: None,
+            }],
+        };
+        let relabeled = relabel_session_setup_providers(snapshot.clone(), &held);
+        let slot = &relabeled.candidates[0].slots[0];
+        assert_eq!(slot.choices[0].provider_id, "openrouter");
+        assert_eq!(slot.choices[1].provider_id, "orcompat");
+        assert_eq!(
+            relabeled.model.effective.as_ref().unwrap().provider_id,
+            "orcompat"
+        );
+        assert_eq!(relabeled.model.allowed[0].provider_id, "openrouter");
+        // A snapshot from another config generation keeps the route tokens.
+        let mut stale = snapshot;
+        stale.config_generation = 6;
+        let kept = relabel_session_setup_providers(stale, &held);
+        assert_eq!(
+            kept.candidates[0].slots[0].choices[0].provider_id,
+            "openai-compatible"
+        );
+        assert_eq!(
+            kept.model.effective.unwrap().provider_id,
+            "openai-compatible"
         );
     }
 

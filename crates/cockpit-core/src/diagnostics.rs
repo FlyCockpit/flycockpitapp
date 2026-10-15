@@ -172,14 +172,24 @@ pub async fn cli_snapshot(
         (None, Some(Err(error))) => DiagnosticDb::OpenFailed(error),
         (None, None) => DiagnosticDb::Unavailable,
     };
+    // A fresh daemon session runs the default installed agent when one is
+    // set (the daemon-owned `agent_default_installation`), else the
+    // configured builtin default, falling back to Build.
+    let default_installed = match &db_source {
+        DiagnosticDb::Open(db) => {
+            crate::daemon::agent_installation::default_installed_root_launch_target(db)
+                .await
+                .ok()
+                .flatten()
+        }
+        DiagnosticDb::OpenFailed(_) | DiagnosticDb::Unavailable => None,
+    };
     let mut snapshot = build_snapshot(
         DiagnosticsInput {
             cwd: launch.launch.cwd,
             session_id: None,
             session_short_id: None,
-            // A fresh daemon session resolves its root primary from the
-            // configured default agent, falling back to Build.
-            active_agent: effective_default_agent(&extended),
+            active_agent: default_installed.unwrap_or_else(|| effective_default_agent(&extended)),
             active_model: launch.launch.active_model,
             pending_model_selection: None,
             sandbox_enabled: Some(!no_sandbox),

@@ -1829,6 +1829,7 @@ impl App {
                     self.apply_inventory_bundle_response(response);
                 }
                 Err(error) => {
+                    tracing::warn!(%error, "inventory bundle request failed");
                     if let Some(ticket) = self.inventory.in_flight.clone() {
                         self.inventory.apply_failure(&ticket, error);
                     }

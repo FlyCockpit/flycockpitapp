@@ -1698,32 +1698,45 @@ fn resolve_setup_default_agent_fallback_chain_and_exclusions() {
         "Careful".to_string(),
     ];
     assert_eq!(
-        resolve_setup_default_agent(Some("Careful"), &available, "Build"),
+        resolve_setup_default_agent(None, Some("Careful"), &available, "Build"),
         "Careful",
         "last-used in workspace wins"
     );
     assert_eq!(
-        resolve_setup_default_agent(Some("gone"), &available, "Plan"),
+        resolve_setup_default_agent(None, Some("gone"), &available, "Plan"),
         "Plan",
         "missing last-used falls back to defaultPrimaryAgent"
     );
     assert_eq!(
-        resolve_setup_default_agent(None, &available, "Plan"),
+        resolve_setup_default_agent(None, None, &available, "Plan"),
         "Plan"
     );
     assert_eq!(
-        resolve_setup_default_agent(Some("helper"), &available, "Build"),
+        resolve_setup_default_agent(None, Some("helper"), &available, "Build"),
         "Build",
         "private subagent names are not selectable even if last-used"
     );
     assert_eq!(
-        resolve_setup_default_agent(Some("Multireview"), &available, "Build"),
+        resolve_setup_default_agent(None, Some("Multireview"), &available, "Build"),
         "Build",
         "hidden primary is excluded"
     );
     assert_eq!(
-        resolve_setup_default_agent(None, &[], "unknown"),
+        resolve_setup_default_agent(None, None, &[], "unknown"),
         FALLBACK_PRIMARY
+    );
+    // #561: the default installed agent (onboarding's "make default") wins
+    // over last-used and the builtin default while it is available.
+    let mut with_pilot = available.clone();
+    with_pilot.push("pilot".to_string());
+    assert_eq!(
+        resolve_setup_default_agent(Some("pilot"), Some("Careful"), &with_pilot, "Build"),
+        "pilot"
+    );
+    assert_eq!(
+        resolve_setup_default_agent(Some("pilot"), Some("Careful"), &available, "Build"),
+        "Careful",
+        "a default installation that is no longer available falls through"
     );
 }
 

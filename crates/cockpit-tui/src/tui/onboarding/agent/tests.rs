@@ -66,6 +66,8 @@ fn sample_projection(revision: &str) -> AgentAuthoringProjection {
             }],
             definition_frontmatter_yaml: None,
         }],
+        route_provider_labels: Vec::new(),
+        default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
         review_trust_disclosure: "Trust classification is shared global provider/model policy."
             .into(),
     }
@@ -930,7 +932,10 @@ fn runner_keeps_the_safe_default_route_and_lists_its_actual_trust() {
 
     screen.phase = Phase::SubagentsList;
     let rendered = render_string(&mut screen, 120, 40);
-    assert!(rendered.contains("runner  ·  unset"), "{rendered}");
+    assert!(
+        rendered.contains("runner  ·  untrusted by default"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -1171,7 +1176,8 @@ fn golden_agent_authoring_screens() {
         if phase == Phase::SubagentEdit(SubagentPhase::ModelTrust) {
             let rendered = render_string(&mut screen, 120, 40);
             assert!(
-                rendered.contains("Confirm vendor/exact-a as unset") && rendered.contains('○'),
+                rendered.contains("vendor/exact-a · untrusted by default")
+                    && rendered.contains('○'),
                 "nested trust golden must include a confirmable runner route: {rendered}"
             );
         }
@@ -1343,9 +1349,10 @@ fn a_keyboard_confirm_consumes_the_armed_row_so_the_next_model_needs_two_clicks(
     screen.handle_key(key(KeyCode::Char(' ')));
     assert!(screen.draft.trust_confirmations[0]);
 
-    // Route 1 now occupies row 0. Its first click must only arm it.
+    // Route 0 stays listed (confirmed); route 1 is on row 1. Its first
+    // click must only arm it.
     render_buffer(&mut screen, 120, 40);
-    let row = screen.list_row_rects[0];
+    let row = screen.list_row_rects[1];
     screen.handle_mouse(click_at(Position::new(row.x, row.y)));
     assert!(
         !screen.draft.trust_confirmations[1],
@@ -1682,4 +1689,180 @@ fn a_shell_chrome_click_or_a_resize_between_the_two_clicks_disarms() {
     shell_full_click(&mut shell, row.x, row.y);
     shell_full_click(&mut shell, row.x, row.y);
     assert!(shell_trust_confirmed(&shell));
+}
+
+/// Three routes behind one configured provider `openrouter`, built from the
+/// `openai-compatible` template, so every route carries that template token.
+/// The daemon ships the configured names and the default model's route with
+/// the projection (`route_provider_labels`, `default_route`).
+fn template_routes_projection() -> AgentAuthoringProjection {
+    let mut projection = sample_projection("template-routes");
+    let route = projection.policy.routes[0].clone();
+    projection.policy.routes = ["anthropic/haiku", "deepseek/flash", "openai/mini"]
+        .into_iter()
+        .map(|model| AgentPolicyRoute {
+            provider_id: "openai-compatible".into(),
+            model_id: model.into(),
+            ..route.clone()
+        })
+        .collect();
+    projection.route_provider_labels = vec![Some("openrouter".into()); 3];
+    projection.default_route = Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 1 });
+    projection
+}
+
+/// #553 (B11): rows name the configured provider, not the template token, and
+/// the default model chosen on the model step is the starred, granted
+/// default of the agent and of its runner subagent.
+#[test]
+fn agent_models_default_to_the_chosen_model_under_the_configured_provider() {
+    let mut screen = AgentAuthoringScreen::new(template_routes_projection(), "b11".into());
+    assert_eq!(screen.draft.default_route_index, 1);
+    let granted: Vec<bool> = screen
+        .draft
+        .route_grants
+        .iter()
+        .map(|grant| grant.enabled)
+        .collect();
+    assert_eq!(granted, [false, true, false]);
+    let runner = &screen.draft.children[0];
+    assert_eq!(runner.default_route_index, 1, "runner default");
+    assert!(runner.route_grants[1].enabled && !runner.route_grants[0].enabled);
+
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelGrants));
+    let rendered = render_string(&mut screen, 100, 24);
+    assert!(rendered.contains("openrouter/deepseek/flash"), "{rendered}");
+    assert!(!rendered.contains("openai-compatible/"), "{rendered}");
+    assert!(
+        rendered.contains("★ openrouter/deepseek/flash"),
+        "{rendered}"
+    );
+}
+
+/// #553 (B12): confirming trust rows keeps them listed (marked ✓) with the
+/// cursor on a real row, so every row can be confirmed with Space alone.
+#[test]
+fn confirmed_trust_rows_stay_listed_and_space_confirms_each() {
+    let mut screen = AgentAuthoringScreen::new(template_routes_projection(), "b12".into());
+    for grant in &mut screen.draft.route_grants {
+        grant.enabled = true;
+    }
+    screen.handle_key(key(KeyCode::Enter));
+    screen.cursor = 2;
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelTrust));
+    assert_eq!(screen.cursor, 0, "a trust list opens at its first row");
+    for row in 0..3 {
+        screen.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            screen.visible_row_count(),
+            3,
+            "row {row}: confirmed rows stay"
+        );
+        assert!(screen.cursor < 3);
+        screen.handle_key(key(KeyCode::Down));
+    }
+    assert!(screen.draft.trust_confirmations.iter().all(|done| *done));
+    assert_eq!(screen.cursor, 2, "the cursor stays on the last row");
+    let rendered = render_string(&mut screen, 100, 24);
+    assert_eq!(rendered.matches("✓ openrouter/").count(), 3, "{rendered}");
+    assert!(
+        rendered.contains("openrouter/anthropic/haiku · untrusted by default"),
+        "{rendered}"
+    );
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(
+        !matches!(screen.phase, Phase::ModelTrust),
+        "every row confirmed"
+    );
+}
+
+/// Codex C5: when the default model's route is shared by several providers
+/// the projection cannot name it; nothing is granted or starred (never an
+/// unrelated first row), the screen says why, and the user's first pick is
+/// the default for the agent and its runner.
+#[test]
+fn an_unresolved_default_model_grants_nothing_and_asks_the_user() {
+    let mut projection = template_routes_projection();
+    projection.route_provider_labels = vec![None; 3];
+    projection.default_route = Some(cockpit_proto::AgentAuthoringDefaultRoute::Unresolved {
+        model_id: "deepseek/flash".into(),
+    });
+    let mut screen = AgentAuthoringScreen::new(projection, "c5".into());
+    assert!(screen.draft.route_grants.iter().all(|grant| !grant.enabled));
+    assert!(
+        screen.draft.children[0]
+            .route_grants
+            .iter()
+            .all(|grant| !grant.enabled)
+    );
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelGrants));
+    let rendered = render_string(&mut screen, 120, 24);
+    assert!(!rendered.contains('★'), "{rendered}");
+    assert!(
+        rendered.contains("Your default model deepseek/flash")
+            && rendered.contains("is offered by more than one provider."),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("openai-compatible/deepseek/flash"),
+        "{rendered}"
+    );
+    // Continue without a pick is refused.
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelGrants));
+    // The user's pick becomes the default, and the runner follows it.
+    screen.cursor = 1;
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(screen.draft.route_grants[1].enabled);
+    assert_eq!(screen.draft.default_route_index, 1);
+    assert!(screen.draft.children[0].route_grants[1].enabled);
+    assert_eq!(screen.draft.children[0].default_route_index, 1);
+}
+
+/// Codex C3: labels come from the projection the daemon computed with the
+/// same inventory; a replacement projection (policy conflict, another
+/// client's provider rename) relabels the rows from itself.
+#[test]
+fn replaced_projection_relabels_routes_from_itself() {
+    let mut screen = AgentAuthoringScreen::new(template_routes_projection(), "c3".into());
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(render_string(&mut screen, 100, 24).contains("openrouter/deepseek/flash"));
+    let mut renamed = template_routes_projection();
+    renamed.policy.policy_revision = "renamed".into();
+    renamed.route_provider_labels = vec![Some("orcompat".into()), None, Some("orcompat".into())];
+    screen.replace_projection(renamed);
+    screen.phase = Phase::ModelGrants;
+    let rendered = render_string(&mut screen, 100, 24);
+    assert!(rendered.contains("orcompat/anthropic/haiku"), "{rendered}");
+    assert!(
+        rendered.contains("openai-compatible/deepseek/flash"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("openrouter/"), "{rendered}");
+}
+
+/// Codex C4: entering the trust list from the action bar (mouse Continue)
+/// resets and clamps its cursor exactly like the keyboard path.
+#[test]
+fn trust_list_entered_from_the_action_bar_starts_on_its_first_row() {
+    let mut screen = AgentAuthoringScreen::new(template_routes_projection(), "c4".into());
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(matches!(screen.phase, Phase::ModelGrants));
+    screen.cursor = 2;
+    let continue_button = screen.buttons().len().saturating_sub(1);
+    screen.action_bar_click(continue_button);
+    assert!(
+        matches!(screen.phase, Phase::ModelTrust),
+        "{:?}",
+        screen.phase
+    );
+    assert_eq!(screen.cursor, 0);
+    screen.handle_key(key(KeyCode::Char(' ')));
+    assert!(
+        screen.draft.trust_confirmations[1],
+        "the first Space confirms the only row"
+    );
 }

@@ -4285,7 +4285,6 @@ fn typed_decode_path_recognizes_sections_that_serialize_only_when_set() {
         "compact_prompt",
         "sandbox",
         "goalSupervision",
-        "defaultAgent",
         "agentRuntimeDefaults",
         "sealedAcquisitionConsent",
         "commandResourceProfiles",

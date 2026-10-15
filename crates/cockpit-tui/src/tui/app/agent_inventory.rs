@@ -153,7 +153,18 @@ impl App {
             config_generation,
             inventory_generation,
         };
+        let response_agent = snap.selected_agent.clone();
+        let response_generation = snap.session_generation;
         let applied = self.inventory.apply_success(&ticket, snap);
+        if !applied {
+            tracing::warn!(
+                requested_agent = %ticket.identity.selected_agent,
+                response_agent = %response_agent,
+                response_session_generation = response_generation,
+                floor_session_generation = self.inventory.floors.session_generation,
+                "inventory bundle not applied"
+            );
+        }
         if applied {
             self.refresh_skill_commands();
         } else if self.inventory.take_dirty_replacement() {

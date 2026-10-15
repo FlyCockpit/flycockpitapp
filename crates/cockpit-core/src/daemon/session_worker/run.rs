@@ -143,15 +143,7 @@ fn snapshot_primary_routes(
     Ok(routes)
 }
 
-fn installation_launch_target(
-    installation: &cockpit_db::db::agent_installations::AgentInstallationRow,
-) -> Option<&str> {
-    installation
-        .source_agent_id
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-}
+use crate::daemon::agent_installation::installation_launch_target;
 
 fn load_profile_definition_with_workspace_authority(
     workspace_root: &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,

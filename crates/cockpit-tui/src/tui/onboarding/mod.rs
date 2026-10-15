@@ -353,8 +353,11 @@ pub(crate) enum OnboardingShellAction {
     /// already `Complete`.
     ReturnToCompletion,
     /// Close the shell preserving committed daemon progress; discard only
-    /// local unsaved text.
+    /// local unsaved text. The chat becomes the surface.
     Close,
+    /// Quit Cockpit (the footer's `^c quit`). Committed progress is kept and
+    /// the next launch resumes the run.
+    Quit,
     /// Agent authoring preview/apply/refresh intents for the app daemon
     /// bridge.
     AgentAuthoring(agent::AgentAuthoringShellAction),
@@ -403,6 +406,7 @@ impl std::fmt::Debug for OnboardingShellAction {
                 .finish(),
             Self::ReturnToCompletion => formatter.write_str("ReturnToCompletion"),
             Self::Close => formatter.write_str("Close"),
+            Self::Quit => formatter.write_str("Quit"),
             Self::AgentAuthoring(action) => formatter
                 .debug_tuple("AgentAuthoring")
                 .field(action)
@@ -446,6 +450,9 @@ enum EscapeChoice {
     Back,
     Defer,
     Cancel,
+    /// Before the secure store is chosen there is no chat to cancel into,
+    /// so leaving setup quits.
+    Quit,
     /// Shell-local: leave the completion-screen "add another provider"
     /// detour and present the stored summary again.
     ReturnToSummary,
@@ -457,6 +464,7 @@ impl EscapeChoice {
             Self::Back => "Back to the previous step",
             Self::Defer => "Defer provider setup (limited mode)",
             Self::Cancel => "Cancel setup for now",
+            Self::Quit => "Quit; setup resumes next launch",
             Self::ReturnToSummary => "Return to the setup summary",
         }
     }
@@ -468,6 +476,7 @@ impl EscapeChoice {
                 OnboardingShellAction::Transition(OnboardingTransitionKind::DeferProvider, None)
             }
             Self::Cancel => OnboardingShellAction::Close,
+            Self::Quit => OnboardingShellAction::Quit,
             Self::ReturnToSummary => OnboardingShellAction::ReturnToCompletion,
         }
     }
@@ -512,7 +521,17 @@ impl EscapeMenu {
             if stage == OnboardingStage::Provider {
                 choices.push(EscapeChoice::Defer);
             }
-            choices.push(EscapeChoice::Cancel);
+            // Without a vault the daemon is locked and no workspace can
+            // open, so the only way out is to quit.
+            let before_vault = matches!(
+                stage,
+                OnboardingStage::Welcome | OnboardingStage::Profile | OnboardingStage::SecureStore
+            );
+            choices.push(if before_vault {
+                EscapeChoice::Quit
+            } else {
+                EscapeChoice::Cancel
+            });
         }
         if choices.is_empty() {
             return None;
@@ -1470,7 +1489,7 @@ impl OnboardingShell {
             return None;
         }
         if Self::is_quit_chord(&key) {
-            return Some(OnboardingShellAction::Close);
+            return Some(OnboardingShellAction::Quit);
         }
 
         if let Some(menu) = self.escape.as_mut() {

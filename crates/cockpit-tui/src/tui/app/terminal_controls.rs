@@ -5,6 +5,12 @@ impl App {
     /// Read-only projection loads are intentionally absent. Operations that
     /// can have changed durable or host-published state remain represented by
     /// their exact owner/correlation until a terminal receipt is applied.
+    ///
+    /// Buffered best-effort records that were never dispatched (the
+    /// `RecordUsage` counters queued in `pending_usage` before a runner
+    /// exists) are not authority: nothing outside this process has seen
+    /// them, so they never fence exit. A failed pre-session attach would
+    /// otherwise leave them buffered forever and make quit impossible.
     pub(super) fn has_unsettled_local_authority(&self) -> bool {
         self.pending_prune_confirm
             || self.pending_resume_compaction_confirm
@@ -20,7 +26,6 @@ impl App {
             || self.pending_default_model_update_id.is_some()
             || !self.pending_control_requests.is_empty()
             || self.parked_control_follow_ons.is_pending()
-            || !self.pending_usage.is_empty()
             || !self.settings_blocking_actions.is_empty()
             || self.async_actions.has_unsettled_local_authority()
             || !self.image_ingress_draft_discards.is_empty()

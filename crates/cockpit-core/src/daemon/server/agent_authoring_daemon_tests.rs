@@ -86,7 +86,24 @@ fn package_from_projection(
 ) -> cockpit_proto::AuthoredAgentPackageDraft {
     use crate::authoring_draft::{AgentAuthoringDraft, build_package_draft};
 
+    // These fixtures configure no default model, so nothing is granted up
+    // front; grant the first route the way a user would.
+    assert!(projection.default_route.is_none());
     let mut draft = AgentAuthoringDraft::from_projection(projection);
+    crate::authoring_draft::toggle_route_grant_draft(
+        &mut draft.route_grants,
+        0,
+        &mut draft.default_route_index,
+        &mut draft.self_verification,
+    );
+    for child in &mut draft.children {
+        crate::authoring_draft::toggle_route_grant_draft(
+            &mut child.route_grants,
+            0,
+            &mut child.default_route_index,
+            &mut child.self_verification,
+        );
+    }
     for index in draft.pending_trust_route_indices(projection) {
         draft.trust_confirmations[index] = true;
     }
@@ -191,7 +208,7 @@ async fn authored_agent_controlled_daemon_settlement_matrix() {
         .expect("receipt after shell close");
     assert_eq!(committed.installation_id, after_close.installation_id);
 
-    let replayed = apply_authored(&ctx, &mut state, request).await;
+    let replayed = apply_authored(&ctx, &mut state, request.clone()).await;
     let replayed = match replayed {
         ApplyAuthoredAgentPackageOutcome::Receipt(receipt)
             if receipt.status == AuthoredAgentReceiptStatus::Committed =>
@@ -230,6 +247,44 @@ async fn authored_agent_controlled_daemon_settlement_matrix() {
         default.map(|id| id.to_string()),
         committed.installation_id.clone(),
         "terminal receipt must remain the sole default installation"
+    );
+
+    // #561: the default this apply selected is what a new code session runs,
+    // ahead of the agent last used in the project.
+    let project = tempfile::tempdir().expect("project dir");
+    let project_root = project.path().canonicalize().expect("canonical project");
+    crate::session::Session::insert_row_for_test(
+        &ctx.db,
+        &project_root,
+        "Build",
+        crate::session::TestSessionRowOptions::default(),
+    )
+    .await
+    .expect("last-used Build session");
+    let (_, project_id) = crate::session::Session::test_session_identity(&project_root);
+    let extended = cockpit_config::extended::ExtendedConfig::default();
+    let agent = crate::daemon::registry::initial_code_session_agent(
+        &ctx.db,
+        &project_root,
+        &project_id,
+        &extended,
+    )
+    .await
+    .expect("initial agent");
+    assert_eq!(
+        agent, request.package.name,
+        "new sessions run the default installed agent"
+    );
+    let installed = crate::daemon::agent_installation::installed_root_launch_targets(
+        &ctx.db,
+        &crate::daemon::agent_installation::canonical_workspace_id(&project_root),
+    )
+    .await
+    .expect("installed primaries");
+    assert_eq!(
+        installed,
+        [request.package.name.clone()],
+        "installed agents are selectable primaries"
     );
 }
 

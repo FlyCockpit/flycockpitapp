@@ -248,6 +248,7 @@ impl AgentAuthoringScreen {
             .review_policy_revision
             .as_deref()
             .is_some_and(|revision| revision != projection.policy.policy_revision);
+        let phase = self.phase;
         self.projection = projection;
         self.draft = fresh_authoring_draft(&self.projection);
         self.enter_draft_context();
@@ -305,6 +306,29 @@ impl AgentAuthoringScreen {
                 self.status = Some(message);
             }
         }
+    }
+
+    /// `provider/model` as the user configured the route, from the label the
+    /// daemon computed with this exact projection; the portable route token
+    /// when the projection names no single configured provider for it.
+    fn route_label(&self, provider_id: &str, model_id: &str) -> String {
+        let mut matches = self
+            .projection
+            .policy
+            .routes
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| route.provider_id == provider_id && route.model_id == model_id);
+        let label = match (matches.next(), matches.next()) {
+            (Some((index, _)), None) => self
+                .projection
+                .route_provider_labels
+                .get(index)
+                .cloned()
+                .flatten(),
+            _ => None,
+        };
+        format!("{}/{model_id}", label.as_deref().unwrap_or(provider_id))
     }
 
     fn resize_route_state(&mut self) {
@@ -655,6 +679,35 @@ impl AgentAuthoringScreen {
         if self.tool_model_picker.is_some() {
             return self.handle_tool_model_key(key);
         }
+        let phase = self.phase;
+        let action = self.handle_list_key(key);
+        self.settle_trust_cursor(phase);
+        action
+    }
+
+    /// Phase-entry normalization shared by every input path (keys, the
+    /// action bar, pointer rows, projection replacement): a trust list
+    /// opens at its first row, whatever row the previous list was on, and
+    /// its cursor always stays on a listed row.
+    fn settle_trust_cursor(&mut self, previous_phase: Phase) {
+        if !self.trust_phase() {
+            return;
+        }
+        if self.phase != previous_phase {
+            self.cursor = 0;
+            self.scroll_offset = 0;
+        }
+        self.cursor = self.cursor.min(self.trust_rows().len().saturating_sub(1));
+    }
+
+    fn trust_phase(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::ModelTrust | Phase::SubagentEdit(SubagentPhase::ModelTrust)
+        )
+    }
+
+    fn handle_list_key(&mut self, key: KeyEvent) -> Option<AgentAuthoringAction> {
         match key.code {
             KeyCode::Esc => self.handle_back(),
             KeyCode::Enter => self.handle_advance(),
@@ -807,6 +860,13 @@ impl AgentAuthoringScreen {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let phase = self.phase;
+        let handled = self.route_mouse(mouse);
+        self.settle_trust_cursor(phase);
+        handled
+    }
+
+    fn route_mouse(&mut self, mouse: MouseEvent) -> bool {
         self.note_pointer_event(&mouse);
         let pos = Position::new(mouse.column, mouse.row);
         if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
@@ -961,14 +1021,9 @@ impl AgentAuthoringScreen {
             Phase::ModelGrants | Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
                 self.projection.policy.routes.len()
             }
-            Phase::ModelTrust => self
-                .draft
-                .pending_trust_route_indices(&self.projection)
-                .len(),
-            Phase::SubagentEdit(SubagentPhase::ModelTrust) => self
-                .current_child()
-                .map(|child| child.pending_trust_route_indices(&self.projection).len())
-                .unwrap_or(0),
+            Phase::ModelTrust | Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
+                self.trust_rows().len()
+            }
             Phase::Optimizations | Phase::SubagentEdit(SubagentPhase::Optimizations) => {
                 self.optimization_row_count()
             }
@@ -1002,18 +1057,38 @@ impl AgentAuthoringScreen {
                     model_id: route.model_id.clone(),
                 })
             }
-            Phase::ModelTrust => self
-                .draft
-                .pending_trust_route_indices(&self.projection)
+            Phase::ModelTrust | Phase::SubagentEdit(SubagentPhase::ModelTrust) => self
+                .trust_rows()
                 .get(row)
                 .and_then(|index| self.route_trust_target(*index)),
-            Phase::SubagentEdit(SubagentPhase::ModelTrust) => self
-                .current_child()
-                .map(|child| child.pending_trust_route_indices(&self.projection))
-                .and_then(|pending| pending.get(row).copied())
-                .and_then(|index| self.route_trust_target(index)),
             _ => None,
         }
+    }
+
+    /// The policy routes listed on the current trust-confirmation screen:
+    /// every enabled route that needs a confirmation, confirmed or not, so
+    /// a confirmed row stays in place (marked `✓`) and the cursor never
+    /// points past a row that vanished.
+    fn trust_rows(&self) -> Vec<usize> {
+        match self.phase {
+            Phase::ModelTrust => self
+                .draft
+                .trust_confirmation_route_indices(&self.projection),
+            Phase::SubagentEdit(SubagentPhase::ModelTrust) => self
+                .current_child()
+                .map(|child| child.trust_confirmation_route_indices(&self.projection))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether route `index` is confirmed in the draft being edited.
+    fn trust_confirmed(&self, index: usize) -> bool {
+        let confirmations = match self.current_child() {
+            Some(child) => &child.trust_confirmations,
+            None => &self.draft.trust_confirmations,
+        };
+        confirmations.get(index).copied().unwrap_or(false)
     }
 
     /// The trust-confirmation target of policy route `index`, by model identity.
@@ -1090,12 +1165,29 @@ impl AgentAuthoringScreen {
             }
             Phase::ModelGrants => {
                 let cursor = self.cursor;
+                let first_grant = self.draft.enabled_route_count() == 0;
                 cockpit_core::authoring_draft::toggle_route_grant_draft(
                     &mut self.draft.route_grants,
                     cursor,
                     &mut self.draft.default_route_index,
                     &mut self.draft.self_verification,
                 );
+                if first_grant {
+                    // The default model could not be resolved, so nothing
+                    // was granted up front; the user's first pick is the
+                    // agent's default, and the prepared runner (still
+                    // without a model) follows that explicit choice.
+                    for child in &mut self.draft.children {
+                        if child.route_grants.iter().all(|grant| !grant.enabled) {
+                            cockpit_core::authoring_draft::toggle_route_grant_draft(
+                                &mut child.route_grants,
+                                cursor,
+                                &mut child.default_route_index,
+                                &mut child.self_verification,
+                            );
+                        }
+                    }
+                }
             }
             Phase::SubagentEdit(SubagentPhase::ModelGrants) => {
                 let cursor = self.cursor;
@@ -1109,23 +1201,18 @@ impl AgentAuthoringScreen {
                 }
             }
             Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
-                let cursor = self.cursor;
-                let pending = self
-                    .editing_child
-                    .as_ref()
-                    .map(|child| child.pending_trust_route_indices(&self.projection))
-                    .unwrap_or_default();
-                if let Some(child) = self.current_child_mut() {
-                    if let Some(index) = pending.get(cursor) {
-                        child.trust_confirmations[*index] = !child.trust_confirmations[*index];
-                    }
+                if let Some(index) = self.trust_rows().get(self.cursor).copied()
+                    && let Some(child) = self.current_child_mut()
+                    && let Some(confirmed) = child.trust_confirmations.get_mut(index)
+                {
+                    *confirmed = !*confirmed;
                 }
             }
             Phase::ModelTrust => {
-                let pending = self.draft.pending_trust_route_indices(&self.projection);
-                if let Some(index) = pending.get(self.cursor) {
-                    self.draft.trust_confirmations[*index] =
-                        !self.draft.trust_confirmations[*index];
+                if let Some(index) = self.trust_rows().get(self.cursor).copied()
+                    && let Some(confirmed) = self.draft.trust_confirmations.get_mut(index)
+                {
+                    *confirmed = !*confirmed;
                 }
             }
             Phase::Create => {
@@ -1428,7 +1515,7 @@ impl AgentAuthoringScreen {
                     Phase::SidecarEgress
                 } else if self
                     .draft
-                    .pending_trust_route_indices(&self.projection)
+                    .trust_confirmation_route_indices(&self.projection)
                     .is_empty()
                 {
                     Phase::ModelGrants
@@ -1440,7 +1527,7 @@ impl AgentAuthoringScreen {
             Phase::SubagentEdit(SubagentPhase::Optimizations) => {
                 self.phase = if self.current_child().is_some_and(|child| {
                     !child
-                        .pending_trust_route_indices(&self.projection)
+                        .trust_confirmation_route_indices(&self.projection)
                         .is_empty()
                 }) {
                     Phase::SubagentEdit(SubagentPhase::ModelTrust)
@@ -1834,8 +1921,9 @@ impl AgentAuthoringScreen {
             phase: SubagentPhase::Identity,
         });
         self.draft = parent_snapshot;
+        let child = prepared_child_draft(&self.projection);
         if let Some(parent) = Self::child_slot_at_path(&mut self.draft, &parent_path) {
-            parent.children.push(prepared_child_draft(&self.projection));
+            parent.children.push(child);
         }
         self.editing_child = Self::child_at_path(&self.draft, &child_path).cloned();
         self.enter_draft_context();
@@ -2134,6 +2222,13 @@ impl AgentAuthoringScreen {
     }
 
     pub(crate) fn action_bar_click(&mut self, button: usize) -> Option<AgentAuthoringAction> {
+        let phase = self.phase;
+        let action = self.action_bar_activate(button);
+        self.settle_trust_cursor(phase);
+        action
+    }
+
+    fn action_bar_activate(&mut self, button: usize) -> Option<AgentAuthoringAction> {
         self.disarm();
         match self.phase {
             Phase::SubagentsList if button == 0 => {
@@ -2267,7 +2362,7 @@ impl AgentAuthoringScreen {
                 Paragraph::new(Line::from(vec![
                     ui::radio_mark(focused, focused),
                     Span::styled(
-                        format!("{}/{}", route.provider_id, route.model_id),
+                        self.route_label(&route.provider_id, &route.model_id),
                         if focused {
                             Style::new().fg(theme::BRASS).add_modifier(Modifier::BOLD)
                         } else {
@@ -2377,8 +2472,8 @@ impl AgentAuthoringScreen {
                     lines.push((
                         None,
                         Line::from(format!(
-                            "Remote sidecar  {}/{}",
-                            route.provider_id, route.model_id
+                            "Remote sidecar  {}",
+                            self.route_label(&route.provider_id, &route.model_id)
                         )),
                     ));
                 }
@@ -2423,7 +2518,7 @@ impl AgentAuthoringScreen {
                                 Style::new().fg(theme::BRASS),
                             ),
                             Span::styled(
-                                format!("{}/{}", route.provider_id, route.model_id),
+                                self.route_label(&route.provider_id, &route.model_id),
                                 if self.cursor == index {
                                     selected
                                 } else if grant.enabled {
@@ -2436,38 +2531,50 @@ impl AgentAuthoringScreen {
                     ));
                 }
                 lines.push((None, Line::default()));
+                if !grants.iter().any(|grant| grant.enabled) {
+                    // The projection could not name the default model's
+                    // route, so nothing was granted for the user (#553,
+                    // Codex C5): say why and what to do.
+                    let why = match self.projection.default_route.as_ref() {
+                        Some(cockpit_proto::AgentAuthoringDefaultRoute::Unresolved {
+                            model_id,
+                        }) => {
+                            vec![
+                                format!("Your default model {model_id}"),
+                                "is offered by more than one provider.".to_string(),
+                                "Tick the model to use; the first tick is starred.".to_string(),
+                            ]
+                        }
+                        _ => vec!["Tick the models to use; the first tick is starred.".to_string()],
+                    };
+                    for line in why {
+                        lines.push((None, Line::from(Span::styled(line, selected))));
+                    }
+                }
                 lines.push((None, Line::from(Span::styled(
                     "Space toggles grants; disabling the default selects another enabled route.",
                     muted,
                 ))));
             }
-            Phase::ModelTrust => {
-                for (row, index) in self
-                    .draft
-                    .pending_trust_route_indices(&self.projection)
-                    .into_iter()
-                    .enumerate()
-                {
+            Phase::ModelTrust | Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
+                for (row, index) in self.trust_rows().into_iter().enumerate() {
                     let route = &self.projection.policy.routes[index];
-                    let confirmed = self
-                        .draft
-                        .trust_confirmations
-                        .get(index)
-                        .copied()
-                        .unwrap_or(false);
-                    let marked = confirmed || self.route_trust_armed(index);
+                    let focused = self.cursor == row;
                     lines.push((
                         Some(row),
                         Line::from(vec![
-                            ui::radio_mark(marked, self.cursor == row),
+                            ui::confirm_mark(
+                                self.trust_confirmed(index),
+                                self.route_trust_armed(index),
+                                focused,
+                            ),
                             Span::styled(
                                 format!(
-                                    "Confirm {}/{} as {}",
-                                    route.provider_id,
-                                    route.model_id,
+                                    "{} · {}",
+                                    self.route_label(&route.provider_id, &route.model_id),
                                     trust_label(route.trust)
                                 ),
-                                if self.cursor == row {
+                                if focused {
                                     selected
                                 } else {
                                     Style::new().fg(theme::INK)
@@ -2476,49 +2583,14 @@ impl AgentAuthoringScreen {
                         ]),
                     ));
                 }
+                lines.push((None, Line::default()));
                 lines.push((
                     None,
                     Line::from(Span::styled(
-                        "Click a row twice to confirm its shared trust classification.",
+                        "Space confirms the focused model (✓); click a row twice to confirm it.",
                         muted,
                     )),
                 ));
-            }
-            Phase::SubagentEdit(SubagentPhase::ModelTrust) => {
-                if let Some(child) = self.current_child() {
-                    for (row, index) in child
-                        .pending_trust_route_indices(&self.projection)
-                        .into_iter()
-                        .enumerate()
-                    {
-                        let route = &self.projection.policy.routes[index];
-                        let confirmed = child
-                            .trust_confirmations
-                            .get(index)
-                            .copied()
-                            .unwrap_or(false);
-                        let marked = confirmed || self.route_trust_armed(index);
-                        lines.push((
-                            Some(row),
-                            Line::from(vec![
-                                ui::radio_mark(marked, self.cursor == row),
-                                Span::styled(
-                                    format!(
-                                        "Confirm {}/{} as {}",
-                                        route.provider_id,
-                                        route.model_id,
-                                        trust_label(route.trust)
-                                    ),
-                                    if self.cursor == row {
-                                        selected
-                                    } else {
-                                        Style::new().fg(theme::INK)
-                                    },
-                                ),
-                            ]),
-                        ));
-                    }
-                }
             }
             Phase::Optimizations | Phase::SubagentEdit(SubagentPhase::Optimizations) => {
                 let (auto_prune, interactive, recursion, steering, skeptics, self_verify) =
@@ -2685,7 +2757,7 @@ impl AgentAuthoringScreen {
                             if row == 0 {
                                 "Same model".into()
                             } else {
-                                format!("{}/{}", route.provider_id, route.model_id)
+                                self.route_label(&route.provider_id, &route.model_id)
                             },
                             copies,
                             row == 0,
@@ -2728,7 +2800,10 @@ impl AgentAuthoringScreen {
                         .tool_model_for(item.name)
                         .and_then(|index| self.projection.policy.routes.get(index))
                     {
-                        tail.push_str(&format!(" · {}/{}", model.provider_id, model.model_id));
+                        tail.push_str(&format!(
+                            " · {}",
+                            self.route_label(&model.provider_id, &model.model_id)
+                        ));
                     } else if tool_requires_model(item.name) {
                         tail.push_str(" · choose model");
                     }
@@ -2806,10 +2881,9 @@ impl AgentAuthoringScreen {
                         lines.push((
                             None,
                             Line::from(format!(
-                                "{} {}/{} · {}",
+                                "{} {} · {}",
                                 if grant.is_default { "★" } else { "▣" },
-                                grant.provider_id,
-                                grant.model_id,
+                                self.route_label(&grant.provider_id, &grant.model_id),
                                 trust_label(grant.trust)
                             )),
                         ));
@@ -2857,9 +2931,11 @@ impl AgentAuthoringScreen {
                             .iter()
                             .map(|adjudicator| {
                                 format!(
-                                    "{}/{} ×{}",
-                                    adjudicator.provider_id,
-                                    adjudicator.model_id,
+                                    "{} ×{}",
+                                    self.route_label(
+                                        &adjudicator.provider_id,
+                                        &adjudicator.model_id
+                                    ),
                                     adjudicator.copies
                                 )
                             })
@@ -2878,7 +2954,9 @@ impl AgentAuthoringScreen {
                         ));
                     }
                     for child in &review.children {
-                        for line in review_child_lines(child, 1) {
+                        for line in review_child_lines(child, 1, &|provider: &str, model: &str| {
+                            self.route_label(provider, model)
+                        }) {
                             lines.push((None, line));
                         }
                     }
@@ -3220,6 +3298,8 @@ pub(crate) fn golden_sample_projection() -> AgentAuthoringProjection {
             }],
             definition_frontmatter_yaml: None,
         }],
+        route_provider_labels: Vec::new(),
+        default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
         review_trust_disclosure: "Trust classification is shared global provider/model policy."
             .into(),
     }
@@ -3318,15 +3398,18 @@ fn cycle_tool_tier_at(
     }
 }
 
-fn review_child_lines(child: &AuthoredAgentReviewChild, indent: usize) -> Vec<Line<'static>> {
+fn review_child_lines(
+    child: &AuthoredAgentReviewChild,
+    indent: usize,
+    label: &dyn Fn(&str, &str) -> String,
+) -> Vec<Line<'static>> {
     let prefix = "  ".repeat(indent);
     let mut lines = vec![Line::from(format!("{prefix}{}", child.path))];
     for grant in &child.grants {
         let mark = if grant.is_default { "*" } else { " " };
         lines.push(Line::from(format!(
-            "{prefix}  {mark} {}/{} · {}",
-            grant.provider_id,
-            grant.model_id,
+            "{prefix}  {mark} {} · {}",
+            label(&grant.provider_id, &grant.model_id),
             trust_label(grant.trust)
         )));
     }
@@ -3376,7 +3459,7 @@ fn review_child_lines(child: &AuthoredAgentReviewChild, indent: usize) -> Vec<Li
     if !child.children.is_empty() {
         lines.push(Line::from(format!("{prefix}  delegation children:")));
         for nested in &child.children {
-            lines.extend(review_child_lines(nested, indent + 1));
+            lines.extend(review_child_lines(nested, indent + 1, label));
         }
     }
     lines
@@ -3386,6 +3469,7 @@ fn trust_label(trust: cockpit_proto::AgentPolicyTrustClassification) -> &'static
     match trust {
         cockpit_proto::AgentPolicyTrustClassification::Trusted => "trusted",
         cockpit_proto::AgentPolicyTrustClassification::Untrusted => "untrusted",
-        cockpit_proto::AgentPolicyTrustClassification::Unset => "unset",
+        // An unclassified model resolves to untrusted at runtime.
+        cockpit_proto::AgentPolicyTrustClassification::Unset => "untrusted by default",
     }
 }

@@ -1,7 +1,7 @@
 ╭ Trust ───────────────────────────────────────────────────────────────────────╮
-│ ○ Confirm vendor/exact-a as unset                                            │
-│ Click a row twice to confirm its shared trust classification.                │
+│ ○ vendor/exact-a · untrusted by default                                      │
 │                                                                              │
+│ Space confirms the focused model (✓); click a row twice to confirm it.       │
 │                                                                              │
 │                                                                              │
 │                                                                              │

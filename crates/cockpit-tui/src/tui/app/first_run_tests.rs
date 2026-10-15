@@ -374,6 +374,8 @@ fn settle_onboarding_agent_stage(app: &mut App) {
             }],
             definition_frontmatter_yaml: None,
         }],
+        route_provider_labels: Vec::new(),
+        default_route: Some(cockpit_proto::AgentAuthoringDefaultRoute::Route { index: 0 }),
         review_trust_disclosure: "Trust classification is shared global provider/model policy."
             .into(),
     };

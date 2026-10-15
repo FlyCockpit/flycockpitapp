@@ -119,6 +119,30 @@ pub struct AgentAuthoringProjection {
     pub sources: Vec<AgentAuthoringSource>,
     /// Stable disclosure that trust is shared global policy, not per-agent.
     pub review_trust_disclosure: String,
+    /// Display names for `policy.routes`, index-aligned, computed from the
+    /// same provider inventory as the policy. A route's `provider_id` is the
+    /// portable token an authored definition stores (a template id, or
+    /// `configured-provider-N`); this is the configured provider id the user
+    /// knows, present only when exactly one configured provider offers the
+    /// route. Clients must never derive it from another inventory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_provider_labels: Vec<Option<String>>,
+    /// Where the configured default model sits among `policy.routes`, from
+    /// the same inventory. Absent when no default model is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_route: Option<AgentAuthoringDefaultRoute>,
+}
+
+/// Resolution of the configured default model onto the projection's routes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentAuthoringDefaultRoute {
+    /// The default model is exactly this route.
+    Route { index: u32 },
+    /// The default model's route token is shared by several configured
+    /// providers (or it is not offered), so no route can be named for it.
+    /// Clients must ask the user instead of granting a route.
+    Unresolved { model_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

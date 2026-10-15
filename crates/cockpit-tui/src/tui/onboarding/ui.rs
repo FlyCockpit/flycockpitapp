@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 pub(super) use crate::tui::chrome::{
-    RADIO_OFF, RADIO_ON, check_mark, radio_mark, render_field, render_field_masked,
+    RADIO_OFF, RADIO_ON, check_mark, confirm_mark, radio_mark, render_field, render_field_masked,
 };
 use crate::tui::theme::{BRASS, FOG, INK, NIGHT};
 #[allow(dead_code)] // starred default-model rows land in #430.

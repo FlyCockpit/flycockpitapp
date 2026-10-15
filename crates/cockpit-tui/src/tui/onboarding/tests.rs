@@ -383,11 +383,18 @@ fn escape_offers_visible_choices_and_never_defers_silently() {
 #[test]
 fn escape_menu_choices_differ_by_stage() {
     let cases: [(OnboardingStage, &[&str]); 4] = [
-        // Welcome has nowhere to go back to and nothing to defer.
-        (OnboardingStage::Welcome, &["Cancel setup for now"]),
+        // Welcome has nowhere to go back to and nothing to defer. Before
+        // the secure store there is no chat to cancel into: leaving quits.
+        (
+            OnboardingStage::Welcome,
+            &["Quit; setup resumes next launch"],
+        ),
         (
             OnboardingStage::SecureStore,
-            &["Back to the previous step", "Cancel setup for now"],
+            &[
+                "Back to the previous step",
+                "Quit; setup resumes next launch",
+            ],
         ),
         (
             // Back from Provider would reopen the committed secure-store
@@ -1335,7 +1342,7 @@ fn escape_menu_row_hover_follows_the_pointer_when_the_menu_moves_or_clips() {
     let mut engine = Dialog::None;
     shell.handle_key(key(KeyCode::Esc), &mut engine);
     let opened = render_buffer(&mut shell, 80, 24);
-    let row = find_text(&opened, "Cancel setup for now");
+    let row = find_text(&opened, "Quit; setup resumes next launch");
     shell.handle_mouse(moved(row.x + 2, row.y), &mut engine);
     let hovered = render_buffer(&mut shell, 80, 24);
     assert_eq!(escape_menu_hover_rows(&hovered), [row.y]);
@@ -1343,7 +1350,7 @@ fn escape_menu_row_hover_follows_the_pointer_when_the_menu_moves_or_clips() {
     // A shorter terminal recentres the menu: the row moves away from the
     // pointer, and only a row actually under the pointer may hover.
     let moved_menu = render_buffer(&mut shell, 80, 16);
-    let moved_row = find_text(&moved_menu, "Cancel setup for now");
+    let moved_row = find_text(&moved_menu, "Quit; setup resumes next launch");
     assert_ne!(moved_row.y, row.y, "the menu must move");
     let rows = escape_menu_hover_rows(&moved_menu);
     assert!(rows.iter().all(|y| *y == row.y), "{rows:?}");
@@ -2512,13 +2519,61 @@ fn back_is_unclickable_on_welcome_and_provider() {
 #[test]
 fn ctrl_c_quits_from_anywhere() {
     let mut engine = Dialog::None;
-    let mut shell = shell_at(OnboardingStage::SecureStore);
-    let mut key = key(KeyCode::Char('c'));
-    key.modifiers = KeyModifiers::CONTROL;
-    assert!(matches!(
-        shell.handle_key(key, &mut engine),
-        Some(OnboardingShellAction::Close)
-    ));
+    // The footer promises `^c quit`: Ctrl-C quits Cockpit at every stage,
+    // never closes the shell into a chat that cannot load (#548).
+    for stage in [
+        OnboardingStage::Welcome,
+        OnboardingStage::SecureStore,
+        OnboardingStage::Provider,
+        OnboardingStage::Model,
+        OnboardingStage::Agent,
+        OnboardingStage::Lifetime,
+    ] {
+        let mut shell = shell_at(stage);
+        let mut key = key(KeyCode::Char('c'));
+        key.modifiers = KeyModifiers::CONTROL;
+        assert!(
+            matches!(
+                shell.handle_key(key, &mut engine),
+                Some(OnboardingShellAction::Quit)
+            ),
+            "{stage:?}"
+        );
+    }
+}
+
+#[test]
+fn escape_menu_quits_before_the_secure_store_and_cancels_after() {
+    let mut engine = Dialog::None;
+    for (stage, label, quits) in [
+        (
+            OnboardingStage::Profile,
+            "Quit; setup resumes next launch",
+            true,
+        ),
+        (OnboardingStage::Provider, "Cancel setup for now", false),
+    ] {
+        let mut shell = shell_at(stage);
+        shell.handle_key(key(KeyCode::Esc), &mut engine);
+        let menu = render_string(&mut shell, 90, 24, &engine);
+        assert!(menu.contains(label), "{stage:?}: {menu}");
+        // The leaving row is last.
+        for _ in 0..3 {
+            shell.handle_key(key(KeyCode::Down), &mut engine);
+        }
+        let action = shell.handle_key(key(KeyCode::Enter), &mut engine);
+        if quits {
+            assert!(
+                matches!(action, Some(OnboardingShellAction::Quit)),
+                "{stage:?}"
+            );
+        } else {
+            assert!(
+                matches!(action, Some(OnboardingShellAction::Close)),
+                "{stage:?}"
+            );
+        }
+    }
 }
 
 #[test]

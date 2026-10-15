@@ -44,7 +44,29 @@ impl Db {
         let kind = kind.to_owned();
         let source_key = source_key.map(str::to_owned);
         let payload_json = payload_json.to_owned();
+        #[cfg(any(test, feature = "test-support"))]
+        let mut pause = test_gate::take(self.path.as_deref());
+        #[cfg(any(test, feature = "test-support"))]
+        if pause
+            .as_ref()
+            .is_some_and(|gate| gate.phase == ProjectionWritePhaseForTest::BeforeEnqueue)
+        {
+            let gate = pause.take().expect("before-enqueue pause is present");
+            let _ = gate.entered.send(());
+            gate.release
+                .await
+                .context("releasing pre-enqueue projection pause")?;
+        }
         self.write(move |conn| {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(gate) = pause {
+                // Running on the real file writer proves acceptance. Hold the
+                // reply until the transport has cancelled and joined dispatch.
+                let _ = gate.entered.send(());
+                gate.release
+                    .blocking_recv()
+                    .context("releasing accepted projection pause")?;
+            }
             Self::append_code_root_projection_delivery_conn(
                 conn,
                 session_id,
@@ -352,4 +374,102 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeRootProjecti
         payload_json: row.get(5)?,
         created_at_unix_ms: row.get(6)?,
     })
+}
+
+// A per-database, one-shot seam around the actual async projection write. It
+// never replaces the SQLite job, enqueue path, commit, or reply ownership.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionWritePhaseForTest {
+    BeforeEnqueue,
+    Accepted,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct ProjectionWritePauseForTest {
+    path: std::path::PathBuf,
+    entered: tokio::sync::oneshot::Receiver<()>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ProjectionWritePauseForTest {
+    pub async fn entered(&mut self) -> Result<()> {
+        (&mut self.entered)
+            .await
+            .context("projection write reached pause")
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ProjectionWritePauseForTest {
+    fn drop(&mut self) {
+        test_gate::take(Some(&self.path));
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Db {
+    pub fn pause_next_code_root_projection_for_test(
+        &self,
+        phase: ProjectionWritePhaseForTest,
+    ) -> Result<ProjectionWritePauseForTest> {
+        let path = self
+            .path
+            .clone()
+            .context("projection pause requires a file-backed writer")?;
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let mut gates = test_gate::gates()
+            .lock()
+            .expect("projection test gates poisoned");
+        ensure!(
+            !gates.contains_key(&path),
+            "projection pause already installed"
+        );
+        gates.insert(
+            path.clone(),
+            test_gate::Gate {
+                phase,
+                entered: entered_tx,
+                release: release_rx,
+            },
+        );
+        Ok(ProjectionWritePauseForTest {
+            path,
+            entered,
+            release: Some(release),
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+mod test_gate {
+    use super::ProjectionWritePhaseForTest;
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{Mutex, OnceLock},
+    };
+
+    pub(super) struct Gate {
+        pub phase: ProjectionWritePhaseForTest,
+        pub entered: tokio::sync::oneshot::Sender<()>,
+        pub release: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    pub(super) fn gates() -> &'static Mutex<HashMap<PathBuf, Gate>> {
+        static GATES: OnceLock<Mutex<HashMap<PathBuf, Gate>>> = OnceLock::new();
+        GATES.get_or_init(Mutex::default)
+    }
+
+    pub(super) fn take(path: Option<&Path>) -> Option<Gate> {
+        gates()
+            .lock()
+            .expect("projection test gates poisoned")
+            .remove(path?)
+    }
 }

@@ -6,6 +6,22 @@
 
 use cockpit_proto as proto;
 
+/// Empty editor ingress for daemon-boundary tests. Keep raw ingress
+/// construction in the composition owner; consumers can supply only opaque
+/// correlation ids, never forwarded declarations or credential material.
+#[cfg(test)]
+pub(crate) fn empty_ingress_for_test(
+    client_provenance_id: &str,
+    ingress_request_id: &str,
+) -> proto::AcpForwardedMcpIngressV1 {
+    proto::AcpForwardedMcpIngressV1 {
+        version: proto::ACP_FORWARDED_MCP_VERSION_V1,
+        declarations: Vec::new(),
+        client_provenance_id: proto::OpaqueAsciiId128V1::new(client_provenance_id).unwrap(),
+        ingress_request_id: proto::OpaqueAsciiId128V1::new(ingress_request_id).unwrap(),
+    }
+}
+
 /// Composition-only state carried while a public ACP route delegates to a
 /// base Code-root primitive. The base primitive consumes this immediately
 /// before it records its attachment/idempotency receipt, so neither the

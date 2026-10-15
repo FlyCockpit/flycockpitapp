@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   clientEnvelopeSchema,
   eventEnvelopeSchema,
+  lockedReadyConstructionSchema,
   onboardingBootstrapSnapshotSchema,
   PROTOCOL_VERSION,
+  redactionCoverageStatusSchema,
   responseEnvelopeSchema,
 } from "./index";
 
@@ -71,5 +73,40 @@ describe("daemon onboarding wire projection", () => {
     expect(
       onboardingBootstrapSnapshotSchema.safeParse({ ...snapshot, [field]: "canary" }).success,
     ).toBe(false);
+  });
+});
+
+describe("typed redaction coverage state", () => {
+  it.each([
+    "capture_failed",
+    "busy",
+    "sources_changed",
+    "source_file_over_limit",
+    "ssh_keys_over_budget",
+    "sources_over_budget",
+    "held_by_open_sessions",
+  ])("preserves %s through construction and projection schemas", (reason) => {
+    const failure = { failed: { reason: { redaction_coverage: reason } } };
+    expect(lockedReadyConstructionSchema.parse(failure)).toEqual(failure);
+    for (const session_id of [undefined, snapshot.run_id]) {
+      const status = { session_id, unavailable: reason };
+      expect(redactionCoverageStatusSchema.parse(status)).toEqual(status);
+      const frame = {
+        v: PROTOCOL_VERSION,
+        kind: "evt",
+        event: "redaction_coverage_status",
+        data: status,
+      };
+      expect(eventEnvelopeSchema.parse(frame)).toEqual(frame);
+    }
+  });
+
+  it("rejects missing or unknown failure reasons and secret-bearing status", () => {
+    for (const failure of ["failed", { failed: {} }, { failed: { reason: "unknown" } }]) {
+      expect(lockedReadyConstructionSchema.safeParse(failure).success).toBe(false);
+    }
+    expect(redactionCoverageStatusSchema.parse({})).toEqual({});
+    expect(redactionCoverageStatusSchema.safeParse({ unavailable: "unknown" }).success).toBe(false);
+    expect(redactionCoverageStatusSchema.safeParse({ credential: "canary" }).success).toBe(false);
   });
 });

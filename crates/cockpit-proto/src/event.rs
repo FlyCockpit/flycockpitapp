@@ -1661,6 +1661,17 @@ pub enum Event {
         message: Option<String>,
     },
 
+    /// Content-free coverage state. `session_id: Some` describes an attach
+    /// projection and follows that attachment's epoch; `None` describes the
+    /// daemon-global owner-response backstop. `Some(reason)` means free text
+    /// was withheld; `None` means coverage is current again for that scope.
+    RedactionCoverageStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unavailable: Option<crate::RedactionCoverageFailure>,
+    },
+
     /// The lifetime of this live daemon changed. **Daemon-global**: every
     /// attached client must replace its cached exit policy before deciding
     /// whether to show the ephemeral-owner detach prompt.
@@ -1875,6 +1886,7 @@ macro_rules! event_variants {
             (Event::TandemState { .. }, "tandem_state");
             (Event::GitignoreAllow { .. }, "gitignore_allow");
             (Event::CaffeinateState { .. }, "caffeinate_state");
+            (Event::RedactionCoverageStatus { .. }, "redaction_coverage_status");
             (Event::DaemonLifetimeChanged { .. }, "daemon_lifetime_changed");
             (Event::OnboardingBootstrap(..), "onboarding_bootstrap");
             #[cfg(feature = "remote")]

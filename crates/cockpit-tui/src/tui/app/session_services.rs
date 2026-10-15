@@ -191,7 +191,9 @@ impl App {
         );
         // An exit escape belongs to the attachment it was armed for.
         self.exit_check_escape = None;
+        self.prepare_attachment_header_state(None);
         self.queue.clear();
+        self.session_redaction_coverage_unavailable = None;
         self.folded_queue_item_ids.clear();
         self.folded_queue_item_order.clear();
         self.retained_user_submission_ids.clear();
@@ -222,6 +224,26 @@ impl App {
         // drop any pending pin-state failure-retry gate — otherwise returning to
         // a briefly-gated session within the backoff would show a stale count.
         self.pin_state_retry_after = None;
+    }
+
+    /// Session activity is unknown until the replacement attachment supplies
+    /// it. Installation-wide pills (updates, coverage, caffeinate) survive.
+    /// A pending interrupt in the outgoing session remains real background
+    /// attention and must still resolve under that session's identity.
+    pub(super) fn prepare_attachment_header_state(&mut self, session_id: Option<uuid::Uuid>) {
+        self.waiting_for_lock = None;
+        self.longcache_enabled = false;
+        self.longcache_supported = false;
+        if session_id.is_some() && self.launch.session_id != session_id {
+            if let Some(outgoing) = self.launch.session_id
+                && let Some(attention) = self.attention_interrupt.take()
+            {
+                self.background_attention_interrupts
+                    .insert(outgoing, attention);
+            }
+            self.attention_interrupt =
+                session_id.and_then(|id| self.background_attention_interrupts.remove(&id));
+        }
     }
 
     pub(super) fn cancel_outgoing_turn_if_busy(&mut self) {
@@ -712,10 +734,29 @@ impl App {
         outcome: agent_runner::SessionSwitchOutcome,
         current_session_persisted: bool,
     ) {
+        let replacement_epoch = outcome.attachment_epoch;
+        self.same_session_resync_event_buffer
+            .retain(|queued| queued.attachment_epoch == replacement_epoch);
         self.drain_agent_events();
         self.cancel_older_history_page_request();
         self.adopt_session_switch_identity(&outcome);
+        self.adopt_switched_attachment_epoch(replacement_epoch);
         self.current_session_persisted = current_session_persisted;
+    }
+
+    /// Make the switched-to attachment visible and replay, in order, the
+    /// events it delivered before App adopted the outcome. Without this a
+    /// resumed session's events (its config snapshot, queue, live turns) stay
+    /// held forever behind the outgoing epoch.
+    fn adopt_switched_attachment_epoch(&mut self, epoch: u64) {
+        self.visible_attachment_epoch = epoch;
+        self.session_redaction_coverage_unavailable = None;
+        let buffered = std::mem::take(&mut self.same_session_resync_event_buffer);
+        for queued in buffered {
+            if queued.attachment_epoch == epoch {
+                self.apply_event(queued.event);
+            }
+        }
     }
 
     /// Adopt the daemon's completed attach as one ordered identity change.
@@ -735,6 +776,8 @@ impl App {
         }
         self.launch.session_id = Some(outcome.session_id);
         self.launch.session_short_id = Some(outcome.short_id.clone());
+        self.launch.agent_name = outcome.active_agent.clone();
+        self.agent_path = outcome.active_agent_path.clone();
         self.project_id = Some(outcome.project_id.clone());
         self.foreground_input_target = outcome.foreground_target.clone();
         if outcome.promoted_from_ephemeral
@@ -764,7 +807,13 @@ impl App {
             self.event_loop_monotonic_now,
         );
         self.clear_at_suggestion_popup_state();
-        self.same_session_resync_event_buffer.clear();
+        // Keep only the replacement attachment's events: they were held
+        // because they arrived before this outcome (#547: the attach-time
+        // `ConfigSnapshot` among them; dropping it left the resumed session
+        // with no provider). Anything older is stale.
+        let replacement_epoch = outcome.attachment_epoch;
+        self.same_session_resync_event_buffer
+            .retain(|queued| queued.attachment_epoch == replacement_epoch);
         self.drain_agent_events();
         self.cancel_older_history_page_request();
         let resume_history = matches!(outcome.target, agent_runner::SessionTarget::Resume { .. })
@@ -805,6 +854,7 @@ impl App {
             self.current_session_persisted = true;
         }
         self.adopt_session_switch_identity(&outcome);
+        self.adopt_switched_attachment_epoch(replacement_epoch);
         match outcome.target {
             agent_runner::SessionTarget::New => {
                 self.current_session_persisted = false;

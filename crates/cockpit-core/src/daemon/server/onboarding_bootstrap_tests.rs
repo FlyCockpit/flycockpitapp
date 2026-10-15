@@ -657,6 +657,11 @@ async fn ready_transition_keeps_the_acquired_permit_until_return_publication() {
 #[tokio::test]
 async fn dropped_ready_construction_rolls_back_in_memory_and_releases_the_permit() {
     let (_tmp, locked, _) = ready_construction().await;
+    locked.record_ready_construction_failure(
+        cockpit_proto::ReadyConstructionFailure::RedactionCoverage(
+            cockpit_proto::RedactionCoverageFailure::SshKeysOverBudget,
+        ),
+    );
     let constructed = locked
         .finish_ready_transition()
         .await
@@ -672,7 +677,9 @@ async fn dropped_ready_construction_rolls_back_in_memory_and_releases_the_permit
     assert!(!locked.closing.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(
         locked.ready_construction_phase(),
-        cockpit_proto::LockedReadyConstruction::Failed
+        cockpit_proto::LockedReadyConstruction::Failed {
+            reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
+        }
     );
 }
 
@@ -693,7 +700,9 @@ async fn stored_ready_handoff_without_lifecycle_receiver_rolls_back() {
     );
     assert_eq!(
         locked.ready_construction_phase(),
-        cockpit_proto::LockedReadyConstruction::Failed
+        cockpit_proto::LockedReadyConstruction::Failed {
+            reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
+        }
     );
     assert!(!locked.ready.load(std::sync::atomic::Ordering::Acquire));
 }
@@ -1287,7 +1296,9 @@ async fn ready_construction_retry_is_idempotent_and_daemon_owned() {
     );
     wait_for_phase(
         &served.locked,
-        cockpit_proto::LockedReadyConstruction::Failed,
+        cockpit_proto::LockedReadyConstruction::Failed {
+            reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
+        },
     )
     .await;
     assert!(
@@ -1344,7 +1355,9 @@ async fn failed_retry_snapshot_cannot_cancel_the_spawned_construction() {
         .expect("first attempt admitted");
     wait_for_phase(
         &served.locked,
-        cockpit_proto::LockedReadyConstruction::Failed,
+        cockpit_proto::LockedReadyConstruction::Failed {
+            reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
+        },
     )
     .await;
     served
@@ -1589,7 +1602,9 @@ async fn vault_present_boot_serves_the_bootstrap_hello_then_publishes_ready() {
     // never `constructing` (nothing is running).
     assert_eq!(
         locked.ready_construction_phase(),
-        cockpit_proto::LockedReadyConstruction::Failed,
+        cockpit_proto::LockedReadyConstruction::Failed {
+            reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
+        },
     );
     let ticket = crate::daemon::peer_authority::mint_launch_ticket();
     locked
@@ -1906,7 +1921,9 @@ async fn passphrase_file_onboarding_runs_end_to_end_to_ready() {
     // must construct from the same custody.
     wait_for_phase(
         &served.locked,
-        cockpit_proto::LockedReadyConstruction::Failed,
+        cockpit_proto::LockedReadyConstruction::Failed {
+            reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
+        },
     )
     .await;
     super::retry_locked_ready_construction(&served.locked)
@@ -1940,7 +1957,9 @@ async fn committed_choice_without_a_construction_owner_reports_failed_and_is_ret
     assert!(locked.vault_committed());
     assert_eq!(
         locked.ready_construction_phase(),
-        cockpit_proto::LockedReadyConstruction::Failed,
+        cockpit_proto::LockedReadyConstruction::Failed {
+            reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
+        },
         "nothing constructs, so nothing may report constructing"
     );
     assert!(
@@ -2032,7 +2051,9 @@ async fn replayed_committed_intent_restarts_a_failed_construction() {
         .expect("commit");
     wait_for_phase(
         &served.locked,
-        cockpit_proto::LockedReadyConstruction::Failed,
+        cockpit_proto::LockedReadyConstruction::Failed {
+            reason: cockpit_proto::ReadyConstructionFailure::Unclassified,
+        },
     )
     .await;
     let replay = served
@@ -2322,9 +2343,11 @@ async fn fatal_locked_loop_exit_settles_the_in_flight_construction() {
             .ready_transition_inflight
             .load(std::sync::atomic::Ordering::Acquire)
     );
-    assert_ne!(
-        locked.ready_construction_phase(),
-        cockpit_proto::LockedReadyConstruction::Failed,
+    assert!(
+        !matches!(
+            locked.ready_construction_phase(),
+            cockpit_proto::LockedReadyConstruction::Failed { .. }
+        ),
         "a successful construction retired by the exit is not rolled back"
     );
 }

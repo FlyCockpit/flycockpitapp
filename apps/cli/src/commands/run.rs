@@ -2076,6 +2076,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Reconnect { .. }
         | DaemonDraining { .. }
         | DaemonLifetimeChanged { .. }
+        | RedactionCoverageStatus { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }

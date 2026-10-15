@@ -2603,6 +2603,35 @@ impl App {
                 self.gitignore_session_allow = allow;
                 self.at_cache.borrow_mut().take();
             }
+            TurnEvent::RedactionCoverageStatus {
+                session_id,
+                unavailable,
+            } => {
+                let was = self.header_coverage_unavailable();
+                if let Some(session_id) = session_id {
+                    if self.launch.session_id != Some(session_id) {
+                        return;
+                    }
+                    self.session_redaction_coverage_unavailable = unavailable;
+                } else {
+                    self.redaction_coverage_unavailable = unavailable;
+                }
+                let current = self.header_coverage_unavailable();
+                match (was, current) {
+                    (previous, Some(reason)) if previous != Some(reason) => {
+                        let text = super::redaction_coverage_withheld_text(reason);
+                        self.push_plain(format!("⚠ {text}"));
+                        self.show_toast(text, ToastKind::Warning);
+                    }
+                    (Some(_), None) => {
+                        self.show_toast(
+                            "redaction coverage restored; reattach or reopen views to reload withheld text",
+                            ToastKind::Info,
+                        );
+                    }
+                    _ => {}
+                }
+            }
             TurnEvent::CaffeinateState {
                 active,
                 lid_close_guaranteed,

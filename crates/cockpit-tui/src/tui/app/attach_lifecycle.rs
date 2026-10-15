@@ -540,6 +540,7 @@ impl App {
         new_session_id: Option<uuid::Uuid>,
         state: Option<&cockpit_proto::ActiveModelState>,
     ) {
+        self.prepare_attachment_header_state(new_session_id);
         for operation in self.pending_sealed_operations.values() {
             operation.invalidate();
         }

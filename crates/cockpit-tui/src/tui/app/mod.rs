@@ -1908,6 +1908,19 @@ pub(super) fn sandbox_down_notice_text_with_intent(
     text
 }
 
+/// What the TUI says while response text is withheld because the daemon
+/// could not establish redaction coverage (#547).
+pub(super) fn redaction_coverage_withheld_text(
+    reason: cockpit_proto::RedactionCoverageFailure,
+) -> String {
+    format!(
+        "Redaction coverage is unavailable, so Cockpit is withholding text from the daemon \
+         (shown as \"{}\"): {}",
+        cockpit_core::redact::COVERAGE_WITHHELD_PLACEHOLDER,
+        reason.message()
+    )
+}
+
 fn command_capability_notice_text(
     text: &str,
     fix_command: Option<&str>,
@@ -3028,6 +3041,14 @@ pub struct App {
     /// event so it stays in sync across all clients (incl. until-idle
     /// auto-off). Not client-owned: the assertion lives in the daemon.
     pub(super) caffeinate_active: bool,
+    /// Set while the daemon reports that it cannot establish redaction
+    /// coverage for this client's responses (`RedactionCoverageStatus`):
+    /// their free text arrives withheld. Drives the header warning pill.
+    pub(super) redaction_coverage_unavailable: Option<cockpit_proto::RedactionCoverageFailure>,
+    /// Separate attachment-owned projection state: a healthy global response
+    /// cannot clear a session's withheld history warning (or vice versa).
+    pub(super) session_redaction_coverage_unavailable:
+        Option<cockpit_proto::RedactionCoverageFailure>,
     /// User attention-notification settings (implementation note):
     /// in-TUI toast (default on), terminal title (default on), terminal bell,
     /// desktop notification.
@@ -4522,6 +4543,8 @@ impl App {
             capability_refresh_queue: Vec::new(),
             capability_refresh_calls: 0,
             caffeinate_active: false,
+            redaction_coverage_unavailable: None,
+            session_redaction_coverage_unavailable: None,
             attention,
             attention_state: crate::tui::attention::AttentionState::new(),
             attention_interrupt: None,

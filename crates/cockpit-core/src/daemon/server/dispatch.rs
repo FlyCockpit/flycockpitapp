@@ -9,7 +9,6 @@ use super::sessions_remote::{self, RemoteSessionLedger};
 use super::*;
 use crate::daemon::acp_catalog_composition::PendingAcpCatalogCompositionV1;
 use crate::daemon::agent_management::{bad_config, conflict};
-use crate::daemon::code_roots::CodeRootProjectionWriterV1;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
 use sha2::{Digest, Sha256};
@@ -3882,7 +3881,7 @@ async fn handle_message_ingress(
         .await
         .map_err(internal)?
     {
-        let origin_principal = state.principal.tag();
+        let origin_principal = state.principal.authorship_tag();
         if !durable_canonical_replay
             && terminal.origin_principal.as_deref() != origin_principal.as_deref()
         {
@@ -4470,7 +4469,7 @@ async fn handle_send_user_message(
     }
     let session_id = require_attached(state)?.handle.session_id();
     let handle = require_attached(state)?.handle.clone();
-    let origin_principal = state.principal.tag();
+    let origin_principal = state.principal.authorship_tag();
     // A text-only oversized source switches to FCM2 before any receipt or
     // queue side effect. In particular the codec rejects 8MiB+1 before the
     // worker can create a receipt triple or reservation.
@@ -6212,7 +6211,7 @@ async fn rollback_acp_catalog_composition_failure(
     let Some(attachment) = pending.attachment else {
         return error;
     };
-    let close = Box::pin(handle_serialized_request_impl(
+    let close = Box::pin(handle_serialized_request_inner(
         request_id,
         Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
             attachment_capability: attachment,
@@ -6257,7 +6256,45 @@ async fn rollback_acp_catalog_composition_failure(
     }
 }
 
+/// All serialized entry points return through this projection boundary. The
+/// inner routes (including ACP composition) record canonical, frozen operation
+/// results before we scrub a response copy. Receipt replays therefore retain
+/// their original history/identity/cursor while using current session coverage
+/// and reporting its typed disposition on every connection and every retry.
 async fn handle_serialized_request_impl(
+    request_id: Uuid,
+    request: Request,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let mut response = Box::pin(handle_serialized_request_inner(
+        request_id,
+        request,
+        state,
+        shared,
+        ctx,
+        effects,
+        #[cfg(feature = "remote")]
+        remote_operation,
+    ))
+    .await?;
+    let root = match &mut response {
+        Response::CodeRootCreated(result) => &mut result.root,
+        Response::CodeRootAttached(result) => &mut result.root,
+        Response::CodeRootWithAcpIngressCreated(result) => &mut result.base.root,
+        Response::CodeRootWithAcpIngressAttached(result) => &mut result.base.root,
+        _ => return Ok(response),
+    };
+    let handle = require_attached(state)?.handle.clone();
+    ensure_agent_tree_attached_session(root.root_id.0, &handle)?;
+    scrub_code_root_read_current(root, &handle, &mut state.pending_replay).await;
+    Ok(response)
+}
+
+async fn handle_serialized_request_inner(
     request_id: Uuid,
     request: Request,
     state: &mut MutableClientState,
@@ -6921,7 +6958,7 @@ async fn handle_serialized_request_impl(
                 root_id: None,
                 attachment: None,
             });
-            let base_response = Box::pin(handle_serialized_request_impl(
+            let base_response = Box::pin(handle_serialized_request_inner(
                 request_id,
                 Request::CreateCodeRootV1(request.base.clone()),
                 state,
@@ -6996,7 +7033,7 @@ async fn handle_serialized_request_impl(
                 root_id: None,
                 attachment: None,
             });
-            let base_response = Box::pin(handle_serialized_request_impl(
+            let base_response = Box::pin(handle_serialized_request_inner(
                 request_id,
                 Request::AttachExistingCodeRootV1(request.base.clone()),
                 state,
@@ -7051,7 +7088,7 @@ async fn handle_serialized_request_impl(
                 .record_for_capability(&request.attachment_capability)
                 .map_err(code_root_contract_error)?
                 .root_id;
-            let base_response = Box::pin(handle_serialized_request_impl(
+            let base_response = Box::pin(handle_serialized_request_inner(
                 request_id,
                 Request::CloseCodeRootAttachmentV1(proto::CloseCodeRootAttachmentV1Request {
                     attachment_capability: request.attachment_capability.clone(),
@@ -7191,7 +7228,7 @@ async fn handle_serialized_request_impl(
                     return Err(error);
                 }
             };
-            let mut root = match code_root_read_from_attached_response(ctx, attached).await {
+            let root = match code_root_read_from_attached_response(ctx, attached).await {
                 Ok(root) => root,
                 Err(error) => {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -7199,9 +7236,6 @@ async fn handle_serialized_request_impl(
                     return Err(error);
                 }
             };
-            if let Some(attached) = state.attached.as_ref() {
-                scrub_code_root_read(&mut root, &attached.handle.redaction_table());
-            }
             if let Some(attached) = state.attached.as_ref() {
                 if let Err(error) = attached.handle.persist_if_needed() {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -7211,7 +7245,13 @@ async fn handle_serialized_request_impl(
             }
             let writer =
                 crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
-            let initial = match writer.write_root_state_changed(root.root_id).await {
+            let initial_source_key = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .initial_delivery_source_key("create", &request)
+                .map_err(code_root_contract_error)?;
+            let initial = match writer
+                .write_initial_root_state_changed(root.root_id, initial_source_key)
+                .await
+            {
                 Ok(initial) => initial,
                 Err(error) => {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -7372,7 +7412,7 @@ async fn handle_serialized_request_impl(
                     return Err(error);
                 }
             };
-            let mut root = match code_root_read_from_attached_response(ctx, attached).await {
+            let root = match code_root_read_from_attached_response(ctx, attached).await {
                 Ok(root) => root,
                 Err(error) => {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -7380,12 +7420,15 @@ async fn handle_serialized_request_impl(
                     return Err(error);
                 }
             };
-            if let Some(attached) = state.attached.as_ref() {
-                scrub_code_root_read(&mut root, &attached.handle.redaction_table());
-            }
             let writer =
                 crate::daemon::code_roots::DurableCodeRootProjectionWriterV1::new(ctx.db.clone());
-            let initial = match writer.write_root_state_changed(root.root_id).await {
+            let initial_source_key = crate::sync::lock_or_recover(&ctx.code_root_authority)
+                .initial_delivery_source_key("attach", &request)
+                .map_err(code_root_contract_error)?;
+            let initial = match writer
+                .write_initial_root_state_changed(root.root_id, initial_source_key)
+                .await
+            {
                 Ok(initial) => initial,
                 Err(error) => {
                     crate::sync::lock_or_recover(&ctx.code_root_authority)
@@ -31075,12 +31118,14 @@ pub(super) async fn attach(
         })
         .await
         .map_err(internal)?;
-    if !paused_work.is_empty()
-        && let Some(att) = state.attached.as_ref()
-    {
-        att.handle.broadcast_notice(
-            "paused work is waiting for resume or cancel after daemon restart".to_string(),
-        );
+    if !paused_work.is_empty() {
+        // This reminder describes the rows just read. Hydrate only this
+        // connection: broadcasting it as a worker transition would append a
+        // fresh Notice and Code-root delivery on every receipt reconnect.
+        state.pending_replay.push(proto::Event::Notice {
+            session_id,
+            text: "paused work is waiting for resume or cancel after daemon restart".to_string(),
+        });
     }
 
     replay_attach_hydration_events(&mut event_rx, &mut state.pending_replay, session_id);

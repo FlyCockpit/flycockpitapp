@@ -90,6 +90,10 @@ struct GlobalCoverageInner {
     published: Mutex<Option<CoverageStamp>>,
     /// `None` only for a fixed test table, which is always current.
     sources: Option<GlobalCoverageSources>,
+    /// Set when an owner response had to be delivered withheld because no
+    /// current table could be established; cleared (and announced) by the
+    /// next owner response that has current coverage again.
+    owner_withheld: std::sync::atomic::AtomicBool,
 }
 
 /// The daemon-global redaction table and its publication state.
@@ -135,6 +139,7 @@ impl GlobalCoverage {
             inner: Arc::new(GlobalCoverageInner {
                 table: Arc::new(std::sync::RwLock::new(table)),
                 published: Mutex::new(stamp),
+                owner_withheld: std::sync::atomic::AtomicBool::new(false),
                 sources: Some(GlobalCoverageSources {
                     authority,
                     config_source,
@@ -157,6 +162,7 @@ impl GlobalCoverage {
             inner: Arc::new(GlobalCoverageInner {
                 table: Arc::new(std::sync::RwLock::new(table)),
                 published: Mutex::new(None),
+                owner_withheld: std::sync::atomic::AtomicBool::new(false),
                 sources: None,
             }),
         }
@@ -223,15 +229,33 @@ impl GlobalCoverage {
         Ok(CoverageStamp::new(key, epoch))
     }
 
-    /// The published table when its stamp equals `live`, read under the same
-    /// lock that publishes table and stamp together.
+    /// The published table when its stamp equals `live` *and* its bound
+    /// generation is still the authority's current resident for that key,
+    /// read under the same lock that publishes table and stamp together.
+    ///
+    /// The stamp alone is not exact: a generation can stop being current
+    /// without the key or epoch changing (a key revision bump, or a resident
+    /// dropped by the authority). Such a table scrubs every non-empty string
+    /// to the placeholder, so it must be republished, never served (#542,
+    /// #547).
     fn published_matching(&self, live: &CoverageStamp) -> Option<Arc<RedactionTable>> {
         let published = self
             .inner
             .published
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (published.as_ref() == Some(live)).then(|| self.table())
+        if published.as_ref() != Some(live) {
+            return None;
+        }
+        let table = self.table();
+        table.ensure_binding_current().is_ok().then_some(table)
+    }
+
+    /// Whether the published table's bound generation is still current. A
+    /// cheap in-memory check (no source I/O) that lets a use skip the live
+    /// stamp computation when the table is already known to be stale.
+    fn published_binding_current(&self) -> bool {
+        self.table().ensure_binding_current().is_ok()
     }
 
     /// Publish an admitted table with its own stamp. Table and stamp change
@@ -293,7 +317,8 @@ impl GlobalCoverage {
         };
         // The live stamp re-reads files and the vault; on a multi-thread
         // runtime worker, tell the runtime this thread blocks.
-        if let Ok(live) = blocking_io(|| Self::live_stamp(sources))
+        if self.published_binding_current()
+            && let Ok(live) = blocking_io(|| Self::live_stamp(sources))
             && let Some(table) = self.published_matching(&live)
         {
             return Ok(table);
@@ -301,9 +326,14 @@ impl GlobalCoverage {
         self.republish_blocking(CoverageScope::DaemonGlobalEvent)
     }
 
-    async fn current_or_republish(&self) -> Result<Arc<RedactionTable>> {
+    /// [`Self::current_or_republish_blocking`] for async callers: the owner
+    /// response backstop and the async global-event producers.
+    pub(crate) async fn current_or_republish(&self) -> Result<Arc<RedactionTable>> {
         if self.sources().is_none() {
             return Ok(self.table());
+        }
+        if !self.published_binding_current() {
+            return self.republish(CoverageScope::DaemonGlobalEvent).await;
         }
         // The live stamp re-reads files and the vault: keep it off the
         // async worker.
@@ -320,6 +350,48 @@ impl GlobalCoverage {
             return Ok(table);
         }
         self.republish(CoverageScope::DaemonGlobalEvent).await
+    }
+
+    /// A table for the owner response backstop: a current daemon-global
+    /// table, or — when none can be established — a table that withholds
+    /// every free-text string, together with the typed reason. Never the
+    /// stale or merely published table: a stale table would replace every
+    /// string with the secret placeholder, and a published table whose
+    /// sources changed would miss new secrets.
+    ///
+    /// `recovered` is `true` on the first current result after a withheld
+    /// one, so the caller can announce that coverage is back.
+    pub(crate) async fn owner_backstop(&self) -> OwnerBackstopCoverage {
+        use std::sync::atomic::Ordering;
+        match self.current_or_republish().await {
+            Ok(table) => OwnerBackstopCoverage {
+                table,
+                withheld: None,
+                recovered: self.inner.owner_withheld.swap(false, Ordering::AcqRel),
+            },
+            Err(error) => {
+                let reason = crate::redact::coverage_authority::coverage_failure_reason(&error);
+                tracing::warn!(
+                    reason = ?reason,
+                    error = %format!("{error:#}"),
+                    "daemon-global coverage unavailable; owner response free text withheld"
+                );
+                self.inner.owner_withheld.store(true, Ordering::Release);
+                OwnerBackstopCoverage {
+                    table: Arc::new(RedactionTable::withholding_all()),
+                    withheld: Some(reason),
+                    recovered: false,
+                }
+            }
+        }
+    }
+
+    /// An owner projection lost its binding while being scrubbed. Preserve
+    /// the recovery edge just as for a refusal during acquisition.
+    pub(crate) fn mark_owner_withheld(&self) {
+        self.inner
+            .owner_withheld
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Publish a terminal-host event on the daemon-global bus. The PTY
@@ -349,6 +421,7 @@ impl GlobalCoverage {
             inner: Arc::new(GlobalCoverageInner {
                 table: Arc::new(std::sync::RwLock::new(table)),
                 published: Mutex::new(None),
+                owner_withheld: std::sync::atomic::AtomicBool::new(false),
                 sources: None,
             }),
         }
@@ -396,6 +469,13 @@ impl GlobalCoverage {
         };
         send_with_coverage(tx, coverage, origin, event);
     }
+}
+
+/// See [`GlobalCoverage::owner_backstop`].
+pub(crate) struct OwnerBackstopCoverage {
+    pub(crate) table: Arc<RedactionTable>,
+    pub(crate) withheld: Option<proto::RedactionCoverageFailure>,
+    pub(crate) recovered: bool,
 }
 
 /// Run blocking I/O from a synchronous caller that may be on a Tokio
@@ -467,6 +547,7 @@ pub(crate) fn content_free_global_event(event: proto::Event) -> Option<proto::Ev
         // No free text at all.
         event @ (E::DaemonDraining { .. }
         | E::DaemonLifetimeChanged { .. }
+        | E::RedactionCoverageStatus { .. }
         | E::Reconnect { .. }
         | E::OnboardingBootstrap(_)) => Some(event),
         #[cfg(feature = "extended")]
@@ -715,6 +796,60 @@ mod tests {
             &coverage.published_matching(&older.stamp).unwrap(),
             &older.table
         ));
+    }
+
+    /// The stamp alone is not exact (#542, #547): a generation can stop being
+    /// current while its key and the authority epoch stay the same (here a
+    /// key-revision bump). Its table then scrubs every string to the
+    /// placeholder, so `published_matching` must refuse it and force a
+    /// republish.
+    #[tokio::test]
+    async fn published_table_whose_generation_is_no_longer_current_is_not_served() {
+        use crate::redact::coverage_authority::{
+            CoverageBinding, CoverageBuild, RedactionCoverageAuthority,
+        };
+        let stamped = stamp(b"residency", 1);
+        let key = stamped.key.clone();
+        let binding = |domain: &[u8]| CoverageBinding::derive(domain, b"residency");
+        let revisions = crate::redact::coverage_bindings::OwnedSourceRevisions {
+            environment: binding(b"environment"),
+            credential_vault: binding(b"credential-vault"),
+            policy: binding(b"policy"),
+            sealed: binding(b"sealed"),
+            override_revision: binding(b"override"),
+            machine_sources: binding(b"machine-sources"),
+        };
+        let authority = RedactionCoverageAuthority::default();
+        let admission = authority
+            .acquire(
+                key.clone(),
+                CoverageScope::DaemonGlobalBootstrap,
+                move || {
+                    Ok(CoverageBuild::from_complete_table(
+                        RedactionTable::empty(),
+                        revisions,
+                    ))
+                },
+            )
+            .await
+            .expect("admitted generation");
+        let (admitted_key, epoch) = admission.acquisition_stamp();
+        let admitted = AdmittedGlobalCoverage {
+            table: Arc::new(admission.install_table().expect("installed table")),
+            stamp: CoverageStamp::new(admitted_key, epoch),
+        };
+        let coverage = GlobalCoverage::fixed(Arc::new(RedactionTable::empty()));
+        coverage.install(&admitted);
+        assert!(
+            coverage.published_matching(&admitted.stamp).is_some(),
+            "precondition: a current generation is served"
+        );
+        authority.invalidate_key(&key);
+        assert_eq!(authority.epoch(), epoch, "the epoch is unchanged");
+        assert!(
+            coverage.published_matching(&admitted.stamp).is_none(),
+            "a table whose generation is no longer current must be republished, not served"
+        );
     }
 
     /// The vault's owner-publication callback holds only a weak handle, so it

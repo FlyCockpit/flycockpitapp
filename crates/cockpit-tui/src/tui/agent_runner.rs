@@ -1078,6 +1078,10 @@ fn is_global_turn_event(event: &TurnEvent) -> bool {
             | TurnEvent::HostCapabilitiesChanged { .. }
             | TurnEvent::OnboardingBootstrapChanged
             | TurnEvent::CaffeinateState { .. }
+            | TurnEvent::RedactionCoverageStatus {
+                session_id: None,
+                ..
+            }
             | TurnEvent::DaemonDraining { .. }
             | TurnEvent::InterruptRaised { .. }
             | TurnEvent::InterruptResolved { .. }
@@ -1167,7 +1171,7 @@ async fn dispatch_user_submission_for_current_attachment<F, Fut>(
     send: F,
 ) -> UserSubmissionDispatchOutcome
 where
-    F: FnOnce(Uuid, u64, ClientUserSubmission) -> Fut,
+    F: FnOnce(Uuid, Uuid, u64, ClientUserSubmission) -> Fut,
     Fut: std::future::Future<Output = Result<(), UserSubmissionSendError>>,
 {
     let transition_guard = transition_gate.lock_owned().await;
@@ -1184,7 +1188,11 @@ where
     // image/tag/display/skill payloads accepted just before the reconnect.
     let _reattached_same_session = bound.intended_attachment_epoch != current_epoch;
     let optimistic_submission_id = bound.optimistic_submission_id;
+    // Carry the validated destination through to image admission and strict
+    // ingress. Capturing the runner startup id here breaks sends after a
+    // switch to any other session, even with a current client and epoch.
     match send(
+        bound.intended_session_id,
         optimistic_submission_id,
         bound.intended_attachment_epoch,
         bound.submission.clone(),
@@ -1393,7 +1401,7 @@ async fn run_user_submission_dispatcher<F, Fut>(
     mut context: UserSubmissionDispatcherContext,
     send: F,
 ) where
-    F: Fn(Uuid, u64, ClientUserSubmission) -> Fut + Clone,
+    F: Fn(Uuid, Uuid, u64, ClientUserSubmission) -> Fut + Clone,
     Fut: std::future::Future<Output = Result<(), UserSubmissionSendError>>,
 {
     enum DispatcherWake {
@@ -2539,6 +2547,10 @@ fn is_global_event(event: &proto::Event) -> bool {
     matches!(
         event,
         proto::Event::CaffeinateState { .. }
+            | proto::Event::RedactionCoverageStatus {
+                session_id: None,
+                ..
+            }
             | proto::Event::DaemonDraining { .. }
             | proto::Event::DaemonLifetimeChanged { .. }
             | proto::Event::LspNotice { .. }
@@ -3037,7 +3049,7 @@ async fn try_spawn_inner(
                 attachment_ready_rx,
                 awaiting_durable: awaiting_durable.clone(),
             },
-            move |client_submission_id, intended_attachment_epoch, sub| {
+            move |session_id, client_submission_id, intended_attachment_epoch, sub| {
                 let current_client = current_client.clone();
                 let events = events.clone();
                 let event_notify = event_notify.clone();
@@ -4399,6 +4411,7 @@ fn update_active_agent(
 fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
     use proto::Event::*;
     Some(match event {
+        RedactionCoverageStatus { session_id, .. } => return *session_id,
         ConfigSnapshot { snapshot } => snapshot.session_id,
         ThinkingStarted { session_id, .. }
         | QueueUpdated { session_id, .. }
@@ -5496,6 +5509,13 @@ pub(crate) fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent
             last_error,
         },
         DaemonDraining { forced } => TurnEvent::DaemonDraining { forced },
+        RedactionCoverageStatus {
+            session_id,
+            unavailable,
+        } => TurnEvent::RedactionCoverageStatus {
+            session_id,
+            unavailable,
+        },
         // This event updates the runner's atomic lifecycle projection before
         // translation. It has no renderer event of its own.
         DaemonLifetimeChanged { .. } => return None,
@@ -6154,7 +6174,7 @@ mod tests {
                 attachment_ready_rx,
                 awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
             },
-            move |_client_submission_id, _intended_attachment_epoch, submission| {
+            move |_session_id, _client_submission_id, _intended_attachment_epoch, submission| {
                 let sent_tx = sent_tx.clone();
                 async move {
                     sent_tx.send(submission).unwrap();
@@ -6226,7 +6246,7 @@ mod tests {
                 attachment_ready_rx,
                 awaiting_durable: awaiting_durable.clone(),
             },
-            move |id, _intended_attachment_epoch, submission| {
+            move |_session_id, id, _intended_attachment_epoch, submission| {
                 let sent_tx = sent_tx.clone();
                 async move {
                     sent_tx
@@ -6452,7 +6472,7 @@ mod tests {
                 let accepted = accepted.clone();
                 let execution_count = execution_count.clone();
                 let first_response_dropped = first_response_dropped.clone();
-                move |client_submission_id, _intended_attachment_epoch, submission| {
+                move |_session_id, client_submission_id, _intended_attachment_epoch, submission| {
                     let attempts = attempts.clone();
                     let accepted = accepted.clone();
                     let execution_count = execution_count.clone();
@@ -6589,7 +6609,7 @@ mod tests {
             {
                 let attempts = attempts.clone();
                 let accept_first = accept_first.clone();
-                move |client_submission_id, _intended_attachment_epoch, submission| {
+                move |_session_id, client_submission_id, _intended_attachment_epoch, submission| {
                     let attempts = attempts.clone();
                     let accept_first = accept_first.clone();
                     let attempt_tx = attempt_tx.clone();
@@ -6724,7 +6744,7 @@ mod tests {
                 attachment_ready_rx,
                 awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
             },
-            move |client_submission_id, _intended_attachment_epoch, _submission| {
+            move |_session_id, client_submission_id, _intended_attachment_epoch, _submission| {
                 let delivered_tx = delivered_tx.clone();
                 async move {
                     if client_submission_id == failed_id {
@@ -6830,6 +6850,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_submission_uses_adopted_session_after_new_and_resume() {
+        let startup_session = Uuid::new_v4();
+        let resumed_session = Uuid::new_v4();
+        let (connections, mut connect_rx) =
+            mpsc::channel::<oneshot::Sender<Option<cockpit_client::InProcessConnection>>>(4);
+        let (sensitive, _sensitive_rx) = mpsc::channel(1);
+        let endpoint = ClientEndpoint::InProcess(cockpit_client::InProcessEndpoint::new(
+            connections,
+            sensitive,
+        ));
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let broker = tokio::spawn(async move {
+            let mut clients = tokio::task::JoinSet::new();
+            let mut connection_count = 0;
+            while let Some(reply) = connect_rx.recv().await {
+                let (requests, mut request_rx) =
+                    mpsc::channel::<cockpit_client::InProcessRequest>(8);
+                let (events, event_rx) = mpsc::channel(4);
+                assert!(
+                    reply
+                        .send(Some(cockpit_client::InProcessConnection {
+                            requests,
+                            events: event_rx,
+                        }))
+                        .is_ok()
+                );
+                let sent_tx = sent_tx.clone();
+                let fresh_session = if connection_count == 0 {
+                    startup_session
+                } else {
+                    Uuid::new_v4()
+                };
+                connection_count += 1;
+                clients.spawn(async move {
+                    let _keep_events_open = events;
+                    let mut attached_session = None;
+                    // Ack is only a queue acknowledgement. A watch wake may
+                    // legitimately retry it before a durable receipt arrives.
+                    // Model the daemon's idempotent operation boundary, and
+                    // assert every retry rather than counting it as a new send.
+                    let mut accepted: HashMap<
+                        Uuid,
+                        cockpit_proto::send_user_message::LocalOwnerDirectSendUserMessage,
+                    > = HashMap::new();
+                    while let Some(request) = request_rx.recv().await {
+                        let response = match request.request {
+                            Request::CreateCodeRootV1(_) => {
+                                attached_session = Some(fresh_session);
+                                attached_response(fresh_session, Vec::new())
+                            }
+                            Request::AttachExistingCodeRootV1(attach) => {
+                                attached_session = Some(attach.root_id.0);
+                                attached_response(attach.root_id.0, Vec::new())
+                            }
+                            Request::SendUserMessage { ingress } => {
+                                let proto::send_user_message::MessageIngress::LocalOwnerDirect(
+                                    local,
+                                ) = ingress
+                                else {
+                                    panic!("expected local owner ingress");
+                                };
+                                let destination = attached_session.expect("attached");
+                                assert_eq!(
+                                    local.session_locator,
+                                    destination.to_string(),
+                                    "strict ingress must use the adopted destination, not the startup session"
+                                );
+                                match accepted.entry(local.request.client_submission_id) {
+                                    std::collections::hash_map::Entry::Occupied(previous) => {
+                                        // An acknowledged attempt releases its
+                                        // operation id; the durable authored
+                                        // identity is client_submission_id.
+                                        // Check every other ingress field.
+                                        let mut retry = local;
+                                        retry.operation_id = previous.get().operation_id;
+                                        assert_eq!(previous.get(), &retry,
+                                            "a retry must keep the exact authored submission");
+                                    }
+                                    std::collections::hash_map::Entry::Vacant(slot) => {
+                                        slot.insert(local.clone());
+                                        sent_tx.send((destination, local)).unwrap();
+                                    }
+                                }
+                                Response::Ack
+                            }
+                            _ => Response::Ack,
+                        };
+                        let _ = request.reply.send(Ok(response));
+                    }
+                });
+            }
+        });
+        let (lifecycle, mut lifecycle_rx) = LifecycleClient::channel(2);
+        let lifecycle_endpoint = endpoint.clone();
+        let lifecycle_host = tokio::spawn(async move {
+            while let Some(request) = lifecycle_rx.recv().await {
+                assert_eq!(request.intent, LifecycleIntent::PromoteToPersistent);
+                let _ = request.reply.send(Ok(cockpit_client::LifecycleResolution {
+                    endpoint: lifecycle_endpoint.clone(),
+                    process_watch: None,
+                    lifetime_client: None,
+                    owns_daemon: false,
+                    ephemeral_owner: false,
+                    socket: PathBuf::new(),
+                    startup_notice: None,
+                    promoted_from_ephemeral: false,
+                }));
+            }
+        });
+        let cwd = tempfile::tempdir().unwrap();
+        let mut runner = attach_to_selected_lifecycle(
+            cwd.path(),
+            None,
+            None,
+            None,
+            false,
+            lifecycle,
+            SelectedLifecycle {
+                endpoint,
+                process_watch: None,
+                lifetime_client: None,
+                owns_daemon: false,
+                ephemeral_owner: false,
+                socket: PathBuf::new(),
+                startup_notice: None,
+                promoted_from_ephemeral: false,
+            },
+        )
+        .await
+        .unwrap();
+        for target in [
+            None,
+            Some(SessionTarget::New),
+            Some(SessionTarget::Resume {
+                session_id: resumed_session,
+                since_seq: None,
+            }),
+        ] {
+            if let Some(target) = target {
+                let outcome = runner.switch_session_task(target).await.unwrap();
+                runner.apply_session_switch_outcome(&outcome);
+                drop(outcome); // Release the same adoption guard used by App.
+            }
+            let expected_session = runner.session_id();
+            let text = format!("public message for {expected_session}");
+            runner
+                .try_send_input(ClientUserSubmission::text(text.clone()))
+                .unwrap();
+            let (attached, local) = tokio::time::timeout(Duration::from_secs(2), sent_rx.recv())
+                .await
+                .expect("production send reaches transport")
+                .expect("request broker alive");
+            assert_eq!(attached, expected_session);
+            assert_eq!(
+                local.session_locator,
+                expected_session.to_string(),
+                "strict ingress must use the adopted destination, not the startup session"
+            );
+            assert_eq!(local.request.text, text);
+        }
+        drop(runner);
+        broker.abort();
+        lifecycle_host.abort();
+        let _ = broker.await;
+        let _ = lifecycle_host.await;
+    }
+
+    #[tokio::test]
     async fn same_session_reconnect_rebinds_and_delivers_the_complete_submission() {
         let session_id = Uuid::new_v4();
         let session_id_state = Arc::new(Mutex::new(session_id));
@@ -6839,22 +7027,26 @@ mod tests {
         let expected_value = serde_json::to_value(&expected).unwrap();
         let (sent_tx, sent_rx) = oneshot::channel();
 
-        let outcome = dispatch_user_submission_for_current_attachment(
-            BoundUserSubmission {
-                submission: expected,
-                optimistic_submission_id: Uuid::new_v4(),
-                intended_session_id: session_id,
-                intended_attachment_epoch: 7,
-            },
-            &session_id_state,
-            &attachment_epoch,
-            transition_gate,
-            move |_client_submission_id, _intended_attachment_epoch, submission| async move {
-                sent_tx.send(submission).unwrap();
-                Ok(())
-            },
-        )
-        .await;
+        let outcome =
+            dispatch_user_submission_for_current_attachment(
+                BoundUserSubmission {
+                    submission: expected,
+                    optimistic_submission_id: Uuid::new_v4(),
+                    intended_session_id: session_id,
+                    intended_attachment_epoch: 7,
+                },
+                &session_id_state,
+                &attachment_epoch,
+                transition_gate,
+                move |_session_id,
+                      _client_submission_id,
+                      _intended_attachment_epoch,
+                      submission| async move {
+                    sent_tx.send(submission).unwrap();
+                    Ok(())
+                },
+            )
+            .await;
 
         assert!(matches!(
             outcome,
@@ -6894,7 +7086,7 @@ mod tests {
                 attachment_ready_rx,
                 awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
             },
-            move |_client_submission_id, _intended_attachment_epoch, submission| {
+            move |_session_id, _client_submission_id, _intended_attachment_epoch, submission| {
                 let sent_tx = sent_tx.clone();
                 async move {
                     sent_tx.send(submission).unwrap();
@@ -6970,7 +7162,7 @@ mod tests {
             &session_id_state,
             &attachment_epoch,
             transition_gate.clone(),
-            |_client_submission_id, _intended_attachment_epoch, _submission| async {
+            |_session_id, _client_submission_id, _intended_attachment_epoch, _submission| async {
                 Err(UserSubmissionSendError::Rejected(
                     "transport stopped".to_string(),
                 ))
@@ -7896,6 +8088,25 @@ mod tests {
                 assert_eq!(actual_routing, routing);
             }
             other => panic!("expected subagent routing amend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coverage_projection_status_follows_attachment_epoch() {
+        let session_id = uuid::Uuid::new_v4();
+        for scope in [None, Some(session_id)] {
+            let event = proto::Event::RedactionCoverageStatus {
+                session_id: scope,
+                unavailable: Some(proto::RedactionCoverageFailure::SshKeysOverBudget),
+            };
+            assert_eq!(event_session(&event), scope);
+            assert_eq!(is_global_event(&event), scope.is_none());
+            let turn = proto_event_to_turn_event(event).expect("coverage presentation event");
+            assert_eq!(is_global_turn_event(&turn), scope.is_none());
+            assert!(matches!(turn, TurnEvent::RedactionCoverageStatus {
+                session_id: observed,
+                unavailable: Some(proto::RedactionCoverageFailure::SshKeysOverBudget),
+            } if observed == scope));
         }
     }
 
@@ -8829,7 +9040,9 @@ mod tests {
                 attachment_ready_rx,
                 awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
             },
-            |_client_submission_id, _intended_attachment_epoch, _submission| async { Ok(()) },
+            |_session_id, _client_submission_id, _intended_attachment_epoch, _submission| async {
+                Ok(())
+            },
         ));
 
         // Force a deferred recovery notice: retain under a different session,

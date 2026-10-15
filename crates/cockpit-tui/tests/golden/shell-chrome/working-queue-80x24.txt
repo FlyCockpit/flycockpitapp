@@ -1,5 +1,5 @@
                             fixture-session                            ● Working
- ◆ Cockpit           [Hide] ⎇ …/proj…   issue-449 ● 2 changes   [Cockpit] [Code]
+ ◆ Cockpit           [Hide] ⎇    issue-449 ● 2 changes   [Cockpit] [Setup: Code]
                             ────────────────────────────────────────────────────
   + New session                                                                 
                                                                                 

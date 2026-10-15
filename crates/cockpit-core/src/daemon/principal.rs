@@ -346,6 +346,18 @@ impl ClientPrincipal {
         }
     }
 
+    /// Who authored a user row, as recorded in `origin_principal`. `None`
+    /// means the machine owner: the in-process owner and every owner-class
+    /// local client (TUI, CLI, ACP) are the same human, so a row they wrote
+    /// must not read as a steer from another client after a relaunch changes
+    /// the client's pid (#547). Every other principal keeps its [`Self::tag`].
+    pub fn authorship_tag(&self) -> Option<String> {
+        if self.has_owner_level_authority() {
+            return None;
+        }
+        self.tag()
+    }
+
     pub fn steer_origin(&self) -> String {
         match self {
             Self::Owner => format!("local:{}", local_principal_name()),
@@ -645,6 +657,43 @@ pub fn request_requires_owner_capability(request: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local(role: LocalClientRole, pid: u32) -> ClientPrincipal {
+        ClientPrincipal::local_authenticated(
+            cockpit_host::peer_cred::PeerIdentity {
+                pid,
+                uid: 501,
+                gid: 20,
+                process_start: ProcessStartIdentity {
+                    primary: u64::from(pid),
+                    secondary: 0,
+                },
+            },
+            role,
+            Vec::new(),
+        )
+    }
+
+    /// #547: the same human owner across relaunches (a new TUI pid, or the
+    /// CLI) authored the row, so it records no origin and replays as the
+    /// user's own turn, not as a steer from `local:tui:<old pid>`. A client
+    /// without owner-level authority keeps its distinguishing tag.
+    #[test]
+    fn owner_class_clients_author_rows_as_the_machine_owner() {
+        for role in [
+            LocalClientRole::Tui,
+            LocalClientRole::Cli,
+            LocalClientRole::Acp,
+        ] {
+            for pid in [4242, 4343] {
+                assert_eq!(local(role, pid).authorship_tag(), None, "{role:?}");
+            }
+        }
+        assert_eq!(ClientPrincipal::owner().authorship_tag(), None);
+        let child = local(LocalClientRole::AgentChild, 4444);
+        assert_eq!(child.authorship_tag(), child.tag());
+        assert!(child.authorship_tag().is_some());
+    }
 
     macro_rules! request_ordering_rows_from_command_table {
         (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{

@@ -179,11 +179,38 @@ export const onboardingTransitionResultSchema = z
   .strict();
 export type OnboardingTransitionResult = z.infer<typeof onboardingTransitionResultSchema>;
 
+/** Typed, content-free reason redaction coverage could not be built. */
+export const redactionCoverageFailureSchema = z.enum([
+  "capture_failed",
+  "busy",
+  "sources_changed",
+  "source_file_over_limit",
+  "ssh_keys_over_budget",
+  "sources_over_budget",
+  "held_by_open_sessions",
+]);
+export type RedactionCoverageFailure = z.infer<typeof redactionCoverageFailureSchema>;
+
+/** Content-free global backstop or attachment-projection coverage state. */
+export const redactionCoverageStatusSchema = z
+  .object({
+    session_id: z.string().uuid().optional(),
+    unavailable: redactionCoverageFailureSchema.optional(),
+  })
+  .strict();
+export type RedactionCoverageStatus = z.infer<typeof redactionCoverageStatusSchema>;
+
+/** Why a locked owner's ready construction failed. */
+export const readyConstructionFailureSchema = z.union([
+  z.object({ redaction_coverage: redactionCoverageFailureSchema }).strict(),
+  z.enum(["timed_out", "unclassified"]),
+]);
+export type ReadyConstructionFailure = z.infer<typeof readyConstructionFailureSchema>;
+
 /** Ready-service construction phase of a locked daemon owner. */
-export const lockedReadyConstructionSchema = z.enum([
-  "awaiting_secure_store",
-  "constructing",
-  "failed",
+export const lockedReadyConstructionSchema = z.union([
+  z.enum(["awaiting_secure_store", "constructing"]),
+  z.object({ failed: z.object({ reason: readyConstructionFailureSchema }).strict() }).strict(),
 ]);
 export type LockedReadyConstruction = z.infer<typeof lockedReadyConstructionSchema>;
 

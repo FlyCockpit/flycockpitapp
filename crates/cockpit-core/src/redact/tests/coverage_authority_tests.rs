@@ -330,6 +330,68 @@ async fn total_budget_keeps_global_and_session_generations_of_a_many_key_profile
     }
 }
 
+/// #542: an installed table pins its generation. When the resident budget is
+/// held by installed tables, a further admission is refused with a typed
+/// error instead of evicting a generation another session is still scrubbing
+/// with (which used to turn that session's every body into the placeholder).
+/// Dropping an installed table releases its pin.
+#[tokio::test]
+async fn installed_tables_pin_their_generation_and_full_budget_refuses_admission() {
+    const GENERATION_BYTES: usize = COVERAGE_LIMITS.artifact_bytes_total / 4;
+    const _: () = assert!(GENERATION_BYTES <= COVERAGE_LIMITS.artifact_bytes_per_generation);
+    let authority = RedactionCoverageAuthority::default();
+    let admit = |index: u8| {
+        let authority = authority.clone();
+        async move {
+            let parts = [150 + index; 10];
+            authority
+                .acquire(key(parts), CoverageScope::SessionStart, move || {
+                    let table = RedactionTable::empty().with_forced_literal(
+                        "coverage-canary-secret".to_string(),
+                        "$test:coverage".to_string(),
+                    )?;
+                    Ok(CoverageBuild::from_complete_table_and_artifact_bytes(
+                        table,
+                        GENERATION_BYTES,
+                        boundary_for(parts),
+                    ))
+                })
+                .await
+        }
+    };
+    let mut installed = Vec::new();
+    for index in 0..4u8 {
+        let admission = admit(index).await.expect("within the total budget");
+        installed.push(admission.install_table().expect("installed table"));
+    }
+    assert_eq!(
+        admit(4).await.err(),
+        Some(CoverageError::ResidentBudgetExhausted),
+        "a full budget of pinned generations refuses the new admission"
+    );
+    for (index, table) in installed.iter().enumerate() {
+        assert!(
+            table.ensure_binding_current().is_ok(),
+            "installed generation {index} was evicted"
+        );
+        assert_eq!(table.scrub("ordinary public text"), "ordinary public text");
+        assert_eq!(table.scrub("coverage-canary-secret"), REDACTED);
+    }
+    // Clones must retain the pin until the final installed view is dropped.
+    let last_view = installed[0].clone();
+    drop(installed.remove(0));
+    assert_eq!(
+        admit(5).await.err(),
+        Some(CoverageError::ResidentBudgetExhausted)
+    );
+    drop(last_view);
+    let admitted = admit(6).await.expect("an unpinned generation is evictable");
+    drop(admitted);
+    for table in &installed {
+        assert!(table.ensure_binding_current().is_ok());
+    }
+}
+
 /// A capture over the per-generation budget still fails closed, and the
 /// refusal names private SSH key material and the settings that bound it
 /// when keys are part of the artifact.

@@ -634,6 +634,17 @@ impl SessionRail {
             .collect()
     }
 
+    /// A loaded summary independent of search, selection and the painted
+    /// rail level. Filtering the rail must not change header identity.
+    pub(crate) fn session_summary(&self, session_id: Uuid) -> Option<&SessionSummary> {
+        self.levels
+            .iter()
+            .rev()
+            .flat_map(|level| level.cards.iter())
+            .map(|(summary, _)| summary)
+            .find(|summary| summary.session_id == session_id)
+    }
+
     pub fn selected_id(&self) -> Option<Uuid> {
         let level = self.current();
         let id = level.selected_session_id?;

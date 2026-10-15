@@ -928,15 +928,18 @@ fn render_supervised_running_status(
 /// Human status line for a locked owner, by its ready-construction phase.
 /// The locked hello is redacted metadata: only its phase and protocol
 /// version are shown (never the capability snapshot).
-fn locked_status_headline(ready_construction: proto::LockedReadyConstruction) -> &'static str {
+fn locked_status_headline(ready_construction: proto::LockedReadyConstruction) -> String {
     match ready_construction {
         proto::LockedReadyConstruction::AwaitingSecureStore => {
-            "daemon: running, awaiting onboarding"
+            "daemon: running, awaiting onboarding".into()
         }
-        proto::LockedReadyConstruction::Constructing => "daemon: running, starting ready services",
-        proto::LockedReadyConstruction::Failed => {
-            "daemon: running, ready services failed to start (see daemon.log)"
+        proto::LockedReadyConstruction::Constructing => {
+            "daemon: running, starting ready services".into()
         }
+        proto::LockedReadyConstruction::Failed { reason } => format!(
+            "daemon: running, ready services failed to start: {}",
+            reason.message()
+        ),
     }
 }
 
@@ -944,7 +947,7 @@ fn locked_status_state(ready_construction: proto::LockedReadyConstruction) -> &'
     match ready_construction {
         proto::LockedReadyConstruction::AwaitingSecureStore => DAEMON_STATE_AWAITING_ONBOARDING,
         proto::LockedReadyConstruction::Constructing => "starting",
-        proto::LockedReadyConstruction::Failed => "ready_construction_failed",
+        proto::LockedReadyConstruction::Failed { .. } => "ready_construction_failed",
     }
 }
 
@@ -954,7 +957,7 @@ fn render_awaiting_onboarding_status(
     ready_construction: proto::LockedReadyConstruction,
     supervisor: Option<&SupervisorStatus>,
 ) -> String {
-    let mut output = locked_status_headline(ready_construction).to_string();
+    let mut output = locked_status_headline(ready_construction);
     if let Some(supervisor) = supervisor {
         render_supervisor_lines(&mut output, supervisor);
     }
@@ -1466,9 +1469,27 @@ mod tests {
             "/tmp/cockpit.sock",
             1,
             true,
-            proto::LockedReadyConstruction::Failed,
+            proto::LockedReadyConstruction::Failed {
+                reason: proto::ReadyConstructionFailure::RedactionCoverage(
+                    proto::RedactionCoverageFailure::SshKeysOverBudget,
+                ),
+            },
         );
         assert_eq!(failed["state"], "ready_construction_failed");
+        let failed = render_awaiting_onboarding_status(
+            "/tmp/cockpit.sock",
+            1,
+            proto::LockedReadyConstruction::Failed {
+                reason: proto::ReadyConstructionFailure::RedactionCoverage(
+                    proto::RedactionCoverageFailure::SshKeysOverBudget,
+                ),
+            },
+            None,
+        );
+        assert!(
+            failed.starts_with("daemon: running, ready services failed to start: redaction coverage could not be built: private SSH key material"),
+            "{failed}"
+        );
     }
 
     #[test]

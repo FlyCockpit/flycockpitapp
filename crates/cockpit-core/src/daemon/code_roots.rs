@@ -1,7 +1,10 @@
 //! Daemon-owned ACP Code-root authority.
 //!
 //! Capabilities, discovery snapshots, and idempotency receipts are deliberately
-//! boot-local. Only the redacted delivery projection and logical-client ACK
+//! boot-local. Create/attach receipts freeze the canonical operation result;
+//! the dispatch return boundary projects a copy with current session coverage,
+//! including its typed status, on both initial delivery and exact replay.
+//! Only the redacted delivery projection and logical-client ACK
 //! cursor are durable (in `cockpit-db`).
 
 use std::{
@@ -90,8 +93,9 @@ struct DiscoverySnapshot {
     expires_at: Instant,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct CodeRootAuthorityV1 {
+    initial_delivery_namespace: Uuid,
     attachments: HashMap<String, CodeRootAttachmentRecord>,
     idempotency: HashMap<(String, String, &'static str), IdempotencyReceipt>,
     discovery: HashMap<String, DiscoverySnapshot>,
@@ -100,7 +104,38 @@ pub(crate) struct CodeRootAuthorityV1 {
     interrupt_resolutions_in_flight: HashSet<(String, String)>,
 }
 
+impl Default for CodeRootAuthorityV1 {
+    fn default() -> Self {
+        Self {
+            initial_delivery_namespace: Uuid::new_v4(),
+            attachments: HashMap::new(),
+            idempotency: HashMap::new(),
+            discovery: HashMap::new(),
+            attachment_reservations: HashSet::new(),
+            code_root_requests_in_flight: HashMap::new(),
+            interrupt_resolutions_in_flight: HashSet::new(),
+        }
+    }
+}
+
 impl CodeRootAuthorityV1 {
+    /// Bind the initial snapshot to this boot's logical operation before any
+    /// durable enqueue. An accepted DB job outlives a cancelled dispatch and
+    /// its boot-local receipt; retrying must recover that job's exact cursor.
+    /// Route and full request fingerprint keep distinct operations separate.
+    pub fn initial_delivery_source_key<T: serde::Serialize>(
+        &self,
+        route: &'static str,
+        request: &T,
+    ) -> Result<String> {
+        let fingerprint = request_fingerprint(request)?;
+        use std::fmt::Write as _;
+        let mut source_key = format!("initial:{}:{route}:", self.initial_delivery_namespace);
+        for byte in fingerprint {
+            write!(&mut source_key, "{byte:02x}")?;
+        }
+        Ok(source_key)
+    }
     fn reap_expired(&mut self, now: Instant) {
         self.attachments.retain(|_, record| {
             record.open
@@ -423,7 +458,7 @@ impl CodeRootAuthorityV1 {
 
     /// Replays must never share an attachment capability with an uncertain
     /// original transport. Reissue one for the authenticated logical client,
-    /// preserving the root and frozen response; this makes an ambiguous
+    /// preserving the root and frozen canonical response; this makes an ambiguous
     /// disconnect exactly replayable even before its teardown has drained.
     fn reissue_receipt_attachment(
         &mut self,
@@ -769,7 +804,15 @@ impl CodeRootAuthorityV1 {
 }
 
 pub(crate) fn request_fingerprint<T: serde::Serialize>(value: &T) -> Result<[u8; 32]> {
-    let bytes = serde_json::to_vec(value).context("serializing Code-root idempotency input")?;
+    // Hash the complete typed input, including environment values rather than
+    // trusting its caller-supplied digest. Independent wire decodes randomize
+    // HashMap iteration, so order every nested object before serialization.
+    // Explicit sorting also holds if serde_json enables `preserve_order`.
+    let mut canonical =
+        serde_json::to_value(value).context("canonicalizing Code-root idempotency input")?;
+    canonical.sort_all_objects();
+    let bytes =
+        serde_json::to_vec(&canonical).context("serializing Code-root idempotency input")?;
     Ok(Sha256::digest(bytes).into())
 }
 
@@ -806,10 +849,24 @@ impl DurableCodeRootProjectionWriterV1 {
         Self { db }
     }
 
+    pub(crate) async fn write_initial_root_state_changed(
+        &self,
+        root_id: proto::CodeRootIdV1,
+        source_key: String,
+    ) -> Result<proto::CodeRootDeliveryV1> {
+        self.write(
+            root_id,
+            proto::CodeRootDeliveryPayloadV1::RootStateChanged,
+            Some(source_key),
+        )
+        .await
+    }
+
     async fn write(
         &self,
         root_id: proto::CodeRootIdV1,
         mut payload: proto::CodeRootDeliveryPayloadV1,
+        initial_source_key: Option<String>,
     ) -> Result<proto::CodeRootDeliveryV1> {
         let (mut kind, mut source_key) = match &payload {
             proto::CodeRootDeliveryPayloadV1::History { entry } => {
@@ -827,7 +884,9 @@ impl DurableCodeRootProjectionWriterV1 {
                     entry.decision_request_id, entry.revision
                 )),
             ),
-            proto::CodeRootDeliveryPayloadV1::RootStateChanged => ("root_state_changed", None),
+            proto::CodeRootDeliveryPayloadV1::RootStateChanged => {
+                ("root_state_changed", initial_source_key)
+            }
             proto::CodeRootDeliveryPayloadV1::ClientIncompatible => ("client_incompatible", None),
         };
         let mut payload_json = serde_json::to_string(&payload)?;
@@ -866,8 +925,12 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
         root_id: proto::CodeRootIdV1,
         entry: proto::HistoryEntry,
     ) -> Result<proto::CodeRootDeliveryV1> {
-        self.write(root_id, proto::CodeRootDeliveryPayloadV1::History { entry })
-            .await
+        self.write(
+            root_id,
+            proto::CodeRootDeliveryPayloadV1::History { entry },
+            None,
+        )
+        .await
     }
 
     async fn write_attention(
@@ -878,6 +941,7 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
         self.write(
             root_id,
             proto::CodeRootDeliveryPayloadV1::Attention { entry },
+            None,
         )
         .await
     }
@@ -886,14 +950,191 @@ impl CodeRootProjectionWriterV1 for DurableCodeRootProjectionWriterV1 {
         &self,
         root_id: proto::CodeRootIdV1,
     ) -> Result<proto::CodeRootDeliveryV1> {
-        self.write(root_id, proto::CodeRootDeliveryPayloadV1::RootStateChanged)
-            .await
+        self.write(
+            root_id,
+            proto::CodeRootDeliveryPayloadV1::RootStateChanged,
+            None,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn environment_create_request() -> proto::CreateCodeRootV1Request {
+        let mut request = create_request();
+        request.options.env_snapshot = Some(
+            crate::env_snapshot::EnvSnapshot::new(
+                proto::EnvSnapshotSource::TuiShell,
+                (0..16)
+                    .map(|i| (format!("IDENTITY_MAP_{i}"), format!("public-value-{i}")))
+                    .collect(),
+            )
+            .to_wire(),
+        );
+        request
+    }
+
+    fn environment_attach_request() -> proto::AttachExistingCodeRootV1Request {
+        let create = environment_create_request();
+        proto::AttachExistingCodeRootV1Request {
+            root_id: proto::CodeRootIdV1(Uuid::nil()),
+            capture_generation: 1,
+            logical_client_id: create.logical_client_id,
+            client_request_id: create.client_request_id,
+            replay_cursor: None,
+            since_seq: None,
+            options: create.options,
+        }
+    }
+
+    fn assert_same_wire_identity<T, I>(request: T, identity: impl Fn(&T) -> I)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        I: PartialEq + std::fmt::Debug,
+    {
+        let wire = serde_json::to_vec(&request).unwrap();
+        let expected = identity(&request);
+        for _ in 0..32 {
+            let decoded: T = serde_json::from_slice(&wire).unwrap();
+            assert_eq!(decoded, request, "same wire retains every typed field");
+            assert_eq!(
+                identity(&decoded),
+                expected,
+                "same wire retains operation identity"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_same_wire_source_identity_is_stable() {
+        let authority = CodeRootAuthorityV1::default();
+        assert_same_wire_identity(environment_create_request(), |request| {
+            authority
+                .initial_delivery_source_key("create", request)
+                .unwrap()
+        });
+        assert_same_wire_identity(environment_attach_request(), |request| {
+            authority
+                .initial_delivery_source_key("attach", request)
+                .unwrap()
+        });
+    }
+
+    #[test]
+    fn environment_same_wire_receipt_fingerprint_is_stable() {
+        assert_same_wire_identity(environment_create_request(), |request| {
+            request_fingerprint(request).unwrap()
+        });
+        assert_same_wire_identity(environment_attach_request(), |request| {
+            request_fingerprint(request).unwrap()
+        });
+    }
+
+    #[test]
+    fn environment_changed_value_keeps_distinct_identity_despite_same_digest() {
+        let authority = CodeRootAuthorityV1::default();
+        let create = environment_create_request();
+        let attach = environment_attach_request();
+        let mut changed_create = create.clone();
+        let mut changed_attach = attach.clone();
+        for snapshot in [
+            &mut changed_create.options.env_snapshot,
+            &mut changed_attach.options.env_snapshot,
+        ] {
+            snapshot
+                .as_mut()
+                .unwrap()
+                .vars
+                .insert("IDENTITY_MAP_0".into(), "changed-environment-value".into());
+        }
+        assert_eq!(
+            create.options.env_snapshot.as_ref().unwrap().digest,
+            changed_create.options.env_snapshot.as_ref().unwrap().digest
+        );
+        assert_eq!(
+            attach.options.env_snapshot.as_ref().unwrap().digest,
+            changed_attach.options.env_snapshot.as_ref().unwrap().digest
+        );
+        assert_ne!(
+            request_fingerprint(&create).unwrap(),
+            request_fingerprint(&changed_create).unwrap()
+        );
+        assert_ne!(
+            request_fingerprint(&attach).unwrap(),
+            request_fingerprint(&changed_attach).unwrap()
+        );
+        assert_ne!(
+            authority
+                .initial_delivery_source_key("create", &create)
+                .unwrap(),
+            authority
+                .initial_delivery_source_key("create", &changed_create)
+                .unwrap()
+        );
+        assert_ne!(
+            authority
+                .initial_delivery_source_key("attach", &attach)
+                .unwrap(),
+            authority
+                .initial_delivery_source_key("attach", &changed_attach)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn initial_delivery_identity_is_scoped_to_boot_route_and_logical_request() {
+        let authority = CodeRootAuthorityV1::default();
+        let request = create_request();
+        let key = authority
+            .initial_delivery_source_key("create", &request)
+            .unwrap();
+        assert!(key.len() <= 128);
+        assert_eq!(
+            key,
+            authority
+                .initial_delivery_source_key("create", &request)
+                .unwrap()
+        );
+        assert_ne!(
+            key,
+            authority
+                .initial_delivery_source_key("attach", &request)
+                .unwrap()
+        );
+        assert_ne!(
+            key,
+            CodeRootAuthorityV1::default()
+                .initial_delivery_source_key("create", &request)
+                .unwrap()
+        );
+        let mut distinct = request.clone();
+        distinct.client_request_id = proto::OpaqueAsciiId128V1::new("another-request").unwrap();
+        assert_ne!(
+            key,
+            authority
+                .initial_delivery_source_key("create", &distinct)
+                .unwrap()
+        );
+        distinct = request.clone();
+        distinct.logical_client_id = proto::OpaqueAsciiId128V1::new("another-client").unwrap();
+        assert_ne!(
+            key,
+            authority
+                .initial_delivery_source_key("create", &distinct)
+                .unwrap()
+        );
+        distinct = request.clone();
+        distinct.options.interactive = !distinct.options.interactive;
+        assert_ne!(
+            key,
+            authority
+                .initial_delivery_source_key("create", &distinct)
+                .unwrap()
+        );
+    }
 
     fn create_request() -> proto::CreateCodeRootV1Request {
         proto::CreateCodeRootV1Request {

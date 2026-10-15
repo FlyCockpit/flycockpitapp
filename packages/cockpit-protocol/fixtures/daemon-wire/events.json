@@ -40,6 +40,18 @@
     "kind": "evt",
     "v": 1
   },
+  "agent_tree_changed": {
+    "data": {
+      "session_event_seq": 42,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "subject_id": "44444444-4444-4444-8444-444444444444",
+      "subject_kind": "decision",
+      "transition": "attention_state_changed"
+    },
+    "event": "agent_tree_changed",
+    "kind": "evt",
+    "v": 1
+  },
   "approval_mode_state": {
     "data": {
       "mode": "auto",
@@ -203,9 +215,25 @@
             "programMaxScope": {},
             "riskMaxScope": {}
           },
+          "auto_title_with_session_model": false,
           "concurrency": "subagents",
           "daemon": {
             "background_agents": true,
+            "boot": {
+              "container_probe_paths": {
+                "container_env": "/run/.containerenv",
+                "docker_env": "/.dockerenv",
+                "init_cgroup": "/proc/1/cgroup",
+                "self_mountinfo": "/proc/self/mountinfo"
+              },
+              "secret_store_backend": "auto",
+              "secret_store_path": null
+            },
+            "handover": {
+              "drain_ms": 30000,
+              "grace_ms": 10000,
+              "hard_ms": 5000
+            },
             "uploads": {
               "global_bytes": 268435456,
               "global_uploads": 32,
@@ -240,8 +268,14 @@
             "targets": [],
             "workflows": []
           },
+          "image_sidecar": {
+            "mode": "automatic",
+            "trusted_primary_default": null,
+            "untrusted_primary_default": null
+          },
           "inlineThink": true,
           "intelCentralityRanking": true,
+          "knowledgeBases": [],
           "knowledge_inject_max_tokens": 2048,
           "loop_guard": {
             "repeat_threshold": 2
@@ -314,11 +348,11 @@
           "preflight": {
             "enabled": false
           },
-          "knowledgeBases": [],
           "prompt_injection_guard": {
             "resultAction": "block",
             "threshold": "off"
           },
+          "queuedMessagesAsSteering": true,
           "redact": {
             "allowlist": [],
             "denylist": [],
@@ -349,9 +383,12 @@
           },
           "response_metrics_tokenizer": "cl100k_base",
           "retention": {
-            "payload_window_days": 30,
+            "compaction_lineage_keep_windows": 3,
+            "raw_wire_window_days": 30,
             "session_window_days": 0,
             "sweep_interval_hours": 6,
+            "terminal_evidence_window_days": 90,
+            "transcript_window_days": 90,
             "vacuum_interval_days": 7,
             "vacuum_min_deletions": 1000
           },
@@ -400,13 +437,14 @@
             "render_agent_markdown": true,
             "render_user_markdown": false,
             "rich_text_copy": true,
+            "session_rail_visible": true,
             "show_branch": true,
             "show_cwd": true,
             "thinking": "condensed",
             "use_emojis": false,
             "vim_mode": "hint"
           },
-          "queuedMessagesAsSteering": true
+          "updates": "auto"
         },
         "generation": 4,
         "providers": {
@@ -436,7 +474,12 @@
                   "compact_keep_recent_turns": 4,
                   "compact_nudge_pct": 60,
                   "compact_shadow": true,
-                  "compact_shadow_margin_pct": 10
+                  "compact_shadow_margin_pct": 10,
+                  "idle_window_secs": 900,
+                  "keep_warm": "auto",
+                  "resume_default": "ask",
+                  "rolling_precompaction": true,
+                  "rolling_precompaction_rebuild_turns": 24
                 },
                 "headers": [],
                 "models": [
@@ -673,6 +716,64 @@
     "kind": "evt",
     "v": 1
   },
+  "image_control_config_changed": {
+    "data": {
+      "event": {
+        "canonicalProjectRoot": "/tmp/project",
+        "changeSet": {
+          "changes": [
+            {
+              "entityGeneration": "4",
+              "entityId": "t1",
+              "item": {
+                "adapterKind": "openai_images",
+                "costEvidence": {
+                  "known": false,
+                  "method": null,
+                  "unit": null,
+                  "usdMicros": null,
+                  "variant": null
+                },
+                "dimensionDescriptor": {
+                  "type": "provider_default"
+                },
+                "displayName": null,
+                "enabled": true,
+                "endpointId": "ep1",
+                "entityGeneration": "4",
+                "formats": ["png"],
+                "hostedIdentity": "gpt-image-1",
+                "isDefault": true,
+                "maxReferences": 0,
+                "maxSamples": 1,
+                "openRouterRouting": null,
+                "referenceSupport": "unsupported",
+                "schemaVersion": 1,
+                "targetId": "t1",
+                "typedParameterSchema": [],
+                "workflowDigest": null,
+                "workflowId": null
+              },
+              "type": "target_upserted"
+            }
+          ],
+          "configGeneration": "4",
+          "schemaVersion": 1
+        },
+        "configGeneration": 4,
+        "daemonInstanceId": "11111111-1111-4111-8111-111111111111",
+        "kind": "config_changed",
+        "mutationCapability": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "requestedProjectRoot": "/tmp/project",
+        "resultRevision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "schemaVersion": 1,
+        "targetPath": "/tmp/project/.cockpit/config.json"
+      }
+    },
+    "event": "image_control_config_changed",
+    "kind": "evt",
+    "v": 1
+  },
   "inference_failed": {
     "data": {
       "agent": "agent-fixture",
@@ -710,6 +811,15 @@
       "waited_secs": 7
     },
     "event": "inference_warning",
+    "kind": "evt",
+    "v": 1
+  },
+  "interrupt_interrupted": {
+    "data": {
+      "interrupt_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "interrupt_interrupted",
     "kind": "evt",
     "v": 1
   },
@@ -829,15 +939,6 @@
     "kind": "evt",
     "v": 1
   },
-  "interrupt_interrupted": {
-    "data": {
-      "interrupt_id": "11111111-1111-4111-8111-111111111111",
-      "session_id": "11111111-1111-4111-8111-111111111111"
-    },
-    "event": "interrupt_interrupted",
-    "kind": "evt",
-    "v": 1
-  },
   "interrupt_resolved": {
     "data": {
       "decision": {
@@ -855,59 +956,6 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "interrupt_resolved",
-    "kind": "evt",
-    "v": 1
-  },
-  "image_control_config_changed": {
-    "data": {
-      "event": {
-        "schemaVersion": 1,
-        "daemonInstanceId": "11111111-1111-4111-8111-111111111111",
-        "projectId": "/tmp/project",
-        "kind": "config_changed",
-        "changeSet": {
-          "schemaVersion": 1,
-          "configGeneration": "4",
-          "changes": [
-            {
-              "type": "target_upserted",
-              "entityId": "t1",
-              "entityGeneration": "4",
-              "item": {
-                "schemaVersion": 1,
-                "targetId": "t1",
-                "entityGeneration": "4",
-                "endpointId": "ep1",
-                "displayName": null,
-                "enabled": true,
-                "isDefault": true,
-                "adapterKind": "openai_images",
-                "hostedIdentity": "gpt-image-1",
-                "workflowId": null,
-                "workflowDigest": null,
-                "formats": ["png"],
-                "referenceSupport": "unsupported",
-                "maxReferences": 0,
-                "maxSamples": 1,
-                "dimensionDescriptor": {
-                  "type": "provider_default"
-                },
-                "typedParameterSchema": [],
-                "openRouterRouting": null,
-                "costEvidence": {
-                  "known": false,
-                  "usdMicros": null,
-                  "unit": null,
-                  "method": null,
-                  "variant": null
-                }
-              }
-            }
-          ]
-        }
-      }
-    },
-    "event": "image_control_config_changed",
     "kind": "evt",
     "v": 1
   },
@@ -1010,6 +1058,17 @@
     "kind": "evt",
     "v": 1
   },
+  "onboarding_bootstrap": {
+    "data": {
+      "attempt_id": "22222222-2222-4222-8222-222222222222",
+      "revision": 2,
+      "run_id": "11111111-1111-4111-8111-111111111111",
+      "state": "materializing"
+    },
+    "event": "onboarding_bootstrap",
+    "kind": "evt",
+    "v": 1
+  },
   "osc52_protocol_violation": {
     "data": {
       "generation": 1,
@@ -1084,8 +1143,10 @@
     "data": {
       "queue": [
         {
+          "delivery_class": "steering",
           "display_text": "queued @src/lib.rs",
           "id": "11111111-1111-4111-8111-111111111111",
+          "send_now": false,
           "status": "queued",
           "target": {
             "agent": "Build",
@@ -1093,9 +1154,7 @@
             "id": "root",
             "task_call_id": "task-parent"
           },
-          "text": "queued text",
-          "delivery_class": "steering",
-          "send_now": false
+          "text": "queued text"
         }
       ],
       "session_id": "11111111-1111-4111-8111-111111111111"
@@ -1146,8 +1205,8 @@
       "generation": 7,
       "resume_from": [
         {
-          "marker": 42,
-          "session_id": "123e4567-e89b-12d3-a456-426614174000"
+          "marker": 7,
+          "session_id": "11111111-1111-4111-8111-111111111111"
         }
       ]
     },
@@ -1165,6 +1224,15 @@
       "url": "url-fixture"
     },
     "event": "reconnecting",
+    "kind": "evt",
+    "v": 1
+  },
+  "redaction_coverage_status": {
+    "data": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "unavailable": "ssh_keys_over_budget"
+    },
+    "event": "redaction_coverage_status",
     "kind": "evt",
     "v": 1
   },
@@ -1345,6 +1413,25 @@
     "kind": "evt",
     "v": 1
   },
+  "subagent_compacted": {
+    "data": {
+      "agent": "agent-fixture",
+      "label": "label-fixture",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "source": "auto",
+      "tail_kept": 2,
+      "tail_trimmed": 0,
+      "task_call_id": "task_call_id-fixture",
+      "tokens_after": 1200,
+      "tokens_before": 9000,
+      "trigger_ctx_pct": 82.5,
+      "turns_summarized": 3,
+      "window_index": 1
+    },
+    "event": "subagent_compacted",
+    "kind": "evt",
+    "v": 1
+  },
   "subagent_report": {
     "data": {
       "agent": "agent-fixture",
@@ -1395,25 +1482,6 @@
       "task_call_id": "task_call_id-fixture"
     },
     "event": "subagent_spawned",
-    "kind": "evt",
-    "v": 1
-  },
-  "subagent_compacted": {
-    "data": {
-      "agent": "agent-fixture",
-      "label": "label-fixture",
-      "session_id": "11111111-1111-4111-8111-111111111111",
-      "source": "auto",
-      "task_call_id": "task_call_id-fixture",
-      "trigger_ctx_pct": 82.5,
-      "tokens_after": 1200,
-      "tokens_before": 9000,
-      "turns_summarized": 3,
-      "tail_kept": 2,
-      "tail_trimmed": 0,
-      "window_index": 1
-    },
-    "event": "subagent_compacted",
     "kind": "evt",
     "v": 1
   },
@@ -1593,22 +1661,10 @@
     "kind": "evt",
     "v": 1
   },
-  "agent_tree_changed": {
-    "data": {
-      "session_id": "11111111-1111-4111-8111-111111111111",
-      "session_event_seq": 42,
-      "transition": "attention_state_changed",
-      "subject_kind": "decision",
-      "subject_id": "44444444-4444-4444-8444-444444444444"
-    },
-    "event": "agent_tree_changed",
-    "kind": "evt",
-    "v": 1
-  },
   "workspace_trust_reconciliation": {
     "data": {
-      "session_id": "11111111-1111-4111-8111-111111111111",
       "revision": 7,
+      "session_id": "11111111-1111-4111-8111-111111111111",
       "state": "pending"
     },
     "event": "workspace_trust_reconciliation",

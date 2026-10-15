@@ -1,5 +1,5 @@
                             fixture-session                               ● Idle
- ◆ Cockpit           [Hide] ⎇ …/proje…   issue-449 ● 2 changes   [update] [Code]
+ ◆ Cockpit           [Hide] issue-449 ● 2 changes   [update 9.9.9] [Setup: Code]
                             ────────────────────────────────────────────────────
   + New session                                                                 
                                                                                 

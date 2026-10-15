@@ -94,12 +94,14 @@ pub mod image_control;
 pub mod image_sidecar_authority;
 pub mod media_egress_authority;
 pub mod onboarding;
+pub mod redaction_coverage;
 pub use image_sidecar_authority::{
     ImageSidecarApprovalModeV1, ImageSidecarAuthoritySnapshotV1, ImageSidecarGrantMutationV1,
     ImageSidecarGrantScopeV1, ImageSidecarGrantV1, ImageSidecarInvocationCapSourceV1,
     ImageSidecarInvocationV1, ImageSidecarModelOptionV1, ImageSidecarPrimaryV1,
     ImageSidecarResolutionV1,
 };
+pub use redaction_coverage::{ReadyConstructionFailure, RedactionCoverageFailure};
 pub mod launch;
 pub mod provider_management;
 pub use host_capabilities::{

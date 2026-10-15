@@ -2598,6 +2598,10 @@ async fn resume_outcome_adopts_its_epoch_and_replays_held_events() {
         app.launch.session_id = Some(outgoing);
         app.session_redaction_coverage_unavailable =
             Some(cockpit_proto::RedactionCoverageFailure::Busy);
+        app.apply_event(TurnEvent::RedactionCoverageStatus {
+            session_id: None,
+            unavailable: Some(cockpit_proto::RedactionCoverageFailure::SourcesOverBudget),
+        });
         let mut providers = app.config_snapshot.provider_view.clone();
         let provider = providers.providers.remove("outgoing").unwrap();
         providers.providers.insert("resumed".into(), provider);
@@ -2605,6 +2609,12 @@ async fn resume_outcome_adopts_its_epoch_and_replays_held_events() {
         let mut extended = app.config_snapshot.extended.clone();
         extended.dialog.lockout_ms = 17;
         let replacement_events = [
+            // The global snapshot precedes Attached. It must survive both
+            // forms of adoption while session snapshots wait for the epoch.
+            TurnEvent::RedactionCoverageStatus {
+                session_id: None,
+                unavailable: None,
+            },
             TurnEvent::ConfigSnapshot {
                 snapshot: Box::new(cockpit_proto::ConfigSnapshot {
                     session_id: resumed,
@@ -2626,7 +2636,17 @@ async fn resume_outcome_adopts_its_epoch_and_replays_held_events() {
             runner.attachment_epoch.store(2, Ordering::Release);
             let mut events = runner.events.lock().unwrap();
             events.extend(replacement_events.into_iter().map(|event| QueuedTurnEvent {
-                attachment_epoch: 2,
+                attachment_epoch: if matches!(
+                    &event,
+                    TurnEvent::RedactionCoverageStatus {
+                        session_id: None,
+                        ..
+                    }
+                ) {
+                    crate::tui::agent_runner::GLOBAL_ATTACHMENT_EPOCH
+                } else {
+                    2
+                },
                 event,
             }));
         }
@@ -2639,6 +2659,7 @@ async fn resume_outcome_adopts_its_epoch_and_replays_held_events() {
                 },
             });
         assert!(app.drain_agent_events());
+        assert_eq!(app.redaction_coverage_unavailable, None);
         assert_eq!(app.same_session_resync_event_buffer.len(), 4);
         let AsyncActionPayload::SessionSwitched(outcome) =
             switch_outcome_with_epoch(resumed, "res001", 2)
@@ -2656,6 +2677,7 @@ async fn resume_outcome_adopts_its_epoch_and_replays_held_events() {
             app.apply_session_switch_outcome(outcome);
         }
         assert_eq!(app.visible_attachment_epoch, 2);
+        assert_eq!(app.redaction_coverage_unavailable, None);
         assert!(app.same_session_resync_event_buffer.is_empty());
         assert!(app.config_snapshot.from_daemon);
         assert_eq!(

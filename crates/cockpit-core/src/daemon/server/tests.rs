@@ -22357,12 +22357,10 @@ fn authz_opaque_id() -> proto::OpaqueAsciiId128V1 {
 }
 
 fn authz_acp_ingress() -> proto::AcpForwardedMcpIngressV1 {
-    proto::AcpForwardedMcpIngressV1 {
-        version: proto::ACP_FORWARDED_MCP_VERSION_V1,
-        declarations: Vec::new(),
-        client_provenance_id: authz_opaque_id(),
-        ingress_request_id: authz_opaque_id(),
-    }
+    crate::daemon::acp_catalog_composition::empty_ingress_for_test(
+        &Uuid::now_v7().to_string(),
+        &Uuid::now_v7().to_string(),
+    )
 }
 
 /// Sealed local executors pin an absolute, canonicalized, identity-hashed
@@ -39705,7 +39703,7 @@ async fn attach_replays_drain_state_after_attached_response() {
     .await
     .expect("attach envelope handled");
 
-    match recv_writer_body(&mut writer_rx, "response").await {
+    match recv_owner_attach_response(&mut writer_rx, "response").await {
         Body::Response { id, response } => {
             let Response::Attached { session_id, .. } = *response else {
                 panic!("expected Attached response, got {response:?}");
@@ -39715,15 +39713,6 @@ async fn attach_replays_drain_state_after_attached_response() {
         }
         other => panic!("expected Attached response, got {other:?}"),
     }
-    assert!(matches!(
-        recv_writer_body(&mut writer_rx, "attachment coverage snapshot").await,
-        Body::Event {
-            event: proto::Event::RedactionCoverageStatus {
-                session_id: None,
-                unavailable: None,
-            },
-        }
-    ));
     let mut saw_drain = false;
     for _ in 0..8 {
         match recv_writer_body(&mut writer_rx, "drain state replay").await {
@@ -39739,6 +39728,18 @@ async fn attach_replays_drain_state_after_attached_response() {
         }
     }
     assert!(saw_drain, "expected DaemonDraining replay");
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "lifetime state replay").await,
+        Body::Event {
+            event: proto::Event::DaemonLifetimeChanged {
+                ephemeral_owner: false,
+            },
+        }
+    ));
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "all owner envelopes consumed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

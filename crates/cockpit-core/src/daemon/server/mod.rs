@@ -10337,12 +10337,11 @@ async fn handle_envelope(
                 *shared = state.shared_snapshot();
                 let _ = principal_tx.send(ClientEventAuthority::from_state(state));
             }
-            let (mut notice, envelope) =
-                response_envelope_for_shared(id, result, shared, ctx).await;
-            // Attachment adoption starts with its response. Deliver its
-            // coverage snapshot before replay, after the client can bind
-            // that replay to the replacement attachment.
-            if !attached && let Some(notice) = notice.take() {
+            let (notice, envelope) = response_envelope_for_shared(id, result, shared, ctx).await;
+            // Establish daemon-global coverage before every owner response,
+            // including attachment adoption. Session replay stays below the
+            // response so clients can bind it to the replacement attachment.
+            if let Some(notice) = notice {
                 let _ = send_writer_envelope(writer_tx, notice).await;
             }
             let envelope_kind = envelope_kind(&envelope);
@@ -10361,9 +10360,6 @@ async fn handle_envelope(
                     request_shutdown(ctx);
                 }
                 return Ok(());
-            }
-            if let Some(notice) = notice {
-                let _ = send_writer_envelope(writer_tx, notice).await;
             }
             if effects.shutdown_after_response {
                 request_shutdown(ctx);
@@ -10686,7 +10682,7 @@ async fn apply_concurrent_request_test_hook(request: &Request) {
 /// [`proto::Event::RedactionCoverageStatus`] snapshot when withholding,
 /// recovering, or adopting an attachment. Attachment snapshots include healthy
 /// state: a reconnect may have missed the daemon-global recovery edge.
-/// Socket attachment snapshots follow the response and precede replay.
+/// Socket attachment snapshots precede the response; session replay follows it.
 async fn response_envelope_for_shared(
     id: Uuid,
     result: std::result::Result<Response, ErrorPayload>,

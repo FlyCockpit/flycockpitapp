@@ -244,7 +244,10 @@ fn composed_create(base: proto::CreateCodeRootV1Request, acp: bool) -> Request {
     if acp {
         Request::CreateCodeRootWithAcpIngressV1(proto::CreateCodeRootWithAcpIngressV1Request {
             base,
-            ingress: receipt_ingress(),
+            ingress: crate::daemon::acp_catalog_composition::empty_ingress_for_test(
+                "receipt-client",
+                "receipt-ingress",
+            ),
         })
     } else {
         Request::CreateCodeRootV1(base)
@@ -256,20 +259,14 @@ fn composed_attach(base: proto::AttachExistingCodeRootV1Request, acp: bool) -> R
         Request::AttachExistingCodeRootWithAcpIngressV1(
             proto::AttachExistingCodeRootWithAcpIngressV1Request {
                 base,
-                ingress: receipt_ingress(),
+                ingress: crate::daemon::acp_catalog_composition::empty_ingress_for_test(
+                    "receipt-client",
+                    "receipt-ingress",
+                ),
             },
         )
     } else {
         Request::AttachExistingCodeRootV1(base)
-    }
-}
-
-fn receipt_ingress() -> proto::AcpForwardedMcpIngressV1 {
-    proto::AcpForwardedMcpIngressV1 {
-        version: 1,
-        declarations: Vec::new(),
-        client_provenance_id: proto::OpaqueAsciiId128V1::new("receipt-client").unwrap(),
-        ingress_request_id: proto::OpaqueAsciiId128V1::new("receipt-ingress").unwrap(),
     }
 }
 
